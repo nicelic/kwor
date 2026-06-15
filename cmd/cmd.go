@@ -14,13 +14,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alireza0/s-ui/cmd/migration"
 	"github.com/alireza0/s-ui/config"
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/service"
 )
 
 const (
-	kworServiceName = "kwor"
+	kworServiceName  = "kwor"
+	defaultPanelPort = 8888
+	defaultPanelPath = "/app/"
 )
 
 // getServiceFilePath returns the systemd service file path for kwor.
@@ -291,7 +294,7 @@ func isInternalSystemdCommandAllowed() bool {
 
 func printUnsupportedSubcommand(name string) {
 	fmt.Printf("[kwor] unsupported subcommand: %s\n", name)
-	fmt.Println("[kwor] available subcommands: start, stop, uninstall")
+	fmt.Println("[kwor] available subcommands: start, stop, uninstall, migrate, uri, setting, admin")
 }
 
 func isFirstRun() bool {
@@ -465,11 +468,11 @@ func printFirstRunPanelURLs() {
 
 	port, err := settingService.GetPort()
 	if err != nil || port <= 0 || port > 65535 {
-		port = 36000
+		port = defaultPanelPort
 	}
 	webPath, err := settingService.GetWebPath()
 	if err != nil || strings.TrimSpace(webPath) == "" {
-		webPath = "/apps/"
+		webPath = defaultPanelPath
 	}
 	domain, _ := settingService.GetWebDomain()
 	listen, _ := settingService.GetListen()
@@ -508,14 +511,14 @@ func firstRunSetup() {
 	fmt.Println("============================================")
 	fmt.Println()
 
-	portStr := readInput("Enter panel port", "36000")
+	portStr := readInput("Enter panel port", strconv.Itoa(defaultPanelPort))
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port <= 0 || port > 65535 {
-		port = 36000
+		port = defaultPanelPort
 		fmt.Printf("[kwor] invalid port, using default: %d\n", port)
 	}
 
-	webPath := readInput("Enter panel URL path", "/apps/")
+	webPath := readInput("Enter panel URL path", defaultPanelPath)
 	if !strings.HasPrefix(webPath, "/") {
 		webPath = "/" + webPath
 	}
@@ -793,6 +796,58 @@ func cleanupCoreConfigForSystemd(coreName string) error {
 	return nil
 }
 
+func handleSettingSubcommand(args []string) {
+	settingFlags := flag.NewFlagSet("setting", flag.ContinueOnError)
+	settingFlags.SetOutput(os.Stdout)
+
+	show := settingFlags.Bool("show", false, "show current panel and subscription settings")
+	reset := settingFlags.Bool("reset", false, "reset settings to defaults")
+	port := settingFlags.Int("port", 0, "set panel port")
+	path := settingFlags.String("path", "", "set panel path")
+	subPort := settingFlags.Int("subPort", 0, "set subscription port")
+	subPath := settingFlags.String("subPath", "", "set subscription path")
+
+	if err := settingFlags.Parse(args); err != nil {
+		return
+	}
+
+	switch {
+	case *show:
+		showSetting()
+	case *reset:
+		resetSetting()
+	case settingFlags.NFlag() == 0:
+		settingFlags.Usage()
+	default:
+		updateSetting(*port, *path, *subPort, *subPath)
+	}
+}
+
+func handleAdminSubcommand(args []string) {
+	adminFlags := flag.NewFlagSet("admin", flag.ContinueOnError)
+	adminFlags.SetOutput(os.Stdout)
+
+	show := adminFlags.Bool("show", false, "show current admin credentials")
+	reset := adminFlags.Bool("reset", false, "reset admin credentials to admin/admin")
+	username := adminFlags.String("username", "", "set admin username")
+	password := adminFlags.String("password", "", "set admin password")
+
+	if err := adminFlags.Parse(args); err != nil {
+		return
+	}
+
+	switch {
+	case *show:
+		showAdmin()
+	case *reset:
+		resetAdmin()
+	case adminFlags.NFlag() == 0:
+		adminFlags.Usage()
+	default:
+		updateAdmin(*username, *password)
+	}
+}
+
 func ParseCmd() {
 	var showVersion bool
 	flag.BoolVar(&showVersion, "v", false, "show version")
@@ -804,7 +859,12 @@ func ParseCmd() {
 		fmt.Println("Commands:")
 		fmt.Println("    start          start kwor and register systemd auto-start")
 		fmt.Println("    stop           stop kwor panel and remove its systemd auto-start")
+		fmt.Println("    resetadmin     interactively reset panel login state")
 		fmt.Println("    uninstall      uninstall kwor and cleanup project files")
+		fmt.Println("    migrate        migrate the database to the current version")
+		fmt.Println("    uri            print current panel access URL(s)")
+		fmt.Println("    setting        show or update panel/subscription settings")
+		fmt.Println("    admin          show or update admin credentials")
 	}
 
 	flag.Parse()
@@ -849,8 +909,18 @@ func ParseCmd() {
 		handleStart()
 	case "stop":
 		handleStop()
+	case "resetadmin":
+		handleResetAdminCommand()
 	case "uninstall":
 		handleUninstallCommand()
+	case "migrate":
+		migration.MigrateDb()
+	case "uri":
+		getPanelURI()
+	case "setting":
+		handleSettingSubcommand(os.Args[2:])
+	case "admin":
+		handleAdminSubcommand(os.Args[2:])
 	default:
 		printUnsupportedSubcommand(os.Args[1])
 		flag.Usage()

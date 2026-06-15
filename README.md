@@ -32,8 +32,8 @@
 - Panel Port: 8888
 - Panel Path: /app/
 - Subscription Port: 22780
-- Subscription Path: /sub/
-- User/Password: admin
+- Subscription Path: auto-generated random path on first initialization
+- Admin Credentials: interactive setup uses `admin/admin` by default; `install.sh` can generate random credentials if you skip configuration
 
 ## Install & Upgrade to Latest Version
 

@@ -130,12 +130,12 @@ func handleResetAdminCommand() {
 
 	currentPort, err := settingService.GetPort()
 	if err != nil || currentPort <= 0 || currentPort > 65535 {
-		currentPort = 36000
+		currentPort = defaultPanelPort
 	}
 
 	currentWebPath, err := settingService.GetWebPath()
 	if err != nil || strings.TrimSpace(currentWebPath) == "" {
-		currentWebPath = "/apps/"
+		currentWebPath = defaultPanelPath
 	}
 
 	currentUsername := "admin"

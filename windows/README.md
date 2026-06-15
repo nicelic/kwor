@@ -1,23 +1,23 @@
 # Windows Files
 
-This directory contains all Windows-specific files for S-UI.
+This directory contains Windows-specific helper files for kwor local development and optional manual packaging.
 
 ## Available Files:
 
-- **s-ui-windows.xml**: Windows Service configuration
+- **kwor-windows.xml**: WinSW service configuration used by the Windows installer
 - **install-windows.bat**: Installation script
-- **s-ui-windows.bat**: Control panel
+- **kwor-windows.bat**: Control panel script
 - **uninstall-windows.bat**: Uninstallation script
-- **build-windows.bat**: Simple build script for CMD
-- **build-windows.ps1**: Advanced build script for PowerShell
+- **kwor-windows-build.bat**: Simple build script for CMD
+- **kwor-windows-build.ps1**: Build script for PowerShell
 
 ## Usage:
 
-To install S-UI on Windows:
+To install kwor on Windows:
 1. Run `install-windows.bat` as Administrator
 2. Follow the installation wizard
-3. Use `s-ui-windows.bat` for management
+3. Use `kwor-windows.bat` in the install directory for management
 
 To build from source:
-- With CMD: `build-windows.bat`
-- With PowerShell: `.\build-windows.ps1`
+- With CMD: `kwor-windows-build.bat`
+- With PowerShell: `.\kwor-windows-build.ps1`

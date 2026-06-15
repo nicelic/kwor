@@ -1,28 +1,28 @@
 @echo off
 setlocal enabledelayedexpansion
 
-REM S-UI Windows Control Script
-REM This script provides a menu-driven interface for managing S-UI on Windows
+REM kwor Windows Control Script
+REM This script provides a menu-driven interface for managing kwor on Windows
 
-set "SERVICE_NAME=s-ui"
-set "INSTALL_DIR=%SUI_HOME%"
-if "%INSTALL_DIR%"=="" set "INSTALL_DIR=C:\Program Files\s-ui"
+set "SERVICE_NAME=kwor"
+set "INSTALL_DIR=%KWOR_HOME%"
+if "%INSTALL_DIR%"=="" set "INSTALL_DIR=C:\Program Files\kwor"
 
 :menu
 cls
 echo ========================================
-echo S-UI Windows Control Panel
+echo kwor Windows Control Panel
 echo ========================================
 echo.
 echo Current directory: %INSTALL_DIR%
 echo.
-echo 1. Start S-UI Service
-echo 2. Stop S-UI Service
-echo 3. Restart S-UI Service
+echo 1. Start kwor Service
+echo 2. Stop kwor Service
+echo 3. Restart kwor Service
 echo 4. Check Service Status
 echo 5. View Service Logs
 echo 6. Open Panel in Browser
-echo 7. Run S-UI Manually
+echo 7. Run kwor Manually
 echo 8. Install/Uninstall Service
 echo 9. Open Installation Directory
 echo 10. Show Configuration
@@ -48,7 +48,7 @@ if "%choice%"=="0" goto exit
 goto invalid_choice
 
 :start_service
-echo Starting S-UI service...
+echo Starting kwor service...
 net start %SERVICE_NAME%
 if %errorLevel% equ 0 (
     echo Service started successfully!
@@ -59,7 +59,7 @@ pause
 goto menu
 
 :stop_service
-echo Stopping S-UI service...
+echo Stopping kwor service...
 net stop %SERVICE_NAME%
 if %errorLevel% equ 0 (
     echo Service stopped successfully!
@@ -70,7 +70,7 @@ pause
 goto menu
 
 :restart_service
-echo Restarting S-UI service...
+echo Restarting kwor service...
 net stop %SERVICE_NAME% >nul 2>&1
 timeout /t 2 /nobreak >nul
 net start %SERVICE_NAME%
@@ -83,7 +83,7 @@ pause
 goto menu
 
 :check_status
-echo Checking S-UI service status...
+echo Checking kwor service status...
 sc query %SERVICE_NAME%
 echo.
 echo Service status details:
@@ -94,7 +94,7 @@ pause
 goto menu
 
 :view_logs
-echo Opening S-UI logs...
+echo Opening kwor logs...
 if exist "%INSTALL_DIR%\logs" (
     start "" "%INSTALL_DIR%\logs"
 ) else (
@@ -104,22 +104,33 @@ pause
 goto menu
 
 :open_panel
-echo Opening S-UI panel in browser...
-start http://localhost:2095
-echo Panel opened in default browser.
+echo Opening kwor panel in browser...
+set "PANEL_URL="
+if exist "%INSTALL_DIR%\kwor.exe" (
+    for /f "usebackq delims=" %%i in (`"%INSTALL_DIR%\kwor.exe" uri ^| findstr /B /C:"http://" /C:"https://"`) do (
+        if not defined PANEL_URL set "PANEL_URL=%%i"
+    )
+)
+if defined PANEL_URL (
+    start "" "%PANEL_URL%"
+    echo Panel opened: %PANEL_URL%
+) else (
+    echo Could not detect panel URL automatically.
+    echo Try the default address: http://localhost:8888/app/
+)
 pause
 goto menu
 
 :run_manual
-echo Running S-UI manually...
-if exist "%INSTALL_DIR%\sui.exe" (
+echo Running kwor manually...
+if exist "%INSTALL_DIR%\kwor.exe" (
     cd /d "%INSTALL_DIR%"
-    echo Starting S-UI in current window...
+    echo Starting kwor in current window...
     echo Press Ctrl+C to stop
     echo.
-    sui.exe
+    kwor.exe
 ) else (
-    echo S-UI executable not found: %INSTALL_DIR%\sui.exe
+    echo kwor executable not found: %INSTALL_DIR%\kwor.exe
     echo Please run the installer first.
 )
 pause
@@ -144,9 +155,9 @@ goto invalid_choice
 
 :install_service
 echo Installing Windows Service...
-if exist "%INSTALL_DIR%\s-ui-service.exe" (
+if exist "%INSTALL_DIR%\kwor-service.exe" (
     cd /d "%INSTALL_DIR%"
-    s-ui-service.exe install
+    kwor-service.exe install
     if %errorLevel% equ 0 (
         echo Service installed successfully!
         echo Starting service...
@@ -162,10 +173,10 @@ goto service_management
 
 :uninstall_service
 echo Uninstalling Windows Service...
-if exist "%INSTALL_DIR%\s-ui-service.exe" (
+if exist "%INSTALL_DIR%\kwor-service.exe" (
     cd /d "%INSTALL_DIR%"
     net stop %SERVICE_NAME% >nul 2>&1
-    s-ui-service.exe uninstall
+    kwor-service.exe uninstall
     if %errorLevel% equ 0 (
         echo Service uninstalled successfully!
     ) else (
@@ -190,17 +201,17 @@ goto menu
 :show_config
 echo.
 echo ========================================
-echo S-UI Configuration
+echo kwor Configuration
 echo ========================================
-if exist "%INSTALL_DIR%\sui.exe" (
+if exist "%INSTALL_DIR%\kwor.exe" (
     cd /d "%INSTALL_DIR%"
     echo Current settings:
-    sui.exe setting -show
+    kwor.exe setting -show
     echo.
     echo Admin credentials:
-    sui.exe admin -show
+    kwor.exe admin -show
 ) else (
-    echo S-UI executable not found. Please run the installer first.
+    echo kwor executable not found. Please run the installer first.
 )
 pause
 goto menu
@@ -211,16 +222,15 @@ echo ========================================
 echo Access URLs
 echo ========================================
 echo.
-echo Local access:
-echo   Panel: http://localhost:2095
-echo   Subscription: http://localhost:2096
-echo.
-echo Network access:
-for /f "tokens=2 delims=:" %%i in ('ipconfig ^| findstr /i "IPv4"') do (
-    set "ip=%%i"
-    set "ip=!ip: =!"
-    echo   Panel: http://!ip!:2095
-    echo   Subscription: http://!ip!:2096
+if exist "%INSTALL_DIR%\kwor.exe" (
+    cd /d "%INSTALL_DIR%"
+    echo Panel URLs:
+    kwor.exe uri
+    echo.
+    echo Subscription settings:
+    kwor.exe setting -show
+) else (
+    echo kwor executable not found. Please run the installer first.
 )
 echo.
 pause
@@ -232,5 +242,5 @@ pause
 goto menu
 
 :exit
-echo Thank you for using S-UI Windows Control Panel!
+echo Thank you for using kwor Windows Control Panel!
 exit /b 0

@@ -52,6 +52,13 @@ func showAdmin() {
 	userModel, err := userService.GetFirstUser()
 	if err != nil {
 		fmt.Println("get current user info failed,error info:", err)
+		fmt.Println("hint: initialize the database or run ./kwor start first")
+		return
+	}
+	if userModel == nil {
+		fmt.Println("current admin user not found")
+		fmt.Println("hint: initialize the database or run ./kwor start first")
+		return
 	}
 	username := userModel.Username
 	userpasswd := userModel.Password

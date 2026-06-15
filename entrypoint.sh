@@ -1,4 +1,4 @@
 #!/bin/sh
 
 ./kwor migrate
-./kwor
+exec ./kwor
