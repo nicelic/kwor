@@ -20,6 +20,8 @@ on:
 
 jobs:
   build-linux:
+    permissions:
+      contents: write
     strategy:
       matrix:
         platform:
@@ -76,11 +78,11 @@ jobs:
           retention-days: 30
 
       - name: Upload to Release
-        uses: svenstaro/upload-release-action@v2
-        if: github.event_name == 'release' && github.event.action == 'published'
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          tag: ${{ github.ref }}
-          file: kwor-linux-${{ matrix.platform }}.tar.gz
-          asset_name: kwor-linux-${{ matrix.platform }}.tar.gz
-          overwrite: true
+          tag_name: ${{ github.ref_name }}
+          name: kwor ${{ github.ref_name }}
+          files: kwor-linux-${{ matrix.platform }}.tar.gz
+          fail_on_unmatched_files: true
+          generate_release_notes: true
