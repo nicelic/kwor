@@ -1,0 +1,49 @@
+.DS_Store
+.git
+.gitignore
+
+# Build outputs / artifacts
+dist/
+release/
+releases/
+tmp/
+.sync*
+*.tar.gz
+*.zip
+.build-marker
+
+# Compiled binaries (rebuilt inside the image)
+*.exe
+kwor
+sui
+main
+.vscode_build_test.exe
+
+# Frontend deps / build output (reinstalled & rebuilt in the image)
+temp_frontend/node_modules/
+temp_frontend/dist/
+frontend/
+web/html/
+
+# Runtime data (must not leak into the image)
+Promanager_data/
+db/
+bin/
+backup/
+_tmp_mihomo_src/
+_tmp_mieru_official/
+
+# Backup / temp source files
+*.pre_fix_backup
+
+# local env files
+.env.local
+.env.*.local
+
+# Log files
+*.log*
+.cache
+
+# Editor directories and files
+.idea
+.vscode

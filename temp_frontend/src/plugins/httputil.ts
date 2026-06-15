@@ -1,0 +1,105 @@
+import api from './api'
+import { i18n } from '@/locales'
+import router from '@/router'
+import axios from 'axios'
+import { push } from 'notivue'
+
+export interface Msg {
+  success: boolean
+  msg: string
+  obj: any | null
+}
+
+function _handleMsg(msg: any, silent = false): void {
+  if (silent) {
+    return
+  }
+  if (!isMsg(msg)) {
+    return
+  }
+  if(msg.msg){
+    if (!msg.success && msg.msg == "Invalid login") {
+      push.warning({
+        title: i18n.global.t('invalidLogin'),
+        duration: 5000,
+      })
+      logout()
+      return
+    }
+    if (msg.success) {
+      push.success({
+        message: i18n.global.t('success') + ": " + i18n.global.t('actions.' + msg.msg),
+        duration: 5000,
+      })
+    } else {
+      push.warning({
+        title: i18n.global.t('failed'),
+        duration: 5000,
+        message: msg.msg
+      })
+    }
+  }
+}
+
+export const logout = async () => {
+  const response = await HttpUtils.get('api/logout')
+  if(response.success){
+    router.push('/login')
+  }
+}
+
+function _respToMsg(resp: any): Msg {
+  const data = resp.data
+  if (data == null) {
+    return { success: true, msg: "", obj: null }
+  } else if (isMsg(data)) {
+    if (data.hasOwnProperty('success')) {
+        return { success: data.success, msg: data.msg, obj: data.obj || null }
+    } else {
+        return data
+    }
+  } else {
+    return { success: false, msg: `unknown data: ${data}`, obj: null }
+  }
+}
+
+function isMsg(obj: any): obj is Msg {
+  return Object.hasOwn(obj,'success') && Object.hasOwn(obj,'msg') && Object.hasOwn(obj, 'obj')
+}
+  
+const HttpUtils = {
+  async get(url: string, data: object = {}, options: any = {}): Promise<Msg> {
+    const { silentAuthCheck, ...requestOptions } = options ?? {}
+    let msg: Msg
+    try {
+        const resp = await api.get(url, { params: data, ...requestOptions })
+        msg = _respToMsg(resp)
+    } catch (e: any) {
+        if (axios.isCancel(e)) {
+            msg = { success: false, msg: "", obj: null }
+        } else {
+        msg = { success: false, msg: e.toString(), obj: null }
+        }
+    }
+    _handleMsg(msg, silentAuthCheck === true)
+    return msg
+  },
+  async post(url: string, data: object | null, options: any = undefined): Promise<Msg> {
+    const { silentAuthCheck, ...requestOptions } = options ?? {}
+    let msg: Msg
+    try {
+        const resp = await api.post(url, data, requestOptions)
+        msg = _respToMsg(resp)
+    } catch (e: any) {
+        if (axios.isCancel(e)) {
+            msg = { success: false, msg: "", obj: null }
+        } else {
+        msg = { success: false, msg: e.toString(), obj: null }
+        }
+    }
+    _handleMsg(msg, silentAuthCheck === true)
+    return msg
+  },
+}
+
+export default HttpUtils

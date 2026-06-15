@@ -1,0 +1,25 @@
+---
+services:
+  kwor:
+    image: ghcr.io/nicelic/kwor:latest
+    container_name: kwor
+    hostname: "kwor"
+    volumes:
+      - "./Promanager_data:/app/Promanager_data"
+    tty: true
+    restart: unless-stopped
+    network_mode: host
+    # network_mode: host lets kwor use the panel/sub ports and any inbound
+    # ports you configure without re-declaring them here. If you prefer bridge
+    # networking, comment out network_mode above and use the ports block below
+    # (remember to also expose every inbound port you create in the panel).
+    #
+    # networks:
+    #   - kwor
+    # ports:
+    #   - "8888:8888"   # panel
+    #   - "22780:22780" # subscription
+
+# networks:
+#   kwor:
+#     driver: bridge

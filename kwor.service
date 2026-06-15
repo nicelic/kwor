@@ -1,0 +1,14 @@
+[Unit]
+Description=kwor Service
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+WorkingDirectory=/usr/local/kwor/
+ExecStart=/usr/local/kwor/kwor
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
