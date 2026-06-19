@@ -92,7 +92,7 @@
    - 再看：对应 `service/*.go`
 7. **构建 / 安装 / 发布问题**
    - 先看：`build.bat`、`build.sh`、`windows/*`、`.github/workflows/*`
-   - 再看：`scripts/sync-version.mjs`、`web/web.go`
+   - 再看：`install.sh`、`cmd/cmd.go`、`config/config.go`、`scripts/sync-version.mjs`、`web/web.go`
 
 ---
 
@@ -1128,6 +1128,30 @@ npm.cmd run build
 
 职责：Windows 安装、服务包装、目录初始化、管理员配置等。
 
+## 9.7 Linux 安装脚本职责：`install.sh`
+
+当前 `install.sh` 的职责，不再是“自己重复实现一套 panel setting / admin 设置逻辑”，而是：
+
+1. 探测 Linux 发行版与 CPU 架构
+2. 下载 GitHub Release 里的 Linux 发布包
+3. 优先按**运行中的 `kwor` 进程**定位旧安装目录
+4. 若无运行进程，再按**`kwor.service` 的 `ExecStart` / `WorkingDirectory`** 反推旧安装目录
+5. 若两者都没有，则按**默认新装目录 `/opt/kwor`**
+6. 升级时调用现有二进制的 `stop`
+7. 替换二进制后调用现有二进制的 `start`
+
+因此当前 Linux 安装链要分清三层：
+
+- 发布包下载与替换：`install.sh`
+- 首次初始化、`systemd` 注册、首次登录信息：`cmd/cmd.go` 里的 `start`
+- 运行期数据目录与数据库路径：`config/config.go`
+
+另外要注意：
+
+- `install.sh` 现在是**目录定位器 + release 下载器 + `start/stop` 包装层**
+- 首次安装默认目录是 `/opt/kwor`
+- 但如果脚本检测到旧实例正在运行，或检测到已有 `kwor.service`，就会沿用旧目录，不擅自迁移目录
+
 ---
 
 ## 10. 按任务找文件：最短定位路径
@@ -1593,6 +1617,12 @@ npm.cmd run build
 18. **不要只盯 Inbounds 页找 core 控制入口**
     - 首页 `Main.vue` 也能直接启动 / 停止 / 重启 sing-box 与 Mihomo。
 
+19. **不要把 release 包文件名、手工重命名文件名、运行进程名混为一谈**
+    - release 产物名可能是 `kwor-linux-amd64.tar.gz`
+    - 手工部署文档里可能会把二进制改名成 `kwor_amd64`
+    - 但程序内部 `kworServiceName`、`systemd` 服务名、主进程语义仍然以 `kwor` 为核心
+    - 分析安装 / 升级问题时，一定要区分“压缩包名”“磁盘文件名”“进程名”“service 名”
+
 ---
 
 ## 12. 前端共享页面、包装页、modal 与协议组件关系图
@@ -1926,4 +1956,4 @@ npm.cmd run build
 
 ---
 
-最后更新：`2026-06-18`
+最后更新：`2026-06-19`
