@@ -1,197 +1,296 @@
 # AI 编程必读工程文件概述（kwor / s-ui-main）
-> 目标：让 AI 或新开发者先分清“主源码在哪、哪些目录是运行期生成物、默认 sing-box 链和 mihomo 链怎么并行存在、改需求时该先看哪一层”。
+
+> 目标：让 AI 编程助手或新接手开发的人，先分清 **源码在哪、运行期文件在哪、默认链与 Mihomo 链如何并行、改一处时要联动检查哪里**。
 >
-> 扫描基线：`2026-03-20`
+> 扫描基线：`2026-06-18`
 >
-> 结论来源：以当前仓库源码为准，不以 README、旧脚本或历史文件名为准。
+> 适用场景：**Win10 + VSCode + Go + Node + npm.cmd 本地开发**，然后构建并发布到其他平台运行。
+>
+> 结论来源：以当前仓库源码、构建脚本、启动入口为准；**README、旧文档、历史目录、运行期生成文件都只能辅助参考，不能反过来覆盖源码事实。**
 
 ---
 
-## 0. AI 必须遵守的开发约定
+## 0. 先看这一页：这份文档怎么用
 
-1. 先读这个文件再找代码，按这里的树状索引去定位关联文件。
-2. 看到一个文件时，要联想到它的调用方、被调用方、配置落点、运行时副作用，不要只看当前文件。
-3. 本项目不是 Git 仓库，不要把“git 工作流”当成默认前提。
-4. 前端正式构建优先使用 `npm.cmd run build`；如果当前环境没有 `npm.cmd`，不要硬跑不存在的命令，改用已安装的 `node` 直接调用 `temp_frontend/node_modules` 里的 `vue-tsc` 和 `vite` 做等价验证。
-5. 所有修改必须保持 UTF-8，不得引入乱码。
-6. 不要默认跑 `go test ./service` 这类长测试；优先跑定向、短时、只覆盖当前改动的测试。即使定向测试已通过，也不得自行再补跑 `go test ./service` 之类的整包/全量回归。
+### 0.1 这不是产品介绍，而是“AI 任务导航图”
+
+这个项目不是单一网页，也不是单一 Go 服务，而是下面几条链叠加起来的：
+
+1. **Go 后端主程序**
+2. **Vue 3 前端 SPA**
+3. **内嵌前端资源的 Web 服务**
+4. **订阅服务（普通 / JSON / Clash / Mihomo / SubManager / SubGroup）**
+5. **默认链（sing-box）配置生成与运行控制**
+6. **Mihomo 链配置生成与运行控制**
+7. **系统级运维能力**：证书、防火墙、端口转发、反向代理、流量总览、系统监控、内核包管理等
+
+所以接任务时，**不要把它当成“改一个 Vue 文件”或“改一个 Go 接口”就能结束的项目**。
+
+### 0.2 当前 owner 协作约定（AI 必须遵守）
+
+1. **交流、总结、解释统一使用中文。**
+2. **任何修改都必须保持 UTF-8，不得引入乱码。**
+3. **Windows 本地前端命令默认使用 `npm.cmd`，不要写成 PowerShell 专属调用方式。**
+4. **不要默认跑 `go test ./service` 这类整包长测试。**
+   - 优先做小范围、短时、与当前改动直接相关的验证。
+   - 即使前面的小验证通过，也不要顺手补跑全量长测。
+5. 改功能前，先判断需求属于哪一层：
+   - 默认链（sing-box）
+   - Mihomo 链
+   - 前后端共享层
+   - 运行期生成层
+   - 构建 / 发布层
+6. 看到一个文件时，要主动思考：
+   - 它被谁调用
+   - 它把数据交给谁
+   - 保存后会重写哪些运行文件
+   - 前端或后端是否还有另一条并行链也要一起改
+
+### 0.3 权威来源优先级
+
+遇到文档与代码冲突时，按下面优先级判断：
+
+1. **源码实现**
+2. **路径函数 / 默认值函数 / 构建脚本**
+3. **启动入口与 API 路由**
+4. **README**
+5. **旧文档**
+6. **运行期生成文件**
+
+特别是以下文件，属于高权威来源：
+
+- 路径与运行目录：`config/config.go`
+- 默认值与设置项：`service/setting.go`
+- 应用启动链：`main.go`、`app/app.go`
+- API 真正入口：`api/apiHandler.go`、`api/apiService.go`
+- 前端分流总开关：`temp_frontend/src/store/uiNamespace.ts`
+- 默认链配置生成：`service/promanager.go`
+- Mihomo YAML 生成：`service/mihomo_manager.go`
+- Core 运行控制：`service/coreManager.go`、`service/mihomo_core_manager.go`
+
+### 0.4 快速任务分类法（接任务先套这个）
+
+如果用户一句话描述需求，先把它归到下面某一类，再开始查文件：
+
+1. **页面 / 表单 / 交互问题**
+   - 先看：`temp_frontend/src/views/*`、`temp_frontend/src/layouts/modals/*`
+   - 再看：`temp_frontend/src/store/uiNamespace.ts`、对应 store
+2. **保存后结果不对 / 运行文件没更新**
+   - 先看：`api/apiService.go`、`service/config.go`
+   - 再看：`service/promanager.go` 或 `service/mihomo_manager.go`
+3. **URL / 端口 / 路径 / 登录跳转问题**
+   - 先看：`service/setting.go`、`web/web.go`、`sub/sub.go`
+   - 再看：`temp_frontend/index.html`、`router/index.ts`、`vite.config.mts`
+4. **订阅内容 / 二维码 / 导入链接问题**
+   - 先看：`sub/subHandler.go`、`sub/jsonService.go`、`sub/clashService.go`
+   - 再看：`temp_frontend/src/layouts/modals/QrCode.vue`
+5. **外部 core 下载 / 版本 / 启停问题**
+   - 先看：`service/coreManager.go`、`service/mihomo_core_manager.go`
+   - 再看：`temp_frontend/src/layouts/modals/SingboxCore.vue`、`temp_frontend/src/views/Inbounds.vue`
+6. **系统功能（证书 / 防火墙 / 转发 / 反代 / 监控）问题**
+   - 先看：对应 `Settings*.vue`、`api/apiHandler.go`、`api/apiService.go`
+   - 再看：对应 `service/*.go`
+7. **构建 / 安装 / 发布问题**
+   - 先看：`build.bat`、`build.sh`、`windows/*`、`.github/workflows/*`
+   - 再看：`scripts/sync-version.mjs`、`web/web.go`
 
 ---
 
-## 1. 先读这 25 个文件
+## 1. 5 分钟读图顺序
+
+如果你刚接任务，只按下面顺序读，基本就能建立正确脑图。
+
+### 1.1 第一轮：先搞清程序怎么启动
 
 1. `main.go`
+   - 看无参数启动应用、有参数走 CLI。
 2. `app/app.go`
-3. `cmd/cmd.go`
-4. `config/config.go`
-5. `database/db.go`
-6. `web/web.go`
-7. `sub/sub.go`
-8. `sub/subHandler.go`
-9. `api/apiHandler.go`
-10. `api/apiService.go`
-11. `service/setting.go`
-12. `service/config.go`
-13. `service/promanager.go`
+   - 看启动时初始化了哪些服务、哪些运行文件会被自动生成。
+3. `config/config.go`
+   - 看版本、程序名、`Promanager_data`、数据库路径等基础规则。
+4. `service/setting.go`
+   - 看面板端口、路径、订阅端口、随机订阅路径、默认配置等。
+
+### 1.2 第二轮：搞清对外暴露了哪些服务
+
+5. `web/web.go`
+   - 看 Web 面板路径、静态资源、Session、API、SPA fallback、TLS。
+6. `sub/sub.go`
+   - 看订阅服务是如何按 `subPath` 启动的。
+7. `sub/subHandler.go`
+   - 看普通订阅、Mihomo 订阅、SubManager、SubGroup 的具体路由。
+8. `api/apiHandler.go`
+   - 看 Session API 与 GET/POST action 路由入口。
+9. `api/apiService.go`
+   - 看前端加载数据、保存配置、系统功能入口怎么串起来。
+
+### 1.3 第三轮：搞清“保存后为什么会连锁重生成”
+
+10. `service/config.go`
+    - 这是 `/api/save` 的总分发中心，也是保存后副作用中心。
+11. `service/promanager.go`
+    - 看默认链（sing-box）运行文件如何生成。
+12. `service/mihomo_manager.go`
+    - 看 Mihomo 的 `server.yaml` 如何生成。
+13. `service/core_layout.go`
+    - 看运行期 `core/` 目录与配置文件真实路径。
 14. `service/coreManager.go`
+    - 看 sing-box 外部 core 的下载、版本、启动、systemd 控制。
 15. `service/mihomo_core_manager.go`
-16. `service/mihomo_manager.go`
-17. `service/mihomo_config.go`
-18. `service/mihomo_route_render.go`
-19. `service/mihomo_proxy_convert.go`
-20. `database/model/mihomo.go`
-21. `cronjob/cronJob.go`
-22. `temp_frontend/src/router/index.ts`
-23. `temp_frontend/src/store/uiNamespace.ts`
-24. `temp_frontend/src/store/modules/data.ts`
-25. `temp_frontend/src/store/modules/mihomoData.ts`
-26. `service/firewall.go`
-27. `service/firewall_nftables_install.go`
-28. `service/firewall_scan.go`
-29. `cronjob/firewallSyncJob.go`
-30. `temp_frontend/src/components/SettingsFirewallManage.vue`
-31. `service/firewall_geoip.go`
-32. `service/firewall_geoip_parser.go`
-33. `service/firewall_geoip_nft.go`
-34. `temp_frontend/src/components/SettingsFirewallGeoOptions.ts`
+    - 看 Mihomo 外部 core 的下载、版本、启动、systemd 控制。
 
-如果只想最快摸清项目，读完上面这些文件基本就能建立正确地图。
+### 1.4 第四轮：搞清前端为什么“一处修改会影响两条链”
 
----
+16. `temp_frontend/index.html`
+    - 看 `BASE_URL` 如何注入到前端。
+17. `temp_frontend/src/main.ts`
+    - 看 Vue App、router、store、i18n、Vuetify、Notivue 的启动顺序。
+18. `temp_frontend/src/router/index.ts`
+    - 看登录探测、10 秒轮询、Mihomo 页面入口。
+19. `temp_frontend/src/store/uiNamespace.ts`
+    - 看默认链与 Mihomo 链如何在前端分流。
+20. `temp_frontend/src/store/modules/data.ts`
+    - 看默认链的数据加载与保存。
+21. `temp_frontend/src/store/modules/mihomoData.ts`
+    - 看 Mihomo 链的数据加载与保存。
+22. `temp_frontend/src/views/Settings.vue`
+    - 看大量系统功能（流量、防火墙、反代、监控等）是如何挂在设置页里的。
 
-## 2. 目录边界
+### 1.5 真正的最短排查顺序（不要一上来全仓乱翻）
 
-### 2.1 当前主源码目录
+当你已经有具体问题时，推荐按下面顺序排查：
 
-- 后端主源码：`api/`、`app/`、`cmd/`、`config/`、`cronjob/`、`database/`、`middleware/`、`network/`、`service/`、`sub/`、`util/`、`web/`
-- 前端主源码：`temp_frontend/src/`
-- 前端构建产物：`web/html/`
+1. **先定层**：前端层 / API 层 / 保存层 / 生成层 / 运行层 / 构建层
+2. **再定链**：默认链 / Mihomo 链 / 共享层 / 系统功能层
+3. **再找入口**：
+   - 页面问题先看 view 或 modal
+   - 接口问题先看 `apiHandler.go`
+   - 保存问题先看 `service/config.go`
+   - 运行配置问题先看 `promanager.go` 或 `mihomo_manager.go`
+4. **最后补联动**：
+   - 这个字段是否进了 store
+   - 这个保存是否会触发文件重生成
+   - 这个页面是否有 Mihomo 包装页共用
 
-### 2.2 运行期生成目录
+如果你没先做这 4 步，就很容易出现：
 
-- `Promanager_data/db/kwor.db`
-- `Promanager_data/core/singbox/config.json`
-- `Promanager_data/core/server.yaml`
-- `Promanager_data/core/mihomo_inbounds_meta.json`
-- `Promanager_data/core/singbox/sing-box` / `sing-box.exe`
-- `Promanager_data/core/mihomo/mihomo` / `mihomo.exe`
-- `Promanager_data/cert/*`
-- `Promanager_data/Inbound/*.json`
-- `Promanager_data/outbound/*.json`
-- `Promanager_data/sub_json/*.json`
-
-这些都不是手写业务源码，很多文件会在保存配置、同步或启动时被重写。
-
-### 1.3 容易看错的目录
-
-- `frontend/`
-  - 仍然像历史子模块/发布输入目录。
-  - 但当前本地开发构建脚本 `build.sh`、`build.bat` 实际使用的是 `temp_frontend/`。
-- `web/html/`
-  - 是嵌入到 Go 二进制里的前端编译结果。
-  - 不要直接改这里。
-- `db/`
-  - 旧数据库位置兼容目录。
-  - 真实运行路径现在是 `Promanager_data/db/kwor.db`。
-- `backup/`
-  - 历史备份，不是当前主链。
-- `_tmp_mihomo_src/`、`_tmp_mieru_official/`
-  - 参考源码或临时对照目录，不是当前产品主入口。
+- 找对文件但改错层
+- 改对默认链却漏掉 Mihomo 链
+- 前端表现改了，但保存后又被后端重写回去
 
 ---
 
-## 2. 项目当前形态
+## 2. 项目真实形态：先建立全局认知
 
-- 可执行程序名：`kwor`
-- 模块名仍是：`github.com/alireza0/s-ui`
-- 版本：`1.4.20`
-- 后端：Go 1.25 + Gin + GORM + SQLite（`github.com/glebarez/sqlite`）
-- 前端：Vue 3 + Vite + Vuetify + Pinia + TypeScript
-- Session Cookie 名：`kwor`
-- Web API：`<webPath>/api/*`
-- Token API：`<webPath>/apiv2/*`
+### 2.1 当前项目不是“前端 + 一个简单后端”
 
-### 2.0 版本号修改速查（避免每次全仓库排查）
+它更接近下面这个结构：
 
-主页面「系统信息 -> S-UI (kwor)」显示链路：
+- **面板后端**：Gin + GORM + SQLite
+- **前端 SPA**：Vue 3 + Vite + Vuetify + Pinia + TypeScript
+- **嵌入式前端资源**：构建后复制到 `web/html/`，再由 Go `embed` 进二进制
+- **默认链（sing-box）**：数据库配置 → 运行期 JSON 文件 → 外部 core 运行
+- **Mihomo 链**：数据库配置 → `server.yaml` → 外部 core 运行
+- **系统能力层**：证书、nftables、防火墙、反代、转发、流量统计、监控等
 
-`config/version` -> `config/config.go:GetVersion()` -> `service/server.go:GetSystemInfo().appVersion` -> `temp_frontend/src/components/Main.vue: appVersionLabel`
+### 2.2 当前产品名与模块名并不完全一致
 
-结论（默认强制流程）：
+- 程序名：`kwor`
+- 版本来源：`config/version`
+- Go module 仍是：`github.com/alireza0/s-ui`
 
-- 当需求是“只改主页面版本显示”时，只允许修改 `config/version` 这 1 个文件。
-- 默认禁止全仓库版本字符串扫描（例如 `rg 1.x.x`）和无关目录排查。
-- 默认不要改 `web/html/` 下打包产物（会被前端构建覆盖）。
-- 默认不要改 `temp_frontend/package.json` 与 `temp_frontend/package-lock.json`（它们不是主页面版本显示必需项）。
-- 修改后说明“需要重新编译并重启后生效”（`config/config.go` 通过 `//go:embed version` 读取版本）。
+因此看到 `s-ui`、`kwor` 混用时，不要立刻以为是两个项目，先确认它是历史命名残留还是当前功能语义。
 
-例外条件（仅满足其一才允许扩展扫描或多文件修改）：
+### 2.3 当前主运行模式不是“内嵌 core”
 
-- 用户明确要求“同步前端包版本/发版元信息”。
-- 用户明确要求“做全仓版本一致性检查”。
-- 构建脚本或发布流程报错，明确要求 `package.json` 版本必须与 `config/version` 一致。
-- 版本显示链路被改动，`config/version -> GetVersion() -> appVersion` 链路不再成立。
+虽然仓库里仍有 `core/` 相关代码，但**当前主链路里真正负责 sing-box / Mihomo 运行控制的，是 `service/coreManager.go` 和 `service/mihomo_core_manager.go`。**
 
-建议自检：
+也就是说：
 
-- 打开主页面确认版本标签已变更（例如 `vX.Y.Z`）。
-- 确认 `service/setting.go` 默认值里的 `version` 仍由 `config.GetVersion()` 提供，不要改成硬编码字符串。
+- 真正的 core 下载 / 升级 / 启停：看 `service/*core_manager*.go`
+- 真正的运行配置路径：看 `service/core_layout.go`
+- 真正的配置生成：看 `service/promanager.go` 与 `service/mihomo_manager.go`
 
-当前不是“单一配置面板”，而是两条并行配置面：
-
-### 2.1 默认链（sing-box / 面板 / 订阅）
-
-- 数据对象：`config`、`clients`、`tls`、`inbounds`、`outbounds`、`outboundgroups`、`suboutbounds`、`subgroups`、`services`、`endpoints`
-- 运行配置输出：`Promanager_data/core/singbox/config.json`
-- 相关生成文件：`Promanager_data/Inbound/*`、`Promanager_data/outbound/*`、`Promanager_data/sub_json/*`
-
-### 2.2 Mihomo 链
-
-- 数据对象：`mihomo_config`、`mihomo_clients`、`mihomo_tls`、`mihomo_inbounds`、`mihomo_outbounds`、`mihomo_outboundgroups`
-- 运行配置输出：`Promanager_data/core/server.yaml`
-- 额外元数据输出：`Promanager_data/core/mihomo_inbounds_meta.json`
-
-关键现实：
-
-- `service/config.go` 里的 `corePtr` 仍然是 dummy，不是实际 core 生命周期入口。
-- 真正的 sing-box 管理器在 `service/coreManager.go`。
-- 真正的 mihomo 管理器在 `service/mihomo_core_manager.go`。
+不要先把注意力放在 `core/` 目录，以免误判主链。
 
 ---
 
-## 3. 启动方式与运行模式
+## 3. 目录边界：哪些是源码，哪些是生成物
 
-### 3.1 无参数启动
+### 3.1 目录总表
+
+| 类别 | 位置 | 说明 | 是否应直接修改 |
+| --- | --- | --- | --- |
+| 后端主源码 | `api/` `app/` `cmd/` `config/` `cronjob/` `database/` `middleware/` `network/` `service/` `sub/` `util/` `web/` | Go 主业务代码 | 是 |
+| 前端主源码 | `temp_frontend/src/` | 当前实际前端源码 | 是 |
+| 前端入口模板 | `temp_frontend/index.html` | 注入 `BASE_URL`，dev 时回退 `/app/` | 是 |
+| 前端构建输出 | `temp_frontend/dist/` | Vite 打包产物 | 否 |
+| Go 内嵌前端产物 | `web/html/` | 前端复制后给 Go `embed` 使用 | 否 |
+| 运行期数据目录 | `<binary_dir>/Promanager_data/` | DB、core 配置、证书、订阅 JSON 等 | 一般否 |
+| 历史/非当前主前端 | `frontend/` | 不是当前本地主开发目录 | 一般否 |
+| Windows 构建与安装 | `windows/` | Windows 打包、安装、服务相关脚本 | 按需 |
+| 版本同步脚本 | `scripts/sync-version.mjs` | 同步 `config/version` 到前端包元数据 | 按需 |
+| 文档目录 | `docs/` | 子系统文档，未必始终跟代码同步 | 辅助参考 |
+
+### 3.2 最容易看错的几个目录
+
+#### `temp_frontend/`
+这是**当前真实前端项目根目录**。本地开发、构建、Vite 配置、Pinia、路由、页面，全在这里。
+
+#### `web/html/`
+这是**Go 运行时要嵌入的前端打包结果**，不是源码。改这里没有长期意义，下次构建会被覆盖。
+
+#### `temp_frontend/dist/`
+这是**Vite 构建输出目录**，同样不是源码。
+
+#### `Promanager_data/`
+这是**运行期目录**，真实位置由 `config.GetDataDir()` 决定：
+
+- 规则：`<可执行文件所在目录>/Promanager_data`
+
+因此它通常不固定在仓库根目录，而是跟着最终运行的 `kwor` / `kwor.exe` 走。这里的很多文件都是**启动时、保存配置后、定时任务中自动生成或重写的**。
+
+#### `frontend/`
+仓库里虽然有这个目录，但**当前前端构建链实际使用的是 `temp_frontend/`**。不要把 `frontend/` 当成本地主源码入口。
+
+### 3.3 运行期生成物速查表
+
+下面这些路径非常常见，但都不应该被当成“手写源码来源”：
+
+| 路径 | 来源 | 何时更新 | 应该去改哪里 |
+| --- | --- | --- | --- |
+| `Promanager_data/db/kwor.db` | SQLite 主库 | 保存配置、运行时 | `database/` + `service/` |
+| `Promanager_data/core/singbox/config.json` | 默认链配置生成器 | 启动时、默认链保存后 | `service/promanager.go` `service/config.go` |
+| `Promanager_data/core/mihomo/server.yaml` | Mihomo 生成器 | 启动时、任意 `mihomo_*` 保存后 | `service/mihomo_manager.go` |
+| `Promanager_data/core/mihomo_inbounds_meta.json` | Mihomo 入站元数据生成器 | Mihomo 配置重生成时 | `service/mihomo_manager.go` |
+| `Promanager_data/Inbound/*.json` | 默认链入站文件生成器 | `inbounds` / `clients` / `tls` / `settings` 相关保存后 | `service/promanager.go` |
+| `Promanager_data/outbound/*.json` | 默认链出站文件生成器 | `outbounds` / `outboundgroups` / `settings` 相关保存后 | `service/promanager.go` |
+| `Promanager_data/sub_json/*.json` | 订阅 JSON 生成器 | 客户端、组、订阅输出相关保存后 | `service/promanager.go` `service/suboutbounds.go` `service/subgroups.go` |
+| `Promanager_data/cert/*` | 证书中心 / 自签 / 导入 | 证书签发、应用、迁移时 | `service/acme_service.go` `service/panel_*` |
+| `temp_frontend/dist/*` | Vite build 结果 | 前端构建后 | `temp_frontend/src/*` |
+| `web/html/*` | 拷贝后的嵌入前端 | 前端构建并复制后 | `temp_frontend/src/*` |
+
+---
+
+## 4. 启动链、服务链与关键入口
+
+## 4.1 启动总入口
+
+### 无参数启动
 
 链路：
 
-`main.go -> runApp() -> app.Init() -> app.Start()`
+`main.go -> runApp() -> app.NewApp() -> app.Init() -> app.Start()`
 
-`app.Init()` 当前会做这些事：
-
-- 初始化数据库：`database.InitDB(config.GetDBPath())`
-- 初始化运行期文件备份/落盘体系：`service.InitManagedRuntimeFileStore()`
-- 读取 settings，并尝试拆分旧的 panel/sub 共用自签证书路径
-- 初始化 `cronJob`、`webServer`、`subServer`
-- 初始化 `ConfigService`
-- 启动前先触发两条生成链：
-  - `service.NewProManagerService(...).SaveInboundJson()`
-  - `service.NewMihomoManagerService().RegenerateServerConfig()`
-
-`app.Start()` 当前会：
-
-- 启动 cron
-- 启动 Web Server
-- 启动 Sub Server
-- 启动 `PanelCertManager`
-
-### 3.2 命令模式
+### 有参数启动
 
 链路：
 
 `main.go -> cmd.ParseCmd()`
 
-当前支持：
+### `cmd` 常用子命令
+
+在 `cmd/cmd.go` 里可以看到主要命令入口：
 
 - `start`
 - `stop`
@@ -202,403 +301,291 @@
 - `uri`
 - `migrate`
 
-### 3.3 `kwor start` 和正常运行默认值不是一套
+另外还有给 systemd / 内部链路使用的辅助命令，例如：
 
-正常运行的权威默认值来自 `service/setting.go`：
+- `materialize-core-config`
+- `cleanup-core-config`
 
-- 面板端口：`8888`
-- 面板路径：`/app/`
-- 订阅端口：`22780`
-- 订阅路径：`/sub/`
+### `kwor start` 首次初始化要注意的事实
 
-`kwor start` 首次向导默认值来自 `cmd/cmd.go`：
+`cmd/cmd.go` 里的 `firstRunSetup()` **只会交互式询问下面几项**：
 
-- 面板端口：`8888`
-- 面板路径：`/app/`
-- 管理员：`admin/admin`
-- 首次启动会尝试分别生成 panel/sub 自签证书
+- 面板端口
+- 面板路径
+- 管理员用户名
+- 管理员密码
 
-高频坑：
+并不会在首次交互里单独询问订阅端口或订阅路径。
 
-- `temp_frontend/src/views/Settings.vue` 里的本地占位默认 `subPort` 仍是 `2096`。
-- 但后端真实默认值已经是 `22780`。
-- 以 `service/setting.go` 为准，不要以表单初始值为准。
+也就是说：
+
+- `subPort` 默认值来自 `service/setting.go`
+- `subPath` 若为空，会在 `service/setting.go` 中自动生成随机路径
+
+因此不要再把“首次启动默认订阅路径固定是 `/sub/`”当成当前事实。
+
+## 4.2 `app.Init()` 做了什么
+
+`app/app.go` 中，`Init()` 是真正的应用装配入口。当前它会做这些关键动作：
+
+1. 初始化日志
+2. 初始化数据库：`database.InitDB(config.GetDBPath())`
+3. 初始化运行期托管文件存储：`service.InitManagedRuntimeFileStore()`
+4. 初始化系统监控存储：`service.InitSystemMonitorStore()`
+5. 确保 core 运行目录存在：`service.EnsureManagedCoreLayout()`
+6. 读取全部 settings，并做若干启动修复 / 迁移动作
+7. 同步 panel / sub 的证书分配关系
+8. 准备 ACME 概览一致性
+9. 清理启动前遗留的临时防火墙规则
+10. 创建：
+   - `cronJob`
+   - `webServer`
+   - `subServer`
+   - `reverseProxy`
+11. 注册 TLS 运行时应用器与防火墙运行时端口提供器
+12. 创建 `ConfigService`
+13. **启动前先主动生成两条配置链：**
+   - 默认链：`service.NewProManagerService(...).SaveInboundJson()`
+   - Mihomo 链：`service.NewMihomoManagerService().RegenerateServerConfig()`
+
+重点：**程序启动前就会先把运行配置落盘。**
+
+## 4.3 `app.Start()` 做了什么
+
+`app/app.go` 中，`Start()` 会：
+
+1. 启动时先同步托管 nftables 生命周期：`service.SyncManagedNftablesOnStartup()`
+2. 读取时区和流量保留设置
+3. 启动 cron
+4. 启动 Web Server
+5. 启动 Sub Server
+6. 启动 Reverse Proxy 运行时
+7. 启动流量总览 runtime probe
+8. 启动系统监控 runtime probe
+9. Linux 下延迟检查并自恢复 sing-box / Mihomo 托管 core
+
+### Cron 当前主要注册了什么
+
+`cronjob/cronJob.go` 当前会注册（含启动即跑的一次性执行）这些关键任务：
+
+- nft core sync
+- Mihomo nft core sync
+- firewall sync
+- port-forward sync
+- reverse-proxy sync
+- panel certificate balance sync
+- TLS path sync
+- stats job
+- port hop refresh job
+- deplete job
+- sing-box core update check
+- Mihomo core update check
+- subgroup auto update
+- ACME auto renew
+
+所以遇到“为什么我没点保存，它也会自动改状态/改文件/改运行规则”时，**别忘了把 cron 也算进去。**
+
+### 4.3.1 `app.Stop()` 与 `app.RestartApp()` 也值得关注
+
+很多人只看启动，不看停止和重启，但这个项目里它们也有实际副作用：
+
+- `app.Stop()` 会：
+  - 停止 cron
+  - 按条件清理托管 nftables 运行时规则
+  - flush 流量总览快照
+  - 停止 Sub / Web / Reverse Proxy 运行时
+- `app.RestartApp()` 会：
+  - 标记 panel-only stop
+  - 重新创建 `webServer` 与 `subServer`
+  - 再次调用 `Start()`
+
+因此遇到“重启后状态不一致”“停服务后某些规则没了/没清理”“反代只在重启后生效”这类问题时，要把：
+
+- `app/app.go`
+- `service/nft_lifecycle.go`
+- `service/reverse_proxy.go`
+- `service/traffic_overview.go`
+
+一起纳入排查。
+
+### 4.3.2 托管 nftables 生命周期不是只属于 sing-box
+
+`service/nft_lifecycle.go` 当前会在启动 / 停止时统一处理多类运行时规则：
+
+- firewall
+- port-forward
+- traffic-cap
+- 默认链 core 相关 nft 规则
+- Mihomo core 相关 nft 规则
+
+所以不要把 `nftables` 理解成“只给 sing-box 用的附属功能”；它其实是多个系统能力共享的运行时基础设施。
+
+## 4.4 Web 服务入口：`web/web.go`
+
+当前 Web 服务的关键事实：
+
+- 使用 `SettingService.GetWebPath()` 作为面板基础路径
+- Session Cookie 名是：`kwor`
+- 静态资源挂载在：`<webPath>assets/`
+- Session API 挂载在：`<webPath>api/*`
+- Token API 挂载在：`<webPath>apiv2/*`
+- 前端 HTML 模板来自内嵌的 `html/index.html`
+- 对不符合规则的路径会做 SPA fallback 或 anti-probe 假响应
+- 启动时会根据 `EnsurePanelTLSMaterials(...)` 决定是走 HTTPS 还是 HTTP fallback
+
+### `BASE_URL` 是前后端协作关键点
+
+后端在渲染 `index.html` 时，会把：
+
+- `BASE_URL = webPath`
+
+注入到前端，前端再用它做：
+
+- 路由 history base
+- 页面入口路径判断
+- 登录跳转基准路径
+
+因此改 `webPath` 不能只改一边。
+
+## 4.5 Sub 服务入口：`sub/sub.go` + `sub/subHandler.go`
+
+订阅服务会按 `subPath` 启动一个独立的 HTTP 服务组。
+
+当前核心路由包括：
+
+### 默认链客户端订阅
+
+- `GET /q/client`
+- `HEAD /q/client`
+- `GET /:subid`
+- `HEAD /:subid`
+
+### Mihomo 链客户端订阅
+
+- `GET /q/mihomo`
+- `HEAD /q/mihomo`
+- `GET /mihomo/:subid`
+- `HEAD /mihomo/:subid`
+
+### SubManager 订阅
+
+- `GET /q/sm`
+- `GET /sm/:tag`
+
+### SubGroup 订阅
+
+- `GET /q/group`
+- `GET /group/:groupName`
+
+### 订阅格式切换
+
+通过查询参数：
+
+- `?format=json`
+- `?format=clash`
+
+分别走 JSON / Clash 渲染链。
+
+## 4.6 API 入口分成两套：Session API 与 Token API
+
+### Session API：`api/apiHandler.go`
+
+这是面板前端最常走的完整接口集合，特点是：
+
+- 功能最全
+- 覆盖保存、加载、系统功能、证书、监控、防火墙、反代、core 管理等大多数能力
+- 依赖 Session 登录状态
+
+### Token API：`api/apiV2Handler.go`
+
+这是另一套基于 Token 的 API，特点是：
+
+- 通过 `Token` 请求头鉴权
+- 功能覆盖面比 Session API 小
+- 主要提供：
+  - `load`
+  - 部分 partial load
+  - `save`
+  - `restartApp`
+  - `restartSb`
+  - `linkConvert`
+  - `importdb`
+  - `portOccupancy`
+
+### 结论
+
+如果用户说“接口没返回这个字段”“某个 API 能不能也支持某功能”，先确认他说的是：
+
+- 面板 Session API
+- 还是 Token API
+
+不要默认以为两套接口能力完全一致。
 
 ---
 
-## 4. Web / API / Sub 主链路
+## 5. 前端主链：入口、路由、双 Store、命名空间
 
-### 4.1 Web 服务
+## 5.1 前端启动链
 
-入口：`web/web.go`
+链路：
 
-职责：
+`temp_frontend/index.html -> temp_frontend/src/main.ts -> temp_frontend/src/App.vue`
 
-- 读取 `webPath`
-- 注册 session：`sessions.Sessions("kwor", ...)`
-- 挂载静态资源：`<webPath>assets/`
-- 挂载 API：
-  - `<webPath>api/*`
-  - `<webPath>apiv2/*`
-- 处理 SPA fallback
-- 对错误路径做 anti-probe
-- 根据证书存在情况自动走 HTTPS 或 HTTP fallback
+### `temp_frontend/index.html`
 
-### 4.2 Sub 服务
+负责：
 
-入口：`sub/sub.go` + `sub/subHandler.go`
+- 注入 `window.BASE_URL = "{{ .BASE_URL }}"`
+- 在 dev fallback 场景下，如果没被后端模板替换，就回退到 `/app/`
 
-当前路由：
+### `temp_frontend/src/main.ts`
 
-- 客户端订阅（默认链）：
-  - `GET /q/client`
-  - `HEAD /q/client`
-  - `GET /:subid`
-  - `HEAD /:subid`
-- 客户端订阅（Mihomo 链）：
-  - `GET /q/mihomo`
-  - `HEAD /q/mihomo`
-  - `GET /mihomo/:subid`
-  - `HEAD /mihomo/:subid`
-- SubManager 订阅：
-  - `GET /q/sm`
-  - `GET /sm/:tag`
-- SubGroup 订阅：
-  - `GET /q/group`
-  - `GET /group/:groupName`
+负责：
 
-`?format=json|clash` 仍然有效。
+- 创建 Vue App
+- 挂载 router
+- 挂载 Pinia store
+- 挂载 i18n
+- 挂载 Notivue
+- 挂载 Vuetify
+- 注入全局 loading 状态
 
-### 4.3 面板 API
+### `temp_frontend/src/App.vue`
 
-入口：
+负责：
 
-- Session API：`api/apiHandler.go`
-- Token API：`api/apiV2Handler.go`
+- 全局 loading overlay
+- message 组件
+- `router-view`
+- 页面标题基础设置
 
-当前规律：
+## 5.2 路由与登录探测：`temp_frontend/src/router/index.ts`
 
-- Session API 最全。
-- Token API 只覆盖一部分读取与保存接口，没有完整复刻 mihomo 专用接口。
+这个文件非常关键，因为它决定了：
 
-### 4.4 `api/save` 是总分发入口
+1. 页面路由如何定义
+2. 登录态怎么探测
+3. 何时跳到 `/login`
+4. 何时开始 10 秒轮询数据
+5. Mihomo 页面如何挂到主菜单体系里
 
-入口：`api/apiService.go -> ConfigService.Save(...)`
+### 当前主要页面
 
-默认对象：
+默认链页面：
 
-- `clients`
-- `tls`
-- `inbounds`
-- `outbounds`
-- `outboundgroups`
-- `suboutbounds`
-- `subgroups`
-- `services`
-- `endpoints`
-- `config`
-- `settings`
+- `/`
+- `/submanager`
+- `/inbounds`
+- `/clients`
+- `/outbounds`
+- `/rules`
+- `/tls`
+- `/dns`
+- `/basics`
+- `/admins`
+- `/settings`
 
-Mihomo 对象：
-
-- `mihomo_clients`
-- `mihomo_tls`
-- `mihomo_inbounds`
-- `mihomo_outbounds`
-- `mihomo_outboundgroups`
-- `mihomo_config`
-
-### 4.5 保存后的副作用
-
-入口：`service/config.go`
-
-特点：
-
-- 先事务保存数据库
-- 再提交事务
-- 然后跑 `managed runtime hooks`
-- 最后触发生成文件和 nftables 后处理
-
-默认链常见副作用：
-
-- 重生成 `Inbound/*`
-- 重生成 `outbound/*`
-- 重生成 `core/singbox/config.json`
-- 重生成 `sub_json/*`
-- 必要时更新 subgroup / suboutbound 文件
-- 必要时更新 sing-box 侧 nftables 状态
-
-Mihomo 链常见副作用：
-
-- 任意 `mihomo_*` 保存成功后重生成 `Promanager_data/core/server.yaml`
-- 同时重写 `Promanager_data/core/mihomo_inbounds_meta.json`
-- 必要时更新 mihomo 侧 nft redirect 状态
-
----
-
-## 5. 默认 sing-box 生成链
-
-### 5.1 配置来源
-
-`service/ConfigService.GetConfig()`
-
-它不是直接把 `settings.config` 原样返回，而是把：
-
-- `settings.config`
-- DB 中的 inbounds
-- DB 中的 outbounds
-- DB 中的 services
-- DB 中的 endpoints
-
-重新拼成完整 sing-box 配置对象。
-
-### 5.2 真实生成器
-
-入口：`service/promanager.go`
-
-核心职责：
-
-- 生成每个入站的单文件配置
-- 生成每个出站的单文件配置
-- 生成完整 core 配置
-- 生成订阅 JSON 文件
-
-当前输出：
-
-- `Promanager_data/Inbound/*.json`
-- `Promanager_data/outbound/*.json`
-- `Promanager_data/core/singbox/config.json`
-- `Promanager_data/sub_json/*.json`
-
-### 5.3 ProManager 不是纯监听器
-
-虽然 `service/promanager.go` 里有事件总线和批处理逻辑，但当前更常见的触发方式是：
-
-- 启动时直接调用 `SaveInboundJson()`
-- `ConfigService.Save()` 在提交后直接调用 `regenerate*`
-
-所以出问题时，优先看保存链和生成函数本身，不要只盯事件队列。
-
-### 5.4 实际 core 生命周期
-
-入口：`service/coreManager.go`
-
-职责：
-
-- 下载 sing-box
-- 读取本地版本
-- 查询 GitHub 远程版本
-- 管理自动检查更新
-- Linux 下创建/删除 `kwor-singbox` systemd service（`ExecStartPre` 会通过 `kwor materialize-core-config singbox` 从托管库刷新 `core/singbox/config.json`，`cleanup-core-config singbox` 不删除这份持久运行配置）
-- 启动/停止/重启 sing-box
-
-当前 sing-box 链保持历史目录布局：
-
-- 内核程序：`Promanager_data/core/singbox/sing-box`
-- 运行配置：`Promanager_data/core/singbox/config.json`
-- `core/singbox/config.json` 保存配置时会真实落盘，systemd 启动前仍会用托管库内容刷新该文件；`cleanup-core-config singbox` 不再删除这份持久运行配置。
-
-所以：
-
-- `service/config.go` 里的 dummy core 不是实际运行体。
-- 真正运行控制和下载升级都在 `service/coreManager.go`。
-
----
-
-## 6. Mihomo 并行链
-
-### 6.1 配置来源不是另一份 `config.json`
-
-Mihomo 基础配置来源：
-
-- `settings.mihomo_config`
-
-但最终运行文件是：
-
-- `Promanager_data/core/server.yaml`
-- Mihomo 内核和运行时缓存位于 `Promanager_data/core/mihomo/`。
-
-入口：
-
-- `service/mihomo_config.go`
-- `service/mihomo_manager.go`
-
-### 6.2 Mihomo 配置保存会先清洗
-
-前端清洗：
-
-- `temp_frontend/src/types/rules.ts`
-- `temp_frontend/src/types/tls.ts`
-
-后端清洗：
-
-- `service/mihomo_route_sanitize.go`
-- `service/mihomo_config.go`
-- `database/model/mihomo.go`
-
-当前明确行为：
-
-- 逻辑规则会被丢弃
-- 只保留 `action=route` 或 `action=reject`
-- 一批 sing-box 专有字段会被删除
-- mihomo 不支持的 TLS 字段会被删除
-
-### 6.3 Mihomo YAML 渲染主链
-
-入口：`service/mihomo_manager.go -> GenerateServerDocument()`
-
-当前流程：
-
-1. 读取 `mihomo_config`
-2. 复制通用配置，提取 route 通用项
-3. 读取 `mihomo_outbounds`
-   - 订阅导入的 Clash 客户端节点会额外保存在 `mihomo_outbounds.RawOutbound`
-   - 如果来源是 Clash 订阅，还会把每个 proxy 的原始 YAML 文本保存到 `mihomo_outbounds.RawClashYAML`
-   - 写 `server.yaml` 时，`proxies:` 段会优先回放这份原始 proxy YAML；只有缺失时才 fallback 到结构化渲染
-4. 用 `service/mihomo_proxy_convert.go` 转成 `proxies` 和 `proxy-groups`
-5. 读取 `route.rule_set`，转成 `rule-providers`
-6. 读取 `mihomo_inbounds`
-7. 用 inbound 的 `route_tag` / detour / final 生成 `listeners` 与 `sub-rules`
-8. 用 `service/mihomo_route_render.go` 把 route.rules 展平成最终 `rules`
-9. 归一化 `sniffer`
-10. 输出 `server.yaml`
-
-### 6.4 Mihomo 当前允许的 listener 类型
-
-后端过滤入口：`service/mihomo_route_render.go -> filterSupportedMihomoListeners(...)`
-
-当前允许：
-
-- `mixed`
-- `socks`
-- `http`
-- `redirect`
-- `tproxy`
-- `tun`
-- `shadowsocks`
-- `shadowtls`
-- `vmess`
-- `vless`
-- `trojan`
-- `anytls`
-- `tuic`
-- `hysteria2`
-- `mieru`
-
-前端 `temp_frontend/src/layouts/modals/Inbound.vue` 在 `mihomo` namespace 下当前隐藏的是：
-
-- `direct`
-- `naive`
-- `hysteria`
-
-所以旧结论“mihomo 前端隐藏 shadowtls / mieru”已经不成立。
-
-### 6.5 Mihomo outbound 不是 UI 里能建就一定能落到 YAML
-
-权威转换入口：`service/mihomo_proxy_convert.go`
-
-当前明确行为：
-
-- `selector`、`urltest` 会转成 `proxy-groups`
-- `direct` 归一成 `DIRECT`
-- `tor`、`ssh` 会被标记 unsupported
-- `shadowtls` 不是普通独立 proxy
-  - 只有 `shadowsocks + detour=shadowtls` 或运行时可还原成 ShadowTLS 组合时，才会正确折算
-
-前端对应限制：
-
-- `temp_frontend/src/layouts/modals/Outbound.vue` 在 `mihomo` namespace 下隐藏 `tor`、`ssh`
-
-### 6.6 Mihomo 当前没有完整在线/流量统计链
-
-入口：`api/apiService.go -> getMihomoData()`
-
-当前返回：
-
-- `enableTraffic = false`
-- `onlines = { inbound: [], outbound: [], user: [] }`
-
-所以 mihomo 页面与默认链当前并不等价。
-
----
-
-## 7. 数据库与模型层
-
-### 7.1 数据库路径
-
-入口：`config/config.go`
-
-当前默认：
-
-- `<可执行文件目录>/Promanager_data/db/kwor.db`
-
-兼容迁移：
-
-- 如果发现旧路径 `<可执行文件目录>/db/kwor.db`
-- 会自动复制到新路径并清理旧 sidecar 文件
-
-### 7.2 自动建表
-
-入口：`database/db.go`
-
-除了默认链表，还会自动迁移这些 Mihomo 表：
-
-- `mihomo_tls`
-- `mihomo_inbounds`
-- `mihomo_outbounds`
-- `mihomo_outbound_groups`
-- `mihomo_clients`
-- `mihomo_inbound_redirect_state`
-
-### 7.3 Mihomo 模型的现实意义
-
-入口：`database/model/mihomo.go`
-
-重要点：
-
-- `MihomoInbound` / `MihomoOutbound` 复用默认 `Inbound` / `Outbound` 的编解码逻辑
-- 保存时会删掉 mihomo 不支持的字段
-- `MihomoTls.Sanitize()` 会主动清理一批 TLS 字段
-- mihomo outbound 还会按类型清理 `utls`、`reality` 等字段
-
----
-
-## 8. 前端主链
-
-### 8.0 前端验证命令（Windows / Codex 环境）
-
-优先使用项目脚本：
-
-```powershell
-cd temp_frontend
-npm.cmd run build
-```
-
-如果当前环境没有 `npm.cmd`，但 `node` 和 `temp_frontend/node_modules` 已存在，使用本地 CLI 直接验证：
-
-```powershell
-cd temp_frontend
-node ..\scripts\sync-version.mjs
-node .\node_modules\vue-tsc\bin\vue-tsc.js --noEmit
-node .\node_modules\vite\bin\vite.js build
-```
-
-说明：
-- `temp_frontend/package.json` 的 `build` 实际等价于 `sync-version + vue-tsc --noEmit + vite build`。
-- 这种 fallback 只用于当前环境缺少 `npm.cmd` 时的验证，不代表要修改 `package.json` 脚本。
-- `vite build` 会生成 `temp_frontend/dist/`；如果只是验证改动，不要把这个临时产物当源码提交或纳入后续修改。
-- Vite 当前可能出现大 chunk warning；只要构建 exit code 为 0，且没有新增错误，通常按既有警告处理。
-
-### 8.1 路由与菜单
-
-入口：
-
-- 路由：`temp_frontend/src/router/index.ts`
-- 菜单：`temp_frontend/src/layouts/default/Drawer.vue`
-- 设置页内子标签：`temp_frontend/src/views/Settings.vue`
-- 设置页新增了完整的 `反向代理` 页签：`temp_frontend/src/components/SettingsReverseProxyManage.vue`
-
-当前有 6 个 mihomo 页面：
+Mihomo 页面：
 
 - `/mihomo_inbounds`
 - `/mihomo_clients`
@@ -607,42 +594,31 @@ node .\node_modules\vite\bin\vite.js build
 - `/mihomo_rules`
 - `/mihomo_dns`
 
-默认链的 `/endpoints` 与 `/services` 页面当前保留源码和数据链，但已从左侧菜单与直接访问入口中暂时隐藏。
+### 10 秒轮询不是只拉一套数据
 
-默认链里这 6 个页面（`inbounds`/`clients`/`outbounds`/`tls`/`rules`/`dns`）现在在：
-
-- 左侧菜单（`Drawer.vue`）
-- 顶部标题（`AppBar.vue`）
-
-都统一加了 `singbox_` 前缀，避免菜单名和页头标题不一致。
-
-### 8.2 前端每 10 秒同时轮询两套数据
-
-入口：`temp_frontend/src/router/index.ts`
-
-非登录页会定时执行：
+进入已登录页面后，router 会定时执行：
 
 - `Data().loadData()`
 - `MihomoData().loadData()`
 
-所以两套 store 是并行常驻的，不是临时切换。
+也就是：**默认链和 Mihomo 链两套 store 会常驻并行刷新。**
 
-### 8.3 namespace 分流是前端核心
+因此很多页面虽只显示一套内容，但后台两套数据都可能在更新。
 
-入口：`temp_frontend/src/store/uiNamespace.ts`
+## 5.3 命名空间分流总开关：`temp_frontend/src/store/uiNamespace.ts`
+
+这是前端最关键的“共享页分流器”。
 
 它决定：
 
-- 使用哪个 store
-- 使用哪个 API endpoint
-- 订阅二维码 URL 前缀
-- 端口日志 localStorage key
-- 是否在 Inbounds 页显示 core 控制按钮
-- 使用哪套 core manager 元数据
+- 该页面使用哪个 store
+- 调哪个 API endpoint
+- 订阅二维码 URL 前缀是什么
+- 使用哪个 core manager 接口
+- 使用哪个运行配置路径显示文本
+- Inbounds 页是否显示 core 控制按钮
 
-当前 namespace 差异：
-
-默认：
+### 默认链 namespace 配置
 
 - `syncEndpoint = api/syncToSubManager`
 - `inboundIpsEndpoint = api/inbound-ips`
@@ -651,527 +627,1303 @@ node .\node_modules\vite\bin\vite.js build
 - `showCoreControlsOnInbounds = true`
 - core config path = `Promanager_data/core/singbox/config.json`
 
-Mihomo：
+### Mihomo namespace 配置
 
 - `syncEndpoint = api/mihomoSyncToSubManager`
 - `inboundIpsEndpoint = api/mihomo-inbound-ips`
 - `subscriptionPathPrefix = "mihomo/"`
 - `supportsSubscriptionQr = true`
 - `showCoreControlsOnInbounds = true`
-- core config path = `Promanager_data/core/server.yaml`
+- core config path = `Promanager_data/core/mihomo/server.yaml`
 
-注意：
+### 这意味着什么
 
-- 旧文档里“mihomo 不支持 subscription QR”已经过时。
-- 现在 `QrCode.vue` 会给 mihomo 也显示订阅二维码，只是 URL 带 `mihomo/` 前缀。
+- Mihomo 现在**支持订阅二维码**，只是链接前缀不同
+- `SingboxCore.vue` 虽然名字像 sing-box 专属，但实际上会根据 namespace 切换到 Mihomo 接口
+- 共享页面修改后，要先问自己：**默认链和 Mihomo 链会不会一起被影响？**
 
-### 8.4 `Mihomo*.vue` 只是薄包装
+## 5.4 两套 Store：`data.ts` 与 `mihomoData.ts`
 
-`MihomoInbounds.vue`、`MihomoClients.vue`、`MihomoOutbounds.vue`、`MihomoTls.vue`、`MihomoRules.vue`
+### 默认链 Store：`temp_frontend/src/store/modules/data.ts`
 
-本质上只是把：
+负责：
 
-- `namespace="mihomo"`
+- `api/load` 拉取默认链数据
+- `api/save` 保存默认链对象
+- 保存对象名通常是：
+  - `config`
+  - `clients`
+  - `tls`
+  - `inbounds`
+  - `outbounds`
+  - `outboundgroups`
+  - `suboutbounds`
+  - `subgroups`
+  - `services`
+  - `endpoints`
 
-传给共用页面：
+### Mihomo Store：`temp_frontend/src/store/modules/mihomoData.ts`
 
-- `Inbounds.vue`
-- `Clients.vue`
-- `Outbounds.vue`
-- `Tls.vue`
-- `Rules.vue`
+负责：
 
-真正的业务分流点还是：
+- `api/mihomo-load` 拉取 Mihomo 链数据
+- 保存时把前端对象名映射为：
+  - `mihomo_config`
+  - `mihomo_clients`
+  - `mihomo_tls`
+  - `mihomo_inbounds`
+  - `mihomo_outbounds`
+  - `mihomo_outboundgroups`
 
-- `uiNamespace.ts`
-- `data.ts`
-- `mihomoData.ts`
-- 共用页面里的 namespace 判断
+### 共享订阅管理数据要特别注意
 
-补充：
+`getMihomoData()` 虽然是 Mihomo 数据接口，但它仍会带回：
 
-- `MihomoDns.vue` 不是薄包装，它是独立页面，直接读写 `mihomo_config.dns` 相关字段。
+- `suboutbounds`
+- `subgroups`
 
-### 8.5 `SingboxCore.vue` 现在是通用 core 弹窗
+这说明：**Mihomo 页面并不是完全独立世界，订阅管理层仍有共享数据。**
 
-入口：`temp_frontend/src/layouts/modals/SingboxCore.vue`
+## 5.5 哪些 Mihomo 页面只是“薄包装”
 
-虽然文件名还叫 `SingboxCore.vue`，但它实际会根据 namespace 读：
+以下页面本质上只是把 `namespace="mihomo"` 传给共用页：
 
-- sing-box 的版本、下载、状态接口
-- 或 mihomo 的版本、下载、状态接口
-
-所以不要被文件名误导。
-
-### 8.6 sing-box 与 mihomo 的 core 控制入口现在都在 Inbounds 页
-
-- sing-box：`temp_frontend/src/views/Inbounds.vue`（默认 namespace）
-- mihomo：`temp_frontend/src/views/Inbounds.vue`（`namespace="mihomo"`）
-
-`temp_frontend/src/views/SubManager.vue` 现在只保留订阅管理相关 UI，不再承载 sing-box core 顶部控制区。
-
----
-
-## 9. 订阅、SubManager、同步链
-
-### 9.1 三套系统不要混为一谈
-
-系统 A：JSON 订阅扩展
-
-- 前端：`Settings.vue` + `SubJsonExt.vue` + `SubJsonExtLogic.ts`
-- 后端：`sub/jsonService.go`
-- 存储：`settings.subJsonExt`
-
-系统 B：Clash/Mihomo 订阅扩展
-
-- 前端：`Settings.vue` + `SubClashExt.vue` + `SubClashExtLogic.ts`
-- 后端：`sub/clashService.go`
-- 存储：`settings.subClashExt`
-
-当前订阅输出会按目标内核分别过滤协议：
-
-- `?format=json` 只保留 sing-box 支持的 outbounds；例如 `mieru` 不会进入 JSON 订阅
-- `?format=clash` 只保留 mihomo 可转换/可识别的 proxies；不支持协议不会进入 `proxies`
-
-系统 C：Mihomo 路由页
-
-- 前端：`Rules.vue(namespace="mihomo")`
-- 后端：`service/mihomo_config.go` + `service/mihomo_route_*`
-- 存储：`settings.mihomo_config`
-
-这三套不是同一条链。
-
-### 9.2 `Settings.vue` 保存前会先提交 UI 临时态
-
-入口：`temp_frontend/src/views/Settings.vue`
-
-保存前会先调用：
-
-- `commitCustomRuleRows()`
-- `commitDnsRouteRows()`
-- `commitClashRuleRows()`
-- `commitClashDnsPolicyRows()`
-
-所以 `SubJsonExtLogic.ts` / `SubClashExtLogic.ts` 不是纯展示逻辑，而是最终保存前的结构整理器。
-
-### 9.3 客户端同步到 SubManager 分两套
-
-默认链：
-
-- 前端按钮：`Clients.vue`
-- 后端：`service/syncService.go`
-- `source_type = "client"`
-
-Mihomo 链：
-
-- 前端按钮：`Clients.vue(namespace="mihomo")`
-- 后端：`service/mihomo_sync.go`
-- `source_type = "mihomo_client"`
-- 同步出的 `suboutbound tag` 会加 `mihomo_` 前缀
-
-### 9.4 `sub_json` 文件名现在有冲突保护
-
-入口：`service/sub_json_file_guard.go`
-
-会检查三类名字归一化后是否冲突：
-
-- client subscription 文件名
-- subgroup 文件名
-- suboutbound 文件名
+- `MihomoInbounds.vue` -> `Inbounds.vue`
+- `MihomoClients.vue` -> `Clients.vue`
+- `MihomoOutbounds.vue` -> `Outbounds.vue`
+- `MihomoTls.vue` -> `Tls.vue`
+- `MihomoRules.vue` -> `Rules.vue`
 
 因此：
 
-- 改 subgroup 名或 suboutbound tag 时，如果保存失败，要先怀疑文件名冲突而不是渲染器本身。
+- 改 `Inbounds.vue`，默认链与 Mihomo 链都会受影响
+- 改 `Clients.vue`，默认链与 Mihomo 链都会受影响
+- 改 `Outbounds.vue`，默认链与 Mihomo 链都会受影响
+- 改 `Tls.vue`，默认链与 Mihomo 链都会受影响
+- 改 `Rules.vue`，默认链与 Mihomo 链都会受影响
 
-### 9.5 SubGroup 自动更新已经是正式链路
+### 例外：`MihomoDns.vue`
 
-入口：
+`MihomoDns.vue` 是独立页面，不是简单包装页。它直接围绕 `mihomo_config.dns` 相关字段工作。
 
-- 设置：`service/subgroups_auto_update.go`
-- API：`api/subgroup-auto-update-info`、`api/subgroup-auto-update-settings`
-- Cron：`NewSubGroupAutoUpdateJob()`
+### 共享页面 / 命名空间映射速查
 
-行为：
+| 页面 | 默认链实现 | Mihomo 链实现 | 说明 |
+| --- | --- | --- | --- |
+| Inbounds | `views/Inbounds.vue` | `views/MihomoInbounds.vue` -> 同一个 `Inbounds.vue` | 最典型的共享页 |
+| Clients | `views/Clients.vue` | `views/MihomoClients.vue` -> 同一个 `Clients.vue` | 客户端管理共享 |
+| Outbounds | `views/Outbounds.vue` | `views/MihomoOutbounds.vue` -> 同一个 `Outbounds.vue` | 出站管理共享 |
+| Tls | `views/Tls.vue` | `views/MihomoTls.vue` -> 同一个 `Tls.vue` | TLS 页面共享 |
+| Rules | `views/Rules.vue` | `views/MihomoRules.vue` -> 同一个 `Rules.vue` | 路由页共享 |
+| Dns | `views/Dns.vue` | `views/MihomoDns.vue` | Mihomo DNS 是独立实现 |
 
-- 支持 JSON 与 Clash 两种来源
-- 自动重试
-- 会记录失败来源与错误
-- JSON 来源的有效节点会按原始 JSON 节点保存到 `suboutbounds.RawOutbound`
-- Clash 来源的有效节点会按原始 proxy YAML 文本保存到 `suboutbounds.RawClashYAML`
-- 输出 Clash 订阅时会优先直接回放 `RawClashYAML`，避免重新 `yaml.Marshal` 改写 proxy 文本
+### 菜单与页头标题还有一层“默认链前缀”规则
 
----
+左侧菜单和页头并不只是直接显示路由名：
 
-## 10. 证书与面板 HTTPS 链
+- `temp_frontend/src/layouts/default/Drawer.vue` 会给默认链页面标题加 `singbox_` 前缀
+- `temp_frontend/src/layouts/default/AppBar.vue` 也会给默认链页头标题加 `singbox_` 前缀
+- 默认链中的 `services` / `endpoints` 现在在 UI 里是暂时隐藏的，但路由和 API 仍然存在
 
-### 10.1 panel/sub 自签证书已分离
+这意味着：
 
-入口：
+- 路由存在 ≠ 菜单可见
+- 页面标题 ≠ 路由原名
+- 共享页改动时，别只看一个 view，菜单和页头也可能要联动
 
-- `service/panel_self_signed_cert.go`
-- `service/panel_self_signed_cert_paths.go`
+### 再补一个容易漏掉的点：首页也有两套 core 状态入口
 
-现在会分别为：
+`temp_frontend/src/components/Main.vue` 首页卡片里，会同时显示：
 
-- panel
-- sub
+- Sing-Box 运行状态
+- Mihomo 运行状态
 
-生成独立证书路径。
+并且都可以直接执行启动 / 停止 / 重启。
 
-### 10.2 启动后有独立证书管理器
+所以 core 相关改动不要只查 `Inbounds.vue` 和 `SingboxCore.vue`，还要联查：
 
-入口：`app/panel_cert_manager.go`
+- `temp_frontend/src/components/Main.vue`
 
-职责：
+## 5.6 设置页不是“小设置”，而是系统能力总入口
 
-- 检查 web/sub 当前在用证书
-- 热重载证书
-- 在自签证书临近过期时续签
-- 在受信任证书过期且超过 grace window 时 fallback 到自签
-- 整个过程不触碰 sing-box / mihomo core 生命周期
+`temp_frontend/src/views/Settings.vue` 当前不仅有面板基础设置，还挂了很多大功能页签：
 
-### 10.3 旧共用证书路径会自动拆分
+- 面板接口设置
+- 订阅设置
+- JSON 订阅扩展
+- Clash 订阅扩展
+- 流量总览
+- 防火墙
+- 端口转发
+- 系统优化
+- 证书管理
+- 反向代理
+- 内核包管理
+- 系统监控
 
-入口：`service/SplitLegacySharedPanelSelfSignedCertificate(...)`
+所以当用户说“改设置页”时，先问清楚是：
 
-所以看到旧路径：
+- 基础面板设置
+- 订阅设置
+- 还是某个系统功能子模块
 
-- `Promanager_data/cert/fullchain.pem`
-- `Promanager_data/cert/privkey.pem`
+### 设置页保存前不是原样直传
 
-不要再把它当当前标准结构。
+`Settings.vue` 保存前会先做几件整理动作：
 
-### 10.4 证书列表现在是“统一证书仓库”（SQLite）
+- 端口空值 / 非法值会先按默认值归一化
+  - `webPort -> 8888`
+  - `subPort -> 22780`
+- JSON 订阅页会先提交临时编辑行：
+  - `commitCustomRuleRows()`
+  - `commitDnsRouteRows()`
+- Clash 订阅页会先提交临时编辑行：
+  - `commitClashRuleRows()`
+  - `commitClashDnsPolicyRows()`
+- 证书绑定字段会在 payload 中主动删除，避免旧 UI 状态把当前证书分配回滚掉
 
-入口：
-
-- 模型：`database/model/certificate_record.go`
-- 迁移：`database/db.go`（`AutoMigrate(&model.CertificateRecord{})`）
-- 统一服务：`service/certificate_inventory.go`
-- ACME 接入：`service/acme_service.go`
-- 自签/导入接入：`service/panel_sqlite_cert_store.go`、`service/setting.go`、`service/config.go`、`app/app.go`
-- 前端页：`temp_frontend/src/components/SettingsAcmeManage.vue`
-- 查看证书 API：`api/apiService.go: ViewAcmeCertificate` + `api/apiHandler.go: acme-view`
-
-当前行为：
-
-- 证书列表不再只等于 ACME 表，而是统一读取 `certificate_records`。
-- 统一仓库里的数据库主键 `id` 只用于内部接口；列表另外使用永久显示 `displayId`。
-- `displayId` 从 `1` 开始分配，删除后会优先复用当前最小空缺编号。
-- `displayId` 只保存在 SQLite 元数据里，不会写回 PEM、证书正文、推送目录或应用证书。
-- 列表排序使用 `list_order_at DESC, id DESC`，新证书在上，旧证书在下，和 `displayId` 大小无关。
-- 来源类型通过 `sourceType` 区分：
-  - `acme`
-  - `self_signed`（SQLite 自签）
-  - `imported`（设置页 `webCertFile/subCertFile` 导入路径）
-- 列表删除是“删仓库记录”为主：
-  - 对 `acme` 记录：同时删除 `acme_certificates` 对应记录
-  - 对 `self_signed/imported`：仅删 `certificate_records` 记录
-  - 已推送目录内的 `cert.pem/key.pem/fullchain.pem/chain.pem` 不会被删除
-- 不再存在“默认推送目录”全局回填逻辑：
-  - 签发页/自签页的 `pushDir` 仅在用户显式填写时生效
-  - 证书列表“推送到目录”仅使用证书已有 `pushDir` 或用户手动输入的目录
-  - “查看证书”弹窗统一展示：
-    - 上：`fullchain.pem` 文本
-    - 下：`key.pem` 文本
-- 续签/强制续签/应用到面板/应用到订阅仅对 `acme` 来源可用，前后端双重限制。
-- ACME 新签发在 `recordID == 0` 时必须新建 `acme_certificates` 源记录，不再按 `main_domain + use_ecc` 复用旧行；这解决了同一 IP 重复签发只显示一条的问题。
-
-同步链路：
-
-- ACME 签发/续签/推送/应用后会 upsert 到统一仓库。
-- Panel 自签写入 SQLite 时会 upsert 到统一仓库。
-- 路径导入证书在读取成功时 upsert，路径清空/无效时会清理对应 imported 记录。
-- 应用启动时会做一次“从 ACME 表 + panel sqlite + settings 路径”到统一仓库的补齐同步。
-- 每次 ACME overview 同步、以及应用启动同步后，都会补做一次 `displayId/list_order_at` 修复。
-- 如果 ACME 源表里还有证书、但统一仓库缺行，overview 同步会自动补回并显示。
-- 如果统一仓库里的证书记录缺少 `displayId`，会自动补绑后显示，避免“隐藏证书”长期滞留在库里。
+因此“设置页看起来没改这个字段，为什么保存后结果变了”时，先别急着怀疑后端，前端保存前本身就有一层整理逻辑。
 
 ---
 
-## 11. Cron、nftables、端口跳跃、Core 更新
+## 6. 两条配置链：默认链（sing-box）与 Mihomo 链
 
-### 11.1 Cron 统一入口
+## 6.1 对照表
 
-入口：`cronjob/cronJob.go`
+| 维度 | 默认链（sing-box） | Mihomo 链 |
+| --- | --- | --- |
+| 前端 store | `data.ts` | `mihomoData.ts` |
+| 数据加载接口 | `api/load` | `api/mihomo-load` |
+| 保存对象名 | `config` `clients` `tls` `inbounds` `outbounds` `outboundgroups` `suboutbounds` `subgroups` `services` `endpoints` | `mihomo_config` `mihomo_clients` `mihomo_tls` `mihomo_inbounds` `mihomo_outbounds` `mihomo_outboundgroups` |
+| 前端分流开关 | `uiNamespace.ts` 默认配置 | `uiNamespace.ts` mihomo 配置 |
+| 主配置生成器 | `service/promanager.go` | `service/mihomo_manager.go` |
+| 运行配置路径 | `Promanager_data/core/singbox/config.json` | `Promanager_data/core/mihomo/server.yaml` |
+| 额外生成物 | `Inbound/*.json` `outbound/*.json` `sub_json/*.json` | `Promanager_data/core/mihomo_inbounds_meta.json` |
+| Core 管理器 | `service/coreManager.go` | `service/mihomo_core_manager.go` |
+| 订阅 URL 前缀 | `""` | `"mihomo/"` |
+| Inbounds 页 core 控制 | 显示 | 显示 |
 
-当前注册：
+## 6.2 默认链（sing-box）要记住的事实
 
-- 启动即执行一次：`TLSPathSyncJob`（goroutine 直接 `Run()`）
-- 每 5 秒：`NftCoreSyncJob`
-- 每 5 秒：`MihomoNftCoreSyncJob`
-- 每 10 秒：`StatsJob`
-- 每 10 秒：`PortHopRefreshJob`（仅 traffic 关闭时单独跑）
-- 每 10 秒：`MihomoPortHopRefreshJob`
-- 每 1 分钟：`DepleteJob`
-- 每天：`DelStatsJob`（traffic 开启时）
-- 每 1 分钟：`CheckCoreJob`
-- 每 1 分钟：`CheckMihomoCoreJob`
-- 每 1 分钟：`SubGroupAutoUpdateJob`
-- 每 30 秒：`TLSPathSyncJob`
+- 数据源不只是 `settings.config`
+- `ConfigService.GetConfig()` 会把：
+  - `settings.config`
+  - inbounds
+  - outbounds
+  - services
+  - endpoints
+  重新拼成完整 sing-box 配置对象
+- 真正的配置生成逻辑在 `service/promanager.go`
+- 真正的 core 下载 / 运行控制在 `service/coreManager.go`
 
-### 11.2 nftables 是双链并行
+## 6.3 Mihomo 链要记住的事实
 
-- 默认链：`service/nftables*.go`
-- Mihomo 链：`service/mihomo_nftables.go`
-- 面板防火墙链：`service/firewall.go` + `service/firewall_scan.go`
+- 数据源是 `settings.mihomo_config` + Mihomo 各对象表
+- 最终不是生成 JSON，而是生成 `server.yaml`
+- 真实主生成器是 `service/mihomo_manager.go`
+- 真实运行控制是 `service/mihomo_core_manager.go`
+- 运行配置真实路径是：
+  - `Promanager_data/core/mihomo/server.yaml`
+- 额外元数据路径是：
+  - `Promanager_data/core/mihomo_inbounds_meta.json`
 
-保存入站时不会“永远直接写死规则”，而是：
+**不要再把 Mihomo 的权威运行配置路径写成旧式 `Promanager_data/core/server.yaml`。**
 
-- 先写状态
-- 由保存后处理和定时任务按 core 是否运行来同步实际规则
+## 6.4 Mihomo 额外要注意的并行限制
 
-面板防火墙补充现实：
+Mihomo 链不是“默认链的 YAML 皮肤”，它还有自己的前端限制与后端裁剪逻辑：
 
-- 防火墙不是挂在现有 `inet kwor` 统计表里，而是单独维护自己的 `inet kwor_firewall` 表
-- 真正的开关、规则渲染、默认 SSH / 面板 / 订阅保留规则，都在 `service/firewall.go`
-- `service/firewall_nftables_install.go` 负责 Linux 下 `nft` 缺失检测、发行版/包管理器探测、`manualCommands/reason` 状态建模，以及自动安装命令选择
-- 对“外部程序自己写进 nftables 的放行规则”的扫描、展示与可选清理，在 `service/firewall_scan.go`
-- 外部扫描结果默认不参与面板自己的放行链；真正下发到 `inet kwor_firewall` 的只有系统保留规则、面板手工规则以及 GeoIP 规则
-- 定时同步入口是 `cronjob/firewallSyncJob.go`
-- 设置页 UI 入口在 `temp_frontend/src/components/SettingsFirewallManage.vue`
-- `api/firewall-overview` 现在会额外返回 `nftables` 状态对象；`api/firewall-nftables-install` 是防火墙页点击“下载 nftables”后的安装入口
-- 防火墙页顶部总开关左侧现在会在“Linux 且未检测到 `nft` 二进制”时显示“下载 nftables”按钮；安装成功后按钮会立即隐藏
-- 自动安装现在会在安装 `nftables` 包后尝试 `enable --now nftables`（或 fallback 到 `service nftables start`）；即使服务启动分支未命中，真正的规则接管仍由 `service/firewall.go` 与 `cronjob/firewallSyncJob.go` 继续完成
-- 权限策略固定为：`kwor` 进程本身是 `root` 就直接执行；非 `root` 且存在 `sudo` 时走 `sudo -n` 无交互提权；没有 `sudo`、包管理器不支持、或命中 `rpm-ostree` / `transactional-update` 这类事务式系统时，只返回明确原因和可复制的手动命令
-- 当前实现重点是“入站放行”场景，默认会额外保留已建立连接、回环，以及 ICMP / ICMPv6 的必要控制报文；`ping` 请求需要显式 ICMP 规则
-- 面板防火墙生效方式是直接执行 `nft` 命令批量重建运行时表，规则立即生效，不需要重启 `nftables` 服务；只有改系统持久化配置时才涉及 reload / restart
-- GeoIP 来源识别是独立于普通规则表的第二套规则链
-- GeoIP 前端来源选项在 `temp_frontend/src/components/SettingsFirewallGeoOptions.ts`
-- GeoIP 下载、缓存、更新周期和热更新入口在 `service/firewall_geoip.go`
-- GeoIP 文件解析和 nft 分组渲染在 `service/firewall_geoip_parser.go`、`service/firewall_geoip_nft.go`
-- GeoIP 缓存目录是 `Promanager_data/geoip`
-- 默认来源顺序是“先 JSON，再 Clash，命中第一个可用源即停止”；只有用户显式填写完整 URL 时才会多源合并
-- 即使防火墙总开关关闭，GeoIP 缓存仍会按更新周期继续刷新；真正开启后才会把最新缓存热更新进 nftables
+- 前端某些 listener / outbound 类型在 Mihomo 语境下是受限的
+- 后端会对规则、listener、outbound 做裁剪 / 转换 / 回退
+- 不是所有 UI 上能建出来的对象，最后都能原样进入 `server.yaml`
 
-### 11.3 端口占用检查现在前后端都接上了
+所以改 Mihomo 时，不要只盯一个页面；要继续往后端转换层追：
 
-后端入口：`api/portOccupancy` + `service/port_check.go`
-
-前端入口：
-
-- `temp_frontend/src/layouts/modals/Inbound.vue`
-- `temp_frontend/src/views/Inbounds.vue`
-- `temp_frontend/src/plugins/portCheck`
-
-当前行为：
-
-- `listen_port` blur 检查单端口占用
-- `port_hop_range` blur 检查 UDP 范围占用
-- Inbounds 页还会定时监控端口跳跃范围
-- localStorage key 按 namespace 区分
-
-### 11.4 两套 core manager 都带自动检查更新
-
-- sing-box：`service/coreManager.go`
-- mihomo：`service/mihomo_core_manager.go`
-- Linux 子服务会在 `ExecStartPre` 通过 `kwor materialize-core-config <singbox|mihomo>` 刷新运行配置，避免 SQLite 托管配置与 systemd 独立启动链脱节。sing-box 的 `core/singbox/config.json` 是持久落盘文件；mihomo 的 `core/mihomo/server.yaml` 仍按临时实体化方式清理。
-
-前端统一用：
-
-- `SingboxCore.vue`
-
-但具体接口由 `uiNamespace.ts` 切换。
+- `service/mihomo_config.go`
+- `service/mihomo_proxy_convert.go`
+- `service/mihomo_route_render.go`
+- `database/model/mihomo.go`
 
 ---
 
-## 12. 默认值与环境变量
+## 7. 保存链与生成链：为什么改一个对象会重写很多文件
 
-### 12.1 后端权威默认值
+## 7.1 总入口：`/api/save`
 
-入口：`service/setting.go`
+保存总链路是：
 
-重要默认值：
+`前端 store.save()`
+→ `api/save`
+→ `api/apiService.go`
+→ `service/config.go: ConfigService.Save()`
+
+`ConfigService.Save()` 不只是“存数据库”，它还负责：
+
+1. 开事务保存对象
+2. 提交事务
+3. 更新变更时间 / 变更记录
+4. 跑 managed runtime hooks
+5. 触发运行配置重生成
+6. 应用 nftables / TLS / 自动同步等后置动作
+
+它是全项目最需要建立全局意识的文件之一。
+
+## 7.2 默认链保存后的常见副作用
+
+| 保存对象 | 常见副作用 |
+| --- | --- |
+| `inbounds` | 重生成入站文件、重生成 sing-box 主配置、重生成订阅 JSON、可能应用 nft 动作 |
+| `clients` | 重生成入站文件、主配置、订阅 JSON，并同步默认链自动托管客户端 |
+| `tls` | 重生成入站文件、主配置、订阅 JSON |
+| `outbounds` | 重生成出站文件、重生成主配置 |
+| `outboundgroups` | 重生成出站文件、重生成主配置 |
+| `services` `endpoints` | 重生成主配置 |
+| `suboutbounds` | 重生成订阅 JSON / 相关共享订阅文件 |
+| `subgroups` | 更新组订阅文件 |
+| `config` | 重生成默认链整套运行文件 |
+| `settings` | 重生成默认链整套运行文件，并应用 panel/sub TLS 运行时设置、防火墙同步等 |
+
+## 7.3 Mihomo 保存后的常见副作用
+
+当保存下面任一对象时：
+
+- `mihomo_inbounds`
+- `mihomo_outbounds`
+- `mihomo_outboundgroups`
+- `mihomo_clients`
+- `mihomo_tls`
+- `mihomo_config`
+
+都会触发：
+
+- `service.NewMihomoManagerService().RegenerateServerConfig()`
+- 也就是重生成：
+  - `Promanager_data/core/mihomo/server.yaml`
+  - `Promanager_data/core/mihomo_inbounds_meta.json`
+
+## 7.4 默认链生成器：`service/promanager.go`
+
+ProManager 当前最重要的职责是：
+
+- 生成每个入站的 JSON 文件
+- 生成每个出站的 JSON 文件
+- 生成默认链完整 core 配置
+- 生成订阅 JSON 文件
+
+典型输出：
+
+- `Promanager_data/Inbound/*.json`
+- `Promanager_data/outbound/*.json`
+- `Promanager_data/core/singbox/config.json`
+- `Promanager_data/sub_json/*.json`
+
+## 7.5 Mihomo 生成器：`service/mihomo_manager.go`
+
+Mihomo 当前最重要的职责是：
+
+- 读取 `mihomo_config`
+- 读取 Mihomo 出入站 / 组 / 客户端数据
+- 把结构化对象转换为 Mihomo 可接受的 YAML 文档
+- 落盘 `server.yaml`
+- 生成入站元数据文件
+
+因此改 Mihomo 路由、代理组、出站协议支持时，**一定要继续追到 `service/mihomo_manager.go`、`service/mihomo_proxy_convert.go`、`service/mihomo_route_render.go`。**
+
+## 7.6 `sub_json` 文件名冲突保护是正式链路，不是边角料
+
+`sub_json` 不是随便往目录里丢文件就行。当前它有正式的冲突保护：
+
+- client subscription 文件名
+- subgroup 文件名
+- suboutbound tag
+
+三者会经过规范化后相互校验。
+
+这意味着：
+
+- 如果你保存 subgroup 或 suboutbound 失败，先怀疑“文件名冲突”
+- 不要先怀疑渲染器本身坏了
+- 不要以为改一个名字只影响一张表，它可能会影响整个 `sub_json` 目录
+
+### 7.7 `Changes` 变更记录不是装饰品
+
+`service/config.go` 在保存后会写入 `model.Changes`，前端 `loadData()` / `loadMihomoData()` 又会通过 `lu` 去增量判断是否需要重新拉取。
+
+所以如果你看到“前端明明轮询了，但页面数据没按预期刷新”，要联想：
+
+- `LastUpdate`
+- `model.Changes`
+- `ConfigService.CheckChanges()`
+- 前端 `lu` 参数
+
+这一套是增量刷新机制的核心。
+
+---
+
+## 8. 运行路径与生成物：不要把“仓库里的文件路径”当成“程序真正运行路径”
+
+## 8.1 数据根目录规则
+
+`config/config.go` 中：
+
+- `GetDataDir() = <binary_dir>/Promanager_data`
+
+也就是说：
+
+- 运行期数据目录是跟着**可执行文件所在目录**走的
+- 不是固定跟着仓库根目录走
+
+### 这意味着什么
+
+- 如果你在仓库根目录直接运行 `kwor.exe`，那运行期目录可能出现在仓库旁边
+- 如果你把二进制发布到别的目录，那 `Promanager_data` 也会跟着去那个目录
+- 文档里写运行路径时，优先用“相对二进制”的表达法，而不是写死成仓库内路径
+
+## 8.2 数据库路径规则
+
+`config/config.go` 中：
+
+- `GetDBPath() = <data_dir>/db/kwor.db`
+
+即：
+
+- `<binary_dir>/Promanager_data/db/kwor.db`
+
+另外它还会尝试把旧的 `./db/kwor.db` 迁移到新位置。
+
+## 8.3 Core 目录与配置路径规则
+
+`service/core_layout.go` 中：
+
+- sing-box core 目录：`Promanager_data/core/singbox/`
+- sing-box 配置路径：`Promanager_data/core/singbox/config.json`
+- Mihomo core 目录：`Promanager_data/core/mihomo/`
+- Mihomo 配置路径：`Promanager_data/core/mihomo/server.yaml`
+- Mihomo 入站元数据：`Promanager_data/core/mihomo_inbounds_meta.json`
+
+## 8.4 订阅最终 URL 不是简单拼字符串
+
+`service/setting.go` 里的 `GetFinalSubURI(host)` 会按下面优先级决定订阅 URL：
+
+1. 如果手工设置了 `subURI`，直接用它
+2. 否则根据：
+   - `subDomain`
+   - `subPort`
+   - `subPath`
+   - 是否给订阅服务分配了证书（决定 `http` 还是 `https`）
+   来自动拼接
+
+所以改订阅 URL 行为时，不要只看前端展示字段，后端还有最终拼装逻辑。
+
+## 8.5 系统监控是独立数据库，不在主库里
+
+除了主库 `kwor.db` 外，系统监控还会使用独立数据库：
+
+- `monitor.db`
+
+真实路径由 `config.GetSystemMonitorDBPath()` 决定，通常也在：
+
+- `Promanager_data/db/monitor.db`
+
+### 这意味着什么
+
+- 监控历史清空，不等于主业务数据清空
+- `monitor.db` 体积变化，不代表 `kwor.db` 一定有问题
+- 如果用户说“数据库占用很大”，要先问清楚是：
+  - 主库 `kwor.db`
+  - 还是监控库 `monitor.db`
+
+---
+
+## 9. 构建、嵌入与发布链
+
+## 9.1 前端脚本：`temp_frontend/package.json`
+
+当前前端脚本最重要的事实：
+
+- `dev`：先跑 `scripts/sync-version.mjs`，再起 Vite
+- `build`：先跑 `scripts/sync-version.mjs`，再 `vue-tsc --noEmit`，再 `vite build`
+- `preview`：先同步版本
+- `lint`：先同步版本
+
+也就是说：**前端 build/dev/lint 都会先同步版本号。**
+
+## 9.2 版本同步脚本：`scripts/sync-version.mjs`
+
+这个脚本会把：
+
+- `config/version`
+
+同步到：
+
+- `temp_frontend/package.json`
+- `temp_frontend/package-lock.json`
+
+所以如果你改版本号后发现前端包版本也变了，不是副作用 bug，而是脚本的设计行为。
+
+## 9.3 Vite 开发环境要注意：2095 不是面板默认端口
+
+`temp_frontend/vite.config.mts` 当前重要设置：
+
+- dev server 端口：`3000`
+- 代理：`/app/api -> http://localhost:2095`
+
+这只是 **Vite 联调代理目标**，不是程序运行时默认面板端口。
+
+真正的面板默认端口来自 `service/setting.go`：
 
 - `webPort = 8888`
-- `webPath = /app/`
-- `subPort = 22780`
-- `subPath = /sub/`
-- `trafficAge = 30`
-- `timeLocation = Asia/Tehran`
-- `sessionMaxAge = 0`
-- `subUpdates = 12`
-- `serverTlsStoreEnabled = true`
-- `serverTlsStore = chrome`
-- `clientTlsStoreEnabled = true`
-- `clientTlsStore = chrome`
-- `mihomo_config` 初始是最小 route 模板
 
-### 12.2 当前运行期主要环境变量
+因此：
 
-入口：`config/config.go`
+- `2095` 是开发代理目标
+- `8888` 是默认运行面板端口
 
-当前主代码直接读取：
+这两个数字不是一回事。
 
-- `KWOR_LOG_LEVEL`
-- `KWOR_DEBUG`
-- `KWOR_DB_FOLDER`
+## 9.4 前端嵌入链
 
-额外说明：
+前端构建真正的嵌入链是：
 
-- `KWOR_BIN_FOLDER` 只在旧迁移逻辑 `cmd/migration/1_2.go` 中出现，不是当前正常运行主链的一部分。
+`temp_frontend/src`（源码）
+→ `temp_frontend/dist`（Vite 打包）
+→ `web/html`（复制给 Go 内嵌）
+→ `web/web.go` 的 `embed`（编进二进制）
+
+### 结论
+
+- 改前端源码：改 `temp_frontend/src/*`
+- 不要直接改：
+  - `temp_frontend/dist/*`
+  - `web/html/*`
+
+## 9.5 Windows 本地开发命令约定
+
+本地 Windows 例子统一按下面写：
+
+```bat
+cd temp_frontend
+npm.cmd run build
+```
+
+如需仅验证前端类型检查与构建，也应优先按当前项目脚本语义执行，不要自行切成 PowerShell 专属写法。
+
+## 9.6 构建脚本职责分工
+
+### 根目录 `build.bat`
+
+职责：**在 Windows 上构建 Linux amd64 / arm64 发布产物**，输出到 `releases/`。
+
+它不是“本地 Windows 运行入口”。
+
+### `build.sh`
+
+职责：构建 Linux amd64 的 `kwor`。
+
+### `windows/kwor-windows-build.bat`
+
+职责：**构建本地 Windows `kwor.exe`**。
+
+### `windows/install-windows.bat`
+
+职责：Windows 安装、服务包装、目录初始化、管理员配置等。
 
 ---
 
-## 13. 改需求时的最短路径
+## 10. 按任务找文件：最短定位路径
 
-### 场景 A：改默认链的保存/生成行为
+## 10.1 改“面板路径 / 面板端口 / 登录跳转 / 基础 URL”
 
-1. `api/apiService.go`
-2. `service/config.go`
-3. `service/promanager.go`
-4. 如涉及 core 运行，再看 `service/coreManager.go`
+先看：
 
-### 场景 B：改 mihomo 的 `server.yaml` 输出
+1. `service/setting.go`
+2. `web/web.go`
+3. `temp_frontend/index.html`
+4. `temp_frontend/src/router/index.ts`
+5. `temp_frontend/vite.config.mts`
 
-1. `service/mihomo_config.go`
-2. `service/mihomo_manager.go`
+还要联查：
+
+- `temp_frontend/src/plugins/httputil.ts`
+- `cmd/cmd.go`（首次启动 / `setting` 命令）
+
+## 10.2 改“设置页保存后没生效 / 保存后跳转异常 / 保存后被还原”
+
+先看：
+
+1. `temp_frontend/src/views/Settings.vue`
+2. `api/apiService.go`
+3. `service/config.go`
+4. `service/setting.go`
+
+重点留意：
+
+- 前端保存前会先归一化端口默认值
+- JSON / Clash 订阅页有自己的“提交临时行”步骤
+- payload 会主动删除证书绑定字段
+- 从 HTTP 切到 HTTPS 时，保存成功后前端可能主动跳转
+
+这类问题经常是“前端保存整理 + 后端保存副作用 + 保存后跳转”三者叠加，不要只盯一个 POST 请求。
+
+## 10.3 改“订阅路径 / 订阅端口 / 订阅链接 / 订阅格式输出”
+
+先看：
+
+1. `service/setting.go`
+2. `sub/sub.go`
+3. `sub/subHandler.go`
+4. `sub/jsonService.go`
+5. `sub/clashService.go`
+6. `temp_frontend/src/views/Settings.vue`
+
+## 10.3 改“API 字段 / 保存行为 / 某个 object 名”
+
+先看：
+
+1. `api/apiHandler.go`
+2. `api/apiService.go`
+3. `service/config.go`
+4. `temp_frontend/src/store/modules/data.ts`
+5. `temp_frontend/src/store/modules/mihomoData.ts`
+6. `temp_frontend/src/store/uiNamespace.ts`
+
+## 10.4 改“默认链 sing-box 运行配置输出”
+
+先看：
+
+1. `service/config.go`
+2. `service/promanager.go`
+3. `service/core_layout.go`
+4. `service/coreManager.go`
+
+## 10.5 改“Mihomo 的 server.yaml 输出”
+
+先看：
+
+1. `service/mihomo_manager.go`
+2. `service/mihomo_config.go`
 3. `service/mihomo_proxy_convert.go`
 4. `service/mihomo_route_render.go`
 5. `database/model/mihomo.go`
+6. `service/mihomo_core_manager.go`
 
-### 场景 C：改 mihomo 路由编辑器行为
+## 10.6 改“共享页面（Inbounds / Outbounds / Rules / Tls / Clients）”
 
-1. `temp_frontend/src/views/Rules.vue`
-2. `temp_frontend/src/layouts/modals/Rule.vue`
-3. `temp_frontend/src/layouts/modals/Ruleset.vue`
-4. `temp_frontend/src/types/rules.ts`
-5. `service/mihomo_route_sanitize.go`
-6. `service/mihomo_route_render.go`
+先看：
 
-### 场景 D：改 TLS 页面行为
-
-1. `temp_frontend/src/views/Tls.vue`
-2. `temp_frontend/src/types/tls.ts`
-3. 默认链看 `service/tls.go`
-4. mihomo 链看 `service/mihomo_tls.go`
-5. 模型清洗看 `database/model/mihomo.go`
-
-### 场景 E：某个客户端同步到 SubManager 不对
-
-1. `temp_frontend/src/views/Clients.vue`
-2. 默认链看 `service/syncService.go`
-3. Mihomo 链看 `service/mihomo_sync.go`
-4. 继续看 `suboutbounds` / `subgroups` / `sub_json_file_guard.go`
-
-### 场景 F：core 按钮、下载、版本列表不对
-
-1. `temp_frontend/src/layouts/modals/SingboxCore.vue`
+1. `temp_frontend/src/views/Inbounds.vue` / `Outbounds.vue` / `Rules.vue` / `Tls.vue` / `Clients.vue`
 2. `temp_frontend/src/store/uiNamespace.ts`
-3. 默认链看 `service/coreManager.go`
-4. Mihomo 链看 `service/mihomo_core_manager.go`
+3. `temp_frontend/src/store/modules/data.ts`
+4. `temp_frontend/src/store/modules/mihomoData.ts`
+5. 对应 `temp_frontend/src/views/Mihomo*.vue`
 
-### 场景 G：订阅输出不对
+先确认它是不是共用页面，再决定改动范围。
 
-1. `sub/subHandler.go`
-2. `sub/jsonService.go`
-3. `sub/clashService.go`
-4. `service/promanager.go`
-5. `service/subgroups_auto_update.go`（如果是自动拉取来源）
+## 10.7 改“版本号 / 首页显示版本 / 前端版本同步”
 
-### 场景 H：证书热更新、自签、面板 HTTPS 不对
+先看：
 
-1. `app/panel_cert_manager.go`
-2. `service/panel_self_signed_cert.go`
-3. `service/panel_self_signed_cert_paths.go`
-4. `web/web.go`
-5. `sub/sub.go`
+1. `config/version`
+2. `config/config.go`
+3. `service/server.go`
+4. `temp_frontend/src/components/Main.vue`
+5. `scripts/sync-version.mjs`
+6. `temp_frontend/package.json`
 
-### 场景 I：证书列表、查看证书、统一仓库不对
+## 10.8 改“证书 / HTTPS / Panel/Sub TLS”
 
-1. `database/model/certificate_record.go`
-2. `service/certificate_inventory.go`
-3. `service/acme_service.go`
+先看：
+
+1. `web/web.go`
+2. `sub/sub.go`
+3. `app/app.go`
 4. `service/panel_sqlite_cert_store.go`
-5. `service/setting.go`（`SyncPanelImportedCertificatesToInventory`）
-6. `service/config.go`（settings 保存后的 post-commit hook）
-7. `api/apiService.go`（`acme-view`）
+5. `service/panel_self_signed_cert_paths.go`
+6. `service/acme_service.go`
+7. `service/certificate_inventory.go`
 8. `temp_frontend/src/components/SettingsAcmeManage.vue`
 
----
+## 10.9 改“防火墙 / 端口转发 / 反向代理”
 
-## 14. 高风险坑位（AI 必看）
+先看：
 
-1. 不要直接改 `web/html/*`
-- 这是构建产物，源代码在 `temp_frontend/src/*`
+1. `service/firewall.go`
+2. `service/port_forward.go`
+3. `service/reverse_proxy.go`
+4. `cronjob/firewallSyncJob.go`
+5. `cronjob/portForwardSyncJob.go`
+6. `cronjob/reverseProxySyncJob.go`
+7. `temp_frontend/src/views/Settings.vue`
+8. `temp_frontend/src/components/SettingsFirewallManage.vue`
+9. `temp_frontend/src/components/SettingsPortForwardManage.vue`
+10. `temp_frontend/src/components/SettingsReverseProxyManage.vue`
 
-2. 不要把 `Promanager_data/core/singbox/config.json` 当手写源文件
-- 它会被 `ProManagerService` 重写
+## 10.11 改“二维码 / 订阅导入链接 / 为什么 Mihomo 也会显示订阅二维码”
 
-3. 不要把 `Promanager_data/core/server.yaml` 当手写源文件
-- 它会被 `MihomoManagerService.RegenerateServerConfig()` 重写
+先看：
 
-4. 不要把 `frontend/` 当当前本地主前端
-- 当前构建脚本实际用的是 `temp_frontend/`
+1. `temp_frontend/src/layouts/modals/QrCode.vue`
+2. `temp_frontend/src/store/uiNamespace.ts`
+3. `service/setting.go`
+4. `sub/subHandler.go`
+5. `sub/jsonService.go`
+6. `sub/clashService.go`
 
-5. `service/config.go` 里的 dummy core 不是实际 core
-- 真正运行控制在 `service/coreManager.go` 和 `service/mihomo_core_manager.go`
+关键事实：
 
-6. `Mihomo*.vue` 不是独立业务实现
-- 它们只是共用页面的薄包装
+- 二维码弹窗不是写死链接，而是根据 namespace 动态拼接
+- Mihomo 下会走 `q/mihomo?name=...`
+- 默认链下会走 `q/client?name=...`
+- `supportsSubscriptionQr = true` 时，Mihomo 也会显示订阅二维码
 
-7. `SingboxCore.vue` 文件名具有误导性
-- 它现在同时服务 sing-box 和 mihomo
+## 10.12 改“Token API 也要支持某能力 / 接口能力不一致”
 
-8. Mihomo 订阅二维码现在是开启的
-- `uiNamespace.ts` 里 `supportsSubscriptionQr = true`
-- 旧文档里“mihomo 不支持 subscription QR”已经失效
+先看：
 
-9. Mihomo 前端当前并没有隐藏 `shadowtls` 和 `mieru`
-- 当前隐藏的是 `direct`、`naive`、`hysteria`
+1. `api/apiV2Handler.go`
+2. `api/apiHandler.go`
+3. `api/apiService.go`
 
-10. Mihomo 路由编辑器是受限子集
-- 逻辑规则会被清掉
-- 只保留 route / reject
+重点留意：
 
-11. Mihomo 当前没有完整在线/流量统计链
-- `enableTraffic = false`
-- `onlines` 固定空
-
-12. `Settings.vue` 的 `subPort` 本地默认值不是权威值
-- 真正默认值在 `service/setting.go`
-
-13. `Promanager_data/Inbound` 目录名大小写要注意
-- 代码用的是大写 `Inbound`
-
-14. `sub_json` 文件名会做冲突保护
-- subgroup 名、suboutbound tag、client subscription 文件名冲突会直接阻止保存
-
-15. `KWOR_BIN_FOLDER` 不是当前运行期核心配置
-- 它只留在旧迁移逻辑里
+- Session API 与 Token API 不是一模一样的镜像
+- 很多系统级功能只在 Session API 中开放
+- 需求如果是“也要开放给外部脚本 / Token 调用”，通常要补 `apiV2Handler.go`
 
 ---
 
-## 15. 本文档的维护规则
+## 11. 联动检查矩阵：改一处时别忘了这些地方
+
+| 改动点 | 必须联查 |
+| --- | --- |
+| `webPath` / `webPort` / `webDomain` | `service/setting.go`、`web/web.go`、`temp_frontend/index.html`、`router/index.ts`、`vite.config.mts` |
+| 设置页保存流程 | `Settings.vue`、`api/apiService.go`、`service/config.go`、`service/setting.go` |
+| `subPath` / `subPort` / `subDomain` / `subURI` | `service/setting.go`、`sub/sub.go`、`sub/subHandler.go`、`GetFinalSubURI()`、设置页 |
+| `/api/save` 的 object 名或字段 | `api/apiHandler.go`、`api/apiService.go`、`service/config.go`、两个 store、相关 views/modals/types |
+| 共享页面逻辑 | `uiNamespace.ts`、`data.ts`、`mihomoData.ts`、对应 `Mihomo*.vue` 包装页 |
+| 默认链运行配置路径 | `service/core_layout.go`、`service/promanager.go`、`service/coreManager.go`、前端 core 显示路径文本 |
+| Mihomo 运行配置路径 | `service/core_layout.go`、`service/mihomo_manager.go`、`service/mihomo_core_manager.go`、`uiNamespace.ts` |
+| 版本号 | `config/version`、`config/config.go`、`service/server.go`、`Main.vue`、`sync-version.mjs`、前端包元数据 |
+| 前端构建输出或嵌入方式 | `temp_frontend/package.json`、`scripts/sync-version.mjs`、`build.bat`、`build.sh`、`windows/kwor-windows-build.bat`、`web/web.go` |
+| 证书分配或 TLS 行为 | `web/web.go`、`sub/sub.go`、`app/app.go`、证书 inventory / ACME / self-signed 相关 service |
+| 二维码 / 订阅导入链接 | `QrCode.vue`、`uiNamespace.ts`、`GetFinalSubURI()`、`sub/subHandler.go` |
+| Token API 功能覆盖 | `api/apiV2Handler.go`、`api/apiHandler.go`、`api/apiService.go` |
+| 设置页子功能 | `Settings.vue` + 对应 `Settings*.vue` 组件 + `api/apiHandler.go` + `api/apiService.go` + 对应 service |
+
+---
+
+## 11.1 专题地图：证书 / ACME / 自签 / Panel/Sub TLS
+
+### 先看哪些文件
+
+- 后端服务：
+  - `service/acme_service.go`
+  - `service/self_signed_service.go`
+  - `service/certificate_inventory.go`
+  - `service/panel_sqlite_cert_store.go`
+  - `service/panel_self_signed_cert_paths.go`
+- Web / Sub 入口：
+  - `web/web.go`
+  - `sub/sub.go`
+  - `app/app.go`
+- Cron：
+  - `cronjob/acmeAutoRenewJob.go`
+  - `cronjob/panelCertificateBalanceSyncJob.go`
+  - `cronjob/tlsPathSyncJob.go`
+- 前端：
+  - `temp_frontend/src/components/SettingsAcmeManage.vue`
+  - `temp_frontend/src/views/Settings.vue`
+- API：
+  - `api/apiHandler.go`
+  - `api/apiService.go`
+
+### 这个模块的真实分层
+
+1. **证书签发与升级**：`AcmeService`
+2. **统一证书仓库**：`CertificateInventoryService`
+3. **自签证书体系**：`SelfSignedService`
+4. **Panel / Sub 入口实际取材与运行时应用**：`panel_*` 相关 service + `web/sub/app`
+5. **前端设置与查看**：`SettingsAcmeManage.vue`
+
+### 最容易误判的点
+
+- 证书列表不只等于 ACME 证书列表，它是统一 inventory 视图。
+- Panel 和 Sub 是两套 target，不是同一份入口配置。
+- 旧共享自签路径会被拆分迁移，不要再把 `Promanager_data/cert/fullchain.pem` 当唯一标准结构。
+- 保存 settings 本身不会直接覆盖当前证书绑定 ID，前端 payload 会主动删掉这些字段。
+
+### 改这个模块时常见联动
+
+- 改证书列表展示：前端页 + `certificate_inventory.go`
+- 改 ACME 签发 / 自动续签：`acme_service.go` + `acmeAutoRenewJob.go`
+- 改 Panel/Sub 实际 HTTPS 行为：`web/web.go`、`sub/sub.go`、`app/app.go`、`panel_sqlite_cert_store.go`
+- 改自签证书路径策略：`panel_self_signed_cert_paths.go`
+
+## 11.2 专题地图：防火墙（nftables）
+
+### 先看哪些文件
+
+- 后端服务：
+  - `service/firewall.go`
+  - `service/firewall_scan.go`
+  - `service/firewall_nftables_install.go`
+  - `service/firewall_geoip.go`
+  - `service/firewall_geoip_parser.go`
+  - `service/firewall_geoip_nft.go`
+- Cron：
+  - `cronjob/firewallSyncJob.go`
+- API：
+  - `api/apiHandler.go`
+  - `api/apiService.go`
+- 前端：
+  - `temp_frontend/src/components/SettingsFirewallManage.vue`
+  - `temp_frontend/src/components/SettingsFirewallGeoOptions.ts`
+  - `temp_frontend/src/views/Settings.vue`
+- 启停生命周期：
+  - `service/nft_lifecycle.go`
+
+### 这个模块的真实分层
+
+1. **规则模型与 overview**：`firewall.go`
+2. **GeoIP 来源、缓存、渲染**：`firewall_geoip*.go`
+3. **安装 nftables 命令与系统探测**：`firewall_nftables_install.go`
+4. **扫描外部已存在规则**：`firewall_scan.go`
+5. **定时同步运行时表**：`firewallSyncJob.go`
+
+### 最容易误判的点
+
+- 防火墙不是简单“写数据库”，真正生效依赖运行时同步。
+- 外部规则扫描结果不等于面板自己的规则集。
+- GeoIP 缓存刷新和实际规则启用不是同一件事。
+- 这个模块只在 Linux 下真正执行 nft 管理。
+
+### 改这个模块时常见联动
+
+- 改 UI 展示：`SettingsFirewallManage.vue` + `api/firewall-overview`
+- 改实际规则渲染：`firewall.go` + `firewall_geoip_nft.go`
+- 改安装行为：`firewall_nftables_install.go`
+- 改同步时机：`firewallSyncJob.go` + `nft_lifecycle.go`
+
+## 11.3 专题地图：端口转发
+
+### 先看哪些文件
+
+- 后端服务：
+  - `service/port_forward.go`
+- Cron：
+  - `cronjob/portForwardSyncJob.go`
+- API：
+  - `api/apiHandler.go`
+  - `api/apiService.go`
+- 前端：
+  - `temp_frontend/src/components/SettingsPortForwardManage.vue`
+  - `temp_frontend/src/components/SettingsPortForwardManage.shared.ts`
+  - `temp_frontend/src/views/Settings.vue`
+- 生命周期：
+  - `service/nft_lifecycle.go`
+
+### 这个模块的真实分层
+
+1. **规则校验、概览、状态**：`port_forward.go`
+2. **定时同步运行时规则**：`portForwardSyncJob.go`
+3. **前端重型管理页**：`SettingsPortForwardManage.vue`
+4. **共享文案 / 选项 / 逻辑抽取**：`SettingsPortForwardManage.shared.ts`
+
+### 最容易误判的点
+
+- 端口转发不是保存后永久静态生效，它依赖定时 sync 与运行时规则重建。
+- 规则冲突不仅看端口，还要看 family / protocol / range。
+- Linux 与非 Linux 的可用性判断不同。
+
+## 11.4 专题地图：反向代理
+
+### 先看哪些文件
+
+- 后端服务：
+  - `service/reverse_proxy.go`
+- Cron：
+  - `cronjob/reverseProxySyncJob.go`
+  - `cronjob/panelCertificateBalanceSyncJob.go`
+- API：
+  - `api/apiHandler.go`
+  - `api/apiService.go`
+- 前端：
+  - `temp_frontend/src/components/SettingsReverseProxyManage.vue`
+  - `temp_frontend/src/components/SettingsReverseProxyManage.shared.ts`
+  - `temp_frontend/src/views/Settings.vue`
+- 应用启动 / 停止：
+  - `app/app.go`
+
+### 这个模块的真实分层
+
+1. **规则模型、listener 运行时、TLS 证书选择、上游协议行为**：`reverse_proxy.go`
+2. **页面逻辑抽取**：`SettingsReverseProxyManage.shared.ts`
+3. **运行时启动与停止**：`app/app.go` 中 `StartRuntime()` / `StopRuntime()`
+4. **周期性 reconcile**：`reverseProxySyncJob.go`
+
+### 最容易误判的点
+
+- 反向代理不是只在保存后生效，应用启动时也会启动 runtime。
+- 证书选择和证书 balance 是这个模块的重要组成部分，不是外部附属逻辑。
+- 它既依赖配置保存，也依赖 app 生命周期。
+
+## 11.5 专题地图：流量总览
+
+### 先看哪些文件
+
+- 后端服务：
+  - `service/traffic_overview.go`
+- API：
+  - `api/apiHandler.go`
+  - `api/apiService.go`
+- 前端：
+  - `temp_frontend/src/components/SettingsTrafficManage.vue`
+  - `temp_frontend/src/views/Settings.vue`
+- Cron / 生命周期：
+  - `cronjob/statsJob.go`
+  - `service/nft_lifecycle.go`
+  - `app/app.go`
+
+### 这个模块的真实分层
+
+1. **总览数据、vnstat 安装删除、限额状态**：`traffic_overview.go`
+2. **设置页管理面板**：`SettingsTrafficManage.vue`
+3. **定时采样与限额协调**：`statsJob.go`
+4. **启动 / 停止时的快照 flush 与 cleanup**：`app/app.go` + `nft_lifecycle.go`
+
+### 最容易误判的点
+
+- 这个模块不只负责展示统计，它还会管：
+  - vnstat 安装/移除
+  - 月流量限额
+  - 快照 flush
+- 流量总览与 `enableTraffic`、StatsJob、运行时快照是联动的。
+
+## 11.6 专题地图：系统监控
+
+### 先看哪些文件
+
+- 后端服务：
+  - `service/system_monitor.go`
+  - `service/system_monitor_store.go`
+- API：
+  - `api/apiHandler.go`
+  - `api/apiService.go`
+- 前端：
+  - `temp_frontend/src/components/SettingsMonitorManage.vue`
+  - `temp_frontend/src/views/Settings.vue`
+- 应用启动：
+  - `app/app.go`
+
+### 这个模块的真实分层
+
+1. **实时采样与 overview / history 查询**：`system_monitor.go`
+2. **独立 monitor.db 存储与 rollup 表维护**：`system_monitor_store.go`
+3. **设置页图表与采样/保留设置**：`SettingsMonitorManage.vue`
+4. **应用启动时 runtime probe 准备**：`app/app.go`
+
+### 最容易误判的点
+
+- 系统监控不是走主库 `kwor.db`，而是独立 `monitor.db`。
+- 这个模块不是只有实时值，还有 rollup 历史桶表。
+- “数据库占用”在监控页里说的是监控库体积，不是主库体积。
+
+---
+
+## 12. 前端共享页面、包装页、modal 与协议组件关系图
+
+1. **不要直接改 `web/html/*`**
+   - 这是嵌入产物，不是前端源码。
+
+2. **不要直接改 `temp_frontend/dist/*`**
+   - 这是 Vite 产物，不是前端源码。
+
+3. **不要把 `Promanager_data/*` 当手写业务源码**
+   - 大量文件会在保存配置或启动时被重写。
+
+4. **不要把 `frontend/` 当当前前端主目录**
+   - 当前本地开发实际使用的是 `temp_frontend/`。
+
+5. **不要把 `service/config.go` 里的 dummy core 当实际运行 core**
+   - 真正的运行控制在：
+     - `service/coreManager.go`
+     - `service/mihomo_core_manager.go`
+
+6. **不要把 `Mihomo*.vue` 全部当独立实现**
+   - 很多只是给共用页传 `namespace="mihomo"` 的包装层。
+
+7. **不要被 `SingboxCore.vue` 文件名误导**
+   - 它现在同时服务默认链和 Mihomo 链。
+
+8. **不要把 Vite 代理端口 `2095` 当成程序默认面板端口**
+   - 默认面板端口来自 `service/setting.go`，是 `8888`。
+
+9. **不要再把订阅默认路径写死成 `/sub/`**
+   - 当前 `subPath` 会在首次需要时自动生成随机路径，除非用户手工设置。
+
+10. **不要再把 Mihomo 配置路径写成旧式 `Promanager_data/core/server.yaml`**
+    - 当前权威路径是 `Promanager_data/core/mihomo/server.yaml`。
+
+11. **不要以为只改前端表单就算完成**
+    - 这类项目经常还要补：
+      - store
+      - `/api/save`
+      - service 保存逻辑
+      - 运行配置生成
+      - 实际落盘路径
+
+12. **不要把设置页当“小配置页”**
+    - 它实际上还挂着流量、防火墙、反代、监控、内核管理等系统级功能。
+
+13. **Windows 本地前端命令优先写 `npm.cmd`**
+    - 不要默认给出 PowerShell 专属写法。
+
+14. **默认禁止跑 `go test ./service` 这类长测试**
+    - 只做与当前修改直接相关的短验证。
+
+15. **不要默认认为 Session API 和 Token API 完全等价**
+    - `api/apiV2Handler.go` 当前只覆盖了部分能力。
+
+16. **不要把 `monitor.db` 和 `kwor.db` 混为一谈**
+    - 系统监控使用独立数据库。
+
+17. **不要忽略 `sub_json` 文件名冲突保护**
+    - client subscription / subgroup / suboutbound 三类名字会相互校验。
+
+18. **不要只盯 Inbounds 页找 core 控制入口**
+    - 首页 `Main.vue` 也能直接启动 / 停止 / 重启 sing-box 与 Mihomo。
+
+---
+
+## 12. 前端共享页面、包装页、modal 与协议组件关系图
+
+## 12.1 页面分层：哪些是主页面，哪些是一层包装
+
+### 主页面（真正承载业务逻辑）
+
+- `views/Home.vue`
+- `views/SubManager.vue`
+- `views/Inbounds.vue`
+- `views/Clients.vue`
+- `views/Outbounds.vue`
+- `views/Rules.vue`
+- `views/Tls.vue`
+- `views/Dns.vue`
+- `views/Basics.vue`
+- `views/Admins.vue`
+- `views/Settings.vue`
+- `views/MihomoDns.vue`
+- `views/Login.vue`
+
+### Mihomo 包装页（一层 namespace 包装）
+
+- `views/MihomoInbounds.vue`
+- `views/MihomoClients.vue`
+- `views/MihomoOutbounds.vue`
+- `views/MihomoRules.vue`
+- `views/MihomoTls.vue`
+
+这些文件本身几乎不承载业务，只是把 `namespace="mihomo"` 传给共享主页面。
+
+### 隐藏但仍存在的页面
+
+- `views/Services.vue`
+- `views/Endpoints.vue`
+
+当前路由和数据链仍在，但 UI 菜单里临时隐藏。
+
+## 12.2 哪些 modal 是真正编辑器
+
+下面这些 modal 不是“小弹窗”，而是实际业务编辑器：
+
+- `layouts/modals/Inbound.vue`
+- `layouts/modals/Outbound.vue`
+- `layouts/modals/Client.vue`
+- `layouts/modals/ClientBulk.vue`
+- `layouts/modals/Tls.vue`
+- `layouts/modals/Rule.vue`
+- `layouts/modals/Ruleset.vue`
+- `layouts/modals/Dns.vue`
+- `layouts/modals/DnsRule.vue`
+- `layouts/modals/SubOutbound.vue`
+- `layouts/modals/SubGroup.vue`
+- `layouts/modals/OutboundGroup.vue`
+- `layouts/modals/Admin.vue`
+- `layouts/modals/Service.vue`
+- `layouts/modals/Endpoint.vue`
+- `layouts/modals/Token.vue`
+- `layouts/modals/SingboxCore.vue`
+
+### 更偏查看 / 辅助 / 操作型的 modal
+
+- `layouts/modals/QrCode.vue`
+- `layouts/modals/SubManagerQrCode.vue`
+- `layouts/modals/SubGroupQrCode.vue`
+- `layouts/modals/Stats.vue`
+- `layouts/modals/Logs.vue`
+- `layouts/modals/Changes.vue`
+- `layouts/modals/Backup.vue`
+- `layouts/modals/PortLogs.vue`
+- `layouts/modals/WgQrCode.vue`
+
+## 12.3 哪些 protocol 组件只是局部协议片段
+
+`temp_frontend/src/components/protocols/*.vue` 基本都不是独立页面，而是给 `Inbound.vue` / `Outbound.vue` / 相关编辑器嵌入的协议片段，例如：
+
+- `Shadowsocks.vue`
+- `Hysteria.vue`
+- `Hysteria2.vue`
+- `Tuic.vue`
+- `Vless.vue`
+- `Vmess.vue`
+- `Trojan.vue`
+- `Snell.vue`
+- `Mieru.vue`
+- `TrustTunnel.vue`
+- `ShadowTls.vue`
+- `OutShadowTls.vue`
+- `Ssh.vue`
+- `SshInbound.vue`
+- `AnyTls.vue`
+- `Tun.vue`
+- `TProxy.vue`
+- `Naive.vue`
+- `OutNaive.vue`
+- `Selector.vue`
+- `UrlTest.vue`
+- `Tor.vue`
+- `Wireguard.vue`
+- `Tailscale.vue`
+- `Warp.vue`
+- `Direct.vue`
+- `Socks.vue`
+- `Http.vue`
+- `Sudoku.vue`
+
+### 这意味着什么
+
+- 协议字段改动，往往不能只改某个 protocol 组件
+- 还要联查：
+  - `layouts/modals/Inbound.vue` 或 `Outbound.vue`
+  - 对应 `types/*.ts`
+  - store save
+  - 后端模型 / 生成器
+
+## 12.4 设置页里的“系统功能大页”很多都还有 shared 逻辑层
+
+典型例子：
+
+- `SettingsReverseProxyManage.vue` + `SettingsReverseProxyManage.shared.ts`
+- `SettingsPortForwardManage.vue` + `SettingsPortForwardManage.shared.ts`
+- `SettingsFirewallManage.vue` + `SettingsFirewallGeoOptions.ts`
+
+这类页面通常是：
+
+- `.vue` 负责展示
+- `.shared.ts` 或配套 `.ts` 负责常量、文案、表头、过滤项、组合逻辑
+
+所以改系统功能页时，不要只搜 `.vue`。
+
+---
+
+## 13. 典型需求案例：按问题倒推文件
+
+## 13.1 改一个“默认值”应该怎么查
+
+### 例：面板端口、订阅端口、首次默认值不对
+
+排查顺序：
+
+1. `service/setting.go`
+   - 看权威默认值
+2. `cmd/cmd.go`
+   - 看首次启动交互默认值是否另有一套
+3. `temp_frontend/src/views/Settings.vue`
+   - 看前端本地初始值与保存前归一化逻辑
+4. `README.md` / 文档
+   - 看是否需要同步说明
+
+### 原则
+
+- 后端默认值优先级高于前端占位值
+- CLI 首次启动默认值不一定等于 Settings 页初始值
+- 文档不要反过来定义事实
+
+## 13.2 改一个 API 字段应该怎么查
+
+### 例：前端要多一个字段 / 字段名要改 / Token API 也要支持
+
+排查顺序：
+
+1. `api/apiHandler.go`
+   - 找具体 action
+2. `api/apiService.go`
+   - 找最终返回对象组装位置
+3. `temp_frontend/src/store/modules/data.ts` / `mihomoData.ts`
+   - 看前端是否接这个字段
+4. 对应 `views/*.vue` / `layouts/modals/*.vue`
+   - 看 UI 怎么消费这个字段
+5. 如需外部 token 调用，再补：`api/apiV2Handler.go`
+
+### 原则
+
+- 改返回字段时，不要只改后端响应，还要看 store 是否会覆盖 / 忽略它
+- Session API 改了，不代表 Token API 自动拥有同能力
+
+## 13.3 改 Mihomo 也支持某功能应该怎么查
+
+### 例：默认链已有能力，Mihomo 页面也要有
+
+排查顺序：
+
+1. 看这个能力是不是共享页面天然支持：
+   - `views/Inbounds.vue` / `Clients.vue` / `Outbounds.vue` / `Rules.vue` / `Tls.vue`
+2. 看 `uiNamespace.ts` 是否已经定义 Mihomo 对应 endpoint / 开关
+3. 看 `mihomoData.ts` 是否已有对应保存对象映射
+4. 看后端：
+   - `api/apiService.go`
+   - `service/config.go`
+   - `service/mihomo_*.go`
+5. 最后确认生成器是否真的支持进 `server.yaml`
+
+### 原则
+
+- 前端能显示 ≠ Mihomo 生成器能正确落盘
+- UI 共享 ≠ 后端能力共享
+- Mihomo 改动通常至少要查：页面 + namespace + store + 保存链 + YAML 生成链
+
+## 13.4 改订阅二维码 / 订阅导入链接应该怎么查
+
+### 例：二维码地址不对、Mihomo 链接不对、scan only 链接不对
+
+排查顺序：
+
+1. `temp_frontend/src/layouts/modals/QrCode.vue`
+   - 看二维码 URL 如何拼接
+2. `temp_frontend/src/store/uiNamespace.ts`
+   - 看 namespace 是否支持订阅二维码、前缀是什么
+3. `service/setting.go`
+   - 看 `GetFinalSubURI()` 最终怎么拼 host / port / path / https
+4. `sub/subHandler.go`
+   - 看后端有没有对应的路由入口
+5. `sub/jsonService.go` / `sub/clashService.go`
+   - 看 format 输出是否匹配预期
+
+### 原则
+
+- 不要只改前端字符串
+- 要确认后端 route 存在，最终订阅 URL 拼接也正确
+- Mihomo 与默认链二维码是不同路径前缀
+
+## 13.5 改一个系统功能页应该怎么查
+
+### 例：防火墙 / 反代 / 转发 / 监控页显示或保存不对
+
+排查顺序：
+
+1. `Settings.vue`
+   - 看页面是否真的挂在设置页中
+2. 对应 `Settings*.vue`
+   - 看展示与交互
+3. 对应 `shared.ts` / 选项 `.ts`
+   - 看隐藏的逻辑层
+4. `api/apiHandler.go`
+5. `api/apiService.go`
+6. 对应 `service/*.go`
+7. 如依赖运行时同步，再看 `cronjob/*SyncJob.go`
+
+### 原则
+
+- 系统功能页通常不是“单页 + 单接口”结构
+- 往往是：页面 + shared 逻辑 + API + service + cron + 运行时状态
+
+---
+
+## 14. 常见误判与高风险坑位（AI 必看）
+
+1. **不要直接改 `web/html/*`**
+   - 这是嵌入产物，不是前端源码。
+
+2. **不要直接改 `temp_frontend/dist/*`**
+   - 这是 Vite 产物，不是前端源码。
+
+3. **不要把 `Promanager_data/*` 当手写业务源码**
+   - 大量文件会在保存配置或启动时被重写。
+
+4. **不要把 `frontend/` 当当前前端主目录**
+   - 当前本地开发实际使用的是 `temp_frontend/`。
+
+5. **不要把 `service/config.go` 里的 dummy core 当实际运行 core**
+   - 真正的运行控制在：
+     - `service/coreManager.go`
+     - `service/mihomo_core_manager.go`
+
+6. **不要把 `Mihomo*.vue` 全部当独立实现**
+   - 很多只是给共用页传 `namespace="mihomo"` 的包装层。
+
+7. **不要被 `SingboxCore.vue` 文件名误导**
+   - 它现在同时服务默认链和 Mihomo 链。
+
+8. **不要把 Vite 代理端口 `2095` 当成程序默认面板端口**
+   - 默认面板端口来自 `service/setting.go`，是 `8888`。
+
+9. **不要再把订阅默认路径写死成 `/sub/`**
+   - 当前 `subPath` 会在首次需要时自动生成随机路径，除非用户手工设置。
+
+10. **不要再把 Mihomo 配置路径写成旧式 `Promanager_data/core/server.yaml`**
+    - 当前权威路径是 `Promanager_data/core/mihomo/server.yaml`。
+
+11. **不要以为只改前端表单就算完成**
+    - 这类项目经常还要补：
+      - store
+      - `/api/save`
+      - service 保存逻辑
+      - 运行配置生成
+      - 实际落盘路径
+
+12. **不要把设置页当“小配置页”**
+    - 它实际上还挂着流量、防火墙、反代、监控、内核管理等系统级功能。
+
+13. **Windows 本地前端命令优先写 `npm.cmd`**
+    - 不要默认给出 PowerShell 专属写法。
+
+14. **默认禁止跑 `go test ./service` 这类长测试**
+    - 只做与当前修改直接相关的短验证。
+
+15. **不要默认认为 Session API 和 Token API 完全等价**
+    - `api/apiV2Handler.go` 当前只覆盖了部分能力。
+
+16. **不要把 `monitor.db` 和 `kwor.db` 混为一谈**
+    - 系统监控使用独立数据库。
+
+17. **不要忽略 `sub_json` 文件名冲突保护**
+    - client subscription / subgroup / suboutbound 三类名字会相互校验。
+
+18. **不要只盯 Inbounds 页找 core 控制入口**
+    - 首页 `Main.vue` 也能直接启动 / 停止 / 重启 sing-box 与 Mihomo。
+
+---
+
+## 15. 文档维护规则
 
 出现以下变化时，必须同步更新本文档：
 
-- 菜单或路由变化
+- 路由变化
 - `uiNamespace.ts` 变化
-- `Drawer.vue` / `AppBar.vue` 标题前缀逻辑变化
 - `data.ts` / `mihomoData.ts` 对象映射变化
-- `sub/subHandler.go` 路由入口变化（尤其 `/q/*` 别名）
 - `api/save` 分发对象变化
-- `coreManager` / `mihomo_core_manager` 行为变化
-- `Promanager_data/core/singbox/config.json` 或 `server.yaml` 生成链变化
-- Mihomo 支持/隐藏的 inbound/outbound 类型变化
-- `supportsSubscriptionQr`、`subscriptionPathPrefix` 等 namespace 配置变化
-- `sub_json` 目录命名规则变化
-- nftables / port-hop / cron job 变化
-- 设置页里的防火墙托管逻辑、系统保留端口策略、外部规则扫描/展示逻辑变化
-- 证书热更新、自签证书路径策略变化
-- Owner command-ban 规则变化（见下节）
+- `api/apiV2Handler.go` 的 Token API 覆盖面变化
+- `service/core_layout.go` 路径规则变化
+- `promanager.go` 输出结构变化
+- `mihomo_manager.go` 输出结构变化
+- `build.bat` / `build.sh` / Windows 构建脚本变化
+- 订阅路由变化
+- `Settings.vue` 保存前整理逻辑变化
+- 二维码 / 订阅链接生成逻辑变化
+- 设置页新增或删除大功能页签
+- Core manager 接口 / 路径 / 版本同步规则变化
+- 系统监控库路径或结构变化
 
 ---
 
-## 16. Owner Hard Rule（必须遵守）
-
-- **禁止运行：** `go test ./service`
-- 如确需测试 `service`，只允许在用户明确同意后运行精确 `-run` 的定向测试命令。
-- 不确定时先询问，不得默认执行任何全量或长时测试命令。
-- 默认只运行与本次改动直接相关的小测试，不再自行尝试整包长测。
-- 即使前面的定向测试已经通过，也**禁止**为了“更稳一点”“补回归”“顺手确认”而自行追加 `go test ./service`、`go test ./...` 或任何整包/全量长测试。
-
----
-
-最后更新：`2026-05-03`
+最后更新：`2026-06-18`

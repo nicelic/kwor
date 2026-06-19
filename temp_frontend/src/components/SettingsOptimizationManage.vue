@@ -2,7 +2,7 @@
   <section class="opt-page">
     <v-row class="mt-1">
       <v-col cols="12" md="4">
-        <v-card rounded="xl" variant="outlined" class="opt-card opt-group-cyan">
+        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-cyan">
           <v-card-title class="text-subtitle-1 font-weight-medium">禁用系统日志</v-card-title>
           <v-divider />
           <v-card-text>
@@ -26,7 +26,7 @@
       </v-col>
 
       <v-col cols="12" md="4">
-        <v-card rounded="xl" variant="outlined" class="opt-card opt-group-cyan">
+        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-cyan">
           <v-card-title class="text-subtitle-1 font-weight-medium">编辑</v-card-title>
           <v-divider />
           <v-card-text>
@@ -43,6 +43,25 @@
           </v-card-text>
         </v-card>
       </v-col>
+
+      <v-col cols="12" md="4">
+        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-cyan">
+          <v-card-title class="text-subtitle-1 font-weight-medium">日志运行信息</v-card-title>
+          <v-divider />
+          <v-card-text>
+            <div class="opt-meta__row">
+              <span>生效路径</span>
+              <strong>{{ logOverview.configPath || '-' }}</strong>
+            </div>
+            <div class="opt-meta__row">
+              <span>文件锁定</span>
+              <strong :class="logOverview.immutable ? 'text-success' : 'text-warning'">
+                {{ logOverview.immutable ? '已锁定(+i)' : '未锁定' }}
+              </strong>
+            </div>
+          </v-card-text>
+        </v-card>
+      </v-col>
     </v-row>
 
     <v-alert
@@ -54,26 +73,9 @@
       {{ logOverview.error }}
     </v-alert>
 
-    <v-card rounded="xl" variant="outlined" class="opt-meta opt-group-cyan">
-      <v-card-title class="text-subtitle-1 font-weight-medium">日志运行信息</v-card-title>
-      <v-divider />
-      <v-card-text>
-        <div class="opt-meta__row">
-          <span>生效路径</span>
-          <strong>{{ logOverview.configPath || '-' }}</strong>
-        </div>
-        <div class="opt-meta__row">
-          <span>文件锁定</span>
-          <strong :class="logOverview.immutable ? 'text-success' : 'text-warning'">
-            {{ logOverview.immutable ? '已锁定(+i)' : '未锁定' }}
-          </strong>
-        </div>
-      </v-card-text>
-    </v-card>
-
     <v-row class="mt-4">
       <v-col cols="12" md="4">
-        <v-card rounded="xl" variant="outlined" class="opt-card opt-group-blue">
+        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-blue">
           <v-card-title class="text-subtitle-1 font-weight-medium">sysctl 参数优化</v-card-title>
           <v-divider />
           <v-card-text>
@@ -97,7 +99,7 @@
       </v-col>
 
       <v-col cols="12" md="4">
-        <v-card rounded="xl" variant="outlined" class="opt-card opt-group-blue">
+        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-blue">
           <v-card-title class="text-subtitle-1 font-weight-medium">编辑</v-card-title>
           <v-divider />
           <v-card-text>
@@ -115,6 +117,25 @@
         </v-card>
       </v-col>
 
+      <v-col cols="12" md="4">
+        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-blue">
+          <v-card-title class="text-subtitle-1 font-weight-medium">sysctl 运行信息</v-card-title>
+          <v-divider />
+          <v-card-text>
+            <div class="opt-meta__row">
+              <span>生效路径</span>
+              <strong>{{ sysctlOverview.configPath || '-' }}</strong>
+            </div>
+            <div class="opt-meta__row">
+              <span>文件锁定</span>
+              <strong :class="sysctlOverview.immutable ? 'text-success' : 'text-warning'">
+                {{ sysctlOverview.immutable ? '已锁定(+i)' : '未锁定' }}
+              </strong>
+            </div>
+          </v-card-text>
+        </v-card>
+      </v-col>
+
     </v-row>
 
     <v-alert
@@ -125,23 +146,6 @@
       class="mb-4">
       {{ sysctlOverview.error }}
     </v-alert>
-
-    <v-card rounded="xl" variant="outlined" class="opt-meta opt-group-blue">
-      <v-card-title class="text-subtitle-1 font-weight-medium">sysctl 运行信息</v-card-title>
-      <v-divider />
-      <v-card-text>
-        <div class="opt-meta__row">
-          <span>生效路径</span>
-          <strong>{{ sysctlOverview.configPath || '-' }}</strong>
-        </div>
-        <div class="opt-meta__row">
-          <span>文件锁定</span>
-          <strong :class="sysctlOverview.immutable ? 'text-success' : 'text-warning'">
-            {{ sysctlOverview.immutable ? '已锁定(+i)' : '未锁定' }}
-          </strong>
-        </div>
-      </v-card-text>
-    </v-card>
 
     <v-alert
       v-if="dnsOverview.error"
@@ -171,7 +175,7 @@
 
     <v-row class="mt-4">
       <v-col cols="12" md="4">
-        <v-card rounded="xl" variant="outlined" class="opt-card opt-group-cyan">
+        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-cyan">
           <v-card-title class="text-subtitle-1 font-weight-medium">编辑</v-card-title>
           <v-divider />
           <v-card-text>
@@ -193,7 +197,7 @@
       </v-col>
 
       <v-col cols="12" md="8">
-        <v-card rounded="xl" variant="outlined" class="opt-card dns-quick-card opt-group-cyan">
+        <v-card rounded="xl" variant="outlined" class="opt-card h-100 dns-quick-card opt-group-cyan">
           <v-card-title class="text-subtitle-1 font-weight-medium">
             DNS 快速编辑
           </v-card-title>
@@ -237,7 +241,7 @@
 
     <v-row class="mt-4">
       <v-col cols="12" md="4">
-        <v-card rounded="xl" variant="outlined" class="opt-card opt-group-blue">
+        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-blue">
           <v-card-title class="text-subtitle-1 font-weight-medium">默认网卡 MTU 优化</v-card-title>
           <v-divider />
           <v-card-text>
@@ -261,7 +265,7 @@
       </v-col>
 
       <v-col cols="12" md="8">
-        <v-card rounded="xl" variant="outlined" class="opt-card dns-quick-card opt-group-blue">
+        <v-card rounded="xl" variant="outlined" class="opt-card h-100 dns-quick-card opt-group-blue">
           <v-card-title class="text-subtitle-1 font-weight-medium">MTU 快速设置</v-card-title>
           <v-divider />
           <v-card-text>
