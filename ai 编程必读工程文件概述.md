@@ -1954,6 +1954,52 @@ npm.cmd run build
 - Core manager 接口 / 路径 / 版本同步规则变化
 - 系统监控库路径或结构变化
 
+## 15.1 提交、Tag、Release 规则
+
+以后处理本项目提交 / 发版时，默认按下面规则执行，不要再临时猜测：
+
+1. `main` 分支始终代表当前最新代码状态。
+2. 只有当 `config/version` 发生变化时，才创建**新的版本 Tag** 与 **新的 GitHub Release**。
+3. 新版本 Tag 统一使用：`v<version>`，例如：
+   - `config/version = 1.5.10`
+   - 对应 Tag = `v1.5.10`
+4. 如果只是文档修正、说明补充、非版本号变更提交：
+   - 正常提交到 `main`
+   - **不要新建新的版本 Tag**
+   - **不要新建新的 GitHub Release**
+5. 如果版本号已经变更并且准备发版：
+   - 先确认 `config/version`
+   - 再同步前端版本元数据
+   - 再创建新的 `v<version>` Tag
+   - 再推送 Tag，让 GitHub Release / Actions 跟随新 Tag 产出
+6. `bash <(curl -Ls https://raw.githubusercontent.com/nicelic/kwor/main/install.sh)` 默认安装逻辑：
+   - 取的是 **GitHub Release latest**
+   - 因此用户执行这条命令时，默认拿到的应始终是**最新已发布版本**
+   - 这也是为什么“版本号变化 -> 新 Tag -> 新 Release”这条链必须保持严格一致
+7. 如果版本号**没有变化**，但又希望当前版本标签也指向最新修正提交：
+   - 可以把**同一个已有 Tag**重新移动到最新提交
+   - 但这属于“修正已有版本标签指向”，不是“创建新版本”
+   - 执行前要明确用户是否接受改写现有 Tag
+
+## 15.2 下次提交时的默认处理原则
+
+如果用户只说“提交并推送”，默认按下面判断：
+
+1. 先看 `config/version` 有没有变化。
+2. 如果版本号没变：
+   - 只提交并推送 `main`
+   - 不创建新 Tag
+   - 不创建新 Release
+3. 如果版本号变了：
+   - 提交并推送 `main`
+   - 创建新的 `v<version>` Tag
+   - 推送新 Tag
+   - 让 GitHub Release / Actions 生成新的版本产物
+4. 如果用户明确要求“把当前已有版本 Tag 挪到最新提交”：
+   - 这是**改写已有 Tag**
+   - 不是“新增版本”
+   - 要明确知道这会改变该版本在 GitHub 上对应的提交
+
 ---
 
 最后更新：`2026-06-19`
