@@ -100,6 +100,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.AckMihomoCoreUpdateNotice(c)
 	case "mihomo-core-download-preference":
 		a.ApiService.SaveMihomoCoreDownloadPreference(c)
+	case "panel-update-install":
+		a.ApiService.InstallPanelUpdate(c)
 	case "importdb":
 		a.ApiService.ImportDb(c)
 	case "addToken":
@@ -395,6 +397,10 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetMihomoCoreUpdateInfo(c)
 	case "mihomo-core-download-progress":
 		a.ApiService.GetCoreDownloadProgress(c)
+	case "panel-update-status":
+		a.ApiService.GetPanelUpdateStatus(c)
+	case "panel-update-versions":
+		a.ApiService.GetPanelUpdateVersions(c)
 	default:
 		jsonMsg(c, "failed", common.NewError("unknown action: ", action))
 	}

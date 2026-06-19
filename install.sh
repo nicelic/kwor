@@ -8,6 +8,7 @@ yellow='\033[0;33m'
 plain='\033[0m'
 
 GH_REPO="nicelic/kwor"
+INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/${GH_REPO}/main/install.sh"
 DEFAULT_INSTALL_DIR="/opt/kwor"
 SERVICE_NAME="kwor"
 
@@ -23,16 +24,27 @@ DOWNLOAD_URL=""
 ARCHIVE_PATH=""
 WORK_DIR=""
 STAGED_BIN_PATH=""
+STAGED_INSTALL_SCRIPT_PATH=""
+STAGED_SERVICE_FILE_PATH=""
 TARGET_BIN_PATH=""
 BACKUP_BIN_PATH=""
 STOP_BIN_PATH=""
+TARGET_BIN_NAME="kwor"
 
 cleanup() {
-    if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
-        rm -rf "${WORK_DIR}"
-    fi
     if [[ -n "${ARCHIVE_PATH}" && -f "${ARCHIVE_PATH}" ]]; then
         rm -f "${ARCHIVE_PATH}"
+    fi
+    if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
+        rm -f "${WORK_DIR}/kwor" 2>/dev/null || true
+        rm -f "${WORK_DIR}/install.sh" 2>/dev/null || true
+        rm -f "${WORK_DIR}/install.sh.latest" 2>/dev/null || true
+        rm -f "${WORK_DIR}/kwor.service" 2>/dev/null || true
+        rm -f "${WORK_DIR}/kwor/kwor" 2>/dev/null || true
+        rm -f "${WORK_DIR}/kwor/install.sh" 2>/dev/null || true
+        rm -f "${WORK_DIR}/kwor/kwor.service" 2>/dev/null || true
+        rmdir "${WORK_DIR}/kwor" 2>/dev/null || true
+        rmdir "${WORK_DIR}" 2>/dev/null || true
     fi
 }
 
@@ -145,6 +157,11 @@ find_running_pid() {
         echo "${pid}"
         return
     fi
+    pid="$(pgrep -x kwor_arm64 2>/dev/null | head -n 1 || true)"
+    if [[ -n "${pid}" ]]; then
+        echo "${pid}"
+        return
+    fi
     echo ""
 }
 
@@ -239,6 +256,10 @@ resolve_service_bin_path() {
             SERVICE_BIN_PATH="$(readlink -f "${working_dir}/kwor_amd64" 2>/dev/null || echo "${working_dir}/kwor_amd64")"
             return
         fi
+        if [[ -f "${working_dir}/kwor_arm64" ]]; then
+            SERVICE_BIN_PATH="$(readlink -f "${working_dir}/kwor_arm64" 2>/dev/null || echo "${working_dir}/kwor_arm64")"
+            return
+        fi
     fi
 }
 
@@ -289,12 +310,92 @@ extract_release_archive() {
         log_error "Release archive does not contain kwor binary"
         exit 1
     fi
+
+    if [[ -f "${WORK_DIR}/install.sh" ]]; then
+        STAGED_INSTALL_SCRIPT_PATH="${WORK_DIR}/install.sh"
+    elif [[ -f "${WORK_DIR}/kwor/install.sh" ]]; then
+        STAGED_INSTALL_SCRIPT_PATH="${WORK_DIR}/kwor/install.sh"
+    fi
 }
 
 prepare_install_dir() {
     mkdir -p "${INSTALL_DIR}"
-    TARGET_BIN_PATH="${INSTALL_DIR}/kwor"
-    BACKUP_BIN_PATH="${INSTALL_DIR}/kwor.bak"
+    if [[ -n "${SERVICE_BIN_PATH}" ]]; then
+        TARGET_BIN_NAME="$(basename "${SERVICE_BIN_PATH}")"
+    elif [[ -n "${RUNNING_BIN_PATH}" ]]; then
+        TARGET_BIN_NAME="$(basename "${RUNNING_BIN_PATH}")"
+    else
+        TARGET_BIN_NAME="kwor"
+    fi
+
+    case "${TARGET_BIN_NAME}" in
+        kwor | kwor_amd64 | kwor_arm64) ;;
+        *) TARGET_BIN_NAME="kwor" ;;
+    esac
+
+    TARGET_BIN_PATH="${INSTALL_DIR}/${TARGET_BIN_NAME}"
+    BACKUP_BIN_PATH="${TARGET_BIN_PATH}.bak"
+}
+
+download_latest_install_script() {
+    local latest_path
+    latest_path="${WORK_DIR}/install.sh.latest"
+    if curl -fsSL "${INSTALL_SCRIPT_URL}" -o "${latest_path}"; then
+        if grep -q 'GH_REPO="nicelic/kwor"' "${latest_path}"; then
+            chmod 755 "${latest_path}" || true
+            STAGED_INSTALL_SCRIPT_PATH="${latest_path}"
+            return
+        fi
+        rm -f "${latest_path}"
+        log_warn "Downloaded install.sh failed validation; using packaged install.sh if available"
+        return
+    fi
+    rm -f "${latest_path}" 2>/dev/null || true
+    log_warn "Failed to download latest install.sh; using packaged install.sh if available"
+}
+
+systemd_escape_unit_value() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//%/%%}"
+    value="${value//$'\t'/\\x09}"
+    value="${value//$'\r'/\\x0d}"
+    value="${value//$'\n'/\\x0a}"
+    value="${value// /\\x20}"
+    printf '%s' "${value}"
+}
+
+write_staged_service_file() {
+    STAGED_SERVICE_FILE_PATH="${WORK_DIR}/kwor.service"
+    cat > "${STAGED_SERVICE_FILE_PATH}" <<EOF
+[Unit]
+Description=kwor Service
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+WorkingDirectory=$(systemd_escape_unit_value "${INSTALL_DIR}")
+ExecStart=$(systemd_escape_unit_value "${TARGET_BIN_PATH}")
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "${STAGED_SERVICE_FILE_PATH}" || true
+}
+
+install_support_files() {
+    if [[ -n "${STAGED_INSTALL_SCRIPT_PATH}" && -f "${STAGED_INSTALL_SCRIPT_PATH}" ]]; then
+        cp -f "${STAGED_INSTALL_SCRIPT_PATH}" "${INSTALL_DIR}/install.sh"
+        chmod 755 "${INSTALL_DIR}/install.sh" || true
+    fi
+    if [[ -n "${STAGED_SERVICE_FILE_PATH}" && -f "${STAGED_SERVICE_FILE_PATH}" ]]; then
+        cp -f "${STAGED_SERVICE_FILE_PATH}" "${INSTALL_DIR}/kwor.service"
+        chmod 644 "${INSTALL_DIR}/kwor.service" || true
+    fi
 }
 
 stop_existing_instance() {
@@ -304,9 +405,21 @@ stop_existing_instance() {
     fi
     log_info "Stopping existing instance using: ${STOP_BIN_PATH} stop"
     if ! "${STOP_BIN_PATH}" stop; then
-        log_error "Failed to stop existing installation via ${STOP_BIN_PATH} stop"
-        exit 1
+        log_warn "Failed to stop via ${STOP_BIN_PATH} stop; falling back to systemctl/pkill"
     fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    fi
+    local name
+    for name in kwor kwor_amd64 kwor_arm64; do
+        pkill -TERM -x "${name}" >/dev/null 2>&1 || true
+    done
+    sleep 2
+    for name in kwor kwor_amd64 kwor_arm64; do
+        if pgrep -x "${name}" >/dev/null 2>&1; then
+            pkill -KILL -x "${name}" >/dev/null 2>&1 || true
+        fi
+    done
 }
 
 install_binary() {
@@ -315,6 +428,15 @@ install_binary() {
     fi
     cp -f "${STAGED_BIN_PATH}" "${TARGET_BIN_PATH}"
     chmod 755 "${TARGET_BIN_PATH}"
+
+    case "${TARGET_BIN_NAME}" in
+        kwor)
+            rm -f "${INSTALL_DIR}/kwor_amd64" "${INSTALL_DIR}/kwor_arm64"
+            ;;
+        kwor_amd64 | kwor_arm64)
+            rm -f "${INSTALL_DIR}/kwor"
+            ;;
+    esac
 }
 
 rollback_and_restart_previous() {
@@ -331,9 +453,54 @@ rollback_and_restart_previous() {
     return 1
 }
 
+start_with_repaired_systemd() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+    if [[ -z "${STAGED_SERVICE_FILE_PATH}" || ! -f "${STAGED_SERVICE_FILE_PATH}" ]]; then
+        return 1
+    fi
+    mkdir -p /etc/systemd/system
+    cp -f "${STAGED_SERVICE_FILE_PATH}" "/etc/systemd/system/${SERVICE_NAME}.service"
+    chmod 644 "/etc/systemd/system/${SERVICE_NAME}.service" || true
+    systemctl daemon-reload
+    systemctl reset-failed "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    systemctl enable "${SERVICE_NAME}"
+    systemctl restart "${SERVICE_NAME}"
+
+    local i
+    for i in $(seq 1 40); do
+        if systemctl is-active --quiet "${SERVICE_NAME}"; then
+            return 0
+        fi
+        sleep 0.3
+    done
+    return 1
+}
+
+repair_systemd_after_target_start() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return
+    fi
+    if [[ -z "${STAGED_SERVICE_FILE_PATH}" || ! -f "${STAGED_SERVICE_FILE_PATH}" ]]; then
+        return
+    fi
+    cp -f "${STAGED_SERVICE_FILE_PATH}" "/etc/systemd/system/${SERVICE_NAME}.service" || return
+    chmod 644 "/etc/systemd/system/${SERVICE_NAME}.service" || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+}
+
 start_target_instance() {
     log_info "Starting ${TARGET_BIN_PATH} start"
+    if [[ "${INSTALL_SOURCE}" != "default" ]] && start_with_repaired_systemd; then
+        rm -f "${BACKUP_BIN_PATH}"
+        return
+    fi
+
     if "${TARGET_BIN_PATH}" start; then
+        repair_systemd_after_target_start
         rm -f "${BACKUP_BIN_PATH}"
         return
     fi
@@ -366,8 +533,11 @@ main() {
     download_release_archive
     extract_release_archive
     prepare_install_dir
+    download_latest_install_script
+    write_staged_service_file
     stop_existing_instance
     install_binary
+    install_support_files
     start_target_instance
     print_summary
 }

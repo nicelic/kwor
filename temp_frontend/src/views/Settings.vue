@@ -94,6 +94,144 @@
               <v-text-field v-model="settings.timeLocation" :label="$t('setting.timeLoc')" hide-details></v-text-field>
             </v-col>
           </v-row>
+
+          <v-divider class="my-6"></v-divider>
+
+          <v-row align="center" class="mb-2">
+            <v-col cols="12" class="d-flex align-center flex-wrap" style="gap: 8px;">
+              <v-chip variant="outlined" color="success" size="small" label>
+                <v-progress-circular
+                  v-if="panelStatusLoading"
+                  indeterminate
+                  size="12"
+                  width="2"
+                  class="mr-1"
+                ></v-progress-circular>
+                本地: {{ panelLocalVersionLabel }}
+              </v-chip>
+              <v-chip variant="outlined" color="info" size="small" label>
+                <v-progress-circular
+                  v-if="panelRemoteLoading"
+                  indeterminate
+                  size="12"
+                  width="2"
+                  class="mr-1"
+                ></v-progress-circular>
+                远程: {{ panelRemoteVersionLabel }}
+              </v-chip>
+              <v-chip v-if="panelBinaryName" variant="tonal" size="small" label>
+                文件: {{ panelBinaryName }}
+                <v-tooltip
+                  v-if="panelUpdateStatus?.binaryPath"
+                  activator="parent"
+                  location="top"
+                  :text="panelUpdateStatus.binaryPath"
+                />
+              </v-chip>
+            </v-col>
+          </v-row>
+
+          <v-row align="center">
+            <v-col cols="12" sm="6" md="4">
+              <v-select
+                v-model="panelSelectedVersion"
+                :items="panelVersionItems"
+                item-title="title"
+                item-value="value"
+                label="选择 kwor 版本"
+                variant="outlined"
+                density="compact"
+                hide-details
+                :loading="panelRemoteLoading"
+                :disabled="panelVersionItems.length === 0"
+                :menu-props="{ maxHeight: 260 }"
+              >
+                <template #item="{ props: itemProps, item }">
+                  <v-list-item
+                    v-bind="itemProps"
+                    :subtitle="item.raw.assetName || undefined"
+                  >
+                    <template #append>
+                      <v-chip
+                        v-if="item.raw.prerelease"
+                        size="x-small"
+                        color="warning"
+                        variant="flat"
+                      >
+                        预发布
+                      </v-chip>
+                    </template>
+                  </v-list-item>
+                </template>
+              </v-select>
+            </v-col>
+
+            <v-col cols="auto">
+              <v-btn
+                color="secondary"
+                variant="tonal"
+                prepend-icon="mdi-refresh"
+                :loading="panelRemoteLoading"
+                :disabled="panelRemoteLoading || panelLoadingMoreVersions || panelInstalling"
+                @click="checkPanelUpdates"
+              >
+                检查更新
+              </v-btn>
+            </v-col>
+
+            <v-col cols="auto">
+              <v-btn
+                color="primary"
+                variant="flat"
+                prepend-icon="mdi-download"
+                :loading="panelInstalling"
+                :disabled="!panelSelectedVersion || panelInstalling || panelRemoteLoading"
+                @click="openPanelInstallDialog"
+              >
+                安装
+              </v-btn>
+            </v-col>
+          </v-row>
+
+          <v-row v-if="panelVersionItems.length > 0 || panelUpdateFeedback" class="mt-1">
+            <v-col cols="12" class="d-flex align-center justify-space-between flex-wrap" style="gap: 8px;">
+              <span v-if="panelVersionItems.length > 0" class="text-caption text-medium-emphasis">
+                已加载 {{ panelVersionItems.length }} 个版本
+              </span>
+              <div class="d-flex align-center" style="gap: 8px;">
+                <v-btn
+                  v-if="panelHasMoreVersions"
+                  size="x-small"
+                  variant="text"
+                  :loading="panelLoadingMoreVersions"
+                  :disabled="panelInstalling"
+                  @click="loadMorePanelVersions"
+                >
+                  加载更多
+                </v-btn>
+                <v-btn
+                  v-if="panelVersionItems.length > 5"
+                  size="x-small"
+                  variant="text"
+                  :disabled="panelInstalling"
+                  @click="resetPanelVersions"
+                >
+                  只看最新 5 个
+                </v-btn>
+              </div>
+            </v-col>
+            <v-col v-if="panelUpdateFeedback" cols="12">
+              <v-alert
+                :type="panelUpdateFeedbackType"
+                variant="tonal"
+                density="compact"
+                closable
+                @click:close="panelUpdateFeedback = ''"
+              >
+                {{ panelUpdateFeedback }}
+              </v-alert>
+            </v-col>
+          </v-row>
         </v-window-item>
 
         <v-window-item value="t2">
@@ -206,6 +344,20 @@
           <SettingsMonitorManageVue :active="tab === 't13'" />
         </v-window-item>
       </v-window>
+
+      <v-dialog v-model="panelInstallDialogVisible" max-width="480">
+        <v-card>
+          <v-card-title>确认安装</v-card-title>
+          <v-card-text>
+            确定要安装 {{ panelSelectedVersion || '-' }} 吗？当前面板会自动下载、停止、替换并重新启动。
+          </v-card-text>
+          <v-card-actions>
+            <v-spacer></v-spacer>
+            <v-btn variant="text" :disabled="panelInstalling" @click="panelInstallDialogVisible = false">取消</v-btn>
+            <v-btn color="primary" variant="flat" :loading="panelInstalling" @click="installPanelVersion">确定安装</v-btn>
+          </v-card-actions>
+        </v-card>
+      </v-dialog>
     </v-card-text>
   </v-card>
 </template>
@@ -239,6 +391,42 @@ const subClashTabBooted = ref(false)
 const resetDialogVisible = ref(false)
 const resetTarget = ref<'json' | 'clash' | ''>('')
 const heavyTabWarmupTimers: number[] = []
+
+type PanelVersionItem = {
+  title: string
+  value: string
+  tagName: string
+  name?: string
+  prerelease?: boolean
+  publishedAt?: string
+  assetName?: string
+  assetSize?: number
+}
+
+type PanelUpdateStatus = {
+  localVersion?: string
+  binaryPath?: string
+  binaryName?: string
+  installDir?: string
+  serviceFilePath?: string
+  serviceBinaryPath?: string
+  runningBinaryPath?: string
+  installSource?: string
+  platform?: string
+}
+
+const panelStatusLoading = ref(false)
+const panelRemoteLoading = ref(false)
+const panelLoadingMoreVersions = ref(false)
+const panelInstalling = ref(false)
+const panelInstallDialogVisible = ref(false)
+const panelUpdateStatus = ref<PanelUpdateStatus | null>(null)
+const panelSelectedVersion = ref('')
+const panelVersionItems = ref<PanelVersionItem[]>([])
+const panelHasMoreVersions = ref(false)
+const panelUpdateFeedback = ref('')
+const panelUpdateFeedbackType = ref<'success' | 'error' | 'info' | 'warning'>('info')
+const panelVersionRequestSeq = ref(0)
 
 const settings = ref({
   webListen: '',
@@ -274,6 +462,7 @@ const DEFAULT_SUB_PORT = '22780'
 
 onMounted(async () => {
   loadData()
+  void loadPanelUpdateStatus()
 })
 
 const changeLocale = (l: any) => {
@@ -294,6 +483,147 @@ const setData = (data: any) => {
   settings.value = data
   oldSettings.value = { ...data }
   void nextTick().then(scheduleHeavyTabWarmup)
+}
+
+const panelLocalVersionLabel = computed(() => {
+  const version = String(panelUpdateStatus.value?.localVersion ?? '').trim()
+  return version ? `v${version.replace(/^v/i, '')}` : '未知'
+})
+
+const panelBinaryName = computed(() => String(panelUpdateStatus.value?.binaryName ?? '').trim())
+
+const panelRemoteVersionLabel = computed(() => {
+  if (panelRemoteLoading.value) return '加载中'
+  if (panelVersionItems.value.length > 0) return panelVersionItems.value[0].value
+  return '未加载'
+})
+
+const normalizePanelVersionTag = (value: string) => {
+  const trimmed = String(value ?? '').trim()
+  if (!trimmed) return ''
+  return trimmed.startsWith('v') ? trimmed : `v${trimmed}`
+}
+
+const loadPanelUpdateStatus = async () => {
+  panelStatusLoading.value = true
+  const msg = await HttpUtils.get('api/panel-update-status', {}, { silentAuthCheck: true })
+  panelStatusLoading.value = false
+  if (msg.success) {
+    panelUpdateStatus.value = msg.obj ?? null
+  }
+}
+
+const buildPanelVersionItems = (versions: any[]): PanelVersionItem[] => {
+  const items: PanelVersionItem[] = []
+  versions.forEach(item => {
+    const tagName = normalizePanelVersionTag(item?.tag_name ?? item?.tagName ?? '')
+    if (!tagName) return
+    items.push({
+      title: tagName,
+      value: tagName,
+      tagName,
+      name: item?.name ?? '',
+      prerelease: item?.prerelease === true,
+      publishedAt: item?.published_at ?? item?.publishedAt ?? '',
+      assetName: item?.asset_name ?? item?.assetName ?? '',
+      assetSize: item?.asset_size ?? item?.assetSize ?? 0,
+    })
+  })
+  return items
+}
+
+const applyPanelVersionResponse = (obj: any, append: boolean) => {
+  const nextItems = buildPanelVersionItems(Array.isArray(obj?.versions) ? obj.versions : [])
+  const existing = append ? [...panelVersionItems.value] : []
+  const seen = new Set(existing.map(item => item.value))
+  nextItems.forEach(item => {
+    if (!seen.has(item.value)) {
+      existing.push(item)
+      seen.add(item.value)
+    }
+  })
+  panelVersionItems.value = existing
+  panelHasMoreVersions.value = obj?.has_more === true || obj?.hasMore === true
+  if (!append && panelVersionItems.value.length > 0) {
+    panelSelectedVersion.value = panelVersionItems.value[0].value
+  } else if (!panelSelectedVersion.value && panelVersionItems.value.length > 0) {
+    panelSelectedVersion.value = panelVersionItems.value[0].value
+  }
+}
+
+const loadPanelVersions = async (append = false) => {
+  const seq = panelVersionRequestSeq.value + 1
+  panelVersionRequestSeq.value = seq
+  if (append) {
+    panelLoadingMoreVersions.value = true
+  } else {
+    panelRemoteLoading.value = true
+  }
+
+  const msg = await HttpUtils.get('api/panel-update-versions', {
+    offset: append ? panelVersionItems.value.length : 0,
+    limit: 5,
+  }, { silentAuthCheck: true })
+
+  if (seq !== panelVersionRequestSeq.value) {
+    return
+  }
+
+  if (append) {
+    panelLoadingMoreVersions.value = false
+  } else {
+    panelRemoteLoading.value = false
+  }
+
+  if (msg.success) {
+    applyPanelVersionResponse(msg.obj, append)
+    panelUpdateFeedback.value = append ? '已加载更多版本' : '检查完成，已选择最新版本'
+    panelUpdateFeedbackType.value = 'success'
+  } else if (msg.msg) {
+    panelUpdateFeedback.value = msg.msg
+    panelUpdateFeedbackType.value = 'error'
+  }
+}
+
+const checkPanelUpdates = async () => {
+  await loadPanelVersions(false)
+}
+
+const loadMorePanelVersions = async () => {
+  await loadPanelVersions(true)
+}
+
+const resetPanelVersions = () => {
+  panelVersionItems.value = panelVersionItems.value.slice(0, 5)
+  panelHasMoreVersions.value = true
+  if (panelVersionItems.value.length > 0) {
+    panelSelectedVersion.value = panelVersionItems.value[0].value
+  }
+}
+
+const openPanelInstallDialog = () => {
+  if (!panelSelectedVersion.value) return
+  panelInstallDialogVisible.value = true
+}
+
+const installPanelVersion = async () => {
+  if (!panelSelectedVersion.value) return
+  panelInstalling.value = true
+  const version = panelSelectedVersion.value
+  const msg = await HttpUtils.post('api/panel-update-install', { version }, { silentAuthCheck: true, timeout: 120000 })
+  panelInstalling.value = false
+  panelInstallDialogVisible.value = false
+
+  if (msg.success) {
+    panelUpdateFeedback.value = `已开始安装 ${version}，请等待面板自动重启后刷新页面。`
+    panelUpdateFeedbackType.value = 'info'
+    window.setTimeout(() => {
+      window.location.reload()
+    }, 12000)
+  } else {
+    panelUpdateFeedback.value = msg.msg || '安装失败'
+    panelUpdateFeedbackType.value = 'error'
+  }
 }
 
 const clearHeavyTabWarmupTimers = () => {

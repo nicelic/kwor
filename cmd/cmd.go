@@ -26,6 +26,8 @@ const (
 	defaultPanelPath = "/app/"
 )
 
+var kworProcessNames = []string{"kwor", "kwor_amd64", "kwor_arm64"}
+
 // getServiceFilePath returns the systemd service file path for kwor.
 func getServiceFilePath() string {
 	return "/etc/systemd/system/" + kworServiceName + ".service"
@@ -60,20 +62,17 @@ func getBinPath() string {
 
 // isProcessRunning checks whether a kwor process is running (excluding self).
 func isProcessRunning() bool {
-	out, err := exec.Command("pgrep", "-x", kworServiceName).Output()
-	if err != nil {
-		return false
-	}
-	pids := strings.TrimSpace(string(out))
-	if pids == "" {
-		return false
-	}
-
 	selfPid := strconv.Itoa(os.Getpid())
-	for _, pid := range strings.Split(pids, "\n") {
-		pid = strings.TrimSpace(pid)
-		if pid != "" && pid != selfPid {
-			return true
+	for _, processName := range kworProcessNames {
+		out, err := exec.Command("pgrep", "-x", processName).Output()
+		if err != nil {
+			continue
+		}
+		for _, pid := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			pid = strings.TrimSpace(pid)
+			if pid != "" && pid != selfPid {
+				return true
+			}
 		}
 	}
 	return false
@@ -147,23 +146,7 @@ func stopManagedChildService(serviceName string, processName string, label strin
 
 func createSystemdService() error {
 	binPath := getBinPath()
-	binDir := getBinDir()
-
-	serviceContent := fmt.Sprintf(`[Unit]
-Description=kwor Service
-After=network.target nss-lookup.target
-
-[Service]
-Type=simple
-WorkingDirectory=%s
-ExecStart=%s
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=infinity
-
-[Install]
-WantedBy=multi-user.target
-`, binDir, binPath)
+	serviceContent := service.BuildPanelSystemdServiceContent(binPath)
 
 	if err := os.WriteFile(getServiceFilePath(), []byte(serviceContent), 0o644); err != nil {
 		return fmt.Errorf("failed to create systemd service file: %v", err)
@@ -686,7 +669,9 @@ func handleStop() {
 		}
 	} else if isProcessRunning() {
 		fmt.Println("[kwor] force stopping kwor process...")
-		killProcessesByNameExceptSelf(kworServiceName)
+		for _, processName := range kworProcessNames {
+			killProcessesByNameExceptSelf(processName)
+		}
 		fmt.Println("[kwor] kwor process stopped")
 		stoppedSomething = true
 	}

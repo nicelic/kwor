@@ -57,6 +57,7 @@ type ApiService struct {
 	service.AcmeService
 	service.CertificateInventoryService
 	service.SelfSignedService
+	service.PanelUpdateService
 }
 
 type tlsSha256Request struct {
@@ -158,6 +159,10 @@ type kernelActionRequest struct {
 
 type kernelCleanupPurgeRequest struct {
 	Packages []string `json:"packages" form:"packages"`
+}
+
+type panelUpdateInstallRequest struct {
+	Version string `json:"version" form:"version"`
 }
 
 type kernelCleanupMarkerRequest struct {
@@ -2884,6 +2889,81 @@ func (a *ApiService) RefreshMihomoOutboundSubscription(c *gin.Context) {
 	}
 	data["result"] = result
 	jsonObj(c, data, nil)
+}
+
+func parsePanelVersionWindowQuery(c *gin.Context) (int, int) {
+	offset := 0
+	limit := 5
+
+	if offsetRaw := strings.TrimSpace(c.Query("offset")); offsetRaw != "" {
+		if parsed, err := strconv.Atoi(offsetRaw); err == nil && parsed >= 0 {
+			offset = parsed
+		}
+		if limitRaw := strings.TrimSpace(c.Query("limit")); limitRaw != "" {
+			if parsed, err := strconv.Atoi(limitRaw); err == nil && parsed > 0 {
+				limit = parsed
+			}
+		} else if perPageRaw := strings.TrimSpace(c.Query("per_page")); perPageRaw != "" {
+			if parsed, err := strconv.Atoi(perPageRaw); err == nil && parsed > 0 {
+				limit = parsed
+			}
+		}
+		return offset, limit
+	}
+
+	page := 1
+	if pageRaw := strings.TrimSpace(c.Query("page")); pageRaw != "" {
+		if parsed, err := strconv.Atoi(pageRaw); err == nil && parsed > 0 {
+			page = parsed
+		}
+	}
+	if limitRaw := strings.TrimSpace(c.Query("limit")); limitRaw != "" {
+		if parsed, err := strconv.Atoi(limitRaw); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	} else if perPageRaw := strings.TrimSpace(c.Query("per_page")); perPageRaw != "" {
+		if parsed, err := strconv.Atoi(perPageRaw); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	offset = (page - 1) * limit
+	return offset, limit
+}
+
+func (a *ApiService) GetPanelUpdateStatus(c *gin.Context) {
+	status, err := a.PanelUpdateService.GetStatus()
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, status, nil)
+}
+
+func (a *ApiService) GetPanelUpdateVersions(c *gin.Context) {
+	offset, limit := parsePanelVersionWindowQuery(c)
+	result, err := a.PanelUpdateService.GetRemoteVersions(offset, limit)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, result, nil)
+}
+
+func (a *ApiService) InstallPanelUpdate(c *gin.Context) {
+	version := strings.TrimSpace(c.Request.FormValue("version"))
+	if version == "" {
+		req := panelUpdateInstallRequest{}
+		if err := c.ShouldBind(&req); err == nil {
+			version = strings.TrimSpace(req.Version)
+		}
+	}
+
+	result, err := a.PanelUpdateService.Install(version)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, result, nil)
 }
 
 // === CoreManager API ===
