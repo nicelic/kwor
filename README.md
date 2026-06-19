@@ -29,11 +29,12 @@
 
 ## Default Installation Information
 
+- Default Install Directory: `/opt/kwor`
 - Panel Port: 8888
 - Panel Path: /app/
 - Subscription Port: 22780
 - Subscription Path: auto-generated random path on first initialization
-- Admin Credentials: interactive setup uses `admin/admin` by default; `install.sh` can generate random credentials if you skip configuration
+- Admin Credentials: interactive setup is handled by `kwor start` on first install
 
 ## Install & Upgrade to Latest Version
 
@@ -43,13 +44,22 @@
 bash <(curl -Ls https://raw.githubusercontent.com/nicelic/kwor/main/install.sh)
 ```
 
+The installer behavior is:
+
+1. Detect a running `kwor` process and upgrade in its current directory when possible.
+2. If no process is running, detect `kwor.service` and reuse the directory encoded in `ExecStart` or `WorkingDirectory`.
+3. If neither exists, perform a fresh install into `/opt/kwor`.
+4. Reuse the program's built-in `kwor stop` and `kwor start` flow for upgrades and first-run setup.
+
 ### Install legacy Version
 
-To install a specific version, add the version tag to the end of the command, e.g. `1.5.7`:
+To install a specific version, add the version tag to the end of the command, e.g. `v1.5.7`:
 
 ```sh
-VERSION=1.5.7 && bash <(curl -Ls https://raw.githubusercontent.com/nicelic/kwor/$VERSION/install.sh) $VERSION
+VERSION=v1.5.7 && bash <(curl -Ls https://raw.githubusercontent.com/nicelic/kwor/$VERSION/install.sh) $VERSION
 ```
+
+The installer also accepts a bare version such as `1.5.7` and normalizes it to `v1.5.7`.
 
 ## Manual installation (Linux)
 
@@ -60,32 +70,27 @@ VERSION=1.5.7 && bash <(curl -Ls https://raw.githubusercontent.com/nicelic/kwor/
    ```sh
    tar -zxvf kwor-linux-amd64.tar.gz
    ```
-3. Copy files into place:
+3. Copy the binary into place:
    ```sh
-   mkdir -p /usr/local/kwor
-   cp -f kwor/kwor /usr/local/kwor/
-   cp -f kwor/kwor.service /etc/systemd/system/
-   chmod +x /usr/local/kwor/kwor
+   mkdir -p /opt/kwor
+   cp -f kwor/kwor /opt/kwor/
+   chmod +x /opt/kwor/kwor
    ```
-4. Reload systemd and start the service:
+4. Start it with the built-in first-run flow:
    ```sh
-   systemctl daemon-reload
-   systemctl enable kwor --now
+   /opt/kwor/kwor start
    ```
-5. Show the panel URL and admin credentials:
+5. For later inspection:
    ```sh
-   /usr/local/kwor/kwor uri
-   /usr/local/kwor/kwor admin -show
+   /opt/kwor/kwor uri
+   /opt/kwor/kwor admin -show
    ```
 
 ## Uninstall
 
 ```sh
 sudo -i
-systemctl disable kwor --now
-rm -f /etc/systemd/system/kwor.service
-systemctl daemon-reload
-rm -fr /usr/local/kwor
+/opt/kwor/kwor uninstall
 ```
 
 ## Install using Docker
