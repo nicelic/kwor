@@ -70,27 +70,33 @@ The installer also accepts a bare version such as `1.5.7` and normalizes it to `
    ```sh
    tar -zxvf kwor-linux-amd64.tar.gz
    ```
-3. Copy the binary into place:
+3. Rename the binary for manual management:
+   ```sh
+   mv kwor kwor_amd64
+   ```
+4. Copy the binary into place:
    ```sh
    mkdir -p /opt/kwor
-   cp -f kwor/kwor /opt/kwor/
-   chmod +x /opt/kwor/kwor
+   cp -f kwor_amd64 /opt/kwor/
+   chmod +x /opt/kwor/kwor_amd64
    ```
-4. Start it with the built-in first-run flow:
+5. Start it with the built-in first-run flow:
    ```sh
-   /opt/kwor/kwor start
+   /opt/kwor/kwor_amd64 start
    ```
-5. For later inspection:
+6. Common manual management commands:
    ```sh
-   /opt/kwor/kwor uri
-   /opt/kwor/kwor admin -show
+   /opt/kwor/kwor_amd64 uri
+   /opt/kwor/kwor_amd64 admin -show
+   /opt/kwor/kwor_amd64 stop
+   /opt/kwor/kwor_amd64 uninstall
    ```
 
 ## Uninstall
 
 ```sh
 sudo -i
-/opt/kwor/kwor uninstall
+/opt/kwor/kwor_amd64 uninstall
 ```
 
 ## Install using Docker
