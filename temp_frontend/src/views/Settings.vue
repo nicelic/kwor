@@ -358,6 +358,16 @@
           </v-card-actions>
         </v-card>
       </v-dialog>
+
+      <v-overlay :model-value="panelRestartOverlay" class="align-center justify-center" persistent>
+        <v-card width="400" rounded="lg">
+          <v-card-text class="text-center py-8">
+            <v-progress-circular indeterminate size="52" width="5" color="primary" class="mb-4" />
+            <div class="text-subtitle-1 font-weight-medium">{{ $t('setting.panelRestartingTitle') }}</div>
+            <div class="text-caption text-medium-emphasis mt-2">{{ $t('setting.panelRestartingDesc') }}</div>
+          </v-card-text>
+        </v-card>
+      </v-overlay>
     </v-card-text>
   </v-card>
 </template>
@@ -420,6 +430,7 @@ const panelRemoteLoading = ref(false)
 const panelLoadingMoreVersions = ref(false)
 const panelInstalling = ref(false)
 const panelInstallDialogVisible = ref(false)
+const panelRestartOverlay = ref(false)
 const panelUpdateStatus = ref<PanelUpdateStatus | null>(null)
 const panelSelectedVersion = ref('')
 const panelVersionItems = ref<PanelVersionItem[]>([])
@@ -427,6 +438,7 @@ const panelHasMoreVersions = ref(false)
 const panelUpdateFeedback = ref('')
 const panelUpdateFeedbackType = ref<'success' | 'error' | 'info' | 'warning'>('info')
 const panelVersionRequestSeq = ref(0)
+const panelReconnectTimerId = ref<number | null>(null)
 
 const settings = ref({
   webListen: '',
@@ -606,23 +618,60 @@ const openPanelInstallDialog = () => {
   panelInstallDialogVisible.value = true
 }
 
+const clearPanelReconnectTimer = () => {
+  if (panelReconnectTimerId.value !== null) {
+    window.clearTimeout(panelReconnectTimerId.value)
+    panelReconnectTimerId.value = null
+  }
+}
+
+const startPanelReconnectPolling = () => {
+  clearPanelReconnectTimer()
+  panelRestartOverlay.value = true
+
+  const poll = async () => {
+    try {
+      const resp = await fetch('./api/session', {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+      })
+      if (resp.ok) {
+        const body = await resp.json()
+        if (body?.success === true) {
+          window.location.reload()
+          return
+        }
+      }
+    } catch {
+      // 等待面板恢复连接
+    }
+
+    panelReconnectTimerId.value = window.setTimeout(poll, 4000)
+  }
+
+  panelReconnectTimerId.value = window.setTimeout(poll, 6000)
+}
+
 const installPanelVersion = async () => {
   if (!panelSelectedVersion.value) return
   panelInstalling.value = true
   const version = panelSelectedVersion.value
-  const msg = await HttpUtils.post('api/panel-update-install', { version }, { silentAuthCheck: true, timeout: 120000 })
-  panelInstalling.value = false
-  panelInstallDialogVisible.value = false
+  try {
+    const msg = await HttpUtils.post('api/panel-update-install', { version }, { silentAuthCheck: true, timeout: 120000 })
+    panelInstallDialogVisible.value = false
 
-  if (msg.success) {
-    panelUpdateFeedback.value = `已开始安装 ${version}，请等待面板自动重启后刷新页面。`
-    panelUpdateFeedbackType.value = 'info'
-    window.setTimeout(() => {
-      window.location.reload()
-    }, 12000)
-  } else {
-    panelUpdateFeedback.value = msg.msg || '安装失败'
-    panelUpdateFeedbackType.value = 'error'
+    if (msg.success) {
+      panelUpdateFeedback.value = ''
+      panelUpdateFeedbackType.value = 'info'
+      await nextTick()
+      startPanelReconnectPolling()
+    } else {
+      panelUpdateFeedback.value = msg.msg || '安装失败'
+      panelUpdateFeedbackType.value = 'error'
+    }
+  } finally {
+    panelInstalling.value = false
   }
 }
 
@@ -660,6 +709,7 @@ watch(tab, value => {
 
 onBeforeUnmount(() => {
   clearHeavyTabWarmupTimers()
+  clearPanelReconnectTimer()
 })
 
 const save = async () => {

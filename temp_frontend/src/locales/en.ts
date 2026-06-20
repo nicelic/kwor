@@ -347,6 +347,8 @@
     path: "Default Path",
     update: "Automatic Update Time",
     subUri: "Subscription URI",
+    panelRestartingTitle: "Panel is restarting",
+    panelRestartingDesc: "Waiting for the panel to reconnect. This page will refresh automatically.",
     jsonSub: "JSON Subscription",
     toDirect: "Route to Direct",
     toBlock: "Route to Block",

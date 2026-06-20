@@ -345,6 +345,8 @@ export default {
     path: "默认路径",
     update: "自动更新时间",
     subUri: "订阅 URI",
+    panelRestartingTitle: "面板正在重启",
+    panelRestartingDesc: "正在等待面板恢复连接，页面会自动刷新。",
     jsonSub: "JSON 订阅",
     toDirect: "路由到直连",
     toBlock: "路由到阻止",
