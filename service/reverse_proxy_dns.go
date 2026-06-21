@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,29 +28,40 @@ const reverseProxyDNSShutdownTimeout = 5 * time.Second
 
 type reverseProxyDNSRuntimeManager struct {
 	mu      sync.Mutex
-	running map[uint]*reverseProxyDNSInstance
+	running map[string]*reverseProxyDNSInstance
 }
 
 type reverseProxyDNSInstance struct {
-	ruleID              uint
-	proxy               *dnsproxy.Proxy
-	h3Server            *http3.Server
-	h3PacketConns       []net.PacketConn
-	rule                *model.ReverseProxyRule
-	certificateStateKey string
-	cancel              context.CancelFunc
-	doneCh              chan struct{}
-	startErr            error
+	key             string
+	ruleID          uint
+	proxy           *dnsproxy.Proxy
+	h3Server        *http3.Server
+	h3PacketConns   []net.PacketConn
+	rules           []model.ReverseProxyRule
+	runtimeStateKey string
+	cancel          context.CancelFunc
+	doneCh          chan struct{}
+	startErr        error
 }
 
 type reverseProxyDNSRuleHandler struct {
+	defaultRoute *reverseProxyDNSRoute
+	routes       map[string]*reverseProxyDNSRoute
+	logger       *slog.Logger
+}
+
+type reverseProxyDNSRoute struct {
 	rule      *model.ReverseProxyRule
 	upstreams []dnsupstream.Upstream
-	logger    *slog.Logger
+}
+
+type reverseProxyDNSIPStrategyResolver struct {
+	base     dnsupstream.Resolver
+	strategy string
 }
 
 var reverseProxyDNSRuntime = &reverseProxyDNSRuntimeManager{
-	running: make(map[uint]*reverseProxyDNSInstance),
+	running: make(map[string]*reverseProxyDNSInstance),
 }
 
 func (m *reverseProxyDNSRuntimeManager) sync(service *ReverseProxyService, rows []model.ReverseProxyRule) error {
@@ -59,7 +71,7 @@ func (m *reverseProxyDNSRuntimeManager) sync(service *ReverseProxyService, rows 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	want := make(map[uint]model.ReverseProxyRule)
+	want := make(map[string][]model.ReverseProxyRule)
 	for i := range rows {
 		row := rows[i]
 		if !row.Enabled {
@@ -68,72 +80,58 @@ func (m *reverseProxyDNSRuntimeManager) sync(service *ReverseProxyService, rows 
 		if !reverseProxyProtocolIsDNS(normalizeReverseProxyProtocolAlias(row.ListenProtocolAlias, row.ListenProtocol)) {
 			continue
 		}
-		want[row.Id] = row
+		key := reverseProxyDNSInstanceKey(&row)
+		want[key] = append(want[key], row)
+	}
+	for key := range want {
+		sortReverseProxyDNSRules(want[key])
 	}
 	certificateState := loadReverseProxyCertificateRenderState(database.GetDB(), rows)
 
-	nextRunning := make(map[uint]*reverseProxyDNSInstance, len(want))
-	created := make(map[uint]*reverseProxyDNSInstance)
-	stopped := make(map[uint]*reverseProxyDNSInstance)
-	for id, row := range want {
-		certStateKey := reverseProxyDNSCertificateStateKey(&row, certificateState)
-		if instance, exists := m.running[id]; exists {
-			if reverseProxyDNSInstanceMatchesRule(instance, &row, certStateKey) {
-				nextRunning[id] = instance
+	nextRunning := make(map[string]*reverseProxyDNSInstance, len(want))
+	created := make(map[string]*reverseProxyDNSInstance)
+	stopped := make(map[string]*reverseProxyDNSInstance)
+	for key, groupRows := range want {
+		stateKey := reverseProxyDNSRuntimeStateKey(groupRows, certificateState)
+		if instance, exists := m.running[key]; exists {
+			if reverseProxyDNSInstanceMatchesRules(instance, groupRows, stateKey) {
+				nextRunning[key] = instance
 				continue
 			}
-			if reverseProxyDNSInstanceSharesListenerSocket(instance, &row) {
-				if err := instance.stop(); err != nil {
-					return err
-				}
-				stopped[id] = instance
+			if err := instance.stop(); err != nil {
+				return err
 			}
+			stopped[key] = instance
 		}
-		instance, err := newReverseProxyDNSInstance(service, &row, certStateKey)
+		instance, err := newReverseProxyDNSInstance(service, key, groupRows, stateKey)
 		if err != nil {
 			for _, item := range created {
 				_ = item.stop()
 			}
-			for oldID, oldInstance := range stopped {
-				if oldInstance == nil || oldInstance.rule == nil {
+			for oldKey, oldInstance := range stopped {
+				if oldInstance == nil || len(oldInstance.rules) == 0 {
 					continue
 				}
-				restored, restoreErr := newReverseProxyDNSInstance(service, oldInstance.rule, oldInstance.certificateStateKey)
+				restored, restoreErr := newReverseProxyDNSInstance(service, oldInstance.key, oldInstance.rules, oldInstance.runtimeStateKey)
 				if restoreErr != nil {
 					logger.Warning("reverse proxy dns runtime rollback failed: ", restoreErr)
 					continue
 				}
-				m.running[oldID] = restored
+				m.running[oldKey] = restored
 			}
 			return err
 		}
-		nextRunning[id] = instance
-		created[id] = instance
+		nextRunning[key] = instance
+		created[key] = instance
 	}
-	for id, instance := range m.running {
-		if _, exists := nextRunning[id]; exists {
+	for key, instance := range m.running {
+		if _, exists := nextRunning[key]; exists {
 			continue
 		}
 		_ = instance.stop()
 	}
 	m.running = nextRunning
 	return nil
-}
-
-func reverseProxyDNSInstanceSharesListenerSocket(instance *reverseProxyDNSInstance, row *model.ReverseProxyRule) bool {
-	if instance == nil || instance.rule == nil || row == nil {
-		return false
-	}
-	current := instance.rule
-	if current.ListenPort != row.ListenPort {
-		return false
-	}
-	currentAlias := normalizeReverseProxyProtocolAlias(current.ListenProtocolAlias, current.ListenProtocol)
-	nextAlias := normalizeReverseProxyProtocolAlias(row.ListenProtocolAlias, row.ListenProtocol)
-	if !reverseProxyDNSProtocolSharesSocket(currentAlias, nextAlias) {
-		return false
-	}
-	return reverseProxyListenIPSetsOverlap(decodeReverseProxyListenIPs(current), decodeReverseProxyListenIPs(row))
 }
 
 func reverseProxyListenIPSetsOverlap(a []string, b []string) bool {
@@ -170,6 +168,67 @@ func reverseProxyListenIPsOverlap(a string, b string) bool {
 	return left.IsUnspecified() || right.IsUnspecified()
 }
 
+func reverseProxyDNSInstanceKey(row *model.ReverseProxyRule) string {
+	if row == nil {
+		return ""
+	}
+	alias := normalizeReverseProxyProtocolAlias(row.ListenProtocolAlias, row.ListenProtocol)
+	listenIPs := decodeReverseProxyListenIPs(row)
+	if len(listenIPs) == 0 {
+		listenIPs = []string{"0.0.0.0"}
+	}
+	normalizedIPs := make([]string, 0, len(listenIPs))
+	for _, item := range listenIPs {
+		normalizedIPs = append(normalizedIPs, strings.ToLower(strings.TrimSpace(item)))
+	}
+	sort.Strings(normalizedIPs)
+	keyParts := []string{
+		alias,
+		fmt.Sprintf("%d", row.ListenPort),
+		strings.Join(normalizedIPs, ","),
+	}
+	if !reverseProxyDNSProtocolUsesPath(alias) {
+		keyParts = append(keyParts, fmt.Sprintf("%d", row.Id))
+	}
+	return strings.Join(keyParts, "|")
+}
+
+func sortReverseProxyDNSRules(rows []model.ReverseProxyRule) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].ListOrder == rows[j].ListOrder {
+			return rows[i].Id < rows[j].Id
+		}
+		return rows[i].ListOrder < rows[j].ListOrder
+	})
+}
+
+func reverseProxyDNSRuntimeStateKey(rows []model.ReverseProxyRule, certificateState map[uint]model.CertificateRecord) string {
+	parts := make([]string, 0, len(rows))
+	for i := range rows {
+		row := rows[i]
+		parts = append(parts, strings.Join([]string{
+			fmt.Sprintf("%d", row.Id),
+			fmt.Sprintf("%d", row.ListOrder),
+			row.ListenProtocol,
+			row.ListenProtocolAlias,
+			row.ListenIPList,
+			fmt.Sprintf("%d", row.ListenPort),
+			row.ListenDNSPath,
+			row.TargetProtocol,
+			row.TargetProtocolAlias,
+			row.TargetAddresses,
+			fmt.Sprintf("%d", row.TargetPort),
+			row.TargetDNSPath,
+			row.IPStrategy,
+			fmt.Sprintf("%t", row.UpstreamTLSVerify),
+			row.CertificateRecordList,
+			fmt.Sprintf("%d", row.CertificateRecordID),
+			reverseProxyDNSCertificateStateKey(&row, certificateState),
+		}, "\x1f"))
+	}
+	return strings.Join(parts, "\x1e")
+}
+
 func (m *reverseProxyDNSRuntimeManager) stopAll() error {
 	if m == nil {
 		return nil
@@ -186,47 +245,34 @@ func (m *reverseProxyDNSRuntimeManager) stopAll() error {
 	return firstErr
 }
 
-func reverseProxyDNSInstanceMatchesRule(instance *reverseProxyDNSInstance, row *model.ReverseProxyRule, certificateStateKey string) bool {
-	if instance == nil || row == nil || instance.rule == nil {
+func reverseProxyDNSInstanceMatchesRules(instance *reverseProxyDNSInstance, rows []model.ReverseProxyRule, stateKey string) bool {
+	if instance == nil {
 		return false
 	}
-	current := instance.rule
-	return current.ListenProtocol == row.ListenProtocol &&
-		current.ListenProtocolAlias == row.ListenProtocolAlias &&
-		current.ListenPort == row.ListenPort &&
-		current.ListenIPList == row.ListenIPList &&
-		current.ListenDNSPath == row.ListenDNSPath &&
-		current.TargetProtocol == row.TargetProtocol &&
-		current.TargetProtocolAlias == row.TargetProtocolAlias &&
-		current.TargetAddresses == row.TargetAddresses &&
-		current.TargetPort == row.TargetPort &&
-		current.TargetDNSPath == row.TargetDNSPath &&
-		current.UpstreamTLSVerify == row.UpstreamTLSVerify &&
-		current.CertificateRecordList == row.CertificateRecordList &&
-		current.CertificateRecordID == row.CertificateRecordID &&
-		instance.certificateStateKey == certificateStateKey
+	return instance.runtimeStateKey == stateKey
 }
 
-func newReverseProxyDNSInstance(service *ReverseProxyService, row *model.ReverseProxyRule, certificateStateKey string) (*reverseProxyDNSInstance, error) {
-	if service == nil || row == nil {
+func newReverseProxyDNSInstance(service *ReverseProxyService, key string, rows []model.ReverseProxyRule, stateKey string) (*reverseProxyDNSInstance, error) {
+	if service == nil || len(rows) == 0 {
 		return nil, errors.New("dns reverse proxy instance init failed: invalid rule")
 	}
+	row := &rows[0]
 
-	handler, err := buildReverseProxyDNSRuleHandler(row)
+	handler, err := buildReverseProxyDNSRuleHandler(rows)
 	if err != nil {
 		return nil, err
 	}
 
-	conf, err := buildReverseProxyDNSProxyConfig(service, row, handler)
+	conf, err := buildReverseProxyDNSProxyConfig(service, rows, handler)
 	if err != nil {
-		closeReverseProxyDNSUpstreams(handler.upstreams)
+		closeReverseProxyDNSHandler(handler)
 		return nil, err
 	}
 
 	if normalizeReverseProxyProtocolAlias(row.ListenProtocolAlias, row.ListenProtocol) == reverseProxyDNSProtocolDoHH3 {
-		instance, err := buildReverseProxyDNSH3OnlyRuntime(row, conf.TLSConfig, handler, certificateStateKey)
+		instance, err := buildReverseProxyDNSH3OnlyRuntime(key, rows, conf.TLSConfig, handler, stateKey)
 		if err != nil {
-			closeReverseProxyDNSUpstreams(handler.upstreams)
+			closeReverseProxyDNSHandler(handler)
 			return nil, err
 		}
 		return instance, nil
@@ -234,27 +280,28 @@ func newReverseProxyDNSInstance(service *ReverseProxyService, row *model.Reverse
 
 	proxyInstance, err := dnsproxy.New(conf)
 	if err != nil {
-		closeReverseProxyDNSUpstreams(handler.upstreams)
+		closeReverseProxyDNSHandler(handler)
 		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	instance := &reverseProxyDNSInstance{
-		ruleID:              row.Id,
-		proxy:               proxyInstance,
-		rule:                cloneReverseProxyRule(row),
-		certificateStateKey: certificateStateKey,
-		cancel:              cancel,
-		doneCh:              make(chan struct{}),
+		key:             key,
+		ruleID:          row.Id,
+		proxy:           proxyInstance,
+		rules:           cloneReverseProxyRules(rows),
+		runtimeStateKey: stateKey,
+		cancel:          cancel,
+		doneCh:          make(chan struct{}),
 	}
 
 	if err := proxyInstance.Start(ctx); err != nil {
 		cancel()
-		closeReverseProxyDNSUpstreams(handler.upstreams)
+		closeReverseProxyDNSHandler(handler)
 		return nil, translateReverseProxyDNSError(row, err)
 	}
 
-	_ = database.GetDB().Model(&model.ReverseProxyRule{}).Where("id = ?", row.Id).Updates(map[string]interface{}{
+	_ = database.GetDB().Model(&model.ReverseProxyRule{}).Where("id IN ?", reverseProxyDNSRuleIDs(rows)).Updates(map[string]interface{}{
 		"last_error":     "",
 		"runtime_status": "running",
 	}).Error
@@ -304,10 +351,11 @@ func (i *reverseProxyDNSInstance) stop() error {
 	return firstErr
 }
 
-func buildReverseProxyDNSProxyConfig(service *ReverseProxyService, row *model.ReverseProxyRule, handler *reverseProxyDNSRuleHandler) (*dnsproxy.Config, error) {
-	if row == nil || handler == nil {
+func buildReverseProxyDNSProxyConfig(service *ReverseProxyService, rows []model.ReverseProxyRule, handler *reverseProxyDNSRuleHandler) (*dnsproxy.Config, error) {
+	if len(rows) == 0 || handler == nil {
 		return nil, errors.New("dns reverse proxy config failed: invalid rule")
 	}
+	row := &rows[0]
 	listenAlias := normalizeReverseProxyProtocolAlias(row.ListenProtocolAlias, row.ListenProtocol)
 	targetAlias := normalizeReverseProxyProtocolAlias(row.TargetProtocolAlias, row.TargetProtocol)
 
@@ -315,7 +363,7 @@ func buildReverseProxyDNSProxyConfig(service *ReverseProxyService, row *model.Re
 		RequestHandler: dnsproxy.HandlerFunc(handler.ServeDNS),
 		UpstreamMode:   dnsproxy.UpstreamModeLoadBalance,
 		UpstreamConfig: &dnsproxy.UpstreamConfig{
-			Upstreams: append([]dnsupstream.Upstream(nil), handler.upstreams...),
+			Upstreams: reverseProxyDNSHandlerUpstreams(handler),
 		},
 		Logger: slog.Default(),
 	}
@@ -330,14 +378,14 @@ func buildReverseProxyDNSProxyConfig(service *ReverseProxyService, row *model.Re
 	case reverseProxyDNSProtocolTCP:
 		conf.TCPListenAddr = buildReverseProxyDNSTCPListenAddrs(listenIPs, row.ListenPort)
 	case reverseProxyDNSProtocolDoT:
-		tlsConfig, err := buildReverseProxyDNSServerTLSConfig(service, row, []string{"dot", "dns"})
+		tlsConfig, err := buildReverseProxyDNSServerTLSConfig(service, rows, []string{"dot", "dns"})
 		if err != nil {
 			return nil, err
 		}
 		conf.TLSConfig = tlsConfig
 		conf.TLSListenAddr = buildReverseProxyDNSTCPListenAddrs(listenIPs, row.ListenPort)
 	case reverseProxyDNSProtocolDoQ:
-		tlsConfig, err := buildReverseProxyDNSServerTLSConfig(service, row, []string{"doq"})
+		tlsConfig, err := buildReverseProxyDNSServerTLSConfig(service, rows, []string{"doq"})
 		if err != nil {
 			return nil, err
 		}
@@ -345,12 +393,26 @@ func buildReverseProxyDNSProxyConfig(service *ReverseProxyService, row *model.Re
 		conf.TLSConfig = tlsConfig
 		conf.QUICListenAddr = buildReverseProxyDNSUDPListenAddrs(listenIPs, row.ListenPort)
 	case reverseProxyDNSProtocolDoH, reverseProxyDNSProtocolDoHH3:
-		tlsConfig, err := buildReverseProxyDNSServerTLSConfig(service, row, []string{"h2", "http/1.1", "h3"})
+		nextProtos := []string{"h2", "http/1.1", "h3"}
+		if listenAlias == reverseProxyDNSProtocolDoHH3 {
+			nextProtos = []string{"h3"}
+		}
+		tlsConfig, err := buildReverseProxyDNSServerTLSConfig(service, rows, nextProtos)
 		if err != nil {
 			return nil, err
 		}
 		conf.TLSConfig = tlsConfig
-		routes := buildReverseProxyDNSDoHRoutes(strings.TrimSpace(row.ListenDNSPath))
+		routes := make([]string, 0, len(rows)*2)
+		routeSet := make(map[string]struct{}, len(rows)*2)
+		for _, item := range rows {
+			for _, route := range buildReverseProxyDNSDoHRoutes(strings.TrimSpace(item.ListenDNSPath)) {
+				if _, exists := routeSet[route]; exists {
+					continue
+				}
+				routeSet[route] = struct{}{}
+				routes = append(routes, route)
+			}
+		}
 		conf.HTTPConfig = &dnsproxy.HTTPConfig{
 			ListenAddresses: buildReverseProxyDNSDoHListenAddrs(listenIPs, row.ListenPort),
 			Routes:          routes,
@@ -367,15 +429,16 @@ func buildReverseProxyDNSProxyConfig(service *ReverseProxyService, row *model.Re
 	return conf, nil
 }
 
-func buildReverseProxyDNSH3OnlyRuntime(row *model.ReverseProxyRule, tlsConfig *tls.Config, handler *reverseProxyDNSRuleHandler, certificateStateKey string) (*reverseProxyDNSInstance, error) {
-	if row == nil || tlsConfig == nil || handler == nil {
+func buildReverseProxyDNSH3OnlyRuntime(key string, rows []model.ReverseProxyRule, tlsConfig *tls.Config, handler *reverseProxyDNSRuleHandler, stateKey string) (*reverseProxyDNSInstance, error) {
+	if len(rows) == 0 || tlsConfig == nil || handler == nil {
 		return nil, errors.New("dns h3 runtime config failed")
 	}
+	row := &rows[0]
 	conf := &dnsproxy.Config{
 		RequestHandler: dnsproxy.HandlerFunc(handler.ServeDNS),
 		UpstreamMode:   dnsproxy.UpstreamModeLoadBalance,
 		UpstreamConfig: &dnsproxy.UpstreamConfig{
-			Upstreams: append([]dnsupstream.Upstream(nil), handler.upstreams...),
+			Upstreams: reverseProxyDNSHandlerUpstreams(handler),
 		},
 		HTTPConfig: &dnsproxy.HTTPConfig{},
 		Logger:     slog.Default(),
@@ -385,8 +448,15 @@ func buildReverseProxyDNSH3OnlyRuntime(row *model.ReverseProxyRule, tlsConfig *t
 		return nil, err
 	}
 	mux := http.NewServeMux()
-	for _, route := range buildReverseProxyDNSDoHRoutes(strings.TrimSpace(row.ListenDNSPath)) {
-		mux.Handle(route, proxyInstance)
+	registeredRoutes := make(map[string]struct{}, len(rows)*2)
+	for _, item := range rows {
+		for _, route := range buildReverseProxyDNSDoHRoutes(strings.TrimSpace(item.ListenDNSPath)) {
+			if _, exists := registeredRoutes[route]; exists {
+				continue
+			}
+			registeredRoutes[route] = struct{}{}
+			mux.Handle(route, proxyInstance)
+		}
 	}
 	h3Server := &http3.Server{
 		Handler:   mux,
@@ -416,48 +486,77 @@ func buildReverseProxyDNSH3OnlyRuntime(row *model.ReverseProxyRule, tlsConfig *t
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	instance := &reverseProxyDNSInstance{
-		ruleID:              row.Id,
-		proxy:               nil,
-		h3Server:            h3Server,
-		h3PacketConns:       packetConns,
-		rule:                cloneReverseProxyRule(row),
-		certificateStateKey: certificateStateKey,
-		cancel:              cancel,
-		doneCh:              make(chan struct{}),
+		key:             key,
+		ruleID:          row.Id,
+		proxy:           nil,
+		h3Server:        h3Server,
+		h3PacketConns:   packetConns,
+		rules:           cloneReverseProxyRules(rows),
+		runtimeStateKey: stateKey,
+		cancel:          cancel,
+		doneCh:          make(chan struct{}),
 	}
 	go func() {
 		<-ctx.Done()
 		close(instance.doneCh)
 	}()
-	_ = database.GetDB().Model(&model.ReverseProxyRule{}).Where("id = ?", row.Id).Updates(map[string]interface{}{
+	_ = database.GetDB().Model(&model.ReverseProxyRule{}).Where("id IN ?", reverseProxyDNSRuleIDs(rows)).Updates(map[string]interface{}{
 		"last_error":     "",
 		"runtime_status": "running",
 	}).Error
 	return instance, nil
 }
 
-func buildReverseProxyDNSRuleHandler(row *model.ReverseProxyRule) (*reverseProxyDNSRuleHandler, error) {
+func buildReverseProxyDNSRuleHandler(rows []model.ReverseProxyRule) (*reverseProxyDNSRuleHandler, error) {
+	if len(rows) == 0 {
+		return nil, errors.New("dns reverse proxy handler init failed: invalid rule")
+	}
+	handler := &reverseProxyDNSRuleHandler{
+		routes: make(map[string]*reverseProxyDNSRoute),
+		logger: slog.Default(),
+	}
+	for i := range rows {
+		route, err := buildReverseProxyDNSRoute(&rows[i])
+		if err != nil {
+			closeReverseProxyDNSHandler(handler)
+			return nil, err
+		}
+		if handler.defaultRoute == nil {
+			handler.defaultRoute = route
+		}
+		alias := normalizeReverseProxyProtocolAlias(rows[i].ListenProtocolAlias, rows[i].ListenProtocol)
+		if reverseProxyDNSProtocolUsesPath(alias) {
+			path := normalizeReverseProxyDNSPath(rows[i].ListenDNSPath)
+			if path == "" {
+				path = "/dns-query"
+			}
+			if _, exists := handler.routes[path]; exists {
+				closeReverseProxyDNSUpstreams(route.upstreams)
+				closeReverseProxyDNSHandler(handler)
+				return nil, fmt.Errorf("duplicate dns listener path: %s", path)
+			}
+			handler.routes[path] = route
+		}
+	}
+	return handler, nil
+}
+
+func buildReverseProxyDNSRoute(row *model.ReverseProxyRule) (*reverseProxyDNSRoute, error) {
 	targetAlias := normalizeReverseProxyProtocolAlias(row.TargetProtocolAlias, row.TargetProtocol)
 	targets := decodeReverseProxyList(row.TargetAddresses)
 	if len(targets) == 0 {
 		return nil, errors.New("dns reverse proxy target is empty")
 	}
 
-	opts := &dnsupstream.Options{
-		Timeout:            12 * time.Second,
-		InsecureSkipVerify: !row.UpstreamTLSVerify,
-		Logger:             slog.Default(),
-	}
-	if targetAlias == reverseProxyDNSProtocolDoH {
-		opts.HTTPVersions = []dnsupstream.HTTPVersion{dnsupstream.HTTPVersion11, dnsupstream.HTTPVersion2}
-	}
-	if targetAlias == reverseProxyDNSProtocolDoHH3 {
-		opts.HTTPVersions = []dnsupstream.HTTPVersion{dnsupstream.HTTPVersion3}
-	}
+	opts := buildReverseProxyDNSUpstreamOptions(row, targetAlias)
 
 	upstreams := make([]dnsupstream.Upstream, 0, len(targets))
 	for _, target := range targets {
-		address, err := buildReverseProxyDNSUpstreamAddress(targetAlias, target, row.TargetPort, row.TargetDNSPath)
+		targetPath := row.TargetDNSPath
+		if reverseProxyDNSProtocolUsesPath(targetAlias) && strings.TrimSpace(targetPath) == "" {
+			targetPath = "/dns-query"
+		}
+		address, err := buildReverseProxyDNSUpstreamAddress(targetAlias, target, row.TargetPort, targetPath)
 		if err != nil {
 			closeReverseProxyDNSUpstreams(upstreams)
 			return nil, err
@@ -470,10 +569,9 @@ func buildReverseProxyDNSRuleHandler(row *model.ReverseProxyRule) (*reverseProxy
 		upstreams = append(upstreams, ups)
 	}
 
-	return &reverseProxyDNSRuleHandler{
+	return &reverseProxyDNSRoute{
 		rule:      cloneReverseProxyRule(row),
 		upstreams: upstreams,
-		logger:    slog.Default(),
 	}, nil
 }
 
@@ -481,15 +579,24 @@ func (h *reverseProxyDNSRuleHandler) ServeDNS(ctx context.Context, _ *dnsproxy.P
 	if h == nil || dctx == nil || dctx.Req == nil {
 		return errors.New("dns reverse proxy handler received empty request")
 	}
+	route := h.defaultRoute
+	if dctx.HTTPRequest != nil && dctx.HTTPRequest.URL != nil {
+		if selected := h.routes[normalizeReverseProxyDNSPath(dctx.HTTPRequest.URL.Path)]; selected != nil {
+			route = selected
+		}
+	}
+	if route == nil || route.rule == nil {
+		return errors.New("dns reverse proxy route is unavailable")
+	}
 	var firstErr error
-	for _, ups := range h.upstreams {
+	for _, ups := range route.upstreams {
 		if ups == nil {
 			continue
 		}
 		resp, err := ups.Exchange(dctx.Req.Copy())
 		if err == nil && resp != nil {
 			dctx.Res = resp
-			_ = database.GetDB().Model(&model.ReverseProxyRule{}).Where("id = ?", h.rule.Id).Updates(map[string]interface{}{
+			_ = database.GetDB().Model(&model.ReverseProxyRule{}).Where("id = ?", route.rule.Id).Updates(map[string]interface{}{
 				"last_error":     "",
 				"runtime_status": "running",
 			}).Error
@@ -502,11 +609,58 @@ func (h *reverseProxyDNSRuleHandler) ServeDNS(ctx context.Context, _ *dnsproxy.P
 	if firstErr == nil {
 		firstErr = errors.New("all dns upstreams failed")
 	}
-	_ = database.GetDB().Model(&model.ReverseProxyRule{}).Where("id = ?", h.rule.Id).Updates(map[string]interface{}{
+	_ = database.GetDB().Model(&model.ReverseProxyRule{}).Where("id = ?", route.rule.Id).Updates(map[string]interface{}{
 		"last_error":     strings.TrimSpace(firstErr.Error()),
 		"runtime_status": "upstream_error",
 	}).Error
 	return firstErr
+}
+
+func buildReverseProxyDNSUpstreamOptions(row *model.ReverseProxyRule, targetAlias string) *dnsupstream.Options {
+	opts := &dnsupstream.Options{
+		Timeout:            12 * time.Second,
+		InsecureSkipVerify: !row.UpstreamTLSVerify,
+		Logger:             slog.Default(),
+		Bootstrap: reverseProxyDNSIPStrategyResolver{
+			base:     net.DefaultResolver,
+			strategy: row.IPStrategy,
+		},
+		PreferIPv6: strings.EqualFold(strings.TrimSpace(row.IPStrategy), reverseProxyIPStrategyPreferIPv6) ||
+			strings.EqualFold(strings.TrimSpace(row.IPStrategy), reverseProxyIPStrategyIPv6Only),
+	}
+	if targetAlias == reverseProxyDNSProtocolDoH {
+		opts.HTTPVersions = []dnsupstream.HTTPVersion{dnsupstream.HTTPVersion11, dnsupstream.HTTPVersion2}
+	}
+	if targetAlias == reverseProxyDNSProtocolDoHH3 {
+		opts.HTTPVersions = []dnsupstream.HTTPVersion{dnsupstream.HTTPVersion3}
+	}
+	return opts
+}
+
+func (r reverseProxyDNSIPStrategyResolver) LookupNetIP(ctx context.Context, network string, host string) ([]netip.Addr, error) {
+	base := r.base
+	if base == nil {
+		base = net.DefaultResolver
+	}
+	addrs, err := base.LookupNetIP(ctx, network, host)
+	if err != nil {
+		return nil, err
+	}
+	strategy := strings.ToLower(strings.TrimSpace(r.strategy))
+	if strategy != reverseProxyIPStrategyIPv4Only && strategy != reverseProxyIPStrategyIPv6Only {
+		return addrs, nil
+	}
+	filtered := make([]netip.Addr, 0, len(addrs))
+	for _, addr := range addrs {
+		if strategy == reverseProxyIPStrategyIPv4Only && addr.Is4() {
+			filtered = append(filtered, addr)
+			continue
+		}
+		if strategy == reverseProxyIPStrategyIPv6Only && addr.Is6() {
+			filtered = append(filtered, addr)
+		}
+	}
+	return filtered, nil
 }
 
 func buildReverseProxyDNSUpstreamAddress(alias string, target string, port int, path string) (string, error) {
@@ -532,19 +686,31 @@ func buildReverseProxyDNSUpstreamAddress(alias string, target string, port int, 
 	}
 }
 
-func buildReverseProxyDNSServerTLSConfig(service *ReverseProxyService, row *model.ReverseProxyRule, nextProtos []string) (*tls.Config, error) {
-	if service == nil || row == nil {
+func buildReverseProxyDNSServerTLSConfig(service *ReverseProxyService, rows []model.ReverseProxyRule, nextProtos []string) (*tls.Config, error) {
+	if service == nil || len(rows) == 0 {
 		return nil, errors.New("dns reverse proxy tls config failed")
 	}
-	certIDs := reverseProxyRuleCertificateIDs(row)
-	if len(certIDs) == 0 {
+	rulePtrs := make([]*model.ReverseProxyRule, 0, len(rows))
+	hasCertificate := false
+	for i := range rows {
+		if len(reverseProxyRuleCertificateIDs(&rows[i])) > 0 {
+			hasCertificate = true
+		}
+		rulePtrs = append(rulePtrs, &rows[i])
+	}
+	if !hasCertificate {
 		return nil, errors.New("dns tls listener requires certificate")
 	}
-	bindings, _, err := service.loadRuleCertificates([]*model.ReverseProxyRule{row})
+	_, orderedItems, err := service.loadRuleCertificates(rulePtrs)
 	if err != nil {
 		return nil, err
 	}
-	items := bindings[row.Id]
+	items := make([]*reverseProxyRuleCertificateBinding, 0, len(orderedItems))
+	for _, item := range orderedItems {
+		if item != nil {
+			items = append(items, item)
+		}
+	}
 	if len(items) == 0 {
 		return nil, errors.New("dns tls listener certificate is unavailable")
 	}
@@ -580,7 +746,7 @@ func buildReverseProxyDNSServerTLSConfig(service *ReverseProxyService, row *mode
 	if len(nextProtos) > 0 {
 		config.NextProtos = append([]string(nil), nextProtos...)
 	}
-	if normalizeReverseProxyProtocolAlias(row.ListenProtocolAlias, row.ListenProtocol) == reverseProxyDNSProtocolDoQ {
+	if normalizeReverseProxyProtocolAlias(rows[0].ListenProtocolAlias, rows[0].ListenProtocol) == reverseProxyDNSProtocolDoQ {
 		config.MinVersion = tls.VersionTLS13
 	}
 	return config, nil
@@ -643,12 +809,68 @@ func cloneReverseProxyRule(row *model.ReverseProxyRule) *model.ReverseProxyRule 
 	return &clone
 }
 
+func cloneReverseProxyRules(rows []model.ReverseProxyRule) []model.ReverseProxyRule {
+	out := make([]model.ReverseProxyRule, len(rows))
+	copy(out, rows)
+	return out
+}
+
+func reverseProxyDNSRuleIDs(rows []model.ReverseProxyRule) []uint {
+	ids := make([]uint, 0, len(rows))
+	for i := range rows {
+		if rows[i].Id > 0 {
+			ids = append(ids, rows[i].Id)
+		}
+	}
+	return ids
+}
+
 func closeReverseProxyDNSUpstreams(items []dnsupstream.Upstream) {
 	for _, item := range items {
 		if item != nil {
 			_ = item.Close()
 		}
 	}
+}
+
+func reverseProxyDNSHandlerUpstreams(handler *reverseProxyDNSRuleHandler) []dnsupstream.Upstream {
+	if handler == nil {
+		return nil
+	}
+	seen := make(map[dnsupstream.Upstream]struct{})
+	out := make([]dnsupstream.Upstream, 0)
+	for _, route := range handler.routes {
+		if route == nil {
+			continue
+		}
+		for _, ups := range route.upstreams {
+			if ups == nil {
+				continue
+			}
+			if _, exists := seen[ups]; exists {
+				continue
+			}
+			seen[ups] = struct{}{}
+			out = append(out, ups)
+		}
+	}
+	if handler.defaultRoute != nil {
+		for _, ups := range handler.defaultRoute.upstreams {
+			if ups == nil {
+				continue
+			}
+			if _, exists := seen[ups]; exists {
+				continue
+			}
+			seen[ups] = struct{}{}
+			out = append(out, ups)
+		}
+	}
+	return out
+}
+
+func closeReverseProxyDNSHandler(handler *reverseProxyDNSRuleHandler) {
+	closeReverseProxyDNSUpstreams(reverseProxyDNSHandlerUpstreams(handler))
 }
 
 func translateReverseProxyDNSError(row *model.ReverseProxyRule, err error) error {
@@ -682,15 +904,16 @@ func (m *reverseProxyDNSRuntimeManager) listenerCount() int {
 
 	count := 0
 	for _, instance := range m.running {
-		if instance == nil || instance.rule == nil {
+		if instance == nil || len(instance.rules) == 0 {
 			continue
 		}
-		alias := normalizeReverseProxyProtocolAlias(instance.rule.ListenProtocolAlias, instance.rule.ListenProtocol)
+		rule := &instance.rules[0]
+		alias := normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
 		if len(instance.h3PacketConns) > 0 {
 			count += len(instance.h3PacketConns)
 			continue
 		}
-		listenIPs := decodeReverseProxyListenIPs(instance.rule)
+		listenIPs := decodeReverseProxyListenIPs(rule)
 		if len(listenIPs) == 0 {
 			listenIPs = []string{"0.0.0.0"}
 		}

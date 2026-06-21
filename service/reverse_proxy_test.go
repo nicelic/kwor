@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -268,7 +269,7 @@ func TestValidateNormalizedDNSRuleRejectsPlainDNSCertificateBinding(t *testing.T
 	}
 }
 
-func TestValidateNormalizedDNSRuleRejectsSharedDoHSocketOnSamePort(t *testing.T) {
+func TestValidateNormalizedDNSRuleAllowsDifferentDoHPathsOnSameSocket(t *testing.T) {
 	openReverseProxyTestDB(t)
 	firstCertID := createReverseProxyTestCertificateRecord(t, "dns-one.example.com")
 	secondCertID := createReverseProxyTestCertificateRecord(t, "dns-two.example.com")
@@ -309,8 +310,54 @@ func TestValidateNormalizedDNSRuleRejectsSharedDoHSocketOnSamePort(t *testing.T)
 		certificateRecordID:  secondCertID,
 		ipStrategy:           reverseProxyIPStrategyPreferIPv4,
 	})
+	if err != nil {
+		t.Fatalf("expected different doh paths to share the same listener socket, got %v", err)
+	}
+}
+
+func TestValidateNormalizedDNSRuleRejectsDuplicateDoHPathOnSameSocket(t *testing.T) {
+	openReverseProxyTestDB(t)
+	firstCertID := createReverseProxyTestCertificateRecord(t, "dns-one.example.com")
+	secondCertID := createReverseProxyTestCertificateRecord(t, "dns-two.example.com")
+
+	existing := model.ReverseProxyRule{
+		DisplayID:             1,
+		ListOrder:             1,
+		Name:                  "existing-doh",
+		Enabled:               true,
+		ListenProtocol:        reverseProxyProtocolDNS,
+		ListenProtocolAlias:   reverseProxyDNSProtocolDoH,
+		ListenIPList:          `["0.0.0.0"]`,
+		ListenPort:            4443,
+		ListenDNSPath:         "/dns-query",
+		TargetProtocol:        reverseProxyProtocolDNS,
+		TargetProtocolAlias:   reverseProxyDNSProtocolUDP,
+		TargetAddresses:       `["1.1.1.1"]`,
+		TargetPort:            53,
+		CertificateRecordList: encodeReverseProxyUintList([]uint{firstCertID}),
+		CertificateRecordID:   firstCertID,
+		IPStrategy:            reverseProxyIPStrategyPreferIPv4,
+	}
+	if err := database.GetDB().Create(&existing).Error; err != nil {
+		t.Fatalf("create dns rule failed: %v", err)
+	}
+
+	err := (&ReverseProxyService{}).validateNormalizedDNSRule(database.GetDB(), reverseProxyNormalizedRule{
+		listenProtocol:       reverseProxyProtocolDNS,
+		listenProtocolAlias:  reverseProxyDNSProtocolDoH,
+		listenPort:           4443,
+		listenDNSPath:        "/dns-query",
+		listenIPs:            []string{"0.0.0.0"},
+		targetProtocol:       reverseProxyProtocolDNS,
+		targetProtocolAlias:  reverseProxyDNSProtocolTCP,
+		targetAddresses:      []string{"8.8.8.8"},
+		targetPort:           53,
+		certificateRecordIDs: []uint{secondCertID},
+		certificateRecordID:  secondCertID,
+		ipStrategy:           reverseProxyIPStrategyPreferIPv4,
+	})
 	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "conflicts with existing dns listener") {
-		t.Fatalf("expected shared doh socket to conflict, got %v", err)
+		t.Fatalf("expected duplicate doh path to conflict, got %v", err)
 	}
 }
 
@@ -405,6 +452,96 @@ func TestReverseProxyDNSDoH3OnlyRoutesRestrictPath(t *testing.T) {
 	mux.ServeHTTP(missRec, missReq)
 	if missRec.Code != http.StatusNotFound || called != 1 {
 		t.Fatalf("expected unconfigured doh3 route to be rejected, status=%d called=%d", missRec.Code, called)
+	}
+}
+
+func TestBuildReverseProxyDNSProxyConfigDoHEnablesHTTP3(t *testing.T) {
+	openReverseProxyTestDB(t)
+	certID := createReverseProxyTestCertificateRecord(t, "dns-config.example.com")
+
+	rows := []model.ReverseProxyRule{
+		{
+			Id:                    1,
+			ListOrder:             1,
+			Enabled:               true,
+			ListenProtocol:        reverseProxyProtocolDNS,
+			ListenProtocolAlias:   reverseProxyDNSProtocolDoH,
+			ListenIPList:          `["127.0.0.1"]`,
+			ListenPort:            443,
+			ListenDNSPath:         "/dns-query",
+			TargetProtocol:        reverseProxyProtocolDNS,
+			TargetProtocolAlias:   reverseProxyDNSProtocolUDP,
+			TargetAddresses:       `["1.1.1.1"]`,
+			TargetPort:            53,
+			CertificateRecordList: encodeReverseProxyUintList([]uint{certID}),
+			CertificateRecordID:   certID,
+			IPStrategy:            reverseProxyIPStrategyPreferIPv4,
+		},
+	}
+	handler, err := buildReverseProxyDNSRuleHandler(rows)
+	if err != nil {
+		t.Fatalf("build doh handler failed: %v", err)
+	}
+	defer closeReverseProxyDNSHandler(handler)
+
+	conf, err := buildReverseProxyDNSProxyConfig(&ReverseProxyService{}, rows, handler)
+	if err != nil {
+		t.Fatalf("build doh config failed: %v", err)
+	}
+	if conf.HTTPConfig == nil || !conf.HTTPConfig.HTTP3Enabled {
+		t.Fatalf("doh listener should enable both https and h3, got %#v", conf.HTTPConfig)
+	}
+
+	rows[0].ListenProtocolAlias = reverseProxyDNSProtocolDoHH3
+	h3Handler, err := buildReverseProxyDNSRuleHandler(rows)
+	if err != nil {
+		t.Fatalf("build doh3 handler failed: %v", err)
+	}
+	defer closeReverseProxyDNSHandler(h3Handler)
+
+	h3Conf, err := buildReverseProxyDNSProxyConfig(&ReverseProxyService{}, rows, h3Handler)
+	if err != nil {
+		t.Fatalf("build doh3 config failed: %v", err)
+	}
+	if h3Conf.HTTPConfig == nil || h3Conf.HTTPConfig.HTTP3Enabled {
+		t.Fatalf("doh3 listener should not use dnsproxy dual h2/h3 mode, got %#v", h3Conf.HTTPConfig)
+	}
+}
+
+func TestReverseProxyDNSIPStrategyResolverFiltersAddressFamilies(t *testing.T) {
+	resolver := reverseProxyDNSIPStrategyResolver{
+		base: reverseProxyTestResolver{
+			addrs: []netip.Addr{
+				netip.MustParseAddr("1.1.1.1"),
+				netip.MustParseAddr("2001:db8::1"),
+			},
+		},
+		strategy: reverseProxyIPStrategyIPv4Only,
+	}
+	got, err := resolver.LookupNetIP(context.Background(), "ip", "dns.example.com")
+	if err != nil {
+		t.Fatalf("lookup ipv4 only failed: %v", err)
+	}
+	if len(got) != 1 || !got[0].Is4() {
+		t.Fatalf("unexpected ipv4 only result: %#v", got)
+	}
+
+	resolver.strategy = reverseProxyIPStrategyIPv6Only
+	got, err = resolver.LookupNetIP(context.Background(), "ip", "dns.example.com")
+	if err != nil {
+		t.Fatalf("lookup ipv6 only failed: %v", err)
+	}
+	if len(got) != 1 || !got[0].Is6() {
+		t.Fatalf("unexpected ipv6 only result: %#v", got)
+	}
+
+	resolver.strategy = reverseProxyIPStrategyPreferIPv6
+	got, err = resolver.LookupNetIP(context.Background(), "ip", "dns.example.com")
+	if err != nil {
+		t.Fatalf("lookup prefer ipv6 failed: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("prefer strategies should keep both address families, got %#v", got)
 	}
 }
 
@@ -3570,6 +3707,20 @@ func createReverseProxyTestCertificateRecord(t *testing.T, name string) uint {
 		t.Fatalf("create reverse proxy certificate record failed: %v", err)
 	}
 	return row.Id
+}
+
+type reverseProxyTestResolver struct {
+	addrs []netip.Addr
+	err   error
+}
+
+func (r reverseProxyTestResolver) LookupNetIP(_ context.Context, _ string, _ string) ([]netip.Addr, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	out := make([]netip.Addr, len(r.addrs))
+	copy(out, r.addrs)
+	return out, nil
 }
 
 func startReverseProxyTestHTTP3Server(t *testing.T, handler http.Handler) (string, int) {

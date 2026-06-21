@@ -1219,6 +1219,12 @@ func (s *ReverseProxyService) validateNormalizedDNSRule(db *gorm.DB, row reverse
 			if !reverseProxyDNSProtocolSharesSocket(existingListenAlias, row.listenProtocolAlias) {
 				continue
 			}
+			if !reverseProxyListenIPSetsOverlap(decodeReverseProxyListenIPs(&existing), row.listenIPs) {
+				continue
+			}
+			if reverseProxyDNSListenersCanSharePathSocket(&existing, row, existingListenAlias) {
+				continue
+			}
 			return common.NewError("dns reverse proxy listener conflicts with existing dns listener on the same port")
 		}
 		if reverseProxyProtocolsShareUnderlyingSocket(existing.ListenProtocol, existing.ListenHTTPVersionStrategy, row.listenProtocol, row.listenHTTPVersionStrategy, existingListenAlias, row.listenProtocolAlias) {
@@ -1226,6 +1232,67 @@ func (s *ReverseProxyService) validateNormalizedDNSRule(db *gorm.DB, row reverse
 		}
 	}
 	return nil
+}
+
+func reverseProxyDNSListenersCanSharePathSocket(existing *model.ReverseProxyRule, row reverseProxyNormalizedRule, existingAlias string) bool {
+	if existing == nil {
+		return false
+	}
+	if existingAlias != row.listenProtocolAlias {
+		return false
+	}
+	if !reverseProxyDNSProtocolUsesPath(row.listenProtocolAlias) {
+		return false
+	}
+	if !reverseProxyListenIPSetsEqual(decodeReverseProxyListenIPs(existing), row.listenIPs) {
+		return false
+	}
+	existingPath := normalizeReverseProxyDNSPath(existing.ListenDNSPath)
+	newPath := normalizeReverseProxyDNSPath(row.listenDNSPath)
+	if existingPath == "" {
+		existingPath = "/dns-query"
+	}
+	if newPath == "" {
+		newPath = "/dns-query"
+	}
+	return existingPath != newPath
+}
+
+func reverseProxyListenIPSetsEqual(a []string, b []string) bool {
+	normalize := func(items []string) []string {
+		if len(items) == 0 {
+			items = []string{"0.0.0.0"}
+		}
+		out := make([]string, 0, len(items))
+		seen := make(map[string]struct{}, len(items))
+		for _, item := range items {
+			value := strings.ToLower(strings.TrimSpace(item))
+			if value == "" {
+				continue
+			}
+			if _, exists := seen[value]; exists {
+				continue
+			}
+			seen[value] = struct{}{}
+			out = append(out, value)
+		}
+		if len(out) == 0 {
+			out = append(out, "0.0.0.0")
+		}
+		sort.Strings(out)
+		return out
+	}
+	left := normalize(a)
+	right := normalize(b)
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func loadReverseProxyCertificateRecord(db *gorm.DB, id uint) (*model.CertificateRecord, error) {
