@@ -21,12 +21,14 @@ type ReverseProxyRule struct {
 
 	HostList   string `json:"hostList" gorm:"type:text;not null;default:''"`
 	PathPrefix string `json:"pathPrefix" gorm:"size:1024;not null;default:'/'"`
+	ListenDNSPath string `json:"listenDnsPath" gorm:"column:listen_dns_path;size:1024;not null;default:''"`
 
 	TargetProtocol      string `json:"targetProtocol" gorm:"size:16;not null;default:'http'"`
 	TargetProtocolAlias string `json:"targetProtocolAlias" gorm:"column:target_protocol_alias;size:16;not null;default:''"`
 	TargetAddresses     string `json:"targetAddresses" gorm:"type:text;not null;default:''"`
 	TargetPort          int    `json:"targetPort" gorm:"not null;default:0"`
 	TargetPath          string `json:"targetPath" gorm:"size:1024;not null;default:''"`
+	TargetDNSPath       string `json:"targetDnsPath" gorm:"column:target_dns_path;size:1024;not null;default:''"`
 
 	CertificateRecordID       uint   `json:"certificateRecordId" gorm:"not null;default:0"`
 	CertificateRecordList     string `json:"certificateRecordList" gorm:"column:certificate_record_list;type:text;not null;default:''"`

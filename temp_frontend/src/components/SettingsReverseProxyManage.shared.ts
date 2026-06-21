@@ -11,7 +11,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 export const reverseProxyCopy = {
   heroEyebrow: 'GO REVERSE PROXY',
   title: '反向代理',
-  subtitle: '由 Go 直接监听本地 HTTP / HTTPS，并按照域名与 URL 路径规则转发到 HTTP / HTTPS 上游。',
+  subtitle: '由 Go 直接监听本地 HTTP / HTTPS / DNS，并按规则转发到对应的上游服务。',
   refresh: '立即刷新',
   newRule: '新建反代',
   available: '可用',
@@ -39,7 +39,7 @@ export const reverseProxyCopy = {
   deleteConfirm: '确定删除反向代理规则 {name} 吗？',
   createTitle: '新建反向代理',
   editTitle: '编辑反向代理',
-  dialogSubtitle: '左侧定义本地监听和命中条件，右侧定义被代理的上游地址与连接策略。',
+  dialogSubtitle: '左侧定义本地监听和命中条件，右侧定义被代理的上游地址与连接策略。DNS 与 HTTP 会按各自协议单独处理。',
   name: '名称',
   listenPanel: '本地监听',
   targetPanel: '目标连接',
@@ -49,11 +49,13 @@ export const reverseProxyCopy = {
   hosts: '域名/IP',
   hostsPlaceholder: 'ss.cc, *.ss.cc, 127.0.0.1',
   pathPrefix: 'URL 路径（可选）',
+  listenDnsPath: 'DNS URL 路径',
   targetProtocol: '目标协议',
   targetAddresses: '目标地址/域名',
   targetAddressesPlaceholder: '1.1.1.1, example.com, 2606:4700:4700::1111',
   targetPort: '目标端口',
   targetPath: '目标基础路径',
+  targetDnsPath: '目标 DNS URL 路径',
   certificate: '证书',
   ipStrategy: 'IP 优先策略',
   httpVersionStrategy: 'HTTP 版本策略',
@@ -77,11 +79,11 @@ export const reverseProxyCopy = {
   reorderSaved: '匹配顺序已更新',
   enableLabel: '启用',
   listenPanelHint: 'Go 运行时会在该端口同时监听 IPv4 与 IPv6；这里填写的是入口白名单，HTTP 校验 Host，HTTPS/H2/H3 校验 SNI；URL 路径按完整路径段严格匹配。',
-  targetPanelHint: '目标支持 HTTP 或 HTTPS。多个目标会按填写顺序依次尝试；域名会保持自己的 Host 和 SNI。目标基础路径会作为上游前缀，原始路径会在其后继续拼接。',
-  tlsPanelHint: '本地协议为 HTTPS 时必须绑定至少一张证书。填写入口名时按 SNI 匹配；入口名留空时只允许无 SNI 请求。',
-  certificateRequired: '请选择至少一张 TLS 监听证书（HTTPS）',
+  targetPanelHint: '目标支持 HTTP / HTTPS / DNS。多个目标会按填写顺序依次尝试；DNS 目标之间也会按顺序回退。',
+  tlsPanelHint: '本地协议为 HTTPS、WSS、DoH、DoH3、DoT、DoQ 时必须绑定至少一张证书。',
+  certificateRequired: '请选择至少一张 TLS 监听证书',
   certificateBound: '已绑定证书',
-  currentHTTPNoCert: '当前是 HTTP 监听，无需证书',
+  currentHTTPNoCert: '当前监听协议无需证书',
   targetHTTPMode: 'HTTP 目标',
   ruleEnabled: '已启用',
   ruleDisabled: '已停用',
@@ -90,16 +92,31 @@ export const reverseProxyCopy = {
   listenPortInlineNotAllowed: '域名/IP 里不能带端口，请把端口填在监听端口',
   targetAddressInlineNotAllowed: '目标地址 / 域名 里不能带端口，请把端口填在目标端口',
   targetRequired: '请填写至少一个目标地址',
-  certRequiredSave: 'TLS 监听（HTTPS）必须至少选择一张证书',
+  certRequiredSave: 'TLS 监听必须至少选择一张证书',
+  dnsPathRequired: '当前 DNS 协议必须填写 URL 路径',
+  dnsHostUnused: 'DNS 反代不使用域名/IP 命中条件',
+  dnsHttpFieldUnused: 'DNS 反代不使用 HTTP 路径改写与 API 透传',
   listenModeHTTP: 'HTTP：仅监听明文 HTTP 请求。',
   listenModeHTTPS: 'HTTPS：同时监听 TCP(H2) 与 UDP(H3)，浏览器按标准协商决定使用哪种版本。',
   listenModeH2: 'H2：仅监听 TCP，仅提供 HTTPS/HTTP2。',
   listenModeH3: 'H3：仅监听 UDP，仅提供 HTTPS/HTTP3。',
+  listenModeDNSDoH: 'DoH（DNS）：同时监听 H2 与 H3 的 DNS over HTTPS，可自定义端口和 URL 路径。',
+  listenModeDNSDoHH3: 'DoH3（DNS）：仅监听 H3 的 DNS over HTTPS，可自定义端口和 URL 路径。',
+  listenModeDNSDoQ: 'DoQ（DNS）：通过 QUIC 提供 DNS over QUIC，可自定义端口。',
+  listenModeDNSDoT: 'DoT（DNS）：通过 TLS 提供 DNS over TLS，可自定义端口。',
+  listenModeDNSUDP: 'UDP（DNS）：通过 UDP 提供传统 DNS，可自定义端口。',
+  listenModeDNSTCP: 'TCP（DNS）：通过 TCP 提供传统 DNS，可自定义端口。',
   targetModeHTTP: 'HTTP：向上游发起明文 HTTP 连接。',
   targetModeHTTPS: 'HTTPS：同时支持 H2/H3 上游协商，按探测结果选择可用连接。',
   targetModeH2: 'H2：仅向上游发起 HTTPS/H2 连接。',
   targetModeH3: 'H3：仅向上游发起 HTTPS/H3 连接。',
-  tlsModeRequired: '当前监听协议需要 TLS 证书（HTTPS）。',
+  targetModeDNSDoH: 'DoH（DNS）：向上游发起 DNS over HTTPS，请求会实时转发。',
+  targetModeDNSDoHH3: 'DoH3（DNS）：向上游发起基于 HTTP/3 的 DNS over HTTPS。',
+  targetModeDNSDoQ: 'DoQ（DNS）：向上游发起 DNS over QUIC。',
+  targetModeDNSDoT: 'DoT（DNS）：向上游发起 DNS over TLS。',
+  targetModeDNSUDP: 'UDP（DNS）：向上游发起传统 DNS UDP 请求。',
+  targetModeDNSTCP: 'TCP（DNS）：向上游发起传统 DNS TCP 请求。',
+  tlsModeRequired: '当前监听协议需要 TLS 证书。',
   listenIpLocalHint: '填写后 HTTP 必须匹配 Host，HTTPS/H2/H3 必须匹配 SNI；留空时 HTTPS/H2/H3 只允许无 SNI，请求携带任意 SNI 都会断开。',
   targetPathRewriteHint: '目标基础路径会作为上游前缀，例如填 /api 后，请求 /foo 会转发到 /api/foo。',
   apiPassthroughHint: '开启后不改写响应正文，适合 AI、SSE 与 API 直通，避免流式内容被缓冲或替换；响应头仍按反代规则处理。',
@@ -128,6 +145,12 @@ export const protocolItems = [
   { title: 'WSS', value: 'wss' },
   { title: 'H2 only', value: 'h2' },
   { title: 'H3 only', value: 'h3' },
+  { title: 'DoH（DNS）', value: 'dns_doh' },
+  { title: 'DoH3（DNS）', value: 'dns_doh3' },
+  { title: 'DoQ（DNS）', value: 'dns_doq' },
+  { title: 'DoT（DNS）', value: 'dns_dot' },
+  { title: 'UDP（DNS）', value: 'dns_udp' },
+  { title: 'TCP（DNS）', value: 'dns_tcp' },
 ] as const
 
 export const ipStrategyItems = [
@@ -168,10 +191,12 @@ export const createEmptyReverseProxyRuleForm = (): ReverseProxyRuleForm => ({
   listenPort: 80,
   hostsText: '',
   pathPrefix: '',
+  listenDnsPath: '/dns-query',
   targetProtocol: 'http',
   targetAddressesText: '',
   targetPort: 80,
   targetPath: '',
+  targetDnsPath: '/dns-query',
   certificateRecordIds: [],
   listenHttpVersionStrategy: '',
   ipStrategy: 'prefer_ipv4',
@@ -329,10 +354,12 @@ const normalizeRule = (value: unknown): ReverseProxyRule => {
     listenPort: asNumber(item.listenPort),
     hosts: normalizeStringList(item.hosts),
     pathPrefix: asString(item.pathPrefix),
+    listenDnsPath: asString(item.listenDnsPath),
     targetProtocol: deriveTargetProtocolForForm(targetProtocolRaw, httpVersionStrategy, targetProtocolAliasRaw),
     targetAddresses: normalizeStringList(item.targetAddresses),
     targetPort: asNumber(item.targetPort),
     targetPath: asString(item.targetPath),
+    targetDnsPath: asString(item.targetDnsPath),
     certificateRecordIds,
     certificateRecordId: certificateRecordIds[0] ?? asNumber(item.certificateRecordId),
     certificateLabel: asString(item.certificateLabel),
@@ -377,6 +404,12 @@ export const formatTimestamp = (value: number) => {
 
 export const protocolLabel = (value: string) => {
   const normalized = value.trim().toLowerCase()
+  if (normalized === 'dns_doh') return 'DoH（DNS）'
+  if (normalized === 'dns_doh3') return 'DoH3（DNS）'
+  if (normalized === 'dns_doq') return 'DoQ（DNS）'
+  if (normalized === 'dns_dot') return 'DoT（DNS）'
+  if (normalized === 'dns_udp') return 'UDP（DNS）'
+  if (normalized === 'dns_tcp') return 'TCP（DNS）'
   if (normalized === 'ws') return 'WS'
   if (normalized === 'wss') return 'WSS'
   if (normalized === 'https') return 'HTTPS'
@@ -428,7 +461,24 @@ const protocolIsHTTP = (value: string) => {
   const normalized = value.trim().toLowerCase()
   return normalized === 'http' || normalized === 'ws'
 }
-const protocolIsTLS = (value: string) => !protocolIsHTTP(value)
+const protocolIsDNS = (value: string) => value.trim().toLowerCase().startsWith('dns_')
+const dnsProtocolUsesPath = (value: string) => {
+  const normalized = value.trim().toLowerCase()
+  return normalized === 'dns_doh' || normalized === 'dns_doh3'
+}
+const protocolIsTLS = (value: string) => {
+  const normalized = value.trim().toLowerCase()
+  if (protocolIsDNS(normalized)) {
+    return normalized === 'dns_doh' || normalized === 'dns_doh3' || normalized === 'dns_doq' || normalized === 'dns_dot'
+  }
+  return !protocolIsHTTP(value)
+}
+
+const protocolNeedsCertificates = (value: string) => {
+  const normalized = value.trim().toLowerCase()
+  if (normalized === 'https' || normalized === 'wss' || normalized === 'h2' || normalized === 'h3') return true
+  return protocolIsDNS(normalized) && protocolIsTLS(normalized)
+}
 
 const normalizeVirtualProtocol = (value: string): 'http' | 'https' | 'h2' | 'h3' => {
   const normalized = value.trim().toLowerCase()
@@ -462,11 +512,13 @@ const deriveListenProtocolForForm = (
   listenProtocol: string,
   listenHttpVersionStrategy: string,
   listenProtocolAlias = '',
-): 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss' => {
+): 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp' => {
   const alias = listenProtocolAlias.trim().toLowerCase()
+  if (protocolIsDNS(alias)) return alias as 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
   if (alias === 'ws') return 'ws'
   if (alias === 'wss') return 'wss'
   const raw = listenProtocol.trim().toLowerCase()
+  if (protocolIsDNS(raw)) return raw as 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
   if (raw === 'ws') return 'ws'
   if (raw === 'wss') return 'wss'
   const protocol = normalizeVirtualProtocol(listenProtocol)
@@ -481,11 +533,13 @@ const deriveTargetProtocolForForm = (
   targetProtocol: string,
   httpVersionStrategy: string,
   targetProtocolAlias = '',
-): 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss' => {
+): 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp' => {
   const alias = targetProtocolAlias.trim().toLowerCase()
+  if (protocolIsDNS(alias)) return alias as 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
   if (alias === 'ws') return 'ws'
   if (alias === 'wss') return 'wss'
   const raw = targetProtocol.trim().toLowerCase()
+  if (protocolIsDNS(raw)) return raw as 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
   if (raw === 'ws') return 'ws'
   if (raw === 'wss') return 'wss'
   const protocol = normalizeVirtualProtocol(targetProtocol)
@@ -497,10 +551,18 @@ const deriveTargetProtocolForForm = (
 }
 
 const mapListenProtocolToBackend = (protocol: string): {
-  listenProtocol: 'http' | 'https'
+  listenProtocol: 'http' | 'https' | 'dns'
+  listenProtocolAlias?: '' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
   listenHttpVersionStrategy: '' | 'h2_h3' | 'h2_only' | 'h3_only'
 } => {
   const raw = protocol.trim().toLowerCase()
+  if (protocolIsDNS(raw)) {
+    return {
+      listenProtocol: 'dns',
+      listenProtocolAlias: raw as 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp',
+      listenHttpVersionStrategy: '',
+    }
+  }
   if (raw === 'ws') {
     return { listenProtocol: 'http', listenHttpVersionStrategy: '' }
   }
@@ -524,10 +586,18 @@ const mapTargetProtocolToBackend = (
   protocol: string,
   strategy: ReverseProxyRuleForm['httpVersionStrategy'],
 ): {
-  targetProtocol: 'http' | 'https'
+  targetProtocol: 'http' | 'https' | 'dns'
+  targetProtocolAlias?: '' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
   httpVersionStrategy: ReverseProxyRuleForm['httpVersionStrategy']
 } => {
   const raw = protocol.trim().toLowerCase()
+  if (protocolIsDNS(raw)) {
+    return {
+      targetProtocol: 'dns',
+      targetProtocolAlias: raw as 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp',
+      httpVersionStrategy: '',
+    }
+  }
   if (raw === 'ws') {
     return { targetProtocol: 'http', httpVersionStrategy: '' }
   }
@@ -581,10 +651,12 @@ export const mapRuleToForm = (rule?: ReverseProxyRule): ReverseProxyRuleForm => 
       ...(rule?.hosts ?? []),
     ]).join(', '),
     pathPrefix: rule?.pathPrefix ?? '',
+    listenDnsPath: rule?.listenDnsPath ?? (dnsProtocolUsesPath(listenProtocol) ? '/dns-query' : ''),
     targetProtocol,
     targetAddressesText: (rule?.targetAddresses ?? []).join(', '),
     targetPort: rule?.targetPort ?? 80,
     targetPath: rule?.targetPath ?? '',
+    targetDnsPath: rule?.targetDnsPath ?? (dnsProtocolUsesPath(targetProtocol) ? '/dns-query' : ''),
     certificateRecordIds: (() => {
       const ids = normalizeNumberList(rule?.certificateRecordIds ?? [])
       if (ids.length > 0) return ids
@@ -609,6 +681,8 @@ export const buildReverseProxyPayload = (
   const pathPrefix = form.pathPrefix.trim()
   const targetAddressesText = normalizeListTextInput(form.targetAddressesText)
   const targetPath = form.targetPath.trim()
+  const listenDnsPath = form.listenDnsPath.trim()
+  const targetDnsPath = form.targetDnsPath.trim()
   const remark = form.remark.trim()
   const matchTokens = splitListenMatchTokens(hostsText)
   const listenProtocol = mapListenProtocolToBackend(form.listenProtocol)
@@ -632,22 +706,24 @@ export const buildReverseProxyPayload = (
     name,
     enabled: form.enabled,
     listenProtocol: listenProtocol.listenProtocol,
-    listenProtocolAlias,
+    listenProtocolAlias: listenProtocol.listenProtocolAlias || listenProtocolAlias,
     listenPort: asNumber(form.listenPort),
     listenIPs: matchTokens.listenIPs.join(', '),
     hosts: matchTokens.hosts.join(', '),
     pathPrefix: normalizePathInput(pathPrefix, true),
+    listenDnsPath: dnsProtocolUsesPath(form.listenProtocol) ? normalizePathInput(listenDnsPath, true) : '',
     targetProtocol: targetProtocol.targetProtocol,
-    targetProtocolAlias,
+    targetProtocolAlias: targetProtocol.targetProtocolAlias || targetProtocolAlias,
     targetAddresses: targetAddressesText,
     targetPort: asNumber(form.targetPort),
     targetPath: normalizePathInput(targetPath, true),
-    certificateRecordIds: listenProtocol.listenProtocol === 'https' ? certificateRecordIds : [],
-    certificateRecordId: listenProtocol.listenProtocol === 'https' ? (certificateRecordIds[0] ?? 0) : 0,
+    targetDnsPath: dnsProtocolUsesPath(form.targetProtocol) ? normalizePathInput(targetDnsPath, true) : '',
+    certificateRecordIds: protocolNeedsCertificates(form.listenProtocol) ? certificateRecordIds : [],
+    certificateRecordId: protocolNeedsCertificates(form.listenProtocol) ? (certificateRecordIds[0] ?? 0) : 0,
     listenHttpVersionStrategy: listenProtocol.listenHttpVersionStrategy,
     ipStrategy: form.ipStrategy,
     httpVersionStrategy: targetProtocol.targetProtocol === 'https' ? targetProtocol.httpVersionStrategy : '',
-    upstreamTlsVerify: targetProtocol.targetProtocol === 'https' ? form.upstreamTlsVerify : false,
+    upstreamTlsVerify: protocolIsTLS(form.targetProtocol) ? form.upstreamTlsVerify : false,
     apiPassthrough: form.apiPassthrough,
     remark,
   }
@@ -731,7 +807,7 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   const saveRule = async () => {
     if (saving.value) return
     trimReverseProxyRuleFormText(editingRule.value)
-    if (splitInputTokens(editingRule.value.hostsText).some(hasExplicitPort)) {
+    if (!protocolIsDNS(editingRule.value.listenProtocol) && splitInputTokens(editingRule.value.hostsText).some(hasExplicitPort)) {
       push.warning({ duration: 4000, message: reverseProxyCopy.listenPortInlineNotAllowed })
       return
     }
@@ -743,9 +819,21 @@ export function useReverseProxyManage(props: { active?: boolean }) {
       push.warning({ duration: 4000, message: reverseProxyCopy.targetRequired })
       return
     }
-    editingRule.value.pathPrefix = normalizePathInput(editingRule.value.pathPrefix, true)
-    editingRule.value.targetPath = normalizePathInput(editingRule.value.targetPath, true)
-    if (protocolIsTLS(editingRule.value.listenProtocol) && editingRule.value.certificateRecordIds.length === 0) {
+    if (!protocolIsDNS(editingRule.value.listenProtocol)) {
+      editingRule.value.pathPrefix = normalizePathInput(editingRule.value.pathPrefix, true)
+    }
+    if (!protocolIsDNS(editingRule.value.targetProtocol)) {
+      editingRule.value.targetPath = normalizePathInput(editingRule.value.targetPath, true)
+    }
+    if (dnsProtocolUsesPath(editingRule.value.listenProtocol) && !editingRule.value.listenDnsPath.trim()) {
+      push.warning({ duration: 4000, message: reverseProxyCopy.dnsPathRequired })
+      return
+    }
+    if (dnsProtocolUsesPath(editingRule.value.targetProtocol) && !editingRule.value.targetDnsPath.trim()) {
+      push.warning({ duration: 4000, message: reverseProxyCopy.dnsPathRequired })
+      return
+    }
+    if (protocolNeedsCertificates(editingRule.value.listenProtocol) && editingRule.value.certificateRecordIds.length === 0) {
       push.warning({ duration: 4000, message: reverseProxyCopy.certRequiredSave })
       return
     }
@@ -854,12 +942,15 @@ export function useReverseProxyManage(props: { active?: boolean }) {
       return [
         rule.name,
         rule.pathPrefix,
+        rule.listenDnsPath,
         rule.remark,
         rule.listenProtocol,
         rule.targetProtocol,
         listenMatchDisplay(rule),
         joinDisplay(rule.targetAddresses),
-      ].some(item => item.toLowerCase().includes(keyword))
+        rule.targetDnsPath,
+        rule.targetPath,
+      ].some(item => (item ?? '').toLowerCase().includes(keyword))
     })
   })
 
@@ -889,6 +980,7 @@ export function useReverseProxyManage(props: { active?: boolean }) {
       .flatMap(cert => [cert.mainDomain, ...(cert.domains ?? [])])
       .map(item => item.trim().toLowerCase())
       .filter(Boolean)
+    const hasIPSANCert = certs.some(cert => [cert.mainDomain, ...(cert.domains ?? [])].some(item => isIPLiteral(item)))
     const wildcardMatch = (pattern: string, host: string) => {
       const normalizedPattern = pattern.trim().toLowerCase()
       const normalizedHost = host.trim().toLowerCase()
@@ -908,6 +1000,9 @@ export function useReverseProxyManage(props: { active?: boolean }) {
         }
         return
       }
+      if (hasIPSANCert) {
+        return
+      }
       if (!certNames.some(name => wildcardMatch(name, match) || wildcardMatch(match, name))) {
         hints.push(`证书未覆盖域名: ${match}`)
       }
@@ -916,22 +1011,32 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   })
   const targetIsHTTPS = computed(() => {
     const value = editingRule.value.targetProtocol.trim().toLowerCase()
+    if (protocolIsDNS(value)) return protocolNeedsCertificates(value)
     if (value === 'ws') return false
     if (value === 'wss') return true
     return protocolIsTLS(editingRule.value.targetProtocol)
   })
   const listenIsHTTPS = computed(() => {
     const value = editingRule.value.listenProtocol.trim().toLowerCase()
+    if (protocolIsDNS(value)) return protocolNeedsCertificates(value)
     if (value === 'ws') return false
     if (value === 'wss') return true
     return protocolIsTLS(editingRule.value.listenProtocol)
   })
-  const targetVersionConfigurable = computed(() => normalizeVirtualProtocol(editingRule.value.targetProtocol) === 'https')
+  const targetVersionConfigurable = computed(() => !protocolIsDNS(editingRule.value.targetProtocol) && normalizeVirtualProtocol(editingRule.value.targetProtocol) === 'https')
+  const listenIsDNS = computed(() => protocolIsDNS(editingRule.value.listenProtocol))
+  const targetIsDNS = computed(() => protocolIsDNS(editingRule.value.targetProtocol))
   const hasPreviewProtocol = computed(() => {
     return false
   })
   const listenProtocolBehavior = computed(() => {
     const value = editingRule.value.listenProtocol
+    if (value === 'dns_doh') return reverseProxyCopy.listenModeDNSDoH
+    if (value === 'dns_doh3') return reverseProxyCopy.listenModeDNSDoHH3
+    if (value === 'dns_doq') return reverseProxyCopy.listenModeDNSDoQ
+    if (value === 'dns_dot') return reverseProxyCopy.listenModeDNSDoT
+    if (value === 'dns_udp') return reverseProxyCopy.listenModeDNSUDP
+    if (value === 'dns_tcp') return reverseProxyCopy.listenModeDNSTCP
     if (value === 'ws') return 'WS：仅监听明文 WebSocket（ws://）。'
     if (value === 'wss') return 'WSS：通过 TLS 监听 WebSocket（wss://），需绑定证书。'
     if (value === 'h2') return reverseProxyCopy.listenModeH2
@@ -941,6 +1046,12 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   })
   const targetProtocolBehavior = computed(() => {
     const value = editingRule.value.targetProtocol
+    if (value === 'dns_doh') return reverseProxyCopy.targetModeDNSDoH
+    if (value === 'dns_doh3') return reverseProxyCopy.targetModeDNSDoHH3
+    if (value === 'dns_doq') return reverseProxyCopy.targetModeDNSDoQ
+    if (value === 'dns_dot') return reverseProxyCopy.targetModeDNSDoT
+    if (value === 'dns_udp') return reverseProxyCopy.targetModeDNSUDP
+    if (value === 'dns_tcp') return reverseProxyCopy.targetModeDNSTCP
     if (value === 'ws') return 'WS：向上游发起明文 WebSocket（ws://）。'
     if (value === 'wss') return 'WSS：向上游发起 TLS WebSocket（wss://）。'
     if (value === 'h2') return reverseProxyCopy.targetModeH2
@@ -985,6 +1096,30 @@ export function useReverseProxyManage(props: { active?: boolean }) {
 
   watch(() => editingRule.value.listenProtocol, (value) => {
     editingRule.value.listenHttpVersionStrategy = mapListenProtocolToBackend(value).listenHttpVersionStrategy
+    if (protocolIsDNS(value)) {
+      editingRule.value.hostsText = ''
+      editingRule.value.pathPrefix = ''
+      editingRule.value.apiPassthrough = true
+      if (dnsProtocolUsesPath(value) && !editingRule.value.listenDnsPath.trim()) {
+        editingRule.value.listenDnsPath = '/dns-query'
+      }
+      if (!dnsProtocolUsesPath(value)) {
+        editingRule.value.listenDnsPath = ''
+      }
+      if (value === 'dns_udp' || value === 'dns_tcp') {
+        if (!editingRule.value.listenPort || editingRule.value.listenPort === 443 || editingRule.value.listenPort === 853) {
+          editingRule.value.listenPort = 53
+        }
+        editingRule.value.certificateRecordIds = []
+      } else if (value === 'dns_doh' || value === 'dns_doh3') {
+        if (!editingRule.value.listenPort || editingRule.value.listenPort === 53 || editingRule.value.listenPort === 853) {
+          editingRule.value.listenPort = 443
+        }
+      } else if (!editingRule.value.listenPort || editingRule.value.listenPort === 53 || editingRule.value.listenPort === 443) {
+        editingRule.value.listenPort = 853
+      }
+      return
+    }
     if (protocolIsHTTP(value)) {
       editingRule.value.certificateRecordIds = []
       if (!editingRule.value.listenPort || editingRule.value.listenPort === 443) {
@@ -1012,6 +1147,29 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   )
 
   watch(() => editingRule.value.targetProtocol, (value) => {
+    if (protocolIsDNS(value)) {
+      editingRule.value.httpVersionStrategy = ''
+      editingRule.value.upstreamTlsVerify = protocolIsTLS(value)
+      editingRule.value.targetPath = ''
+      if (dnsProtocolUsesPath(value) && !editingRule.value.targetDnsPath.trim()) {
+        editingRule.value.targetDnsPath = '/dns-query'
+      }
+      if (!dnsProtocolUsesPath(value)) {
+        editingRule.value.targetDnsPath = ''
+      }
+      if (value === 'dns_udp' || value === 'dns_tcp') {
+        if (!editingRule.value.targetPort || editingRule.value.targetPort === 443 || editingRule.value.targetPort === 853) {
+          editingRule.value.targetPort = 53
+        }
+      } else if (value === 'dns_doh' || value === 'dns_doh3') {
+        if (!editingRule.value.targetPort || editingRule.value.targetPort === 53 || editingRule.value.targetPort === 853) {
+          editingRule.value.targetPort = 443
+        }
+      } else if (!editingRule.value.targetPort || editingRule.value.targetPort === 53 || editingRule.value.targetPort === 443) {
+        editingRule.value.targetPort = 853
+      }
+      return
+    }
     if (value === 'http') {
       editingRule.value.httpVersionStrategy = ''
       editingRule.value.upstreamTlsVerify = false
@@ -1092,6 +1250,8 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     currentCertificateHints,
     targetIsHTTPS,
     listenIsHTTPS,
+    listenIsDNS,
+    targetIsDNS,
     targetVersionConfigurable,
     hasPreviewProtocol,
     listenProtocolBehavior,

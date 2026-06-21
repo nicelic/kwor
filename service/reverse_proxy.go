@@ -39,6 +39,14 @@ const (
 
 	reverseProxyProtocolHTTP  = "http"
 	reverseProxyProtocolHTTPS = "https"
+	reverseProxyProtocolDNS   = "dns"
+
+	reverseProxyDNSProtocolDoH   = "dns_doh"
+	reverseProxyDNSProtocolDoHH3 = "dns_doh3"
+	reverseProxyDNSProtocolDoQ   = "dns_doq"
+	reverseProxyDNSProtocolDoT   = "dns_dot"
+	reverseProxyDNSProtocolUDP   = "dns_udp"
+	reverseProxyDNSProtocolTCP   = "dns_tcp"
 
 	reverseProxyIPStrategyIPv4Only   = "ipv4_only"
 	reverseProxyIPStrategyIPv6Only   = "ipv6_only"
@@ -60,11 +68,11 @@ const (
 	reverseProxyMismatchCooldown             = 24 * time.Hour
 	reverseProxyDialFallbackGap              = 20 * time.Millisecond
 	reverseProxyReadHeaderTimeout            = 15 * time.Second
-	reverseProxyServerIdleTimeout            = 90 * time.Second
+	reverseProxyServerIdleTimeout            = 10 * time.Minute
 	reverseProxyRequestTimeout               = 120 * time.Second
 	reverseProxyShutdownTimeout              = 5 * time.Second
 	reverseProxyAltSvcMaxAgeSeconds          = 2592000
-	reverseProxyUpstreamIdleTimeout          = 5 * time.Minute
+	reverseProxyUpstreamIdleTimeout          = 10 * time.Minute
 	reverseProxyUpstreamTCPKeepAlive         = 30 * time.Second
 	reverseProxyUpstreamHTTP2ReadIdleTimeout = 30 * time.Second
 	reverseProxyUpstreamHTTP2PingTimeout     = 15 * time.Second
@@ -94,11 +102,13 @@ type ReverseProxyRulePayload struct {
 	ListenPort                int    `json:"listenPort"`
 	Hosts                     string `json:"hosts"`
 	PathPrefix                string `json:"pathPrefix"`
+	ListenDNSPath             string `json:"listenDnsPath"`
 	TargetProtocol            string `json:"targetProtocol"`
 	TargetProtocolAlias       string `json:"targetProtocolAlias"`
 	TargetAddresses           string `json:"targetAddresses"`
 	TargetPort                int    `json:"targetPort"`
 	TargetPath                string `json:"targetPath"`
+	TargetDNSPath             string `json:"targetDnsPath"`
 	CertificateRecordIDs      []uint `json:"certificateRecordIds"`
 	CertificateRecordID       uint   `json:"certificateRecordId"`
 	ListenHTTPVersionStrategy string `json:"listenHttpVersionStrategy"`
@@ -139,11 +149,13 @@ type ReverseProxyRuleView struct {
 	ListenPort                int                                        `json:"listenPort"`
 	Hosts                     []string                                   `json:"hosts"`
 	PathPrefix                string                                     `json:"pathPrefix"`
+	ListenDNSPath             string                                     `json:"listenDnsPath"`
 	TargetProtocol            string                                     `json:"targetProtocol"`
 	TargetProtocolAlias       string                                     `json:"targetProtocolAlias"`
 	TargetAddresses           []string                                   `json:"targetAddresses"`
 	TargetPort                int                                        `json:"targetPort"`
 	TargetPath                string                                     `json:"targetPath"`
+	TargetDNSPath             string                                     `json:"targetDnsPath"`
 	CertificateRecordIDs      []uint                                     `json:"certificateRecordIds"`
 	CertificateRecordID       uint                                       `json:"certificateRecordId"`
 	CertificateLabel          string                                     `json:"certificateLabel"`
@@ -188,11 +200,13 @@ type reverseProxyNormalizedRule struct {
 	listenPort                int
 	hosts                     []string
 	pathPrefix                string
+	listenDNSPath             string
 	targetProtocol            string
 	targetProtocolAlias       string
 	targetAddresses           []string
 	targetPort                int
 	targetPath                string
+	targetDNSPath             string
 	certificateRecordIDs      []uint
 	certificateRecordID       uint
 	listenHTTPVersionStrategy string
@@ -240,10 +254,12 @@ type reverseProxyRenderRule struct {
 	ListenPort                int                                  `json:"listenPort"`
 	Hosts                     []string                             `json:"hosts"`
 	PathPrefix                string                               `json:"pathPrefix"`
+	ListenDNSPath             string                               `json:"listenDnsPath"`
 	TargetProtocol            string                               `json:"targetProtocol"`
 	TargetAddresses           []string                             `json:"targetAddresses"`
 	TargetPort                int                                  `json:"targetPort"`
 	TargetPath                string                               `json:"targetPath"`
+	TargetDNSPath             string                               `json:"targetDnsPath"`
 	CertificateRecordIDs      []uint                               `json:"certificateRecordIds,omitempty"`
 	CertificateStates         []reverseProxyRenderCertificateState `json:"certificateStates,omitempty"`
 	IPStrategy                string                               `json:"ipStrategy"`
@@ -484,7 +500,7 @@ func (s *ReverseProxyService) GetOverview() (*ReverseProxyOverview, error) {
 	if !reverseProxyRuntime.state.lastSyncAt.IsZero() {
 		lastSyncAt = reverseProxyRuntime.state.lastSyncAt.Unix()
 	}
-	listenerCount := reverseProxyListenerCount(reverseProxyRuntime.groups)
+	listenerCount := reverseProxyListenerCount(reverseProxyRuntime.groups) + reverseProxyDNSRuntime.listenerCount()
 	overview := &ReverseProxyOverview{
 		Available:        reverseProxySupported(),
 		Started:          listenerCount > 0,
@@ -561,11 +577,13 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 		row.ListenPort = normalized.listenPort
 		row.HostList = encodeReverseProxyList(normalized.hosts)
 		row.PathPrefix = normalized.pathPrefix
+		row.ListenDNSPath = normalized.listenDNSPath
 		row.TargetProtocol = normalized.targetProtocol
 		row.TargetProtocolAlias = normalized.targetProtocolAlias
 		row.TargetAddresses = encodeReverseProxyList(normalized.targetAddresses)
 		row.TargetPort = normalized.targetPort
 		row.TargetPath = normalized.targetPath
+		row.TargetDNSPath = normalized.targetDNSPath
 		row.CertificateRecordList = encodeReverseProxyUintList(normalized.certificateRecordIDs)
 		row.CertificateRecordID = normalized.certificateRecordID
 		row.ListenHTTPVersionStrategy = normalized.listenHTTPVersionStrategy
@@ -598,7 +616,7 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 	if err != nil {
 		return err
 	}
-	if err := reverseProxyRuntime.SyncNow(s); err != nil {
+	if err := s.syncAllRuntimeNow(); err != nil {
 		if hadPrevious {
 			restoreErr := db.Model(&model.ReverseProxyRule{}).
 				Where("id = ?", previousRow.Id).
@@ -612,7 +630,7 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 				logger.Warning("reverse proxy rule create rollback failed: ", restoreErr)
 			}
 		}
-		_ = reverseProxyRuntime.SyncNow(s)
+		_ = s.syncAllRuntimeNow()
 		return err
 	}
 	return nil
@@ -641,12 +659,12 @@ func (s *ReverseProxyService) DeleteRule(id uint) error {
 	if err != nil {
 		return err
 	}
-	if err := reverseProxyRuntime.SyncNow(s); err != nil {
+	if err := s.syncAllRuntimeNow(); err != nil {
 		restoreErr := db.Create(&deletedRow).Error
 		if restoreErr != nil {
 			logger.Warning("reverse proxy rule delete rollback failed: ", restoreErr)
 		}
-		_ = reverseProxyRuntime.SyncNow(s)
+		_ = s.syncAllRuntimeNow()
 		return err
 	}
 	return nil
@@ -692,14 +710,21 @@ func (s *ReverseProxyService) ReorderRules(payload ReverseProxyRuleReorderPayloa
 	if err != nil {
 		return err
 	}
-	return reverseProxyRuntime.SyncNow(s)
+	return s.syncAllRuntimeNow()
 }
 
 func (s *ReverseProxyService) SyncIfNeeded(minGap time.Duration) error {
 	if err := s.MaintainCertificateBalance(false); err != nil {
 		return err
 	}
-	return reverseProxyRuntime.SyncIfNeeded(s, minGap)
+	if err := reverseProxyRuntime.SyncIfNeeded(s, minGap); err != nil {
+		return err
+	}
+	rows, err := s.loadRulesLocked(database.GetDB())
+	if err != nil {
+		return err
+	}
+	return syncReverseProxyDNSRuntime(s, rows)
 }
 
 func (s *ReverseProxyService) StartRuntime() error {
@@ -709,11 +734,34 @@ func (s *ReverseProxyService) StartRuntime() error {
 	if err := s.resetRuntimeStateForStartup(); err != nil {
 		return err
 	}
-	return reverseProxyRuntime.SyncNow(s)
+	if err := reverseProxyRuntime.SyncNow(s); err != nil {
+		return err
+	}
+	rows, err := s.loadRulesLocked(database.GetDB())
+	if err != nil {
+		return err
+	}
+	return syncReverseProxyDNSRuntime(s, rows)
 }
 
 func (s *ReverseProxyService) StopRuntime() error {
-	return reverseProxyRuntime.Stop()
+	httpErr := reverseProxyRuntime.Stop()
+	dnsErr := stopReverseProxyDNSRuntime()
+	if httpErr != nil {
+		return httpErr
+	}
+	return dnsErr
+}
+
+func (s *ReverseProxyService) syncAllRuntimeNow() error {
+	if err := reverseProxyRuntime.SyncNow(s); err != nil {
+		return err
+	}
+	rows, err := s.loadRulesLocked(database.GetDB())
+	if err != nil {
+		return err
+	}
+	return syncReverseProxyDNSRuntime(s, rows)
 }
 
 func (s *ReverseProxyService) resetRuntimeStateForStartup() error {
@@ -790,11 +838,13 @@ func buildReverseProxyRuleView(row *model.ReverseProxyRule, certMap map[uint]Rev
 		ListenPort:                row.ListenPort,
 		Hosts:                     decodeReverseProxyList(row.HostList),
 		PathPrefix:                strings.TrimSpace(row.PathPrefix),
+		ListenDNSPath:             strings.TrimSpace(row.ListenDNSPath),
 		TargetProtocol:            strings.TrimSpace(row.TargetProtocol),
 		TargetProtocolAlias:       strings.TrimSpace(row.TargetProtocolAlias),
 		TargetAddresses:           decodeReverseProxyList(row.TargetAddresses),
 		TargetPort:                row.TargetPort,
 		TargetPath:                strings.TrimSpace(row.TargetPath),
+		TargetDNSPath:             strings.TrimSpace(row.TargetDNSPath),
 		CertificateRecordIDs:      append([]uint(nil), certIDs...),
 		ListenHTTPVersionStrategy: strings.TrimSpace(row.ListenHTTPVersionStrategy),
 		IPStrategy:                strings.TrimSpace(row.IPStrategy),
@@ -851,11 +901,13 @@ func reverseProxyRulePersistenceMap(row *model.ReverseProxyRule) map[string]inte
 		"listen_port":                  row.ListenPort,
 		"host_list":                    row.HostList,
 		"path_prefix":                  row.PathPrefix,
+		"listen_dns_path":              row.ListenDNSPath,
 		"target_protocol":              row.TargetProtocol,
 		"target_protocol_alias":        row.TargetProtocolAlias,
 		"target_addresses":             row.TargetAddresses,
 		"target_port":                  row.TargetPort,
 		"target_path":                  row.TargetPath,
+		"target_dns_path":              row.TargetDNSPath,
 		"certificate_record_list":      row.CertificateRecordList,
 		"certificate_record_id":        row.CertificateRecordID,
 		"listen_http_version_strategy": row.ListenHTTPVersionStrategy,
@@ -909,6 +961,14 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 	normalized.targetProtocol = targetProtocol
 	normalized.listenProtocolAlias = normalizeReverseProxyProtocolAlias(listenProtocolAliasInput, listenProtocolInput)
 	normalized.targetProtocolAlias = normalizeReverseProxyProtocolAlias(targetProtocolAliasInput, targetProtocolInput)
+	normalized.listenDNSPath = normalizeReverseProxyDNSPath(payload.ListenDNSPath)
+	normalized.targetDNSPath = normalizeReverseProxyDNSPath(payload.TargetDNSPath)
+	if normalized.listenDNSPath == "" {
+		normalized.listenDNSPath = normalizeReverseProxyDNSPath(payload.PathPrefix)
+	}
+	if normalized.targetDNSPath == "" {
+		normalized.targetDNSPath = normalizeReverseProxyDNSPath(payload.TargetPath)
+	}
 
 	if normalized.listenPort < 1 || normalized.listenPort > 65535 {
 		return reverseProxyNormalizedRule{}, common.NewError("listen port must be between 1 and 65535")
@@ -940,6 +1000,47 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 	}
 	normalized.targetAddresses = targetAddresses
 	normalized.targetPath = normalizeReverseProxyPath(payload.TargetPath, false)
+
+	if normalized.listenProtocol == reverseProxyProtocolDNS ||
+		normalized.targetProtocol == reverseProxyProtocolDNS ||
+		reverseProxyProtocolIsDNS(normalized.listenProtocolAlias) ||
+		reverseProxyProtocolIsDNS(normalized.targetProtocolAlias) {
+		if !reverseProxyProtocolIsDNS(normalized.listenProtocolAlias) || !reverseProxyProtocolIsDNS(normalized.targetProtocolAlias) {
+			return reverseProxyNormalizedRule{}, common.NewError("dns reverse proxy requires both local protocol and target protocol to be dns")
+		}
+		if len(normalized.listenIPs) == 0 {
+			normalized.listenIPs = []string{"0.0.0.0"}
+		}
+		normalized.pathPrefix = ""
+		normalized.listenHTTPVersionStrategy = ""
+		normalized.httpVersionStrategy = ""
+		normalized.apiPassthrough = true
+		normalized.upstreamTLSVerify = payload.UpstreamTLSVerify
+		if reverseProxyDNSProtocolUsesPath(normalized.listenProtocolAlias) && normalized.listenDNSPath == "" {
+			normalized.listenDNSPath = "/dns-query"
+		}
+		if reverseProxyDNSProtocolUsesPath(normalized.targetProtocolAlias) && normalized.targetDNSPath == "" {
+			normalized.targetDNSPath = "/dns-query"
+		}
+		if !reverseProxyDNSProtocolUsesPath(normalized.listenProtocolAlias) {
+			normalized.listenDNSPath = ""
+		}
+		if !reverseProxyDNSProtocolUsesPath(normalized.targetProtocolAlias) {
+			normalized.targetDNSPath = ""
+		}
+		certIDs := normalizeReverseProxyCertificateIDList(payload.CertificateRecordIDs, payload.CertificateRecordID)
+		if reverseProxyDNSProtocolUsesTLS(normalized.listenProtocolAlias) {
+			if len(certIDs) == 0 {
+				return reverseProxyNormalizedRule{}, common.NewError("dns tls listener requires certificate")
+			}
+			normalized.certificateRecordIDs = certIDs
+			normalized.certificateRecordID = certIDs[0]
+		} else {
+			normalized.certificateRecordIDs = []uint{}
+			normalized.certificateRecordID = 0
+		}
+		return normalized, nil
+	}
 
 	listenHTTPVersionInput := payload.ListenHTTPVersionStrategy
 	if implied := reverseProxyListenProtocolAliasStrategy(listenProtocolInput); implied != "" {
@@ -1001,6 +1102,9 @@ func (s *ReverseProxyService) validateNormalizedRule(db *gorm.DB, row reversePro
 	if err := validateReverseProxyNoObviousLoop(row); err != nil {
 		return err
 	}
+	if reverseProxyProtocolIsDNS(row.listenProtocolAlias) {
+		return s.validateNormalizedDNSRule(db, row)
+	}
 	if row.listenProtocol == reverseProxyProtocolHTTP && (row.certificateRecordID != 0 || len(row.certificateRecordIDs) > 0) {
 		return common.NewError("http listener cannot bind certificate")
 	}
@@ -1054,6 +1158,71 @@ func (s *ReverseProxyService) validateNormalizedRule(db *gorm.DB, row reversePro
 		}
 		if reverseProxyRulePathsOverlap(existing.PathPrefix, row.pathPrefix) {
 			return common.NewError("reverse proxy rule conflicts with existing host/path on the same listener")
+		}
+	}
+	return nil
+}
+
+func (s *ReverseProxyService) validateNormalizedDNSRule(db *gorm.DB, row reverseProxyNormalizedRule) error {
+	if !reverseProxyProtocolIsDNS(row.targetProtocolAlias) {
+		return common.NewError("dns reverse proxy target protocol is invalid")
+	}
+	if reverseProxyDNSProtocolUsesTLS(row.listenProtocolAlias) {
+		certIDs := append([]uint(nil), row.certificateRecordIDs...)
+		if len(certIDs) == 0 && row.certificateRecordID > 0 {
+			certIDs = []uint{row.certificateRecordID}
+		}
+		if len(certIDs) == 0 {
+			return common.NewError("dns tls listener requires certificate")
+		}
+		for _, certID := range certIDs {
+			cert, err := loadReverseProxyCertificateRecord(db, certID)
+			if err != nil {
+				if database.IsNotFound(err) {
+					return common.NewError("certificate not found")
+				}
+				return err
+			}
+			if cert == nil || len(cert.FullchainPEM) == 0 || len(cert.KeyPEM) == 0 {
+				return common.NewError("certificate material is incomplete")
+			}
+		}
+	} else if row.certificateRecordID != 0 || len(row.certificateRecordIDs) > 0 {
+		return common.NewError("plain dns listener cannot bind certificate")
+	}
+	if reverseProxyDNSProtocolUsesPath(row.listenProtocolAlias) && row.listenDNSPath == "" {
+		return common.NewError("doh listener requires url path")
+	}
+	if reverseProxyDNSProtocolUsesPath(row.targetProtocolAlias) && row.targetDNSPath == "" {
+		return common.NewError("doh target requires url path")
+	}
+	if !reverseProxyDNSProtocolUsesPath(row.listenProtocolAlias) && row.listenDNSPath != "" {
+		return common.NewError("only doh / doh3 listener supports url path")
+	}
+	if !reverseProxyDNSProtocolUsesPath(row.targetProtocolAlias) && row.targetDNSPath != "" {
+		return common.NewError("only doh / doh3 target supports url path")
+	}
+	if row.listenProtocol != reverseProxyProtocolDNS || row.targetProtocol != reverseProxyProtocolDNS {
+		return common.NewError("dns reverse proxy must use dns protocol")
+	}
+
+	rows := make([]model.ReverseProxyRule, 0)
+	if err := db.Where("id <> ?", row.id).Find(&rows).Error; err != nil {
+		return err
+	}
+	for _, existing := range rows {
+		if existing.ListenPort != row.listenPort {
+			continue
+		}
+		existingListenAlias := normalizeReverseProxyProtocolAlias(existing.ListenProtocolAlias, existing.ListenProtocol)
+		if reverseProxyProtocolIsDNS(existingListenAlias) {
+			if !reverseProxyDNSProtocolSharesSocket(existingListenAlias, row.listenProtocolAlias) {
+				continue
+			}
+			return common.NewError("dns reverse proxy listener conflicts with existing dns listener on the same port")
+		}
+		if reverseProxyProtocolsShareUnderlyingSocket(existing.ListenProtocol, existing.ListenHTTPVersionStrategy, row.listenProtocol, row.listenHTTPVersionStrategy, existingListenAlias, row.listenProtocolAlias) {
+			return common.NewError("dns reverse proxy listener conflicts with existing reverse proxy listener on the same port")
 		}
 	}
 	return nil
@@ -1203,21 +1372,23 @@ func normalizeReverseProxyProtocol(raw string) (string, error) {
 		return reverseProxyProtocolHTTP, nil
 	case reverseProxyProtocolHTTPS, "h2", "h3", "wss":
 		return reverseProxyProtocolHTTPS, nil
+	case reverseProxyProtocolDNS, reverseProxyDNSProtocolDoH, reverseProxyDNSProtocolDoHH3, reverseProxyDNSProtocolDoQ, reverseProxyDNSProtocolDoT, reverseProxyDNSProtocolUDP, reverseProxyDNSProtocolTCP:
+		return reverseProxyProtocolDNS, nil
 	default:
-		return "", common.NewError("protocol must be http, https, h2, h3, ws, or wss")
+		return "", common.NewError("protocol must be http, https, h2, h3, ws, wss, dns, dns_doh, dns_doh3, dns_doq, dns_dot, dns_udp, or dns_tcp")
 	}
 }
 
 func normalizeReverseProxyProtocolAlias(alias string, protocolRaw string) string {
 	rawAlias := strings.ToLower(strings.TrimSpace(alias))
 	switch rawAlias {
-	case "ws", "wss":
+	case "ws", "wss", reverseProxyDNSProtocolDoH, reverseProxyDNSProtocolDoHH3, reverseProxyDNSProtocolDoQ, reverseProxyDNSProtocolDoT, reverseProxyDNSProtocolUDP, reverseProxyDNSProtocolTCP:
 		return rawAlias
 	}
 
 	rawProtocol := strings.ToLower(strings.TrimSpace(protocolRaw))
 	switch rawProtocol {
-	case "ws", "wss":
+	case "ws", "wss", reverseProxyDNSProtocolDoH, reverseProxyDNSProtocolDoHH3, reverseProxyDNSProtocolDoQ, reverseProxyDNSProtocolDoT, reverseProxyDNSProtocolUDP, reverseProxyDNSProtocolTCP:
 		return rawProtocol
 	default:
 		return ""
@@ -1286,6 +1457,117 @@ func normalizeReverseProxyHTTPVersionStrategy(raw string, targetProtocol string)
 	default:
 		return "", common.NewError("invalid http version strategy")
 	}
+}
+
+func reverseProxyProtocolIsDNS(alias string) bool {
+	switch strings.ToLower(strings.TrimSpace(alias)) {
+	case reverseProxyDNSProtocolDoH,
+		reverseProxyDNSProtocolDoHH3,
+		reverseProxyDNSProtocolDoQ,
+		reverseProxyDNSProtocolDoT,
+		reverseProxyDNSProtocolUDP,
+		reverseProxyDNSProtocolTCP:
+		return true
+	default:
+		return false
+	}
+}
+
+func reverseProxyDNSProtocolUsesPath(alias string) bool {
+	switch strings.ToLower(strings.TrimSpace(alias)) {
+	case reverseProxyDNSProtocolDoH, reverseProxyDNSProtocolDoHH3:
+		return true
+	default:
+		return false
+	}
+}
+
+func reverseProxyDNSProtocolUsesTLS(alias string) bool {
+	switch strings.ToLower(strings.TrimSpace(alias)) {
+	case reverseProxyDNSProtocolDoH, reverseProxyDNSProtocolDoHH3, reverseProxyDNSProtocolDoQ, reverseProxyDNSProtocolDoT:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeReverseProxyDNSPath(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+	if !strings.HasPrefix(value, "/") {
+		value = "/" + value
+	}
+	for len(value) > 1 && strings.HasSuffix(value, "/") {
+		value = strings.TrimSuffix(value, "/")
+	}
+	return value
+}
+
+func reverseProxyDNSProtocolUsesTCP(alias string) bool {
+	switch strings.ToLower(strings.TrimSpace(alias)) {
+	case reverseProxyDNSProtocolDoH, reverseProxyDNSProtocolDoT, reverseProxyDNSProtocolTCP:
+		return true
+	default:
+		return false
+	}
+}
+
+func reverseProxyDNSProtocolUsesUDP(alias string) bool {
+	switch strings.ToLower(strings.TrimSpace(alias)) {
+	case reverseProxyDNSProtocolDoH, reverseProxyDNSProtocolDoHH3, reverseProxyDNSProtocolDoQ, reverseProxyDNSProtocolUDP:
+		return true
+	default:
+		return false
+	}
+}
+
+func reverseProxyDNSProtocolSharesSocket(a string, b string) bool {
+	return (reverseProxyDNSProtocolUsesTCP(a) && reverseProxyDNSProtocolUsesTCP(b)) ||
+		(reverseProxyDNSProtocolUsesUDP(a) && reverseProxyDNSProtocolUsesUDP(b))
+}
+
+func reverseProxyProtocolsShareUnderlyingSocket(existingProtocol string, existingListenStrategy string, newProtocol string, newListenStrategy string, existingAlias string, newAlias string) bool {
+	if reverseProxyProtocolIsDNS(existingAlias) || reverseProxyProtocolIsDNS(newAlias) {
+		existingTCP := false
+		existingUDP := false
+		newTCP := false
+		newUDP := false
+
+		if reverseProxyProtocolIsDNS(existingAlias) {
+			existingTCP = reverseProxyDNSProtocolUsesTCP(existingAlias)
+			existingUDP = reverseProxyDNSProtocolUsesUDP(existingAlias)
+		} else {
+			existingTCP, existingUDP = reverseProxyHTTPListenerUsesSockets(existingProtocol, existingListenStrategy)
+		}
+		if reverseProxyProtocolIsDNS(newAlias) {
+			newTCP = reverseProxyDNSProtocolUsesTCP(newAlias)
+			newUDP = reverseProxyDNSProtocolUsesUDP(newAlias)
+		} else {
+			newTCP, newUDP = reverseProxyHTTPListenerUsesSockets(newProtocol, newListenStrategy)
+		}
+		return (existingTCP && newTCP) || (existingUDP && newUDP)
+	}
+	return false
+}
+
+func reverseProxyHTTPListenerUsesSockets(protocol string, listenStrategy string) (bool, bool) {
+	if strings.EqualFold(strings.TrimSpace(protocol), reverseProxyProtocolHTTPS) {
+		normalized, err := normalizeReverseProxyListenHTTPVersionStrategy(listenStrategy, reverseProxyProtocolHTTPS)
+		if err != nil {
+			normalized = reverseProxyListenHTTPVersionH2H3
+		}
+		switch normalized {
+		case reverseProxyListenHTTPVersionH2Only:
+			return true, false
+		case reverseProxyListenHTTPVersionH3Only:
+			return false, true
+		default:
+			return true, true
+		}
+	}
+	return true, false
 }
 
 const (
@@ -1635,21 +1917,41 @@ func buildReverseProxyCertificateHints(listenIPs []string, hosts []string, certs
 			hints = append(hints, "证书未覆盖域名: "+host)
 		}
 		for _, ip := range listenIPs {
-			hints = append(hints, "证书未覆盖IP: "+ip)
+			hints = append(hints, "证书未覆盖 IP: "+ip)
 		}
 		return hints
 	}
+	hasIPSANCert := false
+	for _, cert := range certs {
+		if reverseProxyCertificateOptionHasIPSAN(cert) {
+			hasIPSANCert = true
+			break
+		}
+	}
 	for _, host := range hosts {
+		if hasIPSANCert {
+			continue
+		}
 		if !reverseProxyCertificateDomainsCoverHost(certDomains, host) {
 			hints = append(hints, "证书未覆盖域名: "+host)
 		}
 	}
 	for _, ip := range listenIPs {
 		if !reverseProxyCertificateDomainsCoverIP(certDomains, ip) {
-			hints = append(hints, "证书未覆盖IP: "+ip)
+			hints = append(hints, "证书未覆盖 IP: "+ip)
 		}
 	}
 	return hints
+}
+
+func reverseProxyCertificateOptionHasIPSAN(cert ReverseProxyCertificateOption) bool {
+	values := append([]string{cert.MainDomain}, cert.Domains...)
+	for _, value := range values {
+		if reverseProxyParseIPLiteral(value) != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func reverseProxyLeafMatchesServerName(leaf *x509.Certificate, serverName string) bool {
@@ -1887,6 +2189,9 @@ func reverseProxyGroupRules(rows []model.ReverseProxyRule) map[string][]*model.R
 		if !row.Enabled {
 			continue
 		}
+		if reverseProxyProtocolIsDNS(normalizeReverseProxyProtocolAlias(row.ListenProtocolAlias, row.ListenProtocol)) {
+			continue
+		}
 		key := reverseProxyListenerKey(row.ListenProtocol, row.ListenPort)
 		grouped[key] = append(grouped[key], row)
 	}
@@ -1931,7 +2236,8 @@ func loadReverseProxyCertificateRenderState(db *gorm.DB, rows []model.ReversePro
 	seen := make(map[uint]struct{})
 	for i := range rows {
 		row := rows[i]
-		if !row.Enabled || !strings.EqualFold(strings.TrimSpace(row.ListenProtocol), reverseProxyProtocolHTTPS) {
+		listenAlias := normalizeReverseProxyProtocolAlias(row.ListenProtocolAlias, row.ListenProtocol)
+		if !row.Enabled || !reverseProxyListenerUsesManagedCertificates(strings.TrimSpace(row.ListenProtocol), listenAlias) {
 			continue
 		}
 		for _, certID := range reverseProxyRuleCertificateIDs(&row) {
@@ -1961,11 +2267,12 @@ func computeReverseProxyRenderKey(db *gorm.DB, rows []model.ReverseProxyRule) st
 	for i := range rows {
 		row := rows[i]
 		listenProtocol := strings.ToLower(strings.TrimSpace(row.ListenProtocol))
+		listenAlias := normalizeReverseProxyProtocolAlias(row.ListenProtocolAlias, row.ListenProtocol)
 		targetProtocol := strings.ToLower(strings.TrimSpace(row.TargetProtocol))
 		listenHTTPVersionStrategy := strings.ToLower(strings.TrimSpace(row.ListenHTTPVersionStrategy))
 		certificateRecordIDs := []uint{}
 		certificateStates := []reverseProxyRenderCertificateState{}
-		if listenProtocol == reverseProxyProtocolHTTPS {
+		if reverseProxyListenerUsesManagedCertificates(listenProtocol, listenAlias) {
 			certificateRecordIDs = reverseProxyRuleCertificateIDs(&row)
 			certificateStates = make([]reverseProxyRenderCertificateState, 0, len(certificateRecordIDs))
 			for _, certID := range certificateRecordIDs {
@@ -1988,10 +2295,12 @@ func computeReverseProxyRenderKey(db *gorm.DB, rows []model.ReverseProxyRule) st
 			ListenPort:           row.ListenPort,
 			Hosts:                decodeReverseProxyList(row.HostList),
 			PathPrefix:           normalizeReverseProxyPath(row.PathPrefix, false),
+			ListenDNSPath:        normalizeReverseProxyDNSPath(row.ListenDNSPath),
 			TargetProtocol:       targetProtocol,
 			TargetAddresses:      decodeReverseProxyList(row.TargetAddresses),
 			TargetPort:           row.TargetPort,
 			TargetPath:           normalizeReverseProxyPath(row.TargetPath, false),
+			TargetDNSPath:        normalizeReverseProxyDNSPath(row.TargetDNSPath),
 			CertificateRecordIDs: certificateRecordIDs,
 			CertificateStates:    certificateStates,
 			ListenHTTPVersionStrategy: func() string {
@@ -2229,6 +2538,10 @@ func (s *ReverseProxyService) newListenerGroup(key string, rules []*model.Revers
 				Handler:   handler,
 				TLSConfig: h3TLS,
 				Port:      first.ListenPort,
+				QUICConfig: &quic.Config{
+					KeepAlivePeriod: reverseProxyUpstreamQUICKeepAlivePeriod,
+					MaxIdleTimeout:  reverseProxyServerIdleTimeout,
+				},
 				ConnContext: func(ctx context.Context, conn *quic.Conn) context.Context {
 					return group.registerQUICConnectionContext(ctx, conn)
 				},
@@ -2467,7 +2780,7 @@ func (s *ReverseProxyService) loadRuleCertificates(rules []*model.ReverseProxyRu
 	certBindingsByRule := make(map[uint][]*reverseProxyRuleCertificateBinding)
 	orderedCertBindings := make([]*reverseProxyRuleCertificateBinding, 0)
 	for _, rule := range rules {
-		if rule == nil || rule.ListenProtocol != reverseProxyProtocolHTTPS {
+		if rule == nil || !reverseProxyListenerUsesManagedCertificates(rule.ListenProtocol, normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)) {
 			continue
 		}
 		for _, certID := range reverseProxyRuleCertificateIDs(rule) {
@@ -2490,6 +2803,15 @@ func (s *ReverseProxyService) loadRuleCertificates(rules []*model.ReverseProxyRu
 		}
 	}
 	return certBindingsByRule, orderedCertBindings, nil
+}
+
+func reverseProxyListenerUsesManagedCertificates(listenProtocol string, listenAlias string) bool {
+	normalizedProtocol := strings.ToLower(strings.TrimSpace(listenProtocol))
+	normalizedAlias := strings.ToLower(strings.TrimSpace(listenAlias))
+	if normalizedProtocol == reverseProxyProtocolHTTPS {
+		return true
+	}
+	return normalizedProtocol == reverseProxyProtocolDNS && reverseProxyDNSProtocolUsesTLS(normalizedAlias)
 }
 
 func reverseProxyPickDefaultCertificate(bindings []*reverseProxyRuleCertificateBinding) (*tls.Certificate, *x509LeafState) {
@@ -2575,10 +2897,16 @@ func (g *reverseProxyListenerGroup) noSNICertificateCandidatesLocked() []*revers
 	}
 	candidates := make([]*reverseProxyRuleCertificateBinding, 0)
 	for _, rule := range g.rules {
-		if len(reverseProxyRuleServerNames(rule)) != 0 {
+		bindings := g.certBindingsByRule[rule.Id]
+		if len(reverseProxyRuleServerNames(rule)) == 0 {
+			candidates = append(candidates, bindings...)
 			continue
 		}
-		candidates = append(candidates, g.certBindingsByRule[rule.Id]...)
+		for _, binding := range bindings {
+			if reverseProxyCertificateBindingHasIPSAN(binding) {
+				candidates = append(candidates, binding)
+			}
+		}
 	}
 	return candidates
 }

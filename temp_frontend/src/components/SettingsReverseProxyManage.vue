@@ -202,14 +202,14 @@
 
           <template #item.path="{ item }">
             <div class="py-2">
-              <div class="font-weight-medium">{{ item.pathPrefix || '全部路径' }}</div>
+              <div class="font-weight-medium">{{ item.listenProtocol.startsWith('dns_') ? (item.listenDnsPath || '-') : (item.pathPrefix || '全部路径') }}</div>
             </div>
           </template>
 
           <template #item.target="{ item }">
             <div class="py-2">
               <div class="font-weight-medium">{{ protocolLabel(item.targetProtocol) }} -> {{ joinDisplay(item.targetAddresses) }}:{{ item.targetPort }}</div>
-              <div class="text-caption text-medium-emphasis mt-1">{{ item.targetPath || '/' }}</div>
+              <div class="text-caption text-medium-emphasis mt-1">{{ item.targetProtocol.startsWith('dns_') ? (item.targetDnsPath || '-') : (item.targetPath || '/') }}</div>
             </div>
           </template>
 
@@ -357,8 +357,11 @@
                       v-model="editingRule.hostsText"
                       :label="reverseProxyCopy.hosts"
                       :placeholder="reverseProxyCopy.hostsPlaceholder"
+                      :disabled="listenIsDNS"
                       hide-details />
-                    <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.listenIpLocalHint }}</div>
+                    <div class="text-caption text-medium-emphasis mt-2">
+                      {{ listenIsDNS ? reverseProxyCopy.dnsHostUnused : reverseProxyCopy.listenIpLocalHint }}
+                    </div>
                   </v-col>
                   <v-col cols="12" md="6" lg="12">
                     <v-text-field
@@ -369,7 +372,7 @@
                       :label="reverseProxyCopy.listenPort"
                       hide-details />
                   </v-col>
-                  <v-col cols="12" lg="12">
+                  <v-col v-if="!listenIsDNS" cols="12" lg="12">
                     <v-text-field
                       v-model="editingRule.pathPrefix"
                       :label="reverseProxyCopy.pathPrefix"
@@ -377,7 +380,14 @@
                       hide-details />
                     <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.pathPrefixStrictHint }}</div>
                   </v-col>
-                  <v-col cols="12" lg="12">
+                  <v-col v-if="listenIsDNS && (editingRule.listenProtocol === 'dns_doh' || editingRule.listenProtocol === 'dns_doh3')" cols="12" lg="12">
+                    <v-text-field
+                      v-model="editingRule.listenDnsPath"
+                      :label="reverseProxyCopy.listenDnsPath"
+                      placeholder="/dns-query"
+                      hide-details />
+                  </v-col>
+                  <v-col v-if="!listenIsDNS" cols="12" lg="12">
                     <v-switch
                       v-model="editingRule.apiPassthrough"
                       color="primary"
@@ -420,13 +430,20 @@
                       :label="reverseProxyCopy.targetPort"
                       hide-details />
                   </v-col>
-                  <v-col cols="12" lg="12">
+                  <v-col v-if="!targetIsDNS" cols="12" lg="12">
                     <v-text-field
                       v-model="editingRule.targetPath"
                       :label="reverseProxyCopy.targetPath"
                       placeholder="/image-001"
                       hide-details />
                     <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.targetPathRewriteHint }}</div>
+                  </v-col>
+                  <v-col v-if="targetIsDNS && (editingRule.targetProtocol === 'dns_doh' || editingRule.targetProtocol === 'dns_doh3')" cols="12" lg="12">
+                    <v-text-field
+                      v-model="editingRule.targetDnsPath"
+                      :label="reverseProxyCopy.targetDnsPath"
+                      placeholder="/dns-query"
+                      hide-details />
                   </v-col>
                   <v-col cols="12" lg="12">
                     <v-select
@@ -437,7 +454,7 @@
                       :label="reverseProxyCopy.ipStrategy"
                       hide-details />
                   </v-col>
-                  <v-col cols="12" lg="12">
+                  <v-col v-if="!targetIsDNS" cols="12" lg="12">
                     <v-select
                       v-model="editingRule.httpVersionStrategy"
                       :items="httpVersionItems"
@@ -569,6 +586,8 @@ const {
   currentCertificateHints,
   targetIsHTTPS,
   listenIsHTTPS,
+  listenIsDNS,
+  targetIsDNS,
   targetVersionConfigurable,
   hasPreviewProtocol,
   listenProtocolBehavior,

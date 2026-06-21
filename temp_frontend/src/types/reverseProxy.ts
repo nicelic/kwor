@@ -13,18 +13,20 @@ export type ReverseProxyRule = {
   listOrder: number
   name: string
   enabled: boolean
-  listenProtocol: 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss'
-  listenProtocolAlias?: 'ws' | 'wss' | ''
+  listenProtocol: 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
+  listenProtocolAlias?: 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp' | ''
   listenIP: string
   listenIPs: string[]
   listenPort: number
   hosts: string[]
   pathPrefix: string
-  targetProtocol: 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss'
-  targetProtocolAlias?: 'ws' | 'wss' | ''
+  listenDnsPath?: string
+  targetProtocol: 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
+  targetProtocolAlias?: 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp' | ''
   targetAddresses: string[]
   targetPort: number
   targetPath: string
+  targetDnsPath?: string
   certificateRecordIds: number[]
   certificateRecordId: number
   certificateLabel: string
@@ -49,14 +51,16 @@ export type ReverseProxyRuleForm = {
   displayId: number
   name: string
   enabled: boolean
-  listenProtocol: 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss'
+  listenProtocol: 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
   listenPort: number
   hostsText: string
   pathPrefix: string
-  targetProtocol: 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss'
+  listenDnsPath: string
+  targetProtocol: 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
   targetAddressesText: string
   targetPort: number
   targetPath: string
+  targetDnsPath: string
   certificateRecordIds: number[]
   listenHttpVersionStrategy: '' | 'h2_h3' | 'h2_only' | 'h3_only'
   ipStrategy: 'ipv4_only' | 'ipv6_only' | 'prefer_ipv4' | 'prefer_ipv6'

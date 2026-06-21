@@ -80,6 +80,14 @@ func TestNormalizeReverseProxyProtocol_AcceptsWSAliases(t *testing.T) {
 	if gotWSS != reverseProxyProtocolHTTPS {
 		t.Fatalf("expected wss to map to https, got %q", gotWSS)
 	}
+
+	gotDNS, err := normalizeReverseProxyProtocol(reverseProxyDNSProtocolDoH)
+	if err != nil {
+		t.Fatalf("normalize dns doh protocol failed: %v", err)
+	}
+	if gotDNS != reverseProxyProtocolDNS {
+		t.Fatalf("expected dns_doh to map to dns, got %q", gotDNS)
+	}
 }
 
 func TestNormalizeReverseProxyPayloadAllowsEmptyListenMatch(t *testing.T) {
@@ -148,6 +156,255 @@ func TestReverseProxyPayloadPreservesAPIPassthroughForWSAliases(t *testing.T) {
 				t.Fatalf("expected apiPassthrough=%v got %v", tc.expected, normalized.apiPassthrough)
 			}
 		})
+	}
+}
+
+func TestNormalizeReverseProxyPayloadSupportsDNSProtocols(t *testing.T) {
+	svc := &ReverseProxyService{}
+	certIDs := []uint{3, 5}
+	normalized, err := svc.normalizeRulePayload(ReverseProxyRulePayload{
+		Enabled:              true,
+		ListenProtocol:       reverseProxyDNSProtocolDoH,
+		ListenPort:           4443,
+		ListenDNSPath:        "/custom-dns",
+		TargetProtocol:       reverseProxyDNSProtocolDoQ,
+		TargetAddresses:      "1.1.1.1, 8.8.8.8",
+		TargetPort:           853,
+		IPStrategy:           reverseProxyIPStrategyPreferIPv4,
+		UpstreamTLSVerify:    true,
+		CertificateRecordIDs: certIDs,
+	})
+	if err != nil {
+		t.Fatalf("normalize dns payload failed: %v", err)
+	}
+	if normalized.listenProtocol != reverseProxyProtocolDNS {
+		t.Fatalf("expected listen protocol dns, got %q", normalized.listenProtocol)
+	}
+	if normalized.listenProtocolAlias != reverseProxyDNSProtocolDoH {
+		t.Fatalf("expected listen alias dns_doh, got %q", normalized.listenProtocolAlias)
+	}
+	if normalized.targetProtocolAlias != reverseProxyDNSProtocolDoQ {
+		t.Fatalf("expected target alias dns_doq, got %q", normalized.targetProtocolAlias)
+	}
+	if normalized.listenDNSPath != "/custom-dns" {
+		t.Fatalf("expected custom doh path, got %q", normalized.listenDNSPath)
+	}
+	if normalized.targetDNSPath != "" {
+		t.Fatalf("expected empty doq target path, got %q", normalized.targetDNSPath)
+	}
+	if len(normalized.certificateRecordIDs) != len(certIDs) || normalized.certificateRecordID != certIDs[0] {
+		t.Fatalf("expected dns tls listener certificates to be preserved, got ids=%v first=%d", normalized.certificateRecordIDs, normalized.certificateRecordID)
+	}
+}
+
+func TestNormalizeReverseProxyPayloadSupportsFrontendDNSAliasShape(t *testing.T) {
+	svc := &ReverseProxyService{}
+	certIDs := []uint{3, 5}
+	normalized, err := svc.normalizeRulePayload(ReverseProxyRulePayload{
+		Enabled:              true,
+		ListenProtocol:       reverseProxyProtocolDNS,
+		ListenProtocolAlias:  reverseProxyDNSProtocolDoT,
+		ListenPort:           853,
+		TargetProtocol:       reverseProxyProtocolDNS,
+		TargetProtocolAlias:  reverseProxyDNSProtocolDoH,
+		TargetAddresses:      "1.1.1.1",
+		TargetPort:           443,
+		TargetDNSPath:        "/dns-query",
+		IPStrategy:           reverseProxyIPStrategyPreferIPv4,
+		UpstreamTLSVerify:    true,
+		CertificateRecordIDs: certIDs,
+	})
+	if err != nil {
+		t.Fatalf("normalize frontend dns payload failed: %v", err)
+	}
+	if normalized.listenProtocol != reverseProxyProtocolDNS || normalized.targetProtocol != reverseProxyProtocolDNS {
+		t.Fatalf("expected dns protocols, got listen=%q target=%q", normalized.listenProtocol, normalized.targetProtocol)
+	}
+	if normalized.listenProtocolAlias != reverseProxyDNSProtocolDoT || normalized.targetProtocolAlias != reverseProxyDNSProtocolDoH {
+		t.Fatalf("expected dns aliases to be preserved, got listen=%q target=%q", normalized.listenProtocolAlias, normalized.targetProtocolAlias)
+	}
+	if !normalized.upstreamTLSVerify {
+		t.Fatal("expected dns upstream tls verify to be preserved")
+	}
+	if len(normalized.certificateRecordIDs) != len(certIDs) || normalized.certificateRecordID != certIDs[0] {
+		t.Fatalf("expected dns tls listener certificates to be preserved, got ids=%v first=%d", normalized.certificateRecordIDs, normalized.certificateRecordID)
+	}
+}
+
+func TestNormalizeReverseProxyPayloadRejectsDNSTLSWithoutCertificate(t *testing.T) {
+	svc := &ReverseProxyService{}
+	_, err := svc.normalizeRulePayload(ReverseProxyRulePayload{
+		Enabled:         true,
+		ListenProtocol:  reverseProxyDNSProtocolDoT,
+		ListenPort:      853,
+		TargetProtocol:  reverseProxyDNSProtocolTCP,
+		TargetAddresses: "1.1.1.1",
+		TargetPort:      53,
+		IPStrategy:      reverseProxyIPStrategyPreferIPv4,
+	})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "certificate") {
+		t.Fatalf("expected dns tls listener without certificate to fail, got %v", err)
+	}
+}
+
+func TestValidateNormalizedDNSRuleRejectsPlainDNSCertificateBinding(t *testing.T) {
+	openReverseProxyTestDB(t)
+
+	err := (&ReverseProxyService{}).validateNormalizedDNSRule(database.GetDB(), reverseProxyNormalizedRule{
+		listenProtocol:       reverseProxyProtocolDNS,
+		listenProtocolAlias:  reverseProxyDNSProtocolUDP,
+		listenPort:           5353,
+		listenIPs:            []string{"0.0.0.0"},
+		targetProtocol:       reverseProxyProtocolDNS,
+		targetProtocolAlias:  reverseProxyDNSProtocolTCP,
+		targetAddresses:      []string{"1.1.1.1"},
+		targetPort:           53,
+		certificateRecordIDs: []uint{1},
+		certificateRecordID:  1,
+		ipStrategy:           reverseProxyIPStrategyPreferIPv4,
+	})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "plain dns listener cannot bind certificate") {
+		t.Fatalf("expected plain dns listener certificate bind to fail, got %v", err)
+	}
+}
+
+func TestValidateNormalizedDNSRuleRejectsSharedDoHSocketOnSamePort(t *testing.T) {
+	openReverseProxyTestDB(t)
+	firstCertID := createReverseProxyTestCertificateRecord(t, "dns-one.example.com")
+	secondCertID := createReverseProxyTestCertificateRecord(t, "dns-two.example.com")
+
+	existing := model.ReverseProxyRule{
+		DisplayID:             1,
+		ListOrder:             1,
+		Name:                  "existing-doh",
+		Enabled:               true,
+		ListenProtocol:        reverseProxyProtocolDNS,
+		ListenProtocolAlias:   reverseProxyDNSProtocolDoH,
+		ListenIPList:          `["0.0.0.0"]`,
+		ListenPort:            4443,
+		ListenDNSPath:         "/dns-query",
+		TargetProtocol:        reverseProxyProtocolDNS,
+		TargetProtocolAlias:   reverseProxyDNSProtocolUDP,
+		TargetAddresses:       `["1.1.1.1"]`,
+		TargetPort:            53,
+		CertificateRecordList: encodeReverseProxyUintList([]uint{firstCertID}),
+		CertificateRecordID:   firstCertID,
+		IPStrategy:            reverseProxyIPStrategyPreferIPv4,
+	}
+	if err := database.GetDB().Create(&existing).Error; err != nil {
+		t.Fatalf("create dns rule failed: %v", err)
+	}
+
+	err := (&ReverseProxyService{}).validateNormalizedDNSRule(database.GetDB(), reverseProxyNormalizedRule{
+		listenProtocol:       reverseProxyProtocolDNS,
+		listenProtocolAlias:  reverseProxyDNSProtocolDoH,
+		listenPort:           4443,
+		listenDNSPath:        "/another-path",
+		listenIPs:            []string{"0.0.0.0"},
+		targetProtocol:       reverseProxyProtocolDNS,
+		targetProtocolAlias:  reverseProxyDNSProtocolTCP,
+		targetAddresses:      []string{"8.8.8.8"},
+		targetPort:           53,
+		certificateRecordIDs: []uint{secondCertID},
+		certificateRecordID:  secondCertID,
+		ipStrategy:           reverseProxyIPStrategyPreferIPv4,
+	})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "conflicts with existing dns listener") {
+		t.Fatalf("expected shared doh socket to conflict, got %v", err)
+	}
+}
+
+func TestValidateNormalizedDNSRuleRejectsDoH3OnExistingDoHSocket(t *testing.T) {
+	openReverseProxyTestDB(t)
+	firstCertID := createReverseProxyTestCertificateRecord(t, "dns-one.example.com")
+	secondCertID := createReverseProxyTestCertificateRecord(t, "dns-two.example.com")
+
+	existing := model.ReverseProxyRule{
+		DisplayID:             1,
+		ListOrder:             1,
+		Name:                  "existing-doh",
+		Enabled:               true,
+		ListenProtocol:        reverseProxyProtocolDNS,
+		ListenProtocolAlias:   reverseProxyDNSProtocolDoH,
+		ListenIPList:          `["0.0.0.0"]`,
+		ListenPort:            4443,
+		ListenDNSPath:         "/dns-query",
+		TargetProtocol:        reverseProxyProtocolDNS,
+		TargetProtocolAlias:   reverseProxyDNSProtocolUDP,
+		TargetAddresses:       `["1.1.1.1"]`,
+		TargetPort:            53,
+		CertificateRecordList: encodeReverseProxyUintList([]uint{firstCertID}),
+		CertificateRecordID:   firstCertID,
+		IPStrategy:            reverseProxyIPStrategyPreferIPv4,
+	}
+	if err := database.GetDB().Create(&existing).Error; err != nil {
+		t.Fatalf("create dns rule failed: %v", err)
+	}
+
+	err := (&ReverseProxyService{}).validateNormalizedDNSRule(database.GetDB(), reverseProxyNormalizedRule{
+		listenProtocol:       reverseProxyProtocolDNS,
+		listenProtocolAlias:  reverseProxyDNSProtocolDoHH3,
+		listenPort:           4443,
+		listenDNSPath:        "/dns-query",
+		listenIPs:            []string{"0.0.0.0"},
+		targetProtocol:       reverseProxyProtocolDNS,
+		targetProtocolAlias:  reverseProxyDNSProtocolTCP,
+		targetAddresses:      []string{"8.8.8.8"},
+		targetPort:           53,
+		certificateRecordIDs: []uint{secondCertID},
+		certificateRecordID:  secondCertID,
+		ipStrategy:           reverseProxyIPStrategyPreferIPv4,
+	})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "conflicts with existing dns listener") {
+		t.Fatalf("expected doh3 socket to conflict with doh listener, got %v", err)
+	}
+}
+
+func TestReverseProxyDNSListenIPSetsOverlap(t *testing.T) {
+	cases := []struct {
+		name string
+		a    []string
+		b    []string
+		want bool
+	}{
+		{name: "same ip", a: []string{"127.0.0.1"}, b: []string{"127.0.0.1"}, want: true},
+		{name: "wildcard covers concrete", a: []string{"0.0.0.0"}, b: []string{"127.0.0.1"}, want: true},
+		{name: "empty means wildcard", a: nil, b: []string{"127.0.0.1"}, want: true},
+		{name: "different concrete ips", a: []string{"127.0.0.1"}, b: []string{"127.0.0.2"}, want: false},
+		{name: "different families", a: []string{"0.0.0.0"}, b: []string{"::"}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := reverseProxyListenIPSetsOverlap(tc.a, tc.b); got != tc.want {
+				t.Fatalf("overlap=%v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReverseProxyDNSDoH3OnlyRoutesRestrictPath(t *testing.T) {
+	called := 0
+	mux := http.NewServeMux()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called++
+		w.WriteHeader(http.StatusNoContent)
+	})
+	for _, route := range buildReverseProxyDNSDoHRoutes("/dns-query") {
+		mux.Handle(route, handler)
+	}
+
+	okReq := httptest.NewRequest(http.MethodPost, "https://dns.example.com/dns-query", nil)
+	okRec := httptest.NewRecorder()
+	mux.ServeHTTP(okRec, okReq)
+	if okRec.Code != http.StatusNoContent || called != 1 {
+		t.Fatalf("expected configured doh3 route to be handled, status=%d called=%d", okRec.Code, called)
+	}
+
+	missReq := httptest.NewRequest(http.MethodPost, "https://dns.example.com/other", nil)
+	missRec := httptest.NewRecorder()
+	mux.ServeHTTP(missRec, missReq)
+	if missRec.Code != http.StatusNotFound || called != 1 {
+		t.Fatalf("expected unconfigured doh3 route to be rejected, status=%d called=%d", missRec.Code, called)
 	}
 }
 
@@ -829,6 +1086,68 @@ func TestReverseProxyGroupRules_GroupsByProtocolAndPortOnly(t *testing.T) {
 	}
 }
 
+func TestReverseProxyGroupRules_SkipsDNSListeners(t *testing.T) {
+	rows := []model.ReverseProxyRule{
+		{
+			Id:                  1,
+			ListOrder:           1,
+			Enabled:             true,
+			ListenProtocol:      reverseProxyProtocolDNS,
+			ListenProtocolAlias: reverseProxyDNSProtocolUDP,
+			ListenPort:          53,
+		},
+		{
+			Id:             2,
+			ListOrder:      2,
+			Enabled:        true,
+			ListenProtocol: reverseProxyProtocolHTTP,
+			ListenPort:     8080,
+		},
+	}
+
+	grouped := reverseProxyGroupRules(rows)
+	if len(grouped) != 1 {
+		t.Fatalf("expected dns listener to be skipped from http runtime groups, got %#v", grouped)
+	}
+	if _, exists := grouped["dns|53"]; exists {
+		t.Fatalf("dns listener should not be grouped into http runtime: %#v", grouped)
+	}
+}
+
+func TestUpsertDNSRuleSyncsDNSRuntimeImmediately(t *testing.T) {
+	openReverseProxyTestDB(t)
+
+	svc := &ReverseProxyService{}
+	t.Cleanup(func() {
+		_ = svc.StopRuntime()
+	})
+
+	listenPort := reserveReverseProxyTestPort(t)
+	certID := createReverseProxyTestCertificateRecord(t, "dns-runtime.example.com")
+
+	if err := svc.UpsertRule(ReverseProxyRulePayload{
+		Name:                "dns-runtime-sync",
+		Enabled:             true,
+		ListenProtocol:      reverseProxyDNSProtocolDoH,
+		ListenPort:          listenPort,
+		ListenDNSPath:       "/dns-query",
+		TargetProtocol:      reverseProxyDNSProtocolUDP,
+		TargetAddresses:     "1.1.1.1",
+		TargetPort:          53,
+		CertificateRecordID: certID,
+		IPStrategy:          reverseProxyIPStrategyPreferIPv4,
+	}); err != nil {
+		t.Fatalf("upsert dns rule failed: %v", err)
+	}
+
+	reverseProxyDNSRuntime.mu.Lock()
+	defer reverseProxyDNSRuntime.mu.Unlock()
+
+	if len(reverseProxyDNSRuntime.running) != 1 {
+		t.Fatalf("expected dns runtime to start immediately, got %d instances", len(reverseProxyDNSRuntime.running))
+	}
+}
+
 func TestReverseProxyRuleServerNameMatch_UsesSNINameList(t *testing.T) {
 	rule := &model.ReverseProxyRule{
 		ListenIPList: `["1.2.3.4"]`,
@@ -1377,6 +1696,54 @@ func TestReverseProxyGetCertificateWithSNISelectsFirstCoveringCertInConfiguredOr
 	}
 	if got != secondCert {
 		t.Fatalf("expected second certificate to match example.com, got %v", got)
+	}
+}
+
+func TestReverseProxyNoSNICertificateCandidatesIncludeIPSANBindings(t *testing.T) {
+	domainBinding := &reverseProxyRuleCertificateBinding{
+		RuleID:              1,
+		CertificateRecordID: 1,
+		Certificate:         &tls.Certificate{},
+		Leaf:                reverseProxyTestLeafState("example.com"),
+	}
+	ipBinding := &reverseProxyRuleCertificateBinding{
+		RuleID:              1,
+		CertificateRecordID: 2,
+		Certificate:         &tls.Certificate{},
+		Leaf:                reverseProxyTestLeafState("127.0.0.1"),
+	}
+	group := &reverseProxyListenerGroup{
+		rules: []*model.ReverseProxyRule{
+			{
+				Id:           1,
+				ListenIPList: `["example.com"]`,
+				HostList:     `["example.com"]`,
+			},
+		},
+		certBindingsByRule: map[uint][]*reverseProxyRuleCertificateBinding{
+			1: {domainBinding, ipBinding},
+		},
+	}
+
+	candidates := group.noSNICertificateCandidatesLocked()
+	if len(candidates) != 1 || candidates[0] != ipBinding {
+		t.Fatalf("expected no-sni candidates to keep only ip-san binding, got %#v", candidates)
+	}
+}
+
+func TestBuildReverseProxyCertificateHintsSkipsHostWarningsWhenIPSANCertPresent(t *testing.T) {
+	hints := buildReverseProxyCertificateHints(
+		nil,
+		[]string{"dns.example.com"},
+		[]ReverseProxyCertificateOption{
+			{
+				MainDomain: "127.0.0.1",
+				Domains:    []string{"127.0.0.1"},
+			},
+		},
+	)
+	if len(hints) != 0 {
+		t.Fatalf("expected ip-san certificate to suppress host warning, got %#v", hints)
 	}
 }
 
