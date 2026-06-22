@@ -135,6 +135,7 @@
             <v-col cols="12" sm="6" md="4">
               <v-select
                 v-model="panelSelectedVersion"
+                v-model:menu="panelVersionMenuVisible"
                 :items="panelVersionItems"
                 item-title="title"
                 item-value="value"
@@ -162,6 +163,43 @@
                       </v-chip>
                     </template>
                   </v-list-item>
+                </template>
+                <template #append-item>
+                  <v-divider v-if="panelVersionItems.length > 0" class="mt-1" />
+                  <div
+                    v-if="panelVersionItems.length > 0"
+                    class="px-3 py-3 d-flex align-center justify-space-between flex-wrap"
+                    style="gap: 10px;"
+                  >
+                    <span class="text-caption text-medium-emphasis">
+                      已加载 {{ panelVersionItems.length }} 个版本
+                    </span>
+                    <div class="d-flex align-center flex-wrap" style="gap: 8px;">
+                      <v-btn
+                        v-if="panelHasMoreVersions"
+                        size="small"
+                        color="primary"
+                        variant="tonal"
+                        :loading="panelLoadingMoreVersions"
+                        :disabled="panelInstalling || panelRemoteLoading"
+                        @mousedown.prevent
+                        @click.stop="loadMorePanelVersions"
+                      >
+                        加载更多版本
+                      </v-btn>
+                      <v-btn
+                        v-if="panelVersionItems.length > 5"
+                        size="small"
+                        color="secondary"
+                        variant="text"
+                        :disabled="panelInstalling || panelRemoteLoading"
+                        @mousedown.prevent
+                        @click.stop="resetPanelVersions"
+                      >
+                        只看最新 5 个
+                      </v-btn>
+                    </div>
+                  </div>
                 </template>
               </v-select>
             </v-col>
@@ -193,33 +231,7 @@
             </v-col>
           </v-row>
 
-          <v-row v-if="panelVersionItems.length > 0 || panelUpdateFeedback" class="mt-1">
-            <v-col cols="12" class="d-flex align-center justify-space-between flex-wrap" style="gap: 8px;">
-              <span v-if="panelVersionItems.length > 0" class="text-caption text-medium-emphasis">
-                已加载 {{ panelVersionItems.length }} 个版本
-              </span>
-              <div class="d-flex align-center" style="gap: 8px;">
-                <v-btn
-                  v-if="panelHasMoreVersions"
-                  size="x-small"
-                  variant="text"
-                  :loading="panelLoadingMoreVersions"
-                  :disabled="panelInstalling"
-                  @click="loadMorePanelVersions"
-                >
-                  加载更多
-                </v-btn>
-                <v-btn
-                  v-if="panelVersionItems.length > 5"
-                  size="x-small"
-                  variant="text"
-                  :disabled="panelInstalling"
-                  @click="resetPanelVersions"
-                >
-                  只看最新 5 个
-                </v-btn>
-              </div>
-            </v-col>
+          <v-row v-if="panelUpdateFeedback" class="mt-1">
             <v-col v-if="panelUpdateFeedback" cols="12">
               <v-alert
                 :type="panelUpdateFeedbackType"
@@ -442,6 +454,7 @@ const panelStatusLoading = ref(false)
 const panelRemoteLoading = ref(false)
 const panelLoadingMoreVersions = ref(false)
 const panelInstalling = ref(false)
+const panelVersionMenuVisible = ref(false)
 const panelInstallDialogVisible = ref(false)
 const panelRestartOverlay = ref(false)
 const panelUpdateStatus = ref<PanelUpdateStatus | null>(null)
