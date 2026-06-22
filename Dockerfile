@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1
 
+ARG GO_VERSION=1.26
+
 # ---- Frontend build stage ----
 FROM --platform=$BUILDPLATFORM node:22-alpine AS front-builder
 WORKDIR /app
@@ -12,7 +14,7 @@ RUN cd temp_frontend \
     && npm run build
 
 # ---- Backend build stage (pure Go, no CGO) ----
-FROM golang:1.25-alpine AS backend-builder
+FROM golang:${GO_VERSION}-alpine AS backend-builder
 WORKDIR /app
 ARG TARGETARCH
 ENV CGO_ENABLED=0

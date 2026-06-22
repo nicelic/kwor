@@ -41,6 +41,18 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve Go version
+        id: go-version
+        shell: bash
+        run: |
+          go_version="$(awk '/^go / { print $2; exit }' go.mod)"
+          if [ -z "$go_version" ]; then
+            echo "Failed to read Go version from go.mod" >&2
+            exit 1
+          fi
+          echo "Using Go ${go_version} for Docker build"
+          echo "value=${go_version}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -48,6 +60,8 @@ jobs:
           file: Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            GO_VERSION=${{ steps.go-version.outputs.value }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
