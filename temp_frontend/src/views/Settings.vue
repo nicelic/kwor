@@ -168,35 +168,24 @@
                   <v-divider v-if="panelVersionItems.length > 0" class="mt-1" />
                   <div
                     v-if="panelVersionItems.length > 0"
-                    class="px-3 py-3 d-flex align-center justify-space-between flex-wrap"
+                    class="panel-version-footer px-3 py-3 d-flex align-center justify-space-between flex-wrap"
                     style="gap: 10px;"
                   >
-                    <span class="text-caption text-medium-emphasis">
+                    <span class="text-caption panel-version-footer__summary">
                       已加载 {{ panelVersionItems.length }} 个版本
                     </span>
                     <div class="d-flex align-center flex-wrap" style="gap: 8px;">
                       <v-btn
-                        v-if="panelHasMoreVersions"
                         size="small"
                         color="primary"
                         variant="tonal"
+                        class="panel-version-footer__action"
                         :loading="panelLoadingMoreVersions"
-                        :disabled="panelInstalling || panelRemoteLoading"
+                        :disabled="panelInstalling || panelRemoteLoading || panelAllVersionsLoaded"
                         @mousedown.prevent
                         @click.stop="loadMorePanelVersions"
                       >
-                        加载更多版本
-                      </v-btn>
-                      <v-btn
-                        v-if="panelVersionItems.length > 5"
-                        size="small"
-                        color="secondary"
-                        variant="text"
-                        :disabled="panelInstalling || panelRemoteLoading"
-                        @mousedown.prevent
-                        @click.stop="resetPanelVersions"
-                      >
-                        只看最新 5 个
+                        {{ panelAllVersionsLoaded ? '已无版本可以加载' : '加载更多版本' }}
                       </v-btn>
                     </div>
                   </div>
@@ -461,6 +450,7 @@ const panelUpdateStatus = ref<PanelUpdateStatus | null>(null)
 const panelSelectedVersion = ref('')
 const panelVersionItems = ref<PanelVersionItem[]>([])
 const panelHasMoreVersions = ref(false)
+const panelAllVersionsLoaded = ref(false)
 const panelUpdateFeedback = ref('')
 const panelUpdateFeedbackType = ref<'success' | 'error' | 'info' | 'warning'>('info')
 const panelVersionRequestSeq = ref(0)
@@ -584,6 +574,7 @@ const applyPanelVersionResponse = (obj: any, append: boolean) => {
   })
   panelVersionItems.value = existing
   panelHasMoreVersions.value = obj?.has_more === true || obj?.hasMore === true
+  panelAllVersionsLoaded.value = append && !panelHasMoreVersions.value
   if (!append && panelVersionItems.value.length > 0) {
     panelSelectedVersion.value = panelVersionItems.value[0].value
   } else if (!panelSelectedVersion.value && panelVersionItems.value.length > 0) {
@@ -598,6 +589,7 @@ const loadPanelVersions = async (append = false) => {
     panelLoadingMoreVersions.value = true
   } else {
     panelRemoteLoading.value = true
+    panelAllVersionsLoaded.value = false
   }
 
   const msg = await HttpUtils.get('api/panel-update-versions', {
@@ -617,7 +609,12 @@ const loadPanelVersions = async (append = false) => {
 
   if (msg.success) {
     applyPanelVersionResponse(msg.obj, append)
-    panelUpdateFeedback.value = append ? '已加载更多版本' : '检查完成，已选择最新版本'
+    if (append) {
+      panelUpdateFeedback.value = panelAllVersionsLoaded.value ? '已无版本可以加载' : '已加载更多版本'
+      panelUpdateFeedbackType.value = panelAllVersionsLoaded.value ? 'info' : 'success'
+      return
+    }
+    panelUpdateFeedback.value = '检查完成，已选择最新版本'
     panelUpdateFeedbackType.value = 'success'
   } else if (msg.msg) {
     panelUpdateFeedback.value = msg.msg
@@ -630,15 +627,12 @@ const checkPanelUpdates = async () => {
 }
 
 const loadMorePanelVersions = async () => {
-  await loadPanelVersions(true)
-}
-
-const resetPanelVersions = () => {
-  panelVersionItems.value = panelVersionItems.value.slice(0, 5)
-  panelHasMoreVersions.value = true
-  if (panelVersionItems.value.length > 0) {
-    panelSelectedVersion.value = panelVersionItems.value[0].value
+  if (panelAllVersionsLoaded.value) {
+    panelUpdateFeedback.value = '已无版本可以加载'
+    panelUpdateFeedbackType.value = 'info'
+    return
   }
+  await loadPanelVersions(true)
 }
 
 const openPanelInstallDialog = () => {
@@ -971,5 +965,20 @@ const stateChange = computed(() => {
 
 const showTopActionBar = computed(() => tab.value !== 't6' && tab.value !== 't7' && tab.value !== 't8' && tab.value !== 't9' && tab.value !== 't10' && tab.value !== 't11' && tab.value !== 't12' && tab.value !== 't13')
 </script>
+
+<style scoped>
+.panel-version-footer__summary {
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.panel-version-footer__action {
+  color: #fff;
+}
+
+.panel-version-footer__action.v-btn--disabled {
+  color: rgba(255, 255, 255, 0.88);
+  opacity: 1;
+}
+</style>
 
 
