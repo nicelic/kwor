@@ -387,6 +387,57 @@
                       placeholder="/dns-query"
                       hide-details />
                   </v-col>
+                  <v-col v-if="listenIsDNS" cols="12" lg="12">
+                    <v-switch
+                      v-model="editingRule.ednsEnabled"
+                      color="primary"
+                      :label="reverseProxyCopy.ednsEnabled"
+                      hide-details />
+                  </v-col>
+                  <v-col v-if="listenIsDNS && editingRule.ednsEnabled" cols="12" lg="12">
+                    <v-select
+                      v-model="editingRule.ednsMode"
+                      :items="ednsModeItems"
+                      item-title="title"
+                      item-value="value"
+                      :label="reverseProxyCopy.ednsMode"
+                      hide-details />
+                  </v-col>
+                  <v-col v-if="listenIsDNS && editingRule.ednsEnabled && editingRule.ednsMode === 'custom'" cols="12" lg="12">
+                    <v-text-field
+                      v-model="editingRule.ednsCustomIp"
+                      :label="reverseProxyCopy.ednsCustomIp"
+                      placeholder="14.119.184.1 / 2408:xxxx::1"
+                      hide-details />
+                  </v-col>
+                  <v-col v-if="listenIsDNS && editingRule.ednsEnabled && editingRule.ednsMode === 'auto'" cols="12" lg="12">
+                    <v-select
+                      v-model="editingRule.ednsClientSubnetPolicy"
+                      :items="ednsClientSubnetPolicyItems"
+                      item-title="title"
+                      item-value="value"
+                      :label="reverseProxyCopy.ednsClientSubnetPolicy"
+                      hide-details />
+                    <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.ednsPolicyHint }}</div>
+                  </v-col>
+                  <v-col v-if="listenIsDNS" cols="12" lg="12">
+                    <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.ednsHint }}</div>
+                  </v-col>
+                  <v-col v-if="listenIsDNS" cols="12" lg="12">
+                    <v-switch
+                      v-model="editingRule.disableIpv4Answer"
+                      color="primary"
+                      :label="reverseProxyCopy.disableIpv4Answer"
+                      hide-details />
+                  </v-col>
+                  <v-col v-if="listenIsDNS" cols="12" lg="12">
+                    <v-switch
+                      v-model="editingRule.disableIpv6Answer"
+                      color="primary"
+                      :label="reverseProxyCopy.disableIpv6Answer"
+                      hide-details />
+                    <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.dnsAnswerFilterHint }}</div>
+                  </v-col>
                   <v-col v-if="!listenIsDNS" cols="12" lg="12">
                     <v-switch
                       v-model="editingRule.apiPassthrough"
@@ -552,6 +603,8 @@
 import {
   certificateDisplay,
   connectionCountsDisplay,
+  ednsClientSubnetPolicyItems,
+  ednsModeItems,
   httpVersionItems,
   ipStrategyItems,
   joinDisplay,

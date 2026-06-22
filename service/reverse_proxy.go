@@ -83,6 +83,12 @@ const (
 	reverseProxyUpstreamModeHTTPS   = "https"
 	reverseProxyUpstreamModeHTTPSH2 = "https_h2"
 	reverseProxyUpstreamModeHTTPSH3 = "https_h3"
+
+	reverseProxyEDNSModeAuto   = "auto"
+	reverseProxyEDNSModeCustom = "custom"
+
+	reverseProxyEDNSClientSubnetPolicyClientIP            = "client_ip"
+	reverseProxyEDNSClientSubnetPolicyPreferRequestPublic = "prefer_request_public"
 )
 
 var reverseProxyHostTokenRe = regexp.MustCompile(`^[A-Za-z0-9\.\-:\[\]]+$`)
@@ -109,6 +115,12 @@ type ReverseProxyRulePayload struct {
 	TargetPort                int    `json:"targetPort"`
 	TargetPath                string `json:"targetPath"`
 	TargetDNSPath             string `json:"targetDnsPath"`
+	EDNSEnabled               bool   `json:"ednsEnabled"`
+	EDNSMode                  string `json:"ednsMode"`
+	EDNSCustomIP              string `json:"ednsCustomIp"`
+	EDNSClientSubnetPolicy    string `json:"ednsClientSubnetPolicy"`
+	DisableIPv4Answer         bool   `json:"disableIpv4Answer"`
+	DisableIPv6Answer         bool   `json:"disableIpv6Answer"`
 	CertificateRecordIDs      []uint `json:"certificateRecordIds"`
 	CertificateRecordID       uint   `json:"certificateRecordId"`
 	ListenHTTPVersionStrategy string `json:"listenHttpVersionStrategy"`
@@ -156,6 +168,12 @@ type ReverseProxyRuleView struct {
 	TargetPort                int                                        `json:"targetPort"`
 	TargetPath                string                                     `json:"targetPath"`
 	TargetDNSPath             string                                     `json:"targetDnsPath"`
+	EDNSEnabled               bool                                       `json:"ednsEnabled"`
+	EDNSMode                  string                                     `json:"ednsMode"`
+	EDNSCustomIP              string                                     `json:"ednsCustomIp"`
+	EDNSClientSubnetPolicy    string                                     `json:"ednsClientSubnetPolicy"`
+	DisableIPv4Answer         bool                                       `json:"disableIpv4Answer"`
+	DisableIPv6Answer         bool                                       `json:"disableIpv6Answer"`
 	CertificateRecordIDs      []uint                                     `json:"certificateRecordIds"`
 	CertificateRecordID       uint                                       `json:"certificateRecordId"`
 	CertificateLabel          string                                     `json:"certificateLabel"`
@@ -207,6 +225,12 @@ type reverseProxyNormalizedRule struct {
 	targetPort                int
 	targetPath                string
 	targetDNSPath             string
+	ednsEnabled               bool
+	ednsMode                  string
+	ednsCustomIP              string
+	ednsClientSubnetPolicy    string
+	disableIPv4Answer         bool
+	disableIPv6Answer         bool
 	certificateRecordIDs      []uint
 	certificateRecordID       uint
 	listenHTTPVersionStrategy string
@@ -260,6 +284,12 @@ type reverseProxyRenderRule struct {
 	TargetPort                int                                  `json:"targetPort"`
 	TargetPath                string                               `json:"targetPath"`
 	TargetDNSPath             string                               `json:"targetDnsPath"`
+	EDNSEnabled               bool                                 `json:"ednsEnabled"`
+	EDNSMode                  string                               `json:"ednsMode"`
+	EDNSCustomIP              string                               `json:"ednsCustomIp"`
+	EDNSClientSubnetPolicy    string                               `json:"ednsClientSubnetPolicy"`
+	DisableIPv4Answer         bool                                 `json:"disableIpv4Answer"`
+	DisableIPv6Answer         bool                                 `json:"disableIpv6Answer"`
 	CertificateRecordIDs      []uint                               `json:"certificateRecordIds,omitempty"`
 	CertificateStates         []reverseProxyRenderCertificateState `json:"certificateStates,omitempty"`
 	IPStrategy                string                               `json:"ipStrategy"`
@@ -584,6 +614,12 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 		row.TargetPort = normalized.targetPort
 		row.TargetPath = normalized.targetPath
 		row.TargetDNSPath = normalized.targetDNSPath
+		row.EDNSEnabled = normalized.ednsEnabled
+		row.EDNSMode = normalized.ednsMode
+		row.EDNSCustomIP = normalized.ednsCustomIP
+		row.EDNSClientSubnetPolicy = normalized.ednsClientSubnetPolicy
+		row.DisableIPv4Answer = normalized.disableIPv4Answer
+		row.DisableIPv6Answer = normalized.disableIPv6Answer
 		row.CertificateRecordList = encodeReverseProxyUintList(normalized.certificateRecordIDs)
 		row.CertificateRecordID = normalized.certificateRecordID
 		row.ListenHTTPVersionStrategy = normalized.listenHTTPVersionStrategy
@@ -845,6 +881,12 @@ func buildReverseProxyRuleView(row *model.ReverseProxyRule, certMap map[uint]Rev
 		TargetPort:                row.TargetPort,
 		TargetPath:                strings.TrimSpace(row.TargetPath),
 		TargetDNSPath:             strings.TrimSpace(row.TargetDNSPath),
+		EDNSEnabled:               row.EDNSEnabled,
+		EDNSMode:                  strings.TrimSpace(row.EDNSMode),
+		EDNSCustomIP:              strings.TrimSpace(row.EDNSCustomIP),
+		EDNSClientSubnetPolicy:    strings.TrimSpace(row.EDNSClientSubnetPolicy),
+		DisableIPv4Answer:         row.DisableIPv4Answer,
+		DisableIPv6Answer:         row.DisableIPv6Answer,
 		CertificateRecordIDs:      append([]uint(nil), certIDs...),
 		ListenHTTPVersionStrategy: strings.TrimSpace(row.ListenHTTPVersionStrategy),
 		IPStrategy:                strings.TrimSpace(row.IPStrategy),
@@ -908,6 +950,12 @@ func reverseProxyRulePersistenceMap(row *model.ReverseProxyRule) map[string]inte
 		"target_port":                  row.TargetPort,
 		"target_path":                  row.TargetPath,
 		"target_dns_path":              row.TargetDNSPath,
+		"edns_enabled":                 row.EDNSEnabled,
+		"edns_mode":                    row.EDNSMode,
+		"edns_custom_ip":               row.EDNSCustomIP,
+		"edns_client_subnet_policy":    row.EDNSClientSubnetPolicy,
+		"disable_ipv4_answer":          row.DisableIPv4Answer,
+		"disable_ipv6_answer":          row.DisableIPv6Answer,
 		"certificate_record_list":      row.CertificateRecordList,
 		"certificate_record_id":        row.CertificateRecordID,
 		"listen_http_version_strategy": row.ListenHTTPVersionStrategy,
@@ -937,6 +985,9 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		upstreamTLSVerify: payload.UpstreamTLSVerify,
 		apiPassthrough:    payload.ApiPassthrough,
 		remark:            strings.TrimSpace(payload.Remark),
+		ednsEnabled:       payload.EDNSEnabled,
+		disableIPv4Answer: payload.DisableIPv4Answer,
+		disableIPv6Answer: payload.DisableIPv6Answer,
 	}
 	if normalized.name == "" {
 		defaultNameHost := listenIPInput
@@ -1000,6 +1051,14 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 	}
 	normalized.targetAddresses = targetAddresses
 	normalized.targetPath = normalizeReverseProxyPath(payload.TargetPath, false)
+	ipStrategy, err := normalizeReverseProxyIPStrategy(payload.IPStrategy)
+	if err != nil {
+		return reverseProxyNormalizedRule{}, err
+	}
+	normalized.ipStrategy = ipStrategy
+	rawEDNSCustomIP := strings.TrimSpace(payload.EDNSCustomIP)
+	normalized.ednsMode = normalizeReverseProxyEDNSMode(payload.EDNSMode)
+	normalized.ednsClientSubnetPolicy = normalizeReverseProxyEDNSClientSubnetPolicy(payload.EDNSClientSubnetPolicy)
 
 	if normalized.listenProtocol == reverseProxyProtocolDNS ||
 		normalized.targetProtocol == reverseProxyProtocolDNS ||
@@ -1011,7 +1070,9 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		if len(normalized.listenIPs) == 0 {
 			normalized.listenIPs = []string{"0.0.0.0"}
 		}
+		normalized.hosts = []string{}
 		normalized.pathPrefix = ""
+		normalized.targetPath = ""
 		normalized.listenHTTPVersionStrategy = ""
 		normalized.httpVersionStrategy = ""
 		normalized.apiPassthrough = true
@@ -1028,6 +1089,24 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		if !reverseProxyDNSProtocolUsesPath(normalized.targetProtocolAlias) {
 			normalized.targetDNSPath = ""
 		}
+		if !normalized.ednsEnabled {
+			normalized.ednsMode = reverseProxyEDNSModeAuto
+			normalized.ednsCustomIP = ""
+			normalized.ednsClientSubnetPolicy = reverseProxyEDNSClientSubnetPolicyClientIP
+		} else {
+			if normalized.ednsMode == reverseProxyEDNSModeCustom {
+				if rawEDNSCustomIP == "" {
+					return reverseProxyNormalizedRule{}, common.NewError("edns custom ip is required")
+				}
+				parsedIP := net.ParseIP(rawEDNSCustomIP)
+				if parsedIP == nil {
+					return reverseProxyNormalizedRule{}, common.NewError("invalid edns custom ip")
+				}
+				normalized.ednsCustomIP = parsedIP.String()
+			} else {
+				normalized.ednsCustomIP = ""
+			}
+		}
 		certIDs := normalizeReverseProxyCertificateIDList(payload.CertificateRecordIDs, payload.CertificateRecordID)
 		if reverseProxyDNSProtocolUsesTLS(normalized.listenProtocolAlias) {
 			if len(certIDs) == 0 {
@@ -1042,6 +1121,15 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		return normalized, nil
 	}
 
+	normalized.ednsEnabled = false
+	normalized.ednsMode = reverseProxyEDNSModeAuto
+	normalized.ednsCustomIP = ""
+	normalized.ednsClientSubnetPolicy = reverseProxyEDNSClientSubnetPolicyClientIP
+	normalized.disableIPv4Answer = false
+	normalized.disableIPv6Answer = false
+	normalized.listenDNSPath = ""
+	normalized.targetDNSPath = ""
+
 	listenHTTPVersionInput := payload.ListenHTTPVersionStrategy
 	if implied := reverseProxyListenProtocolAliasStrategy(listenProtocolInput); implied != "" {
 		explicit := strings.ToLower(strings.TrimSpace(payload.ListenHTTPVersionStrategy))
@@ -1055,12 +1143,6 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		return reverseProxyNormalizedRule{}, err
 	}
 	normalized.listenHTTPVersionStrategy = listenHTTPVersionStrategy
-
-	ipStrategy, err := normalizeReverseProxyIPStrategy(payload.IPStrategy)
-	if err != nil {
-		return reverseProxyNormalizedRule{}, err
-	}
-	normalized.ipStrategy = ipStrategy
 
 	httpVersionInput := payload.HTTPVersionStrategy
 	if implied := reverseProxyTargetProtocolAliasStrategy(targetProtocolInput); implied != "" {
@@ -1493,6 +1575,24 @@ func normalizeReverseProxyIPStrategy(raw string) (string, error) {
 		return value, nil
 	default:
 		return "", common.NewError("invalid ip strategy")
+	}
+}
+
+func normalizeReverseProxyEDNSMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case reverseProxyEDNSModeCustom:
+		return reverseProxyEDNSModeCustom
+	default:
+		return reverseProxyEDNSModeAuto
+	}
+}
+
+func normalizeReverseProxyEDNSClientSubnetPolicy(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case reverseProxyEDNSClientSubnetPolicyPreferRequestPublic:
+		return reverseProxyEDNSClientSubnetPolicyPreferRequestPublic
+	default:
+		return reverseProxyEDNSClientSubnetPolicyClientIP
 	}
 }
 
@@ -2329,10 +2429,18 @@ func loadReverseProxyCertificateRenderState(db *gorm.DB, rows []model.ReversePro
 }
 
 func computeReverseProxyRenderKey(db *gorm.DB, rows []model.ReverseProxyRule) string {
-	certState := loadReverseProxyCertificateRenderState(db, rows)
-	snapshot := make([]reverseProxyRenderRule, 0, len(rows))
+	httpRows := make([]model.ReverseProxyRule, 0, len(rows))
 	for i := range rows {
-		row := rows[i]
+		listenAlias := normalizeReverseProxyProtocolAlias(rows[i].ListenProtocolAlias, rows[i].ListenProtocol)
+		if reverseProxyProtocolIsDNS(listenAlias) {
+			continue
+		}
+		httpRows = append(httpRows, rows[i])
+	}
+	certState := loadReverseProxyCertificateRenderState(db, httpRows)
+	snapshot := make([]reverseProxyRenderRule, 0, len(httpRows))
+	for i := range httpRows {
+		row := httpRows[i]
 		listenProtocol := strings.ToLower(strings.TrimSpace(row.ListenProtocol))
 		listenAlias := normalizeReverseProxyProtocolAlias(row.ListenProtocolAlias, row.ListenProtocol)
 		targetProtocol := strings.ToLower(strings.TrimSpace(row.TargetProtocol))
@@ -2354,22 +2462,28 @@ func computeReverseProxyRenderKey(db *gorm.DB, rows []model.ReverseProxyRule) st
 			}
 		}
 		snapshot = append(snapshot, reverseProxyRenderRule{
-			ID:                   row.Id,
-			ListOrder:            row.ListOrder,
-			Enabled:              row.Enabled,
-			ListenProtocol:       listenProtocol,
-			ListenIPs:            decodeReverseProxyListenIPs(&row),
-			ListenPort:           row.ListenPort,
-			Hosts:                decodeReverseProxyList(row.HostList),
-			PathPrefix:           normalizeReverseProxyPath(row.PathPrefix, false),
-			ListenDNSPath:        normalizeReverseProxyDNSPath(row.ListenDNSPath),
-			TargetProtocol:       targetProtocol,
-			TargetAddresses:      decodeReverseProxyList(row.TargetAddresses),
-			TargetPort:           row.TargetPort,
-			TargetPath:           normalizeReverseProxyPath(row.TargetPath, false),
-			TargetDNSPath:        normalizeReverseProxyDNSPath(row.TargetDNSPath),
-			CertificateRecordIDs: certificateRecordIDs,
-			CertificateStates:    certificateStates,
+			ID:                     row.Id,
+			ListOrder:              row.ListOrder,
+			Enabled:                row.Enabled,
+			ListenProtocol:         listenProtocol,
+			ListenIPs:              decodeReverseProxyListenIPs(&row),
+			ListenPort:             row.ListenPort,
+			Hosts:                  decodeReverseProxyList(row.HostList),
+			PathPrefix:             normalizeReverseProxyPath(row.PathPrefix, false),
+			ListenDNSPath:          normalizeReverseProxyDNSPath(row.ListenDNSPath),
+			TargetProtocol:         targetProtocol,
+			TargetAddresses:        decodeReverseProxyList(row.TargetAddresses),
+			TargetPort:             row.TargetPort,
+			TargetPath:             normalizeReverseProxyPath(row.TargetPath, false),
+			TargetDNSPath:          normalizeReverseProxyDNSPath(row.TargetDNSPath),
+			EDNSEnabled:            false,
+			EDNSMode:               "",
+			EDNSCustomIP:           "",
+			EDNSClientSubnetPolicy: "",
+			DisableIPv4Answer:      false,
+			DisableIPv6Answer:      false,
+			CertificateRecordIDs:   certificateRecordIDs,
+			CertificateStates:      certificateStates,
 			ListenHTTPVersionStrategy: func() string {
 				if listenProtocol != reverseProxyProtocolHTTPS {
 					return ""

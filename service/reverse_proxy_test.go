@@ -27,8 +27,10 @@ import (
 	"testing"
 	"time"
 
+	dnsproxy "github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
+	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
 	"gorm.io/gorm"
@@ -164,16 +166,22 @@ func TestNormalizeReverseProxyPayloadSupportsDNSProtocols(t *testing.T) {
 	svc := &ReverseProxyService{}
 	certIDs := []uint{3, 5}
 	normalized, err := svc.normalizeRulePayload(ReverseProxyRulePayload{
-		Enabled:              true,
-		ListenProtocol:       reverseProxyDNSProtocolDoH,
-		ListenPort:           4443,
-		ListenDNSPath:        "/custom-dns",
-		TargetProtocol:       reverseProxyDNSProtocolDoQ,
-		TargetAddresses:      "1.1.1.1, 8.8.8.8",
-		TargetPort:           853,
-		IPStrategy:           reverseProxyIPStrategyPreferIPv4,
-		UpstreamTLSVerify:    true,
-		CertificateRecordIDs: certIDs,
+		Enabled:                true,
+		ListenProtocol:         reverseProxyDNSProtocolDoH,
+		ListenPort:             4443,
+		ListenDNSPath:          "/custom-dns",
+		TargetProtocol:         reverseProxyDNSProtocolDoQ,
+		TargetAddresses:        "1.1.1.1, 8.8.8.8",
+		TargetPort:             853,
+		EDNSEnabled:            true,
+		EDNSMode:               reverseProxyEDNSModeCustom,
+		EDNSCustomIP:           "14.119.184.123",
+		EDNSClientSubnetPolicy: reverseProxyEDNSClientSubnetPolicyPreferRequestPublic,
+		DisableIPv4Answer:      true,
+		DisableIPv6Answer:      false,
+		IPStrategy:             reverseProxyIPStrategyPreferIPv4,
+		UpstreamTLSVerify:      true,
+		CertificateRecordIDs:   certIDs,
 	})
 	if err != nil {
 		t.Fatalf("normalize dns payload failed: %v", err)
@@ -193,8 +201,444 @@ func TestNormalizeReverseProxyPayloadSupportsDNSProtocols(t *testing.T) {
 	if normalized.targetDNSPath != "" {
 		t.Fatalf("expected empty doq target path, got %q", normalized.targetDNSPath)
 	}
+	if normalized.ipStrategy != reverseProxyIPStrategyPreferIPv4 {
+		t.Fatalf("expected dns ip strategy to be preserved, got %q", normalized.ipStrategy)
+	}
+	if !normalized.ednsEnabled || normalized.ednsMode != reverseProxyEDNSModeCustom || normalized.ednsCustomIP != "14.119.184.123" {
+		t.Fatalf("expected edns settings to be preserved, got enabled=%v mode=%q ip=%q", normalized.ednsEnabled, normalized.ednsMode, normalized.ednsCustomIP)
+	}
+	if normalized.ednsClientSubnetPolicy != reverseProxyEDNSClientSubnetPolicyPreferRequestPublic {
+		t.Fatalf("expected edns client subnet policy to be preserved, got %q", normalized.ednsClientSubnetPolicy)
+	}
+	if !normalized.disableIPv4Answer || normalized.disableIPv6Answer {
+		t.Fatalf("expected ipv4 disable only, got v4=%v v6=%v", normalized.disableIPv4Answer, normalized.disableIPv6Answer)
+	}
 	if len(normalized.certificateRecordIDs) != len(certIDs) || normalized.certificateRecordID != certIDs[0] {
 		t.Fatalf("expected dns tls listener certificates to be preserved, got ids=%v first=%d", normalized.certificateRecordIDs, normalized.certificateRecordID)
+	}
+}
+
+func TestNormalizeReverseProxyPayloadRejectsInvalidEDNSCustomIP(t *testing.T) {
+	svc := &ReverseProxyService{}
+	_, err := svc.normalizeRulePayload(ReverseProxyRulePayload{
+		Enabled:         true,
+		ListenProtocol:  reverseProxyDNSProtocolUDP,
+		ListenPort:      5353,
+		TargetProtocol:  reverseProxyDNSProtocolTCP,
+		TargetAddresses: "1.1.1.1",
+		TargetPort:      53,
+		EDNSEnabled:     true,
+		EDNSMode:        reverseProxyEDNSModeCustom,
+		EDNSCustomIP:    "not-an-ip",
+		IPStrategy:      reverseProxyIPStrategyPreferIPv4,
+	})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "edns custom ip") {
+		t.Fatalf("expected invalid edns custom ip error, got %v", err)
+	}
+}
+
+func TestNormalizeReverseProxyPayloadIgnoresInvalidEDNSCustomIPForNonDNSRules(t *testing.T) {
+	svc := &ReverseProxyService{}
+	normalized, err := svc.normalizeRulePayload(ReverseProxyRulePayload{
+		Enabled:         true,
+		ListenProtocol:  reverseProxyProtocolHTTP,
+		ListenPort:      8080,
+		TargetProtocol:  reverseProxyProtocolHTTP,
+		TargetAddresses: "example.com",
+		TargetPort:      80,
+		EDNSEnabled:     true,
+		EDNSMode:        reverseProxyEDNSModeCustom,
+		EDNSCustomIP:    "not-an-ip",
+		IPStrategy:      reverseProxyIPStrategyPreferIPv4,
+	})
+	if err != nil {
+		t.Fatalf("expected non-dns payload to ignore edns custom ip, got %v", err)
+	}
+	if normalized.ednsEnabled || normalized.ednsCustomIP != "" {
+		t.Fatalf("expected non-dns payload to clear edns fields, got enabled=%v ip=%q", normalized.ednsEnabled, normalized.ednsCustomIP)
+	}
+}
+
+func TestNormalizeReverseProxyPayloadClearsDNSOnlyFieldsForNonDNSRules(t *testing.T) {
+	svc := &ReverseProxyService{}
+	normalized, err := svc.normalizeRulePayload(ReverseProxyRulePayload{
+		Enabled:                true,
+		ListenProtocol:         reverseProxyProtocolHTTP,
+		ListenPort:             8080,
+		Hosts:                  "example.com",
+		PathPrefix:             "/app",
+		ListenDNSPath:          "/stale-listen-dns",
+		TargetProtocol:         reverseProxyProtocolHTTPS,
+		TargetAddresses:        "backend.local",
+		TargetPort:             443,
+		TargetPath:             "/api",
+		TargetDNSPath:          "/stale-target-dns",
+		EDNSEnabled:            true,
+		EDNSMode:               reverseProxyEDNSModeCustom,
+		EDNSCustomIP:           "14.119.184.1",
+		EDNSClientSubnetPolicy: reverseProxyEDNSClientSubnetPolicyPreferRequestPublic,
+		DisableIPv4Answer:      true,
+		DisableIPv6Answer:      true,
+		IPStrategy:             reverseProxyIPStrategyPreferIPv4,
+		HTTPVersionStrategy:    reverseProxyHTTPVersionPreferH2,
+		UpstreamTLSVerify:      true,
+	})
+	if err != nil {
+		t.Fatalf("normalize non-dns payload failed: %v", err)
+	}
+	if normalized.listenDNSPath != "" || normalized.targetDNSPath != "" {
+		t.Fatalf("expected non-dns payload to clear dns paths, got listen=%q target=%q", normalized.listenDNSPath, normalized.targetDNSPath)
+	}
+	if normalized.ednsEnabled || normalized.disableIPv4Answer || normalized.disableIPv6Answer {
+		t.Fatalf("expected non-dns payload to clear dns-only flags, got edns=%v v4=%v v6=%v", normalized.ednsEnabled, normalized.disableIPv4Answer, normalized.disableIPv6Answer)
+	}
+}
+
+func TestNormalizeReverseProxyPayloadClearsHTTPOnlyFieldsForDNSRules(t *testing.T) {
+	svc := &ReverseProxyService{}
+	normalized, err := svc.normalizeRulePayload(ReverseProxyRulePayload{
+		Enabled:                true,
+		ListenProtocol:         reverseProxyDNSProtocolDoH,
+		ListenPort:             443,
+		Hosts:                  "stale.example.com",
+		PathPrefix:             "/stale-http-prefix",
+		ListenDNSPath:          "/dns-query",
+		TargetProtocol:         reverseProxyDNSProtocolTCP,
+		TargetAddresses:        "1.1.1.1",
+		TargetPort:             53,
+		TargetPath:             "/stale-http-target",
+		EDNSEnabled:            true,
+		EDNSMode:               reverseProxyEDNSModeAuto,
+		EDNSClientSubnetPolicy: reverseProxyEDNSClientSubnetPolicyClientIP,
+		IPStrategy:             reverseProxyIPStrategyPreferIPv4,
+		CertificateRecordIDs:   []uint{3},
+	})
+	if err != nil {
+		t.Fatalf("normalize dns payload failed: %v", err)
+	}
+	if len(normalized.hosts) != 0 || normalized.pathPrefix != "" || normalized.targetPath != "" {
+		t.Fatalf("expected dns payload to clear http-only fields, got hosts=%v path=%q targetPath=%q", normalized.hosts, normalized.pathPrefix, normalized.targetPath)
+	}
+}
+
+func TestReverseProxyDNSResolveAutoEDNSIPPrefersPublicRequestECS(t *testing.T) {
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeA)
+	reverseProxyDNSSetECS(req, net.ParseIP("117.189.81.36"))
+
+	dctx := &dnsproxy.DNSContext{
+		Req:  req,
+		Addr: netip.MustParseAddrPort("10.0.0.2:12345"),
+	}
+	rule := &model.ReverseProxyRule{
+		EDNSEnabled:            true,
+		EDNSMode:               reverseProxyEDNSModeAuto,
+		EDNSClientSubnetPolicy: reverseProxyEDNSClientSubnetPolicyPreferRequestPublic,
+	}
+
+	ip, ok := reverseProxyDNSResolveAutoEDNSIP(req, dctx, rule)
+	if !ok || ip == nil || !ip.Equal(net.ParseIP("117.189.81.36")) {
+		t.Fatalf("expected request public ecs to be preferred, got ok=%v ip=%v", ok, ip)
+	}
+}
+
+func TestReverseProxyDNSExtractUsableRequestECSPreservesClientPrefix(t *testing.T) {
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeA)
+	opt := &dns.OPT{
+		Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT},
+		Option: []dns.EDNS0{
+			&dns.EDNS0_SUBNET{
+				Code:          dns.EDNS0SUBNET,
+				Family:        1,
+				SourceNetmask: 24,
+				SourceScope:   0,
+				Address:       net.ParseIP("117.189.81.36"),
+			},
+		},
+	}
+	opt.SetUDPSize(4096)
+	req.Extra = append(req.Extra, opt)
+
+	subnet, ok := reverseProxyDNSExtractUsableRequestECS(req)
+	if !ok || subnet == nil {
+		t.Fatal("expected usable request ecs to be extracted")
+	}
+	if subnet.Family != 1 || subnet.SourceNetmask != 24 {
+		t.Fatalf("expected client ecs family/prefix to be preserved, got family=%d prefix=%d", subnet.Family, subnet.SourceNetmask)
+	}
+	if ip := subnet.Address.To4(); ip == nil || !ip.Equal(net.ParseIP("117.189.81.36").To4()) {
+		t.Fatalf("expected client ecs address to be preserved, got %v", subnet.Address)
+	}
+}
+
+func TestReverseProxyDNSResolveAutoEDNSIPIgnoresPrivateRequestECS(t *testing.T) {
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeA)
+	reverseProxyDNSSetECS(req, net.ParseIP("192.168.1.25"))
+
+	dctx := &dnsproxy.DNSContext{
+		Req:  req,
+		Addr: netip.MustParseAddrPort("117.189.81.36:12345"),
+	}
+	rule := &model.ReverseProxyRule{
+		EDNSEnabled:            true,
+		EDNSMode:               reverseProxyEDNSModeAuto,
+		EDNSClientSubnetPolicy: reverseProxyEDNSClientSubnetPolicyPreferRequestPublic,
+	}
+
+	ip, ok := reverseProxyDNSResolveAutoEDNSIP(req, dctx, rule)
+	if !ok || ip == nil || !ip.Equal(net.ParseIP("117.189.81.36")) {
+		t.Fatalf("expected private request ecs to fall back to client ip, got ok=%v ip=%v", ok, ip)
+	}
+}
+
+func TestReverseProxyDNSApplyEDNSPolicyPrefersPublicRequestECSPrefixWithoutRewriting(t *testing.T) {
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeA)
+	opt := &dns.OPT{
+		Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT},
+		Option: []dns.EDNS0{
+			&dns.EDNS0_SUBNET{
+				Code:          dns.EDNS0SUBNET,
+				Family:        1,
+				SourceNetmask: 24,
+				SourceScope:   0,
+				Address:       net.ParseIP("117.189.81.36"),
+			},
+		},
+	}
+	opt.SetUDPSize(4096)
+	req.Extra = append(req.Extra, opt)
+	dctx := &dnsproxy.DNSContext{
+		Req:  req,
+		Addr: netip.MustParseAddrPort("14.119.184.86:12345"),
+	}
+	rule := &model.ReverseProxyRule{
+		EDNSEnabled:            true,
+		EDNSMode:               reverseProxyEDNSModeAuto,
+		EDNSClientSubnetPolicy: reverseProxyEDNSClientSubnetPolicyPreferRequestPublic,
+	}
+
+	reverseProxyDNSApplyEDNSPolicy(req, dctx, rule)
+
+	subnet, ok := reverseProxyDNSExtractUsableRequestECS(req)
+	if !ok || subnet == nil {
+		t.Fatal("expected request ecs to remain after applying policy")
+	}
+	if subnet.SourceNetmask != 24 {
+		t.Fatalf("expected request ecs prefix to remain 24, got %d", subnet.SourceNetmask)
+	}
+	if ip := subnet.Address.To4(); ip == nil || !ip.Equal(net.ParseIP("117.189.81.36").To4()) {
+		t.Fatalf("expected request ecs address to remain unchanged, got %v", subnet.Address)
+	}
+}
+
+func TestReverseProxyDNSApplyEDNSPolicyMasksIPv4ToDotOne(t *testing.T) {
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeA)
+	dctx := &dnsproxy.DNSContext{
+		Req:  req,
+		Addr: netip.MustParseAddrPort("14.119.184.86:12345"),
+	}
+	rule := &model.ReverseProxyRule{
+		EDNSEnabled:            true,
+		EDNSMode:               reverseProxyEDNSModeAuto,
+		EDNSClientSubnetPolicy: reverseProxyEDNSClientSubnetPolicyClientIP,
+	}
+
+	reverseProxyDNSApplyEDNSPolicy(req, dctx, rule)
+
+	ip, ok := reverseProxyDNSExtractUsableRequestECSIP(req)
+	if !ok || ip == nil || !ip.Equal(net.ParseIP("14.119.184.1")) {
+		t.Fatalf("expected auto ipv4 ecs to mask to dot one, got ok=%v ip=%v", ok, ip)
+	}
+}
+
+func TestReverseProxyDNSApplyEDNSPolicyRemovesExistingECSWhenDisabled(t *testing.T) {
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeA)
+	reverseProxyDNSSetECS(req, net.ParseIP("117.189.81.36"))
+
+	reverseProxyDNSApplyEDNSPolicy(req, nil, &model.ReverseProxyRule{
+		EDNSEnabled: false,
+	})
+
+	if _, ok := reverseProxyDNSExtractUsableRequestECSIP(req); ok {
+		t.Fatal("expected existing ecs to be removed when edns is disabled")
+	}
+}
+
+func TestReverseProxyDNSApplyEDNSPolicyRemovesExistingECSWhenCustomIPInvalid(t *testing.T) {
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeA)
+	reverseProxyDNSSetECS(req, net.ParseIP("117.189.81.36"))
+
+	reverseProxyDNSApplyEDNSPolicy(req, &dnsproxy.DNSContext{Req: req}, &model.ReverseProxyRule{
+		EDNSEnabled:  true,
+		EDNSMode:     reverseProxyEDNSModeCustom,
+		EDNSCustomIP: "not-an-ip",
+	})
+
+	if _, ok := reverseProxyDNSExtractUsableRequestECSIP(req); ok {
+		t.Fatal("expected existing ecs to be removed when custom edns ip is invalid")
+	}
+}
+
+func TestReverseProxyDNSFilterResponseDropsAddressRecordsAndMatchingRRSIG(t *testing.T) {
+	resp := &dns.Msg{
+		Answer: []dns.RR{
+			&dns.A{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.ParseIP("1.1.1.1").To4()},
+			&dns.AAAA{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 120}, AAAA: net.ParseIP("2400:3200::1")},
+			&dns.RRSIG{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeRRSIG, Class: dns.ClassINET, Ttl: 120}, TypeCovered: dns.TypeA},
+			&dns.RRSIG{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeRRSIG, Class: dns.ClassINET, Ttl: 120}, TypeCovered: dns.TypeAAAA},
+		},
+	}
+
+	reverseProxyDNSFilterResponse(resp, true, false)
+
+	if len(resp.Answer) != 2 {
+		t.Fatalf("expected only aaaa and its rrsig to remain, got %d", len(resp.Answer))
+	}
+	if _, ok := resp.Answer[0].(*dns.AAAA); !ok {
+		t.Fatalf("expected first remaining record to be AAAA, got %T", resp.Answer[0])
+	}
+	if sig, ok := resp.Answer[1].(*dns.RRSIG); !ok || sig.TypeCovered != dns.TypeAAAA {
+		t.Fatalf("expected remaining rrsig to cover AAAA, got %#v", resp.Answer[1])
+	}
+}
+
+func TestReverseProxyDNSFilterResponseDropsNSECAndItsRRSIGWhenAddressTypeIsBlocked(t *testing.T) {
+	resp := &dns.Msg{
+		Ns: []dns.RR{
+			&dns.NSEC{
+				Hdr:        dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeNSEC, Class: dns.ClassINET, Ttl: 60},
+				NextDomain: "next.example.com.",
+				TypeBitMap: []uint16{dns.TypeA, dns.TypeRRSIG},
+			},
+			&dns.RRSIG{
+				Hdr:         dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeRRSIG, Class: dns.ClassINET, Ttl: 60},
+				TypeCovered: dns.TypeNSEC,
+			},
+		},
+	}
+
+	reverseProxyDNSFilterResponse(resp, true, false)
+
+	if len(resp.Ns) != 0 {
+		t.Fatalf("expected nsec and matching rrsig to be removed, got %d records", len(resp.Ns))
+	}
+}
+
+func TestReverseProxyDNSFilterResponseDropsNSEC3AndItsRRSIGWhenAddressTypeIsBlocked(t *testing.T) {
+	resp := &dns.Msg{
+		Ns: []dns.RR{
+			&dns.NSEC3{
+				Hdr:        dns.RR_Header{Name: "hash.example.com.", Rrtype: dns.TypeNSEC3, Class: dns.ClassINET, Ttl: 60},
+				Hash:       dns.SHA1,
+				Flags:      0,
+				Iterations: 1,
+				SaltLength: 0,
+				HashLength: 0,
+				NextDomain: "",
+				TypeBitMap: []uint16{dns.TypeAAAA, dns.TypeRRSIG},
+			},
+			&dns.RRSIG{
+				Hdr:         dns.RR_Header{Name: "hash.example.com.", Rrtype: dns.TypeRRSIG, Class: dns.ClassINET, Ttl: 60},
+				TypeCovered: dns.TypeNSEC3,
+			},
+		},
+	}
+
+	reverseProxyDNSFilterResponse(resp, false, true)
+
+	if len(resp.Ns) != 0 {
+		t.Fatalf("expected nsec3 and matching rrsig to be removed, got %d records", len(resp.Ns))
+	}
+}
+
+func TestReverseProxyDNSFilterResponseDropsCrossSectionRRSIGForBlockedAddressType(t *testing.T) {
+	resp := &dns.Msg{
+		Answer: []dns.RR{
+			&dns.RRSIG{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeRRSIG, Class: dns.ClassINET, Ttl: 60}, TypeCovered: dns.TypeA},
+		},
+		Extra: []dns.RR{
+			&dns.A{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.ParseIP("1.1.1.1").To4()},
+		},
+	}
+
+	reverseProxyDNSFilterResponse(resp, true, false)
+
+	if len(resp.Answer) != 0 || len(resp.Extra) != 0 {
+		t.Fatalf("expected cross-section a record and rrsig to be removed, got answer=%d extra=%d", len(resp.Answer), len(resp.Extra))
+	}
+}
+
+func TestReverseProxyDNSFilterResponseDropsHTTPSHintsForBlockedAddressType(t *testing.T) {
+	resp := &dns.Msg{
+		Answer: []dns.RR{
+			&dns.HTTPS{
+				SVCB: dns.SVCB{
+					Hdr:      dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeHTTPS, Class: dns.ClassINET, Ttl: 60},
+					Priority: 1,
+					Target:   ".",
+					Value: []dns.SVCBKeyValue{
+						&dns.SVCBIPv4Hint{Hint: []net.IP{net.ParseIP("1.1.1.1").To4()}},
+						&dns.SVCBIPv6Hint{Hint: []net.IP{net.ParseIP("2400:3200::1")}},
+					},
+				},
+			},
+			&dns.RRSIG{
+				Hdr:         dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeRRSIG, Class: dns.ClassINET, Ttl: 60},
+				TypeCovered: dns.TypeHTTPS,
+			},
+		},
+	}
+
+	reverseProxyDNSFilterResponse(resp, true, false)
+
+	if len(resp.Answer) != 1 {
+		t.Fatalf("expected only https rr to remain after trimming ipv4 hint, got %d", len(resp.Answer))
+	}
+	httpsRR, ok := resp.Answer[0].(*dns.HTTPS)
+	if !ok {
+		t.Fatalf("expected first remaining record to be HTTPS, got %T", resp.Answer[0])
+	}
+	if len(httpsRR.Value) != 1 {
+		t.Fatalf("expected only one https hint to remain, got %d", len(httpsRR.Value))
+	}
+	if _, ok := httpsRR.Value[0].(*dns.SVCBIPv6Hint); !ok {
+		t.Fatalf("expected remaining https hint to be ipv6, got %T", httpsRR.Value[0])
+	}
+}
+
+func TestReverseProxyDNSFilterResponseClearsAuthenticatedDataWhenResponseChanges(t *testing.T) {
+	resp := &dns.Msg{
+		Answer: []dns.RR{
+			&dns.A{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.ParseIP("1.1.1.1").To4()},
+		},
+	}
+	resp.AuthenticatedData = true
+
+	reverseProxyDNSFilterResponse(resp, true, false)
+
+	if resp.AuthenticatedData {
+		t.Fatal("expected authenticated data bit to be cleared after response filtering")
+	}
+}
+
+func TestReverseProxyDNSFilterResponseKeepsAuthenticatedDataWhenUnchanged(t *testing.T) {
+	resp := &dns.Msg{
+		Answer: []dns.RR{
+			&dns.AAAA{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60}, AAAA: net.ParseIP("2400:3200::1")},
+		},
+	}
+	resp.AuthenticatedData = true
+
+	reverseProxyDNSFilterResponse(resp, true, false)
+
+	if !resp.AuthenticatedData {
+		t.Fatal("expected authenticated data bit to remain when response is unchanged")
 	}
 }
 
@@ -833,6 +1277,93 @@ func TestComputeReverseProxyRenderKey_IgnoresRuntimeFields(t *testing.T) {
 	rows[0].ApiPassthrough = true
 	if got := computeReverseProxyRenderKey(nil, rows); got == base {
 		t.Fatalf("api passthrough change should affect render key")
+	}
+}
+
+func TestComputeReverseProxyRenderKey_IgnoresDNSFieldsForHTTPRules(t *testing.T) {
+	rows := []model.ReverseProxyRule{
+		{
+			Id:                  1,
+			ListOrder:           1,
+			Enabled:             true,
+			ListenProtocol:      reverseProxyProtocolHTTPS,
+			ListenIPList:        `["127.0.0.1"]`,
+			ListenPort:          8443,
+			HostList:            `["example.com"]`,
+			PathPrefix:          "/app",
+			TargetProtocol:      reverseProxyProtocolHTTPS,
+			TargetAddresses:     `["backend.local"]`,
+			TargetPort:          443,
+			TargetPath:          "/api",
+			CertificateRecordID: 7,
+			IPStrategy:          reverseProxyIPStrategyPreferIPv4,
+			HTTPVersionStrategy: reverseProxyHTTPVersionPreferH2,
+			UpstreamTLSVerify:   true,
+		},
+	}
+
+	base := computeReverseProxyRenderKey(nil, rows)
+	rows[0].EDNSEnabled = true
+	rows[0].EDNSMode = reverseProxyEDNSModeCustom
+	rows[0].EDNSCustomIP = "14.119.184.1"
+	rows[0].EDNSClientSubnetPolicy = reverseProxyEDNSClientSubnetPolicyPreferRequestPublic
+	rows[0].DisableIPv4Answer = true
+	rows[0].DisableIPv6Answer = true
+
+	if got := computeReverseProxyRenderKey(nil, rows); got != base {
+		t.Fatalf("dns-only fields should not affect http render key: %q vs %q", got, base)
+	}
+}
+
+func TestComputeReverseProxyRenderKey_IgnoresSeparateDNSRules(t *testing.T) {
+	rows := []model.ReverseProxyRule{
+		{
+			Id:                  1,
+			ListOrder:           1,
+			Enabled:             true,
+			ListenProtocol:      reverseProxyProtocolHTTPS,
+			ListenIPList:        `["127.0.0.1"]`,
+			ListenPort:          8443,
+			HostList:            `["example.com"]`,
+			PathPrefix:          "/app",
+			TargetProtocol:      reverseProxyProtocolHTTPS,
+			TargetAddresses:     `["backend.local"]`,
+			TargetPort:          443,
+			TargetPath:          "/api",
+			IPStrategy:          reverseProxyIPStrategyPreferIPv4,
+			HTTPVersionStrategy: reverseProxyHTTPVersionPreferH2,
+			UpstreamTLSVerify:   true,
+		},
+		{
+			Id:                     2,
+			ListOrder:              2,
+			Enabled:                true,
+			ListenProtocol:         reverseProxyProtocolDNS,
+			ListenProtocolAlias:    reverseProxyDNSProtocolDoH,
+			ListenIPList:           `["0.0.0.0"]`,
+			ListenPort:             443,
+			ListenDNSPath:          "/dns-query",
+			TargetProtocol:         reverseProxyProtocolDNS,
+			TargetProtocolAlias:    reverseProxyDNSProtocolTCP,
+			TargetAddresses:        `["1.1.1.1"]`,
+			TargetPort:             53,
+			EDNSEnabled:            true,
+			EDNSMode:               reverseProxyEDNSModeAuto,
+			EDNSClientSubnetPolicy: reverseProxyEDNSClientSubnetPolicyClientIP,
+			DisableIPv4Answer:      true,
+			IPStrategy:             reverseProxyIPStrategyPreferIPv4,
+		},
+	}
+
+	base := computeReverseProxyRenderKey(nil, rows)
+	rows[1].EDNSEnabled = false
+	rows[1].EDNSMode = reverseProxyEDNSModeCustom
+	rows[1].EDNSCustomIP = "14.119.184.1"
+	rows[1].DisableIPv6Answer = true
+	rows[1].TargetAddresses = `["8.8.8.8"]`
+
+	if got := computeReverseProxyRenderKey(nil, rows); got != base {
+		t.Fatalf("separate dns rule change should not affect http render key: %q vs %q", got, base)
 	}
 }
 

@@ -17,10 +17,12 @@ import (
 
 	dnsproxy "github.com/AdguardTeam/dnsproxy/proxy"
 	dnsupstream "github.com/AdguardTeam/dnsproxy/upstream"
+	aghnetutil "github.com/AdguardTeam/golibs/netutil"
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/util/common"
+	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go/http3"
 )
 
@@ -219,6 +221,12 @@ func reverseProxyDNSRuntimeStateKey(rows []model.ReverseProxyRule, certificateSt
 			row.TargetAddresses,
 			fmt.Sprintf("%d", row.TargetPort),
 			row.TargetDNSPath,
+			fmt.Sprintf("%t", row.EDNSEnabled),
+			row.EDNSMode,
+			row.EDNSCustomIP,
+			row.EDNSClientSubnetPolicy,
+			fmt.Sprintf("%t", row.DisableIPv4Answer),
+			fmt.Sprintf("%t", row.DisableIPv6Answer),
 			row.IPStrategy,
 			fmt.Sprintf("%t", row.UpstreamTLSVerify),
 			row.CertificateRecordList,
@@ -588,13 +596,18 @@ func (h *reverseProxyDNSRuleHandler) ServeDNS(ctx context.Context, _ *dnsproxy.P
 	if route == nil || route.rule == nil {
 		return errors.New("dns reverse proxy route is unavailable")
 	}
+	req := dctx.Req.Copy()
+	reverseProxyDNSApplyEDNSPolicy(req, dctx, route.rule)
 	var firstErr error
 	for _, ups := range route.upstreams {
 		if ups == nil {
 			continue
 		}
-		resp, err := ups.Exchange(dctx.Req.Copy())
+		resp, err := ups.Exchange(req.Copy())
 		if err == nil && resp != nil {
+			if route.rule.DisableIPv4Answer || route.rule.DisableIPv6Answer {
+				reverseProxyDNSFilterResponse(resp, route.rule.DisableIPv4Answer, route.rule.DisableIPv6Answer)
+			}
 			dctx.Res = resp
 			_ = database.GetDB().Model(&model.ReverseProxyRule{}).Where("id = ?", route.rule.Id).Updates(map[string]interface{}{
 				"last_error":     "",
@@ -871,6 +884,455 @@ func reverseProxyDNSHandlerUpstreams(handler *reverseProxyDNSRuleHandler) []dnsu
 
 func closeReverseProxyDNSHandler(handler *reverseProxyDNSRuleHandler) {
 	closeReverseProxyDNSUpstreams(reverseProxyDNSHandlerUpstreams(handler))
+}
+
+func reverseProxyDNSApplyEDNSPolicy(req *dns.Msg, dctx *dnsproxy.DNSContext, rule *model.ReverseProxyRule) {
+	if req == nil || rule == nil {
+		return
+	}
+	if !rule.EDNSEnabled {
+		reverseProxyDNSRemoveECS(req)
+		return
+	}
+
+	switch normalizeReverseProxyEDNSMode(rule.EDNSMode) {
+	case reverseProxyEDNSModeCustom:
+		ip := net.ParseIP(strings.TrimSpace(rule.EDNSCustomIP))
+		if ip == nil {
+			reverseProxyDNSRemoveECS(req)
+			return
+		}
+		reverseProxyDNSSetECS(req, ip)
+	default:
+		if normalizeReverseProxyEDNSClientSubnetPolicy(rule.EDNSClientSubnetPolicy) == reverseProxyEDNSClientSubnetPolicyPreferRequestPublic {
+			if subnet, ok := reverseProxyDNSExtractUsableRequestECS(req); ok {
+				reverseProxyDNSSetECSSubnet(req, subnet)
+				return
+			}
+		}
+		ip, ok := reverseProxyDNSResolveAutoEDNSIP(req, dctx, rule)
+		if !ok {
+			reverseProxyDNSRemoveECS(req)
+			return
+		}
+		if ip4 := ip.To4(); ip4 != nil {
+			ip = net.IPv4(ip4[0], ip4[1], ip4[2], 1)
+		}
+		reverseProxyDNSSetECS(req, ip)
+	}
+}
+
+func reverseProxyDNSResolveAutoEDNSIP(req *dns.Msg, dctx *dnsproxy.DNSContext, rule *model.ReverseProxyRule) (net.IP, bool) {
+	if dctx == nil || rule == nil {
+		return nil, false
+	}
+
+	if normalizeReverseProxyEDNSClientSubnetPolicy(rule.EDNSClientSubnetPolicy) == reverseProxyEDNSClientSubnetPolicyPreferRequestPublic {
+		if subnet, ok := reverseProxyDNSExtractUsableRequestECS(req); ok {
+			return net.IP(append([]byte(nil), subnet.Address...)), true
+		}
+	}
+
+	return reverseProxyDNSResolveClientEDNSIP(dctx)
+}
+
+func reverseProxyDNSResolveClientEDNSIP(dctx *dnsproxy.DNSContext) (net.IP, bool) {
+	if dctx == nil {
+		return nil, false
+	}
+
+	clientAddr := dctx.Addr.Addr()
+	if !clientAddr.IsValid() || aghnetutil.IsSpecialPurpose(clientAddr) {
+		return nil, false
+	}
+
+	clientIP := clientAddr.AsSlice()
+	if len(clientIP) == 0 {
+		return nil, false
+	}
+
+	return net.IP(append([]byte(nil), clientIP...)), true
+}
+
+func reverseProxyDNSExtractUsableRequestECS(req *dns.Msg) (*dns.EDNS0_SUBNET, bool) {
+	if req == nil {
+		return nil, false
+	}
+
+	opt := req.IsEdns0()
+	if opt == nil {
+		return nil, false
+	}
+	for _, option := range opt.Option {
+		subnet, ok := option.(*dns.EDNS0_SUBNET)
+		if !ok {
+			continue
+		}
+		normalized, ok := reverseProxyDNSNormalizeUsableECS(subnet)
+		if !ok {
+			continue
+		}
+		return normalized, true
+	}
+
+	return nil, false
+}
+
+func reverseProxyDNSExtractUsableRequestECSIP(req *dns.Msg) (net.IP, bool) {
+	subnet, ok := reverseProxyDNSExtractUsableRequestECS(req)
+	if !ok || subnet == nil {
+		return nil, false
+	}
+
+	return net.IP(append([]byte(nil), subnet.Address...)), true
+}
+
+func reverseProxyDNSNormalizeUsableECS(subnet *dns.EDNS0_SUBNET) (*dns.EDNS0_SUBNET, bool) {
+	if subnet == nil {
+		return nil, false
+	}
+
+	normalized := &dns.EDNS0_SUBNET{
+		Code:          dns.EDNS0SUBNET,
+		Family:        subnet.Family,
+		SourceNetmask: subnet.SourceNetmask,
+		SourceScope:   subnet.SourceScope,
+	}
+
+	switch subnet.Family {
+	case 1:
+		if subnet.SourceNetmask > net.IPv4len*8 {
+			return nil, false
+		}
+		ip := subnet.Address.To4()
+		if ip == nil {
+			return nil, false
+		}
+		addr, ok := netip.AddrFromSlice(ip)
+		if !ok || !addr.IsValid() || aghnetutil.IsSpecialPurpose(addr) {
+			return nil, false
+		}
+		normalized.Address = net.IPv4(ip[0], ip[1], ip[2], ip[3])
+	case 2:
+		if subnet.SourceNetmask > net.IPv6len*8 {
+			return nil, false
+		}
+		ip := subnet.Address.To16()
+		if len(ip) != net.IPv6len {
+			return nil, false
+		}
+		addr, ok := netip.AddrFromSlice(ip)
+		if !ok || !addr.IsValid() || aghnetutil.IsSpecialPurpose(addr) {
+			return nil, false
+		}
+		normalized.Address = append(net.IP(nil), ip...)
+	default:
+		return nil, false
+	}
+
+	return normalized, true
+}
+
+func reverseProxyDNSSetECS(req *dns.Msg, ip net.IP) {
+	if req == nil || ip == nil {
+		return
+	}
+
+	reverseProxyDNSRemoveECS(req)
+
+	subnet := &dns.EDNS0_SUBNET{
+		Code:        dns.EDNS0SUBNET,
+		SourceScope: 0,
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		subnet.Family = 1
+		subnet.SourceNetmask = 32
+		subnet.Address = net.IPv4(ip4[0], ip4[1], ip4[2], ip4[3])
+	} else {
+		subnet.Family = 2
+		subnet.SourceNetmask = 128
+		subnet.Address = append(net.IP(nil), ip...)
+	}
+
+	if opt := req.IsEdns0(); opt != nil {
+		opt.Option = append(opt.Option, subnet)
+		return
+	}
+
+	opt := &dns.OPT{
+		Hdr: dns.RR_Header{
+			Name:   ".",
+			Rrtype: dns.TypeOPT,
+		},
+		Option: []dns.EDNS0{subnet},
+	}
+	opt.SetUDPSize(4096)
+	req.Extra = append(req.Extra, opt)
+}
+
+func reverseProxyDNSSetECSSubnet(req *dns.Msg, subnet *dns.EDNS0_SUBNET) {
+	if req == nil || subnet == nil {
+		return
+	}
+
+	normalized, ok := reverseProxyDNSNormalizeUsableECS(subnet)
+	if !ok {
+		reverseProxyDNSRemoveECS(req)
+		return
+	}
+
+	reverseProxyDNSRemoveECS(req)
+
+	if opt := req.IsEdns0(); opt != nil {
+		opt.Option = append(opt.Option, normalized)
+		return
+	}
+
+	opt := &dns.OPT{
+		Hdr: dns.RR_Header{
+			Name:   ".",
+			Rrtype: dns.TypeOPT,
+		},
+		Option: []dns.EDNS0{normalized},
+	}
+	opt.SetUDPSize(4096)
+	req.Extra = append(req.Extra, opt)
+}
+
+func reverseProxyDNSRemoveECS(req *dns.Msg) {
+	if req == nil {
+		return
+	}
+
+	opt := req.IsEdns0()
+	if opt == nil {
+		return
+	}
+
+	filtered := opt.Option[:0]
+	for _, option := range opt.Option {
+		if _, ok := option.(*dns.EDNS0_SUBNET); ok {
+			continue
+		}
+		filtered = append(filtered, option)
+	}
+	opt.Option = filtered
+}
+
+func reverseProxyDNSFilterResponse(resp *dns.Msg, disableIPv4 bool, disableIPv6 bool) {
+	if resp == nil || (!disableIPv4 && !disableIPv6) {
+		return
+	}
+
+	droppedKeys := make(map[string]struct{})
+	reverseProxyDNSCollectDroppedKeys(resp.Answer, disableIPv4, disableIPv6, droppedKeys)
+	reverseProxyDNSCollectDroppedKeys(resp.Ns, disableIPv4, disableIPv6, droppedKeys)
+	reverseProxyDNSCollectDroppedKeys(resp.Extra, disableIPv4, disableIPv6, droppedKeys)
+
+	answer, answerChanged := reverseProxyDNSFilterRRSection(resp.Answer, disableIPv4, disableIPv6, droppedKeys)
+	ns, nsChanged := reverseProxyDNSFilterRRSection(resp.Ns, disableIPv4, disableIPv6, droppedKeys)
+	extra, extraChanged := reverseProxyDNSFilterRRSection(resp.Extra, disableIPv4, disableIPv6, droppedKeys)
+
+	resp.Answer = answer
+	resp.Ns = ns
+	resp.Extra = extra
+	if answerChanged || nsChanged || extraChanged {
+		resp.AuthenticatedData = false
+	}
+}
+
+func reverseProxyDNSCollectDroppedKeys(items []dns.RR, disableIPv4 bool, disableIPv6 bool, droppedKeys map[string]struct{}) {
+	if len(items) == 0 || droppedKeys == nil || (!disableIPv4 && !disableIPv6) {
+		return
+	}
+
+	for _, rr := range items {
+		reverseProxyDNSMarkDroppedKeys(rr, disableIPv4, disableIPv6, droppedKeys)
+	}
+}
+
+func reverseProxyDNSFilterRRSection(items []dns.RR, disableIPv4 bool, disableIPv6 bool, droppedKeys map[string]struct{}) ([]dns.RR, bool) {
+	if len(items) == 0 || (!disableIPv4 && !disableIPv6) {
+		return items, false
+	}
+
+	filtered := make([]dns.RR, 0, len(items))
+	changed := false
+	for _, rr := range items {
+		if rr == nil {
+			changed = true
+			continue
+		}
+		drop, rrChanged := reverseProxyDNSShouldDropRR(rr, disableIPv4, disableIPv6, droppedKeys)
+		if rrChanged {
+			changed = true
+		}
+		if drop {
+			continue
+		}
+		if sig, ok := rr.(*dns.RRSIG); ok {
+			if _, exists := droppedKeys[reverseProxyDNSRRSIGKey(sig.Hdr.Name, sig.TypeCovered)]; exists {
+				changed = true
+				continue
+			}
+		}
+		filtered = append(filtered, rr)
+	}
+
+	return filtered, changed
+}
+
+func reverseProxyDNSMarkDroppedKeys(rr dns.RR, disableIPv4 bool, disableIPv6 bool, droppedKeys map[string]struct{}) {
+	if rr == nil || droppedKeys == nil {
+		return
+	}
+
+	switch record := rr.(type) {
+	case *dns.A:
+		if disableIPv4 {
+			reverseProxyDNSMarkRRSIGForType(record.Header().Name, dns.TypeA, droppedKeys)
+		}
+	case *dns.AAAA:
+		if disableIPv6 {
+			reverseProxyDNSMarkRRSIGForType(record.Header().Name, dns.TypeAAAA, droppedKeys)
+		}
+	case *dns.NSEC:
+		if (disableIPv4 && reverseProxyDNSNSECContainsType(record.TypeBitMap, dns.TypeA)) ||
+			(disableIPv6 && reverseProxyDNSNSECContainsType(record.TypeBitMap, dns.TypeAAAA)) {
+			reverseProxyDNSMarkRRSIGForType(record.Header().Name, dns.TypeNSEC, droppedKeys)
+		}
+	case *dns.NSEC3:
+		if (disableIPv4 && reverseProxyDNSNSECContainsType(record.TypeBitMap, dns.TypeA)) ||
+			(disableIPv6 && reverseProxyDNSNSECContainsType(record.TypeBitMap, dns.TypeAAAA)) {
+			reverseProxyDNSMarkRRSIGForType(record.Header().Name, dns.TypeNSEC3, droppedKeys)
+		}
+	case *dns.HTTPS:
+		if reverseProxyDNSHasBlockedSVCBHints(record.Value, disableIPv4, disableIPv6) {
+			reverseProxyDNSMarkRRSIGForType(record.Header().Name, dns.TypeHTTPS, droppedKeys)
+		}
+	case *dns.SVCB:
+		if reverseProxyDNSHasBlockedSVCBHints(record.Value, disableIPv4, disableIPv6) {
+			reverseProxyDNSMarkRRSIGForType(record.Header().Name, dns.TypeSVCB, droppedKeys)
+		}
+	}
+}
+
+func reverseProxyDNSShouldDropRR(rr dns.RR, disableIPv4 bool, disableIPv6 bool, droppedKeys map[string]struct{}) (bool, bool) {
+	switch record := rr.(type) {
+	case *dns.A:
+		if disableIPv4 {
+			return true, true
+		}
+	case *dns.AAAA:
+		if disableIPv6 {
+			return true, true
+		}
+	case *dns.RRSIG:
+		if disableIPv4 && record.TypeCovered == dns.TypeA {
+			return true, true
+		}
+		if disableIPv6 && record.TypeCovered == dns.TypeAAAA {
+			return true, true
+		}
+	case *dns.NSEC:
+		if disableIPv4 && reverseProxyDNSNSECContainsType(record.TypeBitMap, dns.TypeA) {
+			return true, true
+		}
+		if disableIPv6 && reverseProxyDNSNSECContainsType(record.TypeBitMap, dns.TypeAAAA) {
+			return true, true
+		}
+	case *dns.NSEC3:
+		if disableIPv4 && reverseProxyDNSNSECContainsType(record.TypeBitMap, dns.TypeA) {
+			return true, true
+		}
+		if disableIPv6 && reverseProxyDNSNSECContainsType(record.TypeBitMap, dns.TypeAAAA) {
+			return true, true
+		}
+	case *dns.HTTPS:
+		if reverseProxyDNSFilterSVCBValueHints(&record.Value, disableIPv4, disableIPv6) {
+			reverseProxyDNSMarkRRSIGForType(record.Header().Name, dns.TypeHTTPS, droppedKeys)
+			return false, true
+		}
+	case *dns.SVCB:
+		if reverseProxyDNSFilterSVCBValueHints(&record.Value, disableIPv4, disableIPv6) {
+			reverseProxyDNSMarkRRSIGForType(record.Header().Name, dns.TypeSVCB, droppedKeys)
+			return false, true
+		}
+	}
+
+	return false, false
+}
+
+func reverseProxyDNSHasBlockedSVCBHints(values []dns.SVCBKeyValue, disableIPv4 bool, disableIPv6 bool) bool {
+	if len(values) == 0 || (!disableIPv4 && !disableIPv6) {
+		return false
+	}
+
+	for _, value := range values {
+		switch value.(type) {
+		case *dns.SVCBIPv4Hint:
+			if disableIPv4 {
+				return true
+			}
+		case *dns.SVCBIPv6Hint:
+			if disableIPv6 {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func reverseProxyDNSFilterSVCBValueHints(values *[]dns.SVCBKeyValue, disableIPv4 bool, disableIPv6 bool) bool {
+	if values == nil || len(*values) == 0 || (!disableIPv4 && !disableIPv6) {
+		return false
+	}
+
+	changed := false
+	filtered := make([]dns.SVCBKeyValue, 0, len(*values))
+	for _, value := range *values {
+		switch value.(type) {
+		case *dns.SVCBIPv4Hint:
+			if disableIPv4 {
+				changed = true
+				continue
+			}
+			filtered = append(filtered, value)
+		case *dns.SVCBIPv6Hint:
+			if disableIPv6 {
+				changed = true
+				continue
+			}
+			filtered = append(filtered, value)
+		default:
+			filtered = append(filtered, value)
+		}
+	}
+	if changed {
+		*values = filtered
+	}
+	return changed
+}
+
+func reverseProxyDNSMarkRRSIGForType(name string, coveredType uint16, droppedKeys map[string]struct{}) {
+	if droppedKeys == nil {
+		return
+	}
+	droppedKeys[reverseProxyDNSRRSIGKey(name, coveredType)] = struct{}{}
+}
+
+func reverseProxyDNSRRSIGKey(name string, coveredType uint16) string {
+	return strings.ToLower(strings.TrimSpace(name)) + "|" + fmt.Sprintf("%d", coveredType)
+}
+
+func reverseProxyDNSNSECContainsType(items []uint16, target uint16) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
 }
 
 func translateReverseProxyDNSError(row *model.ReverseProxyRule, err error) error {

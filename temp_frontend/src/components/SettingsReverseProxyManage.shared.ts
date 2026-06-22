@@ -56,6 +56,21 @@ export const reverseProxyCopy = {
   targetPort: '目标端口',
   targetPath: '目标基础路径',
   targetDnsPath: '目标 DNS URL 路径',
+  ednsTitle: 'EDNS 客户端子网',
+  ednsEnabled: '启用 EDNS 客户端子网',
+  ednsMode: 'EDNS 模式',
+  ednsModeAuto: '自动来源 IP',
+  ednsModeCustom: '自定义 IP',
+  ednsCustomIp: 'EDNS 自定义 IP',
+  ednsClientSubnetPolicy: '自动模式来源策略',
+  ednsClientSubnetPolicyClientIP: '使用连接客户端 IP',
+  ednsClientSubnetPolicyPreferRequestPublic: '优先使用请求自带公网 ECS',
+  ednsHint: '自动模式下：IPv4 会自动脱敏为末尾 .1；IPv6 直接使用连接到本机监听器的客户端 IPv6，不额外改写。自定义 IP 支持 IPv4 和 IPv6。',
+  ednsPolicyHint: '若请求里已带 ECS，且你选择“优先使用请求自带公网 ECS”，则仅在该 ECS 为公网地址时采用；私网、环回、链路本地等地址会被忽略并回退到客户端连接 IP。',
+  ednsCustomRequired: '请输入有效的 EDNS 自定义 IP',
+  disableIpv4Answer: '禁用 IPv4 地址解析结果',
+  disableIpv6Answer: '禁用 IPv6 地址解析结果',
+  dnsAnswerFilterHint: '仅作用于本地监听返回结果。禁用后会丢弃对应地址记录以及与 A/AAAA 直接相关的附属记录，剩余数据继续按上游结果透传。',
   certificate: '证书',
   ipStrategy: 'IP 优先策略',
   httpVersionStrategy: 'HTTP 版本策略',
@@ -94,6 +109,7 @@ export const reverseProxyCopy = {
   targetRequired: '请填写至少一个目标地址',
   certRequiredSave: 'TLS 监听必须至少选择一张证书',
   dnsPathRequired: '当前 DNS 协议必须填写 URL 路径',
+  dnsProtocolPairRequired: 'DNS 反代要求本地协议和目标协议都使用 DNS',
   dnsHostUnused: 'DNS 反代不使用域名/IP 命中条件',
   dnsHttpFieldUnused: 'DNS 反代不使用 HTTP 路径改写与 API 透传',
   listenModeHTTP: 'HTTP：仅监听明文 HTTP 请求。',
@@ -168,6 +184,16 @@ export const httpVersionItems = [
   { title: 'Prefer H3', value: 'prefer_h3' },
 ] as const
 
+export const ednsModeItems = [
+  { title: reverseProxyCopy.ednsModeAuto, value: 'auto' },
+  { title: reverseProxyCopy.ednsModeCustom, value: 'custom' },
+] as const
+
+export const ednsClientSubnetPolicyItems = [
+  { title: reverseProxyCopy.ednsClientSubnetPolicyClientIP, value: 'client_ip' },
+  { title: reverseProxyCopy.ednsClientSubnetPolicyPreferRequestPublic, value: 'prefer_request_public' },
+] as const
+
 const emptyOverview = (): ReverseProxyOverview => ({
   available: true,
   started: false,
@@ -197,6 +223,12 @@ export const createEmptyReverseProxyRuleForm = (): ReverseProxyRuleForm => ({
   targetPort: 80,
   targetPath: '',
   targetDnsPath: '/dns-query',
+  ednsEnabled: false,
+  ednsMode: 'auto',
+  ednsCustomIp: '',
+  ednsClientSubnetPolicy: 'client_ip',
+  disableIpv4Answer: false,
+  disableIpv6Answer: false,
   certificateRecordIds: [],
   listenHttpVersionStrategy: '',
   ipStrategy: 'prefer_ipv4',
@@ -271,10 +303,16 @@ const isIPv4Literal = (value: string) => {
 const isIPv6Literal = (value: string) => {
   const normalized = normalizeIPLiteral(value)
   if (!normalized.includes(':')) return false
-  return /^[0-9a-f:]+$/i.test(normalized)
+  try {
+    const parsed = new URL(`http://[${normalized}]/`).hostname
+    return normalizeIPLiteral(parsed).toLowerCase() === normalized.toLowerCase()
+  } catch {
+    return false
+  }
 }
 
 const isIPLiteral = (value: string) => isIPv4Literal(value) || isIPv6Literal(value)
+export const isValidEDNSCustomIP = (value: string) => isIPLiteral(value.trim())
 
 const hasExplicitPort = (value: string) => {
   const trimmed = value.trim()
@@ -360,6 +398,12 @@ const normalizeRule = (value: unknown): ReverseProxyRule => {
     targetPort: asNumber(item.targetPort),
     targetPath: asString(item.targetPath),
     targetDnsPath: asString(item.targetDnsPath),
+    ednsEnabled: asBoolean(item.ednsEnabled, false),
+    ednsMode: asString(item.ednsMode, 'auto') === 'custom' ? 'custom' : 'auto',
+    ednsCustomIp: asString(item.ednsCustomIp),
+    ednsClientSubnetPolicy: asString(item.ednsClientSubnetPolicy, 'client_ip') === 'prefer_request_public' ? 'prefer_request_public' : 'client_ip',
+    disableIpv4Answer: asBoolean(item.disableIpv4Answer, false),
+    disableIpv6Answer: asBoolean(item.disableIpv6Answer, false),
     certificateRecordIds,
     certificateRecordId: certificateRecordIds[0] ?? asNumber(item.certificateRecordId),
     certificateLabel: asString(item.certificateLabel),
@@ -657,6 +701,12 @@ export const mapRuleToForm = (rule?: ReverseProxyRule): ReverseProxyRuleForm => 
     targetPort: rule?.targetPort ?? 80,
     targetPath: rule?.targetPath ?? '',
     targetDnsPath: rule?.targetDnsPath ?? (dnsProtocolUsesPath(targetProtocol) ? '/dns-query' : ''),
+    ednsEnabled: rule?.ednsEnabled ?? false,
+    ednsMode: rule?.ednsMode === 'custom' ? 'custom' : 'auto',
+    ednsCustomIp: rule?.ednsCustomIp ?? '',
+    ednsClientSubnetPolicy: rule?.ednsClientSubnetPolicy === 'prefer_request_public' ? 'prefer_request_public' : 'client_ip',
+    disableIpv4Answer: rule?.disableIpv4Answer ?? false,
+    disableIpv6Answer: rule?.disableIpv6Answer ?? false,
     certificateRecordIds: (() => {
       const ids = normalizeNumberList(rule?.certificateRecordIds ?? [])
       if (ids.length > 0) return ids
@@ -683,6 +733,7 @@ export const buildReverseProxyPayload = (
   const targetPath = form.targetPath.trim()
   const listenDnsPath = form.listenDnsPath.trim()
   const targetDnsPath = form.targetDnsPath.trim()
+  const ednsCustomIp = form.ednsCustomIp.trim()
   const remark = form.remark.trim()
   const matchTokens = splitListenMatchTokens(hostsText)
   const listenProtocol = mapListenProtocolToBackend(form.listenProtocol)
@@ -718,6 +769,12 @@ export const buildReverseProxyPayload = (
     targetPort: asNumber(form.targetPort),
     targetPath: normalizePathInput(targetPath, true),
     targetDnsPath: dnsProtocolUsesPath(form.targetProtocol) ? normalizePathInput(targetDnsPath, true) : '',
+    ednsEnabled: protocolIsDNS(form.listenProtocol) ? form.ednsEnabled : false,
+    ednsMode: protocolIsDNS(form.listenProtocol) ? form.ednsMode : 'auto',
+    ednsCustomIp: protocolIsDNS(form.listenProtocol) && form.ednsEnabled && form.ednsMode === 'custom' ? ednsCustomIp : '',
+    ednsClientSubnetPolicy: protocolIsDNS(form.listenProtocol) && form.ednsEnabled ? form.ednsClientSubnetPolicy : 'client_ip',
+    disableIpv4Answer: protocolIsDNS(form.listenProtocol) ? form.disableIpv4Answer : false,
+    disableIpv6Answer: protocolIsDNS(form.listenProtocol) ? form.disableIpv6Answer : false,
     certificateRecordIds: protocolNeedsCertificates(form.listenProtocol) ? certificateRecordIds : [],
     certificateRecordId: protocolNeedsCertificates(form.listenProtocol) ? (certificateRecordIds[0] ?? 0) : 0,
     listenHttpVersionStrategy: listenProtocol.listenHttpVersionStrategy,
@@ -807,6 +864,10 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   const saveRule = async () => {
     if (saving.value) return
     trimReverseProxyRuleFormText(editingRule.value)
+    if (protocolIsDNS(editingRule.value.listenProtocol) !== protocolIsDNS(editingRule.value.targetProtocol)) {
+      push.warning({ duration: 4000, message: reverseProxyCopy.dnsProtocolPairRequired })
+      return
+    }
     if (!protocolIsDNS(editingRule.value.listenProtocol) && splitInputTokens(editingRule.value.hostsText).some(hasExplicitPort)) {
       push.warning({ duration: 4000, message: reverseProxyCopy.listenPortInlineNotAllowed })
       return
@@ -831,6 +892,10 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     }
     if (dnsProtocolUsesPath(editingRule.value.targetProtocol) && !editingRule.value.targetDnsPath.trim()) {
       push.warning({ duration: 4000, message: reverseProxyCopy.dnsPathRequired })
+      return
+    }
+    if (protocolIsDNS(editingRule.value.listenProtocol) && editingRule.value.ednsEnabled && editingRule.value.ednsMode === 'custom' && !isValidEDNSCustomIP(editingRule.value.ednsCustomIp)) {
+      push.warning({ duration: 4000, message: reverseProxyCopy.ednsCustomRequired })
       return
     }
     if (protocolNeedsCertificates(editingRule.value.listenProtocol) && editingRule.value.certificateRecordIds.length === 0) {
@@ -1120,6 +1185,13 @@ export function useReverseProxyManage(props: { active?: boolean }) {
       }
       return
     }
+    editingRule.value.ednsEnabled = false
+    editingRule.value.ednsMode = 'auto'
+    editingRule.value.ednsCustomIp = ''
+    editingRule.value.ednsClientSubnetPolicy = 'client_ip'
+    editingRule.value.disableIpv4Answer = false
+    editingRule.value.disableIpv6Answer = false
+    editingRule.value.listenDnsPath = ''
     if (protocolIsHTTP(value)) {
       editingRule.value.certificateRecordIds = []
       if (!editingRule.value.listenPort || editingRule.value.listenPort === 443) {
@@ -1170,6 +1242,7 @@ export function useReverseProxyManage(props: { active?: boolean }) {
       }
       return
     }
+    editingRule.value.targetDnsPath = ''
     if (value === 'http') {
       editingRule.value.httpVersionStrategy = ''
       editingRule.value.upstreamTlsVerify = false

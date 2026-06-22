@@ -27,6 +27,12 @@ export type ReverseProxyRule = {
   targetPort: number
   targetPath: string
   targetDnsPath?: string
+  ednsEnabled: boolean
+  ednsMode: 'auto' | 'custom'
+  ednsCustomIp: string
+  ednsClientSubnetPolicy: 'client_ip' | 'prefer_request_public'
+  disableIpv4Answer: boolean
+  disableIpv6Answer: boolean
   certificateRecordIds: number[]
   certificateRecordId: number
   certificateLabel: string
@@ -61,6 +67,12 @@ export type ReverseProxyRuleForm = {
   targetPort: number
   targetPath: string
   targetDnsPath: string
+  ednsEnabled: boolean
+  ednsMode: 'auto' | 'custom'
+  ednsCustomIp: string
+  ednsClientSubnetPolicy: 'client_ip' | 'prefer_request_public'
+  disableIpv4Answer: boolean
+  disableIpv6Answer: boolean
   certificateRecordIds: number[]
   listenHttpVersionStrategy: '' | 'h2_h3' | 'h2_only' | 'h3_only'
   ipStrategy: 'ipv4_only' | 'ipv6_only' | 'prefer_ipv4' | 'prefer_ipv6'
