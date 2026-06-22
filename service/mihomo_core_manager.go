@@ -23,6 +23,8 @@ type MihomoCoreManagerService struct {
 	mu        sync.Mutex
 	coreCmd   *exec.Cmd
 	isStarted bool
+	stdout    *os.File
+	stderr    *os.File
 }
 
 const (
@@ -169,6 +171,7 @@ func (s *MihomoCoreManagerService) GetCoreStatus() (*CoreInfo, error) {
 	info := &CoreInfo{
 		Platform: s.getPlatformInfo(),
 	}
+	info.RuntimeMode = string(getManagedCoreRuntimeMode())
 	if preference, err := s.GetDownloadPreference(); err == nil {
 		info.DownloadPreference = preference
 	} else {
@@ -543,7 +546,7 @@ func (s *MihomoCoreManagerService) normalizeDownloadTarget(target CoreDownloadTa
 	}
 	if normalized.Arch == "amd64" {
 		if normalized.Amd64Level == "" {
-			normalized.Amd64Level = "v3"
+			normalized.Amd64Level = inferHostAMD64Level()
 		}
 	} else {
 		normalized.Amd64Level = ""
@@ -967,8 +970,14 @@ func (s *MihomoCoreManagerService) StartCore() error {
 	}
 	if err != nil {
 		DiscardMaterializedManagedRuntimeCoreFile(configPath)
+		return err
 	}
-	return err
+	if runtime.GOOS == "linux" {
+		if markerErr := markManagedCoreShouldRun("mihomo"); markerErr != nil {
+			logger.Warning("failed to persist mihomo runtime marker: ", markerErr)
+		}
+	}
+	return nil
 }
 
 func (s *MihomoCoreManagerService) startCoreLocked() error {
@@ -1009,8 +1018,14 @@ func (s *MihomoCoreManagerService) startCoreLocked() error {
 	}
 	if err != nil {
 		DiscardMaterializedManagedRuntimeCoreFile(configPath)
+		return err
 	}
-	return err
+	if runtime.GOOS == "linux" {
+		if markerErr := markManagedCoreShouldRun("mihomo"); markerErr != nil {
+			logger.Warning("failed to persist mihomo runtime marker: ", markerErr)
+		}
+	}
+	return nil
 }
 
 func (s *MihomoCoreManagerService) StopCore() error {
@@ -1018,7 +1033,11 @@ func (s *MihomoCoreManagerService) StopCore() error {
 	defer s.mu.Unlock()
 
 	if runtime.GOOS == "linux" {
-		return s.stopCoreLinuxFull()
+		err := s.stopCoreLinuxFull()
+		if err == nil {
+			clearManagedCoreShouldRun("mihomo")
+		}
+		return err
 	}
 	return s.stopCoreInternal()
 }
@@ -1037,6 +1056,7 @@ func (s *MihomoCoreManagerService) DeleteCore() error {
 		}
 		s.cleanupLegacyMihomoSystemdServices()
 		s.removeMihomoSystemdService()
+		clearManagedCoreShouldRun("mihomo")
 	} else {
 		if err := s.stopCoreInternal(); err != nil {
 			return err
@@ -1064,7 +1084,7 @@ func (s *MihomoCoreManagerService) RestartCore() error {
 		return err
 	}
 
-	if runtime.GOOS == "linux" && s.isMihomoSystemdActive() {
+	if runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime() && s.isMihomoSystemdActive() {
 		if err := s.regenerateRuntimeConfig(); err != nil {
 			return err
 		}
@@ -1092,12 +1112,23 @@ func (s *MihomoCoreManagerService) RestartCore() error {
 			return fmt.Errorf("systemd restart mihomo failed: %v", err)
 		}
 		s.isStarted = true
+		if markerErr := markManagedCoreShouldRun("mihomo"); markerErr != nil {
+			logger.Warning("failed to persist mihomo runtime marker: ", markerErr)
+		}
 		return nil
 	}
 
 	_ = s.stopCoreInternal()
 	time.Sleep(1 * time.Second)
-	return s.startCoreLocked()
+	if err := s.startCoreLocked(); err != nil {
+		return err
+	}
+	if runtime.GOOS == "linux" {
+		if markerErr := markManagedCoreShouldRun("mihomo"); markerErr != nil {
+			logger.Warning("failed to persist mihomo runtime marker: ", markerErr)
+		}
+	}
+	return nil
 }
 
 func (s *MihomoCoreManagerService) IsRunning() bool {
@@ -1107,7 +1138,7 @@ func (s *MihomoCoreManagerService) IsRunning() bool {
 }
 
 func (s *MihomoCoreManagerService) isRunning() bool {
-	if runtime.GOOS == "linux" {
+	if runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime() {
 		if s.isMihomoSystemdActive() {
 			s.isStarted = true
 			return true
@@ -1120,6 +1151,10 @@ func (s *MihomoCoreManagerService) isRunning() bool {
 		}
 		s.isStarted = false
 		s.coreCmd = nil
+	}
+	if runtime.GOOS == "linux" && shouldUseDirectManagedCoreRuntime() && isManagedCoreProcessRunningByBinaryPath(s.getCoreBinPath()) {
+		s.isStarted = true
+		return true
 	}
 	return false
 }
@@ -1138,15 +1173,69 @@ func (s *MihomoCoreManagerService) startCoreWindows(coreDir string) error {
 		"XDG_CONFIG_HOME="+filepath.Join(coreDir, ".config"),
 		"XDG_CACHE_HOME="+filepath.Join(coreDir, ".cache"),
 	)
+	s.stdout = nil
+	s.stderr = nil
 	if err := s.coreCmd.Start(); err != nil {
 		s.coreCmd = nil
 		return fmt.Errorf("start core failed: %v", err)
 	}
 	s.isStarted = true
+	startedCmd := s.coreCmd
+	waitManagedCoreCommandAsync(startedCmd, func() {
+		s.mu.Lock()
+		if s.coreCmd == startedCmd {
+			s.isStarted = false
+			s.coreCmd = nil
+			closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
+			s.stdout = nil
+			s.stderr = nil
+		}
+		s.mu.Unlock()
+	})
+	return nil
+}
+
+func (s *MihomoCoreManagerService) startCoreDirectLinux(coreDir string) error {
+	binPath := filepath.Join(coreDir, s.getCoreBinName())
+	configPath := s.getConfigPath()
+	s.coreCmd = exec.Command(binPath, "-d", coreDir, "-f", configPath)
+	s.coreCmd.Dir = coreDir
+	s.coreCmd.Env = append(os.Environ(),
+		"XDG_CONFIG_HOME="+filepath.Join(coreDir, ".config"),
+		"XDG_CACHE_HOME="+filepath.Join(coreDir, ".cache"),
+	)
+	s.stdout, s.stderr = resolveManagedCoreDirectStdStreams()
+	s.coreCmd.Stdout = s.stdout
+	s.coreCmd.Stderr = s.stderr
+	if err := s.coreCmd.Start(); err != nil {
+		closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
+		s.stdout = nil
+		s.stderr = nil
+		s.coreCmd = nil
+		return fmt.Errorf("direct start mihomo failed: %v", err)
+	}
+	s.isStarted = true
+	logger.Info("mihomo 内核已直接启动 (Linux, 无systemd), PID: ", s.coreCmd.Process.Pid)
+	startedCmd := s.coreCmd
+	waitManagedCoreCommandAsync(startedCmd, func() {
+		s.mu.Lock()
+		if s.coreCmd == startedCmd {
+			s.isStarted = false
+			s.coreCmd = nil
+			closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
+			s.stdout = nil
+			s.stderr = nil
+		}
+		s.mu.Unlock()
+	})
 	return nil
 }
 
 func (s *MihomoCoreManagerService) startCoreLinux(coreDir string) error {
+	if shouldUseDirectManagedCoreRuntime() {
+		return s.startCoreDirectLinux(coreDir)
+	}
+
 	binPath := filepath.Join(coreDir, s.getCoreBinName())
 	configPath := s.getConfigPath()
 
@@ -1200,13 +1289,23 @@ func (s *MihomoCoreManagerService) startCoreLinux(coreDir string) error {
 }
 
 func (s *MihomoCoreManagerService) stopCoreLinuxFull() error {
+	if shouldUseDirectManagedCoreRuntime() {
+		if err := s.stopCoreInternal(); err != nil {
+			return err
+		}
+		s.cleanupLegacyMihomoSystemdServices()
+		s.removeMihomoSystemdService()
+		clearManagedCoreShouldRun("mihomo")
+		return nil
+	}
 	_ = s.stopCoreInternal()
 	s.removeMihomoSystemdService()
+	clearManagedCoreShouldRun("mihomo")
 	return nil
 }
 
 func (s *MihomoCoreManagerService) stopCoreInternal() error {
-	if runtime.GOOS == "linux" && s.isMihomoSystemdActive() {
+	if runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime() && s.isMihomoSystemdActive() {
 		cmd := exec.Command("systemctl", "stop", mihomoSystemdName)
 		if err := cmd.Run(); err == nil {
 			time.Sleep(300 * time.Millisecond)
@@ -1215,10 +1314,25 @@ func (s *MihomoCoreManagerService) stopCoreInternal() error {
 			}
 			s.isStarted = false
 			s.coreCmd = nil
+			closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
+			s.stdout = nil
+			s.stderr = nil
 			return nil
 		} else {
 			return fmt.Errorf("failed to stop mihomo systemd service: %v", err)
 		}
+	}
+
+	if runtime.GOOS == "linux" && shouldUseDirectManagedCoreRuntime() {
+		if err := terminateManagedCoreProcessesByBinaryPath(s.getCoreBinPath(), 5*time.Second); err != nil {
+			return fmt.Errorf("failed to stop mihomo direct runtime process: %v", err)
+		}
+		s.isStarted = false
+		s.coreCmd = nil
+		closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
+		s.stdout = nil
+		s.stderr = nil
+		return nil
 	}
 
 	if s.coreCmd != nil && s.coreCmd.Process != nil {
@@ -1231,27 +1345,29 @@ func (s *MihomoCoreManagerService) stopCoreInternal() error {
 			if err := s.coreCmd.Process.Signal(os.Interrupt); err != nil {
 				return fmt.Errorf("failed to interrupt mihomo process %d: %v", pid, err)
 			}
-			done := make(chan struct{})
-			go func() {
-				_ = s.coreCmd.Wait()
-				close(done)
-			}()
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				if !managedCoreProcessPIDAlive(pid) {
+					break
+				}
+				time.Sleep(120 * time.Millisecond)
+			}
+			if managedCoreProcessPIDAlive(pid) {
 				if err := s.coreCmd.Process.Kill(); err != nil {
 					return fmt.Errorf("failed to kill mihomo process %d: %v", pid, err)
 				}
 			}
 		}
-		tmp := &CoreManagerService{}
-		if tmp.isProcessAlive(pid) {
+		if managedCoreProcessPIDAlive(pid) {
 			return fmt.Errorf("mihomo process %d is still alive after stop request", pid)
 		}
 	}
 
 	s.isStarted = false
 	s.coreCmd = nil
+	closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
+	s.stdout = nil
+	s.stderr = nil
 	return nil
 }
 
@@ -1268,8 +1384,11 @@ func (s *MihomoCoreManagerService) removeSystemdServiceByName(serviceName string
 	if serviceName == "" {
 		return
 	}
-	_ = exec.Command("systemctl", "stop", serviceName).Run()
-	_ = exec.Command("systemctl", "disable", serviceName).Run()
+	useSystemctl := runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime()
+	if useSystemctl {
+		_ = exec.Command("systemctl", "stop", serviceName).Run()
+		_ = exec.Command("systemctl", "disable", serviceName).Run()
+	}
 
 	removed := false
 	for _, servicePath := range getSystemdServiceFileCandidates(serviceName) {
@@ -1283,8 +1402,10 @@ func (s *MihomoCoreManagerService) removeSystemdServiceByName(serviceName string
 		removed = true
 	}
 	if removed {
-		_ = exec.Command("systemctl", "daemon-reload").Run()
-		_ = exec.Command("systemctl", "reset-failed").Run()
+		if useSystemctl {
+			_ = exec.Command("systemctl", "daemon-reload").Run()
+			_ = exec.Command("systemctl", "reset-failed").Run()
+		}
 	}
 }
 
@@ -1345,13 +1466,18 @@ func (s *MihomoCoreManagerService) removeMihomoSystemdService() {
 	if _, err := os.Stat(servicePath); os.IsNotExist(err) {
 		return
 	}
-	_ = exec.Command("systemctl", "disable", mihomoSystemdName).Run()
+	useSystemctl := runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime()
+	if useSystemctl {
+		_ = exec.Command("systemctl", "disable", mihomoSystemdName).Run()
+	}
 	if err := os.Remove(servicePath); err != nil {
 		logger.Warning("unable to remove systemd service file: ", err)
 		return
 	}
-	_ = exec.Command("systemctl", "daemon-reload").Run()
-	_ = exec.Command("systemctl", "reset-failed").Run()
+	if useSystemctl {
+		_ = exec.Command("systemctl", "daemon-reload").Run()
+		_ = exec.Command("systemctl", "reset-failed").Run()
+	}
 }
 
 func (s *MihomoCoreManagerService) getCoreAutoCheckSettings() (enabled bool, intervalHours int, lastCheckedAt int64, err error) {

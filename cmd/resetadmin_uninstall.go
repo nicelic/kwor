@@ -192,6 +192,12 @@ func handleResetAdminCommand() {
 }
 
 func handleUninstallCommand() {
+	if service.RunningInsideContainer() {
+		fmt.Println("[kwor] uninstall is disabled inside Docker containers.")
+		fmt.Println("[kwor] To remove the container, use Docker/Compose. Delete the mounted data volume explicitly only after backup.")
+		return
+	}
+
 	confirm := strings.TrimSpace(readInput("是否停止kwor运行并卸载、删除其创建的全部文件？(y/N)", ""))
 	if confirm != "y" && confirm != "Y" {
 		fmt.Println("[kwor] \u5df2\u53d6\u6d88\u5378\u8f7d")

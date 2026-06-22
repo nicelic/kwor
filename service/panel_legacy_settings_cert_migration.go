@@ -114,6 +114,10 @@ func MigrateLegacySettingsPathCertificatesToInventory(settingService *SettingSer
 				return setErr
 			}
 		}
+
+		if clearErr := clearLegacySettingsPathCertificateSource(settingService, BuildImportedSourceRef(target)); clearErr != nil {
+			return clearErr
+		}
 	}
 	return nil
 }

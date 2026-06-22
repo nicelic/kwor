@@ -175,10 +175,7 @@ func reverseProxyDNSInstanceKey(row *model.ReverseProxyRule) string {
 		return ""
 	}
 	alias := normalizeReverseProxyProtocolAlias(row.ListenProtocolAlias, row.ListenProtocol)
-	listenIPs := decodeReverseProxyListenIPs(row)
-	if len(listenIPs) == 0 {
-		listenIPs = []string{"0.0.0.0"}
-	}
+	listenIPs := reverseProxyDNSRuntimeListenIPsForAlias(row, alias)
 	normalizedIPs := make([]string, 0, len(listenIPs))
 	for _, item := range listenIPs {
 		normalizedIPs = append(normalizedIPs, strings.ToLower(strings.TrimSpace(item)))
@@ -193,6 +190,60 @@ func reverseProxyDNSInstanceKey(row *model.ReverseProxyRule) string {
 		keyParts = append(keyParts, fmt.Sprintf("%d", row.Id))
 	}
 	return strings.Join(keyParts, "|")
+}
+
+func reverseProxyDNSRuntimeListenIPs(row *model.ReverseProxyRule) []string {
+	listenIPs := decodeReverseProxyListenIPs(row)
+	if len(listenIPs) > 0 {
+		return listenIPs
+	}
+	items := []string{"0.0.0.0"}
+	if reverseProxyDNSIPv6WildcardAvailable() {
+		items = append(items, "::")
+	}
+	return items
+}
+
+func reverseProxyDNSRuntimeListenIPsForAlias(row *model.ReverseProxyRule, alias string) []string {
+	listenIPs := reverseProxyDNSRuntimeListenIPs(row)
+	if len(decodeReverseProxyListenIPs(row)) > 0 {
+		return listenIPs
+	}
+	switch normalizeReverseProxyProtocolAlias(alias, reverseProxyProtocolDNS) {
+	case reverseProxyDNSProtocolDoH, reverseProxyDNSProtocolDoHH3, reverseProxyDNSProtocolDoQ:
+		return dedupeReverseProxyDNSWildcardListenIPs(listenIPs)
+	default:
+		return listenIPs
+	}
+}
+
+func dedupeReverseProxyDNSWildcardListenIPs(listenIPs []string) []string {
+	hasIPv6Wildcard := false
+	hasIPv4Wildcard := false
+	for _, item := range listenIPs {
+		switch strings.TrimSpace(item) {
+		case "::":
+			hasIPv6Wildcard = true
+		case "0.0.0.0":
+			hasIPv4Wildcard = true
+		}
+	}
+	if hasIPv6Wildcard {
+		return []string{"::"}
+	}
+	if hasIPv4Wildcard {
+		return []string{"0.0.0.0"}
+	}
+	return listenIPs
+}
+
+func reverseProxyDNSIPv6WildcardAvailable() bool {
+	conn, err := net.ListenPacket("udp6", "[::]:0")
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 func sortReverseProxyDNSRules(rows []model.ReverseProxyRule) {
@@ -376,10 +427,7 @@ func buildReverseProxyDNSProxyConfig(service *ReverseProxyService, rows []model.
 		Logger: slog.Default(),
 	}
 
-	listenIPs := decodeReverseProxyListenIPs(row)
-	if len(listenIPs) == 0 {
-		listenIPs = []string{"0.0.0.0"}
-	}
+	listenIPs := reverseProxyDNSRuntimeListenIPsForAlias(row, listenAlias)
 	switch listenAlias {
 	case reverseProxyDNSProtocolUDP:
 		conf.UDPListenAddr = buildReverseProxyDNSUDPListenAddrs(listenIPs, row.ListenPort)
@@ -471,10 +519,7 @@ func buildReverseProxyDNSH3OnlyRuntime(key string, rows []model.ReverseProxyRule
 		TLSConfig: http3.ConfigureTLSConfig(tlsConfig),
 		Port:      row.ListenPort,
 	}
-	listenIPs := decodeReverseProxyListenIPs(row)
-	if len(listenIPs) == 0 {
-		listenIPs = []string{"0.0.0.0"}
-	}
+	listenIPs := reverseProxyDNSRuntimeListenIPsForAlias(row, reverseProxyDNSProtocolDoHH3)
 	packetConns := make([]net.PacketConn, 0, len(listenIPs))
 	for _, listenIP := range listenIPs {
 		addr := net.JoinHostPort(strings.TrimSpace(listenIP), fmt.Sprintf("%d", row.ListenPort))
@@ -897,11 +942,12 @@ func reverseProxyDNSApplyEDNSPolicy(req *dns.Msg, dctx *dnsproxy.DNSContext, rul
 
 	switch normalizeReverseProxyEDNSMode(rule.EDNSMode) {
 	case reverseProxyEDNSModeCustom:
-		ip := net.ParseIP(strings.TrimSpace(rule.EDNSCustomIP))
-		if ip == nil {
+		normalizedIP, ok := normalizeReverseProxyEDNSCustomIPv4(rule.EDNSCustomIP)
+		if !ok {
 			reverseProxyDNSRemoveECS(req)
 			return
 		}
+		ip := net.ParseIP(normalizedIP)
 		reverseProxyDNSSetECS(req, ip)
 	default:
 		if normalizeReverseProxyEDNSClientSubnetPolicy(rule.EDNSClientSubnetPolicy) == reverseProxyEDNSClientSubnetPolicyPreferRequestPublic {
@@ -1375,10 +1421,7 @@ func (m *reverseProxyDNSRuntimeManager) listenerCount() int {
 			count += len(instance.h3PacketConns)
 			continue
 		}
-		listenIPs := decodeReverseProxyListenIPs(rule)
-		if len(listenIPs) == 0 {
-			listenIPs = []string{"0.0.0.0"}
-		}
+		listenIPs := reverseProxyDNSRuntimeListenIPs(rule)
 		if alias == reverseProxyDNSProtocolDoH {
 			count += len(listenIPs) * 2
 			continue

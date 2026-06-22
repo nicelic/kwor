@@ -436,6 +436,64 @@ func TestDeleteImportedSettingsPathCertificateClearsLegacySourceSettings(t *test
 	}
 }
 
+func TestMigrateLegacySettingsPathCertificatesToInventoryClearsLegacySettings(t *testing.T) {
+	setupAcmeIPBehaviorTestDB(t, "acme-migrate-legacy-settings.db")
+
+	settingService := &SettingService{}
+	if _, err := settingService.GetAllSetting(); err != nil {
+		t.Fatalf("seed default settings failed: %v", err)
+	}
+	certDir := t.TempDir()
+	generated, err := GeneratePanelSelfSignedCertificateInDir(certDir)
+	if err != nil {
+		t.Fatalf("generate legacy panel certificate failed: %v", err)
+	}
+	if err := settingService.SaveSetting("webCertFile", generated.CertPath); err != nil {
+		t.Fatalf("set web cert path failed: %v", err)
+	}
+	if err := settingService.SaveSetting("webKeyFile", generated.KeyPath); err != nil {
+		t.Fatalf("set web key path failed: %v", err)
+	}
+
+	if err := MigrateLegacySettingsPathCertificatesToInventory(settingService); err != nil {
+		t.Fatalf("migrate legacy settings-path certificates failed: %v", err)
+	}
+
+	webCertFile, err := settingService.GetCertFile()
+	if err != nil {
+		t.Fatalf("read web cert path failed: %v", err)
+	}
+	if strings.TrimSpace(webCertFile) != "" {
+		t.Fatalf("expected web cert path cleared, got=%q", webCertFile)
+	}
+
+	webKeyFile, err := settingService.GetKeyFile()
+	if err != nil {
+		t.Fatalf("read web key path failed: %v", err)
+	}
+	if strings.TrimSpace(webKeyFile) != "" {
+		t.Fatalf("expected web key path cleared, got=%q", webKeyFile)
+	}
+
+	assignedID, err := GetAssignedCertificateRecordID(settingService, PanelSelfSignedTargetPanel)
+	if err != nil {
+		t.Fatalf("read assigned certificate id failed: %v", err)
+	}
+	if assignedID == 0 {
+		t.Fatal("expected assigned certificate id after migration")
+	}
+	row, err := certificateInventory.GetRecordByID(assignedID)
+	if err != nil {
+		t.Fatalf("read migrated inventory row failed: %v", err)
+	}
+	if row == nil {
+		t.Fatal("expected migrated inventory row")
+	}
+	if row.SourceRef != BuildImportedSourceRef(PanelSelfSignedTargetPanel) {
+		t.Fatalf("unexpected source ref: %s", row.SourceRef)
+	}
+}
+
 func TestCertificateInventoryDisplayIDReusesSmallestGap(t *testing.T) {
 	setupAcmeIPBehaviorTestDB(t, "acme-display-id-gap.db")
 

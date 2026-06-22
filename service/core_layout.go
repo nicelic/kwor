@@ -81,6 +81,31 @@ func EnsureManagedCoreLayout() error {
 	if err := migrateLegacyCoreArtifacts(root); err != nil {
 		return err
 	}
+	if err := ensureManagedCoreRuntimeScaffold(root); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureManagedCoreRuntimeScaffold(root string) error {
+	if err := ensureManagedCoreDirScaffold(GetMihomoCoreDir()); err != nil {
+		return fmt.Errorf("prepare mihomo runtime scaffold failed: %w", err)
+	}
+	singboxCoreDir := GetSingboxCoreDir()
+	if !sameManagedCorePath(singboxCoreDir, root) {
+		if err := ensureManagedCoreDirScaffold(singboxCoreDir); err != nil {
+			return fmt.Errorf("prepare singbox runtime scaffold failed: %w", err)
+		}
+	}
+	return nil
+}
+
+func ensureManagedCoreDirScaffold(coreDir string) error {
+	for _, child := range []string{".config", ".cache"} {
+		if err := os.MkdirAll(filepath.Join(coreDir, child), 0o755); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

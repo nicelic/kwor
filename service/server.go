@@ -59,6 +59,11 @@ type systemdUnitStats struct {
 	UptimeSec uint64
 }
 
+type managedCoreRuntimeInspector interface {
+	IsRunning() bool
+	GetCoreStatus() (*CoreInfo, error)
+}
+
 func (s *ServerService) GetStatus(request string) *map[string]interface{} {
 	status := make(map[string]interface{}, 0)
 	requests := strings.Split(request, ",")
@@ -251,16 +256,36 @@ func (s *ServerService) getAppRuntimeStats() runtimeStats {
 }
 
 func (s *ServerService) getSingboxRuntimeStats() systemdUnitStats {
-	return s.getManagedCoreRuntimeStats(singboxSystemdName)
+	return s.getManagedCoreRuntimeStats(singboxSystemdName, "sing-box", &CoreManagerService{})
 }
 
 func (s *ServerService) getMihomoRuntimeStats() systemdUnitStats {
-	return s.getManagedCoreRuntimeStats(mihomoSystemdName)
+	return s.getManagedCoreRuntimeStats(mihomoSystemdName, "mihomo", &MihomoCoreManagerService{})
 }
 
-func (s *ServerService) getManagedCoreRuntimeStats(unit string) systemdUnitStats {
+func (s *ServerService) getManagedCoreRuntimeStats(unit string, processName string, inspector managedCoreRuntimeInspector) systemdUnitStats {
 	stats := systemdUnitStats{}
 	if runtime.GOOS != "linux" {
+		return stats
+	}
+
+	if shouldUseDirectManagedCoreRuntime() {
+		if inspector == nil || !inspector.IsRunning() {
+			return stats
+		}
+		info, err := inspector.GetCoreStatus()
+		if err != nil || info == nil || !info.Running {
+			return stats
+		}
+		procStats := s.findManagedCoreProcessStats(processName, info)
+		if procStats.pid <= 0 {
+			return stats
+		}
+		stats.Active = true
+		stats.MainPID = procStats.pid
+		stats.Memory = procStats.MemoryBytes
+		stats.Tasks = procStats.Threads
+		stats.UptimeSec = procStats.Uptime
 		return stats
 	}
 
@@ -284,6 +309,50 @@ func (s *ServerService) getManagedCoreRuntimeStats(unit string) systemdUnitStats
 	}
 
 	return stats
+}
+
+type processRuntimeStatsWithPID struct {
+	pid int32
+	runtimeStats
+}
+
+func (s *ServerService) findManagedCoreProcessStats(processName string, info *CoreInfo) processRuntimeStatsWithPID {
+	result := processRuntimeStatsWithPID{}
+	processName = strings.TrimSpace(processName)
+	if info == nil || processName == "" {
+		return result
+	}
+
+	processes, err := process.Processes()
+	if err != nil {
+		return result
+	}
+	for _, proc := range processes {
+		if proc == nil {
+			continue
+		}
+		name, err := proc.Name()
+		if err != nil {
+			continue
+		}
+		if name != processName {
+			continue
+		}
+		exe, exeErr := proc.Exe()
+		if exeErr == nil {
+			exe = filepath.Clean(exe)
+			expected := filepath.Clean(filepath.Join(config.GetDataDir(), "core"))
+			if !strings.Contains(exe, expected) {
+				continue
+			}
+		}
+		stats := s.getProcessRuntimeStats(proc.Pid)
+		return processRuntimeStatsWithPID{
+			pid:          proc.Pid,
+			runtimeStats: stats,
+		}
+	}
+	return result
 }
 
 func (s *ServerService) getProcessRuntimeStats(pid int32) runtimeStats {

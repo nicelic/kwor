@@ -407,7 +407,8 @@
                     <v-text-field
                       v-model="editingRule.ednsCustomIp"
                       :label="reverseProxyCopy.ednsCustomIp"
-                      placeholder="14.119.184.1 / 2408:xxxx::1"
+                      placeholder="14.119.184.1"
+                      @blur="normalizeCustomEDNSInput"
                       hide-details />
                   </v-col>
                   <v-col v-if="listenIsDNS && editingRule.ednsEnabled && editingRule.ednsMode === 'auto'" cols="12" lg="12">
@@ -647,6 +648,7 @@ const {
   targetProtocolBehavior,
   refreshOverview,
   openRuleDialog,
+  normalizeCustomEDNSInput,
   saveRule,
   removeRule,
   toggleRule,

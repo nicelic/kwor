@@ -202,6 +202,16 @@ type managedCoreController interface {
 }
 
 func (a *APP) reconcileManagedCoreOnStartup(serviceName string, starter managedCoreController, label string) {
+	if service.ShouldRecoverManagedCoreOnStartup(label) {
+		if starter.IsRunning() {
+			return
+		}
+		if err := starter.StartCore(); err != nil {
+			logger.Warningf("%s startup auto-recover failed: %v", label, err)
+		}
+		return
+	}
+
 	servicePath := filepath.Join("/etc/systemd/system", serviceName+".service")
 	if _, err := os.Stat(servicePath); err != nil {
 		return

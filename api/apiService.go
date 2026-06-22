@@ -873,6 +873,22 @@ func (a *ApiService) ResetTrafficOverview(c *gin.Context) {
 	a.GetTrafficOverview(c)
 }
 
+func (a *ApiService) ResetTrafficOverviewPeriod(c *gin.Context) {
+	if err := a.TrafficOverviewService.ResetPeriodTrafficOverviewStats(); err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	a.GetTrafficOverview(c)
+}
+
+func (a *ApiService) ResetTrafficOverviewTotal(c *gin.Context) {
+	if err := a.TrafficOverviewService.ResetTotalTrafficOverviewStats(); err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	a.GetTrafficOverview(c)
+}
+
 func (a *ApiService) GetFirewallOverview(c *gin.Context) {
 	overview, err := a.FirewallService.GetOverview()
 	if err != nil {

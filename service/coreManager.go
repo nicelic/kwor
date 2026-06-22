@@ -27,6 +27,8 @@ type CoreManagerService struct {
 	mu        sync.Mutex
 	coreCmd   *exec.Cmd
 	isStarted bool
+	stdout    *os.File
+	stderr    *os.File
 }
 
 const (
@@ -159,6 +161,7 @@ type CoreInfo struct {
 	Running            bool                   `json:"running"`
 	VersionInfo        string                 `json:"versionInfo"`
 	Platform           string                 `json:"platform"`
+	RuntimeMode        string                 `json:"runtimeMode,omitempty"`
 	InstalledTarget    CoreDownloadTarget     `json:"installedTarget,omitempty"`
 	DownloadPreference CoreDownloadPreference `json:"downloadPreference"`
 }
@@ -366,6 +369,7 @@ func (s *CoreManagerService) GetCoreStatus() (*CoreInfo, error) {
 	info := &CoreInfo{
 		Platform: s.getPlatformInfo(),
 	}
+	info.RuntimeMode = string(getManagedCoreRuntimeMode())
 	if preference, err := s.GetDownloadPreference(); err == nil {
 		info.DownloadPreference = preference
 	} else {
@@ -729,7 +733,11 @@ func (s *CoreManagerService) normalizeDownloadTarget(target CoreDownloadTarget) 
 	if normalized.Arch == "" {
 		normalized.Arch = s.getArchName()
 	}
-	if normalized.Arch != "amd64" {
+	if normalized.Arch == "amd64" {
+		if normalized.Amd64Level == "" {
+			normalized.Amd64Level = inferHostAMD64Level()
+		}
+	} else {
 		normalized.Amd64Level = ""
 	}
 	if normalized.OS != "linux" {
@@ -740,6 +748,11 @@ func (s *CoreManagerService) normalizeDownloadTarget(target CoreDownloadTarget) 
 	case "", "glibc", "musl", "universal":
 	default:
 		normalized.Libc = ""
+	}
+	if normalized.Libc == "" {
+		if detected := detectHostLinuxLibc(); detected != "" {
+			normalized.Libc = detected
+		}
 	}
 	return normalized
 }
@@ -1162,8 +1175,14 @@ func (s *CoreManagerService) StartCore() error {
 	}
 	if err != nil {
 		DiscardMaterializedManagedRuntimeCoreFile(configPath)
+		return err
 	}
-	return err
+	if runtime.GOOS == "linux" {
+		if markerErr := markManagedCoreShouldRun("singbox"); markerErr != nil {
+			logger.Warning("failed to persist sing-box runtime marker: ", markerErr)
+		}
+	}
+	return nil
 }
 
 // startCoreLocked starts core while caller already holds s.mu.
@@ -1207,8 +1226,14 @@ func (s *CoreManagerService) startCoreLocked() error {
 	}
 	if err != nil {
 		DiscardMaterializedManagedRuntimeCoreFile(configPath)
+		return err
 	}
-	return err
+	if runtime.GOOS == "linux" {
+		if markerErr := markManagedCoreShouldRun("singbox"); markerErr != nil {
+			logger.Warning("failed to persist sing-box runtime marker: ", markerErr)
+		}
+	}
+	return nil
 }
 
 // StopCore 停止内核（UI 点击停止）
@@ -1219,7 +1244,11 @@ func (s *CoreManagerService) StopCore() error {
 	defer s.mu.Unlock()
 
 	if runtime.GOOS == "linux" {
-		return s.stopCoreLinuxFull()
+		err := s.stopCoreLinuxFull()
+		if err == nil {
+			clearManagedCoreShouldRun("singbox")
+		}
+		return err
 	}
 	return s.stopCoreInternal()
 }
@@ -1239,6 +1268,7 @@ func (s *CoreManagerService) DeleteCore() error {
 		}
 		s.cleanupLegacySingboxSystemdServices()
 		s.removeSingboxSystemdService()
+		clearManagedCoreShouldRun("singbox")
 	} else {
 		if err := s.stopCoreInternal(); err != nil {
 			return err
@@ -1273,7 +1303,7 @@ func (s *CoreManagerService) RestartCore() error {
 		return err
 	}
 
-	if runtime.GOOS == "linux" && s.isSingboxSystemdActive() {
+	if runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime() && s.isSingboxSystemdActive() {
 		s.regenerateRuntimeConfig()
 		configPath := s.getConfigPath()
 		configExists, err := ManagedRuntimeFileExists(configPath)
@@ -1332,6 +1362,9 @@ func (s *CoreManagerService) RestartCore() error {
 			return fmt.Errorf("%s", message)
 		}
 		s.isStarted = true
+		if markerErr := markManagedCoreShouldRun("singbox"); markerErr != nil {
+			logger.Warning("failed to persist sing-box runtime marker: ", markerErr)
+		}
 		logger.Info("sing-box 已通过 systemd 重启")
 		return nil
 	}
@@ -1371,8 +1404,14 @@ func (s *CoreManagerService) RestartCore() error {
 	}
 	if err != nil {
 		DiscardMaterializedManagedRuntimeCoreFile(configPath)
+		return err
 	}
-	return err
+	if runtime.GOOS == "linux" {
+		if markerErr := markManagedCoreShouldRun("singbox"); markerErr != nil {
+			logger.Warning("failed to persist sing-box runtime marker: ", markerErr)
+		}
+	}
+	return nil
 }
 
 // =====================================================================
@@ -1390,8 +1429,8 @@ func (s *CoreManagerService) IsRunning() bool {
 
 // isRunning 检查内核是否在运行
 func (s *CoreManagerService) isRunning() bool {
-	// Linux: 优先检查 systemd 状态
-	if runtime.GOOS == "linux" {
+	// Linux 宿主机模式优先检查 systemd 状态
+	if runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime() {
 		if s.isSingboxSystemdActive() {
 			s.isStarted = true
 			return true
@@ -1406,6 +1445,11 @@ func (s *CoreManagerService) isRunning() bool {
 		// 进程已退出
 		s.isStarted = false
 		s.coreCmd = nil
+	}
+
+	if runtime.GOOS == "linux" && shouldUseDirectManagedCoreRuntime() && isManagedCoreProcessRunningByBinaryPath(s.getCoreBinPath()) {
+		s.isStarted = true
+		return true
 	}
 
 	return false
@@ -1426,21 +1470,7 @@ func (s *CoreManagerService) isSingboxSystemdExists() bool {
 
 // isProcessAlive 检查 PID 对应的进程是否存在
 func (s *CoreManagerService) isProcessAlive(pid int) bool {
-	if runtime.GOOS == "windows" {
-		cmd := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/FO", "CSV", "/NH")
-		output, err := cmd.Output()
-		if err != nil {
-			return false
-		}
-		return strings.Contains(string(output), fmt.Sprintf("%d", pid))
-	}
-	// Linux/Mac: 发送 signal 0 检查进程
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	err = process.Signal(os.Signal(nil))
-	return err == nil
+	return managedCoreProcessPIDAlive(pid)
 }
 
 // =====================================================================
@@ -1456,6 +1486,8 @@ func (s *CoreManagerService) startCoreWindows(coreDir string) error {
 	s.coreCmd.Dir = coreDir
 	s.coreCmd.Stdout = nil
 	s.coreCmd.Stderr = nil
+	s.stdout = nil
+	s.stderr = nil
 
 	err := s.coreCmd.Start()
 	if err != nil {
@@ -1466,13 +1498,19 @@ func (s *CoreManagerService) startCoreWindows(coreDir string) error {
 	s.isStarted = true
 	logger.Info("sing-box 内核已启动 (Windows), PID: ", s.coreCmd.Process.Pid)
 
-	go func() {
-		s.coreCmd.Wait()
+	startedCmd := s.coreCmd
+	waitManagedCoreCommandAsync(startedCmd, func() {
 		s.mu.Lock()
-		s.isStarted = false
-		logger.Info("sing-box 内核进程已退出")
+		if s.coreCmd == startedCmd {
+			s.isStarted = false
+			s.coreCmd = nil
+			closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
+			s.stdout = nil
+			s.stderr = nil
+			logger.Info("sing-box 内核进程已退出")
+		}
 		s.mu.Unlock()
-	}()
+	})
 
 	return nil
 }
@@ -1484,6 +1522,10 @@ func (s *CoreManagerService) startCoreWindows(coreDir string) error {
 // startCoreLinux 通过 systemd 启动 sing-box
 // 流程: 生成 service 文件 → daemon-reload → systemctl start
 func (s *CoreManagerService) startCoreLinux(coreDir string) error {
+	if shouldUseDirectManagedCoreRuntime() {
+		return s.startCoreDirectLinux(coreDir)
+	}
+
 	binPath := s.getCoreBinPath()
 	configPath := s.getConfigPath()
 	s.cleanupLegacySingboxSystemdServices()
@@ -1548,11 +1590,15 @@ func (s *CoreManagerService) startCoreDirectLinux(coreDir string) error {
 
 	s.coreCmd = exec.Command(binPath, "run", "-c", configPath)
 	s.coreCmd.Dir = coreDir
-	s.coreCmd.Stdout = nil
-	s.coreCmd.Stderr = nil
+	s.stdout, s.stderr = resolveManagedCoreDirectStdStreams()
+	s.coreCmd.Stdout = s.stdout
+	s.coreCmd.Stderr = s.stderr
 
 	err := s.coreCmd.Start()
 	if err != nil {
+		closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
+		s.stdout = nil
+		s.stderr = nil
 		s.coreCmd = nil
 		return fmt.Errorf("直接启动内核失败: %v", err)
 	}
@@ -1560,13 +1606,19 @@ func (s *CoreManagerService) startCoreDirectLinux(coreDir string) error {
 	s.isStarted = true
 	logger.Info("sing-box 内核已直接启动 (Linux, 无systemd), PID: ", s.coreCmd.Process.Pid)
 
-	go func() {
-		s.coreCmd.Wait()
+	startedCmd := s.coreCmd
+	waitManagedCoreCommandAsync(startedCmd, func() {
 		s.mu.Lock()
-		s.isStarted = false
-		logger.Info("sing-box 内核进程已退出")
+		if s.coreCmd == startedCmd {
+			s.isStarted = false
+			s.coreCmd = nil
+			closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
+			s.stdout = nil
+			s.stderr = nil
+			logger.Info("sing-box 内核进程已退出")
+		}
 		s.mu.Unlock()
-	}()
+	})
 
 	return nil
 }
@@ -1577,6 +1629,17 @@ func (s *CoreManagerService) startCoreDirectLinux(coreDir string) error {
 // 3. 删除 service 文件
 // 4. daemon-reload + reset-failed
 func (s *CoreManagerService) stopCoreLinuxFull() error {
+	if shouldUseDirectManagedCoreRuntime() {
+		if err := s.stopCoreInternal(); err != nil {
+			return err
+		}
+		s.cleanupLegacySingboxSystemdServices()
+		s.removeSingboxSystemdService()
+		clearManagedCoreShouldRun("singbox")
+		logger.Info("sing-box 内核已停止，Docker/直启模式运行标记已清理")
+		return nil
+	}
+
 	s.cleanupLegacySingboxSystemdServices()
 	// 先通过 systemd 停止
 	if s.isSingboxSystemdActive() {
@@ -1590,16 +1653,17 @@ func (s *CoreManagerService) stopCoreLinuxFull() error {
 
 	// 如果还有直接启动的进程，也停掉
 	if s.coreCmd != nil && s.coreCmd.Process != nil {
-		s.coreCmd.Process.Signal(os.Interrupt)
-		done := make(chan struct{})
-		go func() {
-			s.coreCmd.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			s.coreCmd.Process.Kill()
+		pid := s.coreCmd.Process.Pid
+		_ = s.coreCmd.Process.Signal(os.Interrupt)
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if !s.isProcessAlive(pid) {
+				break
+			}
+			time.Sleep(120 * time.Millisecond)
+		}
+		if s.isProcessAlive(pid) {
+			_ = s.coreCmd.Process.Kill()
 		}
 	}
 
@@ -1608,14 +1672,18 @@ func (s *CoreManagerService) stopCoreLinuxFull() error {
 
 	s.isStarted = false
 	s.coreCmd = nil
+	closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
+	s.stdout = nil
+	s.stderr = nil
+	clearManagedCoreShouldRun("singbox")
 	logger.Info("sing-box 内核已停止，systemd 服务已清理")
 	return nil
 }
 
 // stopCoreInternal 内部停止方法（Windows 或非 systemd 场景）
 func (s *CoreManagerService) stopCoreInternal() error {
-	// Linux: 先尝试 systemd stop
-	if runtime.GOOS == "linux" && s.isSingboxSystemdActive() {
+	// Linux 宿主机模式：先尝试 systemd stop
+	if runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime() && s.isSingboxSystemdActive() {
 		cmd := exec.Command("systemctl", "stop", singboxSystemdName)
 		if err := cmd.Run(); err == nil {
 			time.Sleep(300 * time.Millisecond)
@@ -1625,6 +1693,9 @@ func (s *CoreManagerService) stopCoreInternal() error {
 			logger.Info("sing-box 已通过 systemd 停止")
 			s.isStarted = false
 			s.coreCmd = nil
+			closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
+			s.stdout = nil
+			s.stderr = nil
 			return nil
 		} else {
 			return fmt.Errorf("failed to stop sing-box systemd service: %v", err)
@@ -1632,6 +1703,19 @@ func (s *CoreManagerService) stopCoreInternal() error {
 	}
 
 	// 直接停止进程
+	if runtime.GOOS == "linux" && shouldUseDirectManagedCoreRuntime() {
+		if err := terminateManagedCoreProcessesByBinaryPath(s.getCoreBinPath(), 5*time.Second); err != nil {
+			return fmt.Errorf("failed to stop sing-box direct runtime process: %v", err)
+		}
+		s.isStarted = false
+		s.coreCmd = nil
+		closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
+		s.stdout = nil
+		s.stderr = nil
+		logger.Info("sing-box 内核已停止")
+		return nil
+	}
+
 	if s.coreCmd != nil && s.coreCmd.Process != nil {
 		pid := s.coreCmd.Process.Pid
 		logger.Info("正在停止 sing-box 内核, PID: ", pid)
@@ -1645,14 +1729,14 @@ func (s *CoreManagerService) stopCoreInternal() error {
 			if err := s.coreCmd.Process.Signal(os.Interrupt); err != nil {
 				return fmt.Errorf("failed to interrupt sing-box process %d: %v", pid, err)
 			}
-			done := make(chan struct{})
-			go func() {
-				s.coreCmd.Wait()
-				close(done)
-			}()
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				if !s.isProcessAlive(pid) {
+					break
+				}
+				time.Sleep(120 * time.Millisecond)
+			}
+			if s.isProcessAlive(pid) {
 				if err := s.coreCmd.Process.Kill(); err != nil {
 					return fmt.Errorf("failed to kill sing-box process %d: %v", pid, err)
 				}
@@ -1664,11 +1748,17 @@ func (s *CoreManagerService) stopCoreInternal() error {
 
 		s.isStarted = false
 		s.coreCmd = nil
+		closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
+		s.stdout = nil
+		s.stderr = nil
 		logger.Info("sing-box 内核已停止")
 		return nil
 	}
 
 	s.isStarted = false
+	closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
+	s.stdout = nil
+	s.stderr = nil
 	return nil
 }
 
@@ -1691,8 +1781,11 @@ func (s *CoreManagerService) removeSystemdServiceByName(serviceName string) {
 		return
 	}
 
-	exec.Command("systemctl", "stop", serviceName).Run()
-	exec.Command("systemctl", "disable", serviceName).Run()
+	useSystemctl := runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime()
+	if useSystemctl {
+		exec.Command("systemctl", "stop", serviceName).Run()
+		exec.Command("systemctl", "disable", serviceName).Run()
+	}
 
 	removed := false
 	for _, servicePath := range getSystemdServiceFileCandidates(serviceName) {
@@ -1707,8 +1800,10 @@ func (s *CoreManagerService) removeSystemdServiceByName(serviceName string) {
 	}
 
 	if removed {
-		exec.Command("systemctl", "daemon-reload").Run()
-		exec.Command("systemctl", "reset-failed").Run()
+		if useSystemctl {
+			exec.Command("systemctl", "daemon-reload").Run()
+			exec.Command("systemctl", "reset-failed").Run()
+		}
 		logger.Info("removed systemd service: ", serviceName)
 	}
 }
@@ -1745,8 +1840,10 @@ func (s *CoreManagerService) removeSingboxSystemdService() {
 		return // 文件不存在，无需删除
 	}
 
-	// 先禁用服务
-	exec.Command("systemctl", "disable", singboxSystemdName).Run()
+	useSystemctl := runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime()
+	if useSystemctl {
+		exec.Command("systemctl", "disable", singboxSystemdName).Run()
+	}
 
 	// 删除服务文件
 	err := os.Remove(servicePath)
@@ -1755,9 +1852,10 @@ func (s *CoreManagerService) removeSingboxSystemdService() {
 		return
 	}
 
-	// 重新加载 systemd
-	exec.Command("systemctl", "daemon-reload").Run()
-	exec.Command("systemctl", "reset-failed").Run()
+	if useSystemctl {
+		exec.Command("systemctl", "daemon-reload").Run()
+		exec.Command("systemctl", "reset-failed").Run()
+	}
 
 	logger.Info("已删除 ", singboxSystemdName, " systemd 服务")
 }

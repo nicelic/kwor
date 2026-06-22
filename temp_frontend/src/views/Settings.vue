@@ -185,7 +185,7 @@
                 variant="flat"
                 prepend-icon="mdi-download"
                 :loading="panelInstalling"
-                :disabled="!panelSelectedVersion || panelInstalling || panelRemoteLoading"
+                :disabled="!panelSelectedVersion || panelInstalling || panelRemoteLoading || !panelCanInstall"
                 @click="openPanelInstallDialog"
               >
                 安装
@@ -229,6 +229,17 @@
                 @click:close="panelUpdateFeedback = ''"
               >
                 {{ panelUpdateFeedback }}
+              </v-alert>
+            </v-col>
+          </v-row>
+          <v-row v-if="panelInstallHint" class="mt-1">
+            <v-col cols="12">
+              <v-alert
+                type="warning"
+                variant="tonal"
+                density="compact"
+              >
+                {{ panelInstallHint }}
               </v-alert>
             </v-col>
           </v-row>
@@ -423,6 +434,8 @@ type PanelUpdateStatus = {
   runningBinaryPath?: string
   installSource?: string
   platform?: string
+  canInstall?: boolean
+  installHint?: string
 }
 
 const panelStatusLoading = ref(false)
@@ -503,6 +516,8 @@ const panelLocalVersionLabel = computed(() => {
 })
 
 const panelBinaryName = computed(() => String(panelUpdateStatus.value?.binaryName ?? '').trim())
+const panelCanInstall = computed(() => panelUpdateStatus.value?.canInstall !== false)
+const panelInstallHint = computed(() => String(panelUpdateStatus.value?.installHint ?? '').trim())
 
 const panelRemoteVersionLabel = computed(() => {
   if (panelRemoteLoading.value) return '加载中'
@@ -614,6 +629,11 @@ const resetPanelVersions = () => {
 }
 
 const openPanelInstallDialog = () => {
+  if (!panelCanInstall.value) {
+    panelUpdateFeedback.value = panelInstallHint.value || '当前部署方式不支持面板内直接安装'
+    panelUpdateFeedbackType.value = 'warning'
+    return
+  }
   if (!panelSelectedVersion.value) return
   panelInstallDialogVisible.value = true
 }

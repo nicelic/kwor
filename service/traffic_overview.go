@@ -48,6 +48,7 @@ type TrafficOverview struct {
 
 type VnstatPackageStatus struct {
 	Supported      bool     `json:"supported"`
+	CanManage      bool     `json:"canManage"`
 	Installed      bool     `json:"installed"`
 	Managed        bool     `json:"managed"`
 	Running        bool     `json:"running"`
@@ -58,6 +59,7 @@ type VnstatPackageStatus struct {
 	BinaryPath     string   `json:"binaryPath,omitempty"`
 	FileCount      int      `json:"fileCount"`
 	DataPaths      []string `json:"dataPaths,omitempty"`
+	ManageHint     string   `json:"manageHint,omitempty"`
 	Error          string   `json:"error,omitempty"`
 }
 
@@ -133,6 +135,7 @@ type trafficOverviewRuntimeState struct {
 	PeriodBaseUp     int64  `json:"periodBaseUp"`
 	PeriodBaseDown   int64  `json:"periodBaseDown"`
 	PeriodTag        string `json:"periodTag"`
+	PeriodResetDay   int    `json:"periodResetDay"`
 	LastFullResetAt  int64  `json:"lastFullResetAt"`
 	LastPeriodReset  int64  `json:"lastPeriodReset"`
 	KernelOffsetUp   int64  `json:"kernelOffsetUp"`
@@ -553,6 +556,7 @@ func (s *TrafficOverviewService) resumeTrafficOverviewAccounting() error {
 	state.PeriodBaseUp = nonNegativeDiff(currentUp, pauseState.Snapshot.Up)
 	state.PeriodBaseDown = nonNegativeDiff(currentDown, pauseState.Snapshot.Down)
 	state.PeriodTag = computePeriodTag(resetDay, now)
+	state.PeriodResetDay = normalizeResetDay(resetDay)
 	state.LastPeriodReset = maxInt64(state.LastPeriodReset, pauseState.PausedAt)
 	if err = s.saveRuntimeState(state); err != nil {
 		trafficOverviewStateMu.Unlock()
@@ -569,11 +573,17 @@ func (s *TrafficOverviewService) resumeTrafficOverviewAccounting() error {
 func (s *TrafficOverviewService) GetVnstatStatus() VnstatPackageStatus {
 	status := VnstatPackageStatus{
 		Supported: runtime.GOOS == "linux",
+		CanManage: runtime.GOOS == "linux",
 		DataPaths: defaultVnstatDataPaths(),
 	}
 	if runtime.GOOS != "linux" {
 		status.Error = "vnstat is supported on linux only"
+		status.CanManage = false
 		return status
+	}
+	if canManage, manageHint := vnstatManagementSupport(); !canManage {
+		status.CanManage = false
+		status.ManageHint = manageHint
 	}
 
 	if manager := detectVnstatPackageManagerPlan(); manager != nil {
@@ -626,6 +636,9 @@ func (s *TrafficOverviewService) GetVnstatVersionOptions() (*VnstatVersionListRe
 	if manager := detectVnstatPackageManagerPlan(); manager != nil {
 		description = fmt.Sprintf("默认通过 %s 安装 vnstat；失败时自动回退到 GitHub 官方版本", manager.Name)
 	}
+	if canManage, manageHint := vnstatManagementSupport(); !canManage {
+		description = manageHint
+	}
 	return &VnstatVersionListResult{
 		Versions: []VnstatVersionOption{
 			{
@@ -640,6 +653,9 @@ func (s *TrafficOverviewService) GetVnstatVersionOptions() (*VnstatVersionListRe
 func (s *TrafficOverviewService) InstallManagedVnstat(version string) (*TrafficOverview, error) {
 	if runtime.GOOS != "linux" {
 		return nil, errors.New("vnstat is supported on linux only")
+	}
+	if canManage, manageHint := vnstatManagementSupport(); !canManage {
+		return nil, errors.New(manageHint)
 	}
 	version = strings.TrimSpace(version)
 	if version == "" {
@@ -686,6 +702,9 @@ func (s *TrafficOverviewService) InstallManagedVnstat(version string) (*TrafficO
 func (s *TrafficOverviewService) RemoveManagedVnstat() (*TrafficOverview, error) {
 	if runtime.GOOS != "linux" {
 		return nil, errors.New("vnstat is supported on linux only")
+	}
+	if canManage, manageHint := vnstatManagementSupport(); !canManage {
+		return nil, errors.New(manageHint)
 	}
 
 	manifest, hasManifest := s.loadVnstatManifest()
@@ -1273,12 +1292,17 @@ func (s *TrafficOverviewService) ResetAllTrafficOverviewStats() error {
 		trafficOverviewStateMu.Unlock()
 		return deriveErr
 	}
+	if _, normalizeErr := normalizeStateForTotals(&state, iface, currentUp, currentDown); normalizeErr != nil {
+		trafficOverviewStateMu.Unlock()
+		return normalizeErr
+	}
 	state.Interface = iface
 	state.ManualBaseUp = currentUp
 	state.ManualBaseDown = currentDown
 	state.PeriodBaseUp = currentUp
 	state.PeriodBaseDown = currentDown
 	state.PeriodTag = computePeriodTag(resetDay, now)
+	state.PeriodResetDay = normalizeResetDay(resetDay)
 	state.LastFullResetAt = now.Unix()
 	state.LastPeriodReset = now.Unix()
 
@@ -1305,6 +1329,163 @@ func (s *TrafficOverviewService) ResetAllTrafficOverviewStats() error {
 	}
 	if err := s.ReconcileTrafficCap(); err != nil {
 		logger.Warning("reconcile traffic cap after manual reset failed:", err)
+	}
+	return nil
+}
+
+func (s *TrafficOverviewService) ResetPeriodTrafficOverviewStats() error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	if enabled, err := s.isOverviewEnabled(); err != nil {
+		return err
+	} else if !enabled {
+		return nil
+	}
+
+	iface, err := detectDefaultTrafficInterface()
+	if err != nil {
+		return err
+	}
+	if iface == "" {
+		return errors.New("default interface is empty")
+	}
+
+	vnstatUp, vnstatDown, err := loadVnstatTrafficTotals(iface)
+	if err != nil {
+		return err
+	}
+
+	_, resetDay, _, cfgErr := s.getOverviewConfig()
+	if cfgErr != nil {
+		return cfgErr
+	}
+
+	now := time.Now().In(s.getOverviewLocation())
+	trafficOverviewStateMu.Lock()
+	state, stateErr := s.loadRuntimeState()
+	if stateErr != nil {
+		trafficOverviewStateMu.Unlock()
+		return stateErr
+	}
+
+	currentUp, currentDown, source, _, deriveErr := deriveCurrentAlltimeTotals(&state, iface, vnstatUp, vnstatDown)
+	if deriveErr != nil {
+		trafficOverviewStateMu.Unlock()
+		return deriveErr
+	}
+	if _, normalizeErr := normalizeStateForTotals(&state, iface, currentUp, currentDown); normalizeErr != nil {
+		trafficOverviewStateMu.Unlock()
+		return normalizeErr
+	}
+	state.Interface = iface
+	state.PeriodBaseUp = currentUp
+	state.PeriodBaseDown = currentDown
+	state.PeriodTag = computePeriodTag(resetDay, now)
+	state.PeriodResetDay = normalizeResetDay(resetDay)
+	state.LastPeriodReset = now.Unix()
+
+	accumUp := nonNegativeDiff(currentUp, state.ManualBaseUp)
+	accumDown := nonNegativeDiff(currentDown, state.ManualBaseDown)
+
+	err = s.saveRuntimeState(state)
+	trafficOverviewStateMu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	resetSnapshot := trafficOverviewSnapshot{
+		Source:     source,
+		Interface:  iface,
+		Available:  true,
+		Up:         0,
+		Down:       0,
+		Total:      0,
+		AccumUp:    accumUp,
+		AccumDown:  accumDown,
+		AccumTotal: accumUp + accumDown,
+		UpdatedAt:  now.Unix(),
+	}
+	if err := s.stageOverviewSnapshot(resetSnapshot, true); err != nil {
+		return err
+	}
+	if err := s.ReconcileTrafficCap(); err != nil {
+		logger.Warning("reconcile traffic cap after period reset failed:", err)
+	}
+	return nil
+}
+
+func (s *TrafficOverviewService) ResetTotalTrafficOverviewStats() error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	if enabled, err := s.isOverviewEnabled(); err != nil {
+		return err
+	} else if !enabled {
+		return nil
+	}
+
+	iface, err := detectDefaultTrafficInterface()
+	if err != nil {
+		return err
+	}
+	if iface == "" {
+		return errors.New("default interface is empty")
+	}
+
+	vnstatUp, vnstatDown, err := loadVnstatTrafficTotals(iface)
+	if err != nil {
+		return err
+	}
+
+	now := time.Now().In(s.getOverviewLocation())
+	trafficOverviewStateMu.Lock()
+	state, stateErr := s.loadRuntimeState()
+	if stateErr != nil {
+		trafficOverviewStateMu.Unlock()
+		return stateErr
+	}
+
+	currentUp, currentDown, source, _, deriveErr := deriveCurrentAlltimeTotals(&state, iface, vnstatUp, vnstatDown)
+	if deriveErr != nil {
+		trafficOverviewStateMu.Unlock()
+		return deriveErr
+	}
+	if _, normalizeErr := normalizeStateForTotals(&state, iface, currentUp, currentDown); normalizeErr != nil {
+		trafficOverviewStateMu.Unlock()
+		return normalizeErr
+	}
+	state.Interface = iface
+	state.ManualBaseUp = currentUp
+	state.ManualBaseDown = currentDown
+	state.LastFullResetAt = now.Unix()
+
+	periodUp := nonNegativeDiff(currentUp, state.PeriodBaseUp)
+	periodDown := nonNegativeDiff(currentDown, state.PeriodBaseDown)
+
+	err = s.saveRuntimeState(state)
+	trafficOverviewStateMu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	resetSnapshot := trafficOverviewSnapshot{
+		Source:     source,
+		Interface:  iface,
+		Available:  true,
+		Up:         periodUp,
+		Down:       periodDown,
+		Total:      periodUp + periodDown,
+		AccumUp:    0,
+		AccumDown:  0,
+		AccumTotal: 0,
+		UpdatedAt:  now.Unix(),
+	}
+	if err := s.stageOverviewSnapshot(resetSnapshot, true); err != nil {
+		return err
+	}
+	if err := s.ReconcileTrafficCap(); err != nil {
+		logger.Warning("reconcile traffic cap after total reset failed:", err)
 	}
 	return nil
 }
@@ -1419,7 +1600,7 @@ func (s *TrafficOverviewService) reconcileTrafficCapFromOverview(overview *Traff
 	if limitGiB <= 0 {
 		limitReached = false
 	} else if overview != nil && overview.Available && strings.TrimSpace(overview.Error) == "" {
-		limitReached = overview.Total >= limitGiBToBytes(limitGiB)
+		limitReached = overview.AccumTotal >= limitGiBToBytes(limitGiB)
 	}
 
 	desiredActive := limitGiB > 0 && limitReached
@@ -1504,6 +1685,7 @@ func (s *TrafficOverviewService) loadRuntimeState() (trafficOverviewRuntimeState
 	state.ManualBaseDown = maxInt64(state.ManualBaseDown, 0)
 	state.PeriodBaseUp = maxInt64(state.PeriodBaseUp, 0)
 	state.PeriodBaseDown = maxInt64(state.PeriodBaseDown, 0)
+	state.PeriodResetDay = normalizeResetDay(state.PeriodResetDay)
 	state.LastFullResetAt = maxInt64(state.LastFullResetAt, 0)
 	state.LastPeriodReset = maxInt64(state.LastPeriodReset, 0)
 	state.KernelOffsetUp = maxInt64(state.KernelOffsetUp, 0)
@@ -1824,6 +2006,7 @@ func normalizeStateForTotals(state *trafficOverviewRuntimeState, iface string, u
 		state.PeriodBaseUp = up
 		state.PeriodBaseDown = down
 		state.PeriodTag = ""
+		state.PeriodResetDay = 0
 		state.LastPeriodReset = time.Now().Unix()
 		return true, nil
 	}
@@ -1835,15 +2018,25 @@ func applyPeriodResetIfNeeded(state *trafficOverviewRuntimeState, resetDay int, 
 		return false, errors.New("state is nil")
 	}
 
+	resetDay = normalizeResetDay(resetDay)
 	if resetDay <= 0 {
-		changed := state.PeriodTag != "" || state.PeriodBaseUp != state.ManualBaseUp || state.PeriodBaseDown != state.ManualBaseDown
+		changed := state.PeriodTag != "" || state.PeriodResetDay != 0
 		state.PeriodTag = ""
-		state.PeriodBaseUp = state.ManualBaseUp
-		state.PeriodBaseDown = state.ManualBaseDown
+		state.PeriodResetDay = 0
 		return changed, nil
 	}
 
 	expectedTag := computePeriodTag(resetDay, now)
+	if state.PeriodResetDay != resetDay {
+		changed := state.PeriodResetDay != resetDay || state.PeriodTag != expectedTag
+		state.PeriodResetDay = resetDay
+		state.PeriodTag = expectedTag
+		return changed, nil
+	}
+	if strings.TrimSpace(state.PeriodTag) == "" {
+		state.PeriodTag = expectedTag
+		return true, nil
+	}
 	if state.PeriodTag == expectedTag {
 		return false, nil
 	}
@@ -2681,6 +2874,20 @@ func defaultVnstatDataPaths() []string {
 		"/var/log/vnstat",
 		"/var/cache/vnstat",
 	}
+}
+
+func vnstatManagementSupport() (bool, string) {
+	return vnstatManagementSupportForRuntime(runtime.GOOS, runningInsideContainer())
+}
+
+func vnstatManagementSupportForRuntime(goos string, insideContainer bool) (bool, string) {
+	if goos != "linux" {
+		return false, "vnstat is supported on linux only"
+	}
+	if insideContainer {
+		return false, "Docker/容器部署不支持在面板内安装或卸载 vnstat。请在镜像中预装 vnstat，并自行持久化 /var/lib/vnstat 等数据目录。"
+	}
+	return true, ""
 }
 
 func isSafeVnstatDataPath(path string) bool {

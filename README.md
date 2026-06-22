@@ -25,7 +25,7 @@
 | Platform | Architecture   | Status         |
 | -------- | -------------- | -------------- |
 | Linux    | amd64, arm64   | ✅ Supported    |
-| Docker   | amd64, arm64   | ✅ Supported    |
+| Docker (Linux host) | amd64, arm64   | ✅ Supported    |
 
 ## Default Installation Information
 
@@ -106,11 +106,16 @@ sudo -i
 
 ### Step 1: Install Docker
 
-```sh
-curl -fsSL https://get.docker.com | sh
-```
+Install Docker Engine and the Docker Compose plugin from the official Docker
+documentation for your Linux distribution before continuing.
 
 ### Step 2: Run kwor
+
+Docker deployment is intended for Linux hosts. `network_mode: host` and the
+panel's nftables-based features require a Linux Docker engine plus
+`CAP_NET_ADMIN`. Docker Desktop on Windows/macOS can run the panel in limited
+bridge-network mode, but it will not provide the same host-network /
+nftables behavior.
 
 > Docker Compose method
 
@@ -120,15 +125,32 @@ wget -q https://raw.githubusercontent.com/nicelic/kwor/main/docker-compose.yml
 docker compose up -d
 ```
 
-> Plain docker run (host network is recommended; kwor manages its own ports / nftables)
+容器首次启动会自动完成非交互初始化：
+
+- 默认用户名是 `admin`
+- 如果未传 `KWOR_BOOTSTRAP_PASSWORD`，容器会生成一次性随机密码并打印到容器日志
+- 可选环境变量：`KWOR_BOOTSTRAP_USERNAME`、`KWOR_BOOTSTRAP_PASSWORD`、`KWOR_BOOTSTRAP_PANEL_PORT`、`KWOR_BOOTSTRAP_PANEL_PATH`、`KWOR_BOOTSTRAP_SUB_PORT`、`KWOR_BOOTSTRAP_SUB_PATH`
+
+升级时请不要在面板内直接点“安装”。Docker 正确升级方式是拉取新镜像后重建容器，例如：
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+证书管理中的 `acme.sh` 在 Docker 镜像里已包含 `curl`/`wget` 以及 `standalone` 模式常用的监听工具；如果你使用 `standalone` / `alpn` 挑战，仍需确保宿主机对应的 `80` / `443` 端口没有被其他进程占用。
+
+> Plain docker run (Linux host network is recommended; kwor manages its own ports / nftables)
 
 ```sh
 mkdir -p kwor/Promanager_data && cd kwor
 docker run -itd \
+    --cap-add NET_ADMIN \
+    --security-opt no-new-privileges:true \
     --network host \
     -v $PWD/Promanager_data:/app/Promanager_data \
     --name kwor --restart=unless-stopped \
-    ghcr.io/nicelic/kwor:latest
+    ghcr.io/nicelic/kwor:v1.5.16
 ```
 
 ### Build your own image
@@ -137,6 +159,20 @@ docker run -itd \
 git clone https://github.com/nicelic/kwor
 cd kwor
 docker build -t kwor .
+```
+
+Run a locally built image with the same Linux host-network / capability
+requirements:
+
+```sh
+mkdir -p kwor/Promanager_data && cd kwor
+docker run -itd \
+    --cap-add NET_ADMIN \
+    --security-opt no-new-privileges:true \
+    --network host \
+    -v $PWD/Promanager_data:/app/Promanager_data \
+    --name kwor --restart=unless-stopped \
+    kwor
 ```
 
 </details>

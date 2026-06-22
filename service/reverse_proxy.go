@@ -262,6 +262,20 @@ type reverseProxyListenBind struct {
 	optional bool
 }
 
+func normalizeReverseProxyEDNSCustomIPv4(raw string) (string, bool) {
+	parsedIP := net.ParseIP(strings.TrimSpace(raw))
+	if parsedIP == nil {
+		return "", false
+	}
+
+	ip4 := parsedIP.To4()
+	if ip4 == nil {
+		return "", false
+	}
+
+	return net.IPv4(ip4[0], ip4[1], ip4[2], 1).String(), true
+}
+
 type reverseProxyRuntimeState struct {
 	lastSyncAt    time.Time
 	lastRenderKey string
@@ -600,10 +614,7 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 		row.ListenProtocol = normalized.listenProtocol
 		row.ListenProtocolAlias = normalized.listenProtocolAlias
 		row.ListenIP = ""
-		if len(normalized.listenIPs) > 0 {
-			row.ListenIP = normalized.listenIPs[0]
-		}
-		row.ListenIPList = encodeReverseProxyList(normalized.listenIPs)
+		row.ListenIPList = ""
 		row.ListenPort = normalized.listenPort
 		row.HostList = encodeReverseProxyList(normalized.hosts)
 		row.PathPrefix = normalized.pathPrefix
@@ -860,6 +871,7 @@ func buildReverseProxyRuleView(row *model.ReverseProxyRule, certMap map[uint]Rev
 		return view
 	}
 	listenIPs := decodeReverseProxyListenIPs(row)
+	hosts := reverseProxyRuleServerNames(row)
 	certIDs := reverseProxyRuleCertificateIDs(row)
 	view = ReverseProxyRuleView{
 		ID:                        row.Id,
@@ -872,7 +884,7 @@ func buildReverseProxyRuleView(row *model.ReverseProxyRule, certMap map[uint]Rev
 		ListenIP:                  strings.TrimSpace(row.ListenIP),
 		ListenIPs:                 listenIPs,
 		ListenPort:                row.ListenPort,
-		Hosts:                     decodeReverseProxyList(row.HostList),
+		Hosts:                     hosts,
 		PathPrefix:                strings.TrimSpace(row.PathPrefix),
 		ListenDNSPath:             strings.TrimSpace(row.ListenDNSPath),
 		TargetProtocol:            strings.TrimSpace(row.TargetProtocol),
@@ -974,6 +986,14 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 	if listenIPInput == "" {
 		listenIPInput = strings.TrimSpace(payload.ListenIP)
 	}
+	legacyListenNames, err := normalizeReverseProxyLegacyListenNames(listenIPInput)
+	if err != nil {
+		return reverseProxyNormalizedRule{}, err
+	}
+	listenNameInput := strings.TrimSpace(payload.Hosts)
+	if listenNameInput == "" && len(legacyListenNames) > 0 {
+		listenNameInput = strings.Join(legacyListenNames, ", ")
+	}
 	listenProtocolAliasInput := strings.ToLower(strings.TrimSpace(payload.ListenProtocolAlias))
 	targetProtocolAliasInput := strings.ToLower(strings.TrimSpace(payload.TargetProtocolAlias))
 	normalized := reverseProxyNormalizedRule{
@@ -985,16 +1005,13 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		upstreamTLSVerify: payload.UpstreamTLSVerify,
 		apiPassthrough:    payload.ApiPassthrough,
 		remark:            strings.TrimSpace(payload.Remark),
+		listenIPs:         extractReverseProxyLegacyListenIPs(listenIPInput),
 		ednsEnabled:       payload.EDNSEnabled,
 		disableIPv4Answer: payload.DisableIPv4Answer,
 		disableIPv6Answer: payload.DisableIPv6Answer,
 	}
 	if normalized.name == "" {
-		defaultNameHost := listenIPInput
-		if strings.TrimSpace(defaultNameHost) == "" {
-			defaultNameHost = payload.Hosts
-		}
-		normalized.name = buildReverseProxyDefaultName(payload.ListenProtocol, defaultNameHost, payload.ListenPort, payload.PathPrefix)
+		normalized.name = buildReverseProxyDefaultName(payload.ListenProtocol, listenNameInput, payload.ListenPort, payload.PathPrefix)
 	}
 
 	listenProtocolInput := strings.TrimSpace(payload.ListenProtocol)
@@ -1028,13 +1045,7 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		return reverseProxyNormalizedRule{}, common.NewError("target port must be between 1 and 65535")
 	}
 
-	listenIPs, err := normalizeReverseProxyTokens(listenIPInput, reverseProxyTokenModeServerName)
-	if err != nil {
-		return reverseProxyNormalizedRule{}, err
-	}
-	normalized.listenIPs = listenIPs
-
-	hosts, err := normalizeReverseProxyTokens(payload.Hosts, reverseProxyTokenModeHost)
+	hosts, err := normalizeReverseProxyTokens(listenNameInput, reverseProxyTokenModeListenName)
 	if err != nil {
 		return reverseProxyNormalizedRule{}, err
 	}
@@ -1067,9 +1078,6 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		if !reverseProxyProtocolIsDNS(normalized.listenProtocolAlias) || !reverseProxyProtocolIsDNS(normalized.targetProtocolAlias) {
 			return reverseProxyNormalizedRule{}, common.NewError("dns reverse proxy requires both local protocol and target protocol to be dns")
 		}
-		if len(normalized.listenIPs) == 0 {
-			normalized.listenIPs = []string{"0.0.0.0"}
-		}
 		normalized.hosts = []string{}
 		normalized.pathPrefix = ""
 		normalized.targetPath = ""
@@ -1098,11 +1106,11 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 				if rawEDNSCustomIP == "" {
 					return reverseProxyNormalizedRule{}, common.NewError("edns custom ip is required")
 				}
-				parsedIP := net.ParseIP(rawEDNSCustomIP)
-				if parsedIP == nil {
-					return reverseProxyNormalizedRule{}, common.NewError("invalid edns custom ip")
+				normalizedIP, ok := normalizeReverseProxyEDNSCustomIPv4(rawEDNSCustomIP)
+				if !ok {
+					return reverseProxyNormalizedRule{}, common.NewError("invalid edns custom ip: only ipv4 is supported")
 				}
-				normalized.ednsCustomIP = parsedIP.String()
+				normalized.ednsCustomIP = normalizedIP
 			} else {
 				normalized.ednsCustomIP = ""
 			}
@@ -1218,7 +1226,20 @@ func (s *ReverseProxyService) validateNormalizedRule(db *gorm.DB, row reversePro
 		return err
 	}
 	for _, existing := range rows {
-		if existing.ListenProtocol != row.listenProtocol || existing.ListenPort != row.listenPort {
+		if existing.ListenPort != row.listenPort {
+			continue
+		}
+		existingListenAlias := normalizeReverseProxyProtocolAlias(existing.ListenProtocolAlias, existing.ListenProtocol)
+		if reverseProxyProtocolIsDNS(existingListenAlias) {
+			if reverseProxyProtocolsShareUnderlyingSocket(existing.ListenProtocol, existing.ListenHTTPVersionStrategy, row.listenProtocol, row.listenHTTPVersionStrategy, existingListenAlias, row.listenProtocolAlias) {
+				return common.NewError("reverse proxy listener conflicts with existing dns listener on the same port")
+			}
+			continue
+		}
+		if existing.ListenProtocol != row.listenProtocol {
+			if reverseProxyProtocolsShareUnderlyingSocket(existing.ListenProtocol, existing.ListenHTTPVersionStrategy, row.listenProtocol, row.listenHTTPVersionStrategy, existingListenAlias, row.listenProtocolAlias) {
+				return common.NewError("reverse proxy listener conflicts with existing reverse proxy listener on the same port")
+			}
 			continue
 		}
 		if row.listenProtocol == reverseProxyProtocolHTTPS {
@@ -1695,28 +1716,17 @@ func reverseProxyDNSProtocolSharesSocket(a string, b string) bool {
 		(reverseProxyDNSProtocolUsesUDP(a) && reverseProxyDNSProtocolUsesUDP(b))
 }
 
-func reverseProxyProtocolsShareUnderlyingSocket(existingProtocol string, existingListenStrategy string, newProtocol string, newListenStrategy string, existingAlias string, newAlias string) bool {
-	if reverseProxyProtocolIsDNS(existingAlias) || reverseProxyProtocolIsDNS(newAlias) {
-		existingTCP := false
-		existingUDP := false
-		newTCP := false
-		newUDP := false
-
-		if reverseProxyProtocolIsDNS(existingAlias) {
-			existingTCP = reverseProxyDNSProtocolUsesTCP(existingAlias)
-			existingUDP = reverseProxyDNSProtocolUsesUDP(existingAlias)
-		} else {
-			existingTCP, existingUDP = reverseProxyHTTPListenerUsesSockets(existingProtocol, existingListenStrategy)
-		}
-		if reverseProxyProtocolIsDNS(newAlias) {
-			newTCP = reverseProxyDNSProtocolUsesTCP(newAlias)
-			newUDP = reverseProxyDNSProtocolUsesUDP(newAlias)
-		} else {
-			newTCP, newUDP = reverseProxyHTTPListenerUsesSockets(newProtocol, newListenStrategy)
-		}
-		return (existingTCP && newTCP) || (existingUDP && newUDP)
+func reverseProxyListenerUsesUnderlyingSockets(protocol string, listenStrategy string, alias string) (bool, bool) {
+	if reverseProxyProtocolIsDNS(alias) {
+		return reverseProxyDNSProtocolUsesTCP(alias), reverseProxyDNSProtocolUsesUDP(alias)
 	}
-	return false
+	return reverseProxyHTTPListenerUsesSockets(protocol, listenStrategy)
+}
+
+func reverseProxyProtocolsShareUnderlyingSocket(existingProtocol string, existingListenStrategy string, newProtocol string, newListenStrategy string, existingAlias string, newAlias string) bool {
+	existingTCP, existingUDP := reverseProxyListenerUsesUnderlyingSockets(existingProtocol, existingListenStrategy, existingAlias)
+	newTCP, newUDP := reverseProxyListenerUsesUnderlyingSockets(newProtocol, newListenStrategy, newAlias)
+	return (existingTCP && newTCP) || (existingUDP && newUDP)
 }
 
 func reverseProxyHTTPListenerUsesSockets(protocol string, listenStrategy string) (bool, bool) {
@@ -1739,14 +1749,13 @@ func reverseProxyHTTPListenerUsesSockets(protocol string, listenStrategy string)
 
 const (
 	reverseProxyTokenModeServerName = iota + 1
+	reverseProxyTokenModeListenName
 	reverseProxyTokenModeHost
 	reverseProxyTokenModeTarget
 )
 
 func normalizeReverseProxyTokens(raw string, mode int) ([]string, error) {
-	fields := strings.FieldsFunc(raw, func(r rune) bool {
-		return r == ',' || r == ' ' || r == '\n' || r == '\r' || r == '\t'
-	})
+	fields := splitReverseProxyTokenFields(raw)
 	seen := make(map[string]struct{}, len(fields))
 	result := make([]string, 0, len(fields))
 	for _, field := range fields {
@@ -1770,16 +1779,28 @@ func normalizeReverseProxyTokens(raw string, mode int) ([]string, error) {
 				if !reverseProxyIsStandardWildcardHost(lower) {
 					return nil, common.NewError("sni wildcard must follow *.example.com format")
 				}
-			} else if !reverseProxyHostTokenRe.MatchString(lower) || !reverseProxyLooksLikeHost(lower) {
+			} else if reverseProxyParseIPLiteral(lower) == nil && (!reverseProxyHostTokenRe.MatchString(lower) || !reverseProxyLooksLikeHost(lower)) {
 				return nil, common.NewError("sni names must be domain or ip")
+			}
+		case reverseProxyTokenModeListenName:
+			if strings.Contains(lower, "*") {
+				if !reverseProxyIsStandardWildcardHost(lower) {
+					return nil, common.NewError("listen wildcard must follow *.example.com format")
+				}
+			} else if reverseProxyParseIPLiteral(lower) != nil {
+				return nil, common.NewError("listen names must be domain")
+			} else if !reverseProxyHostTokenRe.MatchString(lower) || !reverseProxyLooksLikeHost(lower) {
+				return nil, common.NewError("listen names must be domain")
 			}
 		case reverseProxyTokenModeHost:
 			if strings.Contains(lower, "*") {
 				if !reverseProxyIsStandardWildcardHost(lower) {
 					return nil, common.NewError("hosts wildcard must follow *.example.com format")
 				}
+			} else if reverseProxyParseIPLiteral(lower) != nil {
+				return nil, common.NewError("hosts must be domain")
 			} else if !reverseProxyHostTokenRe.MatchString(lower) || !reverseProxyLooksLikeHost(lower) {
-				return nil, common.NewError("hosts must be domain or ip")
+				return nil, common.NewError("hosts must be domain")
 			}
 		case reverseProxyTokenModeTarget:
 			if strings.Contains(lower, "*") {
@@ -1798,6 +1819,87 @@ func normalizeReverseProxyTokens(raw string, mode int) ([]string, error) {
 		result = append(result, lower)
 	}
 	return result, nil
+}
+
+func splitReverseProxyTokenFields(raw string) []string {
+	return strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\n' || r == '\r' || r == '\t'
+	})
+}
+
+func collectReverseProxyLegacyListenNames(values []string, strict bool) ([]string, error) {
+	result := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, raw := range values {
+		for _, field := range splitReverseProxyTokenFields(raw) {
+			token := strings.TrimSpace(field)
+			if reverseProxyTokenHasExplicitPort(token) {
+				if strict {
+					return nil, common.NewError("listen names must not include port; use the listen port field")
+				}
+				continue
+			}
+			token = strings.Trim(token, "[]")
+			if token == "" {
+				continue
+			}
+			lower := strings.ToLower(token)
+			if reverseProxyParseIPLiteral(lower) != nil {
+				continue
+			}
+			if strings.Contains(lower, "*") {
+				if !reverseProxyIsStandardWildcardHost(lower) {
+					if strict {
+						return nil, common.NewError("listen wildcard must follow *.example.com format")
+					}
+					continue
+				}
+			} else if !reverseProxyHostTokenRe.MatchString(lower) || !reverseProxyLooksLikeHost(lower) {
+				if strict {
+					return nil, common.NewError("listen names must be domain")
+				}
+				continue
+			}
+			if _, exists := seen[lower]; exists {
+				continue
+			}
+			seen[lower] = struct{}{}
+			result = append(result, lower)
+		}
+	}
+	return result, nil
+}
+
+func normalizeReverseProxyLegacyListenNames(raw string) ([]string, error) {
+	return collectReverseProxyLegacyListenNames([]string{raw}, true)
+}
+
+func collectReverseProxyLegacyListenIPs(values []string) []string {
+	result := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, raw := range values {
+		for _, field := range splitReverseProxyTokenFields(raw) {
+			token := strings.TrimSpace(strings.Trim(field, "[]"))
+			if token == "" {
+				continue
+			}
+			parsedIP := reverseProxyParseIPLiteral(token)
+			if parsedIP == nil {
+				continue
+			}
+			canonical := strings.ToLower(parsedIP.String())
+			if _, exists := seen[canonical]; exists {
+				continue
+			}
+			seen[canonical] = struct{}{}
+			result = append(result, canonical)
+		}
+	}
+	return result
+}
+
+func extractReverseProxyLegacyListenIPs(raw string) []string {
+	return collectReverseProxyLegacyListenIPs([]string{raw})
 }
 
 func reverseProxyTokenHasExplicitPort(value string) bool {
@@ -1848,8 +1950,7 @@ func reverseProxyIsStandardWildcardHost(value string) bool {
 }
 
 func reverseProxyNormalizedServerNames(row reverseProxyNormalizedRule) []string {
-	values := make([]string, 0, len(row.listenIPs)+len(row.hosts))
-	values = append(values, row.listenIPs...)
+	values := make([]string, 0, len(row.hosts))
 	values = append(values, row.hosts...)
 	return reverseProxyCleanServerNames(values)
 }
@@ -1859,7 +1960,7 @@ func reverseProxyRuleServerNames(row *model.ReverseProxyRule) []string {
 		return []string{}
 	}
 	values := make([]string, 0)
-	values = append(values, decodeReverseProxyListenIPs(row)...)
+	values = append(values, decodeReverseProxyLegacyListenNames(row)...)
 	values = append(values, decodeReverseProxyList(row.HostList)...)
 	return reverseProxyCleanServerNames(values)
 }
@@ -1903,7 +2004,7 @@ func reverseProxyRuleNamesOverlap(a []string, b []string) bool {
 }
 
 func reverseProxyRuleNameSetsAreSNIDisjoint(a []string, b []string) bool {
-	return (len(a) == 0 && len(b) > 0) || (len(a) > 0 && len(b) == 0)
+	return false
 }
 
 func reverseProxyRulePathsOverlap(a string, b string) bool {
@@ -1961,18 +2062,25 @@ func decodeReverseProxyListenIPs(row *model.ReverseProxyRule) []string {
 	if row == nil {
 		return []string{}
 	}
-	values := decodeReverseProxyList(row.ListenIPList)
-	if len(values) > 0 {
-		return values
+	values := make([]string, 0)
+	values = append(values, decodeReverseProxyList(row.ListenIPList)...)
+	if strings.TrimSpace(row.ListenIP) != "" {
+		values = append(values, row.ListenIP)
 	}
-	legacy := strings.TrimSpace(strings.Trim(row.ListenIP, "[]"))
-	if legacy == "" {
+	return collectReverseProxyLegacyListenIPs(values)
+}
+
+func decodeReverseProxyLegacyListenNames(row *model.ReverseProxyRule) []string {
+	if row == nil {
 		return []string{}
 	}
-	if net.ParseIP(legacy) == nil {
-		return []string{}
+	values := make([]string, 0)
+	values = append(values, decodeReverseProxyList(row.ListenIPList)...)
+	if strings.TrimSpace(row.ListenIP) != "" {
+		values = append(values, row.ListenIP)
 	}
-	return []string{strings.ToLower(legacy)}
+	names, _ := collectReverseProxyLegacyListenNames(values, false)
+	return names
 }
 
 func encodeReverseProxyUintList(values []uint) string {
@@ -2062,11 +2170,15 @@ func reverseProxyRuleCertificateIDs(row *model.ReverseProxyRule) []uint {
 
 func buildReverseProxyCertificateHints(listenIPs []string, hosts []string, certs []ReverseProxyCertificateOption) []string {
 	hints := make([]string, 0)
-	if len(certs) == 0 || (len(listenIPs) == 0 && len(hosts) == 0) {
+	if len(certs) == 0 || len(hosts) == 0 {
 		return hints
 	}
+	hasIPSANCert := false
 	certDomains := make([]string, 0, len(certs)*3)
 	for _, cert := range certs {
+		if reverseProxyCertificateOptionHasIPSAN(cert) {
+			hasIPSANCert = true
+		}
 		mainDomain := strings.ToLower(strings.TrimSpace(cert.MainDomain))
 		if mainDomain != "" {
 			certDomains = append(certDomains, mainDomain)
@@ -2081,31 +2193,29 @@ func buildReverseProxyCertificateHints(listenIPs []string, hosts []string, certs
 	}
 	if len(certDomains) == 0 {
 		for _, host := range hosts {
+			if reverseProxyParseIPLiteral(host) != nil {
+				hints = append(hints, "证书未覆盖 IP: "+host)
+				continue
+			}
+			if hasIPSANCert {
+				continue
+			}
 			hints = append(hints, "证书未覆盖域名: "+host)
-		}
-		for _, ip := range listenIPs {
-			hints = append(hints, "证书未覆盖 IP: "+ip)
 		}
 		return hints
 	}
-	hasIPSANCert := false
-	for _, cert := range certs {
-		if reverseProxyCertificateOptionHasIPSAN(cert) {
-			hasIPSANCert = true
-			break
-		}
-	}
 	for _, host := range hosts {
+		if reverseProxyParseIPLiteral(host) != nil {
+			if !reverseProxyCertificateDomainsCoverIP(certDomains, host) {
+				hints = append(hints, "证书未覆盖 IP: "+host)
+			}
+			continue
+		}
 		if hasIPSANCert {
 			continue
 		}
 		if !reverseProxyCertificateDomainsCoverHost(certDomains, host) {
 			hints = append(hints, "证书未覆盖域名: "+host)
-		}
-	}
-	for _, ip := range listenIPs {
-		if !reverseProxyCertificateDomainsCoverIP(certDomains, ip) {
-			hints = append(hints, "证书未覆盖 IP: "+ip)
 		}
 	}
 	return hints
@@ -2468,7 +2578,7 @@ func computeReverseProxyRenderKey(db *gorm.DB, rows []model.ReverseProxyRule) st
 			ListenProtocol:         listenProtocol,
 			ListenIPs:              decodeReverseProxyListenIPs(&row),
 			ListenPort:             row.ListenPort,
-			Hosts:                  decodeReverseProxyList(row.HostList),
+			Hosts:                  reverseProxyRuleServerNames(&row),
 			PathPrefix:             normalizeReverseProxyPath(row.PathPrefix, false),
 			ListenDNSPath:          normalizeReverseProxyDNSPath(row.ListenDNSPath),
 			TargetProtocol:         targetProtocol,
@@ -3044,8 +3154,23 @@ func (g *reverseProxyListenerGroup) getCertificate(hello *tls.ClientHelloInfo) (
 			g.bindCertificateSelectionToConnection(connAddrKey, selection)
 			return selected.Certificate, nil
 		}
+		if selected := reverseProxyFallbackCertificateBinding(g.orderedCertBindings); selected != nil && selected.Certificate != nil {
+			return selected.Certificate, nil
+		}
 		reverseProxyCloseClientHelloConn(hello)
-		return nil, common.NewError("tls sni is required")
+		return nil, common.NewError("tls listener certificate is unavailable")
+	}
+	if reverseProxyParseIPLiteral(serverName) != nil {
+		candidates := g.noSNICertificateCandidatesLocked()
+		if selected, selection, err := g.selectBalancedCertificate(candidates, reverseProxyCertBalanceNoSNIBucket); err == nil && selected != nil {
+			g.bindCertificateSelectionToConnection(connAddrKey, selection)
+			return selected.Certificate, nil
+		}
+		if selected := reverseProxyFallbackCertificateBinding(g.orderedCertBindings); selected != nil && selected.Certificate != nil {
+			return selected.Certificate, nil
+		}
+		reverseProxyCloseClientHelloConn(hello)
+		return nil, common.NewError("tls listener certificate is unavailable")
 	}
 	matchedRule := false
 	candidates := make([]*reverseProxyRuleCertificateBinding, 0)
@@ -3065,8 +3190,11 @@ func (g *reverseProxyListenerGroup) getCertificate(hello *tls.ClientHelloInfo) (
 		return selected.Certificate, nil
 	}
 	if matchedRule {
+		if selected := reverseProxyFallbackCertificateBinding(g.orderedCertBindings); selected != nil && selected.Certificate != nil {
+			return selected.Certificate, nil
+		}
 		reverseProxyCloseClientHelloConn(hello)
-		return nil, common.NewError("no certificate available for requested sni")
+		return nil, common.NewError("tls listener certificate is unavailable")
 	}
 	reverseProxyCloseClientHelloConn(hello)
 	return nil, common.NewError("unrecognized tls sni")
@@ -3079,10 +3207,6 @@ func (g *reverseProxyListenerGroup) noSNICertificateCandidatesLocked() []*revers
 	candidates := make([]*reverseProxyRuleCertificateBinding, 0)
 	for _, rule := range g.rules {
 		bindings := g.certBindingsByRule[rule.Id]
-		if len(reverseProxyRuleServerNames(rule)) == 0 {
-			candidates = append(candidates, bindings...)
-			continue
-		}
 		for _, binding := range bindings {
 			if reverseProxyCertificateBindingHasIPSAN(binding) {
 				candidates = append(candidates, binding)
@@ -3196,27 +3320,25 @@ func reverseProxyRuleRequestNameMatchDetail(rule *model.ReverseProxyRule, host s
 	}
 	candidates := reverseProxyRuleServerNames(rule)
 	if len(candidates) == 0 {
-		if requireSNI {
-			sni = reverseProxyNormalizeServerName(sni)
-			return sni == "", sni == ""
-		}
 		return true, true
 	}
 	host = reverseProxyNormalizeServerName(host)
 	sni = reverseProxyNormalizeServerName(sni)
-	hostMatch := reverseProxyRequestNameMatchesAny(candidates, host)
-	sniMatch := reverseProxyRequestNameMatchesAny(candidates, sni)
+	hostIsIP := reverseProxyParseIPLiteral(host) != nil
+	sniIsIP := reverseProxyParseIPLiteral(sni) != nil
+	hostMatch := host == "" || hostIsIP || reverseProxyRequestNameMatchesAny(candidates, host)
+	sniMatch := sni == "" || sniIsIP || reverseProxyRequestNameMatchesAny(candidates, sni)
 	partial := hostMatch || sniMatch
 	if requireSNI {
-		if !sniMatch {
+		if sni != "" && !sniIsIP && !sniMatch {
 			return false, partial
 		}
-		if host != "" && !hostMatch {
+		if host != "" && !hostIsIP && !hostMatch {
 			return false, true
 		}
 		return true, true
 	}
-	if !hostMatch {
+	if host != "" && !hostIsIP && !hostMatch {
 		return false, false
 	}
 	return true, true
@@ -3246,6 +3368,9 @@ func reverseProxyRuleServerNameMatch(rule *model.ReverseProxyRule, serverName st
 		return false
 	}
 	candidates := reverseProxyRuleServerNames(rule)
+	if len(candidates) == 0 {
+		return true
+	}
 	for _, candidate := range candidates {
 		if reverseProxyHostPatternMatches(candidate, serverName) {
 			return true

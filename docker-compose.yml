@@ -1,18 +1,27 @@
 ---
 services:
   kwor:
-    image: ghcr.io/nicelic/kwor:latest
+    image: ghcr.io/nicelic/kwor:v1.5.16
     container_name: kwor
     hostname: "kwor"
+    cap_add:
+      - NET_ADMIN
     volumes:
       - "./Promanager_data:/app/Promanager_data"
+    security_opt:
+      - no-new-privileges:true
     tty: true
     restart: unless-stopped
     network_mode: host
-    # network_mode: host lets kwor use the panel/sub ports and any inbound
-    # ports you configure without re-declaring them here. If you prefer bridge
-    # networking, comment out network_mode above and use the ports block below
-    # (remember to also expose every inbound port you create in the panel).
+    # Linux Docker host only:
+    # - network_mode: host lets kwor use the panel/sub ports and any inbound
+    #   ports you configure without re-declaring them here.
+    # - cap_add: NET_ADMIN is required for nftables-based firewall / traffic /
+    #   port-forward features inside the shared host network namespace.
+    # If you prefer bridge networking, comment out network_mode above and use
+    # the ports block below (remember to also expose every inbound port you
+    # create in the panel, and nftables rules will stay inside the container
+    # network namespace rather than the host).
     #
     # networks:
     #   - kwor

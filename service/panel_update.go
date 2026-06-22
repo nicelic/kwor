@@ -44,6 +44,8 @@ type PanelUpdateStatus struct {
 	RunningBinaryPath string `json:"runningBinaryPath"`
 	InstallSource     string `json:"installSource"`
 	Platform          string `json:"platform"`
+	CanInstall        bool   `json:"canInstall"`
+	InstallHint       string `json:"installHint,omitempty"`
 }
 
 type PanelVersionListResponse struct {
@@ -79,6 +81,7 @@ var panelUpdateMu sync.Mutex
 func (s *PanelUpdateService) GetStatus() (*PanelUpdateStatus, error) {
 	binaryPath, runningPath, servicePath, serviceBinPath, source := resolvePanelUpdateBinaryPath()
 	installDir := filepath.Dir(binaryPath)
+	canInstall, installHint := panelUpdateInstallSupport()
 
 	return &PanelUpdateStatus{
 		LocalVersion:      config.GetVersion(),
@@ -90,6 +93,8 @@ func (s *PanelUpdateService) GetStatus() (*PanelUpdateStatus, error) {
 		RunningBinaryPath: runningPath,
 		InstallSource:     source,
 		Platform:          fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
+		CanInstall:        canInstall,
+		InstallHint:       installHint,
 	}, nil
 }
 
@@ -166,15 +171,13 @@ func (s *PanelUpdateService) Install(version string) (*PanelInstallResult, error
 	panelUpdateMu.Lock()
 	defer panelUpdateMu.Unlock()
 
+	if supported, reason := panelUpdateInstallSupport(); !supported {
+		return nil, fmt.Errorf("%s", reason)
+	}
+
 	version = normalizePanelVersionTag(version)
 	if version == "" {
 		return nil, fmt.Errorf("version is required")
-	}
-	if runtime.GOOS != "linux" {
-		return nil, fmt.Errorf("panel update is only supported on Linux")
-	}
-	if os.Geteuid() != 0 {
-		return nil, fmt.Errorf("panel update requires root privileges")
 	}
 
 	status, err := s.GetStatus()
@@ -260,6 +263,19 @@ func normalizePanelVersionWindow(offset int, limit int) (int, int) {
 		limit = panelUpdateVersionMaxLimit
 	}
 	return offset, limit
+}
+
+func panelUpdateInstallSupport() (bool, string) {
+	if runtime.GOOS != "linux" {
+		return false, "面板内升级仅支持 Linux 宿主机部署"
+	}
+	if runningInsideContainer() {
+		return false, "Docker/容器部署不支持面板内直接升级，请改为拉取新镜像并重建容器"
+	}
+	if os.Geteuid() != 0 {
+		return false, "面板内升级需要 root 权限"
+	}
+	return true, ""
 }
 
 func normalizePanelVersionTag(raw string) string {

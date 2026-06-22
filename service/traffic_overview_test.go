@@ -61,6 +61,7 @@ func TestApplyPeriodResetIfNeeded_ResetsOnlyWhenBoundaryChanges(t *testing.T) {
 		PeriodTag:      computePeriodTag(resetDay, before),
 		PeriodBaseUp:   100,
 		PeriodBaseDown: 200,
+		PeriodResetDay: resetDay,
 	}
 
 	changed, err := applyPeriodResetIfNeeded(&state, resetDay, 500, 700, before)
@@ -83,6 +84,87 @@ func TestApplyPeriodResetIfNeeded_ResetsOnlyWhenBoundaryChanges(t *testing.T) {
 	}
 	if state.PeriodBaseUp != 800 || state.PeriodBaseDown != 900 {
 		t.Fatalf("period bases were not updated on boundary")
+	}
+}
+
+func TestApplyPeriodResetIfNeeded_EnablingResetDayKeepsCurrentUsage(t *testing.T) {
+	loc := time.FixedZone("UTC+8", 8*60*60)
+	now := time.Date(2026, time.June, 22, 12, 0, 0, 0, loc)
+
+	state := trafficOverviewRuntimeState{
+		PeriodBaseUp:   100,
+		PeriodBaseDown: 200,
+	}
+
+	changed, err := applyPeriodResetIfNeeded(&state, 17, 500, 700, now)
+	if err != nil {
+		t.Fatalf("unexpected error when enabling reset day: %v", err)
+	}
+	if !changed {
+		t.Fatalf("expected state alignment when enabling reset day")
+	}
+	if state.PeriodBaseUp != 100 || state.PeriodBaseDown != 200 {
+		t.Fatalf("period bases should stay unchanged when enabling reset day")
+	}
+	if state.PeriodResetDay != 17 {
+		t.Fatalf("period reset day = %d, want 17", state.PeriodResetDay)
+	}
+	if state.PeriodTag != computePeriodTag(17, now) {
+		t.Fatalf("unexpected period tag after enabling reset day: %q", state.PeriodTag)
+	}
+}
+
+func TestApplyPeriodResetIfNeeded_ChangingResetDayKeepsCurrentUsage(t *testing.T) {
+	loc := time.FixedZone("UTC+8", 8*60*60)
+	now := time.Date(2026, time.June, 22, 12, 0, 0, 0, loc)
+
+	state := trafficOverviewRuntimeState{
+		PeriodBaseUp:   100,
+		PeriodBaseDown: 200,
+		PeriodTag:      computePeriodTag(17, now),
+		PeriodResetDay: 17,
+	}
+
+	changed, err := applyPeriodResetIfNeeded(&state, 25, 500, 700, now)
+	if err != nil {
+		t.Fatalf("unexpected error when changing reset day: %v", err)
+	}
+	if !changed {
+		t.Fatalf("expected state alignment when changing reset day")
+	}
+	if state.PeriodBaseUp != 100 || state.PeriodBaseDown != 200 {
+		t.Fatalf("period bases should stay unchanged when changing reset day")
+	}
+	if state.PeriodResetDay != 25 {
+		t.Fatalf("period reset day = %d, want 25", state.PeriodResetDay)
+	}
+	if state.PeriodTag != computePeriodTag(25, now) {
+		t.Fatalf("unexpected period tag after changing reset day: %q", state.PeriodTag)
+	}
+}
+
+func TestVnstatManagementSupportForRuntimeBlocksDocker(t *testing.T) {
+	canManage, hint := vnstatManagementSupportForRuntime("linux", true)
+	if canManage {
+		t.Fatal("expected docker runtime to disable vnstat management")
+	}
+	if hint == "" {
+		t.Fatal("expected docker runtime hint")
+	}
+
+	canManage, hint = vnstatManagementSupportForRuntime("linux", false)
+	if !canManage {
+		t.Fatalf("expected host runtime to allow vnstat management, got hint=%q", hint)
+	}
+}
+
+func TestVnstatManagementSupportForRuntimeRejectsNonLinux(t *testing.T) {
+	canManage, hint := vnstatManagementSupportForRuntime("windows", false)
+	if canManage {
+		t.Fatal("expected non-linux runtime to disable vnstat management")
+	}
+	if hint == "" {
+		t.Fatal("expected non-linux runtime hint")
 	}
 }
 

@@ -21,21 +21,13 @@
                 :variant="overview.vnstat.installed ? 'outlined' : 'tonal'"
                 :prepend-icon="overview.vnstat.installed ? 'mdi-delete-outline' : 'mdi-download'"
                 :loading="installingVnstat || removingVnstat"
-                :disabled="loading || togglingTraffic || installingVnstat || removingVnstat || !overview.vnstat.supported"
+                :disabled="loading || togglingTraffic || installingVnstat || removingVnstat || !overview.vnstat.supported || !overview.vnstat.canManage"
                 @click="handleVnstatInstallButton">
                 {{ overview.vnstat.installed ? '删除' : '下载' }}
               </v-btn>
               <v-chip size="small" :color="statusColor">
                 {{ statusLabel }}
               </v-chip>
-              <v-btn
-                icon="mdi-refresh"
-                density="comfortable"
-                variant="text"
-                :title="resetAllTooltipText"
-                :loading="resettingAll"
-                :disabled="loading || resettingAll"
-                @click="confirmResetAllTraffic" />
             </div>
           </v-card-title>
           <v-divider />
@@ -55,6 +47,14 @@
               <span class="mx-2">|</span>
               更新时间: {{ updatedAtLabel }}
             </div>
+            <v-alert
+              v-if="overview.vnstat.supported && !overview.vnstat.canManage && overview.vnstat.manageHint"
+              type="info"
+              variant="tonal"
+              density="comfortable"
+              class="mb-4">
+              {{ overview.vnstat.manageHint }}
+            </v-alert>
             <v-row>
               <v-col cols="12" sm="4">
                 <v-card variant="outlined" class="metric-card">
@@ -159,6 +159,24 @@
             <div class="mt-1 text-caption text-medium-emphasis">
               {{ nextResetLabel }}: {{ nextResetAtLabel }}
             </div>
+            <div class="traffic-settings__actions mt-4">
+              <v-btn
+                color="warning"
+                variant="tonal"
+                :loading="resettingPeriod"
+                :disabled="loading || savingSettings || togglingTraffic || installingVnstat || removingVnstat || resettingPeriod || resettingTotal"
+                @click="confirmResetPeriodTraffic">
+                重置流量
+              </v-btn>
+              <v-btn
+                color="error"
+                variant="outlined"
+                :loading="resettingTotal"
+                :disabled="loading || savingSettings || togglingTraffic || installingVnstat || removingVnstat || resettingPeriod || resettingTotal"
+                @click="confirmResetTotalTraffic">
+                重置总流量
+              </v-btn>
+            </div>
           </v-card-text>
         </v-card>
       </v-col>
@@ -193,6 +211,7 @@ type TrafficOverview = {
 
 type VnstatStatus = {
   supported: boolean
+  canManage: boolean
   installed: boolean
   managed: boolean
   running: boolean
@@ -203,6 +222,7 @@ type VnstatStatus = {
   binaryPath: string
   fileCount: number
   dataPaths: string[]
+  manageHint: string
   error?: string
 }
 
@@ -219,8 +239,8 @@ const resetDayLabel = '\u6d41\u91cf\u91cd\u7f6e\u65e5\u671f'
 const disabledLabel = '\u672a\u542f\u7528'
 const daySuffix = '\u53f7'
 const monthlyHint = '\u6bcf\u6708\u6309\u8be5\u65e5\u671f\u91cd\u7f6e\uff1b\u82e5\u5f53\u6708\u5929\u6570\u4e0d\u8db3\u5219\u81ea\u52a8\u5728\u6708\u5e95\u91cd\u7f6e\u3002'
-const resetAllConfirmText = '\u662f\u5426\u91cd\u7f6e\u5168\u90e8\u7edf\u8ba1\u6d41\u91cf\uff1f'
-const resetAllTooltipText = '\u91cd\u7f6e\u5e76\u91cd\u5efa\u6d41\u91cf\u7edf\u8ba1'
+const resetPeriodConfirmText = '\u662f\u5426\u91cd\u7f6e\u5de6\u4fa7\u6d41\u91cf\u7edf\u8ba1\uff1f'
+const resetTotalConfirmText = '\u662f\u5426\u91cd\u7f6e\u603b\u4f7f\u7528\u6d41\u91cf\uff1f'
 const nextResetLabel = '\u4e0b\u4e00\u6b21\u91cd\u7f6e\u65f6\u95f4'
 const removeVnstatConfirmText = '确认删除 vnstat 吗？将停止运行的 vnstat，卸载软件包，并删除已跟踪的 vnstat 流量数据。'
 const removeExternalVnstatConfirmText = '检测到系统已有 vnstat。确认删除会停止并卸载 vnstat，同时清理 vnstat 流量数据，是否继续？'
@@ -228,7 +248,8 @@ const disableTrafficConfirmText = '确认关闭流量统计吗？关闭期间产
 
 const loading = ref(false)
 const savingSettings = ref(false)
-const resettingAll = ref(false)
+const resettingPeriod = ref(false)
+const resettingTotal = ref(false)
 const togglingTraffic = ref(false)
 const installingVnstat = ref(false)
 const removingVnstat = ref(false)
@@ -250,6 +271,7 @@ const overview = ref<TrafficOverview>({
   updatedAt: 0,
   vnstat: {
     supported: false,
+    canManage: false,
     installed: false,
     managed: false,
     running: false,
@@ -260,6 +282,7 @@ const overview = ref<TrafficOverview>({
     binaryPath: '',
     fileCount: 0,
     dataPaths: [],
+    manageHint: '',
   },
 })
 
@@ -339,6 +362,7 @@ const normalizeVnstatStatus = (raw: unknown): VnstatStatus => {
   const input = (raw ?? {}) as TrafficOverviewRaw
   return {
     supported: readBoolField(input, ['supported'], false),
+    canManage: readBoolField(input, ['canManage', 'can_manage'], false),
     installed: readBoolField(input, ['installed'], false),
     managed: readBoolField(input, ['managed'], false),
     running: readBoolField(input, ['running'], false),
@@ -349,6 +373,7 @@ const normalizeVnstatStatus = (raw: unknown): VnstatStatus => {
     binaryPath: readStringField(input, ['binaryPath', 'binary_path'], ''),
     fileCount: readNumberField(input, ['fileCount', 'file_count'], 0),
     dataPaths: readStringArrayField(input, ['dataPaths', 'data_paths'], []),
+    manageHint: readStringField(input, ['manageHint', 'manage_hint'], ''),
     error: readStringField(input, ['error'], ''),
   }
 }
@@ -360,17 +385,18 @@ const hasPendingSettingsChanges = computed(() => (
   normalizeLimitGiB(limitGiBInput.value) !== savedLimitGiB.value ||
   normalizeResetDay(resetDayInput.value) !== savedResetDay.value
 ))
+const usageBytes = computed(() => overview.value.accumTotal)
 const usagePercent = computed(() => (
-  limitBytes.value > 0 ? Math.min(100, Math.round(overview.value.total * 100 / limitBytes.value)) : 0
+  limitBytes.value > 0 ? Math.min(100, Math.round(usageBytes.value * 100 / limitBytes.value)) : 0
 ))
 const usageColor = computed(() => (
   usagePercent.value >= 100 ? 'error' : usagePercent.value >= 90 ? 'warning' : 'success'
 ))
 const usageText = computed(() => {
   if (limitBytes.value <= 0) {
-    return `${periodTotalText.value} / -`
+    return `${formatGB(usageBytes.value)} / -`
   }
-  return `${periodTotalText.value} / ${formatGB(limitBytes.value)} (${usagePercent.value}%)`
+  return `${formatGB(usageBytes.value)} / ${formatGB(limitBytes.value)} (${usagePercent.value}%)`
 })
 
 const periodUpText = computed(() => formatGB(overview.value.up))
@@ -685,19 +711,35 @@ const saveTrafficSettings = async () => {
   }
 }
 
-const confirmResetAllTraffic = async () => {
-  const confirmed = window.confirm(resetAllConfirmText)
+const confirmResetPeriodTraffic = async () => {
+  const confirmed = window.confirm(resetPeriodConfirmText)
   if (!confirmed) {
     return
   }
-  resettingAll.value = true
+  resettingPeriod.value = true
   try {
-    const msg = await HttpUtils.post('api/traffic-overview-reset', {})
+    const msg = await HttpUtils.post('api/traffic-overview-period-reset', {})
     if (msg.success && msg.obj) {
       applyOverview(msg.obj as Partial<TrafficOverview>)
     }
   } finally {
-    resettingAll.value = false
+    resettingPeriod.value = false
+  }
+}
+
+const confirmResetTotalTraffic = async () => {
+  const confirmed = window.confirm(resetTotalConfirmText)
+  if (!confirmed) {
+    return
+  }
+  resettingTotal.value = true
+  try {
+    const msg = await HttpUtils.post('api/traffic-overview-total-reset', {})
+    if (msg.success && msg.obj) {
+      applyOverview(msg.obj as Partial<TrafficOverview>)
+    }
+  } finally {
+    resettingTotal.value = false
   }
 }
 
@@ -834,6 +876,16 @@ onBeforeUnmount(() => {
 
 .traffic-code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+.traffic-settings__actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.traffic-settings__actions .v-btn {
+  flex: 1 1 140px;
 }
 
 @media (max-width: 720px) {

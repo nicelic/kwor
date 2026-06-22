@@ -85,6 +85,7 @@ var (
 	acmeAutoRenewRunning atomic.Bool
 	acmeMaintenanceMu    sync.Mutex
 	acmeMaintenanceAt    atomic.Int64
+	acmeMaintenanceDB    atomic.Value
 
 	acmeEnvPattern      = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 	acmeLogIDPattern    = regexp.MustCompile(`^[A-Za-z0-9_-]{8,96}$`)
@@ -443,6 +444,10 @@ type acmeChallengePortSnapshot struct {
 }
 
 func (s *AcmeService) GetOverview() (*AcmeOverview, error) {
+	if err := s.EnsureOverviewRuntimeConsistency(false); err != nil {
+		return nil, err
+	}
+
 	overview := &AcmeOverview{
 		Supported: runtime.GOOS == "linux",
 	}
@@ -508,9 +513,10 @@ func (s *AcmeService) GetOverview() (*AcmeOverview, error) {
 
 func (s *AcmeService) EnsureOverviewRuntimeConsistency(force bool) error {
 	now := time.Now().Unix()
+	dbKey := currentAcmeMaintenanceDBKey()
 	if !force {
 		last := acmeMaintenanceAt.Load()
-		if last > 0 && now-last < 8 {
+		if last > 0 && now-last < 8 && acmeMaintenanceDBKeyMatches(dbKey) {
 			return nil
 		}
 	}
@@ -520,7 +526,7 @@ func (s *AcmeService) EnsureOverviewRuntimeConsistency(force bool) error {
 
 	if !force {
 		last := acmeMaintenanceAt.Load()
-		if last > 0 && now-last < 8 {
+		if last > 0 && now-last < 8 && acmeMaintenanceDBKeyMatches(dbKey) {
 			return nil
 		}
 	}
@@ -544,11 +550,30 @@ func (s *AcmeService) EnsureOverviewRuntimeConsistency(force bool) error {
 	}
 
 	acmeMaintenanceAt.Store(time.Now().Unix())
+	acmeMaintenanceDB.Store(dbKey)
 	return nil
 }
 
 func (s *AcmeService) removeLegacyDefaultPushSetting() error {
 	return database.GetDB().Where("key = ?", "acmeDefaultPushDir").Delete(&model.Setting{}).Error
+}
+
+func currentAcmeMaintenanceDBKey() string {
+	db := database.GetDB()
+	if db == nil {
+		return ""
+	}
+	sqlDB, err := db.DB()
+	if err != nil || sqlDB == nil {
+		return ""
+	}
+	return fmt.Sprintf("%p", sqlDB)
+}
+
+func acmeMaintenanceDBKeyMatches(dbKey string) bool {
+	value := acmeMaintenanceDB.Load()
+	lastDBKey, _ := value.(string)
+	return lastDBKey == dbKey
 }
 
 func (s *AcmeService) GetLogSession(id string) (*AcmeLogSessionView, error) {
@@ -5233,7 +5258,7 @@ func (s *AcmeService) removeManagedAcmeWithOptionsLocked(opts acmeRemoveOptions)
 		}
 	}
 
-	if runtime.GOOS == "linux" {
+	if runtime.GOOS == "linux" && !runningInsideContainer() {
 		systemctlPath, lookErr := exec.LookPath("systemctl")
 		if lookErr == nil {
 			for _, unit := range acmeSystemdUnitCandidates {

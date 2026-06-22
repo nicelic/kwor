@@ -280,6 +280,12 @@ func printUnsupportedSubcommand(name string) {
 	fmt.Println("[kwor] available subcommands: start, stop, uninstall, migrate, uri, setting, admin")
 }
 
+func printContainerLifecycleHint(action string) {
+	fmt.Printf("[kwor] %s is managed by Docker in this image.\n", action)
+	fmt.Println("[kwor] Use 'docker compose up -d' or 'docker restart <container>' to start/restart it.")
+	fmt.Println("[kwor] Use 'docker stop <container>' or 'docker compose down' to stop it.")
+}
+
 func isFirstRun() bool {
 	_, err := os.Stat(config.GetDBPath())
 	return os.IsNotExist(err)
@@ -593,6 +599,11 @@ func firstRunSetup() {
 }
 
 func handleStart() {
+	if service.RunningInsideContainer() {
+		printContainerLifecycleHint("start")
+		return
+	}
+
 	firstRunInitialized := false
 
 	if isProcessRunning() {
@@ -649,6 +660,11 @@ func handleStart() {
 }
 
 func handleStop() {
+	if service.RunningInsideContainer() {
+		printContainerLifecycleHint("stop")
+		return
+	}
+
 	stoppedSomething := false
 
 	panelRunning := isSystemdServiceActive() || isProcessRunning()
@@ -864,6 +880,8 @@ func ParseCmd() {
 	}
 
 	switch os.Args[1] {
+	case "version":
+		fmt.Println(config.GetName(), "\t", config.GetVersion())
 	case "materialize-core-config":
 		if !isInternalSystemdCommandAllowed() {
 			printUnsupportedSubcommand(os.Args[1])
@@ -890,6 +908,8 @@ func ParseCmd() {
 			fmt.Printf("[kwor] cleanup core config failed: %v\n", err)
 			os.Exit(1)
 		}
+	case "docker-bootstrap":
+		handleDockerBootstrap()
 	case "start":
 		handleStart()
 	case "stop":

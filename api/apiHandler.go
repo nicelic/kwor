@@ -124,6 +124,10 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.SaveTrafficOverviewSettings(c)
 	case "traffic-overview-switch":
 		a.ApiService.SaveTrafficOverviewSwitch(c)
+	case "traffic-overview-period-reset":
+		a.ApiService.ResetTrafficOverviewPeriod(c)
+	case "traffic-overview-total-reset":
+		a.ApiService.ResetTrafficOverviewTotal(c)
 	case "traffic-overview-reset":
 		a.ApiService.ResetTrafficOverview(c)
 	case "traffic-overview-vnstat-install":

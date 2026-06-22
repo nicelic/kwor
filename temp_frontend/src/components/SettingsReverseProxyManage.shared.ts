@@ -46,8 +46,8 @@ export const reverseProxyCopy = {
   tlsPanel: 'HTTPS / TLS',
   listenProtocol: '本地协议',
   listenPort: '监听端口',
-  hosts: '域名/IP',
-  hostsPlaceholder: 'ss.cc, *.ss.cc, 127.0.0.1',
+  hosts: '域名',
+  hostsPlaceholder: 'ss.cc, *.ss.cc',
   pathPrefix: 'URL 路径（可选）',
   listenDnsPath: 'DNS URL 路径',
   targetProtocol: '目标协议',
@@ -60,14 +60,14 @@ export const reverseProxyCopy = {
   ednsEnabled: '启用 EDNS 客户端子网',
   ednsMode: 'EDNS 模式',
   ednsModeAuto: '自动来源 IP',
-  ednsModeCustom: '自定义 IP',
-  ednsCustomIp: 'EDNS 自定义 IP',
+  ednsModeCustom: '自定义 IPv4',
+  ednsCustomIp: 'EDNS 自定义 IPv4',
   ednsClientSubnetPolicy: '自动模式来源策略',
   ednsClientSubnetPolicyClientIP: '使用连接客户端 IP',
   ednsClientSubnetPolicyPreferRequestPublic: '优先使用请求自带公网 ECS',
-  ednsHint: '自动模式下：IPv4 会自动脱敏为末尾 .1；IPv6 直接使用连接到本机监听器的客户端 IPv6，不额外改写。自定义 IP 支持 IPv4 和 IPv6。',
+  ednsHint: '自动模式下：IPv4 会自动脱敏为末尾 .1；IPv6 直接使用连接到本机监听器的客户端 IPv6，不额外改写。自定义模式当前仅支持 IPv4，并会自动改写为末尾 .1。',
   ednsPolicyHint: '若请求里已带 ECS，且你选择“优先使用请求自带公网 ECS”，则仅在该 ECS 为公网地址时采用；私网、环回、链路本地等地址会被忽略并回退到客户端连接 IP。',
-  ednsCustomRequired: '请输入有效的 EDNS 自定义 IP',
+  ednsCustomRequired: '请输入有效的 IPv4 地址；保存时会自动改写为末尾 .1',
   disableIpv4Answer: '禁用 IPv4 地址解析结果',
   disableIpv6Answer: '禁用 IPv6 地址解析结果',
   dnsAnswerFilterHint: '仅作用于本地监听返回结果。禁用后会丢弃对应地址记录以及与 A/AAAA 直接相关的附属记录，剩余数据继续按上游结果透传。',
@@ -93,7 +93,7 @@ export const reverseProxyCopy = {
   saveUpdated: '反向代理已更新',
   reorderSaved: '匹配顺序已更新',
   enableLabel: '启用',
-  listenPanelHint: 'Go 运行时会在该端口同时监听 IPv4 与 IPv6；这里填写的是入口白名单，HTTP 校验 Host，HTTPS/H2/H3 校验 SNI；URL 路径按完整路径段严格匹配。',
+  listenPanelHint: 'Go 运行时会在该端口同时监听 IPv4 与 IPv6；这里填写的是域名命中条件，HTTP 校验域名型 Host，HTTPS/H2/H3 校验域名型 SNI；通过 IP 访问或无 SNI 访问始终允许；URL 路径按完整路径段严格匹配。',
   targetPanelHint: '目标支持 HTTP / HTTPS / DNS。多个目标会按填写顺序依次尝试；DNS 目标之间也会按顺序回退。',
   tlsPanelHint: '本地协议为 HTTPS、WSS、DoH、DoH3、DoT、DoQ 时必须绑定至少一张证书。',
   certificateRequired: '请选择至少一张 TLS 监听证书',
@@ -103,14 +103,15 @@ export const reverseProxyCopy = {
   ruleEnabled: '已启用',
   ruleDisabled: '已停用',
   pathRequired: '路径不能为空',
-  listenMatchRequired: '域名/IP 可留空',
-  listenPortInlineNotAllowed: '域名/IP 里不能带端口，请把端口填在监听端口',
+  listenMatchRequired: '域名可留空',
+  listenIPLiteralNotAllowed: '这里只能填写域名，不能填写 IP；通过 IP 访问默认允许',
+  listenPortInlineNotAllowed: '域名里不能带端口，请把端口填在监听端口',
   targetAddressInlineNotAllowed: '目标地址 / 域名 里不能带端口，请把端口填在目标端口',
   targetRequired: '请填写至少一个目标地址',
   certRequiredSave: 'TLS 监听必须至少选择一张证书',
   dnsPathRequired: '当前 DNS 协议必须填写 URL 路径',
   dnsProtocolPairRequired: 'DNS 反代要求本地协议和目标协议都使用 DNS',
-  dnsHostUnused: 'DNS 反代不使用域名/IP 命中条件',
+  dnsHostUnused: 'DNS 反代不使用域名命中条件',
   dnsHttpFieldUnused: 'DNS 反代不使用 HTTP 路径改写与 API 透传',
   listenModeHTTP: 'HTTP：仅监听明文 HTTP 请求。',
   listenModeHTTPS: 'HTTPS：同时监听 TCP(H2) 与 UDP(H3)，浏览器按标准协商决定使用哪种版本。',
@@ -133,7 +134,7 @@ export const reverseProxyCopy = {
   targetModeDNSUDP: 'UDP（DNS）：向上游发起传统 DNS UDP 请求。',
   targetModeDNSTCP: 'TCP（DNS）：向上游发起传统 DNS TCP 请求。',
   tlsModeRequired: '当前监听协议需要 TLS 证书。',
-  listenIpLocalHint: '填写后 HTTP 必须匹配 Host，HTTPS/H2/H3 必须匹配 SNI；留空时 HTTPS/H2/H3 只允许无 SNI，请求携带任意 SNI 都会断开。',
+  listenIpLocalHint: '填写后仅约束域名型 Host / SNI；通过 IP 访问或无 SNI 访问仍允许。留空时不做域名命中限制。',
   targetPathRewriteHint: '目标基础路径会作为上游前缀，例如填 /api 后，请求 /foo 会转发到 /api/foo。',
   apiPassthroughHint: '开启后不改写响应正文，适合 AI、SSE 与 API 直通，避免流式内容被缓冲或替换；响应头仍按反代规则处理。',
   runtimeHint: '当请求没有命中任何规则时，Go 运行时会拒绝该请求。',
@@ -312,7 +313,14 @@ const isIPv6Literal = (value: string) => {
 }
 
 const isIPLiteral = (value: string) => isIPv4Literal(value) || isIPv6Literal(value)
-export const isValidEDNSCustomIP = (value: string) => isIPLiteral(value.trim())
+const normalizeEDNSCustomIPv4 = (value: string) => {
+  const normalized = normalizeIPLiteral(value.trim())
+  if (!isIPv4Literal(normalized)) return ''
+  const parts = normalized.split('.')
+  parts[3] = '1'
+  return parts.join('.')
+}
+export const isValidEDNSCustomIP = (value: string) => normalizeEDNSCustomIPv4(value) !== ''
 
 const hasExplicitPort = (value: string) => {
   const trimmed = value.trim()
@@ -321,18 +329,7 @@ const hasExplicitPort = (value: string) => {
   return /^(\[[0-9a-f:]+\]|[^:\[\]]+):\d+$/i.test(trimmed)
 }
 
-const splitListenMatchTokens = (value: string) => {
-  const hosts: string[] = []
-  const listenIPs: string[] = []
-  splitInputTokens(value).forEach((token) => {
-    if (isIPLiteral(token)) {
-      listenIPs.push(normalizeIPLiteral(token))
-      return
-    }
-    hosts.push(token)
-  })
-  return { hosts, listenIPs }
-}
+const splitDomainTokens = (value: string) => splitInputTokens(value).filter(token => !isIPLiteral(token))
 
 const sortCertificateIDsByOptionOrder = (ids: number[], options: ReverseProxyCertificateOption[]) => {
   if (ids.length <= 1 || options.length === 0) return [...ids]
@@ -498,6 +495,7 @@ const trimReverseProxyRuleFormText = (form: ReverseProxyRuleForm) => {
   form.pathPrefix = form.pathPrefix.trim()
   form.targetAddressesText = normalizeListTextInput(form.targetAddressesText)
   form.targetPath = form.targetPath.trim()
+  form.ednsCustomIp = form.ednsCustomIp.trim()
   form.remark = form.remark.trim()
 }
 
@@ -690,10 +688,7 @@ export const mapRuleToForm = (rule?: ReverseProxyRule): ReverseProxyRuleForm => 
     enabled: rule?.enabled ?? true,
     listenProtocol,
     listenPort: rule?.listenPort ?? 80,
-    hostsText: normalizeStringList([
-      ...(rule?.listenIPs ?? []),
-      ...(rule?.hosts ?? []),
-    ]).join(', '),
+    hostsText: normalizeStringList(rule?.hosts ?? []).join(', '),
     pathPrefix: rule?.pathPrefix ?? '',
     listenDnsPath: rule?.listenDnsPath ?? (dnsProtocolUsesPath(listenProtocol) ? '/dns-query' : ''),
     targetProtocol,
@@ -722,6 +717,13 @@ export const mapRuleToForm = (rule?: ReverseProxyRule): ReverseProxyRuleForm => 
   }
 }
 
+const normalizeEDNSCustomIPInForm = (form: ReverseProxyRuleForm) => {
+  if (!protocolIsDNS(form.listenProtocol) || !form.ednsEnabled || form.ednsMode !== 'custom') return
+  const normalized = normalizeEDNSCustomIPv4(form.ednsCustomIp)
+  if (!normalized) return
+  form.ednsCustomIp = normalized
+}
+
 export const buildReverseProxyPayload = (
   form: ReverseProxyRuleForm,
   certificates: ReverseProxyCertificateOption[] = [],
@@ -733,9 +735,9 @@ export const buildReverseProxyPayload = (
   const targetPath = form.targetPath.trim()
   const listenDnsPath = form.listenDnsPath.trim()
   const targetDnsPath = form.targetDnsPath.trim()
-  const ednsCustomIp = form.ednsCustomIp.trim()
+  const ednsCustomIp = normalizeEDNSCustomIPv4(form.ednsCustomIp)
   const remark = form.remark.trim()
-  const matchTokens = splitListenMatchTokens(hostsText)
+  const listenNames = splitInputTokens(hostsText)
   const listenProtocol = mapListenProtocolToBackend(form.listenProtocol)
   const targetProtocol = mapTargetProtocolToBackend(form.targetProtocol, form.httpVersionStrategy)
   const listenProtocolAlias = (() => {
@@ -759,8 +761,8 @@ export const buildReverseProxyPayload = (
     listenProtocol: listenProtocol.listenProtocol,
     listenProtocolAlias: listenProtocol.listenProtocolAlias || listenProtocolAlias,
     listenPort: asNumber(form.listenPort),
-    listenIPs: matchTokens.listenIPs.join(', '),
-    hosts: matchTokens.hosts.join(', '),
+    listenIPs: '',
+    hosts: listenNames.join(', '),
     pathPrefix: normalizePathInput(pathPrefix, true),
     listenDnsPath: dnsProtocolUsesPath(form.listenProtocol) ? normalizePathInput(listenDnsPath, true) : '',
     targetProtocol: targetProtocol.targetProtocol,
@@ -861,11 +863,20 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     dialogVisible.value = true
   }
 
+  const normalizeCustomEDNSInput = () => {
+    normalizeEDNSCustomIPInForm(editingRule.value)
+  }
+
   const saveRule = async () => {
     if (saving.value) return
     trimReverseProxyRuleFormText(editingRule.value)
+    normalizeEDNSCustomIPInForm(editingRule.value)
     if (protocolIsDNS(editingRule.value.listenProtocol) !== protocolIsDNS(editingRule.value.targetProtocol)) {
       push.warning({ duration: 4000, message: reverseProxyCopy.dnsProtocolPairRequired })
+      return
+    }
+    if (!protocolIsDNS(editingRule.value.listenProtocol) && splitInputTokens(editingRule.value.hostsText).some(isIPLiteral)) {
+      push.warning({ duration: 4000, message: reverseProxyCopy.listenIPLiteralNotAllowed })
       return
     }
     if (!protocolIsDNS(editingRule.value.listenProtocol) && splitInputTokens(editingRule.value.hostsText).some(hasExplicitPort)) {
@@ -1040,7 +1051,7 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   const currentCertificateHints = computed(() => {
     const certs = selectedCertificates.value
     if (certs.length === 0) return []
-    const matches = splitInputTokens(editingRule.value.hostsText)
+    const matches = splitDomainTokens(editingRule.value.hostsText)
     const certNames = certs
       .flatMap(cert => [cert.mainDomain, ...(cert.domains ?? [])])
       .map(item => item.trim().toLowerCase())
@@ -1058,13 +1069,6 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     }
     const hints: string[] = []
     matches.forEach((match) => {
-      if (isIPLiteral(match)) {
-        const normalizedIP = normalizeIPLiteral(match).toLowerCase()
-        if (!certNames.some(name => name === normalizedIP)) {
-          hints.push(`证书未覆盖 IP: ${match}`)
-        }
-        return
-      }
       if (hasIPSANCert) {
         return
       }
@@ -1290,6 +1294,11 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     editingRule.value.pathPrefix = normalizePathInput(value, true)
   })
 
+  watch(() => editingRule.value.ednsMode, (value) => {
+    if (value !== 'custom') return
+    normalizeEDNSCustomIPInForm(editingRule.value)
+  })
+
   onMounted(() => {
     if (props.active) {
       void fetchOverview()
@@ -1332,6 +1341,7 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     fetchOverview,
     refreshOverview,
     openRuleDialog,
+    normalizeCustomEDNSInput,
     saveRule,
     removeRule,
     toggleRule,
