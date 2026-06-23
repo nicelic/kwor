@@ -414,11 +414,14 @@ func (s *Server) getTLSCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate
 	var selected *tlsRuntimeCertificate
 	var selection service.PanelCertificateBalanceSelection
 	if serverName != "" {
-		candidates := collectSNIMatchingTLSRuntimeCertificates(materials, serverName)
-		if len(candidates) == 0 {
-			return nil, fmt.Errorf("no certificate available for requested sni")
+		exactCandidates, wildcardCandidates := splitSNITLSRuntimeCertificateCandidates(materials, serverName)
+		selected, selection = s.selectBalancedTLSRuntimeCertificate(exactCandidates, listenerKey, serverName)
+		if selected == nil {
+			selected, selection = s.selectBalancedTLSRuntimeCertificate(wildcardCandidates, listenerKey, serverName)
 		}
-		selected, selection = s.selectBalancedTLSRuntimeCertificate(candidates, listenerKey, serverName)
+		if selected == nil {
+			selected, selection = s.selectBalancedTLSRuntimeCertificate(materials, listenerKey, serverName)
+		}
 	} else {
 		ipPreferred, others := splitNoSNITLSRuntimeCertificateCandidates(materials, localIP)
 		selected, selection = s.selectBalancedTLSRuntimeCertificate(ipPreferred, listenerKey, service.NormalizePanelCertificateBalanceSNIBucket(""))
@@ -603,6 +606,29 @@ func collectSNIMatchingTLSRuntimeCertificates(materials []*tlsRuntimeCertificate
 	return matched
 }
 
+func splitSNITLSRuntimeCertificateCandidates(materials []*tlsRuntimeCertificate, serverName string) ([]*tlsRuntimeCertificate, []*tlsRuntimeCertificate) {
+	serverName = strings.TrimSpace(strings.TrimSuffix(serverName, "."))
+	if serverName == "" {
+		return nil, nil
+	}
+	exact := make([]*tlsRuntimeCertificate, 0, len(materials))
+	wildcard := make([]*tlsRuntimeCertificate, 0, len(materials))
+	now := time.Now()
+	for _, material := range materials {
+		if !tlsRuntimeCertificateUsable(material, now) || material == nil || material.leaf == nil {
+			continue
+		}
+		matchType := tlsRuntimeCertificateSNIMatchType(material, serverName)
+		switch matchType {
+		case tlsRuntimeCertificateSNIMatchExact:
+			exact = append(exact, material)
+		case tlsRuntimeCertificateSNIMatchWildcard:
+			wildcard = append(wildcard, material)
+		}
+	}
+	return exact, wildcard
+}
+
 func splitNoSNITLSRuntimeCertificateCandidates(materials []*tlsRuntimeCertificate, localIP string) ([]*tlsRuntimeCertificate, []*tlsRuntimeCertificate) {
 	localIP = strings.TrimSpace(localIP)
 	ipPreferred := make([]*tlsRuntimeCertificate, 0, len(materials))
@@ -654,9 +680,43 @@ func tlsRuntimeCertificateMatchesNoSNILocalIP(material *tlsRuntimeCertificate, l
 	}
 	localIP = strings.TrimSpace(strings.Trim(localIP, "[]"))
 	if net.ParseIP(localIP) == nil {
-		return true
+		return false
 	}
 	return material.leaf.VerifyHostname(localIP) == nil
+}
+
+type tlsRuntimeCertificateSNIMatchCategory int
+
+const (
+	tlsRuntimeCertificateSNIMatchNone tlsRuntimeCertificateSNIMatchCategory = iota
+	tlsRuntimeCertificateSNIMatchExact
+	tlsRuntimeCertificateSNIMatchWildcard
+)
+
+func tlsRuntimeCertificateSNIMatchType(material *tlsRuntimeCertificate, serverName string) tlsRuntimeCertificateSNIMatchCategory {
+	if material == nil || material.leaf == nil {
+		return tlsRuntimeCertificateSNIMatchNone
+	}
+	serverName = strings.TrimSpace(strings.TrimSuffix(serverName, "."))
+	if serverName == "" {
+		return tlsRuntimeCertificateSNIMatchNone
+	}
+	if material.leaf.VerifyHostname(serverName) != nil {
+		return tlsRuntimeCertificateSNIMatchNone
+	}
+	if ip := net.ParseIP(serverName); ip != nil {
+		return tlsRuntimeCertificateSNIMatchExact
+	}
+	for _, name := range material.leaf.DNSNames {
+		candidate := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(name, ".")))
+		if candidate == "" {
+			continue
+		}
+		if candidate == serverName {
+			return tlsRuntimeCertificateSNIMatchExact
+		}
+	}
+	return tlsRuntimeCertificateSNIMatchWildcard
 }
 
 func normalizeTLSLocalIP(conn net.Conn) string {

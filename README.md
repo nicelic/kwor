@@ -150,7 +150,7 @@ docker run -itd \
     --network host \
     -v $PWD/Promanager_data:/app/Promanager_data \
     --name kwor --restart=unless-stopped \
-    ghcr.io/nicelic/kwor:v1.5.17
+    ghcr.io/nicelic/kwor:v1.5.18
 ```
 
 ### Build your own image

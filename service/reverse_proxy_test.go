@@ -30,6 +30,7 @@ import (
 	dnsproxy "github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
+	"github.com/alireza0/s-ui/network"
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
@@ -90,6 +91,133 @@ func TestNormalizeReverseProxyProtocol_AcceptsWSAliases(t *testing.T) {
 	}
 	if gotDNS != reverseProxyProtocolDNS {
 		t.Fatalf("expected dns_doh to map to dns, got %q", gotDNS)
+	}
+}
+
+func TestReverseProxySplitSNICertificateCandidates_PrefersExactBeforeWildcard(t *testing.T) {
+	wildcardCertPEM, wildcardKeyPEM := buildReverseProxyTestCertificatePEM(t, []string{"*.example.com"})
+	wildcardCert, wildcardLeaf, err := loadReverseProxyBindingForTest(wildcardCertPEM, wildcardKeyPEM)
+	if err != nil {
+		t.Fatalf("load wildcard certificate failed: %v", err)
+	}
+	exactCertPEM, exactKeyPEM := buildReverseProxyTestCertificatePEM(t, []string{"api.example.com"})
+	exactCert, exactLeaf, err := loadReverseProxyBindingForTest(exactCertPEM, exactKeyPEM)
+	if err != nil {
+		t.Fatalf("load exact certificate failed: %v", err)
+	}
+	wildcard := &reverseProxyRuleCertificateBinding{CertificateRecordID: 1, Certificate: wildcardCert, Leaf: wildcardLeaf}
+	exact := &reverseProxyRuleCertificateBinding{CertificateRecordID: 2, Certificate: exactCert, Leaf: exactLeaf}
+
+	exactMatched, wildcardMatched := reverseProxySplitSNICertificateCandidates([]*reverseProxyRuleCertificateBinding{wildcard, exact}, "api.example.com")
+	if len(exactMatched) != 1 || exactMatched[0] != exact {
+		t.Fatalf("expected exact cert in exact bucket, got %#v", exactMatched)
+	}
+	if len(wildcardMatched) != 1 || wildcardMatched[0] != wildcard {
+		t.Fatalf("expected wildcard cert in wildcard bucket, got %#v", wildcardMatched)
+	}
+}
+
+func TestReverseProxyNoSNICertificateCandidatesSkipIPPriorityWhenLocalIPUnknown(t *testing.T) {
+	ipCertPEM, ipKeyPEM := buildReverseProxyTestCertificatePEM(t, []string{"127.0.0.1"})
+	ipCert, ipLeaf, err := loadReverseProxyBindingForTest(ipCertPEM, ipKeyPEM)
+	if err != nil {
+		t.Fatalf("load ip certificate failed: %v", err)
+	}
+	domainCertPEM, domainKeyPEM := buildReverseProxyTestCertificatePEM(t, []string{"example.com"})
+	domainCert, domainLeaf, err := loadReverseProxyBindingForTest(domainCertPEM, domainKeyPEM)
+	if err != nil {
+		t.Fatalf("load domain certificate failed: %v", err)
+	}
+	group := &reverseProxyListenerGroup{
+		rules: []*model.ReverseProxyRule{{Id: 1}},
+		certBindingsByRule: map[uint][]*reverseProxyRuleCertificateBinding{
+			1: {
+				{RuleID: 1, CertificateRecordID: 1, Certificate: ipCert, Leaf: ipLeaf},
+				{RuleID: 1, CertificateRecordID: 2, Certificate: domainCert, Leaf: domainLeaf},
+			},
+		},
+		orderedCertBindings: []*reverseProxyRuleCertificateBinding{
+			{RuleID: 1, CertificateRecordID: 1, Certificate: ipCert, Leaf: ipLeaf},
+			{RuleID: 1, CertificateRecordID: 2, Certificate: domainCert, Leaf: domainLeaf},
+		},
+	}
+
+	candidates := group.noSNICertificateCandidatesLocked("")
+	if len(candidates) != 2 {
+		t.Fatalf("expected all fallback certs when local ip is unknown, got=%d", len(candidates))
+	}
+}
+
+func TestReverseProxyNoSNICertificateCandidatesPreferMatchingLocalIP(t *testing.T) {
+	ipCertPEM, ipKeyPEM := buildReverseProxyTestCertificatePEM(t, []string{"127.0.0.1"})
+	ipCert, ipLeaf, err := loadReverseProxyBindingForTest(ipCertPEM, ipKeyPEM)
+	if err != nil {
+		t.Fatalf("load ip certificate failed: %v", err)
+	}
+	otherIPCertPEM, otherIPKeyPEM := buildReverseProxyTestCertificatePEM(t, []string{"10.0.0.1"})
+	otherIPCert, otherIPLeaf, err := loadReverseProxyBindingForTest(otherIPCertPEM, otherIPKeyPEM)
+	if err != nil {
+		t.Fatalf("load other ip certificate failed: %v", err)
+	}
+	domainCertPEM, domainKeyPEM := buildReverseProxyTestCertificatePEM(t, []string{"example.com"})
+	domainCert, domainLeaf, err := loadReverseProxyBindingForTest(domainCertPEM, domainKeyPEM)
+	if err != nil {
+		t.Fatalf("load domain certificate failed: %v", err)
+	}
+	group := &reverseProxyListenerGroup{
+		orderedCertBindings: []*reverseProxyRuleCertificateBinding{
+			{RuleID: 1, CertificateRecordID: 1, Certificate: domainCert, Leaf: domainLeaf},
+			{RuleID: 1, CertificateRecordID: 2, Certificate: otherIPCert, Leaf: otherIPLeaf},
+			{RuleID: 1, CertificateRecordID: 3, Certificate: ipCert, Leaf: ipLeaf},
+		},
+	}
+
+	candidates := group.noSNICertificateCandidatesLocked("127.0.0.1")
+	if len(candidates) != 1 || candidates[0].Certificate != ipCert {
+		t.Fatalf("expected only local ip matching certificate, got %#v", candidates)
+	}
+}
+
+func TestBuildReverseProxyDNSServerTLSConfigPrefersLocalIPCertificateWithoutSNI(t *testing.T) {
+	openReverseProxyTestDB(t)
+
+	domainCertID := createReverseProxyTestCertificateRecord(t, "example.com")
+	ipCertID := createReverseProxyTestCertificateRecord(t, "127.0.0.1")
+
+	svc := &ReverseProxyService{}
+	config, err := buildReverseProxyDNSServerTLSConfig(svc, []model.ReverseProxyRule{
+		{
+			Id:                    1,
+			Enabled:               true,
+			ListenProtocol:        reverseProxyProtocolDNS,
+			ListenProtocolAlias:   reverseProxyDNSProtocolDoH,
+			ListenPort:            443,
+			ListenIPList:          `["127.0.0.1"]`,
+			CertificateRecordList: encodeReverseProxyUintList([]uint{domainCertID, ipCertID}),
+			CertificateRecordID:   domainCertID,
+		},
+	}, []string{"h2", "http/1.1"})
+	if err != nil {
+		t.Fatalf("build dns tls config failed: %v", err)
+	}
+
+	got, err := config.GetCertificate(&tls.ClientHelloInfo{
+		Conn: reverseProxyTestConn{
+			local: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 443},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected dns tls config to select certificate without sni: %v", err)
+	}
+	if got == nil || len(got.Certificate) == 0 {
+		t.Fatal("expected dns tls config to return a certificate")
+	}
+	leaf, err := network.ParseLeafCertificate(got)
+	if err != nil {
+		t.Fatalf("parse selected dns certificate failed: %v", err)
+	}
+	if leaf.VerifyHostname("127.0.0.1") != nil {
+		t.Fatalf("expected no-sni dns certificate selection to prefer local ip cert, got dns=%v ips=%v", leaf.DNSNames, leaf.IPAddresses)
 	}
 }
 
@@ -2050,7 +2178,7 @@ func TestReverseProxyRuleNamesAndPathsOverlap(t *testing.T) {
 	}
 }
 
-func TestReverseProxyGetCertificateRejectsUnknownOrMissingSNI(t *testing.T) {
+func TestReverseProxyGetCertificateFallsBackWhenSNIHasNoMatch(t *testing.T) {
 	cert := &tls.Certificate{}
 	binding := &reverseProxyRuleCertificateBinding{
 		RuleID:              1,
@@ -2083,8 +2211,8 @@ func TestReverseProxyGetCertificateRejectsUnknownOrMissingSNI(t *testing.T) {
 		t.Fatalf("expected matching ip sni certificate, got cert=%v err=%v", got, err)
 	}
 	got, err = group.getCertificate(&tls.ClientHelloInfo{ServerName: "other.example.com"})
-	if err == nil {
-		t.Fatalf("expected unknown sni to be rejected, got cert=%v", got)
+	if err != nil || got != cert {
+		t.Fatalf("expected unmatched sni to fall back to available certificate, got cert=%v err=%v", got, err)
 	}
 	got, err = group.getCertificate(&tls.ClientHelloInfo{})
 	if err != nil || got != cert {
@@ -2582,7 +2710,7 @@ func TestReverseProxyNoSNICertificateCandidatesIncludeIPSANBindings(t *testing.T
 		},
 	}
 
-	candidates := group.noSNICertificateCandidatesLocked()
+	candidates := group.noSNICertificateCandidatesLocked("127.0.0.1")
 	if len(candidates) != 1 || candidates[0] != ipBinding {
 		t.Fatalf("expected no-sni candidates to keep only ip-san binding, got %#v", candidates)
 	}
@@ -4552,6 +4680,24 @@ func buildReverseProxyTestCertificatePEM(t *testing.T, names []string) ([]byte, 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	return certPEM, keyPEM
+}
+
+func loadReverseProxyBindingForTest(certPEM []byte, keyPEM []byte) (*tls.Certificate, *x509LeafState, error) {
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, nil, err
+	}
+	leaf, err := network.ParseLeafCertificate(&pair)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &pair, &x509LeafState{
+		Certificate: &pair,
+		Leaf:        leaf,
+		Fingerprint: "",
+		NotAfter:    leaf.NotAfter,
+		HasIPSAN:    len(leaf.IPAddresses) > 0,
+	}, nil
 }
 
 func reverseProxyDialNoSNIFingerprint(t *testing.T, listenPort int) string {

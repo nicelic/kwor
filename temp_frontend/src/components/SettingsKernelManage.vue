@@ -268,7 +268,7 @@
               <td>
                 <v-chip v-if="pkg.isPinnedKernel" size="x-small" color="success" class="mr-1">{{ t('kernelManager.cleanupPinned') }}</v-chip>
                 <v-chip v-if="pkg.isCurrentKernel" size="x-small" color="info" class="mr-1">{{ t('kernelManager.cleanupCurrent') }}</v-chip>
-                <v-chip v-if="pkg.isImage" size="x-small" color="primary" class="mr-1">image</v-chip>
+                <v-chip v-if="pkg.isImage" size="x-small" color="primary" class="mr-1 kernel-cleanup-tag--image">image</v-chip>
                 <v-chip v-if="pkg.isHeaders" size="x-small" color="secondary" class="mr-1">headers</v-chip>
               </td>
               <td>
@@ -1105,6 +1105,11 @@ onBeforeUnmount(() => {
   max-width: 320px;
 }
 
+.kernel-cleanup-tag--image,
+.kernel-cleanup-tag--image :deep(.v-chip__content) {
+  color: #fff !important;
+}
+
 .kernel-download-loader {
   display: inline-flex;
   align-items: center;
@@ -1115,6 +1120,6 @@ onBeforeUnmount(() => {
   white-space: nowrap;
   font-size: 12px;
   letter-spacing: 0.1px;
-  color: #ff4d4f;
+  color: #fff;
 }
 </style>

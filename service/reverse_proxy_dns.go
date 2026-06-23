@@ -776,27 +776,28 @@ func buildReverseProxyDNSServerTLSConfig(service *ReverseProxyService, rows []mo
 		MinVersion: tls.VersionTLS12,
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			serverName := ""
+			localIP := ""
 			if hello != nil {
 				serverName = reverseProxyNormalizeServerName(hello.ServerName)
+				if hello.Conn != nil {
+					localIP = reverseProxyNormalizeLocalIP(hello.Conn.LocalAddr())
+				}
 			}
 			if serverName != "" {
-				for _, item := range items {
-					if item == nil || item.Certificate == nil {
-						continue
-					}
-					if reverseProxyCertificateBindingMatchesServerName(item, serverName) {
-						return item.Certificate, nil
-					}
+				exactCandidates, wildcardCandidates := reverseProxySplitSNICertificateCandidates(items, serverName)
+				if selected := reverseProxyFallbackCertificateBinding(exactCandidates); selected != nil && selected.Certificate != nil {
+					return selected.Certificate, nil
+				}
+				if selected := reverseProxyFallbackCertificateBinding(wildcardCandidates); selected != nil && selected.Certificate != nil {
+					return selected.Certificate, nil
+				}
+				if selected := reverseProxyFallbackCertificateBinding(items); selected != nil && selected.Certificate != nil {
+					return selected.Certificate, nil
 				}
 				return nil, common.NewError("no certificate available for requested sni")
 			}
-			if selected := reverseProxyPickNoSNIBinding(items, ""); selected != nil && selected.Certificate != nil {
+			if selected := reverseProxyPickNoSNIBinding(items, localIP); selected != nil && selected.Certificate != nil {
 				return selected.Certificate, nil
-			}
-			for _, item := range items {
-				if item != nil && item.Certificate != nil {
-					return item.Certificate, nil
-				}
 			}
 			return nil, errors.New("dns tls listener certificate is unavailable")
 		},

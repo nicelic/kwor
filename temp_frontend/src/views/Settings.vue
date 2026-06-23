@@ -971,12 +971,14 @@ const showTopActionBar = computed(() => tab.value !== 't6' && tab.value !== 't7'
   color: rgba(255, 255, 255, 0.92);
 }
 
-.panel-version-footer__action {
-  color: #fff;
+.panel-version-footer__action,
+.panel-version-footer__action :deep(.v-btn__content) {
+  color: #fff !important;
 }
 
-.panel-version-footer__action.v-btn--disabled {
-  color: rgba(255, 255, 255, 0.88);
+.panel-version-footer__action.v-btn--disabled,
+.panel-version-footer__action.v-btn--disabled :deep(.v-btn__content) {
+  color: rgba(255, 255, 255, 0.88) !important;
   opacity: 1;
 }
 </style>

@@ -1,7 +1,7 @@
 ---
 services:
   kwor:
-    image: ghcr.io/nicelic/kwor:v1.5.17
+    image: ghcr.io/nicelic/kwor:v1.5.18
     container_name: kwor
     hostname: "kwor"
     cap_add:

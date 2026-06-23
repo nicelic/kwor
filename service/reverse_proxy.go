@@ -2262,35 +2262,88 @@ func reverseProxyNoSNICertificateMatchesLocalIP(binding *reverseProxyRuleCertifi
 	}
 	localIP = reverseProxyNormalizeServerName(localIP)
 	if reverseProxyParseIPLiteral(localIP) == nil {
-		return true
+		return false
 	}
 	return reverseProxyCertificateBindingMatchesServerName(binding, localIP)
 }
 
-func reverseProxyPickNoSNIBinding(bindings []*reverseProxyRuleCertificateBinding, localIP string) *reverseProxyRuleCertificateBinding {
+func reverseProxySplitNoSNICertificateCandidates(bindings []*reverseProxyRuleCertificateBinding, localIP string) ([]*reverseProxyRuleCertificateBinding, []*reverseProxyRuleCertificateBinding) {
 	localIP = reverseProxyNormalizeServerName(localIP)
-	if reverseProxyParseIPLiteral(localIP) != nil {
-		for _, binding := range bindings {
-			if !reverseProxyCertificateBindingHasIPSAN(binding) {
-				continue
-			}
-			if reverseProxyCertificateBindingMatchesServerName(binding, localIP) {
-				return binding
-			}
-		}
-	}
+	ipPreferred := make([]*reverseProxyRuleCertificateBinding, 0, len(bindings))
+	others := make([]*reverseProxyRuleCertificateBinding, 0, len(bindings))
+	now := time.Now()
+	localIPIsLiteral := reverseProxyParseIPLiteral(localIP) != nil
 	for _, binding := range bindings {
-		if reverseProxyCertificateBindingHasIPSAN(binding) {
-			return binding
-		}
-	}
-	for _, binding := range bindings {
-		if !reverseProxyCertificateBindingUsable(binding, time.Now()) {
+		if !reverseProxyCertificateBindingUsable(binding, now) {
 			continue
 		}
-		return binding
+		if localIPIsLiteral && reverseProxyCertificateBindingHasIPSAN(binding) && reverseProxyLeafMatchesServerName(binding.Leaf.Leaf, localIP) {
+			ipPreferred = append(ipPreferred, binding)
+			continue
+		}
+		others = append(others, binding)
 	}
-	return nil
+	return ipPreferred, others
+}
+
+func reverseProxyPickNoSNIBinding(bindings []*reverseProxyRuleCertificateBinding, localIP string) *reverseProxyRuleCertificateBinding {
+	ipPreferred, others := reverseProxySplitNoSNICertificateCandidates(bindings, localIP)
+	if selected := reverseProxyFallbackCertificateBinding(ipPreferred); selected != nil {
+		return selected
+	}
+	return reverseProxyFallbackCertificateBinding(others)
+}
+
+type reverseProxySNIMatchCategory int
+
+const (
+	reverseProxySNIMatchNone reverseProxySNIMatchCategory = iota
+	reverseProxySNIMatchExact
+	reverseProxySNIMatchWildcard
+)
+
+func reverseProxyCertificateBindingSNIMatchType(binding *reverseProxyRuleCertificateBinding, serverName string) reverseProxySNIMatchCategory {
+	if !reverseProxyCertificateBindingUsable(binding, time.Now()) || binding == nil || binding.Leaf == nil || binding.Leaf.Leaf == nil {
+		return reverseProxySNIMatchNone
+	}
+	serverName = reverseProxyNormalizeServerName(serverName)
+	if serverName == "" {
+		return reverseProxySNIMatchNone
+	}
+	if binding.Leaf.Leaf.VerifyHostname(serverName) != nil {
+		return reverseProxySNIMatchNone
+	}
+	if reverseProxyParseIPLiteral(serverName) != nil {
+		return reverseProxySNIMatchExact
+	}
+	for _, dnsName := range binding.Leaf.Leaf.DNSNames {
+		candidate := reverseProxyNormalizeServerName(dnsName)
+		if candidate == "" {
+			continue
+		}
+		if candidate == serverName {
+			return reverseProxySNIMatchExact
+		}
+	}
+	return reverseProxySNIMatchWildcard
+}
+
+func reverseProxySplitSNICertificateCandidates(bindings []*reverseProxyRuleCertificateBinding, serverName string) ([]*reverseProxyRuleCertificateBinding, []*reverseProxyRuleCertificateBinding) {
+	serverName = reverseProxyNormalizeServerName(serverName)
+	if serverName == "" {
+		return nil, nil
+	}
+	exact := make([]*reverseProxyRuleCertificateBinding, 0, len(bindings))
+	wildcard := make([]*reverseProxyRuleCertificateBinding, 0, len(bindings))
+	for _, binding := range bindings {
+		switch reverseProxyCertificateBindingSNIMatchType(binding, serverName) {
+		case reverseProxySNIMatchExact:
+			exact = append(exact, binding)
+		case reverseProxySNIMatchWildcard:
+			wildcard = append(wildcard, binding)
+		}
+	}
+	return exact, wildcard
 }
 
 func reverseProxyCertificateDomainsCoverHost(domains []string, host string) bool {
@@ -3142,78 +3195,87 @@ func (g *reverseProxyListenerGroup) getCertificate(hello *tls.ClientHelloInfo) (
 	defer g.mu.RUnlock()
 	serverName := ""
 	connAddrKey := ""
+	localIP := ""
 	if hello != nil {
 		serverName = reverseProxyNormalizeServerName(hello.ServerName)
 		if hello.Conn != nil {
 			connAddrKey = reverseProxyConnectionAddrKey(hello.Conn)
+			localIP = reverseProxyNormalizeLocalIP(hello.Conn.LocalAddr())
 		}
 	}
 	if serverName == "" {
-		candidates := g.noSNICertificateCandidatesLocked()
-		if selected, selection, err := g.selectBalancedCertificate(candidates, reverseProxyCertBalanceNoSNIBucket); err == nil && selected != nil {
+		ipPreferred, others := reverseProxySplitNoSNICertificateCandidates(g.orderedCertBindings, localIP)
+		if selected, selection, err := g.selectBalancedCertificate(ipPreferred, reverseProxyCertBalanceNoSNIBucket); err == nil && selected != nil {
 			g.bindCertificateSelectionToConnection(connAddrKey, selection)
 			return selected.Certificate, nil
 		}
-		if selected := reverseProxyFallbackCertificateBinding(g.orderedCertBindings); selected != nil && selected.Certificate != nil {
+		if selected, selection, err := g.selectBalancedCertificate(others, reverseProxyCertBalanceNoSNIBucket); err == nil && selected != nil {
+			g.bindCertificateSelectionToConnection(connAddrKey, selection)
 			return selected.Certificate, nil
 		}
 		reverseProxyCloseClientHelloConn(hello)
 		return nil, common.NewError("tls listener certificate is unavailable")
 	}
 	if reverseProxyParseIPLiteral(serverName) != nil {
-		candidates := g.noSNICertificateCandidatesLocked()
-		if selected, selection, err := g.selectBalancedCertificate(candidates, reverseProxyCertBalanceNoSNIBucket); err == nil && selected != nil {
+		ipPreferred, others := reverseProxySplitNoSNICertificateCandidates(g.orderedCertBindings, serverName)
+		if selected, selection, err := g.selectBalancedCertificate(ipPreferred, serverName); err == nil && selected != nil {
 			g.bindCertificateSelectionToConnection(connAddrKey, selection)
 			return selected.Certificate, nil
 		}
-		if selected := reverseProxyFallbackCertificateBinding(g.orderedCertBindings); selected != nil && selected.Certificate != nil {
+		if selected, selection, err := g.selectBalancedCertificate(others, serverName); err == nil && selected != nil {
+			g.bindCertificateSelectionToConnection(connAddrKey, selection)
 			return selected.Certificate, nil
 		}
 		reverseProxyCloseClientHelloConn(hello)
 		return nil, common.NewError("tls listener certificate is unavailable")
 	}
 	matchedRule := false
-	candidates := make([]*reverseProxyRuleCertificateBinding, 0)
+	exactCandidates := make([]*reverseProxyRuleCertificateBinding, 0)
+	wildcardCandidates := make([]*reverseProxyRuleCertificateBinding, 0)
 	for _, rule := range g.rules {
 		if !reverseProxyRuleServerNameMatch(rule, serverName) {
 			continue
 		}
 		matchedRule = true
-		for _, binding := range g.certBindingsByRule[rule.Id] {
-			if reverseProxyCertificateBindingMatchesServerName(binding, serverName) {
-				candidates = append(candidates, binding)
-			}
-		}
+		exactByRule, wildcardByRule := reverseProxySplitSNICertificateCandidates(g.certBindingsByRule[rule.Id], serverName)
+		exactCandidates = append(exactCandidates, exactByRule...)
+		wildcardCandidates = append(wildcardCandidates, wildcardByRule...)
 	}
-	if selected, selection, err := g.selectBalancedCertificate(candidates, serverName); err == nil && selected != nil {
+	if selected, selection, err := g.selectBalancedCertificate(exactCandidates, serverName); err == nil && selected != nil {
 		g.bindCertificateSelectionToConnection(connAddrKey, selection)
 		return selected.Certificate, nil
 	}
-	if matchedRule {
-		if selected := reverseProxyFallbackCertificateBinding(g.orderedCertBindings); selected != nil && selected.Certificate != nil {
-			return selected.Certificate, nil
-		}
-		reverseProxyCloseClientHelloConn(hello)
-		return nil, common.NewError("tls listener certificate is unavailable")
+	if selected, selection, err := g.selectBalancedCertificate(wildcardCandidates, serverName); err == nil && selected != nil {
+		g.bindCertificateSelectionToConnection(connAddrKey, selection)
+		return selected.Certificate, nil
+	}
+	if selected, selection, err := g.selectBalancedCertificate(g.orderedCertBindings, serverName); err == nil && selected != nil {
+		g.bindCertificateSelectionToConnection(connAddrKey, selection)
+		return selected.Certificate, nil
 	}
 	reverseProxyCloseClientHelloConn(hello)
+	if matchedRule {
+		return nil, common.NewError("tls listener certificate is unavailable")
+	}
 	return nil, common.NewError("unrecognized tls sni")
 }
 
-func (g *reverseProxyListenerGroup) noSNICertificateCandidatesLocked() []*reverseProxyRuleCertificateBinding {
+func (g *reverseProxyListenerGroup) noSNICertificateCandidatesLocked(localIP string) []*reverseProxyRuleCertificateBinding {
 	if g == nil {
 		return nil
 	}
-	candidates := make([]*reverseProxyRuleCertificateBinding, 0)
-	for _, rule := range g.rules {
-		bindings := g.certBindingsByRule[rule.Id]
-		for _, binding := range bindings {
-			if reverseProxyCertificateBindingHasIPSAN(binding) {
-				candidates = append(candidates, binding)
-			}
+	bindings := g.orderedCertBindings
+	if len(bindings) == 0 {
+		bindings = make([]*reverseProxyRuleCertificateBinding, 0)
+		for _, rule := range g.rules {
+			bindings = append(bindings, g.certBindingsByRule[rule.Id]...)
 		}
 	}
-	return candidates
+	ipPreferred, others := reverseProxySplitNoSNICertificateCandidates(bindings, localIP)
+	if len(ipPreferred) > 0 {
+		return ipPreferred
+	}
+	return others
 }
 
 func reverseProxyCloseClientHelloConn(hello *tls.ClientHelloInfo) {

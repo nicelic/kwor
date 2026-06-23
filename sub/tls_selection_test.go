@@ -45,6 +45,31 @@ func TestCollectSNIMatchingTLSRuntimeCertificatesSkipsExpired(t *testing.T) {
 	}
 }
 
+func TestSplitSNITLSRuntimeCertificateCandidates_PrefersExactBeforeWildcard(t *testing.T) {
+	exact := mustTLSRuntimeCertificate(t, []string{"api.example.com"}, nil, "fp-exact")
+	wildcard := mustTLSRuntimeCertificate(t, []string{"*.example.com"}, nil, "fp-wildcard")
+	materials := []*tlsRuntimeCertificate{wildcard, exact}
+
+	exactMatched, wildcardMatched := splitSNITLSRuntimeCertificateCandidates(materials, "api.example.com")
+	if len(exactMatched) != 1 || exactMatched[0] != exact {
+		t.Fatalf("expected exact match bucket to contain exact cert, got %#v", exactMatched)
+	}
+	if len(wildcardMatched) != 1 || wildcardMatched[0] != wildcard {
+		t.Fatalf("expected wildcard bucket to contain wildcard cert, got %#v", wildcardMatched)
+	}
+}
+
+func TestSplitSNITLSRuntimeCertificateCandidates_TreatsIPSNIAsExact(t *testing.T) {
+	ipCert := mustTLSRuntimeCertificate(t, nil, []string{"127.0.0.1"}, "fp-ip")
+	exactMatched, wildcardMatched := splitSNITLSRuntimeCertificateCandidates([]*tlsRuntimeCertificate{ipCert}, "127.0.0.1")
+	if len(exactMatched) != 1 || exactMatched[0] != ipCert {
+		t.Fatalf("expected ip sni to match exact bucket, got %#v", exactMatched)
+	}
+	if len(wildcardMatched) != 0 {
+		t.Fatalf("expected no wildcard bucket for ip sni, got %#v", wildcardMatched)
+	}
+}
+
 func TestSplitNoSNITLSRuntimeCertificateCandidates_PrefersIPCertAndFallsBack(t *testing.T) {
 	ipCert := mustTLSRuntimeCertificate(t, nil, []string{"127.0.0.1"}, "fp-ip")
 	domainCert := mustTLSRuntimeCertificate(t, []string{"example.com"}, nil, "fp-domain")
@@ -65,6 +90,14 @@ func TestSplitNoSNITLSRuntimeCertificateCandidates_PrefersIPCertAndFallsBack(t *
 	}
 	if len(others) != 3 {
 		t.Fatalf("expected all certs in fallback set, got=%d", len(others))
+	}
+
+	ipPreferred, others = splitNoSNITLSRuntimeCertificateCandidates(materials, "")
+	if len(ipPreferred) != 0 {
+		t.Fatalf("expected unknown local ip to skip ip-preferred bucket, got=%d", len(ipPreferred))
+	}
+	if len(others) != 3 {
+		t.Fatalf("expected all certs in fallback set when local ip is unknown, got=%d", len(others))
 	}
 }
 
