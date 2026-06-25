@@ -321,6 +321,8 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetTrafficOverview(c)
 	case "traffic-overview-vnstat-versions":
 		a.ApiService.GetTrafficOverviewVnstatVersions(c)
+	case "traffic-overview-vnstat-update-info":
+		a.ApiService.GetTrafficOverviewVnstatUpdateInfo(c)
 	case "firewall-overview":
 		a.ApiService.GetFirewallOverview(c)
 	case "port-forward-overview":
@@ -405,6 +407,8 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetPanelUpdateStatus(c)
 	case "panel-update-versions":
 		a.ApiService.GetPanelUpdateVersions(c)
+	case "panel-update-log":
+		a.ApiService.GetPanelUpdateLog(c)
 	default:
 		jsonMsg(c, "failed", common.NewError("unknown action: ", action))
 	}

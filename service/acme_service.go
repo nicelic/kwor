@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"io"
 	"math"
 	"net/http"
@@ -49,25 +50,27 @@ const (
 	acmeAutoUpgradeKey         = "acmeAutoUpgrade"
 	acmeManagedPathManifestKey = "acmeManagedPathManifest"
 
-	defaultAcmePreferredCA      = "letsencrypt"
-	defaultAcmeChallenge        = "standalone"
-	defaultAcmeKeyLength        = "ec-256"
-	defaultAcmeAutoRenewDays    = 30
-	defaultAcmeInstallScriptURL = "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh"
-	acmeGitHubReleasesAPI       = "https://api.github.com/repos/acmesh-official/acme.sh/releases"
-	acmeGitHubReleaseTagAPI     = "https://api.github.com/repos/acmesh-official/acme.sh/releases/tags/"
-	acmeGitHubTagsAPI           = "https://api.github.com/repos/acmesh-official/acme.sh/tags"
-	acmeLogMaxLines             = 800
-	acmeLogTTL                  = 30 * time.Minute
-	acmeCertificateTypeDomain   = "domain"
-	acmeCertificateTypeIP       = "ip"
-	acmeLEProductionDirectory   = "https://acme-v02.api.letsencrypt.org/directory"
-	acmeLEStagingDirectory      = "https://acme-staging-v02.api.letsencrypt.org/directory"
-	acmeZeroSSLDirectory        = "https://acme.zerossl.com/v2/DV90"
-	acmeIPCertificateMaxIPs     = 100
-	acmeIPCertificatePortHTTP   = 80
-	acmeIPCertificatePortALPN   = 443
-	acmeMaskedEnvValue          = "********"
+	defaultAcmePreferredCA           = "letsencrypt"
+	defaultAcmeChallenge             = "standalone"
+	defaultAcmeKeyLength             = "ec-256"
+	defaultAcmeAutoRenewDays         = 30
+	defaultAcmeInstallScriptURL      = "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh"
+	acmeGitHubReleasesAPI            = "https://api.github.com/repos/acmesh-official/acme.sh/releases"
+	acmeGitHubReleaseTagAPI          = "https://api.github.com/repos/acmesh-official/acme.sh/releases/tags/"
+	acmeGitHubTagsAPI                = "https://api.github.com/repos/acmesh-official/acme.sh/tags"
+	acmeLogMaxLines                  = 800
+	acmeLogTTL                       = 30 * time.Minute
+	acmeCertificateTypeDomain        = "domain"
+	acmeCertificateTypeIP            = "ip"
+	acmeLEProductionDirectory        = "https://acme-v02.api.letsencrypt.org/directory"
+	acmeLEStagingDirectory           = "https://acme-staging-v02.api.letsencrypt.org/directory"
+	acmeZeroSSLDirectory             = "https://acme.zerossl.com/v2/DV90"
+	acmeIPCertificateMaxIPs          = 100
+	acmeIPCertificatePortHTTP        = 80
+	acmeIPCertificatePortALPN        = 443
+	acmeMaskedEnvValue               = "********"
+	acmeManagedWorkspaceStagePrefix  = "acme-home-stage-"
+	acmeManagedWorkspaceBackupPrefix = "acme-home-backup-"
 )
 
 type acmeIPFamilyMode string
@@ -765,9 +768,6 @@ func (s *AcmeService) InstallOrReinstall(payload AcmeInstallPayload) (*AcmeActio
 		if v, err := readAcmeVersionByScript(scriptPath, homeDir); err == nil {
 			beforeVersion = v
 		}
-		if _, removeErr := s.removeManagedAcmeLocked(false); removeErr != nil {
-			return nil, removeErr
-		}
 	}
 
 	tmpFile, err := os.CreateTemp("", "acme-install-*.sh")
@@ -789,13 +789,22 @@ func (s *AcmeService) InstallOrReinstall(payload AcmeInstallPayload) (*AcmeActio
 		return nil, err
 	}
 
-	managedHomeDir := managedAcmeHomeDir()
+	if err := cleanupStaleManagedAcmeInstallWorkspaces(managedAcmeWorkspaceParentDir()); err != nil {
+		return nil, err
+	}
+
+	stagedHomeDir, cleanupStagedHomeDir, err := createManagedAcmeInstallWorkspace(acmeManagedWorkspaceStagePrefix)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanupStagedHomeDir()
+
 	args := []string{
 		tmpPath,
 		"--install-online",
 		"--nocron",
 		"--noprofile",
-		"--home", managedHomeDir,
+		"--home", stagedHomeDir,
 	}
 	if version != "" {
 		args = append(args, "--branch", version)
@@ -808,22 +817,28 @@ func (s *AcmeService) InstallOrReinstall(payload AcmeInstallPayload) (*AcmeActio
 		return nil, common.NewError("install acme.sh failed: ", err)
 	}
 
-	scriptPath := filepath.Clean(filepath.Join(managedHomeDir, "acme.sh"))
-	installed := pathExists(scriptPath)
-	if !installed {
-		// Fallback for legacy installs that may exist in user-specific locations.
-		resolvedPath, _, resolved := s.resolveAcmeScript()
-		if !resolved {
-			detail := summarizeAcmeInstallOutput(output)
-			if detail != "" {
-				return nil, common.NewError("acme.sh install finished but script path was not found: ", detail)
-			}
-			return nil, common.NewError("acme.sh install finished but script path was not found")
+	stagedScriptPath := filepath.Clean(filepath.Join(stagedHomeDir, "acme.sh"))
+	if !pathExists(stagedScriptPath) {
+		detail := summarizeAcmeInstallOutput(output)
+		if detail != "" {
+			return nil, common.NewError("acme.sh install finished but staged script path was not found: ", detail)
 		}
-		scriptPath = resolvedPath
+		return nil, common.NewError("acme.sh install finished but staged script path was not found")
+	}
+	if _, err := readAcmeVersionByScript(stagedScriptPath, stagedHomeDir); err != nil {
+		detail := summarizeAcmeInstallOutput(output)
+		if detail != "" {
+			return nil, common.NewError("staged acme.sh install is incomplete: ", detail)
+		}
+		return nil, common.NewError("staged acme.sh install is incomplete: ", err)
 	}
 
-	if err := s.persistManagedAcmeManifestLocked(managedHomeDir); err != nil {
+	scriptPath, err := s.activateManagedAcmeInstallLocked(stagedHomeDir)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.persistManagedAcmeManifestLocked(managedAcmeHomeDir()); err != nil {
 		return nil, err
 	}
 
@@ -3485,6 +3500,242 @@ func legacyManagedAcmeHomeDir() string {
 	return filepath.Join(config.GetDataDir(), "acme", "home")
 }
 
+func managedAcmeWorkspaceParentDir() string {
+	return filepath.Clean(filepath.Dir(managedAcmeHomeDir()))
+}
+
+func createManagedAcmeInstallWorkspace(prefix string) (string, func(), error) {
+	parentDir := managedAcmeWorkspaceParentDir()
+	if parentDir == "" || parentDir == "." {
+		return "", nil, common.NewError("acme managed workspace parent directory is empty")
+	}
+	if err := os.MkdirAll(parentDir, 0o755); err != nil {
+		return "", nil, common.NewError("create acme managed workspace parent directory failed: ", err)
+	}
+	baseDir, err := os.MkdirTemp(parentDir, prefix)
+	if err != nil {
+		return "", nil, common.NewError("create acme managed workspace failed: ", err)
+	}
+	cleanup := func() {
+		if err := os.RemoveAll(baseDir); err != nil && !os.IsNotExist(err) {
+			logger.Warning("cleanup acme managed workspace failed: ", err)
+		}
+	}
+	return baseDir, cleanup, nil
+}
+
+func cleanupStaleManagedAcmeInstallWorkspaces(parentDir string) error {
+	parentDir = filepath.Clean(strings.TrimSpace(parentDir))
+	if parentDir == "" || parentDir == "." {
+		return nil
+	}
+	entries, err := os.ReadDir(parentDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return common.NewError("list acme managed workspaces failed: ", err)
+	}
+	for _, entry := range entries {
+		if entry == nil || !entry.IsDir() {
+			continue
+		}
+		name := strings.TrimSpace(entry.Name())
+		if !isManagedAcmeWorkspaceName(name) {
+			continue
+		}
+		target := filepath.Join(parentDir, name)
+		if err := os.RemoveAll(target); err != nil && !os.IsNotExist(err) {
+			return common.NewError("remove stale acme managed workspace failed: ", target, ": ", err)
+		}
+	}
+	return nil
+}
+
+func isManagedAcmeWorkspaceName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	return strings.HasPrefix(name, acmeManagedWorkspaceStagePrefix) ||
+		strings.HasPrefix(name, acmeManagedWorkspaceBackupPrefix)
+}
+
+func acmeManagedInstallRoots() []string {
+	roots := []string{
+		filepath.Clean(managedAcmeHomeDir()),
+		filepath.Clean(legacyManagedAcmeHomeDir()),
+	}
+	result := make([]string, 0, len(roots))
+	seen := make(map[string]struct{}, len(roots))
+	for _, root := range roots {
+		root = filepath.Clean(strings.TrimSpace(root))
+		if root == "" || root == "." {
+			continue
+		}
+		if _, exists := seen[root]; exists {
+			continue
+		}
+		seen[root] = struct{}{}
+		result = append(result, root)
+	}
+	return result
+}
+
+func listManagedAcmeInstallEntryNames(root string) ([]string, error) {
+	root = filepath.Clean(strings.TrimSpace(root))
+	if root == "" || root == "." {
+		return []string{}, nil
+	}
+	if !pathExists(root) {
+		return []string{}, nil
+	}
+
+	names := make([]string, 0, len(acmeManagedRootFileNames)+len(acmeManagedRootDirNames))
+	for name := range acmeManagedRootFileNames {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if pathExists(filepath.Join(root, name)) {
+			names = append(names, name)
+		}
+	}
+	for name := range acmeManagedRootDirNames {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if pathExists(filepath.Join(root, name)) {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func rollbackManagedAcmeInstallActivation(targetHomeDir string, backupRoot string, movedNew []string, movedOld []string) error {
+	targetHomeDir = filepath.Clean(strings.TrimSpace(targetHomeDir))
+	backupRoot = filepath.Clean(strings.TrimSpace(backupRoot))
+	var restoreErrs []string
+
+	for i := len(movedNew) - 1; i >= 0; i-- {
+		name := strings.TrimSpace(movedNew[i])
+		if name == "" {
+			continue
+		}
+		target := filepath.Join(targetHomeDir, name)
+		if err := os.RemoveAll(target); err != nil && !os.IsNotExist(err) {
+			restoreErrs = append(restoreErrs, fmt.Sprintf("remove new artifact %s failed: %v", target, err))
+		}
+	}
+
+	if targetHomeDir != "" && targetHomeDir != "." {
+		if err := os.MkdirAll(targetHomeDir, 0o755); err != nil {
+			restoreErrs = append(restoreErrs, fmt.Sprintf("recreate managed home failed: %v", err))
+		}
+	}
+	for i := len(movedOld) - 1; i >= 0; i-- {
+		name := strings.TrimSpace(movedOld[i])
+		if name == "" {
+			continue
+		}
+		src := filepath.Join(backupRoot, name)
+		if !pathExists(src) {
+			continue
+		}
+		dst := filepath.Join(targetHomeDir, name)
+		if err := os.Rename(src, dst); err != nil {
+			restoreErrs = append(restoreErrs, fmt.Sprintf("restore old artifact %s failed: %v", dst, err))
+		}
+	}
+
+	if len(restoreErrs) > 0 {
+		return common.NewError(strings.Join(restoreErrs, "; "))
+	}
+	return nil
+}
+
+func (s *AcmeService) activateManagedAcmeInstallLocked(stagedHomeDir string) (string, error) {
+	stagedHomeDir = filepath.Clean(strings.TrimSpace(stagedHomeDir))
+	if stagedHomeDir == "" || stagedHomeDir == "." {
+		return "", common.NewError("staged acme home directory is empty")
+	}
+	stageScriptPath := filepath.Join(stagedHomeDir, "acme.sh")
+	if !pathExists(stageScriptPath) {
+		return "", common.NewError("staged acme.sh script was not found")
+	}
+
+	targetHomeDir := filepath.Clean(managedAcmeHomeDir())
+	if err := os.MkdirAll(targetHomeDir, 0o755); err != nil {
+		return "", common.NewError("create managed acme home directory failed: ", err)
+	}
+
+	backupRoot, cleanupBackup, err := createManagedAcmeInstallWorkspace(acmeManagedWorkspaceBackupPrefix)
+	if err != nil {
+		return "", err
+	}
+	defer cleanupBackup()
+
+	oldNames, err := listManagedAcmeInstallEntryNames(targetHomeDir)
+	if err != nil {
+		return "", err
+	}
+	movedOld := make([]string, 0, len(oldNames))
+	for _, name := range oldNames {
+		src := filepath.Join(targetHomeDir, name)
+		dst := filepath.Join(backupRoot, name)
+		if err := os.Rename(src, dst); err != nil {
+			rollbackErr := rollbackManagedAcmeInstallActivation(targetHomeDir, backupRoot, nil, movedOld)
+			if rollbackErr != nil {
+				return "", common.NewError("backup current managed acme install failed: ", err, "; rollback failed: ", rollbackErr)
+			}
+			return "", common.NewError("backup current managed acme install failed: ", err)
+		}
+		movedOld = append(movedOld, name)
+	}
+
+	newNames, err := listManagedAcmeInstallEntryNames(stagedHomeDir)
+	if err != nil {
+		rollbackErr := rollbackManagedAcmeInstallActivation(targetHomeDir, backupRoot, nil, movedOld)
+		if rollbackErr != nil {
+			return "", common.NewError("list staged managed acme install failed: ", err, "; rollback failed: ", rollbackErr)
+		}
+		return "", common.NewError("list staged managed acme install failed: ", err)
+	}
+	if len(newNames) == 0 {
+		rollbackErr := rollbackManagedAcmeInstallActivation(targetHomeDir, backupRoot, nil, movedOld)
+		if rollbackErr != nil {
+			return "", common.NewError("staged managed acme install is empty; rollback failed: ", rollbackErr)
+		}
+		return "", common.NewError("staged managed acme install is empty")
+	}
+
+	movedNew := make([]string, 0, len(newNames))
+	for _, name := range newNames {
+		src := filepath.Join(stagedHomeDir, name)
+		dst := filepath.Join(targetHomeDir, name)
+		if err := os.Rename(src, dst); err != nil {
+			rollbackErr := rollbackManagedAcmeInstallActivation(targetHomeDir, backupRoot, movedNew, movedOld)
+			if rollbackErr != nil {
+				return "", common.NewError("activate staged acme install failed: ", err, "; rollback failed: ", rollbackErr)
+			}
+			return "", common.NewError("activate staged acme install failed: ", err)
+		}
+		movedNew = append(movedNew, name)
+	}
+
+	scriptPath := filepath.Clean(filepath.Join(targetHomeDir, "acme.sh"))
+	if !pathExists(scriptPath) {
+		rollbackErr := rollbackManagedAcmeInstallActivation(targetHomeDir, backupRoot, movedNew, movedOld)
+		if rollbackErr != nil {
+			return "", common.NewError("activated acme.sh script path was not found; rollback failed: ", rollbackErr)
+		}
+		return "", common.NewError("activated acme.sh script path was not found")
+	}
+	return scriptPath, nil
+}
+
 func acmeHomeArgs(homeDir string) []string {
 	homeDir = strings.TrimSpace(homeDir)
 	if homeDir == "" {
@@ -3955,11 +4206,14 @@ func cleanupAcmeWorkingTree(homeDir string, mainDomain string, useECC bool) {
 	if homeDir == "" || mainDomain == "" {
 		return
 	}
-	candidates := []string{
-		filepath.Join(homeDir, mainDomain),
-		filepath.Join(homeDir, mainDomain+"_ecc"),
-		filepath.Join(homeDir, mainDomain+"_rsa"),
-		filepath.Join(homeDir, "backup"),
+	candidates := []string{}
+	if useECC {
+		candidates = append(candidates, filepath.Join(homeDir, mainDomain+"_ecc"))
+	} else {
+		candidates = append(candidates,
+			filepath.Join(homeDir, mainDomain),
+			filepath.Join(homeDir, mainDomain+"_rsa"),
+		)
 	}
 	for _, candidate := range candidates {
 		candidate = filepath.Clean(candidate)
@@ -3969,94 +4223,6 @@ func cleanupAcmeWorkingTree(homeDir string, mainDomain string, useECC bool) {
 		if err := os.RemoveAll(candidate); err != nil && !os.IsNotExist(err) {
 			logger.Warning("cleanup acme working tree failed: ", candidate, ": ", err)
 		}
-	}
-}
-
-func cleanupManagedAcmeWorktrees(root string) error {
-	root = filepath.Clean(strings.TrimSpace(root))
-	if root == "" || !pathExists(root) {
-		return nil
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	for _, entry := range entries {
-		name := strings.TrimSpace(entry.Name())
-		if name == "" {
-			continue
-		}
-		target := filepath.Join(root, name)
-		if entry.IsDir() {
-			if _, ok := acmeManagedRootDirNames[name]; ok {
-				continue
-			}
-			if name == "backup" || strings.HasSuffix(name, "_ecc") || strings.HasSuffix(name, "_rsa") || hasAcmeCertificateBundleArtifacts(target) {
-				if err := os.RemoveAll(target); err != nil && !os.IsNotExist(err) {
-					return err
-				}
-				continue
-			}
-			logger.Warning("skip unknown acme root directory while cleaning worktrees: ", target)
-			continue
-		}
-		if _, ok := acmeManagedRootFileNames[name]; ok {
-			continue
-		}
-		if shouldRemoveAcmeRootArtifact(name) {
-			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-			continue
-		}
-		logger.Warning("skip unknown acme root file while cleaning worktrees: ", target)
-	}
-	return nil
-}
-
-func hasAcmeCertificateBundleArtifacts(dir string) bool {
-	dir = filepath.Clean(strings.TrimSpace(dir))
-	if dir == "" {
-		return false
-	}
-	checks := []string{
-		"cert.pem",
-		"key.pem",
-		"fullchain.pem",
-		"chain.pem",
-		"cert.cer",
-		"key.cer",
-		"fullchain.cer",
-		"chain.cer",
-		"cert.key",
-		"fullchain.key",
-		"chain.key",
-	}
-	for _, name := range checks {
-		if pathExists(filepath.Join(dir, name)) {
-			return true
-		}
-	}
-	return false
-}
-
-func shouldRemoveAcmeRootArtifact(name string) bool {
-	name = strings.TrimSpace(strings.ToLower(name))
-	if name == "" {
-		return false
-	}
-	switch {
-	case strings.HasSuffix(name, ".cer"),
-		strings.HasSuffix(name, ".key"),
-		strings.HasSuffix(name, ".pem"),
-		strings.HasSuffix(name, ".csr"),
-		strings.HasSuffix(name, ".conf"):
-		return true
-	default:
-		return false
 	}
 }
 
@@ -4197,13 +4363,25 @@ func cleanupLegacyCertificateManagedDirs() error {
 	); err != nil {
 		return err
 	}
-	if err := cleanupManagedAcmeWorktrees(filepath.Join(config.GetDataDir(), "acme")); err != nil {
+	if err := cleanupStaleManagedAcmeInstallWorkspaces(managedAcmeWorkspaceParentDir()); err != nil {
 		return err
 	}
-	if err := cleanupManagedAcmeWorktrees(filepath.Join(config.GetDataDir(), "acme", "home")); err != nil {
+	if err := cleanupObsoleteLegacyManagedAcmeInstallRoot(); err != nil {
 		return err
 	}
 	return nil
+}
+
+func cleanupObsoleteLegacyManagedAcmeInstallRoot() error {
+	currentScript := filepath.Join(managedAcmeHomeDir(), "acme.sh")
+	if !pathExists(currentScript) {
+		return nil
+	}
+	legacyRoot := filepath.Clean(legacyManagedAcmeHomeDir())
+	if legacyRoot == "" || legacyRoot == "." || !pathExists(legacyRoot) {
+		return nil
+	}
+	return removeManagedInstallArtifactsAtRoot(legacyRoot, true)
 }
 
 func cleanupLegacyCertificateManagedDir(root string, whitelist map[string]struct{}, removeUnknown bool) error {
@@ -5248,8 +5426,12 @@ func (s *AcmeService) removeManagedAcmeWithOptionsLocked(opts acmeRemoveOptions)
 	var removedUnits []string
 	var outputParts []string
 
+	if err := cleanupStaleManagedAcmeInstallWorkspaces(managedAcmeWorkspaceParentDir()); err != nil {
+		return nil, err
+	}
+
 	scriptPath, homeDir, installed := s.resolveAcmeScript()
-	if installed {
+	if installed && (isManagedAcmeScriptPath(scriptPath) || isManagedAcmeHomeDir(homeDir)) {
 		if uninstallOutput, err := runCommandOutputWithTimeoutEnv(60*time.Second, scriptPath, append(acmeHomeArgs(homeDir), "--uninstall"), nil); err == nil {
 			trimmed := strings.TrimSpace(uninstallOutput)
 			if trimmed != "" {
@@ -5289,8 +5471,11 @@ func (s *AcmeService) removeManagedAcmeWithOptionsLocked(opts acmeRemoveOptions)
 	if err := s.setString(acmeManagedPathManifestKey, ""); err != nil {
 		return nil, err
 	}
-	if err := s.setString(acmeScriptPathKey, ""); err != nil {
-		return nil, err
+	savedScriptPath := strings.TrimSpace(s.readSettingWithDefault(acmeScriptPathKey, ""))
+	if savedScriptPath == "" || isManagedAcmeScriptPath(savedScriptPath) || isManagedAcmeHomeDir(filepath.Dir(savedScriptPath)) {
+		if err := s.setString(acmeScriptPathKey, ""); err != nil {
+			return nil, err
+		}
 	}
 
 	if opts.removeCertificates {
@@ -5370,18 +5555,24 @@ func (s *AcmeService) removeManagedFilesByManifestLocked() (bool, error) {
 	if err := json.Unmarshal([]byte(manifestRaw), &paths); err != nil {
 		return false, nil
 	}
+	sort.Slice(paths, func(i, j int) bool {
+		left := filepath.Clean(strings.TrimSpace(paths[i]))
+		right := filepath.Clean(strings.TrimSpace(paths[j]))
+		return len(strings.Split(left, string(os.PathSeparator))) > len(strings.Split(right, string(os.PathSeparator)))
+	})
 
-	managedRoot := filepath.Clean(managedAcmeHomeDir())
-	managedRootSlash := filepath.ToSlash(managedRoot)
+	touchedRoots := make(map[string]struct{})
+
 	for _, raw := range paths {
 		cleaned := filepath.Clean(strings.TrimSpace(raw))
 		if cleaned == "" {
 			continue
 		}
-		cleanedSlash := filepath.ToSlash(cleaned)
-		if cleanedSlash != managedRootSlash && !strings.HasPrefix(cleanedSlash, managedRootSlash+"/") {
+		root, rel, matched := matchManagedAcmeInstallRoot(cleaned)
+		if !matched || !isAllowedManagedAcmeManifestRelativePath(rel) {
 			continue
 		}
+		touchedRoots[root] = struct{}{}
 		if !pathExists(cleaned) {
 			continue
 		}
@@ -5390,26 +5581,35 @@ func (s *AcmeService) removeManagedFilesByManifestLocked() (bool, error) {
 			continue
 		}
 		if info.IsDir() {
-			entries, readErr := os.ReadDir(cleaned)
-			if readErr != nil {
-				continue
-			}
-			if len(entries) == 0 {
-				if err := os.Remove(cleaned); err != nil && !os.IsNotExist(err) {
-					return true, common.NewError("remove empty managed acme directory failed: ", cleaned, ": ", err)
-				}
-			}
 			continue
 		}
 		if err := os.Remove(cleaned); err != nil && !os.IsNotExist(err) {
 			return true, common.NewError("remove managed acme file failed: ", cleaned, ": ", err)
 		}
 	}
+	for root := range touchedRoots {
+		if err := cleanupEmptyManagedAcmeInstallDirs(root); err != nil {
+			return true, err
+		}
+	}
 	return true, nil
 }
 
 func (s *AcmeService) removeManagedRootFallbackLocked(manifestLoaded bool) error {
-	root := filepath.Clean(managedAcmeHomeDir())
+	_ = manifestLoaded
+	for _, root := range acmeManagedInstallRoots() {
+		if err := removeManagedInstallArtifactsAtRoot(root, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeManagedInstallArtifactsAtRoot(root string, removeManagedDirContents bool) error {
+	root = filepath.Clean(strings.TrimSpace(root))
+	if root == "" || root == "." {
+		return nil
+	}
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -5427,12 +5627,20 @@ func (s *AcmeService) removeManagedRootFallbackLocked(manifestLoaded bool) error
 			if _, ok := acmeManagedRootDirNames[name]; !ok {
 				continue
 			}
-			if manifestLoaded {
+			if removeManagedDirContents {
+				if err := os.RemoveAll(target); err != nil && !os.IsNotExist(err) {
+					return common.NewError("remove managed acme fallback directory failed: ", target, ": ", err)
+				}
 				continue
 			}
-			subEntries, subErr := os.ReadDir(target)
-			if subErr == nil && len(subEntries) == 0 {
-				_ = os.Remove(target)
+			empty, pruneErr := pruneManagedAcmeDirTreeIfEmpty(target)
+			if pruneErr != nil {
+				return common.NewError("cleanup managed acme fallback directory failed: ", target, ": ", pruneErr)
+			}
+			if empty {
+				if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+					return common.NewError("remove empty managed acme fallback directory failed: ", target, ": ", err)
+				}
 			}
 			continue
 		}
@@ -5441,6 +5649,29 @@ func (s *AcmeService) removeManagedRootFallbackLocked(manifestLoaded bool) error
 		}
 		if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
 			return common.NewError("remove managed acme fallback file failed: ", target, ": ", err)
+		}
+	}
+	if err := cleanupEmptyManagedAcmeInstallDirs(root); err != nil {
+		return err
+	}
+	return nil
+}
+
+func cleanupEmptyManagedAcmeInstallDirs(root string) error {
+	root = filepath.Clean(strings.TrimSpace(root))
+	if root == "" || root == "." || !pathExists(root) {
+		return nil
+	}
+	for name := range acmeManagedRootDirNames {
+		target := filepath.Join(root, strings.TrimSpace(name))
+		empty, err := pruneManagedAcmeDirTreeIfEmpty(target)
+		if err != nil {
+			return common.NewError("cleanup empty managed acme directory failed: ", target, ": ", err)
+		}
+		if empty {
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return common.NewError("remove empty managed acme directory failed: ", target, ": ", err)
+			}
 		}
 	}
 	remain, err := os.ReadDir(root)
@@ -5456,8 +5687,138 @@ func (s *AcmeService) removeManagedRootFallbackLocked(manifestLoaded bool) error
 	return nil
 }
 
+func pruneManagedAcmeDirTreeIfEmpty(root string) (bool, error) {
+	root = filepath.Clean(strings.TrimSpace(root))
+	if root == "" || root == "." {
+		return true, nil
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	if !info.IsDir() {
+		return false, nil
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	empty := true
+	for _, entry := range entries {
+		name := strings.TrimSpace(entry.Name())
+		if name == "" {
+			empty = false
+			continue
+		}
+		target := filepath.Join(root, name)
+		if entry.IsDir() {
+			childEmpty, childErr := pruneManagedAcmeDirTreeIfEmpty(target)
+			if childErr != nil {
+				return false, childErr
+			}
+			if childEmpty {
+				if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+					return false, err
+				}
+				continue
+			}
+			empty = false
+			continue
+		}
+		empty = false
+	}
+	return empty, nil
+}
+
+func isManagedAcmeHomeDir(path string) bool {
+	cleaned := filepath.Clean(strings.TrimSpace(path))
+	if cleaned == "" || cleaned == "." {
+		return false
+	}
+	for _, root := range acmeManagedInstallRoots() {
+		if cleaned == root {
+			return true
+		}
+	}
+	return false
+}
+
+func isManagedAcmeScriptPath(path string) bool {
+	_, rel, matched := matchManagedAcmeInstallRoot(path)
+	if !matched {
+		return false
+	}
+	rel = filepath.Clean(strings.TrimSpace(rel))
+	if rel == "" || rel == "." {
+		return false
+	}
+	return rel == "acme.sh"
+}
+
+func matchManagedAcmeInstallRoot(path string) (string, string, bool) {
+	cleaned := filepath.Clean(strings.TrimSpace(path))
+	if cleaned == "" || cleaned == "." {
+		return "", "", false
+	}
+	for _, root := range acmeManagedInstallRoots() {
+		rel, ok := relativePathWithinRoot(root, cleaned)
+		if ok {
+			return root, rel, true
+		}
+	}
+	return "", "", false
+}
+
+func relativePathWithinRoot(root string, target string) (string, bool) {
+	root = filepath.Clean(strings.TrimSpace(root))
+	target = filepath.Clean(strings.TrimSpace(target))
+	if root == "" || root == "." || target == "" || target == "." {
+		return "", false
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return "", false
+	}
+	rel = filepath.Clean(rel)
+	if rel == "." {
+		return rel, true
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	return rel, true
+}
+
+func isAllowedManagedAcmeManifestRelativePath(rel string) bool {
+	rel = filepath.Clean(strings.TrimSpace(rel))
+	if rel == "" || rel == "." {
+		return false
+	}
+	parts := strings.Split(rel, string(os.PathSeparator))
+	if len(parts) == 0 {
+		return false
+	}
+	first := strings.TrimSpace(parts[0])
+	if first == "" {
+		return false
+	}
+	if _, ok := acmeManagedRootDirNames[first]; ok {
+		return true
+	}
+	if _, ok := acmeManagedRootFileNames[first]; ok {
+		return len(parts) == 1
+	}
+	return false
+}
+
 func (s *AcmeService) persistManagedAcmeManifestLocked(homeDir string) error {
-	files, err := collectManagedAcmePaths(homeDir)
+	files, err := collectManagedAcmeInstallPaths(homeDir)
 	if err != nil {
 		return err
 	}
@@ -5468,7 +5829,7 @@ func (s *AcmeService) persistManagedAcmeManifestLocked(homeDir string) error {
 	return s.setString(acmeManagedPathManifestKey, string(raw))
 }
 
-func collectManagedAcmePaths(homeDir string) ([]string, error) {
+func collectManagedAcmeInstallPaths(homeDir string) ([]string, error) {
 	root := filepath.Clean(strings.TrimSpace(homeDir))
 	if root == "" {
 		return []string{}, nil
@@ -5477,23 +5838,35 @@ func collectManagedAcmePaths(homeDir string) ([]string, error) {
 		return []string{}, nil
 	}
 
-	result := make([]string, 0, 32)
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	result := make([]string, 0, len(acmeManagedRootFileNames)+len(acmeManagedRootDirNames))
+	for name := range acmeManagedRootFileNames {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
 		}
-		if path == root {
-			return nil
+		target := filepath.Join(root, name)
+		if pathExists(target) {
+			result = append(result, filepath.Clean(target))
 		}
-		result = append(result, filepath.Clean(path))
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i] > result[j]
-	})
+	for name := range acmeManagedRootDirNames {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		target := filepath.Join(root, name)
+		if !pathExists(target) {
+			continue
+		}
+		_ = filepath.WalkDir(target, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil || entry == nil || entry.IsDir() {
+				return nil
+			}
+			result = append(result, filepath.Clean(path))
+			return nil
+		})
+	}
+	sort.Strings(result)
 	return result, nil
 }
 
@@ -5771,10 +6144,101 @@ func compareSemverLikeTags(a string, b string) int {
 	if sb == "" {
 		return -1
 	}
-	if sa < sb {
-		return -1
+	return compareSemverLikeSuffix(sa, sb)
+}
+
+func compareSemverLikeSuffix(a string, b string) int {
+	ta := tokenizeSemverLikeSuffix(a)
+	tb := tokenizeSemverLikeSuffix(b)
+	maxLen := len(ta)
+	if len(tb) > maxLen {
+		maxLen = len(tb)
 	}
-	return 1
+	for i := 0; i < maxLen; i++ {
+		if i >= len(ta) {
+			return -1
+		}
+		if i >= len(tb) {
+			return 1
+		}
+		left := ta[i]
+		right := tb[i]
+		leftNum, leftIsNum := parseSemverLikeNumericToken(left)
+		rightNum, rightIsNum := parseSemverLikeNumericToken(right)
+		switch {
+		case leftIsNum && rightIsNum:
+			if leftNum < rightNum {
+				return -1
+			}
+			if leftNum > rightNum {
+				return 1
+			}
+		default:
+			leftLower := strings.ToLower(left)
+			rightLower := strings.ToLower(right)
+			if leftLower < rightLower {
+				return -1
+			}
+			if leftLower > rightLower {
+				return 1
+			}
+		}
+	}
+	return 0
+}
+
+func tokenizeSemverLikeSuffix(value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	result := make([]string, 0, len(value))
+	var current strings.Builder
+	currentKind := byte(0)
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		result = append(result, current.String())
+		current.Reset()
+		currentKind = 0
+	}
+	for _, r := range value {
+		switch {
+		case r >= '0' && r <= '9':
+			if currentKind != 'd' {
+				flush()
+				currentKind = 'd'
+			}
+			current.WriteRune(r)
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z'):
+			if currentKind != 'a' {
+				flush()
+				currentKind = 'a'
+			}
+			current.WriteRune(r)
+		default:
+			flush()
+		}
+	}
+	flush()
+	return result
+}
+
+func parseSemverLikeNumericToken(value string) (int, bool) {
+	if value == "" {
+		return 0, false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 func splitSemverLike(value string) ([]int, string) {

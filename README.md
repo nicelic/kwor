@@ -50,6 +50,7 @@ The installer behavior is:
 2. If no process is running, detect `kwor.service` and reuse the directory encoded in `ExecStart` or `WorkingDirectory`.
 3. If neither exists, perform a fresh install into `/opt/kwor`.
 4. Reuse the program's built-in `kwor stop` and `kwor start` flow for upgrades and first-run setup.
+5. Runtime support files `install.sh` and `kwor.service` are stored under `<binary_dir>/Promanager_data/` (default fresh install: `/opt/kwor/Promanager_data/`), and legacy copies next to the binary are auto-migrated on upgrade.
 
 ### Install legacy Version
 
@@ -66,6 +67,7 @@ The installer also accepts a bare version such as `1.5.7` and normalizes it to `
 1. Get the latest release for your architecture from GitHub:
    [https://github.com/nicelic/kwor/releases/latest](https://github.com/nicelic/kwor/releases/latest)
    (`kwor-linux-amd64.tar.gz` or `kwor-linux-arm64.tar.gz`)
+   Each release also includes `User Manual.md` and `使用手册.md`, and the Linux archives bundle both manuals alongside the runtime files.
 2. Extract the archive:
    ```sh
    tar -zxvf kwor-linux-amd64.tar.gz
@@ -98,6 +100,11 @@ The installer also accepts a bare version such as `1.5.7` and normalizes it to `
 sudo -i
 /opt/kwor/kwor_amd64 uninstall
 ```
+
+Installer support files after installation live under `<binary_dir>/Promanager_data/`. For a default fresh install:
+
+- `/opt/kwor/Promanager_data/install.sh`
+- `/opt/kwor/Promanager_data/kwor.service`
 
 ## Install using Docker
 
@@ -150,7 +157,7 @@ docker run -itd \
     --network host \
     -v $PWD/Promanager_data:/app/Promanager_data \
     --name kwor --restart=unless-stopped \
-    ghcr.io/nicelic/kwor:v1.5.18
+    ghcr.io/nicelic/kwor:v1.5.19
 ```
 
 ### Build your own image

@@ -61,6 +61,17 @@ func removeManagedFile(path string, opts managedFileRewriteOptions) error {
 		return nil
 	}
 
+	info, statErr := os.Lstat(path)
+	if statErr != nil {
+		if os.IsNotExist(statErr) {
+			return nil
+		}
+		return common.NewError("读取配置文件状态失败: ", statErr)
+	}
+	if info.IsDir() {
+		return common.NewError("拒绝删除目录路径: ", path)
+	}
+
 	displayName := normalizeManagedFileDisplayName(opts.DisplayName)
 	immutable, immutableErr := detectFileImmutable(path)
 	if immutableErr == nil && immutable {

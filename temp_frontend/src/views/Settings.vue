@@ -144,8 +144,10 @@
                 density="compact"
                 hide-details
                 :loading="panelRemoteLoading"
-                :disabled="panelVersionItems.length === 0"
+                :disabled="panelRemoteLoading || panelLoadingMoreVersions || panelInstalling"
                 :menu-props="{ maxHeight: 260 }"
+                :no-data-text="panelVersionNoDataText"
+                @update:menu="onPanelVersionMenuUpdate"
               >
                 <template #item="{ props: itemProps, item }">
                   <v-list-item
@@ -229,7 +231,19 @@
                 closable
                 @click:close="panelUpdateFeedback = ''"
               >
-                {{ panelUpdateFeedback }}
+                <div class="d-flex align-center justify-space-between flex-wrap" style="gap: 8px;">
+                  <span>{{ panelUpdateFeedback }}</span>
+                  <v-btn
+                    v-if="panelUpdateStatus?.lastUpdateLogPath"
+                    size="small"
+                    variant="text"
+                    color="primary"
+                    :loading="panelUpdateLogLoading"
+                    @click="openPanelUpdateLogDialog"
+                  >
+                    查看日志
+                  </v-btn>
+                </div>
               </v-alert>
             </v-col>
           </v-row>
@@ -380,6 +394,27 @@
           </v-card-text>
         </v-card>
       </v-overlay>
+
+      <v-dialog v-model="panelUpdateLogDialogVisible" max-width="960">
+        <v-card rounded="xl" :loading="panelUpdateLogLoading">
+          <v-card-title class="text-subtitle-1 font-weight-medium">面板更新日志</v-card-title>
+          <v-divider />
+          <v-card-text>
+            <div class="text-body-2 text-medium-emphasis mb-2">
+              路径：{{ panelUpdateStatus?.lastUpdateLogPath || '-' }}
+            </div>
+            <div class="text-body-2 text-medium-emphasis mb-4" v-if="panelUpdateLogModifiedText">
+              更新时间：{{ panelUpdateLogModifiedText }}
+            </div>
+            <pre class="acme-log">{{ panelUpdateLogContent }}</pre>
+          </v-card-text>
+          <v-divider />
+          <v-card-actions>
+            <v-spacer />
+            <v-btn variant="text" @click="panelUpdateLogDialogVisible = false">关闭</v-btn>
+          </v-card-actions>
+        </v-card>
+      </v-dialog>
     </v-card-text>
   </v-card>
 </template>
@@ -437,6 +472,16 @@ type PanelUpdateStatus = {
   platform?: string
   canInstall?: boolean
   installHint?: string
+  lastUpdateLogPath?: string
+  lastUpdateError?: string
+}
+
+type PanelUpdateLogView = {
+  path?: string
+  exists?: boolean
+  lines?: string[]
+  tooLong?: boolean
+  modified?: number
 }
 
 const panelStatusLoading = ref(false)
@@ -446,7 +491,10 @@ const panelInstalling = ref(false)
 const panelVersionMenuVisible = ref(false)
 const panelInstallDialogVisible = ref(false)
 const panelRestartOverlay = ref(false)
+const panelUpdateLogDialogVisible = ref(false)
+const panelUpdateLogLoading = ref(false)
 const panelUpdateStatus = ref<PanelUpdateStatus | null>(null)
+const panelUpdateLog = ref<PanelUpdateLogView | null>(null)
 const panelSelectedVersion = ref('')
 const panelVersionItems = ref<PanelVersionItem[]>([])
 const panelHasMoreVersions = ref(false)
@@ -528,6 +576,22 @@ const panelRemoteVersionLabel = computed(() => {
   return '未加载'
 })
 
+const panelLastUpdateError = computed(() => String(panelUpdateStatus.value?.lastUpdateError ?? '').trim())
+const panelVersionNoDataText = computed(() => {
+  if (panelRemoteLoading.value) return '正在加载版本列表...'
+  if (panelVersionItems.value.length > 0) return '暂无更多版本'
+  return '点击展开后加载版本列表'
+})
+const panelUpdateLogContent = computed(() => {
+  const lines = Array.isArray(panelUpdateLog.value?.lines) ? panelUpdateLog.value?.lines : []
+  return lines.length > 0 ? lines.join('\n') : '暂无日志'
+})
+const panelUpdateLogModifiedText = computed(() => {
+  const unix = Number(panelUpdateLog.value?.modified ?? 0)
+  if (!Number.isFinite(unix) || unix <= 0) return ''
+  return new Date(unix * 1000).toLocaleString()
+})
+
 const normalizePanelVersionTag = (value: string) => {
   const trimmed = String(value ?? '').trim()
   if (!trimmed) return ''
@@ -540,6 +604,27 @@ const loadPanelUpdateStatus = async () => {
   panelStatusLoading.value = false
   if (msg.success) {
     panelUpdateStatus.value = msg.obj ?? null
+    if (panelLastUpdateError.value) {
+      panelUpdateFeedback.value = `上次更新失败：${panelLastUpdateError.value}`
+      panelUpdateFeedbackType.value = 'warning'
+    }
+  }
+}
+
+const openPanelUpdateLogDialog = async () => {
+  panelUpdateLogDialogVisible.value = true
+  panelUpdateLogLoading.value = true
+  try {
+    const msg = await HttpUtils.get('api/panel-update-log', {}, { silentAuthCheck: true })
+    if (msg.success) {
+      panelUpdateLog.value = msg.obj ?? null
+    } else {
+      panelUpdateLog.value = {
+        lines: [String(msg.msg || '读取日志失败')],
+      }
+    }
+  } finally {
+    panelUpdateLogLoading.value = false
   }
 }
 
@@ -626,6 +711,17 @@ const checkPanelUpdates = async () => {
   await loadPanelVersions(false)
 }
 
+const ensurePanelVersionsLoaded = async () => {
+  if (panelRemoteLoading.value || panelLoadingMoreVersions.value) return
+  if (panelVersionItems.value.length > 0) return
+  await loadPanelVersions(false)
+}
+
+const onPanelVersionMenuUpdate = (opened: boolean) => {
+  if (!opened) return
+  void ensurePanelVersionsLoaded()
+}
+
 const loadMorePanelVersions = async () => {
   if (panelAllVersionsLoaded.value) {
     panelUpdateFeedback.value = '已无版本可以加载'
@@ -658,15 +754,27 @@ const startPanelReconnectPolling = () => {
 
   const poll = async () => {
     try {
-      const resp = await fetch('./api/session', {
-        method: 'GET',
-        credentials: 'include',
-        cache: 'no-store',
-      })
-      if (resp.ok) {
-        const body = await resp.json()
-        if (body?.success === true) {
+      const [sessionMsg, statusMsg] = await Promise.all([
+        HttpUtils.get('api/session', {}, { silentAuthCheck: true }),
+        HttpUtils.get('api/panel-update-status', {}, { silentAuthCheck: true }),
+      ])
+
+      if (sessionMsg.success && statusMsg.success) {
+        const nextStatus = statusMsg.obj ?? null
+        const nextVersion = String(nextStatus?.localVersion ?? '').trim().replace(/^v/i, '')
+        const targetVersion = String(panelSelectedVersion.value ?? '').trim().replace(/^v/i, '')
+
+        if (nextVersion && targetVersion && nextVersion === targetVersion) {
           window.location.reload()
+          return
+        }
+
+        if (String(nextStatus?.lastUpdateError ?? '').trim()) {
+          panelRestartOverlay.value = false
+          panelUpdateStatus.value = nextStatus
+          panelUpdateFeedback.value = `更新失败：${String(nextStatus.lastUpdateError).trim()}`
+          panelUpdateFeedbackType.value = 'error'
+          clearPanelReconnectTimer()
           return
         }
       }

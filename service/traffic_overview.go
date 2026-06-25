@@ -73,6 +73,18 @@ type VnstatVersionListResult struct {
 	Versions []VnstatVersionOption `json:"versions"`
 }
 
+type VnstatVersionCheckResult struct {
+	Supported      bool   `json:"supported"`
+	CanManage      bool   `json:"canManage"`
+	Installed      bool   `json:"installed"`
+	Managed        bool   `json:"managed"`
+	CurrentVersion string `json:"currentVersion"`
+	LatestVersion  string `json:"latestVersion"`
+	HasUpdate      bool   `json:"hasUpdate"`
+	Source         string `json:"source,omitempty"`
+	Message        string `json:"message"`
+}
+
 type trafficOverviewVnstatManifest struct {
 	Managed        bool     `json:"managed"`
 	SystemFamily   string   `json:"systemFamily"`
@@ -611,17 +623,24 @@ func (s *TrafficOverviewService) GetVnstatStatus() VnstatPackageStatus {
 	if binaryPath, err := exec.LookPath("vnstat"); err == nil {
 		status.Installed = true
 		status.BinaryPath = firstNonEmpty(binaryPath, status.BinaryPath)
-		if version := detectVnstatVersion(); version != "" {
-			status.Version = version
-		} else if hasManifest {
-			status.Version = strings.TrimSpace(manifest.Version)
-		}
 		status.Running = isVnstatDaemonRunning()
 		if status.FileCount == 0 {
 			status.FileCount = len(collectVnstatPackageFilesByManager(status.PackageManager))
 		}
 		if status.InstallMethod == "" {
 			status.InstallMethod = normalizeVnstatInstallMethod("", status.PackageManager)
+		}
+		if status.InstallMethod == vnstatInstallMethodSystemPackage {
+			if version := detectInstalledVnstatPackageVersion(status.PackageManager); version != "" {
+				status.Version = version
+			}
+		}
+		if status.Version == "" {
+			if version := detectVnstatVersion(); version != "" {
+				status.Version = version
+			} else if hasManifest {
+				status.Version = strings.TrimSpace(manifest.Version)
+			}
 		}
 	} else if hasManifest {
 		status.Version = strings.TrimSpace(manifest.Version)
@@ -650,6 +669,56 @@ func (s *TrafficOverviewService) GetVnstatVersionOptions() (*VnstatVersionListRe
 	}, nil
 }
 
+func (s *TrafficOverviewService) GetVnstatUpdateInfo() (*VnstatVersionCheckResult, error) {
+	status := s.GetVnstatStatus()
+	result := &VnstatVersionCheckResult{
+		Supported:      status.Supported,
+		CanManage:      status.CanManage,
+		Installed:      status.Installed,
+		Managed:        status.Managed,
+		CurrentVersion: strings.TrimSpace(status.Version),
+	}
+	if !status.Supported {
+		result.Message = firstNonEmpty(status.Error, "vnstat is supported on linux only")
+		return result, nil
+	}
+	if !status.CanManage && strings.TrimSpace(status.ManageHint) != "" {
+		result.Message = strings.TrimSpace(status.ManageHint)
+		return result, nil
+	}
+	if !status.Installed {
+		result.Message = "vnstat 尚未安装"
+		return result, nil
+	}
+
+	latestVersion, source, err := detectLatestVnstatVersion(status)
+	result.Source = source
+	if err != nil {
+		result.Message = strings.TrimSpace(err.Error())
+		return result, nil
+	}
+	result.LatestVersion = strings.TrimSpace(latestVersion)
+	if result.CurrentVersion == "" {
+		result.Message = "已安装 vnstat，但未能识别当前版本"
+		return result, nil
+	}
+	if result.LatestVersion == "" {
+		result.Message = "未能识别远端版本信息"
+		return result, nil
+	}
+
+	switch compareSemverLikeTags(result.CurrentVersion, result.LatestVersion) {
+	case -1:
+		result.HasUpdate = true
+		result.Message = fmt.Sprintf("发现新版本：%s -> %s", result.CurrentVersion, result.LatestVersion)
+	case 0:
+		result.Message = fmt.Sprintf("当前已是最新版本：%s", result.CurrentVersion)
+	default:
+		result.Message = fmt.Sprintf("当前版本 %s 高于可检测版本 %s", result.CurrentVersion, result.LatestVersion)
+	}
+	return result, nil
+}
+
 func (s *TrafficOverviewService) InstallManagedVnstat(version string) (*TrafficOverview, error) {
 	if runtime.GOOS != "linux" {
 		return nil, errors.New("vnstat is supported on linux only")
@@ -666,14 +735,23 @@ func (s *TrafficOverviewService) InstallManagedVnstat(version string) (*TrafficO
 	}
 
 	manager := detectVnstatPackageManagerPlan()
-	if _, lookErr := exec.LookPath("vnstat"); lookErr != nil && os.Geteuid() != 0 {
+	manifest, hasManifest := s.loadVnstatManifest()
+	if binaryPath, lookErr := exec.LookPath("vnstat"); lookErr == nil {
+		currentMethod := detectInstalledVnstatInstallMethod(manifest, hasManifest, manager, binaryPath)
+		if currentMethod != "" && os.Geteuid() != 0 {
+			if currentMethod == vnstatInstallMethodSystemPackage && manager != nil && len(manager.InstallPlan) > 0 {
+				return nil, fmt.Errorf("vnstat reinstall/update requires root. install it manually: %s", strings.Join(manager.InstallPlan[len(manager.InstallPlan)-1], " "))
+			}
+			return nil, errors.New("vnstat reinstall/update requires root")
+		}
+	} else if os.Geteuid() != 0 {
 		if manager != nil && len(manager.InstallPlan) > 0 {
 			return nil, fmt.Errorf("vnstat install requires root. install it manually: %s", strings.Join(manager.InstallPlan[len(manager.InstallPlan)-1], " "))
 		}
 		return nil, errors.New("vnstat install requires root")
 	}
 
-	manifest, err := s.installOrAdoptManagedVnstat(manager)
+	manifest, err := s.installOrReinstallManagedVnstat(manager)
 	if err != nil {
 		return nil, err
 	}
@@ -804,6 +882,25 @@ func removeVnstatWithoutDatabase() error {
 	return cleanupTrafficCapRules()
 }
 
+func (s *TrafficOverviewService) installOrReinstallManagedVnstat(manager *vnstatPackageManagerPlan) (trafficOverviewVnstatManifest, error) {
+	if binaryPath, err := exec.LookPath("vnstat"); err == nil {
+		manifest, hasManifest := s.loadVnstatManifest()
+		currentMethod := detectInstalledVnstatInstallMethod(manifest, hasManifest, manager, binaryPath)
+		switch currentMethod {
+		case vnstatInstallMethodSystemPackage:
+			if manager == nil {
+				return trafficOverviewVnstatManifest{}, errors.New("vnstat is installed, but no supported linux package manager was found for reinstall/update")
+			}
+			return s.installVnstatViaSystemPackage(manager)
+		case vnstatInstallMethodGitHubRelease:
+			return s.installVnstatViaGitHubRelease(manager)
+		default:
+			return s.adoptCurrentVnstatInstallation(manager, binaryPath), nil
+		}
+	}
+	return s.installOrAdoptManagedVnstat(manager)
+}
+
 func (s *TrafficOverviewService) installOrAdoptManagedVnstat(manager *vnstatPackageManagerPlan) (trafficOverviewVnstatManifest, error) {
 	if binaryPath, err := exec.LookPath("vnstat"); err == nil {
 		return s.adoptCurrentVnstatInstallation(manager, binaryPath), nil
@@ -841,13 +938,17 @@ func (s *TrafficOverviewService) adoptCurrentVnstatInstallation(manager *vnstatP
 	}
 
 	filePaths = appendDetectedVnstatManagedPaths(filePaths)
+	version := detectVnstatVersion()
+	if installMethod == vnstatInstallMethodSystemPackage {
+		version = firstNonEmpty(detectInstalledVnstatPackageVersion(packageManager), version)
+	}
 	return trafficOverviewVnstatManifest{
 		Managed:        true,
 		SystemFamily:   systemFamily,
 		PackageManager: packageManager,
 		InstallMethod:  installMethod,
 		PackageName:    vnstatPackageName,
-		Version:        detectVnstatVersion(),
+		Version:        version,
 		BinaryPath:     binaryPath,
 		FilePaths:      filePaths,
 		DataPaths:      defaultVnstatDataPaths(),
@@ -872,13 +973,14 @@ func (s *TrafficOverviewService) installVnstatViaSystemPackage(manager *vnstatPa
 	}
 
 	filePaths := appendDetectedVnstatManagedPaths(collectVnstatPackageFilesByManager(manager.Name))
+	version := firstNonEmpty(detectInstalledVnstatPackageVersion(manager.Name), detectVnstatVersion())
 	return trafficOverviewVnstatManifest{
 		Managed:        true,
 		SystemFamily:   firstNonEmpty(detectLinuxSystemFamily(), manager.SystemFamily),
 		PackageManager: manager.Name,
 		InstallMethod:  vnstatInstallMethodSystemPackage,
 		PackageName:    vnstatPackageName,
-		Version:        detectVnstatVersion(),
+		Version:        version,
 		BinaryPath:     binaryPath,
 		FilePaths:      filePaths,
 		DataPaths:      defaultVnstatDataPaths(),
@@ -1024,6 +1126,21 @@ func normalizeVnstatInstallMethod(method string, packageManager string) string {
 	}
 	if managerByName(packageManager) != nil {
 		return vnstatInstallMethodSystemPackage
+	}
+	return ""
+}
+
+func detectInstalledVnstatInstallMethod(manifest trafficOverviewVnstatManifest, hasManifest bool, manager *vnstatPackageManagerPlan, binaryPath string) string {
+	if hasManifest {
+		if method := normalizeVnstatInstallMethod(manifest.InstallMethod, manifest.PackageManager); method != "" {
+			return method
+		}
+	}
+	if manager != nil && len(collectVnstatPackageFilesByManager(manager.Name)) > 0 {
+		return vnstatInstallMethodSystemPackage
+	}
+	if strings.TrimSpace(binaryPath) != "" && hasManifest && len(manifest.FilePaths) > 0 && strings.EqualFold(manifest.InstallMethod, vnstatInstallMethodGitHubRelease) {
+		return vnstatInstallMethodGitHubRelease
 	}
 	return ""
 }
@@ -2611,6 +2728,177 @@ func parseVnstatPackageFileList(managerName string, output string) []string {
 	return normalizeAbsolutePathList(paths)
 }
 
+func detectLatestVnstatVersion(status VnstatPackageStatus) (string, string, error) {
+	method := normalizeVnstatInstallMethod(status.InstallMethod, status.PackageManager)
+	switch method {
+	case vnstatInstallMethodGitHubRelease:
+		version, err := fetchLatestVnstatGitHubVersion()
+		return version, "github-release", err
+	case vnstatInstallMethodSystemPackage:
+		manager := managerByName(status.PackageManager)
+		if manager == nil {
+			manager = detectVnstatPackageManagerPlan()
+		}
+		if manager == nil {
+			return "", "system-package", errors.New("未识别到可用的软件包管理器，无法检测 vnstat 更新")
+		}
+		version, err := detectLatestVnstatPackageVersion(manager)
+		return version, manager.Name, err
+	default:
+		if manager := managerByName(status.PackageManager); manager != nil {
+			version, err := detectLatestVnstatPackageVersion(manager)
+			return version, manager.Name, err
+		}
+		version, err := fetchLatestVnstatGitHubVersion()
+		return version, "github-release", err
+	}
+}
+
+func fetchLatestVnstatGitHubVersion() (string, error) {
+	release, err := fetchLatestVnstatRelease()
+	if err != nil {
+		return "", fmt.Errorf("获取 GitHub 最新 vnstat 版本失败: %w", err)
+	}
+	version := normalizeDetectedVnstatVersion(firstNonEmpty(release.TagName, release.Name))
+	if version == "" {
+		return "", errors.New("GitHub 最新 vnstat 版本信息无效")
+	}
+	return version, nil
+}
+
+func detectLatestVnstatPackageVersion(manager *vnstatPackageManagerPlan) (string, error) {
+	if manager == nil {
+		return "", errors.New("未识别到可用的软件包管理器，无法检测 vnstat 更新")
+	}
+	switch manager.Name {
+	case "apt-get":
+		return parseVnstatVersionFromCommand(
+			[]string{"apt-cache", "policy", vnstatPackageName},
+			8*time.Second,
+			func(output string) string {
+				for _, rawLine := range strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n") {
+					line := strings.TrimSpace(rawLine)
+					if !strings.HasPrefix(strings.ToLower(line), "candidate:") {
+						continue
+					}
+					version := normalizeDetectedVnstatPackageVersion(strings.TrimSpace(strings.TrimPrefix(line, "Candidate:")))
+					if version != "" && !strings.EqualFold(version, "(none)") {
+						return version
+					}
+				}
+				return ""
+			},
+			"apt 软件源中未找到可用的 vnstat 版本",
+		)
+	case "dnf", "yum":
+		return parseVnstatVersionFromCommand(
+			[]string{manager.Name, "info", vnstatPackageName},
+			12*time.Second,
+			extractLatestRpmInfoVersion,
+			fmt.Sprintf("%s 软件源中未找到可用的 vnstat 版本", manager.Name),
+		)
+	case "zypper":
+		return parseVnstatVersionFromCommand(
+			[]string{"zypper", "info", vnstatPackageName},
+			12*time.Second,
+			func(output string) string {
+				return extractLabeledVnstatVersion(output, "version")
+			},
+			"zypper 软件源中未找到可用的 vnstat 版本",
+		)
+	case "pacman":
+		return parseVnstatVersionFromCommand(
+			[]string{"pacman", "-Si", vnstatPackageName},
+			8*time.Second,
+			func(output string) string {
+				return extractLabeledVnstatPackageVersion(output, "version")
+			},
+			"pacman 软件源中未找到可用的 vnstat 版本",
+		)
+	case "apk":
+		return parseVnstatVersionFromCommand(
+			[]string{"apk", "policy", vnstatPackageName},
+			8*time.Second,
+			extractFirstVnstatPackageVersionToken,
+			"apk 软件源中未找到可用的 vnstat 版本",
+		)
+	default:
+		return "", fmt.Errorf("当前包管理器 %s 暂不支持远端版本检测，可直接点击下载 / 重装尝试更新", manager.Name)
+	}
+}
+
+func parseVnstatVersionFromCommand(command []string, timeout time.Duration, parser func(string) string, emptyErr string) (string, error) {
+	output, err := runCommandOutput(command, timeout)
+	if err != nil {
+		return "", err
+	}
+	version := ""
+	if parser != nil {
+		version = strings.TrimSpace(parser(output))
+	}
+	if version == "" {
+		return "", errors.New(emptyErr)
+	}
+	return version, nil
+}
+
+func detectInstalledVnstatPackageVersion(managerName string) string {
+	manager := managerByName(managerName)
+	if manager == nil {
+		manager = detectVnstatPackageManagerPlan()
+	}
+	if manager == nil {
+		return ""
+	}
+	switch manager.Name {
+	case "apt-get":
+		version, err := parseVnstatVersionFromCommand(
+			[]string{"dpkg-query", "-W", "-f=${Version}", vnstatPackageName},
+			8*time.Second,
+			func(output string) string {
+				return normalizeDetectedVnstatPackageVersion(output)
+			},
+			"",
+		)
+		if err == nil {
+			return version
+		}
+	case "dnf", "yum", "zypper":
+		version, err := parseVnstatVersionFromCommand(
+			[]string{"rpm", "-q", "--queryformat", "%{VERSION}-%{RELEASE}", vnstatPackageName},
+			8*time.Second,
+			func(output string) string {
+				return normalizeDetectedVnstatPackageVersion(output)
+			},
+			"",
+		)
+		if err == nil {
+			return version
+		}
+	case "pacman":
+		version, err := parseVnstatVersionFromCommand(
+			[]string{"pacman", "-Q", vnstatPackageName},
+			8*time.Second,
+			extractInstalledPacmanVnstatVersion,
+			"",
+		)
+		if err == nil {
+			return version
+		}
+	case "apk":
+		version, err := parseVnstatVersionFromCommand(
+			[]string{"apk", "info", "-v", vnstatPackageName},
+			8*time.Second,
+			extractInstalledApkVnstatVersion,
+			"",
+		)
+		if err == nil {
+			return version
+		}
+	}
+	return ""
+}
+
 func detectVnstatVersion() string {
 	if _, err := exec.LookPath("vnstat"); err != nil {
 		return ""
@@ -2634,6 +2922,153 @@ func extractVnstatVersion(output string) string {
 		}
 		if looksLikeDottedVersion(candidate) {
 			return candidate
+		}
+	}
+	return ""
+}
+
+func normalizeDetectedVnstatVersion(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	if version := extractVnstatVersion(trimmed); version != "" {
+		return version
+	}
+	return ""
+}
+
+func normalizeDetectedVnstatPackageVersion(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	if idx := strings.Index(trimmed, ":"); idx > 0 {
+		prefix := strings.TrimSpace(trimmed[:idx])
+		isEpoch := prefix != ""
+		for _, r := range prefix {
+			if r < '0' || r > '9' {
+				isEpoch = false
+				break
+			}
+		}
+		if isEpoch {
+			trimmed = strings.TrimSpace(trimmed[idx+1:])
+		}
+	}
+	fields := strings.Fields(trimmed)
+	for _, field := range fields {
+		if normalized := normalizeDetectedVnstatPackageVersionToken(field); normalized != "" {
+			return normalized
+		}
+	}
+	return ""
+}
+
+func normalizeDetectedVnstatPackageVersionToken(value string) string {
+	token := strings.Trim(value, " \t\r\n,;:()[]{}\"'")
+	if token == "" {
+		return ""
+	}
+	lowerToken := strings.ToLower(token)
+	prefix := strings.ToLower(vnstatPackageName) + "-"
+	if strings.HasPrefix(lowerToken, prefix) {
+		token = strings.TrimSpace(token[len(prefix):])
+	}
+	if version := extractVnstatVersion(token); version != "" {
+		return version
+	}
+	return ""
+}
+
+func extractLabeledVnstatVersion(output string, label string) string {
+	target := strings.ToLower(strings.TrimSpace(label))
+	version := ""
+	for _, rawLine := range strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(key)) != target {
+			continue
+		}
+		if normalized := normalizeDetectedVnstatVersion(value); normalized != "" {
+			version = normalized
+		}
+	}
+	return version
+}
+
+func extractLabeledVnstatPackageVersion(output string, label string) string {
+	target := strings.ToLower(strings.TrimSpace(label))
+	version := ""
+	for _, rawLine := range strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(key)) != target {
+			continue
+		}
+		if normalized := normalizeDetectedVnstatPackageVersion(value); normalized != "" {
+			version = normalized
+		}
+	}
+	return version
+}
+
+func extractLatestRpmInfoVersion(output string) string {
+	version := ""
+	for _, rawLine := range strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "version":
+			if normalized := normalizeDetectedVnstatPackageVersion(value); normalized != "" {
+				version = normalized
+			}
+		}
+	}
+	return version
+}
+
+func extractFirstVnstatVersionToken(output string) string {
+	return normalizeDetectedVnstatVersion(output)
+}
+
+func extractFirstVnstatPackageVersionToken(output string) string {
+	return normalizeDetectedVnstatPackageVersion(output)
+}
+
+func extractInstalledPacmanVnstatVersion(output string) string {
+	fields := strings.Fields(strings.TrimSpace(output))
+	if len(fields) >= 2 {
+		if normalized := normalizeDetectedVnstatPackageVersion(fields[1]); normalized != "" {
+			return normalized
+		}
+	}
+	return normalizeDetectedVnstatPackageVersion(output)
+}
+
+func extractInstalledApkVnstatVersion(output string) string {
+	lines := strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n")
+	for _, rawLine := range lines {
+		if normalized := normalizeDetectedVnstatPackageVersion(strings.TrimSpace(rawLine)); normalized != "" {
+			return normalized
 		}
 	}
 	return ""

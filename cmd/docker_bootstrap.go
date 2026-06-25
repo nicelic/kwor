@@ -36,6 +36,10 @@ func runDockerBootstrap() error {
 	bootstrapMarkerPath := dockerBootstrapMarkerPath()
 	bootstrapMarked := dockerBootstrapFileExists(bootstrapMarkerPath)
 
+	if err := config.MigrateLegacyRuntimeSupportFiles(); err != nil {
+		fmt.Printf("[kwor] bootstrap migrate legacy runtime support files failed: %v\n", err)
+	}
+
 	if err := database.InitDB(config.GetDBPath()); err != nil {
 		return err
 	}

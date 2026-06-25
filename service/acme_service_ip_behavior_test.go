@@ -69,33 +69,45 @@ func TestDetectAcmeIPFamilyMode(t *testing.T) {
 	}
 }
 
-func TestCleanupManagedAcmeWorktreesRemovesLegacyWorktreeAndKeepsSupportFiles(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "acme")
-	worktree := filepath.Join(root, "2400-f880-dbf-8a82--213_ecc")
-	if err := os.MkdirAll(filepath.Join(worktree, "backup"), 0o755); err != nil {
-		t.Fatalf("mkdir worktree failed: %v", err)
+func TestCleanupStaleManagedAcmeInstallWorkspacesRemovesOnlyManagedWorkspaceDirs(t *testing.T) {
+	parentDir := t.TempDir()
+	stageDir := filepath.Join(parentDir, acmeManagedWorkspaceStagePrefix+"old")
+	backupDir := filepath.Join(parentDir, acmeManagedWorkspaceBackupPrefix+"old")
+	keepDir := filepath.Join(parentDir, "acme")
+	if err := os.MkdirAll(filepath.Join(stageDir, "dnsapi"), 0o755); err != nil {
+		t.Fatalf("mkdir stage workspace failed: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(worktree, "cert.pem"), []byte("cert"), 0o644); err != nil {
-		t.Fatalf("write cert.pem failed: %v", err)
+	if err := os.MkdirAll(filepath.Join(backupDir, "dnsapi"), 0o755); err != nil {
+		t.Fatalf("mkdir backup workspace failed: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "account.conf"), []byte("ACCOUNT_EMAIL='a@example.com'"), 0o600); err != nil {
-		t.Fatalf("write account.conf failed: %v", err)
+	if err := os.WriteFile(filepath.Join(stageDir, "acme.sh"), []byte("stage"), 0o644); err != nil {
+		t.Fatalf("write stage acme.sh failed: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Join(root, "ca"), 0o755); err != nil {
-		t.Fatalf("mkdir ca failed: %v", err)
+	if err := os.WriteFile(filepath.Join(backupDir, "account.conf"), []byte("ACCOUNT_EMAIL='backup@example.com'"), 0o600); err != nil {
+		t.Fatalf("write backup account.conf failed: %v", err)
 	}
-	if err := cleanupManagedAcmeWorktrees(root); err != nil {
-		t.Fatalf("cleanupManagedAcmeWorktrees failed: %v", err)
+	if err := os.MkdirAll(filepath.Join(keepDir, "ca"), 0o755); err != nil {
+		t.Fatalf("mkdir keep ca failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(keepDir, "account.conf"), []byte("ACCOUNT_EMAIL='keep@example.com'"), 0o600); err != nil {
+		t.Fatalf("write keep account.conf failed: %v", err)
 	}
 
-	if _, err := os.Stat(worktree); !os.IsNotExist(err) {
-		t.Fatalf("expected worktree removed, stat err=%v", err)
+	if err := cleanupStaleManagedAcmeInstallWorkspaces(parentDir); err != nil {
+		t.Fatalf("cleanupStaleManagedAcmeInstallWorkspaces failed: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "account.conf")); err != nil {
-		t.Fatalf("expected account.conf kept, stat err=%v", err)
+
+	if _, err := os.Stat(stageDir); !os.IsNotExist(err) {
+		t.Fatalf("expected stage workspace removed, stat err=%v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "ca")); err != nil {
-		t.Fatalf("expected ca directory kept, stat err=%v", err)
+	if _, err := os.Stat(backupDir); !os.IsNotExist(err) {
+		t.Fatalf("expected backup workspace removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(keepDir, "account.conf")); err != nil {
+		t.Fatalf("expected keep account.conf preserved, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(keepDir, "ca")); err != nil {
+		t.Fatalf("expected keep ca preserved, stat err=%v", err)
 	}
 }
 

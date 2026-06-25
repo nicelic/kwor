@@ -49,11 +49,15 @@ type KernelManagerService struct{}
 const (
 	kernelProviderXanMod                   = "xanmod"
 	kernelProviderBBRPlus                  = "bbrplus"
+	kernelFailedCleanupDirName             = ".failed-cleanup"
 	kernelDownloadProgressTTL              = 30 * time.Minute
 	kernelUnknownPackageSizeEstimate int64 = 50 * 1024 * 1024
 )
 
+var kernelFailedDownloadCleanupDelay = 5 * time.Second
+
 var kernelDownloadProgressStore = newKernelDownloadProgressStore()
+var kernelDownloadCleanupStore = newKernelDownloadCleanupScheduler()
 
 var bbrplusVersionDisplayPriority = map[string]int{
 	"6.1.81-bbrplus": 0,
@@ -265,6 +269,17 @@ type kernelDownloadProgressSession struct {
 	finishedAt      int64
 }
 
+type kernelDownloadCleanupScheduler struct {
+	mu     sync.Mutex
+	states map[string]*kernelDownloadCleanupState
+}
+
+type kernelDownloadCleanupState struct {
+	key   string
+	phase string
+	timer *time.Timer
+}
+
 type KernelInstallResult struct {
 	Installed             bool     `json:"installed"`
 	NeedsReboot           bool     `json:"needsReboot"`
@@ -433,6 +448,131 @@ func newKernelDownloadProgressStore() *kernelDownloadProgressSessionStore {
 	return &kernelDownloadProgressSessionStore{
 		sessions: make(map[string]*kernelDownloadProgressSession),
 	}
+}
+
+func newKernelDownloadCleanupScheduler() *kernelDownloadCleanupScheduler {
+	return &kernelDownloadCleanupScheduler{
+		states: make(map[string]*kernelDownloadCleanupState),
+	}
+}
+
+func (s *kernelDownloadCleanupScheduler) markRunning(key string) {
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state := s.states[trimmed]
+	if state == nil {
+		s.states[trimmed] = &kernelDownloadCleanupState{
+			key:   trimmed,
+			phase: "running",
+		}
+		return
+	}
+	if state.timer != nil {
+		state.timer.Stop()
+		state.timer = nil
+	}
+	state.phase = "running"
+}
+
+func (s *kernelDownloadCleanupScheduler) markCompleted(key string) {
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state := s.states[trimmed]
+	if state != nil && state.timer != nil {
+		state.timer.Stop()
+	}
+	delete(s.states, trimmed)
+}
+
+func (s *kernelDownloadCleanupScheduler) release(key string) {
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state := s.states[trimmed]
+	if state != nil && state.timer != nil {
+		state.timer.Stop()
+	}
+	delete(s.states, trimmed)
+}
+
+func (s *kernelDownloadCleanupScheduler) isProtected(key string) bool {
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state := s.states[trimmed]
+	if state == nil {
+		return false
+	}
+	return state.phase == "running" || state.phase == "failed" || state.phase == "cleaning"
+}
+
+func (s *kernelDownloadCleanupScheduler) scheduleFailedCleanup(key string, delay time.Duration, fn func() error) {
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" || fn == nil {
+		return
+	}
+	if delay < 0 {
+		delay = 0
+	}
+
+	s.mu.Lock()
+	state := s.states[trimmed]
+	if state == nil {
+		state = &kernelDownloadCleanupState{key: trimmed}
+		s.states[trimmed] = state
+	}
+	if state.timer != nil {
+		state.timer.Stop()
+		state.timer = nil
+	}
+	state.phase = "failed"
+	state.timer = time.AfterFunc(delay, func() {
+		s.mu.Lock()
+		current := s.states[trimmed]
+		if current == nil || current.phase != "failed" {
+			s.mu.Unlock()
+			return
+		}
+		current.phase = "cleaning"
+		current.timer = nil
+		s.mu.Unlock()
+
+		_ = fn()
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		current = s.states[trimmed]
+		if current == nil {
+			return
+		}
+		if current.phase == "running" {
+			return
+		}
+		delete(s.states, trimmed)
+	})
+	s.mu.Unlock()
 }
 
 func (s *kernelDownloadProgressSessionStore) start(id string, totalCount int) *kernelDownloadProgressSession {
@@ -933,6 +1073,10 @@ func (s *KernelManagerService) DownloadPackages(provider, line, version, arch st
 		return nil, fmt.Errorf("no downloadable kernel deb packages found")
 	}
 
+	if err := ensureKernelPackagePair(pkgs.Packages); err != nil {
+		return nil, err
+	}
+
 	if err := s.removeKernelDownloadPath(s.getKernelDownloadRoot("")); err != nil {
 		return nil, err
 	}
@@ -944,6 +1088,7 @@ func (s *KernelManagerService) DownloadPackages(provider, line, version, arch st
 
 	session := kernelDownloadProgressStore.start(downloadSessionID, len(pkgs.Packages))
 	sessionID := session.id
+	kernelDownloadCleanupStore.markRunning(downloadDir)
 	kernelDownloadProgressStore.setTotals(
 		sessionID,
 		int64(len(pkgs.Packages))*kernelUnknownPackageSizeEstimate,
@@ -990,6 +1135,7 @@ func (s *KernelManagerService) DownloadPackages(provider, line, version, arch st
 	for _, pkg := range pkgs.Packages {
 		if strings.TrimSpace(pkg.DownloadURL) == "" {
 			kernelDownloadProgressStore.finishError(sessionID, fmt.Sprintf("package %s does not provide download url", pkg.Name))
+			s.scheduleKernelFailedDownloadCleanup(downloadDir)
 			return nil, fmt.Errorf("package %s does not provide download url", pkg.Name)
 		}
 		localPath := filepath.Join(downloadDir, pkg.Name)
@@ -1002,6 +1148,7 @@ func (s *KernelManagerService) DownloadPackages(provider, line, version, arch st
 			},
 		); err != nil {
 			kernelDownloadProgressStore.finishError(sessionID, fmt.Sprintf("download %s failed: %v", pkg.Name, err))
+			s.scheduleKernelFailedDownloadCleanup(downloadDir)
 			return nil, fmt.Errorf("download %s failed: %w", pkg.Name, err)
 		}
 		kernelDownloadProgressStore.incrementDownloadedCount(sessionID)
@@ -1037,7 +1184,14 @@ func (s *KernelManagerService) DownloadPackages(provider, line, version, arch st
 		})
 	}
 
+	if err := validateKernelDownloadedPair(downloadDir); err != nil {
+		kernelDownloadProgressStore.finishError(sessionID, err.Error())
+		s.scheduleKernelFailedDownloadCleanup(downloadDir)
+		return nil, err
+	}
+
 	kernelDownloadProgressStore.finishSuccess(sessionID)
+	kernelDownloadCleanupStore.markCompleted(downloadDir)
 	if markerErr := s.saveDownloadedMarker(kernelDownloadedMarker{
 		Provider:   strings.TrimSpace(provider),
 		Line:       pkgs.Line,
@@ -1055,7 +1209,95 @@ func (s *KernelManagerService) GetDownloadProgress(id string) *KernelDownloadPro
 	return kernelDownloadProgressStore.get(id)
 }
 
+func ensureKernelPackagePair(packages []KernelPackageItem) error {
+	hasHeaders := false
+	hasImage := false
+	for _, pkg := range packages {
+		switch strings.ToLower(strings.TrimSpace(pkg.Type)) {
+		case "headers":
+			hasHeaders = true
+		case "image":
+			hasImage = true
+		}
+	}
+	if !hasHeaders || !hasImage {
+		return fmt.Errorf("kernel package list is incomplete: headers and image packages are both required")
+	}
+	return nil
+}
+
+func validateKernelDownloadedPair(dir string) error {
+	imageDeb, headersDeb, err := findKernelInstallDebPair(dir)
+	if err != nil {
+		return fmt.Errorf("kernel package pair validation failed: %w", err)
+	}
+	if strings.TrimSpace(imageDeb) == "" || strings.TrimSpace(headersDeb) == "" {
+		return fmt.Errorf("kernel package pair validation failed: headers and image packages must both exist")
+	}
+	return nil
+}
+
+func (s *KernelManagerService) scheduleKernelFailedDownloadCleanup(downloadDir string) {
+	trimmedDir := strings.TrimSpace(downloadDir)
+	if trimmedDir == "" {
+		return
+	}
+
+	cleanupTarget := s.prepareKernelFailedDownloadCleanup(trimmedDir)
+	if cleanupTarget == "" {
+		return
+	}
+	kernelDownloadCleanupStore.scheduleFailedCleanup(cleanupTarget, kernelFailedDownloadCleanupDelay, func() error {
+		return s.cleanupKernelFailedDownloadArtifacts(cleanupTarget)
+	})
+}
+
+func (s *KernelManagerService) cleanupKernelFailedDownloadArtifacts(downloadDir string) error {
+	if err := s.removeKernelDownloadPath(downloadDir); err != nil {
+		return err
+	}
+	if err := s.clearDownloadedMarkerIfWithinRoot(downloadDir); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *KernelManagerService) prepareKernelFailedDownloadCleanup(downloadDir string) string {
+	trimmedDir := strings.TrimSpace(downloadDir)
+	if trimmedDir == "" {
+		return ""
+	}
+
+	kernelDownloadCleanupStore.release(trimmedDir)
+	_ = s.clearDownloadedMarkerIfWithinRoot(trimmedDir)
+
+	info, err := os.Stat(trimmedDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ""
+		}
+		return trimmedDir
+	}
+	if info == nil || !info.IsDir() {
+		return trimmedDir
+	}
+
+	cleanupRoot := s.getKernelFailedCleanupRoot()
+	if err := os.MkdirAll(cleanupRoot, 0o755); err != nil {
+		return trimmedDir
+	}
+
+	cleanupTarget := filepath.Join(cleanupRoot, buildKernelFailedCleanupDirName(trimmedDir))
+	if err := os.Rename(trimmedDir, cleanupTarget); err != nil {
+		return trimmedDir
+	}
+	return cleanupTarget
+}
+
 func (s *KernelManagerService) saveDownloadedMarker(marker kernelDownloadedMarker) error {
+	if database.GetDB() == nil {
+		return nil
+	}
 	normalizedProvider, err := normalizeKernelProvider(marker.Provider)
 	if err != nil {
 		return err
@@ -1083,6 +1325,9 @@ func (s *KernelManagerService) saveDownloadedMarker(marker kernelDownloadedMarke
 }
 
 func (s *KernelManagerService) loadDownloadedMarker() (*kernelDownloadedMarker, error) {
+	if database.GetDB() == nil {
+		return nil, nil
+	}
 	settingSvc := &SettingService{}
 	setting, err := settingSvc.getSetting(kernelDownloadedMarkerSettingKey)
 	if database.IsNotFound(err) {
@@ -1109,6 +1354,9 @@ func (s *KernelManagerService) loadDownloadedMarker() (*kernelDownloadedMarker, 
 }
 
 func (s *KernelManagerService) clearDownloadedMarker() error {
+	if database.GetDB() == nil {
+		return nil
+	}
 	settingSvc := &SettingService{}
 	return settingSvc.saveSetting(kernelDownloadedMarkerSettingKey, "")
 }
@@ -1119,64 +1367,25 @@ func (s *KernelManagerService) GetDownloadedKernelStatus() (*KernelDownloadedSta
 		return nil, err
 	}
 	if marker == nil || marker.Version == "" || marker.Directory == "" {
-		return &KernelDownloadedStatus{Exists: false}, nil
+		return s.findLegacyDownloadedKernelStatus()
 	}
 
 	info, statErr := os.Stat(marker.Directory)
 	if statErr != nil || info == nil || !info.IsDir() {
-		return &KernelDownloadedStatus{Exists: false}, nil
+		_ = s.clearDownloadedMarker()
+		return s.findLegacyDownloadedKernelStatus()
 	}
 
-	entries, readErr := os.ReadDir(marker.Directory)
-	if readErr != nil {
-		return &KernelDownloadedStatus{Exists: false}, nil
+	if err := validateKernelDownloadedPair(marker.Directory); err != nil {
+		_ = s.cleanupKernelFailedDownloadArtifacts(marker.Directory)
+		return s.findLegacyDownloadedKernelStatus()
 	}
-	hasKernelPackages := false
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		if kernelPackagePattern.MatchString(entry.Name()) {
-			hasKernelPackages = true
-			break
-		}
-	}
-	if !hasKernelPackages {
-		return &KernelDownloadedStatus{Exists: false}, nil
-	}
-
-	display := marker.Version
-	if marker.Provider == kernelProviderXanMod {
-		line := strings.TrimSpace(marker.Line)
-		if line != "" {
-			display = line + "/" + marker.Version
-		}
-		if strings.TrimSpace(marker.Arch) != "" {
-			display = display + "/" + marker.Arch
-		}
-	} else if marker.Provider == kernelProviderBBRPlus {
-		if strings.TrimSpace(marker.Arch) != "" {
-			display = marker.Version + "/" + marker.Arch
-		}
-	}
-
-	return &KernelDownloadedStatus{
-		Exists:    true,
-		Provider:  marker.Provider,
-		Line:      marker.Line,
-		Version:   marker.Version,
-		Arch:      marker.Arch,
-		Directory: marker.Directory,
-		Display:   display,
-	}, nil
+	return buildKernelDownloadedStatus(marker), nil
 }
 
 func (s *KernelManagerService) ClearDownloadedKernel() (*KernelDownloadedClearResult, error) {
-	root := s.getKernelDownloadRoot("")
-	if err := s.removeKernelDownloadPath(root); err != nil {
-		return nil, err
-	}
-	if err := s.clearDownloadedMarker(); err != nil {
+	root, err := s.cleanupAllKernelDownloadArtifacts()
+	if err != nil {
 		return nil, err
 	}
 	return &KernelDownloadedClearResult{
@@ -1423,10 +1632,50 @@ func (s *KernelManagerService) InstallDownloadedPackages(provider, line, version
 }
 
 func (s *KernelManagerService) autoCleanupAfterInstall(downloadDir string) error {
-	if err := s.removeKernelDownloadPath(downloadDir); err != nil {
+	if err := s.cleanupKernelFailedDownloadArtifacts(downloadDir); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (s *KernelManagerService) cleanupAllKernelDownloadArtifacts() (string, error) {
+	root := s.getKernelDownloadRoot("")
+	if err := s.removeKernelDownloadPath(root); err != nil {
+		return root, err
+	}
+	if err := s.clearDownloadedMarker(); err != nil {
+		return root, err
+	}
+	return root, nil
+}
+
+func (s *KernelManagerService) clearDownloadedMarkerIfWithinRoot(targetPath string) error {
+	trimmed := strings.TrimSpace(targetPath)
+	if trimmed == "" {
+		return nil
+	}
+	if database.GetDB() == nil {
+		return nil
+	}
+	marker, err := s.loadDownloadedMarker()
+	if err != nil {
+		return err
+	}
+	if marker == nil || strings.TrimSpace(marker.Directory) == "" {
+		return nil
+	}
+	markerDir, err := filepath.Abs(marker.Directory)
+	if err != nil {
+		return err
+	}
+	absTarget, err := filepath.Abs(trimmed)
+	if err != nil {
+		return err
+	}
+	if filepath.Clean(markerDir) != filepath.Clean(absTarget) {
+		return nil
+	}
+	return s.clearDownloadedMarker()
 }
 
 func runKernelAutoRemoveAndClean() error {
@@ -1564,6 +1813,230 @@ func (s *KernelManagerService) getKernelDownloadRoot(provider string) string {
 	return filepath.Join(config.GetDataDir(), "kernel")
 }
 
+func (s *KernelManagerService) getKernelFailedCleanupRoot() string {
+	return filepath.Join(s.getKernelDownloadRoot(""), kernelFailedCleanupDirName)
+}
+
+func (s *KernelManagerService) findLegacyDownloadedKernelStatus() (*KernelDownloadedStatus, error) {
+	root := s.getKernelDownloadRoot("")
+	candidates, err := s.scanKernelDownloadedDirectories(root)
+	if err != nil {
+		return &KernelDownloadedStatus{Exists: false}, nil
+	}
+	if len(candidates) == 0 {
+		return &KernelDownloadedStatus{Exists: false}, nil
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return len(strings.Split(filepath.Clean(candidates[i]), string(os.PathSeparator))) >
+			len(strings.Split(filepath.Clean(candidates[j]), string(os.PathSeparator)))
+	})
+	targetDir := candidates[0]
+	marker := buildKernelDownloadedMarkerFromPath(targetDir)
+	if marker == nil {
+		return &KernelDownloadedStatus{Exists: false}, nil
+	}
+	_ = s.saveDownloadedMarker(*marker)
+	return buildKernelDownloadedStatus(marker), nil
+}
+
+func (s *KernelManagerService) scanKernelDownloadedDirectories(root string) ([]string, error) {
+	absRoot, err := filepath.Abs(strings.TrimSpace(root))
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(absRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if info == nil || !info.IsDir() {
+		return nil, nil
+	}
+
+	cleanupRoot := filepath.Clean(filepath.Join(absRoot, kernelFailedCleanupDirName))
+	matches := make([]string, 0, 4)
+	err = filepath.WalkDir(absRoot, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if d == nil || !d.IsDir() {
+			return nil
+		}
+		cleanPath := filepath.Clean(path)
+		if cleanPath == absRoot {
+			return nil
+		}
+		if isPathWithinRoot(cleanPath, cleanupRoot) {
+			if cleanPath == cleanupRoot {
+				return nil
+			}
+			if kernelDownloadCleanupStore.isProtected(cleanPath) {
+				return filepath.SkipDir
+			}
+			_ = s.removeKernelDownloadPath(cleanPath)
+			return filepath.SkipDir
+		}
+		if kernelDownloadCleanupStore.isProtected(cleanPath) {
+			return filepath.SkipDir
+		}
+		if validateKernelDownloadedPair(cleanPath) == nil {
+			matches = append(matches, cleanPath)
+			return filepath.SkipDir
+		}
+		if hasAnyKernelArtifacts(cleanPath) {
+			_ = s.removeKernelDownloadPath(cleanPath)
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return matches, nil
+}
+
+func isPathWithinRoot(path string, root string) bool {
+	cleanPath := filepath.Clean(strings.TrimSpace(path))
+	cleanRoot := filepath.Clean(strings.TrimSpace(root))
+	if cleanPath == "" || cleanRoot == "" {
+		return false
+	}
+	if cleanPath == cleanRoot {
+		return true
+	}
+	rel, err := filepath.Rel(cleanRoot, cleanPath)
+	if err != nil {
+		return false
+	}
+	rel = filepath.Clean(rel)
+	if rel == "." || rel == "" {
+		return true
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+func hasAnyKernelArtifacts(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() {
+			continue
+		}
+		lower := strings.ToLower(strings.TrimSpace(name))
+		if kernelPackagePattern.MatchString(name) || strings.HasSuffix(lower, ".deb.tmp") || strings.HasSuffix(lower, ".tmp") {
+			return true
+		}
+	}
+	return false
+}
+
+func buildKernelFailedCleanupDirName(downloadDir string) string {
+	base := filepath.Base(filepath.Clean(strings.TrimSpace(downloadDir)))
+	base = sanitizeKernelCleanupPathSegment(base)
+	if base == "" {
+		base = "kernel"
+	}
+	token := strings.TrimPrefix(normalizeKernelDownloadSessionID(""), "kernel-")
+	return "failed-" + base + "-" + token
+}
+
+func sanitizeKernelCleanupPathSegment(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	var builder strings.Builder
+	builder.Grow(len(value))
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+			builder.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			builder.WriteRune(r)
+		case r >= '0' && r <= '9':
+			builder.WriteRune(r)
+		case r == '-' || r == '_' || r == '.':
+			builder.WriteRune(r)
+		default:
+			builder.WriteByte('_')
+		}
+	}
+	return strings.Trim(builder.String(), "._-")
+}
+
+func buildKernelDownloadedMarkerFromPath(path string) *kernelDownloadedMarker {
+	cleaned := filepath.Clean(strings.TrimSpace(path))
+	if cleaned == "" {
+		return nil
+	}
+	parts := strings.Split(cleaned, string(os.PathSeparator))
+	if len(parts) < 2 {
+		return nil
+	}
+	for i := range parts {
+		if parts[i] != "kernel" {
+			continue
+		}
+		rest := parts[i+1:]
+		if len(rest) >= 3 {
+			provider := kernelProviderXanMod
+			line := rest[0]
+			version := rest[1]
+			arch := rest[2]
+			if rest[0] == kernelProviderBBRPlus {
+				provider = kernelProviderBBRPlus
+				line = ""
+				version = rest[1]
+				arch = rest[2]
+			}
+			return &kernelDownloadedMarker{
+				Provider:   provider,
+				Line:       line,
+				Version:    version,
+				Arch:       arch,
+				Directory:  cleaned,
+				Downloaded: time.Now().Unix(),
+			}
+		}
+	}
+	return nil
+}
+
+func buildKernelDownloadedStatus(marker *kernelDownloadedMarker) *KernelDownloadedStatus {
+	if marker == nil {
+		return &KernelDownloadedStatus{Exists: false}
+	}
+	display := marker.Version
+	if marker.Provider == kernelProviderXanMod {
+		line := strings.TrimSpace(marker.Line)
+		if line != "" {
+			display = line + "/" + marker.Version
+		}
+		if strings.TrimSpace(marker.Arch) != "" {
+			display = display + "/" + marker.Arch
+		}
+	} else if marker.Provider == kernelProviderBBRPlus {
+		if strings.TrimSpace(marker.Arch) != "" {
+			display = marker.Version + "/" + marker.Arch
+		}
+	}
+	return &KernelDownloadedStatus{
+		Exists:    true,
+		Provider:  marker.Provider,
+		Line:      marker.Line,
+		Version:   marker.Version,
+		Arch:      marker.Arch,
+		Directory: marker.Directory,
+		Display:   display,
+	}
+}
+
 func kernelPackageType(name string) string {
 	lower := strings.ToLower(strings.TrimSpace(name))
 	if strings.Contains(lower, "linux-image-") {
@@ -1596,6 +2069,14 @@ func kernelDebPackageName(path string) string {
 	return strings.TrimSpace(parts[0])
 }
 
+func kernelDebKernelID(path string) string {
+	pkgName := kernelDebPackageName(path)
+	if pkgName == "" {
+		return ""
+	}
+	return extractKernelIDFromPackage(pkgName)
+}
+
 func isKernelPackageInstalled(pkg string) bool {
 	pkg = strings.TrimSpace(pkg)
 	if pkg == "" {
@@ -1622,8 +2103,8 @@ func findKernelInstallDebPair(dir string) (string, string, error) {
 		return "", "", err
 	}
 
-	images := make([]string, 0, 2)
-	headers := make([]string, 0, 2)
+	imagesByID := make(map[string][]string, 2)
+	headersByID := make(map[string][]string, 2)
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -1633,18 +2114,35 @@ func findKernelInstallDebPair(dir string) (string, string, error) {
 			continue
 		}
 		fullPath := filepath.Join(dir, name)
+		kernelID := kernelDebKernelID(fullPath)
+		if kernelID == "" {
+			continue
+		}
 		switch kernelPackageType(name) {
 		case "image":
-			images = append(images, fullPath)
+			imagesByID[kernelID] = append(imagesByID[kernelID], fullPath)
 		case "headers":
-			headers = append(headers, fullPath)
+			headersByID[kernelID] = append(headersByID[kernelID], fullPath)
 		}
 	}
 
-	if len(images) == 0 || len(headers) == 0 {
+	commonIDs := make([]string, 0, 2)
+	for kernelID := range imagesByID {
+		if len(headersByID[kernelID]) > 0 {
+			commonIDs = append(commonIDs, kernelID)
+		}
+	}
+	if len(commonIDs) == 0 {
 		return "", "", fmt.Errorf("linux-image and linux-headers deb packages are required in %s", dir)
 	}
+	if len(commonIDs) > 1 {
+		sort.Strings(commonIDs)
+		return "", "", fmt.Errorf("multiple kernel package pairs found in %s: %s", dir, strings.Join(commonIDs, ", "))
+	}
 
+	kernelID := commonIDs[0]
+	images := imagesByID[kernelID]
+	headers := headersByID[kernelID]
 	sort.Strings(images)
 	sort.Strings(headers)
 	return images[len(images)-1], headers[len(headers)-1], nil

@@ -7,11 +7,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/alireza0/s-ui/config"
+	"github.com/alireza0/s-ui/database"
 )
 
 func TestExtractNetSFFilesJSON(t *testing.T) {
@@ -240,6 +244,23 @@ func TestFindKernelInstallDebPairBBRPlusNames(t *testing.T) {
 	}
 	if got := kernelDebPackageName(gotHeaders); got != "linux-headers-6.7.9-bbrplus" {
 		t.Fatalf("unexpected bbrplus headers package name: %q", got)
+	}
+}
+
+func TestFindKernelInstallDebPairRejectsMixedKernelIDs(t *testing.T) {
+	dir := t.TempDir()
+	image := filepath.Join(dir, "linux-image-6.18.27-x64v3-xanmod1_1_amd64.deb")
+	headers := filepath.Join(dir, "linux-headers-6.18.25-x64v3-xanmod1_1_amd64.deb")
+
+	if err := os.WriteFile(image, []byte("image"), 0o644); err != nil {
+		t.Fatalf("write image failed: %v", err)
+	}
+	if err := os.WriteFile(headers, []byte("headers"), 0o644); err != nil {
+		t.Fatalf("write headers failed: %v", err)
+	}
+
+	if _, _, err := findKernelInstallDebPair(dir); err == nil {
+		t.Fatal("expected mixed kernel ids to be rejected")
 	}
 }
 
@@ -553,5 +574,264 @@ func TestPurgePackagesFailureStillRunsSystemCleanup(t *testing.T) {
 	}
 	if result.SystemCleanupSummary != "system cleanup completed" {
 		t.Fatalf("unexpected cleanup summary: %q", result.SystemCleanupSummary)
+	}
+}
+
+func TestKernelDownloadFailureSchedulesCleanup(t *testing.T) {
+	oldEnsure := kernelEnsureRuntimeSupported
+	oldBaseURL := xanmodSourceForgeBaseURL
+	oldDelay := kernelFailedDownloadCleanupDelay
+	defer func() {
+		kernelEnsureRuntimeSupported = oldEnsure
+		xanmodSourceForgeBaseURL = oldBaseURL
+		kernelFailedDownloadCleanupDelay = oldDelay
+	}()
+
+	kernelEnsureRuntimeSupported = func() error { return nil }
+	kernelFailedDownloadCleanupDelay = 20 * time.Millisecond
+	kernelDownloadCleanupStore = newKernelDownloadCleanupScheduler()
+	kernelDownloadProgressStore = newKernelDownloadProgressStore()
+
+	binDir := config.GetBinDir()
+	dataRoot := filepath.Join(binDir, "Promanager_data")
+	_ = os.RemoveAll(filepath.Join(dataRoot, "kernel"))
+	t.Cleanup(func() {
+		_ = os.RemoveAll(filepath.Join(dataRoot, "kernel"))
+	})
+
+	const (
+		line    = "lts"
+		version = "6.18.27-xanmod1"
+		arch    = "x64v3"
+	)
+
+	headersName := "linux-headers-6.18.27-x64v3-xanmod1_1_amd64.deb"
+	imageName := "linux-image-6.18.27-x64v3-xanmod1_1_amd64.deb"
+	headersBody := []byte("headers-ok")
+
+	pages := map[string]map[string]sourceForgeFileEntry{
+		"/releases/lts/": {
+			version: {Name: version, Type: "d"},
+		},
+		"/releases/lts/6.18.27-xanmod1/": {
+			"6.18.27-x64v3-xanmod1": {Name: "6.18.27-x64v3-xanmod1", Type: "d"},
+		},
+		"/releases/lts/6.18.27-xanmod1/6.18.27-x64v3-xanmod1/": {
+			headersName: {
+				Name:        headersName,
+				Type:        "f",
+				DownloadURL: "http://placeholder/headers.deb",
+				FullPath:    "releases/lts/6.18.27-xanmod1/6.18.27-x64v3-xanmod1/" + headersName,
+			},
+			imageName: {
+				Name:        imageName,
+				Type:        "f",
+				DownloadURL: "http://placeholder/image.deb",
+				FullPath:    "releases/lts/6.18.27-xanmod1/6.18.27-x64v3-xanmod1/" + imageName,
+			},
+		},
+	}
+
+	var serverURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/headers.deb":
+			if r.Method == http.MethodHead {
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(headersBody)))
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			_, _ = w.Write(headersBody)
+			return
+		case "/image.deb":
+			http.Error(w, "forced failure", http.StatusInternalServerError)
+			return
+		}
+		entries, ok := pages[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		for key, entry := range entries {
+			if strings.Contains(key, ".deb") {
+				entry.DownloadURL = serverURL + "/" + path.Base(key)
+				entries[key] = entry
+			}
+		}
+		body, err := json.Marshal(entries)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_, _ = fmt.Fprintf(w, "<html><script>net.sf.files = %s;net.sf.staging_days=3;</script></html>", string(body))
+	}))
+	defer srv.Close()
+	serverURL = srv.URL
+	xanmodSourceForgeBaseURL = srv.URL
+
+	svc := &KernelManagerService{}
+	result, err := svc.DownloadPackages("xanmod", line, version, arch, "kernel-download-failure-cleanup")
+	if err == nil {
+		t.Fatal("expected download failure, got nil")
+	}
+	if result != nil {
+		t.Fatalf("expected nil result on failure, got %#v", result)
+	}
+
+	downloadDir := filepath.Join(config.GetDataDir(), "kernel", line, version, arch)
+	tmpPath := filepath.Join(downloadDir, imageName+".tmp")
+	headersPath := filepath.Join(downloadDir, headersName)
+	if _, statErr := os.Stat(headersPath); statErr != nil {
+		if _, tmpErr := os.Stat(tmpPath); tmpErr != nil && !os.IsNotExist(tmpErr) {
+			t.Fatalf("unexpected tmp stat error: %v", tmpErr)
+		}
+	}
+
+	cleanupRoot := filepath.Join(config.GetDataDir(), "kernel", kernelFailedCleanupDirName)
+	entriesBefore, readErr := os.ReadDir(cleanupRoot)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatalf("read cleanup root failed: %v", readErr)
+	}
+	if len(entriesBefore) == 0 {
+		t.Fatalf("expected failed download artifacts moved into cleanup root %q", cleanupRoot)
+	}
+
+	time.Sleep(120 * time.Millisecond)
+	if _, statErr := os.Stat(downloadDir); !os.IsNotExist(statErr) {
+		t.Fatalf("expected failed download directory cleaned, got err=%v", statErr)
+	}
+	entriesAfter, readErr := os.ReadDir(cleanupRoot)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatalf("read cleanup root after cleanup failed: %v", readErr)
+	}
+	if len(entriesAfter) != 0 {
+		t.Fatalf("expected cleanup root emptied after delayed cleanup, still has %d entries", len(entriesAfter))
+	}
+}
+
+func TestClearDownloadedKernelRemovesMarkerAndLegacyArtifacts(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "kernel-clear.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("init db failed: %v", err)
+	}
+	if sqlDB, err := database.GetDB().DB(); err == nil && sqlDB != nil {
+		t.Cleanup(func() {
+			_ = sqlDB.Close()
+		})
+	}
+
+	binDir := config.GetBinDir()
+	dataRoot := filepath.Join(binDir, "Promanager_data")
+	kernelRoot := filepath.Join(dataRoot, "kernel")
+	_ = os.RemoveAll(kernelRoot)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(kernelRoot)
+	})
+
+	downloadDir := filepath.Join(kernelRoot, "lts", "6.18.36-xanmod1", "x64v3")
+	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
+		t.Fatalf("mkdir download dir failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloadDir, "linux-headers-6.18.36-x64v3-xanmod1_1_amd64.deb"), []byte("h"), 0o644); err != nil {
+		t.Fatalf("write headers failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloadDir, "linux-image-6.18.36-x64v3-xanmod1_1_amd64.deb"), []byte("i"), 0o644); err != nil {
+		t.Fatalf("write image failed: %v", err)
+	}
+	legacyDir := filepath.Join(kernelRoot, "main", "legacy-broken", "x64v3")
+	if err := os.MkdirAll(legacyDir, 0o755); err != nil {
+		t.Fatalf("mkdir legacy dir failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "linux-image-legacy_1_amd64.deb.tmp"), []byte("tmp"), 0o644); err != nil {
+		t.Fatalf("write legacy tmp failed: %v", err)
+	}
+
+	settingSvc := &SettingService{}
+	marker := kernelDownloadedMarker{
+		Provider:   "xanmod",
+		Line:       "lts",
+		Version:    "6.18.36-xanmod1",
+		Arch:       "x64v3",
+		Directory:  downloadDir,
+		Downloaded: time.Now().Unix(),
+	}
+	raw, err := json.Marshal(marker)
+	if err != nil {
+		t.Fatalf("marshal marker failed: %v", err)
+	}
+	if err := settingSvc.SaveSetting(kernelDownloadedMarkerSettingKey, string(raw)); err != nil {
+		t.Fatalf("save marker failed: %v", err)
+	}
+
+	svc := &KernelManagerService{}
+	result, err := svc.ClearDownloadedKernel()
+	if err != nil {
+		t.Fatalf("ClearDownloadedKernel failed: %v", err)
+	}
+	if !result.Cleared {
+		t.Fatalf("expected cleared result, got %#v", result)
+	}
+	if _, statErr := os.Stat(kernelRoot); !os.IsNotExist(statErr) {
+		t.Fatalf("expected kernel root removed, got err=%v", statErr)
+	}
+	stored, err := settingSvc.getString(kernelDownloadedMarkerSettingKey)
+	if err != nil {
+		t.Fatalf("load marker failed: %v", err)
+	}
+	if strings.TrimSpace(stored) != "" {
+		t.Fatalf("expected marker cleared, got %q", stored)
+	}
+}
+
+func TestGetDownloadedKernelStatusRepairsLegacyCompletePairAndCleansBrokenDir(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "kernel-legacy-status.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("init db failed: %v", err)
+	}
+	if sqlDB, err := database.GetDB().DB(); err == nil && sqlDB != nil {
+		t.Cleanup(func() {
+			_ = sqlDB.Close()
+		})
+	}
+
+	binDir := config.GetBinDir()
+	dataRoot := filepath.Join(binDir, "Promanager_data")
+	kernelRoot := filepath.Join(dataRoot, "kernel")
+	_ = os.RemoveAll(kernelRoot)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(kernelRoot)
+	})
+
+	validDir := filepath.Join(kernelRoot, "lts", "6.18.36-xanmod1", "x64v3")
+	if err := os.MkdirAll(validDir, 0o755); err != nil {
+		t.Fatalf("mkdir valid dir failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(validDir, "linux-headers-6.18.36-x64v3-xanmod1_1_amd64.deb"), []byte("h"), 0o644); err != nil {
+		t.Fatalf("write headers failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(validDir, "linux-image-6.18.36-x64v3-xanmod1_1_amd64.deb"), []byte("i"), 0o644); err != nil {
+		t.Fatalf("write image failed: %v", err)
+	}
+	brokenDir := filepath.Join(kernelRoot, "lts", "broken-version", "x64v3")
+	if err := os.MkdirAll(brokenDir, 0o755); err != nil {
+		t.Fatalf("mkdir broken dir failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(brokenDir, "linux-image-broken_1_amd64.deb"), []byte("i"), 0o644); err != nil {
+		t.Fatalf("write broken image failed: %v", err)
+	}
+
+	svc := &KernelManagerService{}
+	status, err := svc.GetDownloadedKernelStatus()
+	if err != nil {
+		t.Fatalf("GetDownloadedKernelStatus failed: %v", err)
+	}
+	if status == nil || !status.Exists {
+		t.Fatalf("expected recovered legacy status, got %#v", status)
+	}
+	if filepath.Clean(status.Directory) != filepath.Clean(validDir) {
+		t.Fatalf("unexpected recovered directory: got %q want %q", status.Directory, validDir)
+	}
+	if _, statErr := os.Stat(brokenDir); !os.IsNotExist(statErr) {
+		t.Fatalf("expected broken legacy dir cleaned, got err=%v", statErr)
 	}
 }

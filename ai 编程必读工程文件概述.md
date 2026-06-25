@@ -92,7 +92,7 @@
    - 再看：对应 `service/*.go`
 7. **构建 / 安装 / 发布问题**
    - 先看：`build.bat`、`build.sh`、`windows/*`、`.github/workflows/*`
-   - 再看：`install.sh`、`cmd/cmd.go`、`config/config.go`、`scripts/sync-version.mjs`、`web/web.go`
+   - 再看：`install.sh`、`cmd/cmd.go`、`config/config.go`、`scripts/sync-version.mjs`、`scripts/copy-release-docs.mjs`、`web/web.go`
 
 ---
 
@@ -267,6 +267,8 @@
 | `Promanager_data/outbound/*.json` | 默认链出站文件生成器 | `outbounds` / `outboundgroups` / `settings` 相关保存后 | `service/promanager.go` |
 | `Promanager_data/sub_json/*.json` | 订阅 JSON 生成器 | 客户端、组、订阅输出相关保存后 | `service/promanager.go` `service/suboutbounds.go` `service/subgroups.go` |
 | `Promanager_data/cert/*` | 证书中心 / 自签 / 导入 | 证书签发、应用、迁移时 | `service/acme_service.go` `service/panel_*` |
+| `Promanager_data/install.sh` | Linux 安装脚本副本 | 安装/面板内升级后 | `install.sh` `service/panel_update.go` |
+| `Promanager_data/kwor.service` | Linux service 模板副本 | 安装/面板内升级后 | `install.sh` `service/panel_update.go` |
 | `temp_frontend/dist/*` | Vite build 结果 | 前端构建后 | `temp_frontend/src/*` |
 | `web/html/*` | 拷贝后的嵌入前端 | 前端构建并复制后 | `temp_frontend/src/*` |
 
@@ -967,6 +969,8 @@ Mihomo 当前最重要的职责是：
 `config/config.go` 中：
 
 - `GetDataDir() = <binary_dir>/Promanager_data`
+- `GetRuntimeInstallScriptPath() = <binary_dir>/Promanager_data/install.sh`
+- `GetRuntimeServiceFilePath() = <binary_dir>/Promanager_data/kwor.service`
 
 也就是说：
 
@@ -990,6 +994,8 @@ Mihomo 当前最重要的职责是：
 - `<binary_dir>/Promanager_data/db/kwor.db`
 
 另外它还会尝试把旧的 `./db/kwor.db` 迁移到新位置。
+
+同理，Linux 历史安装中如果把 `install.sh` / `kwor.service` 放在二进制同级目录，当前启动链也会尽量自动迁移到 `Promanager_data/` 下。
 
 ## 8.3 Core 目录与配置路径规则
 
@@ -1116,6 +1122,11 @@ npm.cmd run build
 
 它不是“本地 Windows 运行入口”。
 
+发布附带文档由 `scripts/copy-release-docs.mjs` 统一复制，当前固定包含：
+
+- `User Manual.md`
+- `使用手册.md`
+
 ### `build.sh`
 
 职责：构建 Linux amd64 的 `kwor`。
@@ -1139,6 +1150,7 @@ npm.cmd run build
 5. 若两者都没有，则按**默认新装目录 `/opt/kwor`**
 6. 升级时调用现有二进制的 `stop`
 7. 替换二进制后调用现有二进制的 `start`
+8. 安装脚本副本与 `kwor.service` 模板副本统一写入 `Promanager_data/`，并兼容迁移旧的同级文件
 
 因此当前 Linux 安装链要分清三层：
 

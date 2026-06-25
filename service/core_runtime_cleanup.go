@@ -48,6 +48,10 @@ func cleanupManagedCoreRuntimeArtifacts(coreDir string, binName string) error {
 		}
 	}
 
+	if err := cleanupManagedCoreInstallWorkspaceArtifacts(coreDir, binName); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -89,6 +93,9 @@ func cleanupManagedSingboxRootRuntimeArtifacts(coreDir string) error {
 		filepath.Join(coreDir, "sing-box-*.tar*"),
 		filepath.Join(coreDir, "sing-box-*.zip"),
 		filepath.Join(coreDir, "sing-box-*.gz"),
+		filepath.Join(coreDir, singboxCoreInstallStagePrefix+"*"),
+		filepath.Join(coreDir, singboxCoreInstallBackupPrefix+"*"),
+		filepath.Join(coreDir, "extract_tmp_*"),
 	}
 	for _, pattern := range patterns {
 		matches, err := filepath.Glob(pattern)
@@ -107,5 +114,42 @@ func cleanupManagedSingboxRootRuntimeArtifacts(coreDir string) error {
 
 	_ = removeDirIfEmpty(filepath.Join(coreDir, ".cache"))
 	_ = removeDirIfEmpty(filepath.Join(coreDir, ".config"))
+	return nil
+}
+
+func cleanupManagedCoreInstallWorkspaceArtifacts(coreDir string, binName string) error {
+	coreDir = strings.TrimSpace(coreDir)
+	if coreDir == "" {
+		return nil
+	}
+
+	patterns := []string{
+		filepath.Join(coreDir, "extract_tmp_*"),
+	}
+
+	switch strings.ToLower(strings.TrimSpace(binName)) {
+	case "sing-box", "sing-box.exe":
+		patterns = append(patterns,
+			filepath.Join(coreDir, singboxCoreInstallStagePrefix+"*"),
+			filepath.Join(coreDir, singboxCoreInstallBackupPrefix+"*"),
+		)
+	case "mihomo", "mihomo.exe":
+		patterns = append(patterns,
+			filepath.Join(coreDir, mihomoCoreInstallStagePrefix+"*"),
+			filepath.Join(coreDir, mihomoCoreInstallBackupPrefix+"*"),
+		)
+	}
+
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			return err
+		}
+		for _, match := range matches {
+			if err := os.RemoveAll(match); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove managed core workspace artifact %s failed: %w", match, err)
+			}
+		}
+	}
 	return nil
 }

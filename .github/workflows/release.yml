@@ -17,11 +17,14 @@ on:
       - 'go.sum'
       - 'kwor.service'
       - 'config/version'
+      - 'scripts/copy-release-docs.mjs'
+      - 'User Manual.md'
+      - '使用手册.md'
 
 jobs:
   build-linux:
     permissions:
-      contents: write
+      contents: read
     strategy:
       matrix:
         platform:
@@ -66,6 +69,7 @@ jobs:
           cp kwor kwor-pkg/
           cp kwor.service kwor-pkg/
           cp install.sh kwor-pkg/ 2>/dev/null || true
+          node scripts/copy-release-docs.mjs kwor-pkg
 
       - name: Package
         run: tar -zcvf kwor-linux-${{ matrix.platform }}.tar.gz -C kwor-pkg .
@@ -77,12 +81,32 @@ jobs:
           path: ./kwor-linux-${{ matrix.platform }}.tar.gz
           retention-days: 30
 
+  publish-release:
+    needs: build-linux
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Download release archives
+        uses: actions/download-artifact@v5
+        with:
+          pattern: kwor-linux-*
+          path: release-assets
+          merge-multiple: true
+
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
         with:
           tag_name: ${{ github.ref_name }}
           name: kwor ${{ github.ref_name }}
-          files: kwor-linux-${{ matrix.platform }}.tar.gz
+          files: |
+            release-assets/kwor-linux-amd64.tar.gz
+            release-assets/kwor-linux-arm64.tar.gz
+            User Manual.md
+            使用手册.md
           fail_on_unmatched_files: true
           generate_release_notes: true

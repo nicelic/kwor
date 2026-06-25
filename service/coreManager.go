@@ -907,6 +907,14 @@ func (s *CoreManagerService) DownloadCore(version string, target CoreDownloadTar
 		FinishCoreDownloadProgressError(sessionID, coreDownloadStageDownloading, err.Error())
 		return "", err
 	}
+	if err := cleanupStaleManagedCoreInstallWorkspaces(s.getCoreDir(), singboxCoreInstallStagePrefix, singboxCoreInstallBackupPrefix); err != nil {
+		FinishCoreDownloadProgressError(sessionID, coreDownloadStageDownloading, err.Error())
+		return "", err
+	}
+	if err := cleanupManagedCoreInstallWorkspaceArtifacts(s.getCoreDir(), s.getCoreBinName()); err != nil {
+		FinishCoreDownloadProgressError(sessionID, coreDownloadStageDownloading, err.Error())
+		return "", err
+	}
 
 	wasRunning := s.isRunning()
 	if wasRunning {
@@ -920,13 +928,6 @@ func (s *CoreManagerService) DownloadCore(version string, target CoreDownloadTar
 	failProgress := func(stage string, err error) {
 		if err != nil {
 			FinishCoreDownloadProgressError(sessionID, stage, err.Error())
-		}
-	}
-	if wasRunning {
-		SetCoreDownloadProgressStage(sessionID, coreDownloadStageStopping)
-		if err := s.stopCoreInternal(); err != nil {
-			failProgress(coreDownloadStageStopping, err)
-			return "", err
 		}
 	}
 
@@ -1003,12 +1004,16 @@ func (s *CoreManagerService) DownloadCore(version string, target CoreDownloadTar
 		return "", err
 	}
 
-	binName := s.getCoreBinName()
-	binPath := filepath.Join(coreDir, binName)
-	os.Remove(binPath)
-
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageReplacing)
-	err = s.installCoreFromArchiveFile(tmpFile, coreDir)
+	stageDir, cleanupStageDir, err := createManagedCoreInstallWorkspace(coreDir, singboxCoreInstallStagePrefix)
+	if err != nil {
+		os.Remove(tmpFile)
+		failProgress(coreDownloadStageReplacing, err)
+		return "", err
+	}
+	defer cleanupStageDir()
+
+	err = s.installCoreFromArchiveFile(tmpFile, stageDir)
 
 	os.Remove(tmpFile)
 
@@ -1018,17 +1023,47 @@ func (s *CoreManagerService) DownloadCore(version string, target CoreDownloadTar
 		return "", err
 	}
 
-	if runtime.GOOS != "windows" {
-		os.Chmod(binPath, 0755)
-	}
+	binName := s.getCoreBinName()
+	stagedBinPath := filepath.Join(stageDir, binName)
 
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageValidating)
-	if !s.validateCoreBinary(binPath) {
-		_ = os.Remove(binPath)
+	if !s.validateCoreBinary(stagedBinPath) {
 		err = fmt.Errorf("downloaded sing-box binary is not executable on current runtime %s/%s", runtime.GOOS, runtime.GOARCH)
 		failProgress(coreDownloadStageValidating, err)
 		return "", err
 	}
+
+	activation, activationStage, err := activateManagedCoreBinaryInstallWithRuntime(
+		wasRunning,
+		func() error {
+			SetCoreDownloadProgressStage(sessionID, coreDownloadStageStopping)
+			return s.stopCoreInternal()
+		},
+		func() {
+			SetCoreDownloadProgressStage(sessionID, coreDownloadStageReplacing)
+		},
+		s.startCoreLocked,
+		func() (*managedCoreBinaryActivation, error) {
+			return activateManagedCoreBinaryInstall(coreDir, binName, stageDir, singboxCoreInstallBackupPrefix)
+		},
+	)
+	if err != nil {
+		if strings.TrimSpace(activationStage) == "" {
+			activationStage = coreDownloadStageReplacing
+		}
+		failProgress(activationStage, err)
+		return "", err
+	}
+	finalized := false
+	defer func() {
+		if !finalized {
+			if rollbackErr := activation.Rollback(); rollbackErr != nil {
+				logger.Warning("rollback sing-box staged install failed: ", rollbackErr)
+			}
+		}
+	}()
+
+	binPath := filepath.Join(coreDir, binName)
 
 	localVersion, _ := s.getLocalVersion(binPath)
 	logger.Info("sing-box 下载完成, 版本: ", localVersion)
@@ -1039,13 +1074,27 @@ func (s *CoreManagerService) DownloadCore(version string, target CoreDownloadTar
 	if wasRunning {
 		SetCoreDownloadProgressStage(sessionID, coreDownloadStageStarting)
 		if err = s.startCoreLocked(); err != nil {
-			err = fmt.Errorf("下载完成，但自动启动失败: %v", err)
+			rollbackErr := activation.Rollback()
+			finalized = true
+			if rollbackErr == nil {
+				if restartErr := s.startCoreLocked(); restartErr != nil {
+					err = fmt.Errorf("下载完成，但新版本自动启动失败: %v；已回滚旧版本，但旧版本恢复启动失败: %v", err, restartErr)
+				} else {
+					err = fmt.Errorf("下载完成，但新版本自动启动失败，已自动回滚到旧版本: %v", err)
+				}
+			} else {
+				err = fmt.Errorf("下载完成，但自动启动失败: %v；回滚旧版本失败: %v", err, rollbackErr)
+			}
 			failProgress(coreDownloadStageStarting, err)
 			return localVersion, err
 		}
 		SetCoreDownloadProgressStage(sessionID, coreDownloadStageStarted)
 		time.Sleep(900 * time.Millisecond)
 	}
+	if err := activation.Commit(); err != nil {
+		logger.Warning("cleanup sing-box install backup workspace failed: ", err)
+	}
+	finalized = true
 
 	FinishCoreDownloadProgressSuccess(sessionID, coreDownloadStageCompleted)
 	return localVersion, nil
@@ -2187,6 +2236,14 @@ func (s *CoreManagerService) DownloadCoreFromURL(downloadURL string, requestedSe
 		FinishCoreDownloadProgressError(sessionID, coreDownloadStageDownloading, err.Error())
 		return "", err
 	}
+	if err := cleanupStaleManagedCoreInstallWorkspaces(s.getCoreDir(), singboxCoreInstallStagePrefix, singboxCoreInstallBackupPrefix); err != nil {
+		FinishCoreDownloadProgressError(sessionID, coreDownloadStageDownloading, err.Error())
+		return "", err
+	}
+	if err := cleanupManagedCoreInstallWorkspaceArtifacts(s.getCoreDir(), s.getCoreBinName()); err != nil {
+		FinishCoreDownloadProgressError(sessionID, coreDownloadStageDownloading, err.Error())
+		return "", err
+	}
 
 	wasRunning := s.isRunning()
 	if wasRunning {
@@ -2200,13 +2257,6 @@ func (s *CoreManagerService) DownloadCoreFromURL(downloadURL string, requestedSe
 	failProgress := func(stage string, err error) {
 		if err != nil {
 			FinishCoreDownloadProgressError(sessionID, stage, err.Error())
-		}
-	}
-	if wasRunning {
-		SetCoreDownloadProgressStage(sessionID, coreDownloadStageStopping)
-		if err := s.stopCoreInternal(); err != nil {
-			failProgress(coreDownloadStageStopping, err)
-			return "", err
 		}
 	}
 
@@ -2276,33 +2326,86 @@ func (s *CoreManagerService) DownloadCoreFromURL(downloadURL string, requestedSe
 	}
 
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageReplacing)
-	if err = s.installCoreFromArchiveFile(tmpFile, coreDir); err != nil {
+	stageDir, cleanupStageDir, err := createManagedCoreInstallWorkspace(coreDir, singboxCoreInstallStagePrefix)
+	if err != nil {
+		failProgress(coreDownloadStageReplacing, err)
+		return "", err
+	}
+	defer cleanupStageDir()
+
+	if err = s.installCoreFromArchiveFile(tmpFile, stageDir); err != nil {
 		err = fmt.Errorf("extract/install failed: %v", err)
 		failProgress(coreDownloadStageReplacing, err)
 		return "", err
 	}
 
-	binPath := filepath.Join(coreDir, s.getCoreBinName())
+	binName := s.getCoreBinName()
+	stagedBinPath := filepath.Join(stageDir, binName)
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageValidating)
-	if !s.validateCoreBinary(binPath) {
-		_ = os.Remove(binPath)
+	if !s.validateCoreBinary(stagedBinPath) {
 		err = fmt.Errorf("downloaded sing-box binary is not executable on current runtime %s/%s", runtime.GOOS, runtime.GOARCH)
 		failProgress(coreDownloadStageValidating, err)
 		return "", err
 	}
+
+	activation, activationStage, err := activateManagedCoreBinaryInstallWithRuntime(
+		wasRunning,
+		func() error {
+			SetCoreDownloadProgressStage(sessionID, coreDownloadStageStopping)
+			return s.stopCoreInternal()
+		},
+		func() {
+			SetCoreDownloadProgressStage(sessionID, coreDownloadStageReplacing)
+		},
+		s.startCoreLocked,
+		func() (*managedCoreBinaryActivation, error) {
+			return activateManagedCoreBinaryInstall(coreDir, binName, stageDir, singboxCoreInstallBackupPrefix)
+		},
+	)
+	if err != nil {
+		if strings.TrimSpace(activationStage) == "" {
+			activationStage = coreDownloadStageReplacing
+		}
+		failProgress(activationStage, err)
+		return "", err
+	}
+	finalized := false
+	defer func() {
+		if !finalized {
+			if rollbackErr := activation.Rollback(); rollbackErr != nil {
+				logger.Warning("rollback sing-box custom staged install failed: ", rollbackErr)
+			}
+		}
+	}()
+
+	binPath := filepath.Join(coreDir, binName)
 	localVersion, _ := s.getLocalVersion(binPath)
 	logger.Info("custom core download complete, version: ", localVersion)
 
 	if wasRunning {
 		SetCoreDownloadProgressStage(sessionID, coreDownloadStageStarting)
 		if err = s.startCoreLocked(); err != nil {
-			err = fmt.Errorf("download completed, but auto start failed: %v", err)
+			rollbackErr := activation.Rollback()
+			finalized = true
+			if rollbackErr == nil {
+				if restartErr := s.startCoreLocked(); restartErr != nil {
+					err = fmt.Errorf("download completed, but new core auto start failed: %v; rolled back old core, but old core restart failed: %v", err, restartErr)
+				} else {
+					err = fmt.Errorf("download completed, but new core auto start failed and was rolled back to previous version: %v", err)
+				}
+			} else {
+				err = fmt.Errorf("download completed, but auto start failed: %v; rollback failed: %v", err, rollbackErr)
+			}
 			failProgress(coreDownloadStageStarting, err)
 			return localVersion, err
 		}
 		SetCoreDownloadProgressStage(sessionID, coreDownloadStageStarted)
 		time.Sleep(900 * time.Millisecond)
 	}
+	if err := activation.Commit(); err != nil {
+		logger.Warning("cleanup sing-box custom install backup workspace failed: ", err)
+	}
+	finalized = true
 
 	FinishCoreDownloadProgressSuccess(sessionID, coreDownloadStageCompleted)
 	return localVersion, nil

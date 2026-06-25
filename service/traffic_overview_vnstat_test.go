@@ -74,6 +74,48 @@ func TestBuildVnstatInstallUnavailableErrorIncludesBothSources(t *testing.T) {
 	}
 }
 
+func TestNormalizeDetectedVnstatPackageVersion(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "apt epoch and suffix", input: "1:2.12-5build1", want: "2.12-5build1"},
+		{name: "rpm release suffix", input: "2.11-3.el9", want: "2.11-3.el9"},
+		{name: "plain version", input: "2.13", want: "2.13"},
+		{name: "apk package prefix", input: "vnstat-2.13-r2", want: "2.13-r2"},
+		{name: "pacman package output", input: "vnstat 2.13-2", want: "2.13-2"},
+		{name: "invalid", input: "(none)", want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := normalizeDetectedVnstatPackageVersion(tc.input); got != tc.want {
+				t.Fatalf("normalizeDetectedVnstatPackageVersion(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCompareSemverLikeTagsWithPackageRevision(t *testing.T) {
+	cases := []struct {
+		name string
+		a    string
+		b    string
+		want int
+	}{
+		{name: "package revision increases", a: "2.12-1", b: "2.12-2", want: -1},
+		{name: "two digit revision compares numerically", a: "2.12-10", b: "2.12-2", want: 1},
+		{name: "rpm style release compares numerically", a: "2.12-3.el9", b: "2.12-12.el9", want: -1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := compareSemverLikeTags(tc.a, tc.b); got != tc.want {
+				t.Fatalf("compareSemverLikeTags(%q, %q) = %d, want %d", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
+}
+
 func createManagedSourceFile(t *testing.T, stageRoot string, relPath string) {
 	t.Helper()
 

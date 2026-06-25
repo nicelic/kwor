@@ -11,6 +11,7 @@ GH_REPO="nicelic/kwor"
 INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/${GH_REPO}/main/install.sh"
 DEFAULT_INSTALL_DIR="/opt/kwor"
 SERVICE_NAME="kwor"
+RUNTIME_SUPPORT_DIR_NAME="Promanager_data"
 
 RELEASE=""
 ARCH=""
@@ -30,6 +31,9 @@ TARGET_BIN_PATH=""
 BACKUP_BIN_PATH=""
 STOP_BIN_PATH=""
 TARGET_BIN_NAME="kwor"
+TARGET_SUPPORT_DIR=""
+TARGET_INSTALL_SCRIPT_PATH=""
+TARGET_SERVICE_COPY_PATH=""
 
 cleanup() {
     if [[ -n "${ARCHIVE_PATH}" && -f "${ARCHIVE_PATH}" ]]; then
@@ -320,6 +324,8 @@ extract_release_archive() {
 
 prepare_install_dir() {
     mkdir -p "${INSTALL_DIR}"
+    TARGET_SUPPORT_DIR="${INSTALL_DIR}/${RUNTIME_SUPPORT_DIR_NAME}"
+    mkdir -p "${TARGET_SUPPORT_DIR}"
     if [[ -n "${SERVICE_BIN_PATH}" ]]; then
         TARGET_BIN_NAME="$(basename "${SERVICE_BIN_PATH}")"
     elif [[ -n "${RUNNING_BIN_PATH}" ]]; then
@@ -335,6 +341,8 @@ prepare_install_dir() {
 
     TARGET_BIN_PATH="${INSTALL_DIR}/${TARGET_BIN_NAME}"
     BACKUP_BIN_PATH="${TARGET_BIN_PATH}.bak"
+    TARGET_INSTALL_SCRIPT_PATH="${TARGET_SUPPORT_DIR}/install.sh"
+    TARGET_SERVICE_COPY_PATH="${TARGET_SUPPORT_DIR}/kwor.service"
 }
 
 download_latest_install_script() {
@@ -389,12 +397,20 @@ EOF
 
 install_support_files() {
     if [[ -n "${STAGED_INSTALL_SCRIPT_PATH}" && -f "${STAGED_INSTALL_SCRIPT_PATH}" ]]; then
-        cp -f "${STAGED_INSTALL_SCRIPT_PATH}" "${INSTALL_DIR}/install.sh"
-        chmod 755 "${INSTALL_DIR}/install.sh" || true
+        if cp -f "${STAGED_INSTALL_SCRIPT_PATH}" "${TARGET_INSTALL_SCRIPT_PATH}"; then
+            chmod 755 "${TARGET_INSTALL_SCRIPT_PATH}" || true
+            rm -f "${INSTALL_DIR}/install.sh"
+        else
+            log_warn "Failed to place runtime install.sh into ${TARGET_INSTALL_SCRIPT_PATH}; keeping legacy copy if present"
+        fi
     fi
     if [[ -n "${STAGED_SERVICE_FILE_PATH}" && -f "${STAGED_SERVICE_FILE_PATH}" ]]; then
-        cp -f "${STAGED_SERVICE_FILE_PATH}" "${INSTALL_DIR}/kwor.service"
-        chmod 644 "${INSTALL_DIR}/kwor.service" || true
+        if cp -f "${STAGED_SERVICE_FILE_PATH}" "${TARGET_SERVICE_COPY_PATH}"; then
+            chmod 644 "${TARGET_SERVICE_COPY_PATH}" || true
+            rm -f "${INSTALL_DIR}/kwor.service"
+        else
+            log_warn "Failed to place runtime kwor.service into ${TARGET_SERVICE_COPY_PATH}; keeping legacy copy if present"
+        fi
     fi
 }
 

@@ -822,6 +822,15 @@ func (a *ApiService) GetTrafficOverviewVnstatVersions(c *gin.Context) {
 	jsonObj(c, result, nil)
 }
 
+func (a *ApiService) GetTrafficOverviewVnstatUpdateInfo(c *gin.Context) {
+	result, err := a.TrafficOverviewService.GetVnstatUpdateInfo()
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, result, nil)
+}
+
 func (a *ApiService) InstallTrafficOverviewVnstat(c *gin.Context) {
 	req := trafficOverviewVnstatInstallRequest{}
 	if err := c.ShouldBind(&req); err != nil {
@@ -2958,6 +2967,15 @@ func (a *ApiService) GetPanelUpdateStatus(c *gin.Context) {
 func (a *ApiService) GetPanelUpdateVersions(c *gin.Context) {
 	offset, limit := parsePanelVersionWindowQuery(c)
 	result, err := a.PanelUpdateService.GetRemoteVersions(offset, limit)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, result, nil)
+}
+
+func (a *ApiService) GetPanelUpdateLog(c *gin.Context) {
+	result, err := a.PanelUpdateService.GetLastUpdateLog()
 	if err != nil {
 		jsonMsg(c, "", err)
 		return

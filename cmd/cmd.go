@@ -850,6 +850,10 @@ func handleAdminSubcommand(args []string) {
 }
 
 func ParseCmd() {
+	if err := config.MigrateLegacyRuntimeSupportFiles(); err != nil {
+		fmt.Printf("[kwor] migrate legacy runtime support files failed: %v\n", err)
+	}
+
 	var showVersion bool
 	flag.BoolVar(&showVersion, "v", false, "show version")
 

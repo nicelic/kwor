@@ -651,6 +651,14 @@ func (s *MihomoCoreManagerService) DownloadCore(version string, target CoreDownl
 		FinishCoreDownloadProgressError(sessionID, coreDownloadStageDownloading, err.Error())
 		return "", err
 	}
+	if err := cleanupStaleManagedCoreInstallWorkspaces(s.getCoreDir(), mihomoCoreInstallStagePrefix, mihomoCoreInstallBackupPrefix); err != nil {
+		FinishCoreDownloadProgressError(sessionID, coreDownloadStageDownloading, err.Error())
+		return "", err
+	}
+	if err := cleanupManagedCoreInstallWorkspaceArtifacts(s.getCoreDir(), s.getCoreBinName()); err != nil {
+		FinishCoreDownloadProgressError(sessionID, coreDownloadStageDownloading, err.Error())
+		return "", err
+	}
 
 	wasRunning := s.isRunning()
 	if wasRunning {
@@ -664,13 +672,6 @@ func (s *MihomoCoreManagerService) DownloadCore(version string, target CoreDownl
 	failProgress := func(stage string, err error) {
 		if err != nil {
 			FinishCoreDownloadProgressError(sessionID, stage, err.Error())
-		}
-	}
-	if wasRunning {
-		SetCoreDownloadProgressStage(sessionID, coreDownloadStageStopping)
-		if err := s.stopCoreInternal(); err != nil {
-			failProgress(coreDownloadStageStopping, err)
-			return "", err
 		}
 	}
 
@@ -740,20 +741,59 @@ func (s *MihomoCoreManagerService) DownloadCore(version string, target CoreDownl
 	}
 
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageReplacing)
-	if err = s.installCoreFromArchiveFile(tmpFile, coreDir); err != nil {
+	stageDir, cleanupStageDir, err := createManagedCoreInstallWorkspace(coreDir, mihomoCoreInstallStagePrefix)
+	if err != nil {
+		failProgress(coreDownloadStageReplacing, err)
+		return "", err
+	}
+	defer cleanupStageDir()
+
+	if err = s.installCoreFromArchiveFile(tmpFile, stageDir); err != nil {
 		err = fmt.Errorf("extract/install failed: %v", err)
 		failProgress(coreDownloadStageReplacing, err)
 		return "", err
 	}
 
-	binPath := filepath.Join(coreDir, s.getCoreBinName())
+	binName := s.getCoreBinName()
+	stagedBinPath := filepath.Join(stageDir, binName)
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageValidating)
-	if !s.validateCoreBinary(binPath) {
-		_ = os.Remove(binPath)
+	if !s.validateCoreBinary(stagedBinPath) {
 		err = fmt.Errorf("downloaded mihomo binary is not executable on current runtime %s/%s", runtime.GOOS, runtime.GOARCH)
 		failProgress(coreDownloadStageValidating, err)
 		return "", err
 	}
+
+	activation, activationStage, err := activateManagedCoreBinaryInstallWithRuntime(
+		wasRunning,
+		func() error {
+			SetCoreDownloadProgressStage(sessionID, coreDownloadStageStopping)
+			return s.stopCoreInternal()
+		},
+		func() {
+			SetCoreDownloadProgressStage(sessionID, coreDownloadStageReplacing)
+		},
+		s.startCoreLocked,
+		func() (*managedCoreBinaryActivation, error) {
+			return activateManagedCoreBinaryInstall(coreDir, binName, stageDir, mihomoCoreInstallBackupPrefix)
+		},
+	)
+	if err != nil {
+		if strings.TrimSpace(activationStage) == "" {
+			activationStage = coreDownloadStageReplacing
+		}
+		failProgress(activationStage, err)
+		return "", err
+	}
+	finalized := false
+	defer func() {
+		if !finalized {
+			if rollbackErr := activation.Rollback(); rollbackErr != nil {
+				logger.Warning("rollback mihomo staged install failed: ", rollbackErr)
+			}
+		}
+	}()
+
+	binPath := filepath.Join(coreDir, binName)
 	localVersion, _ := s.getLocalVersion(binPath)
 	if err := s.SaveDownloadTarget(normalizedTarget); err != nil {
 		logger.Warning("failed to save mihomo download preference: ", err)
@@ -762,13 +802,27 @@ func (s *MihomoCoreManagerService) DownloadCore(version string, target CoreDownl
 	if wasRunning {
 		SetCoreDownloadProgressStage(sessionID, coreDownloadStageStarting)
 		if err = s.startCoreLocked(); err != nil {
-			err = fmt.Errorf("download completed, but auto start failed: %v", err)
+			rollbackErr := activation.Rollback()
+			finalized = true
+			if rollbackErr == nil {
+				if restartErr := s.startCoreLocked(); restartErr != nil {
+					err = fmt.Errorf("download completed, but new mihomo auto start failed: %v; rolled back old core, but old core restart failed: %v", err, restartErr)
+				} else {
+					err = fmt.Errorf("download completed, but new mihomo auto start failed and was rolled back to previous version: %v", err)
+				}
+			} else {
+				err = fmt.Errorf("download completed, but auto start failed: %v; rollback failed: %v", err, rollbackErr)
+			}
 			failProgress(coreDownloadStageStarting, err)
 			return localVersion, err
 		}
 		SetCoreDownloadProgressStage(sessionID, coreDownloadStageStarted)
 		time.Sleep(900 * time.Millisecond)
 	}
+	if err := activation.Commit(); err != nil {
+		logger.Warning("cleanup mihomo install backup workspace failed: ", err)
+	}
+	finalized = true
 
 	FinishCoreDownloadProgressSuccess(sessionID, coreDownloadStageCompleted)
 	return localVersion, nil
@@ -790,6 +844,14 @@ func (s *MihomoCoreManagerService) DownloadCoreFromURL(downloadURL string, reque
 		FinishCoreDownloadProgressError(sessionID, coreDownloadStageDownloading, err.Error())
 		return "", err
 	}
+	if err := cleanupStaleManagedCoreInstallWorkspaces(s.getCoreDir(), mihomoCoreInstallStagePrefix, mihomoCoreInstallBackupPrefix); err != nil {
+		FinishCoreDownloadProgressError(sessionID, coreDownloadStageDownloading, err.Error())
+		return "", err
+	}
+	if err := cleanupManagedCoreInstallWorkspaceArtifacts(s.getCoreDir(), s.getCoreBinName()); err != nil {
+		FinishCoreDownloadProgressError(sessionID, coreDownloadStageDownloading, err.Error())
+		return "", err
+	}
 
 	wasRunning := s.isRunning()
 	if wasRunning {
@@ -803,13 +865,6 @@ func (s *MihomoCoreManagerService) DownloadCoreFromURL(downloadURL string, reque
 	failProgress := func(stage string, err error) {
 		if err != nil {
 			FinishCoreDownloadProgressError(sessionID, stage, err.Error())
-		}
-	}
-	if wasRunning {
-		SetCoreDownloadProgressStage(sessionID, coreDownloadStageStopping)
-		if err := s.stopCoreInternal(); err != nil {
-			failProgress(coreDownloadStageStopping, err)
-			return "", err
 		}
 	}
 
@@ -876,31 +931,84 @@ func (s *MihomoCoreManagerService) DownloadCoreFromURL(downloadURL string, reque
 	}
 
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageReplacing)
-	if err = s.installCoreFromArchiveFile(tmpFile, coreDir); err != nil {
+	stageDir, cleanupStageDir, err := createManagedCoreInstallWorkspace(coreDir, mihomoCoreInstallStagePrefix)
+	if err != nil {
+		failProgress(coreDownloadStageReplacing, err)
+		return "", err
+	}
+	defer cleanupStageDir()
+
+	if err = s.installCoreFromArchiveFile(tmpFile, stageDir); err != nil {
 		err = fmt.Errorf("extract/install failed: %v", err)
 		failProgress(coreDownloadStageReplacing, err)
 		return "", err
 	}
 
-	binPath := filepath.Join(coreDir, s.getCoreBinName())
+	binName := s.getCoreBinName()
+	stagedBinPath := filepath.Join(stageDir, binName)
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageValidating)
-	if !s.validateCoreBinary(binPath) {
-		_ = os.Remove(binPath)
+	if !s.validateCoreBinary(stagedBinPath) {
 		err = fmt.Errorf("downloaded mihomo binary is not executable on current runtime %s/%s", runtime.GOOS, runtime.GOARCH)
 		failProgress(coreDownloadStageValidating, err)
 		return "", err
 	}
+
+	activation, activationStage, err := activateManagedCoreBinaryInstallWithRuntime(
+		wasRunning,
+		func() error {
+			SetCoreDownloadProgressStage(sessionID, coreDownloadStageStopping)
+			return s.stopCoreInternal()
+		},
+		func() {
+			SetCoreDownloadProgressStage(sessionID, coreDownloadStageReplacing)
+		},
+		s.startCoreLocked,
+		func() (*managedCoreBinaryActivation, error) {
+			return activateManagedCoreBinaryInstall(coreDir, binName, stageDir, mihomoCoreInstallBackupPrefix)
+		},
+	)
+	if err != nil {
+		if strings.TrimSpace(activationStage) == "" {
+			activationStage = coreDownloadStageReplacing
+		}
+		failProgress(activationStage, err)
+		return "", err
+	}
+	finalized := false
+	defer func() {
+		if !finalized {
+			if rollbackErr := activation.Rollback(); rollbackErr != nil {
+				logger.Warning("rollback mihomo custom staged install failed: ", rollbackErr)
+			}
+		}
+	}()
+
+	binPath := filepath.Join(coreDir, binName)
 	localVersion, _ := s.getLocalVersion(binPath)
 	if wasRunning {
 		SetCoreDownloadProgressStage(sessionID, coreDownloadStageStarting)
 		if err = s.startCoreLocked(); err != nil {
-			err = fmt.Errorf("download completed, but auto start failed: %v", err)
+			rollbackErr := activation.Rollback()
+			finalized = true
+			if rollbackErr == nil {
+				if restartErr := s.startCoreLocked(); restartErr != nil {
+					err = fmt.Errorf("download completed, but new mihomo auto start failed: %v; rolled back old core, but old core restart failed: %v", err, restartErr)
+				} else {
+					err = fmt.Errorf("download completed, but new mihomo auto start failed and was rolled back to previous version: %v", err)
+				}
+			} else {
+				err = fmt.Errorf("download completed, but auto start failed: %v; rollback failed: %v", err, rollbackErr)
+			}
 			failProgress(coreDownloadStageStarting, err)
 			return localVersion, err
 		}
 		SetCoreDownloadProgressStage(sessionID, coreDownloadStageStarted)
 		time.Sleep(900 * time.Millisecond)
 	}
+	if err := activation.Commit(); err != nil {
+		logger.Warning("cleanup mihomo custom install backup workspace failed: ", err)
+	}
+	finalized = true
 	FinishCoreDownloadProgressSuccess(sessionID, coreDownloadStageCompleted)
 	return localVersion, nil
 }

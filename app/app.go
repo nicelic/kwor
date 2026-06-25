@@ -44,6 +44,9 @@ func (a *APP) Init() error {
 	if err != nil {
 		return err
 	}
+	if err := config.MigrateLegacyRuntimeSupportFiles(); err != nil {
+		logger.Warning("migrate legacy runtime support files failed:", err)
+	}
 	if err := service.InitManagedRuntimeFileStore(); err != nil {
 		return err
 	}

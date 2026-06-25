@@ -46,6 +46,8 @@ type PanelUpdateStatus struct {
 	Platform          string `json:"platform"`
 	CanInstall        bool   `json:"canInstall"`
 	InstallHint       string `json:"installHint,omitempty"`
+	LastUpdateLogPath string `json:"lastUpdateLogPath,omitempty"`
+	LastUpdateError   string `json:"lastUpdateError,omitempty"`
 }
 
 type PanelVersionListResponse struct {
@@ -64,6 +66,14 @@ type PanelInstallResult struct {
 	Message    string `json:"message"`
 }
 
+type PanelUpdateLogView struct {
+	Path     string   `json:"path"`
+	Exists   bool     `json:"exists"`
+	Lines    []string `json:"lines"`
+	TooLong  bool     `json:"tooLong"`
+	Modified int64    `json:"modified"`
+}
+
 type panelUpdateVersionCacheEntry struct {
 	expiresAt time.Time
 	response  PanelVersionListResponse
@@ -78,10 +88,15 @@ var panelUpdateVersionCache = struct {
 
 var panelUpdateMu sync.Mutex
 
+const panelUpdateLogMaxBytes = 128 * 1024
+const panelUpdateLogMaxLines = 300
+
 func (s *PanelUpdateService) GetStatus() (*PanelUpdateStatus, error) {
 	binaryPath, runningPath, servicePath, serviceBinPath, source := resolvePanelUpdateBinaryPath()
 	installDir := filepath.Dir(binaryPath)
 	canInstall, installHint := panelUpdateInstallSupport()
+	lastUpdateLogPath := filepath.Join(config.GetRuntimeSupportDir(), "panel-update-last.log")
+	lastUpdateError := readPanelUpdateLastError(lastUpdateLogPath)
 
 	return &PanelUpdateStatus{
 		LocalVersion:      config.GetVersion(),
@@ -95,6 +110,8 @@ func (s *PanelUpdateService) GetStatus() (*PanelUpdateStatus, error) {
 		Platform:          fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
 		CanInstall:        canInstall,
 		InstallHint:       installHint,
+		LastUpdateLogPath: lastUpdateLogPath,
+		LastUpdateError:   lastUpdateError,
 	}, nil
 }
 
@@ -238,6 +255,7 @@ func (s *PanelUpdateService) Install(version string) (*PanelInstallResult, error
 		return nil, err
 	}
 	cleanupWorkDir = false
+	clearPanelUpdateLastError(status.LastUpdateLogPath)
 
 	if err := startPanelUpdateWorker(installScriptPath); err != nil {
 		cleanupWorkDir = true
@@ -250,6 +268,14 @@ func (s *PanelUpdateService) Install(version string) (*PanelInstallResult, error
 		Started:    true,
 		Message:    "更新任务已启动，面板会自动停止、替换并重新启动",
 	}, nil
+}
+
+func (s *PanelUpdateService) GetLastUpdateLog() (*PanelUpdateLogView, error) {
+	status, err := s.GetStatus()
+	if err != nil {
+		return nil, err
+	}
+	return loadPanelUpdateLogView(status.LastUpdateLogPath)
 }
 
 func normalizePanelVersionWindow(offset int, limit int) (int, int) {
@@ -389,6 +415,112 @@ func cleanupPanelUpdateWorkDir(workDir string) {
 	_ = os.Remove(filepath.Join(workDir, "kwor", "kwor.service"))
 	_ = os.Remove(filepath.Join(workDir, "kwor"))
 	_ = os.Remove(workDir)
+}
+
+func readPanelUpdateLastError(logPath string) string {
+	logPath = strings.TrimSpace(logPath)
+	if logPath == "" {
+		return ""
+	}
+	content, err := os.ReadFile(logPath)
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(strings.ReplaceAll(string(content), "\r\n", "\n"), "\n")
+	trimmed := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		trimmed = append(trimmed, line)
+	}
+	if len(trimmed) == 0 {
+		return ""
+	}
+	if len(trimmed) > 4 {
+		trimmed = trimmed[len(trimmed)-4:]
+	}
+	return strings.Join(trimmed, " | ")
+}
+
+func clearPanelUpdateLastError(logPath string) {
+	logPath = strings.TrimSpace(logPath)
+	if logPath == "" {
+		return
+	}
+	_ = os.Remove(logPath)
+}
+
+func loadPanelUpdateLogView(logPath string) (*PanelUpdateLogView, error) {
+	logPath = strings.TrimSpace(logPath)
+	view := &PanelUpdateLogView{
+		Path:   logPath,
+		Exists: false,
+		Lines:  []string{},
+	}
+	if logPath == "" {
+		return view, nil
+	}
+	info, err := os.Stat(logPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return view, nil
+		}
+		return nil, err
+	}
+
+	view.Exists = true
+	view.Modified = info.ModTime().Unix()
+
+	content, tooLong, err := readPanelUpdateLogBytes(logPath, panelUpdateLogMaxBytes)
+	if err != nil {
+		return nil, err
+	}
+	view.TooLong = tooLong
+	view.Lines = normalizePanelUpdateLogLines(content, panelUpdateLogMaxLines)
+	return view, nil
+}
+
+func readPanelUpdateLogBytes(logPath string, maxBytes int64) ([]byte, bool, error) {
+	f, err := os.Open(logPath)
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+
+	reader := io.LimitReader(f, maxBytes+1)
+	content, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(content)) > maxBytes {
+		return content[:maxBytes], true, nil
+	}
+	return content, false, nil
+}
+
+func normalizePanelUpdateLogLines(content []byte, maxLines int) []string {
+	text := strings.ReplaceAll(string(content), "\r\n", "\n")
+	rawLines := strings.Split(text, "\n")
+	lines := make([]string, 0, len(rawLines))
+	for _, line := range rawLines {
+		line = strings.TrimRight(line, "\r")
+		if line == "" && len(lines) == 0 {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		return []string{"暂无日志"}
+	}
+	if len(lines) > maxLines {
+		lines = append([]string{"日志过长，已隐藏较早输出"}, lines[len(lines)-maxLines:]...)
+	}
+	return lines
 }
 
 func extractPanelReleasePayload(archivePath string, stagedBinPath string, stagedInstallScriptPath string) error {
@@ -604,6 +736,9 @@ func writePanelUpdateScript(workDir string, targetBinPath string, stagedBinPath 
 	scriptPath := filepath.Join(workDir, "apply-update.sh")
 	backupPath := targetBinPath + ".bak"
 	logPath := filepath.Join(workDir, "apply-update.log")
+	lastLogPath := filepath.Join(config.GetRuntimeSupportDir(), "panel-update-last.log")
+	installSupportPath := config.GetRuntimeInstallScriptPath()
+	serviceSupportPath := config.GetRuntimeServiceFilePath()
 
 	script := fmt.Sprintf(`#!/usr/bin/env bash
 set -u
@@ -615,12 +750,20 @@ STAGED_SERVICE_FILE=%s
 BACKUP_BIN=%s
 WORK_DIR=%s
 LOG_PATH=%s
+LAST_LOG_PATH=%s
 SERVICE_NAME=%s
 BINARY_NAME=%s
 INSTALL_DIR="$(dirname "$TARGET_BIN")"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+UPDATE_SUCCESS=0
 
 cleanup() {
+  if [[ "$UPDATE_SUCCESS" -eq 0 && -f "$LOG_PATH" ]]; then
+    cp -f "$LOG_PATH" "$LAST_LOG_PATH" 2>/dev/null || true
+    chmod 600 "$LAST_LOG_PATH" 2>/dev/null || true
+  else
+    rm -f "$LAST_LOG_PATH"
+  fi
   rm -f "$STAGED_BIN"
   if [[ -n "$STAGED_INSTALL_SH" ]]; then
     rm -f "$STAGED_INSTALL_SH"
@@ -668,13 +811,23 @@ cp -f "$STAGED_BIN" "$TARGET_BIN"
 chmod 755 "$TARGET_BIN"
 
 if [[ -n "$STAGED_INSTALL_SH" && -f "$STAGED_INSTALL_SH" ]]; then
-  cp -f "$STAGED_INSTALL_SH" "$INSTALL_DIR/install.sh" >> "$LOG_PATH" 2>&1 || true
-  chmod 755 "$INSTALL_DIR/install.sh" >> "$LOG_PATH" 2>&1 || true
+  mkdir -p %s >> "$LOG_PATH" 2>&1 || true
+  if cp -f "$STAGED_INSTALL_SH" %s >> "$LOG_PATH" 2>&1; then
+    chmod 755 %s >> "$LOG_PATH" 2>&1 || true
+    rm -f "$INSTALL_DIR/install.sh" >> "$LOG_PATH" 2>&1 || true
+  else
+    log "failed to place runtime install.sh into %s"
+  fi
 fi
 
 if [[ -f "$STAGED_SERVICE_FILE" ]]; then
-  cp -f "$STAGED_SERVICE_FILE" "$INSTALL_DIR/kwor.service" >> "$LOG_PATH" 2>&1 || true
-  chmod 644 "$INSTALL_DIR/kwor.service" >> "$LOG_PATH" 2>&1 || true
+  mkdir -p %s >> "$LOG_PATH" 2>&1 || true
+  if cp -f "$STAGED_SERVICE_FILE" %s >> "$LOG_PATH" 2>&1; then
+    chmod 644 %s >> "$LOG_PATH" 2>&1 || true
+    rm -f "$INSTALL_DIR/kwor.service" >> "$LOG_PATH" 2>&1 || true
+  else
+    log "failed to place runtime kwor.service into %s"
+  fi
 fi
 
 if [[ "$BINARY_NAME" == "kwor_amd64" || "$BINARY_NAME" == "kwor_arm64" ]]; then
@@ -715,23 +868,41 @@ repair_systemd_file() {
   systemctl enable "$SERVICE_NAME" >> "$LOG_PATH" 2>&1 || true
 }
 
+wait_for_target_runtime() {
+  local process_name
+  process_name="$(basename "$TARGET_BIN")"
+  for _ in $(seq 1 40); do
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SERVICE_NAME"; then
+      return 0
+    fi
+    if pgrep -x "$process_name" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.3
+  done
+  return 1
+}
+
 start_panel() {
   if start_with_repaired_systemd; then
     return 0
   fi
-  if "$TARGET_BIN" start >> "$LOG_PATH" 2>&1; then
+  if "$TARGET_BIN" start >> "$LOG_PATH" 2>&1 && wait_for_target_runtime; then
     repair_systemd_file
     return 0
   fi
   if command -v nohup >/dev/null 2>&1; then
     nohup "$TARGET_BIN" >> "$LOG_PATH" 2>&1 &
-    return 0
+    if wait_for_target_runtime; then
+      return 0
+    fi
   fi
   return 1
 }
 
 if start_panel; then
   rm -f "$BACKUP_BIN"
+  UPDATE_SUCCESS=1
   exit 0
 fi
 
@@ -752,8 +923,17 @@ exit 1
 		shellQuote(backupPath),
 		shellQuote(workDir),
 		shellQuote(logPath),
+		shellQuote(lastLogPath),
 		shellQuote(panelUpdateServiceName),
 		shellQuote(binaryName),
+		shellQuote(filepath.Dir(installSupportPath)),
+		shellQuote(installSupportPath),
+		shellQuote(installSupportPath),
+		installSupportPath,
+		shellQuote(filepath.Dir(serviceSupportPath)),
+		shellQuote(serviceSupportPath),
+		shellQuote(serviceSupportPath),
+		serviceSupportPath,
 	)
 
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
