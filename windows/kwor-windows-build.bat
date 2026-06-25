@@ -54,8 +54,9 @@ echo.
 echo [2/3] Copying frontend to web\html...
 if exist web\html rd /s /q web\html
 mkdir web\html
-xcopy /s /e /y temp_frontend\dist\* web\html\ >nul
-if %ERRORLEVEL% NEQ 0 (
+robocopy temp_frontend\dist web\html /MIR /NFL /NDL /NJH /NJS /NP >nul
+set "COPY_RESULT=%ERRORLEVEL%"
+if %COPY_RESULT% GEQ 8 (
     echo [FAILED] Copy frontend files failed.
     pause
     exit /b 1
