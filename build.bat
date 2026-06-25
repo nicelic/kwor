@@ -68,9 +68,8 @@ echo.
 echo [2/4] Copying frontend to web/html/ ...
 if exist web\html rd /s /q web\html
 mkdir web\html
-robocopy temp_frontend\dist web\html /MIR /NFL /NDL /NJH /NJS /NP >nul
-set "COPY_RESULT=%ERRORLEVEL%"
-if %COPY_RESULT% GEQ 8 (
+xcopy /s /e /y temp_frontend\dist\* web\html\ >nul
+if %ERRORLEVEL% NEQ 0 (
     echo.
     echo [FAILED] Copy frontend files failed!
     pause
@@ -88,20 +87,15 @@ if %ERRORLEVEL% NEQ 0 (
     pause
     exit /b 1
 )
-if not exist "User Manual.md" (
+node scripts\copy-release-docs.mjs "%RELEASE_DIR%"
+if %ERRORLEVEL% NEQ 0 (
     echo.
-    echo [FAILED] Missing User Manual.md in repository root!
-    pause
-    exit /b 1
-)
-if not exist "使用手册.md" (
-    echo.
-    echo [FAILED] Missing 使用手册.md in repository root!
+    echo [FAILED] Copy release manuals failed!
     pause
     exit /b 1
 )
 echo [3/4] Release directory ready: %RELEASE_DIR%
-echo      Repository root manuals verified: User Manual.md, 使用手册.md
+echo      Release manuals copied: User Manual.md, 使用手册.md
 echo.
 
 :: Step 4: Build Go binaries for Linux amd64 and arm64

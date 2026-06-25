@@ -12,10 +12,11 @@ Dockerfile* text eol=lf
 *.service   text eol=lf
 *.mjs       text eol=lf
 
-# Windows 批处理/PowerShell 保持 CRLF
-*.bat       text eol=crlf
-*.cmd       text eol=crlf
-*.ps1       text eol=crlf
+# Windows 批处理/PowerShell 直接在仓库中保留 CRLF。
+# 这样从 GitHub 下载源码压缩包时,不会因为只拿到仓库 blob 的 LF 而被 cmd 误解析。
+*.bat       -text
+*.cmd       -text
+*.ps1       -text
 
 # 常见二进制类型,禁止换行转换
 *.png       binary
