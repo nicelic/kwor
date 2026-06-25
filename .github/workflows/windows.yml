@@ -25,6 +25,12 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Validate manuals in repository root
+        shell: bash
+        run: |
+          test -f "User Manual.md" || { echo "Missing User Manual.md in repository root" >&2; exit 1; }
+          test -f "使用手册.md" || { echo "Missing 使用手册.md in repository root" >&2; exit 1; }
+
       - name: Install zip for Windows
         shell: powershell
         run: |
@@ -56,7 +62,6 @@ jobs:
           mkdir kwor-windows
           cp kwor.exe kwor-windows/
           cp -r windows/* kwor-windows/
-          node scripts/copy-release-docs.mjs kwor-windows
 
       - name: Package
         shell: bash
@@ -88,6 +93,11 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Validate manuals in repository root
+        run: |
+          test -f "User Manual.md" || { echo "Missing User Manual.md in repository root" >&2; exit 1; }
+          test -f "使用手册.md" || { echo "Missing 使用手册.md in repository root" >&2; exit 1; }
+
       - name: Build frontend
         run: |
           cd temp_frontend
@@ -107,7 +117,6 @@ jobs:
           mkdir kwor-windows
           cp kwor.exe kwor-windows/
           cp -r windows/* kwor-windows/
-          node scripts/copy-release-docs.mjs kwor-windows
 
       - name: Package ARM64
         run: zip -r "kwor-windows-arm64.zip" kwor-windows

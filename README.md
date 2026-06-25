@@ -67,7 +67,6 @@ The installer also accepts a bare version such as `1.5.7` and normalizes it to `
 1. Get the latest release for your architecture from GitHub:
    [https://github.com/nicelic/kwor/releases/latest](https://github.com/nicelic/kwor/releases/latest)
    (`kwor-linux-amd64.tar.gz` or `kwor-linux-arm64.tar.gz`)
-   Each release also includes `User Manual.md` and `使用手册.md`, and the Linux archives bundle both manuals alongside the runtime files.
 2. Extract the archive:
    ```sh
    tar -zxvf kwor-linux-amd64.tar.gz
@@ -202,6 +201,11 @@ build.bat
 ```
 
 ### Build steps explained
+
+The repository root keeps both manuals as tracked source files:
+
+- `User Manual.md`
+- `使用手册.md`
 
 The frontend source lives in `temp_frontend/`. A full build:
 

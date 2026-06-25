@@ -92,7 +92,7 @@
    - 再看：对应 `service/*.go`
 7. **构建 / 安装 / 发布问题**
    - 先看：`build.bat`、`build.sh`、`windows/*`、`.github/workflows/*`
-   - 再看：`install.sh`、`cmd/cmd.go`、`config/config.go`、`scripts/sync-version.mjs`、`scripts/copy-release-docs.mjs`、`web/web.go`
+   - 再看：`install.sh`、`cmd/cmd.go`、`config/config.go`、`scripts/sync-version.mjs`、`web/web.go`
 
 ---
 
@@ -1122,10 +1122,11 @@ npm.cmd run build
 
 它不是“本地 Windows 运行入口”。
 
-发布附带文档由 `scripts/copy-release-docs.mjs` 统一复制，当前固定包含：
+仓库根目录固定保留这两个手册源码文件：
 
 - `User Manual.md`
 - `使用手册.md`
+发布前要检查的是：这两个文件在 `main` 根目录中存在，而不是把它们额外上传成 release 资产。
 
 ### `build.sh`
 

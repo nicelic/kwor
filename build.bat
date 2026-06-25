@@ -87,15 +87,20 @@ if %ERRORLEVEL% NEQ 0 (
     pause
     exit /b 1
 )
-node scripts\copy-release-docs.mjs "%RELEASE_DIR%"
-if %ERRORLEVEL% NEQ 0 (
+if not exist "User Manual.md" (
     echo.
-    echo [FAILED] Copy release manuals failed!
+    echo [FAILED] Missing User Manual.md in repository root!
+    pause
+    exit /b 1
+)
+if not exist "使用手册.md" (
+    echo.
+    echo [FAILED] Missing 使用手册.md in repository root!
     pause
     exit /b 1
 )
 echo [3/4] Release directory ready: %RELEASE_DIR%
-echo      Release manuals copied: User Manual.md, 使用手册.md
+echo      Repository root manuals verified: User Manual.md, 使用手册.md
 echo.
 
 :: Step 4: Build Go binaries for Linux amd64 and arm64
