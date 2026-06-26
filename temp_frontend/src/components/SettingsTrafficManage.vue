@@ -44,19 +44,19 @@
                 :items="vnstatVersionSelectItems"
                 item-title="title"
                 item-value="value"
-                label="安装版本"
+                label="安装来源"
+                placeholder="请先选择来源"
                 density="comfortable"
                 hide-details
                 class="traffic-version-select"
-                :loading="loadingVnstatVersions"
                 :disabled="loading || togglingTraffic || installingVnstat || removingVnstat || checkingVnstatUpdate || !overview.vnstat.supported || !overview.vnstat.canManage"
-                @update:menu="onVnstatVersionMenuUpdate" />
+                clearable />
               <div class="traffic-runtime__button-group">
                 <v-btn
                   color="primary"
                   prepend-icon="mdi-download"
                   :loading="installingVnstat"
-                  :disabled="loading || togglingTraffic || installingVnstat || removingVnstat || checkingVnstatUpdate || !overview.vnstat.supported || !overview.vnstat.canManage"
+                  :disabled="loading || togglingTraffic || installingVnstat || removingVnstat || checkingVnstatUpdate || !overview.vnstat.supported || !overview.vnstat.canManage || !hasSelectedVnstatSource"
                   @click="installVnstat">
                   {{ overview.vnstat.installed ? '下载 / 重装' : '下载 / 安装' }}
                 </v-btn>
@@ -65,7 +65,7 @@
                   color="primary"
                   prepend-icon="mdi-cloud-search"
                   :loading="checkingVnstatUpdate"
-                  :disabled="loading || togglingTraffic || installingVnstat || removingVnstat || checkingVnstatUpdate || !overview.vnstat.supported || !overview.vnstat.canManage"
+                  :disabled="loading || togglingTraffic || installingVnstat || removingVnstat || checkingVnstatUpdate || !overview.vnstat.supported || !overview.vnstat.canManage || !hasSelectedVnstatSource"
                   @click="checkVnstatUpdate">
                   检测更新
                 </v-btn>
@@ -281,10 +281,6 @@ type VnstatVersionItem = {
   description: string
 }
 
-type VnstatVersionListResult = {
-  versions: VnstatVersionItem[]
-}
-
 type VnstatUpdateInfo = {
   supported: boolean
   canManage: boolean
@@ -316,11 +312,7 @@ const nextResetLabel = '\u4e0b\u4e00\u6b21\u91cd\u7f6e\u65f6\u95f4'
 const removeVnstatConfirmText = '确认删除 vnstat 吗？将停止运行的 vnstat，卸载软件包，并删除已跟踪的 vnstat 流量数据。'
 const removeExternalVnstatConfirmText = '检测到系统已有 vnstat。确认删除会停止并卸载 vnstat，同时清理 vnstat 流量数据，是否继续？'
 const disableTrafficConfirmText = '确认关闭流量统计吗？关闭期间产生的流量不会计入面板统计，再次开启会从当前数值继续统计。'
-const defaultVnstatVersionOption: VnstatVersionItem = {
-  value: 'system',
-  title: '自动安装（系统源优先）',
-  description: '默认通过当前系统软件源安装或重装 vnstat；系统软件源不可用时自动回退到 GitHub 官方版本。',
-}
+const selectVnstatSourceHint = '请先选择来源'
 
 const loading = ref(false)
 const savingSettings = ref(false)
@@ -330,11 +322,20 @@ const togglingTraffic = ref(false)
 const installingVnstat = ref(false)
 const removingVnstat = ref(false)
 const checkingVnstatUpdate = ref(false)
-const loadingVnstatVersions = ref(false)
-const vnstatVersionLoaded = ref(false)
 const enabledInput = ref(true)
-const selectedVnstatVersion = ref(defaultVnstatVersionOption.value)
-const vnstatVersionItems = ref<VnstatVersionItem[]>([defaultVnstatVersionOption])
+const selectedVnstatVersion = ref('')
+const vnstatVersionItems = ref<VnstatVersionItem[]>([
+  {
+    value: 'system-package',
+    title: '系统软件源',
+    description: '使用当前系统的软件包管理器安装或重装 vnstat',
+  },
+  {
+    value: 'github-release',
+    title: 'GitHub 官方源码包',
+    description: '从 GitHub 官方 release 源码包编译安装或重装 vnstat',
+  },
+])
 const overview = ref<TrafficOverview>({
   source: 'vnstat',
   interface: '',
@@ -482,19 +483,6 @@ const normalizeVnstatStatus = (raw: unknown): VnstatStatus => {
   }
 }
 
-const normalizeVnstatVersionItem = (raw: unknown): VnstatVersionItem | null => {
-  const input = (raw ?? {}) as TrafficOverviewRaw
-  const value = readStringField(input, ['value'], '')
-  if (value.trim() === '') {
-    return null
-  }
-  return {
-    value,
-    title: readStringField(input, ['title'], value),
-    description: readStringField(input, ['description'], ''),
-  }
-}
-
 const normalizeVnstatUpdateInfo = (raw: unknown): VnstatUpdateInfo => {
   const input = (raw ?? {}) as TrafficOverviewRaw
   return {
@@ -558,8 +546,9 @@ const statusColor = computed(() => {
   if (!overview.value.vnstat.installed) return 'error'
   return 'warning'
 })
+const hasSelectedVnstatSource = computed(() => selectedVnstatVersion.value.trim() !== '')
 const vnstatVersionSelectItems = computed(() => (
-  vnstatVersionItems.value.length > 0 ? vnstatVersionItems.value : [defaultVnstatVersionOption]
+  vnstatVersionItems.value
 ))
 const vnstatVersionText = computed(() => overview.value.vnstat.version || '-')
 const vnstatLatestVersionText = computed(() => vnstatUpdateInfo.value.latestVersion || '-')
@@ -771,6 +760,18 @@ const applyOverview = (raw: Partial<TrafficOverview>, options: ApplyOverviewOpti
   }
 }
 
+const ensureVnstatSourceSelected = () => {
+  const selected = selectedVnstatVersion.value.trim()
+  if (selected !== '') {
+    return selected
+  }
+  push.warning({
+    duration: 3000,
+    message: selectVnstatSourceHint,
+  })
+  return ''
+}
+
 const fetchOverview = async (silent = false) => {
   if (!silent) {
     loading.value = true
@@ -814,45 +815,16 @@ const onTrafficEnabledChanged = async (value: boolean | null) => {
   }
 }
 
-const fetchVnstatVersions = async () => {
-  if (loadingVnstatVersions.value) return
-  loadingVnstatVersions.value = true
-  try {
-    const msg = await HttpUtils.get('api/traffic-overview-vnstat-versions')
-    if (!msg.success || msg.obj == null) {
-      return
-    }
-    const data = msg.obj as Partial<VnstatVersionListResult>
-    const items = Array.isArray(data.versions)
-      ? data.versions.map(normalizeVnstatVersionItem).filter((item): item is VnstatVersionItem => item != null)
-      : []
-    vnstatVersionItems.value = items.length > 0 ? items : [defaultVnstatVersionOption]
-    if (!vnstatVersionItems.value.some(item => item.value === selectedVnstatVersion.value)) {
-      selectedVnstatVersion.value = vnstatVersionItems.value[0]?.value || defaultVnstatVersionOption.value
-    }
-    vnstatVersionLoaded.value = true
-  } finally {
-    loadingVnstatVersions.value = false
-  }
-}
-
-const ensureVnstatVersionsLoaded = async () => {
-  if (vnstatVersionLoaded.value) return
-  await fetchVnstatVersions()
-}
-
-const onVnstatVersionMenuUpdate = (opened: boolean) => {
-  if (!opened) return
-  void ensureVnstatVersionsLoaded()
-}
-
 const installVnstat = async () => {
+  const selectedSource = ensureVnstatSourceSelected()
+  if (selectedSource === '') {
+    return
+  }
   const beforeVersion = overview.value.vnstat.version.trim()
-  const targetVersion = selectedVnstatVersion.value.trim() || defaultVnstatVersionOption.value
   installingVnstat.value = true
   try {
     const msg = await HttpUtils.post('api/traffic-overview-vnstat-install', {
-      version: targetVersion,
+      source: selectedSource,
     }, {
       headers: {
         'Content-Type': 'application/json',
@@ -877,7 +849,7 @@ const installVnstat = async () => {
           message: 'vnstat 已重装，现有流量数据已保留',
         })
       }
-      selectedVnstatVersion.value = targetVersion
+      selectedVnstatVersion.value = selectedSource
       vnstatUpdateInfo.value = createIdleVnstatUpdateInfo(overview.value.vnstat)
     }
   } finally {
@@ -886,9 +858,13 @@ const installVnstat = async () => {
 }
 
 const checkVnstatUpdate = async (silent = false) => {
+  const selectedSource = ensureVnstatSourceSelected()
+  if (selectedSource === '') {
+    return
+  }
   checkingVnstatUpdate.value = true
   try {
-    const msg = await HttpUtils.get('api/traffic-overview-vnstat-update-info')
+    const msg = await HttpUtils.get(`api/traffic-overview-vnstat-update-info?source=${encodeURIComponent(selectedSource)}`)
     if (!msg.success) {
       return
     }
@@ -918,7 +894,7 @@ const removeVnstat = async () => {
         duration: 3500,
         message: 'vnstat 已删除，流量统计数据已清理',
       })
-      selectedVnstatVersion.value = defaultVnstatVersionOption.value
+      selectedVnstatVersion.value = ''
       vnstatUpdateInfo.value = createIdleVnstatUpdateInfo(overview.value.vnstat)
     }
   } finally {
@@ -1025,6 +1001,13 @@ watch(() => props.active, (active) => {
     return
   }
   stopPolling()
+})
+
+watch(() => selectedVnstatVersion.value, (value, previousValue) => {
+  if (value === previousValue) {
+    return
+  }
+  vnstatUpdateInfo.value = createIdleVnstatUpdateInfo(overview.value.vnstat)
 })
 
 onMounted(() => {

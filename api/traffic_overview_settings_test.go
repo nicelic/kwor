@@ -169,7 +169,7 @@ func TestSaveTrafficOverviewSwitchPersistsEnabled(t *testing.T) {
 	}
 }
 
-func TestGetTrafficOverviewVnstatVersionsReturnsSystemOption(t *testing.T) {
+func TestGetTrafficOverviewVnstatVersionsReturnsBothSources(t *testing.T) {
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Request = httptest.NewRequest("GET", "/api/traffic-overview-vnstat-versions", nil)
@@ -189,9 +189,20 @@ func TestGetTrafficOverviewVnstatVersionsReturnsSystemOption(t *testing.T) {
 	if !ok || len(versions) == 0 {
 		t.Fatalf("expected at least one vnstat version option, got %#v", payload["versions"])
 	}
-	first, ok := versions[0].(map[string]interface{})
-	if !ok || first["value"] != "system" {
-		t.Fatalf("first version option=%#v, want value system", versions[0])
+	values := make([]string, 0, len(versions))
+	for _, rawVersion := range versions {
+		item, ok := rawVersion.(map[string]interface{})
+		if !ok {
+			t.Fatalf("unexpected version option payload: %#v", rawVersion)
+		}
+		value, _ := item["value"].(string)
+		values = append(values, value)
+	}
+	if len(values) != 2 {
+		t.Fatalf("version option count=%d, want 2; values=%v", len(values), values)
+	}
+	if values[0] != "system-package" || values[1] != "github-release" {
+		t.Fatalf("version option values=%v, want [system-package github-release]", values)
 	}
 }
 

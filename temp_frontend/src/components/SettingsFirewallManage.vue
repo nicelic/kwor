@@ -141,10 +141,43 @@
                   <div class="text-h5 mt-1">{{ overview.systemCount }}</div>
                 </div>
               </v-col>
-              <v-col cols="12" sm="6" md="3">
-                <div class="firewall-metric">
+            </v-row>
+            <v-row class="mt-2">
+              <v-col cols="12" md="4">
+                <div class="firewall-metric firewall-metric--detail">
                   <div class="text-caption text-medium-emphasis">外部扫描</div>
                   <div class="text-h5 mt-1">{{ overview.externalCount }}</div>
+                  <div class="text-caption text-medium-emphasis mt-2">系统中已扫描到的外部放行规则数</div>
+                </div>
+              </v-col>
+              <v-col cols="12" md="4">
+                <div class="firewall-metric firewall-metric--detail">
+                  <div class="d-flex align-start justify-space-between ga-3 flex-wrap">
+                    <div>
+                      <div class="text-caption text-medium-emphasis">TCP 半开</div>
+                      <div class="text-h5 mt-1">{{ formatMetricCount(overview.tcpSynRecvCount) }}</div>
+                    </div>
+                    <div class="firewall-metric__meta">
+                      <div>系统活跃 {{ formatMetricCount(overview.tcpActiveCount) }}</div>
+                      <div>已建立 {{ formatMetricCount(overview.tcpEstablishedCount) }}</div>
+                      <div>异常累计 {{ formatMetricCount(overview.tcpAnomalyTotal) }}</div>
+                    </div>
+                  </div>
+                  <div class="text-caption text-medium-emphasis mt-2">按系统全局 TCP 状态统计，不限端口；半开高更像 SYN 压力，异常累计为系统自启动以来的 Syncookies / ListenDrops / ListenOverflows 总和。</div>
+                </div>
+              </v-col>
+              <v-col cols="12" md="4">
+                <div class="firewall-metric firewall-metric--detail">
+                  <div class="d-flex align-start justify-space-between ga-3 flex-wrap">
+                    <div>
+                      <div class="text-caption text-medium-emphasis">UDP 当前</div>
+                      <div class="text-h5 mt-1">{{ formatMetricCount(overview.udpSocketCount) }}</div>
+                    </div>
+                    <div class="firewall-metric__meta">
+                      <div>异常累计 {{ formatMetricCount(overview.udpAnomalyTotal) }}</div>
+                    </div>
+                  </div>
+                  <div class="text-caption text-medium-emphasis mt-2">按系统全局 UDP socket 条目统计，不限端口；异常累计为系统自启动以来的 NoPorts / InErrors / RcvbufErrors 总和。</div>
                 </div>
               </v-col>
             </v-row>
@@ -890,6 +923,12 @@ type FirewallOverview = {
     subReserved: boolean
   }
   sshConfig: FirewallSSHConfig
+  tcpActiveCount: number
+  tcpSynRecvCount: number
+  tcpEstablishedCount: number
+  tcpAnomalyTotal: number
+  udpSocketCount: number
+  udpAnomalyTotal: number
   manualCount: number
   temporaryCount: number
   externalCount: number
@@ -969,6 +1008,12 @@ const emptyOverview = (): FirewallOverview => ({
     permitOpen: '',
     gatewayPorts: '',
   },
+  tcpActiveCount: 0,
+  tcpSynRecvCount: 0,
+  tcpEstablishedCount: 0,
+  tcpAnomalyTotal: 0,
+  udpSocketCount: 0,
+  udpAnomalyTotal: 0,
   manualCount: 0,
   temporaryCount: 0,
   externalCount: 0,
@@ -1287,6 +1332,12 @@ const formatTimestamp = (timestamp: number) => {
   return new Date(timestamp * 1000).toLocaleString()
 }
 
+const formatMetricCount = (value: number) => {
+  const normalized = Number(value ?? 0)
+  if (!Number.isFinite(normalized) || normalized <= 0) return '0'
+  return normalized.toLocaleString('zh-CN')
+}
+
 const familyLabel = (family: string) => {
   if (family === 'ipv4') return 'IPv4'
   if (family === 'ipv6') return 'IPv6'
@@ -1509,6 +1560,12 @@ const applyOverview = (raw: any) => {
       ...(raw?.sshConfig ?? {}),
       ports: normalizeNumberArray(raw?.sshConfig?.ports),
     },
+    tcpActiveCount: Number(raw?.tcpActiveCount ?? 0),
+    tcpSynRecvCount: Number(raw?.tcpSynRecvCount ?? 0),
+    tcpEstablishedCount: Number(raw?.tcpEstablishedCount ?? 0),
+    tcpAnomalyTotal: Number(raw?.tcpAnomalyTotal ?? 0),
+    udpSocketCount: Number(raw?.udpSocketCount ?? 0),
+    udpAnomalyTotal: Number(raw?.udpAnomalyTotal ?? 0),
     manualCount: Number(raw?.manualCount ?? 0),
     temporaryCount: Number(raw?.temporaryCount ?? 0),
     externalCount: Number(raw?.externalCount ?? 0),
@@ -2033,6 +2090,19 @@ onBeforeUnmount(() => {
 <style scoped>
 .firewall-page {
   min-height: 460px;
+}
+
+.firewall-metric--detail {
+  min-height: 96px;
+}
+
+.firewall-metric__meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.7);
+  text-align: right;
 }
 
 .firewall-hero {

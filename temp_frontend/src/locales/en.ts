@@ -224,6 +224,12 @@
   kernelManager: {
     title: "XanMod Kernel Manager",
     provider: "Kernel source",
+    providerPlaceholder: "Select a kernel source",
+    providerHint: "Choose a kernel source first, then manually select the line, version, and architecture to load the package list.",
+    providerEmpty: "No source selected",
+    linePlaceholder: "Select a kernel line",
+    versionPlaceholder: "Select a kernel version",
+    archPlaceholder: "Select a kernel architecture",
     supported: "Supported",
     unsupported: "Unsupported",
     line: "Kernel line",

@@ -799,7 +799,7 @@ func normalizeKernelDownloadSessionID(id string) string {
 }
 
 func (s *KernelManagerService) GetOverview(provider string) (*KernelOverview, error) {
-	normalizedProvider, err := normalizeKernelProvider(provider)
+	normalizedProvider, err := normalizeKernelProviderRequired(provider)
 	if err != nil {
 		return nil, err
 	}
@@ -839,7 +839,7 @@ func (s *KernelManagerService) GetOverview(provider string) (*KernelOverview, er
 }
 
 func (s *KernelManagerService) GetVersions(provider, line string) (*KernelVersionListResponse, error) {
-	normalizedProvider, err := normalizeKernelProvider(provider)
+	normalizedProvider, err := normalizeKernelProviderRequired(provider)
 	if err != nil {
 		return nil, err
 	}
@@ -886,7 +886,7 @@ func (s *KernelManagerService) GetVersions(provider, line string) (*KernelVersio
 }
 
 func (s *KernelManagerService) GetArches(provider, line, version string) (*KernelArchListResponse, error) {
-	normalizedProvider, err := normalizeKernelProvider(provider)
+	normalizedProvider, err := normalizeKernelProviderRequired(provider)
 	if err != nil {
 		return nil, err
 	}
@@ -963,7 +963,7 @@ func (s *KernelManagerService) GetArches(provider, line, version string) (*Kerne
 }
 
 func (s *KernelManagerService) GetPackages(provider, line, version, arch string) (*KernelPackageListResponse, error) {
-	normalizedProvider, err := normalizeKernelProvider(provider)
+	normalizedProvider, err := normalizeKernelProviderRequired(provider)
 	if err != nil {
 		return nil, err
 	}
@@ -2312,6 +2312,14 @@ func normalizeKernelProvider(provider string) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported kernel provider: %s", provider)
 	}
+}
+
+func normalizeKernelProviderRequired(provider string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(provider))
+	if normalized == "" {
+		return "", fmt.Errorf("provider is required")
+	}
+	return normalizeKernelProvider(normalized)
 }
 
 func normalizeKernelLine(line string) (string, error) {

@@ -17,6 +17,8 @@ func TestBuildSingboxSystemdServiceContent_UsesSystemdSafeExecSyntax(t *testing.
 		`ExecStartPre=/opt/kwor/bin/kwor\x20ctl materialize-core-config singbox`,
 		`ExecStart=/opt/kwor/core/singbox/sing-box run -c /opt/kwor/Promanager\x20data/core/singbox/config.json`,
 		`ExecStopPost=/opt/kwor/bin/kwor\x20ctl cleanup-core-config singbox`,
+		`Restart=on-failure`,
+		`RestartSec=2s`,
 		`WorkingDirectory=/opt/kwor/Promanager\x20data/core/singbox`,
 	}
 	for _, expected := range expectedLines {
@@ -51,6 +53,8 @@ func TestBuildMihomoSystemdServiceContent_UsesSystemdSafeExecSyntax(t *testing.T
 		`ExecStartPre=/opt/kwor/bin/kwor\x20ctl materialize-core-config mihomo`,
 		`ExecStart=/opt/kwor/core/mihomo/mihomo -d /opt/kwor/Promanager\x20data/core/mihomo -f /opt/kwor/Promanager\x20data/core/mihomo/server.yaml`,
 		`ExecStopPost=/opt/kwor/bin/kwor\x20ctl cleanup-core-config mihomo`,
+		`Restart=on-failure`,
+		`RestartSec=2s`,
 		`WorkingDirectory=/opt/kwor/Promanager\x20data/core/mihomo`,
 	}
 	for _, expected := range expectedLines {

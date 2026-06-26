@@ -17,13 +17,23 @@ func TestKernelAPIValidation(t *testing.T) {
 		if msg.Success {
 			t.Fatalf("expected failure when line is missing")
 		}
-		if rec.Code != 200 || !strings.Contains(msg.Msg, "line is required") {
+		if rec.Code != 200 || !strings.Contains(msg.Msg, "provider is required") {
+			t.Fatalf("unexpected response: code=%d msg=%q", rec.Code, msg.Msg)
+		}
+	})
+
+	t.Run("overview provider required", func(t *testing.T) {
+		rec, msg := performKernelAPIGet(t, svc.GetKernelOverview, "/api/kernel-overview")
+		if msg.Success {
+			t.Fatalf("expected failure when provider is missing")
+		}
+		if rec.Code != 200 || !strings.Contains(msg.Msg, "provider is required") {
 			t.Fatalf("unexpected response: code=%d msg=%q", rec.Code, msg.Msg)
 		}
 	})
 
 	t.Run("arches version required", func(t *testing.T) {
-		rec, msg := performKernelAPIGet(t, svc.GetKernelArches, "/api/kernel-arches?line=lts")
+		rec, msg := performKernelAPIGet(t, svc.GetKernelArches, "/api/kernel-arches?provider=xanmod&line=lts")
 		if msg.Success {
 			t.Fatalf("expected failure when version is missing")
 		}
@@ -33,7 +43,7 @@ func TestKernelAPIValidation(t *testing.T) {
 	})
 
 	t.Run("packages arch required", func(t *testing.T) {
-		rec, msg := performKernelAPIGet(t, svc.GetKernelPackages, "/api/kernel-packages?line=lts&version=6.18.27-xanmod1")
+		rec, msg := performKernelAPIGet(t, svc.GetKernelPackages, "/api/kernel-packages?provider=xanmod&line=lts&version=6.18.27-xanmod1")
 		if msg.Success {
 			t.Fatalf("expected failure when arch is missing")
 		}
@@ -57,7 +67,7 @@ func TestKernelAPIValidation(t *testing.T) {
 	})
 
 	t.Run("download line required", func(t *testing.T) {
-		rec, msg := performKernelAPIPostJSON(t, svc.DownloadKernelPackages, `{"version":"6.18.27-xanmod1","arch":"x64v3"}`)
+		rec, msg := performKernelAPIPostJSON(t, svc.DownloadKernelPackages, `{"provider":"xanmod","version":"6.18.27-xanmod1","arch":"x64v3"}`)
 		if msg.Success {
 			t.Fatalf("expected failure when line is missing")
 		}
@@ -67,7 +77,7 @@ func TestKernelAPIValidation(t *testing.T) {
 	})
 
 	t.Run("install arch required", func(t *testing.T) {
-		rec, msg := performKernelAPIPostJSON(t, svc.InstallKernelPackages, `{"line":"lts","version":"6.18.27-xanmod1"}`)
+		rec, msg := performKernelAPIPostJSON(t, svc.InstallKernelPackages, `{"provider":"xanmod","line":"lts","version":"6.18.27-xanmod1"}`)
 		if msg.Success {
 			t.Fatalf("expected failure when arch is missing")
 		}
@@ -102,6 +112,26 @@ func TestKernelAPIValidation(t *testing.T) {
 			t.Fatalf("expected failure when progress id is missing")
 		}
 		if rec.Code != 200 || !strings.Contains(msg.Msg, "id is required") {
+			t.Fatalf("unexpected response: code=%d msg=%q", rec.Code, msg.Msg)
+		}
+	})
+
+	t.Run("download provider required", func(t *testing.T) {
+		rec, msg := performKernelAPIPostJSON(t, svc.DownloadKernelPackages, `{"version":"6.18.27-xanmod1","line":"lts","arch":"x64v3"}`)
+		if msg.Success {
+			t.Fatalf("expected failure when provider is missing")
+		}
+		if rec.Code != 200 || !strings.Contains(msg.Msg, "provider is required") {
+			t.Fatalf("unexpected response: code=%d msg=%q", rec.Code, msg.Msg)
+		}
+	})
+
+	t.Run("install provider required", func(t *testing.T) {
+		rec, msg := performKernelAPIPostJSON(t, svc.InstallKernelPackages, `{"line":"lts","version":"6.18.27-xanmod1","arch":"x64v3"}`)
+		if msg.Success {
+			t.Fatalf("expected failure when provider is missing")
+		}
+		if rec.Code != 200 || !strings.Contains(msg.Msg, "provider is required") {
 			t.Fatalf("unexpected response: code=%d msg=%q", rec.Code, msg.Msg)
 		}
 	})

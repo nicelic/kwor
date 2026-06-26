@@ -22,9 +22,11 @@ type NftCoreSyncJob struct {
 	initialized       bool
 	lastRunning       bool
 	lastIntegrityScan time.Time
+	lastRecoverAt     time.Time
 }
 
 const nftIntegrityScanInterval = 15 * time.Second
+const managedCoreAutoRecoverRetryInterval = 15 * time.Second
 
 func NewNftCoreSyncJob() *NftCoreSyncJob {
 	return &NftCoreSyncJob{}
@@ -39,6 +41,16 @@ func (s *NftCoreSyncJob) Run() {
 	defer s.mu.Unlock()
 
 	running := s.CoreManagerService.IsRunning()
+	if !running && service.ShouldAutoRecoverManagedCoreRuntime("singbox") {
+		now := time.Now()
+		if s.lastRecoverAt.IsZero() || now.Sub(s.lastRecoverAt) >= managedCoreAutoRecoverRetryInterval {
+			s.lastRecoverAt = now
+			if err := s.CoreManagerService.StartCore(); err != nil {
+				logger.Warning("sing-box direct runtime auto-recover failed: ", err)
+			}
+			running = s.CoreManagerService.IsRunning()
+		}
+	}
 	needInit := false
 	if running {
 		// Re-apply rules when core transitions to running, or when nft table was
@@ -73,6 +85,9 @@ func (s *NftCoreSyncJob) Run() {
 		}
 	}
 
+	if running {
+		s.lastRecoverAt = time.Time{}
+	}
 	s.lastRunning = running
 	s.initialized = true
 }

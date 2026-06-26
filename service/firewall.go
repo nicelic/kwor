@@ -107,6 +107,12 @@ type FirewallOverview struct {
 	LastSyncAt               int64                   `json:"lastSyncAt"`
 	DefaultPorts             FirewallDefaultPorts    `json:"defaultPorts"`
 	SSHConfig                FirewallSSHConfigStatus `json:"sshConfig"`
+	TCPActiveCount           int                     `json:"tcpActiveCount"`
+	TCPSynRecvCount          int                     `json:"tcpSynRecvCount"`
+	TCPEstablishedCount      int                     `json:"tcpEstablishedCount"`
+	TCPAnomalyTotal          int64                   `json:"tcpAnomalyTotal"`
+	UDPSocketCount           int                     `json:"udpSocketCount"`
+	UDPAnomalyTotal          int64                   `json:"udpAnomalyTotal"`
 	ManualCount              int                     `json:"manualCount"`
 	TemporaryCount           int                     `json:"temporaryCount"`
 	ExternalCount            int                     `json:"externalCount"`
@@ -274,6 +280,10 @@ func (s *FirewallService) GetOverview() (*FirewallOverview, error) {
 	geoUpdateIntervalMinutes, _ := s.getFirewallGeoUpdateIntervalMinutesLocked()
 	geoLastRefreshAt, _ := s.getFirewallGeoLastRefreshAtLocked()
 	sshConfig := resolveFirewallSSHConfigStatus()
+	connectionStats, statsErr := readFirewallConnectionStats()
+	if statsErr != nil {
+		logger.Warning("read firewall connection stats failed:", statsErr)
+	}
 
 	overview := &FirewallOverview{
 		Enabled:                  enabled,
@@ -283,6 +293,12 @@ func (s *FirewallService) GetOverview() (*FirewallOverview, error) {
 		LastSyncAt:               lastSyncAt,
 		DefaultPorts:             defaults,
 		SSHConfig:                sshConfig,
+		TCPActiveCount:           connectionStats.TCPActiveCount,
+		TCPSynRecvCount:          connectionStats.TCPSynRecvCount,
+		TCPEstablishedCount:      connectionStats.TCPEstablishedCount,
+		TCPAnomalyTotal:          connectionStats.TCPAnomalyTotal,
+		UDPSocketCount:           connectionStats.UDPSocketCount,
+		UDPAnomalyTotal:          connectionStats.UDPAnomalyTotal,
 		ManualCount:              manualCount,
 		TemporaryCount:           temporaryCount,
 		ExternalCount:            externalCount,

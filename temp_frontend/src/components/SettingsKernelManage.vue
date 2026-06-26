@@ -12,13 +12,24 @@
           hide-details
           class="kernel-provider-select"
           :label="t('kernelManager.provider')"
+          :placeholder="t('kernelManager.providerPlaceholder')"
+          clearable
           :disabled="busy" />
-        <v-chip size="small" :color="overview.supported ? 'success' : 'warning'">
-          {{ overview.supported ? t('kernelManager.supported') : t('kernelManager.unsupported') }}
+        <v-chip size="small" :color="providerStatusColor">
+          {{ providerStatusText }}
         </v-chip>
       </v-card-title>
       <v-divider />
       <v-card-text>
+        <v-alert
+          v-if="!hasProvider"
+          type="info"
+          variant="tonal"
+          density="comfortable"
+          class="mb-4">
+          {{ t('kernelManager.providerHint') }}
+        </v-alert>
+
         <v-alert
           v-if="!overview.supported && overview.reason"
           type="warning"
@@ -28,7 +39,7 @@
           {{ overview.reason }}
         </v-alert>
 
-        <v-row class="mb-2">
+        <v-row v-if="hasProvider" class="mb-2">
           <template v-if="isXanMod">
             <v-col cols="12" sm="6" md="4">
               <v-select
@@ -37,6 +48,8 @@
                 item-title="label"
                 item-value="value"
                 :label="t('kernelManager.line')"
+                :placeholder="t('kernelManager.linePlaceholder')"
+                clearable
                 :disabled="busy" />
             </v-col>
             <v-col cols="12" sm="6" md="4">
@@ -46,6 +59,8 @@
                 item-title="name"
                 item-value="name"
                 :label="t('kernelManager.version')"
+                :placeholder="t('kernelManager.versionPlaceholder')"
+                clearable
                 :disabled="busy || versionItems.length === 0" />
             </v-col>
             <v-col cols="12" sm="6" md="4">
@@ -55,6 +70,8 @@
                 item-title="arch"
                 item-value="arch"
                 :label="t('kernelManager.arch')"
+                :placeholder="t('kernelManager.archPlaceholder')"
+                clearable
                 :disabled="busy || archItems.length === 0" />
             </v-col>
           </template>
@@ -66,6 +83,8 @@
                 item-title="name"
                 item-value="name"
                 :label="t('kernelManager.version')"
+                :placeholder="t('kernelManager.versionPlaceholder')"
+                clearable
                 :disabled="busy || versionItems.length === 0" />
             </v-col>
           </template>
@@ -344,6 +363,8 @@ type KernelSystemCleanupInfo = {
   summary: string
 }
 
+type KernelProvider = 'xanmod' | 'bbrplus'
+
 const props = withDefaults(defineProps<{ active?: boolean }>(), {
   active: false,
 })
@@ -372,20 +393,22 @@ const rebootOverlay = ref(false)
 const reconnectTimerId = ref<number | null>(null)
 const downloadProgressSessionId = ref('')
 const downloadProgressTimerId = ref<number | null>(null)
-const provider = ref('xanmod')
+const provider = ref('')
 const kernelSelectionHydrating = ref(false)
-const pendingReturnToDefaultProvider = ref(false)
-
-const selectedLine = ref('lts')
+const selectedLine = ref('')
 const selectedVersion = ref('')
-const selectedArch = ref('x64v3')
+const selectedArch = ref('')
 
-const overview = ref<KernelOverview>({
+const createEmptyKernelOverview = (): KernelOverview => ({
   supported: false,
   reason: '',
   currentKernel: '',
   downloadRoot: '',
+  downloadedKernel: '',
+  downloadedDirectory: '',
 })
+
+const overview = ref<KernelOverview>(createEmptyKernelOverview())
 
 const versionItems = ref<KernelVersionItem[]>([])
 const archItems = ref<KernelArchItem[]>([])
@@ -452,6 +475,17 @@ const beginCleanupScanRequest = () => {
 
 const isLatestCleanupScanRequest = (token: number) => token === latestCleanupScanRequestToken
 
+const normalizeKernelProviderSelection = (value: unknown): KernelProvider | '' => {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (normalized === 'xanmod' || normalized === 'bbrplus') {
+    return normalized
+  }
+  return ''
+}
+
+const selectedProvider = computed(() => normalizeKernelProviderSelection(provider.value))
+const hasProvider = computed(() => selectedProvider.value !== '')
+
 const busy = computed(() => (
   loadingOverview.value ||
   loadingPackages.value ||
@@ -463,7 +497,19 @@ const busy = computed(() => (
   cleanupAutoPurging.value
 ))
 const canOperate = computed(() => overview.value.supported && !busy.value)
-const isXanMod = computed(() => provider.value === 'xanmod')
+const providerStatusText = computed(() => {
+  if (!hasProvider.value) {
+    return t('kernelManager.providerEmpty')
+  }
+  return overview.value.supported ? t('kernelManager.supported') : t('kernelManager.unsupported')
+})
+const providerStatusColor = computed(() => {
+  if (!hasProvider.value) {
+    return 'info'
+  }
+  return overview.value.supported ? 'success' : 'warning'
+})
+const isXanMod = computed(() => selectedProvider.value === 'xanmod')
 const downloadDirText = computed(() => downloadDirectory.value || overview.value.downloadRoot || '-')
 const downloadedKernelLabel = computed(() => String(overview.value.downloadedKernel || '').trim())
 const downloadedKernelDirectory = computed(() => String(overview.value.downloadedDirectory || '').trim())
@@ -563,17 +609,29 @@ const resetDownloadProgress = () => {
 }
 
 const resetKernelSelection = (nextProvider: string) => {
-  selectedLine.value = nextProvider === 'xanmod' ? 'lts' : ''
+  selectedLine.value = ''
   selectedVersion.value = ''
-  selectedArch.value = nextProvider === 'xanmod' ? 'x64v3' : ''
+  selectedArch.value = ''
   versionItems.value = []
   archItems.value = []
   packages.value = []
   downloadDirectory.value = ''
+  overview.value = createEmptyKernelOverview()
+  cleanupCurrentKernel.value = ''
+  cleanupPinnedKernel.value = ''
+  cleanupPackages.value = []
+  resetCleanupSelection()
+  resetDownloadProgress()
 }
 
 const loadOverview = async (requestToken = beginSelectionRequest()) => {
-  const currentProvider = provider.value
+  const currentProvider = selectedProvider.value
+  if (!currentProvider) {
+    if (isLatestSelectionRequest(requestToken)) {
+      overview.value = createEmptyKernelOverview()
+    }
+    return
+  }
   const stopLoading = beginOverviewLoading()
   try {
     const msg = await HttpUtils.get('api/kernel-overview', { provider: currentProvider })
@@ -594,8 +652,17 @@ const loadOverview = async (requestToken = beginSelectionRequest()) => {
 }
 
 const loadVersions = async (requestToken = beginSelectionRequest()) => {
-  const currentProvider = provider.value
+  const currentProvider = selectedProvider.value
   const currentLine = selectedLine.value
+  if (!currentProvider) {
+    if (isLatestSelectionRequest(requestToken)) {
+      versionItems.value = []
+      archItems.value = []
+      packages.value = []
+      downloadDirectory.value = ''
+    }
+    return
+  }
   if (currentProvider === 'xanmod' && !currentLine) {
     if (isLatestSelectionRequest(requestToken)) {
       versionItems.value = []
@@ -619,18 +686,12 @@ const loadVersions = async (requestToken = beginSelectionRequest()) => {
     if (!isLatestSelectionRequest(requestToken)) return
     versionItems.value = msg.success && msg.obj?.versions ? msg.obj.versions as KernelVersionItem[] : []
     kernelSelectionHydrating.value = true
-    selectedVersion.value = versionItems.value.length > 0 ? versionItems.value[0].name : ''
-    if (currentProvider === 'xanmod' && !selectedVersion.value) {
-      selectedArch.value = ''
+    if (!versionItems.value.some(item => item.name === selectedVersion.value)) {
+      selectedVersion.value = ''
     }
+    selectedArch.value = ''
     kernelSelectionHydrating.value = false
-    if (selectedVersion.value.length > 0) {
-      if (currentProvider === 'xanmod') {
-        await loadArches(requestToken)
-      } else {
-        await loadPackages(requestToken)
-      }
-    } else if (isLatestSelectionRequest(requestToken)) {
+    if (selectedVersion.value.length === 0 && isLatestSelectionRequest(requestToken)) {
       archItems.value = []
       packages.value = []
       downloadDirectory.value = ''
@@ -641,7 +702,7 @@ const loadVersions = async (requestToken = beginSelectionRequest()) => {
 }
 
 const loadArches = async (requestToken = beginSelectionRequest()) => {
-  const currentProvider = provider.value
+  const currentProvider = selectedProvider.value
   const currentLine = selectedLine.value
   const currentVersion = selectedVersion.value
   if (currentProvider !== 'xanmod' || !currentLine || !currentVersion) {
@@ -662,21 +723,32 @@ const loadArches = async (requestToken = beginSelectionRequest()) => {
     })
     if (!isLatestSelectionRequest(requestToken)) return
     archItems.value = msg.success && msg.obj?.arches ? msg.obj.arches as KernelArchItem[] : []
-    const preferred = archItems.value.find(item => item.arch === 'x64v3')
     kernelSelectionHydrating.value = true
-    selectedArch.value = preferred?.arch || archItems.value[0]?.arch || ''
+    if (!archItems.value.some(item => item.arch === selectedArch.value)) {
+      selectedArch.value = ''
+    }
     kernelSelectionHydrating.value = false
-    await loadPackages(requestToken)
+    if (!selectedArch.value && isLatestSelectionRequest(requestToken)) {
+      packages.value = []
+      downloadDirectory.value = ''
+    }
   } finally {
     stopLoading()
   }
 }
 
 const loadPackages = async (requestToken = beginSelectionRequest()) => {
-  const currentProvider = provider.value
+  const currentProvider = selectedProvider.value
   const currentVersion = selectedVersion.value
   const currentLine = selectedLine.value
   const currentArch = selectedArch.value
+  if (!currentProvider) {
+    if (isLatestSelectionRequest(requestToken)) {
+      packages.value = []
+      downloadDirectory.value = ''
+    }
+    return
+  }
   if (!currentVersion) {
     if (isLatestSelectionRequest(requestToken)) {
       packages.value = []
@@ -872,7 +944,9 @@ const startDownloadProgressPolling = (sessionId: string) => {
 
 const buildSelectionFormData = (downloadSessionId = '') => {
   const formData = new FormData()
-  formData.append('provider', provider.value)
+  if (selectedProvider.value) {
+    formData.append('provider', selectedProvider.value)
+  }
   if (isXanMod.value) {
     formData.append('line', selectedLine.value)
     formData.append('arch', selectedArch.value)
@@ -1027,6 +1101,9 @@ const refreshKernelData = async (
   selectionRequestToken = beginSelectionRequest(),
   cleanupRequestToken = beginCleanupScanRequest(),
 ) => {
+  if (!selectedProvider.value) {
+    return
+  }
   await loadOverview(selectionRequestToken)
   await loadVersions(selectionRequestToken)
   if (overview.value.supported) {
@@ -1040,48 +1117,43 @@ const refreshCurrentKernelData = async () => {
   await refreshKernelData(selectionRequestToken, cleanupRequestToken)
 }
 
-const processReturnToDefaultProvider = async () => {
-  if (!props.active) return
-  if (busy.value) {
-    pendingReturnToDefaultProvider.value = true
-    return
-  }
-  pendingReturnToDefaultProvider.value = false
-  if (provider.value !== 'xanmod') {
-    provider.value = 'xanmod'
-    return
-  }
-  await refreshCurrentKernelData()
-}
-
 watch(provider, async (nextProvider) => {
   clearFeedback()
   kernelSelectionHydrating.value = true
   resetKernelSelection(nextProvider)
   await nextTick()
   kernelSelectionHydrating.value = false
+  if (!selectedProvider.value) {
+    return
+  }
   await refreshCurrentKernelData()
 }, { immediate: true })
 
-watch(() => props.active, async (active, previousActive) => {
-  if (!active || previousActive === undefined) return
-  await processReturnToDefaultProvider()
-})
-
-watch(busy, async (nextBusy) => {
-  if (nextBusy || !pendingReturnToDefaultProvider.value || !props.active) return
-  await processReturnToDefaultProvider()
-})
-
 watch(selectedLine, async () => {
   if (kernelSelectionHydrating.value || !isXanMod.value) return
+  kernelSelectionHydrating.value = true
+  selectedVersion.value = ''
+  selectedArch.value = ''
+  kernelSelectionHydrating.value = false
   await loadVersions(beginSelectionRequest())
 })
 
 watch(selectedVersion, async () => {
-  if (kernelSelectionHydrating.value || !selectedVersion.value) return
+  if (kernelSelectionHydrating.value || !selectedProvider.value) return
+  if (!selectedVersion.value) {
+    kernelSelectionHydrating.value = true
+    selectedArch.value = ''
+    kernelSelectionHydrating.value = false
+    archItems.value = []
+    packages.value = []
+    downloadDirectory.value = ''
+    return
+  }
   const requestToken = beginSelectionRequest()
   if (isXanMod.value) {
+    kernelSelectionHydrating.value = true
+    selectedArch.value = ''
+    kernelSelectionHydrating.value = false
     await loadArches(requestToken)
     return
   }
@@ -1090,6 +1162,11 @@ watch(selectedVersion, async () => {
 
 watch(selectedArch, async () => {
   if (kernelSelectionHydrating.value || !isXanMod.value) return
+  if (!selectedArch.value) {
+    packages.value = []
+    downloadDirectory.value = ''
+    return
+  }
   await loadPackages(beginSelectionRequest())
 })
 

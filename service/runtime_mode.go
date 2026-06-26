@@ -86,14 +86,18 @@ func shouldUseDirectManagedCoreRuntime() bool {
 	return getManagedCoreRuntimeMode() == managedCoreRuntimeModeDirect
 }
 
-func ShouldRecoverManagedCoreOnStartup(coreName string) bool {
+func ShouldAutoRecoverManagedCoreRuntime(coreName string) bool {
 	if runtime.GOOS != "linux" {
 		return false
 	}
-	if shouldUseDirectManagedCoreRuntime() {
-		return managedCoreShouldRun(coreName)
+	if !shouldUseDirectManagedCoreRuntime() {
+		return false
 	}
-	return false
+	return managedCoreShouldRun(coreName)
+}
+
+func ShouldRecoverManagedCoreOnStartup(coreName string) bool {
+	return ShouldAutoRecoverManagedCoreRuntime(coreName)
 }
 
 func managedCoreRuntimeMarkerPath(coreName string) string {

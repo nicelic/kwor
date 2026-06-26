@@ -78,7 +78,11 @@ type trafficOverviewSwitchRequest struct {
 }
 
 type trafficOverviewVnstatInstallRequest struct {
-	Version string `json:"version" form:"version"`
+	Source string `json:"source" form:"source"`
+}
+
+type trafficOverviewVnstatUpdateRequest struct {
+	Source string `json:"source" form:"source"`
 }
 
 type systemMonitorSettingsRequest struct {
@@ -823,7 +827,12 @@ func (a *ApiService) GetTrafficOverviewVnstatVersions(c *gin.Context) {
 }
 
 func (a *ApiService) GetTrafficOverviewVnstatUpdateInfo(c *gin.Context) {
-	result, err := a.TrafficOverviewService.GetVnstatUpdateInfo()
+	req := trafficOverviewVnstatUpdateRequest{}
+	if err := c.ShouldBindQuery(&req); err != nil {
+		jsonMsg(c, "", fmt.Errorf("invalid query params: %w", err))
+		return
+	}
+	result, err := a.TrafficOverviewService.GetVnstatUpdateInfo(req.Source)
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
@@ -837,7 +846,7 @@ func (a *ApiService) InstallTrafficOverviewVnstat(c *gin.Context) {
 		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
 		return
 	}
-	overview, err := a.TrafficOverviewService.InstallManagedVnstat(req.Version)
+	overview, err := a.TrafficOverviewService.InstallManagedVnstat(req.Source)
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
@@ -2089,6 +2098,10 @@ func (a *ApiService) ReorderReverseProxyRules(c *gin.Context) {
 
 func (a *ApiService) GetKernelOverview(c *gin.Context) {
 	provider := strings.TrimSpace(c.Query("provider"))
+	if provider == "" {
+		jsonMsg(c, "", fmt.Errorf("provider is required"))
+		return
+	}
 	overview, err := a.KernelManagerService.GetOverview(provider)
 	if err != nil {
 		jsonMsg(c, "", err)
@@ -2100,7 +2113,11 @@ func (a *ApiService) GetKernelOverview(c *gin.Context) {
 func (a *ApiService) GetKernelVersions(c *gin.Context) {
 	provider := strings.TrimSpace(c.Query("provider"))
 	line := strings.TrimSpace(c.Query("line"))
-	if (provider == "" || provider == "xanmod") && line == "" {
+	if provider == "" {
+		jsonMsg(c, "", fmt.Errorf("provider is required"))
+		return
+	}
+	if provider == "xanmod" && line == "" {
 		jsonMsg(c, "", fmt.Errorf("line is required"))
 		return
 	}
@@ -2116,7 +2133,11 @@ func (a *ApiService) GetKernelArches(c *gin.Context) {
 	provider := strings.TrimSpace(c.Query("provider"))
 	line := strings.TrimSpace(c.Query("line"))
 	version := strings.TrimSpace(c.Query("version"))
-	if (provider == "" || provider == "xanmod") && line == "" {
+	if provider == "" {
+		jsonMsg(c, "", fmt.Errorf("provider is required"))
+		return
+	}
+	if provider == "xanmod" && line == "" {
 		jsonMsg(c, "", fmt.Errorf("line is required"))
 		return
 	}
@@ -2138,7 +2159,11 @@ func (a *ApiService) GetKernelPackages(c *gin.Context) {
 	line := strings.TrimSpace(c.Query("line"))
 	version := strings.TrimSpace(c.Query("version"))
 	arch := strings.TrimSpace(c.Query("arch"))
-	if (provider == "" || provider == "xanmod") && line == "" {
+	if provider == "" {
+		jsonMsg(c, "", fmt.Errorf("provider is required"))
+		return
+	}
+	if provider == "xanmod" && line == "" {
 		jsonMsg(c, "", fmt.Errorf("line is required"))
 		return
 	}
@@ -2146,7 +2171,7 @@ func (a *ApiService) GetKernelPackages(c *gin.Context) {
 		jsonMsg(c, "", fmt.Errorf("version is required"))
 		return
 	}
-	if (provider == "" || provider == "xanmod") && arch == "" {
+	if provider == "xanmod" && arch == "" {
 		jsonMsg(c, "", fmt.Errorf("arch is required"))
 		return
 	}
@@ -2210,9 +2235,13 @@ func (a *ApiService) DownloadKernelPackages(c *gin.Context) {
 		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
 		return
 	}
-	provider := "xanmod"
-	if req.Provider != nil && strings.TrimSpace(*req.Provider) != "" {
+	provider := ""
+	if req.Provider != nil {
 		provider = strings.TrimSpace(*req.Provider)
+	}
+	if provider == "" {
+		jsonMsg(c, "", fmt.Errorf("provider is required"))
+		return
 	}
 	if provider == "xanmod" && (req.Line == nil || strings.TrimSpace(*req.Line) == "") {
 		jsonMsg(c, "", fmt.Errorf("line is required"))
@@ -2263,9 +2292,13 @@ func (a *ApiService) InstallKernelPackages(c *gin.Context) {
 		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
 		return
 	}
-	provider := "xanmod"
-	if req.Provider != nil && strings.TrimSpace(*req.Provider) != "" {
+	provider := ""
+	if req.Provider != nil {
 		provider = strings.TrimSpace(*req.Provider)
+	}
+	if provider == "" {
+		jsonMsg(c, "", fmt.Errorf("provider is required"))
+		return
 	}
 	if provider == "xanmod" && (req.Line == nil || strings.TrimSpace(*req.Line) == "") {
 		jsonMsg(c, "", fmt.Errorf("line is required"))

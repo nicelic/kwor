@@ -650,10 +650,10 @@ func (s *TrafficOverviewService) GetVnstatStatus() VnstatPackageStatus {
 }
 
 func (s *TrafficOverviewService) GetVnstatVersionOptions() (*VnstatVersionListResult, error) {
-	title := "自动安装（系统源优先）"
-	description := "默认使用当前系统软件源安装 vnstat；系统软件源不可用时自动回退到 GitHub 官方版本"
+	title := "系统软件源"
+	description := "使用当前系统的软件包管理器安装或重装 vnstat"
 	if manager := detectVnstatPackageManagerPlan(); manager != nil {
-		description = fmt.Sprintf("默认通过 %s 安装 vnstat；失败时自动回退到 GitHub 官方版本", manager.Name)
+		description = fmt.Sprintf("通过 %s 安装或重装 vnstat", manager.Name)
 	}
 	if canManage, manageHint := vnstatManagementSupport(); !canManage {
 		description = manageHint
@@ -661,15 +661,20 @@ func (s *TrafficOverviewService) GetVnstatVersionOptions() (*VnstatVersionListRe
 	return &VnstatVersionListResult{
 		Versions: []VnstatVersionOption{
 			{
-				Value:       "system",
+				Value:       vnstatInstallMethodSystemPackage,
 				Title:       title,
 				Description: description,
+			},
+			{
+				Value:       vnstatInstallMethodGitHubRelease,
+				Title:       "GitHub 官方源码包",
+				Description: "从 GitHub 官方 release 源码包编译安装或重装 vnstat",
 			},
 		},
 	}, nil
 }
 
-func (s *TrafficOverviewService) GetVnstatUpdateInfo() (*VnstatVersionCheckResult, error) {
+func (s *TrafficOverviewService) GetVnstatUpdateInfo(source string) (*VnstatVersionCheckResult, error) {
 	status := s.GetVnstatStatus()
 	result := &VnstatVersionCheckResult{
 		Supported:      status.Supported,
@@ -686,20 +691,20 @@ func (s *TrafficOverviewService) GetVnstatUpdateInfo() (*VnstatVersionCheckResul
 		result.Message = strings.TrimSpace(status.ManageHint)
 		return result, nil
 	}
-	if !status.Installed {
-		result.Message = "vnstat 尚未安装"
-		return result, nil
-	}
 
-	latestVersion, source, err := detectLatestVnstatVersion(status)
-	result.Source = source
+	latestVersion, detectedSource, err := detectLatestVnstatVersion(status, source)
+	result.Source = detectedSource
 	if err != nil {
 		result.Message = strings.TrimSpace(err.Error())
 		return result, nil
 	}
 	result.LatestVersion = strings.TrimSpace(latestVersion)
 	if result.CurrentVersion == "" {
-		result.Message = "已安装 vnstat，但未能识别当前版本"
+		if result.Installed {
+			result.Message = fmt.Sprintf("已安装 vnstat，但未能识别当前版本；所选来源最新版本：%s", firstNonEmpty(result.LatestVersion, "-"))
+		} else {
+			result.Message = fmt.Sprintf("vnstat 尚未安装；所选来源最新版本：%s", firstNonEmpty(result.LatestVersion, "-"))
+		}
 		return result, nil
 	}
 	if result.LatestVersion == "" {
@@ -719,39 +724,46 @@ func (s *TrafficOverviewService) GetVnstatUpdateInfo() (*VnstatVersionCheckResul
 	return result, nil
 }
 
-func (s *TrafficOverviewService) InstallManagedVnstat(version string) (*TrafficOverview, error) {
+func (s *TrafficOverviewService) InstallManagedVnstat(source string) (*TrafficOverview, error) {
 	if runtime.GOOS != "linux" {
 		return nil, errors.New("vnstat is supported on linux only")
 	}
 	if canManage, manageHint := vnstatManagementSupport(); !canManage {
 		return nil, errors.New(manageHint)
 	}
-	version = strings.TrimSpace(version)
-	if version == "" {
-		version = "system"
-	}
-	if !strings.EqualFold(version, "system") {
-		return nil, fmt.Errorf("vnstat version %q is not supported by system package installation", version)
+	selectedSource := normalizeRequestedVnstatSource(source)
+	if selectedSource == "" {
+		return nil, errors.New("请先选择来源")
 	}
 
 	manager := detectVnstatPackageManagerPlan()
 	manifest, hasManifest := s.loadVnstatManifest()
 	if binaryPath, lookErr := exec.LookPath("vnstat"); lookErr == nil {
 		currentMethod := detectInstalledVnstatInstallMethod(manifest, hasManifest, manager, binaryPath)
-		if currentMethod != "" && os.Geteuid() != 0 {
-			if currentMethod == vnstatInstallMethodSystemPackage && manager != nil && len(manager.InstallPlan) > 0 {
+		if currentMethod != "" && currentMethod != selectedSource {
+			return nil, fmt.Errorf(
+				"当前 vnstat 安装方式为%s；如需切换到%s，请先删除 vnstat 后再重新安装",
+				describeVnstatInstallMethod(currentMethod, packageManagerName(manager)),
+				describeVnstatInstallMethod(selectedSource, packageManagerName(manager)),
+			)
+		}
+		if currentMethod == "" {
+			return nil, errors.New("检测到现有 vnstat 安装来源不明确；请先删除 vnstat 后再按所选来源重新安装")
+		}
+		if os.Geteuid() != 0 {
+			if selectedSource == vnstatInstallMethodSystemPackage && manager != nil && len(manager.InstallPlan) > 0 {
 				return nil, fmt.Errorf("vnstat reinstall/update requires root. install it manually: %s", strings.Join(manager.InstallPlan[len(manager.InstallPlan)-1], " "))
 			}
 			return nil, errors.New("vnstat reinstall/update requires root")
 		}
 	} else if os.Geteuid() != 0 {
-		if manager != nil && len(manager.InstallPlan) > 0 {
+		if selectedSource == vnstatInstallMethodSystemPackage && manager != nil && len(manager.InstallPlan) > 0 {
 			return nil, fmt.Errorf("vnstat install requires root. install it manually: %s", strings.Join(manager.InstallPlan[len(manager.InstallPlan)-1], " "))
 		}
 		return nil, errors.New("vnstat install requires root")
 	}
 
-	manifest, err := s.installOrReinstallManagedVnstat(manager)
+	manifest, err := s.installManagedVnstatFromSource(manager, selectedSource)
 	if err != nil {
 		return nil, err
 	}
@@ -882,78 +894,14 @@ func removeVnstatWithoutDatabase() error {
 	return cleanupTrafficCapRules()
 }
 
-func (s *TrafficOverviewService) installOrReinstallManagedVnstat(manager *vnstatPackageManagerPlan) (trafficOverviewVnstatManifest, error) {
-	if binaryPath, err := exec.LookPath("vnstat"); err == nil {
-		manifest, hasManifest := s.loadVnstatManifest()
-		currentMethod := detectInstalledVnstatInstallMethod(manifest, hasManifest, manager, binaryPath)
-		switch currentMethod {
-		case vnstatInstallMethodSystemPackage:
-			if manager == nil {
-				return trafficOverviewVnstatManifest{}, errors.New("vnstat is installed, but no supported linux package manager was found for reinstall/update")
-			}
-			return s.installVnstatViaSystemPackage(manager)
-		case vnstatInstallMethodGitHubRelease:
-			return s.installVnstatViaGitHubRelease(manager)
-		default:
-			return s.adoptCurrentVnstatInstallation(manager, binaryPath), nil
-		}
-	}
-	return s.installOrAdoptManagedVnstat(manager)
-}
-
-func (s *TrafficOverviewService) installOrAdoptManagedVnstat(manager *vnstatPackageManagerPlan) (trafficOverviewVnstatManifest, error) {
-	if binaryPath, err := exec.LookPath("vnstat"); err == nil {
-		return s.adoptCurrentVnstatInstallation(manager, binaryPath), nil
-	}
-
-	var systemErr error
-	if manager != nil {
-		manifest, err := s.installVnstatViaSystemPackage(manager)
-		if err == nil {
-			return manifest, nil
-		}
-		systemErr = err
-	} else {
-		systemErr = errors.New("no supported linux package manager was found")
-	}
-
-	manifest, githubErr := s.installVnstatViaGitHubRelease(manager)
-	if githubErr == nil {
-		return manifest, nil
-	}
-	return trafficOverviewVnstatManifest{}, buildVnstatInstallUnavailableError(systemErr, githubErr)
-}
-
-func (s *TrafficOverviewService) adoptCurrentVnstatInstallation(manager *vnstatPackageManagerPlan, binaryPath string) trafficOverviewVnstatManifest {
-	packageManager := ""
-	systemFamily := detectLinuxSystemFamily()
-	installMethod := ""
-	filePaths := []string{binaryPath}
-
-	if manager != nil {
-		packageManager = manager.Name
-		systemFamily = firstNonEmpty(systemFamily, manager.SystemFamily)
-		installMethod = vnstatInstallMethodSystemPackage
-		filePaths = collectVnstatPackageFilesByManager(manager.Name)
-	}
-
-	filePaths = appendDetectedVnstatManagedPaths(filePaths)
-	version := detectVnstatVersion()
-	if installMethod == vnstatInstallMethodSystemPackage {
-		version = firstNonEmpty(detectInstalledVnstatPackageVersion(packageManager), version)
-	}
-	return trafficOverviewVnstatManifest{
-		Managed:        true,
-		SystemFamily:   systemFamily,
-		PackageManager: packageManager,
-		InstallMethod:  installMethod,
-		PackageName:    vnstatPackageName,
-		Version:        version,
-		BinaryPath:     binaryPath,
-		FilePaths:      filePaths,
-		DataPaths:      defaultVnstatDataPaths(),
-		ServiceUnits:   []string{"vnstat", "vnstatd"},
-		InstalledAt:    time.Now().Unix(),
+func (s *TrafficOverviewService) installManagedVnstatFromSource(manager *vnstatPackageManagerPlan, source string) (trafficOverviewVnstatManifest, error) {
+	switch normalizeRequestedVnstatSource(source) {
+	case vnstatInstallMethodSystemPackage:
+		return s.installVnstatViaSystemPackage(manager)
+	case vnstatInstallMethodGitHubRelease:
+		return s.installVnstatViaGitHubRelease(manager)
+	default:
+		return trafficOverviewVnstatManifest{}, errors.New("请先选择来源")
 	}
 }
 
@@ -1121,13 +1069,44 @@ func appendDetectedVnstatManagedPaths(paths []string) []string {
 
 func normalizeVnstatInstallMethod(method string, packageManager string) string {
 	method = strings.TrimSpace(strings.ToLower(method))
-	if method != "" {
+	switch method {
+	case "system", vnstatInstallMethodSystemPackage:
+		return vnstatInstallMethodSystemPackage
+	case "github", vnstatInstallMethodGitHubRelease:
+		return vnstatInstallMethodGitHubRelease
+	case "":
+	default:
 		return method
 	}
 	if managerByName(packageManager) != nil {
 		return vnstatInstallMethodSystemPackage
 	}
 	return ""
+}
+
+func normalizeRequestedVnstatSource(source string) string {
+	switch strings.TrimSpace(strings.ToLower(source)) {
+	case "system", vnstatInstallMethodSystemPackage:
+		return vnstatInstallMethodSystemPackage
+	case "github", vnstatInstallMethodGitHubRelease:
+		return vnstatInstallMethodGitHubRelease
+	default:
+		return ""
+	}
+}
+
+func describeVnstatInstallMethod(method string, packageManager string) string {
+	switch normalizeVnstatInstallMethod(method, packageManager) {
+	case vnstatInstallMethodSystemPackage:
+		if strings.TrimSpace(packageManager) != "" {
+			return fmt.Sprintf("系统软件源（%s）", strings.TrimSpace(packageManager))
+		}
+		return "系统软件源"
+	case vnstatInstallMethodGitHubRelease:
+		return "GitHub 官方源码包"
+	default:
+		return "未知来源"
+	}
 }
 
 func detectInstalledVnstatInstallMethod(manifest trafficOverviewVnstatManifest, hasManifest bool, manager *vnstatPackageManagerPlan, binaryPath string) string {
@@ -2728,8 +2707,11 @@ func parseVnstatPackageFileList(managerName string, output string) []string {
 	return normalizeAbsolutePathList(paths)
 }
 
-func detectLatestVnstatVersion(status VnstatPackageStatus) (string, string, error) {
-	method := normalizeVnstatInstallMethod(status.InstallMethod, status.PackageManager)
+func detectLatestVnstatVersion(status VnstatPackageStatus, source string) (string, string, error) {
+	method := normalizeRequestedVnstatSource(source)
+	if method == "" {
+		return "", "", errors.New("请先选择来源")
+	}
 	switch method {
 	case vnstatInstallMethodGitHubRelease:
 		version, err := fetchLatestVnstatGitHubVersion()

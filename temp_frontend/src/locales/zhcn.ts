@@ -222,6 +222,12 @@ export default {
   kernelManager: {
     title: "XanMod 内核管理",
     provider: "内核来源",
+    providerPlaceholder: "请选择内核来源",
+    providerHint: "请先选择一个内核来源，然后按顺序手动选择分支、版本、架构并加载软件包列表。",
+    providerEmpty: "未选择内核来源",
+    linePlaceholder: "请选择内核分支",
+    versionPlaceholder: "请选择内核版本",
+    archPlaceholder: "请选择内核架构",
     supported: "支持",
     unsupported: "不支持",
     line: "内核线",

@@ -19,6 +19,7 @@ type MihomoNftCoreSyncJob struct {
 	initialized       bool
 	lastRunning       bool
 	lastIntegrityScan time.Time
+	lastRecoverAt     time.Time
 }
 
 func NewMihomoNftCoreSyncJob() *MihomoNftCoreSyncJob {
@@ -34,6 +35,16 @@ func (s *MihomoNftCoreSyncJob) Run() {
 	defer s.mu.Unlock()
 
 	running := s.MihomoCoreManagerService.IsRunning()
+	if !running && service.ShouldAutoRecoverManagedCoreRuntime("mihomo") {
+		now := time.Now()
+		if s.lastRecoverAt.IsZero() || now.Sub(s.lastRecoverAt) >= managedCoreAutoRecoverRetryInterval {
+			s.lastRecoverAt = now
+			if err := s.MihomoCoreManagerService.StartCore(); err != nil {
+				logger.Warning("mihomo direct runtime auto-recover failed: ", err)
+			}
+			running = s.MihomoCoreManagerService.IsRunning()
+		}
+	}
 	needInit := false
 	if running {
 		needInit = !s.initialized || !s.lastRunning || !s.MihomoNftTrafficService.IsNftTableReady()
@@ -66,6 +77,9 @@ func (s *MihomoNftCoreSyncJob) Run() {
 		}
 	}
 
+	if running {
+		s.lastRecoverAt = time.Time{}
+	}
 	s.lastRunning = running
 	s.initialized = true
 }
