@@ -292,7 +292,7 @@ export default {
         if (this.$props.type === this.inTypes.Hysteria2) {
           return this.readOptionalMbpsValue('up_mbps')
         }
-        return this.$props.inData.out_json?.up_mbps ?? 2000
+        return this.$props.inData.out_json?.up_mbps ?? 500
       },
       set(v:number | null) {
         this.writeOptionalMbpsValue('up_mbps', v)
@@ -303,7 +303,7 @@ export default {
         if (this.$props.type === this.inTypes.Hysteria2) {
           return this.readOptionalMbpsValue('down_mbps')
         }
-        return this.$props.inData.out_json?.down_mbps ?? 2000
+        return this.$props.inData.out_json?.down_mbps ?? 500
       },
       set(v:number | null) {
         this.writeOptionalMbpsValue('down_mbps', v)

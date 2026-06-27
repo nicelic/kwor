@@ -2460,6 +2460,18 @@ func (a *ApiService) GetDb(c *gin.Context) {
 	c.Writer.Write(db)
 }
 
+func (a *ApiService) DownloadDBBackup(c *gin.Context) {
+	archive, err := database.BuildDBBackupArchive()
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	c.Header("Content-Type", "application/zip")
+	c.Header("Content-Disposition", "attachment; filename="+archive.FileName)
+	c.Header("Content-Length", strconv.Itoa(len(archive.Data)))
+	_, _ = c.Writer.Write(archive.Data)
+}
+
 func (a *ApiService) postActions(c *gin.Context) (string, json.RawMessage, error) {
 	var data map[string]json.RawMessage
 	err := c.ShouldBind(&data)
@@ -2563,6 +2575,39 @@ func (a *ApiService) ImportDb(c *gin.Context) {
 	}
 	defer file.Close()
 	err = database.ImportDB(file)
+	jsonMsg(c, "", err)
+}
+
+func (a *ApiService) RestoreDBBackup(c *gin.Context) {
+	file, _, err := c.Request.FormFile("backup")
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	defer file.Close()
+
+	stopRunningCores := func() error {
+		singboxSvc := &service.CoreManagerService{}
+		if singboxSvc.IsRunning() || service.ShouldRecoverManagedCoreOnStartup("singbox") {
+			if err := singboxSvc.StopCore(); err != nil {
+				return fmt.Errorf("停止 Sing-Box 内核失败: %v", err)
+			}
+		}
+
+		mihomoSvc := &service.MihomoCoreManagerService{}
+		if mihomoSvc.IsRunning() || service.ShouldRecoverManagedCoreOnStartup("mihomo") {
+			if err := mihomoSvc.StopCore(); err != nil {
+				return fmt.Errorf("停止 Mihomo 内核失败: %v", err)
+			}
+		}
+		return nil
+	}
+
+	panelRestarter := func() error {
+		return a.PanelService.RestartPanel(3 * time.Second)
+	}
+
+	err = database.RestoreDBBackupArchive(file, panelRestarter, stopRunningCores)
 	jsonMsg(c, "", err)
 }
 

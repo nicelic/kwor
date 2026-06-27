@@ -437,10 +437,10 @@ export default {
       if (this.inbound.type != this.inTypes.Hysteria && this.inbound.type != this.inTypes.Hysteria2) return
       if (!this.inbound.out_json) this.inbound.out_json = {}
       if (forceDefaults && this.inbound.out_json.up_mbps === undefined) {
-        this.inbound.out_json.up_mbps = 2000
+        this.inbound.out_json.up_mbps = 500
       }
       if (forceDefaults && this.inbound.out_json.down_mbps === undefined) {
-        this.inbound.out_json.down_mbps = 2000
+        this.inbound.out_json.down_mbps = 500
       }
     },
     normalizeVLESSMihomoEncryptionMode(raw: string): string {

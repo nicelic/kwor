@@ -163,8 +163,12 @@ var systemMonitorRuntime = &systemMonitorRuntimeState{}
 
 type systemMonitorRuntimeState struct {
 	startOnce sync.Once
+	loopMu    sync.Mutex
 	collectMu sync.Mutex
 	stateMu   sync.RWMutex
+
+	loopStopCh chan struct{}
+	loopDoneCh chan struct{}
 
 	latest      systemMonitorLiveSnapshot
 	latestReady bool
@@ -291,17 +295,79 @@ func (s *SystemMonitorService) GetHistory(query SystemMonitorHistoryQuery) (*Sys
 
 func (r *systemMonitorRuntimeState) startBackgroundLoop() {
 	r.startOnce.Do(func() {
+		stopCh := make(chan struct{})
+		doneCh := make(chan struct{})
+		r.loopMu.Lock()
+		r.loopStopCh = stopCh
+		r.loopDoneCh = doneCh
+		r.loopMu.Unlock()
+
 		go func() {
+			defer close(doneCh)
 			for {
 				interval := systemMonitorCurrentSampleInterval(currentSystemMonitorSettings())
 				timer := time.NewTimer(interval)
-				<-timer.C
+				select {
+				case <-timer.C:
+				case <-stopCh:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return
+				}
 				if err := r.collectAndPersist(); err != nil {
 					logger.Warning("system monitor collect failed:", err)
 				}
 			}
 		}()
 	})
+}
+
+func (r *systemMonitorRuntimeState) resetForDatabaseReload() error {
+	r.loopMu.Lock()
+	stopCh := r.loopStopCh
+	doneCh := r.loopDoneCh
+	r.loopMu.Unlock()
+
+	if stopCh != nil {
+		close(stopCh)
+		if doneCh != nil {
+			select {
+			case <-doneCh:
+			case <-time.After(5 * time.Second):
+				return fmt.Errorf("system monitor background loop did not stop in time")
+			}
+		}
+	}
+
+	r.loopMu.Lock()
+	if r.loopStopCh == stopCh {
+		r.loopStopCh = nil
+	}
+	if r.loopDoneCh == doneCh {
+		r.loopDoneCh = nil
+	}
+	r.startOnce = sync.Once{}
+	r.loopMu.Unlock()
+
+	r.collectMu.Lock()
+	defer r.collectMu.Unlock()
+
+	r.stateMu.Lock()
+	r.latest = systemMonitorLiveSnapshot{}
+	r.latestReady = false
+	r.lastError = ""
+	r.stateMu.Unlock()
+
+	r.collectorState = systemMonitorCollectorState{}
+	r.collectorStateLoaded = false
+	r.collectorSampleCount = 0
+	r.physicalInterfaces = nil
+	r.physicalInterfacesRefreshedAt = time.Time{}
+	return nil
 }
 
 func (r *systemMonitorRuntimeState) ensureLatestSnapshot() error {

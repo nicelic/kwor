@@ -44,49 +44,13 @@ func (a *APP) Init() error {
 	if err != nil {
 		return err
 	}
-	if err := config.MigrateLegacyRuntimeSupportFiles(); err != nil {
-		logger.Warning("migrate legacy runtime support files failed:", err)
+	if database.HasPendingDBRestoreToApply() {
+		if err := database.ApplyPendingDBRestore(); err != nil {
+			return err
+		}
 	}
-	if err := service.InitManagedRuntimeFileStore(); err != nil {
+	if err := a.prepareStartupData(); err != nil {
 		return err
-	}
-	if err := service.InitSystemMonitorStore(); err != nil {
-		logger.Warning("init system monitor store failed:", err)
-	}
-	if err := service.EnsureManagedCoreLayout(); err != nil {
-		return err
-	}
-
-	// Init Setting
-	a.SettingService.GetAllSetting()
-	if reconcileErr := service.ReconcileSystemOptimizationOnStartup(); reconcileErr != nil {
-		logger.Warning("reconcile managed system optimization on startup failed:", reconcileErr)
-	}
-	if updated, migrateErr := service.MigrateLegacySubscriptionSelectorTags(); migrateErr != nil {
-		logger.Warning("normalize legacy subscription selector tags failed:", migrateErr)
-	} else if updated > 0 {
-		logger.Infof("normalized legacy subscription selector tags in settings: %d", updated)
-	}
-	if migrateErr := service.MigrateLegacyPanelSQLiteCertificatesToInventory(); migrateErr != nil {
-		logger.Warning("migrate legacy sqlite self-signed certificates failed:", migrateErr)
-	}
-	if migrateErr := service.MigrateLegacySettingsPathCertificatesToInventory(&a.SettingService); migrateErr != nil {
-		logger.Warning("migrate legacy settings-path certificates failed:", migrateErr)
-	}
-	if repairErr := (&service.CertificateInventoryService{}).RepairDisplayIDs(); repairErr != nil {
-		logger.Warning("repair certificate display ids failed:", repairErr)
-	}
-	if syncErr := service.SyncPanelTLSAssignments(&a.SettingService); syncErr != nil {
-		logger.Warning("sync panel tls assignments failed:", syncErr)
-	}
-	if syncErr := (&service.AcmeService{}).MigrateLegacyDNSSecretsOnStartup(); syncErr != nil {
-		logger.Warning("migrate legacy acme dns secrets failed:", syncErr)
-	}
-	if syncErr := (&service.AcmeService{}).EnsureOverviewRuntimeConsistency(true); syncErr != nil {
-		logger.Warning("prepare acme overview runtime consistency failed:", syncErr)
-	}
-	if syncErr := (&service.FirewallService{}).CleanupTemporaryRulesOnStartup(); syncErr != nil {
-		logger.Warning("cleanup temporary firewall rules on startup failed:", syncErr)
 	}
 
 	// a.core = core.NewCore()
@@ -100,13 +64,7 @@ func (a *APP) Init() error {
 
 	a.configService = service.NewConfigService(a.core)
 
-	// Sync generated configs to ProManager files during startup.
-	proManager := service.NewProManagerService(a.configService)
-	proManager.SetJsonService(&sub.JsonService{})
-	proManager.SaveInboundJson()
-	if err := service.NewMihomoManagerService().RegenerateServerConfig(); err != nil {
-		logger.Warning("generate mihomo server config failed:", err)
-	}
+	a.regenerateManagedRuntimeConfigs()
 
 	return nil
 }
@@ -153,6 +111,11 @@ func (a *APP) Start() error {
 	a.startTrafficOverviewRuntimeProbe()
 	a.startSystemMonitorRuntimeProbe()
 	a.startManagedCoreOnLinuxStartup()
+	if database.HasPendingDBRestoreToFinalize() {
+		if err := database.FinalizePendingDBRestore(); err != nil {
+			logger.Warning("finalize pending db restore failed:", err)
+		}
+	}
 
 	// err = a.configService.StartCore("")
 	// if err != nil {
@@ -308,6 +271,33 @@ func (a *APP) RestartApp() {
 		return
 	}
 	a.Stop()
+	restoreApplied := false
+
+	if database.HasPendingDBRestoreToApply() {
+		if err := database.ApplyPendingDBRestore(); err != nil {
+			logger.Error("apply pending db restore failed:", err)
+			a.webServer = web.NewServer()
+			a.subServer = sub.NewServer()
+			if startErr := a.Start(); startErr != nil {
+				logger.Error("restart app after restore failure failed:", startErr)
+			}
+			return
+		}
+		restoreApplied = true
+	}
+
+	if restoreApplied {
+		if err := a.prepareStartupData(); err != nil {
+			logger.Error("prepare startup data after db restore failed:", err)
+			a.webServer = web.NewServer()
+			a.subServer = sub.NewServer()
+			if startErr := a.Start(); startErr != nil {
+				logger.Error("restart app after startup data reload failure failed:", startErr)
+			}
+			return
+		}
+		a.regenerateManagedRuntimeConfigs()
+	}
 
 	// Recreate servers with fresh contexts so Start() works properly
 	a.webServer = web.NewServer()
@@ -316,6 +306,63 @@ func (a *APP) RestartApp() {
 	err := a.Start()
 	if err != nil {
 		logger.Error("restart app failed:", err)
+	}
+}
+
+func (a *APP) prepareStartupData() error {
+	if err := config.MigrateLegacyRuntimeSupportFiles(); err != nil {
+		logger.Warning("migrate legacy runtime support files failed:", err)
+	}
+	if err := service.InitManagedRuntimeFileStore(); err != nil {
+		return err
+	}
+	if err := service.InitSystemMonitorStore(); err != nil {
+		logger.Warning("init system monitor store failed:", err)
+	}
+	if err := service.EnsureManagedCoreLayout(); err != nil {
+		return err
+	}
+	if _, err := a.SettingService.GetAllSetting(); err != nil {
+		return err
+	}
+	if reconcileErr := service.ReconcileSystemOptimizationOnStartup(); reconcileErr != nil {
+		logger.Warning("reconcile managed system optimization on startup failed:", reconcileErr)
+	}
+	if updated, migrateErr := service.MigrateLegacySubscriptionSelectorTags(); migrateErr != nil {
+		logger.Warning("normalize legacy subscription selector tags failed:", migrateErr)
+	} else if updated > 0 {
+		logger.Infof("normalized legacy subscription selector tags in settings: %d", updated)
+	}
+	if migrateErr := service.MigrateLegacyPanelSQLiteCertificatesToInventory(); migrateErr != nil {
+		logger.Warning("migrate legacy sqlite self-signed certificates failed:", migrateErr)
+	}
+	if migrateErr := service.MigrateLegacySettingsPathCertificatesToInventory(&a.SettingService); migrateErr != nil {
+		logger.Warning("migrate legacy settings-path certificates failed:", migrateErr)
+	}
+	if repairErr := (&service.CertificateInventoryService{}).RepairDisplayIDs(); repairErr != nil {
+		logger.Warning("repair certificate display ids failed:", repairErr)
+	}
+	if syncErr := service.SyncPanelTLSAssignments(&a.SettingService); syncErr != nil {
+		logger.Warning("sync panel tls assignments failed:", syncErr)
+	}
+	if syncErr := (&service.AcmeService{}).MigrateLegacyDNSSecretsOnStartup(); syncErr != nil {
+		logger.Warning("migrate legacy acme dns secrets failed:", syncErr)
+	}
+	if syncErr := (&service.AcmeService{}).EnsureOverviewRuntimeConsistency(true); syncErr != nil {
+		logger.Warning("prepare acme overview runtime consistency failed:", syncErr)
+	}
+	if syncErr := (&service.FirewallService{}).CleanupTemporaryRulesOnStartup(); syncErr != nil {
+		logger.Warning("cleanup temporary firewall rules on startup failed:", syncErr)
+	}
+	return nil
+}
+
+func (a *APP) regenerateManagedRuntimeConfigs() {
+	proManager := service.NewProManagerService(a.configService)
+	proManager.SetJsonService(&sub.JsonService{})
+	proManager.SaveInboundJson()
+	if err := service.NewMihomoManagerService().RegenerateServerConfig(); err != nil {
+		logger.Warning("generate mihomo server config failed:", err)
 	}
 }
 

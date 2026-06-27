@@ -12,27 +12,35 @@ import (
 )
 
 func MigrateDb() {
+	if err := MigrateDbWithError(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func MigrateDbWithError() (err error) {
 	// void running on first install
 	path := config.GetDBPath()
-	_, err := os.Stat(path)
+	_, err = os.Stat(path)
 	if err != nil {
-		println("Database not found")
-		return
+		fmt.Println("Database not found")
+		return nil
 	}
 
 	db, err := gorm.Open(sqlite.Open(path))
 	if err != nil {
-		log.Fatal(err)
-		return
+		return err
 	}
 	tx := db.Begin()
 	defer func() {
 		if err == nil {
-			tx.Commit()
-		} else {
-			tx.Rollback()
+			if commitErr := tx.Commit().Error; commitErr != nil {
+				err = commitErr
+			}
+			return
 		}
+		_ = tx.Rollback().Error
 	}()
+
 	currentVersion := config.GetVersion()
 	dbVersion := ""
 	tx.Raw("SELECT value FROM settings WHERE key = ?", "version").Find(&dbVersion)
@@ -40,40 +48,34 @@ func MigrateDb() {
 
 	if currentVersion == dbVersion {
 		fmt.Println("Database is up to date, no need to migrate")
-		return
+		return nil
 	}
 
 	fmt.Println("Start migrating database...")
 
 	// Before 1.2
 	if dbVersion == "" {
-		err = to1_1(tx)
-		if err != nil {
-			log.Fatal("Migration to 1.1 failed: ", err)
-			return
+		if err = to1_1(tx); err != nil {
+			return fmt.Errorf("migration to 1.1 failed: %w", err)
 		}
-		err = to1_2(tx)
-		if err != nil {
-			log.Fatal("Migration to 1.2 failed: ", err)
-			return
+		if err = to1_2(tx); err != nil {
+			return fmt.Errorf("migration to 1.2 failed: %w", err)
 		}
 		dbVersion = "1.2"
 	}
 
 	// Before 1.3
-	if dbVersion[0:3] == "1.2" {
-		err = to1_3(tx)
-		if err != nil {
-			log.Fatal("Migration to 1.3 failed: ", err)
-			return
+	if len(dbVersion) >= 3 && dbVersion[0:3] == "1.2" {
+		if err = to1_3(tx); err != nil {
+			return fmt.Errorf("migration to 1.3 failed: %w", err)
 		}
 	}
 
 	// Set version
 	err = tx.Exec("UPDATE settings SET value = ? WHERE key = ?", currentVersion, "version").Error
 	if err != nil {
-		log.Fatal("Update version failed: ", err)
-		return
+		return fmt.Errorf("update version failed: %w", err)
 	}
 	fmt.Println("Migration done!")
+	return nil
 }

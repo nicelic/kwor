@@ -51,6 +51,8 @@ func (a *APIv2Handler) postHandler(c *gin.Context) {
 		a.ApiService.LinkConvert(c)
 	case "importdb":
 		a.ApiService.ImportDb(c)
+	case "restore-db-backup":
+		a.ApiService.RestoreDBBackup(c)
 	case "portOccupancy":
 		a.ApiService.CheckPortOccupancy(c)
 	default:
@@ -90,6 +92,8 @@ func (a *APIv2Handler) getHandler(c *gin.Context) {
 		a.ApiService.GetTLSSelfSignedTemplates(c)
 	case "getdb":
 		a.ApiService.GetDb(c)
+	case "download-db-backup":
+		a.ApiService.DownloadDBBackup(c)
 	default:
 		jsonMsg(c, "failed", common.NewError("unknown action: ", action))
 	}

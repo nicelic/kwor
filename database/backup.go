@@ -1,7 +1,9 @@
 package database
 
 import (
+	"archive/zip"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -32,6 +34,17 @@ type managedRuntimeFileBackupEntry struct {
 	UpdatedAt int64  `gorm:"column:updated_at;not null"`
 }
 
+type DBBackupArchive struct {
+	FileName string
+	Data     []byte
+}
+
+type pendingDBRestoreMarker struct {
+	StageDir  string `json:"stageDir"`
+	BackupDir string `json:"backupDir,omitempty"`
+	Applied   bool   `json:"applied,omitempty"`
+}
+
 func (managedRuntimeFileBackupEntry) TableName() string {
 	return "managed_runtime_files"
 }
@@ -53,17 +66,17 @@ func copyBackupTable[T any](src *gorm.DB, dst *gorm.DB) error {
 }
 
 func GetDb(exclude string) ([]byte, error) {
-	exclude_changes, exclude_stats := false, false
+	excludeChanges, excludeStats := false, false
 	for _, table := range strings.Split(exclude, ",") {
 		if table == "changes" {
-			exclude_changes = true
+			excludeChanges = true
 		} else if table == "stats" {
-			exclude_stats = true
+			excludeStats = true
 		}
 	}
 
 	dbDir := filepath.Dir(config.GetDBPath())
-	if err := os.MkdirAll(dbDir, 01740); err != nil {
+	if err := os.MkdirAll(dbDir, 0o740); err != nil {
 		return nil, err
 	}
 	dbPath := filepath.Join(dbDir, fmt.Sprintf("%s_%s.db", config.GetName(), time.Now().Format("20060102-150405")))
@@ -139,13 +152,13 @@ func GetDb(exclude string) ([]byte, error) {
 		func() error { return copyBackupTable[model.MihomoInboundRedirectState](db, backupDb) },
 		func() error { return copyBackupTable[model.MihomoClientInboundTrafficState](db, backupDb) },
 		func() error {
-			if exclude_stats {
+			if excludeStats {
 				return nil
 			}
 			return copyBackupTable[model.Stats](db, backupDb)
 		},
 		func() error {
-			if exclude_changes {
+			if excludeChanges {
 				return nil
 			}
 			return copyBackupTable[model.Changes](db, backupDb)
@@ -158,23 +171,19 @@ func GetDb(exclude string) ([]byte, error) {
 		}
 	}
 
-	// Update WAL
-	err = backupDb.Exec("PRAGMA wal_checkpoint;").Error
-	if err != nil {
+	if err := backupDb.Exec("PRAGMA wal_checkpoint;").Error; err != nil {
 		return nil, err
 	}
 
 	bdb, _ := backupDb.DB()
-	bdb.Close()
+	_ = bdb.Close()
 
-	// Open the file for reading
 	file, err := os.Open(dbPath)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
 
-	// Read the file contents
 	fileContents, err := io.ReadAll(file)
 	if err != nil {
 		return nil, err
@@ -183,8 +192,81 @@ func GetDb(exclude string) ([]byte, error) {
 	return fileContents, nil
 }
 
+func BuildDBBackupArchive() (*DBBackupArchive, error) {
+	dbDir := config.GetDBFolderPath()
+	if err := os.MkdirAll(dbDir, 0o740); err != nil {
+		return nil, err
+	}
+
+	snapshotDir, items, err := createDBBackupSnapshots(dbDir)
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(snapshotDir)
+	if len(items) == 0 {
+		return nil, common.NewError("db 目录中没有可备份文件")
+	}
+
+	var buffer bytes.Buffer
+	zipWriter := zip.NewWriter(&buffer)
+
+	for _, item := range items {
+		rel, err := filepath.Rel(snapshotDir, item)
+		if err != nil {
+			_ = zipWriter.Close()
+			return nil, err
+		}
+		rel = filepath.ToSlash(rel)
+
+		info, err := os.Stat(item)
+		if err != nil {
+			_ = zipWriter.Close()
+			return nil, err
+		}
+
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			_ = zipWriter.Close()
+			return nil, err
+		}
+		header.Name = rel
+		header.Method = zip.Deflate
+
+		writer, err := zipWriter.CreateHeader(header)
+		if err != nil {
+			_ = zipWriter.Close()
+			return nil, err
+		}
+
+		file, err := os.Open(item)
+		if err != nil {
+			_ = zipWriter.Close()
+			return nil, err
+		}
+		_, copyErr := io.Copy(writer, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			_ = zipWriter.Close()
+			return nil, copyErr
+		}
+		if closeErr != nil {
+			_ = zipWriter.Close()
+			return nil, closeErr
+		}
+	}
+
+	if err := zipWriter.Close(); err != nil {
+		return nil, err
+	}
+
+	fileName := fmt.Sprintf("%s_db_backup_%s.zip", config.GetName(), time.Now().Format("20060102-150405"))
+	return &DBBackupArchive{
+		FileName: fileName,
+		Data:     buffer.Bytes(),
+	}, nil
+}
+
 func ImportDB(file multipart.File) error {
-	// Check if the file is a SQLite database
 	isValidDb, err := IsSQLiteDB(file)
 	if err != nil {
 		return common.NewErrorf("Error checking db file format: %v", err)
@@ -193,97 +275,270 @@ func ImportDB(file multipart.File) error {
 		return common.NewError("Invalid db file format")
 	}
 
-	// Reset the file reader to the beginning
-	_, err = file.Seek(0, 0)
-	if err != nil {
+	if _, err = file.Seek(0, 0); err != nil {
 		return common.NewErrorf("Error resetting file reader: %v", err)
 	}
 
-	// Save the file as temporary file
 	tempPath := fmt.Sprintf("%s.temp", config.GetDBPath())
-	// Remove the existing fallback file (if any) before creating one
-	_, err = os.Stat(tempPath)
-	if err == nil {
-		errRemove := os.Remove(tempPath)
-		if errRemove != nil {
-			return common.NewErrorf("Error removing existing temporary db file: %v", errRemove)
-		}
+	if err := removeIfExists(tempPath); err != nil {
+		return common.NewErrorf("Error removing existing temporary db file: %v", err)
 	}
-	// Create the temporary file
+
 	tempFile, err := os.Create(tempPath)
 	if err != nil {
 		return common.NewErrorf("Error creating temporary db file: %v", err)
 	}
 	defer tempFile.Close()
-
-	// Remove temp file before returning
 	defer os.Remove(tempPath)
 
-	// Close old DB
-	old_db, _ := db.DB()
-	old_db.Close()
+	if err := closeMainDatabase(); err != nil {
+		return common.NewErrorf("Error closing existing db: %v", err)
+	}
 
-	// Save uploaded file to temporary file
-	_, err = io.Copy(tempFile, file)
-	if err != nil {
+	if _, err = io.Copy(tempFile, file); err != nil {
 		return common.NewErrorf("Error saving db: %v", err)
 	}
 
-	// Check if we can init db or not
 	newDb, err := gorm.Open(sqlite.Open(tempPath), &gorm.Config{})
 	if err != nil {
 		return common.NewErrorf("Error checking db: %v", err)
 	}
-	newDb_db, _ := newDb.DB()
-	newDb_db.Close()
+	newDBHandle, _ := newDb.DB()
+	_ = newDBHandle.Close()
 
-	// Backup the current database for fallback
 	fallbackPath := fmt.Sprintf("%s.backup", config.GetDBPath())
-	// Remove the existing fallback file (if any)
-	_, err = os.Stat(fallbackPath)
-	if err == nil {
-		errRemove := os.Remove(fallbackPath)
-		if errRemove != nil {
-			return common.NewErrorf("Error removing existing fallback db file: %v", errRemove)
-		}
+	if err := removeIfExists(fallbackPath); err != nil {
+		return common.NewErrorf("Error removing existing fallback db file: %v", err)
 	}
-	// Move the current database to the fallback location
-	err = os.Rename(config.GetDBPath(), fallbackPath)
-	if err != nil {
+
+	if err := os.Rename(config.GetDBPath(), fallbackPath); err != nil {
 		return common.NewErrorf("Error backing up temporary db file: %v", err)
 	}
-
-	// Remove the temporary file before returning
 	defer os.Remove(fallbackPath)
 
-	// Move temp to DB path
-	err = os.Rename(tempPath, config.GetDBPath())
-	if err != nil {
-		errRename := os.Rename(fallbackPath, config.GetDBPath())
-		if errRename != nil {
+	if err := os.Rename(tempPath, config.GetDBPath()); err != nil {
+		if errRename := os.Rename(fallbackPath, config.GetDBPath()); errRename != nil {
 			return common.NewErrorf("Error moving db file and restoring fallback: %v", errRename)
 		}
 		return common.NewErrorf("Error moving db file: %v", err)
 	}
 
-	// Migrate DB
-	migration.MigrateDb()
-	err = InitDB(config.GetDBPath())
-	if err != nil {
-		errRename := os.Rename(fallbackPath, config.GetDBPath())
-		if errRename != nil {
+	if err := migration.MigrateDbWithError(); err != nil {
+		if errRename := os.Rename(fallbackPath, config.GetDBPath()); errRename != nil {
+			return common.NewErrorf("Error migrating db and restoring fallback: %v", errRename)
+		}
+		return common.NewErrorf("Error migrating db: %v", err)
+	}
+	if err := InitDB(config.GetDBPath()); err != nil {
+		if errRename := os.Rename(fallbackPath, config.GetDBPath()); errRename != nil {
 			return common.NewErrorf("Error migrating db and restoring fallback: %v", errRename)
 		}
 		return common.NewErrorf("Error migrating db: %v", err)
 	}
 
-	// Restart app
-	err = SendSighup()
-	if err != nil {
+	if err := SendSighup(); err != nil {
 		return common.NewErrorf("Error restarting app: %v", err)
 	}
 
 	return nil
+}
+
+func RestoreDBBackupArchive(file multipart.File, panelRestarter func() error, stopRunningCores func() error) error {
+	if file == nil {
+		return common.NewError("未选择备份文件")
+	}
+	if panelRestarter == nil {
+		return common.NewError("面板重启回调不可用")
+	}
+
+	archiveData, err := io.ReadAll(file)
+	if err != nil {
+		return common.NewErrorf("读取备份文件失败: %v", err)
+	}
+
+	entries, err := readDBBackupArchiveEntries(archiveData)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		return common.NewError("备份压缩包中没有 db 文件")
+	}
+
+	if stopRunningCores != nil {
+		if err := stopRunningCores(); err != nil {
+			return err
+		}
+	}
+
+	stageRoot := pendingDBRestoreBaseDir()
+	stageDir := filepath.Join(stageRoot, fmt.Sprintf("stage-%d", time.Now().UnixNano()))
+
+	if err := os.MkdirAll(stageDir, 0o740); err != nil {
+		return common.NewErrorf("创建恢复临时目录失败: %v", err)
+	}
+
+	if err := extractDBArchiveEntries(entries, stageDir); err != nil {
+		_ = os.RemoveAll(stageDir)
+		return err
+	}
+
+	if err := validateRestoredDatabaseSet(stageDir); err != nil {
+		_ = os.RemoveAll(stageDir)
+		return err
+	}
+
+	if err := writePendingDBRestoreMarker(&pendingDBRestoreMarker{StageDir: stageDir}); err != nil {
+		_ = os.RemoveAll(stageDir)
+		return common.NewErrorf("写入恢复任务失败: %v", err)
+	}
+
+	if err := panelRestarter(); err != nil {
+		clearPendingDBRestoreMarker()
+		_ = os.RemoveAll(stageDir)
+		return common.NewErrorf("重启面板失败: %v", err)
+	}
+
+	return nil
+}
+
+func HasPendingDBRestore() bool {
+	marker, err := readPendingDBRestoreMarker()
+	return err == nil && marker != nil
+}
+
+func HasPendingDBRestoreToApply() bool {
+	marker, err := readPendingDBRestoreMarker()
+	return err == nil && marker != nil && !marker.Applied
+}
+
+func HasPendingDBRestoreToFinalize() bool {
+	marker, err := readPendingDBRestoreMarker()
+	return err == nil && marker != nil && marker.Applied
+}
+
+func ApplyPendingDBRestore() error {
+	marker, err := readPendingDBRestoreMarker()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	baseDir := filepath.Clean(pendingDBRestoreBaseDir())
+	stageDir := filepath.Clean(strings.TrimSpace(marker.StageDir))
+	if !isPathWithinBase(stageDir, baseDir, false) {
+		clearPendingDBRestoreMarker()
+		cleanupPendingDBRestoreStage(stageDir, baseDir)
+		cleanupPendingDBRestoreBaseDir()
+		return common.NewError("恢复任务目录非法")
+	}
+	if err := validateRestoredDatabaseSet(stageDir); err != nil {
+		clearPendingDBRestoreMarker()
+		cleanupPendingDBRestoreStage(stageDir, baseDir)
+		cleanupPendingDBRestoreBaseDir()
+		return err
+	}
+
+	dbDir := config.GetDBFolderPath()
+	backupDir := filepath.Join(baseDir, fmt.Sprintf("backup-%d", time.Now().UnixNano()))
+	currentExists := fileExists(dbDir)
+
+	if err := closeMainDatabase(); err != nil {
+		clearPendingDBRestoreMarker()
+		_ = os.RemoveAll(stageDir)
+		cleanupPendingDBRestoreBaseDir()
+		return common.NewErrorf("关闭主数据库失败: %v", err)
+	}
+	if err := runBeforeDBRestoreHooks(); err != nil {
+		clearPendingDBRestoreMarker()
+		_ = os.RemoveAll(stageDir)
+		cleanupPendingDBRestoreBaseDir()
+		_ = InitDB(config.GetDBPath())
+		_ = runAfterDBRestoreHooks()
+		return common.NewErrorf("执行恢复前清理失败: %v", err)
+	}
+
+	if currentExists {
+		if err := os.Rename(dbDir, backupDir); err != nil {
+			clearPendingDBRestoreMarker()
+			_ = os.RemoveAll(stageDir)
+			cleanupPendingDBRestoreBaseDir()
+			_ = InitDB(config.GetDBPath())
+			_ = runAfterDBRestoreHooks()
+			return common.NewErrorf("备份当前 db 目录失败: %v", err)
+		}
+	}
+
+	if err := os.RemoveAll(dbDir); err != nil {
+		clearPendingDBRestoreMarker()
+		_ = os.RemoveAll(stageDir)
+		cleanupPendingDBRestoreBaseDir()
+		if rollbackErr := rollbackPendingDBRestore(currentExists, dbDir, backupDir); rollbackErr != nil {
+			return common.NewErrorf("清理旧 db 目录失败: %v；回滚失败: %v", err, rollbackErr)
+		}
+		return common.NewErrorf("清理旧 db 目录失败: %v", err)
+	}
+	if err := os.Rename(stageDir, dbDir); err != nil {
+		clearPendingDBRestoreMarker()
+		_ = os.RemoveAll(stageDir)
+		cleanupPendingDBRestoreBaseDir()
+		if rollbackErr := rollbackPendingDBRestore(currentExists, dbDir, backupDir); rollbackErr != nil {
+			return common.NewErrorf("替换 db 目录失败: %v；回滚失败: %v", err, rollbackErr)
+		}
+		return common.NewErrorf("替换 db 目录失败: %v", err)
+	}
+
+	if err := migration.MigrateDbWithError(); err != nil {
+		clearPendingDBRestoreMarker()
+		cleanupPendingDBRestoreBaseDir()
+		if rollbackErr := rollbackPendingDBRestore(currentExists, dbDir, backupDir); rollbackErr != nil {
+			return common.NewErrorf("迁移恢复后的数据库失败: %v；回滚失败: %v", err, rollbackErr)
+		}
+		return common.NewErrorf("迁移恢复后的数据库失败: %v", err)
+	}
+	if err := InitDB(config.GetDBPath()); err != nil {
+		clearPendingDBRestoreMarker()
+		cleanupPendingDBRestoreBaseDir()
+		if rollbackErr := rollbackPendingDBRestore(currentExists, dbDir, backupDir); rollbackErr != nil {
+			return common.NewErrorf("重新初始化主数据库失败: %v；回滚失败: %v", err, rollbackErr)
+		}
+		return common.NewErrorf("重新初始化主数据库失败: %v", err)
+	}
+	if err := runAfterDBRestoreHooks(); err != nil {
+		clearPendingDBRestoreMarker()
+		cleanupPendingDBRestoreBaseDir()
+		if rollbackErr := rollbackPendingDBRestore(currentExists, dbDir, backupDir); rollbackErr != nil {
+			return common.NewErrorf("执行恢复后初始化失败: %v；回滚失败: %v", err, rollbackErr)
+		}
+		return common.NewErrorf("执行恢复后初始化失败: %v", err)
+	}
+
+	marker.StageDir = dbDir
+	marker.BackupDir = backupDir
+	marker.Applied = true
+	if err := writePendingDBRestoreMarker(marker); err != nil {
+		clearPendingDBRestoreMarker()
+		if rollbackErr := rollbackPendingDBRestore(currentExists, dbDir, backupDir); rollbackErr != nil {
+			return common.NewErrorf("写入恢复完成标记失败: %v；回滚失败: %v", err, rollbackErr)
+		}
+		return common.NewErrorf("写入恢复完成标记失败: %v", err)
+	}
+	return nil
+}
+
+func FinalizePendingDBRestore() error {
+	marker, err := readPendingDBRestoreMarker()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if marker == nil || !marker.Applied {
+		return nil
+	}
+	return finalizePendingDBRestore(marker, filepath.Clean(pendingDBRestoreBaseDir()))
 }
 
 func IsSQLiteDB(file io.Reader) (bool, error) {
@@ -297,13 +552,11 @@ func IsSQLiteDB(file io.Reader) (bool, error) {
 }
 
 func SendSighup() error {
-	// Get the current process
 	process, err := os.FindProcess(os.Getpid())
 	if err != nil {
 		return err
 	}
 
-	// Send SIGHUP to the current process
 	go func() {
 		time.Sleep(3 * time.Second)
 		if runtime.GOOS == "windows" {
@@ -316,4 +569,347 @@ func SendSighup() error {
 		}
 	}()
 	return nil
+}
+
+func createDBBackupSnapshots(dbDir string) (string, []string, error) {
+	runtimeDir := filepath.Join(config.GetDataDir(), "runtime")
+	if err := os.MkdirAll(runtimeDir, 0o740); err != nil {
+		return "", nil, err
+	}
+
+	snapshotDir, err := os.MkdirTemp(runtimeDir, "db-backup-")
+	if err != nil {
+		return "", nil, err
+	}
+
+	items, err := collectBackupSnapshotFiles(dbDir, snapshotDir)
+	if err != nil {
+		_ = os.RemoveAll(snapshotDir)
+		return "", nil, err
+	}
+	return snapshotDir, items, nil
+}
+
+func collectBackupSourceFiles(dbDir string) ([]string, error) {
+	entries, err := os.ReadDir(dbDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	files := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := strings.TrimSpace(entry.Name())
+		if name == "" {
+			continue
+		}
+		lower := strings.ToLower(name)
+		if !strings.HasSuffix(lower, ".db") && !strings.HasSuffix(lower, "-wal") && !strings.HasSuffix(lower, "-shm") {
+			continue
+		}
+		files = append(files, filepath.Join(dbDir, name))
+	}
+	return files, nil
+}
+
+func collectBackupSnapshotFiles(dbDir string, snapshotDir string) ([]string, error) {
+	sourceFiles, err := collectBackupSourceFiles(dbDir)
+	if err != nil {
+		return nil, err
+	}
+
+	files := make([]string, 0, len(sourceFiles))
+	for _, sourcePath := range sourceFiles {
+		name := strings.TrimSpace(filepath.Base(sourcePath))
+		if name == "" {
+			continue
+		}
+
+		lower := strings.ToLower(name)
+		if strings.HasSuffix(lower, "-wal") || strings.HasSuffix(lower, "-shm") {
+			continue
+		}
+
+		targetPath := filepath.Join(snapshotDir, name)
+		if strings.HasSuffix(lower, ".db") {
+			if err := createSQLiteSnapshot(sourcePath, targetPath); err != nil {
+				return nil, common.NewErrorf("创建数据库快照失败 %s: %v", name, err)
+			}
+			files = append(files, targetPath)
+		}
+	}
+	return files, nil
+}
+
+func createSQLiteSnapshot(sourcePath string, targetPath string) error {
+	sourceDB, err := gorm.Open(sqlite.Open(sqliteDSNWithPragmas(sourcePath)), &gorm.Config{})
+	if err != nil {
+		return err
+	}
+	sqlDB, dbErr := sourceDB.DB()
+	if dbErr == nil {
+		defer sqlDB.Close()
+	}
+
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o740); err != nil {
+		return err
+	}
+	sql := fmt.Sprintf("VACUUM INTO '%s'", escapeSQLiteLiteral(filepath.ToSlash(targetPath)))
+	return sourceDB.Exec(sql).Error
+}
+
+func escapeSQLiteLiteral(value string) string {
+	return strings.ReplaceAll(value, "'", "''")
+}
+
+func closeMainDatabase() error {
+	if db == nil {
+		return nil
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		db = nil
+		return err
+	}
+	db = nil
+	return sqlDB.Close()
+}
+
+func removeIfExists(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return os.Remove(path)
+	} else if os.IsNotExist(err) {
+		return nil
+	} else {
+		return err
+	}
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func isPathWithinBase(targetPath string, basePath string, allowBase bool) bool {
+	targetPath = filepath.Clean(strings.TrimSpace(targetPath))
+	basePath = filepath.Clean(strings.TrimSpace(basePath))
+	if targetPath == "" || basePath == "" {
+		return false
+	}
+
+	rel, err := filepath.Rel(basePath, targetPath)
+	if err != nil {
+		return false
+	}
+	rel = filepath.Clean(rel)
+	if rel == "." {
+		return allowBase
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+func cleanupPendingDBRestoreStage(stageDir string, baseDir string) {
+	if !isPathWithinBase(stageDir, baseDir, false) {
+		return
+	}
+	_ = os.RemoveAll(stageDir)
+}
+
+func rollbackPendingDBRestore(currentExists bool, dbDir string, backupDir string) error {
+	if currentExists && fileExists(backupDir) {
+		_ = os.RemoveAll(dbDir)
+		if err := os.Rename(backupDir, dbDir); err != nil {
+			return err
+		}
+	}
+	if fileExists(dbDir) {
+		if err := InitDB(config.GetDBPath()); err != nil {
+			return err
+		}
+		if err := runAfterDBRestoreHooks(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func finalizePendingDBRestore(marker *pendingDBRestoreMarker, baseDir string) error {
+	backupDir := filepath.Clean(strings.TrimSpace(marker.BackupDir))
+	if backupDir == "" {
+		clearPendingDBRestoreMarker()
+		cleanupPendingDBRestoreBaseDir()
+		return nil
+	}
+	if !isPathWithinBase(backupDir, baseDir, false) {
+		clearPendingDBRestoreMarker()
+		return common.NewError("恢复备份目录非法")
+	}
+	if err := os.RemoveAll(backupDir); err != nil {
+		return common.NewErrorf("清理旧数据库备份失败: %v", err)
+	}
+	clearPendingDBRestoreMarker()
+	cleanupPendingDBRestoreBaseDir()
+	return nil
+}
+
+func readDBBackupArchiveEntries(data []byte) (map[string][]byte, error) {
+	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, common.NewErrorf("备份文件不是有效的 zip 压缩包: %v", err)
+	}
+
+	entries := make(map[string][]byte)
+	for _, file := range reader.File {
+		if file.FileInfo().IsDir() {
+			continue
+		}
+
+		name := filepath.ToSlash(strings.TrimSpace(file.Name))
+		if name == "" {
+			continue
+		}
+		if strings.HasPrefix(name, "/") || strings.Contains(name, "../") {
+			return nil, common.NewErrorf("备份压缩包包含非法路径: %s", name)
+		}
+
+		rc, err := file.Open()
+		if err != nil {
+			return nil, common.NewErrorf("读取压缩包文件失败 %s: %v", name, err)
+		}
+		content, readErr := io.ReadAll(rc)
+		closeErr := rc.Close()
+		if readErr != nil {
+			return nil, common.NewErrorf("读取压缩包文件失败 %s: %v", name, readErr)
+		}
+		if closeErr != nil {
+			return nil, common.NewErrorf("关闭压缩包文件失败 %s: %v", name, closeErr)
+		}
+		entries[name] = content
+	}
+
+	return entries, nil
+}
+
+func extractDBArchiveEntries(entries map[string][]byte, stageDir string) error {
+	baseDir := filepath.Clean(stageDir)
+	for name, content := range entries {
+		targetPath := filepath.Join(stageDir, filepath.FromSlash(name))
+		cleanTarget := filepath.Clean(targetPath)
+		if !isPathWithinBase(cleanTarget, baseDir, false) {
+			return common.NewErrorf("备份压缩包包含越界路径: %s", name)
+		}
+		if err := os.MkdirAll(filepath.Dir(cleanTarget), 0o740); err != nil {
+			return common.NewErrorf("创建恢复目录失败 %s: %v", name, err)
+		}
+		if err := os.WriteFile(cleanTarget, content, 0o640); err != nil {
+			return common.NewErrorf("写入恢复文件失败 %s: %v", name, err)
+		}
+	}
+	return nil
+}
+
+func validateRestoredDatabaseSet(stageDir string) error {
+	mainDBPath := filepath.Join(stageDir, filepath.Base(config.GetDBPath()))
+	if !fileExists(mainDBPath) {
+		return common.NewErrorf("备份压缩包缺少主数据库文件 %s", filepath.Base(config.GetDBPath()))
+	}
+
+	file, err := os.Open(mainDBPath)
+	if err != nil {
+		return common.NewErrorf("打开主数据库失败: %v", err)
+	}
+	isSQLite, checkErr := IsSQLiteDB(file)
+	closeErr := file.Close()
+	if checkErr != nil {
+		return common.NewErrorf("校验主数据库失败: %v", checkErr)
+	}
+	if closeErr != nil {
+		return common.NewErrorf("关闭主数据库失败: %v", closeErr)
+	}
+	if !isSQLite {
+		return common.NewError("备份中的主数据库不是有效的 SQLite 文件")
+	}
+
+	tempDB, err := gorm.Open(sqlite.Open(mainDBPath), &gorm.Config{})
+	if err != nil {
+		return common.NewErrorf("备份中的主数据库无法打开: %v", err)
+	}
+	sqlDB, dbErr := tempDB.DB()
+	if dbErr == nil {
+		_ = sqlDB.Close()
+	}
+
+	monitorDBPath := filepath.Join(stageDir, filepath.Base(config.GetSystemMonitorDBPath()))
+	if fileExists(monitorDBPath) {
+		monitorFile, err := os.Open(monitorDBPath)
+		if err != nil {
+			return common.NewErrorf("打开监控数据库失败: %v", err)
+		}
+		monitorSQLite, checkErr := IsSQLiteDB(monitorFile)
+		closeErr := monitorFile.Close()
+		if checkErr != nil {
+			return common.NewErrorf("校验监控数据库失败: %v", checkErr)
+		}
+		if closeErr != nil {
+			return common.NewErrorf("关闭监控数据库失败: %v", closeErr)
+		}
+		if !monitorSQLite {
+			return common.NewError("备份中的监控数据库不是有效的 SQLite 文件")
+		}
+	}
+
+	return nil
+}
+
+func pendingDBRestoreBaseDir() string {
+	return filepath.Join(config.GetDataDir(), "runtime", "db-restore")
+}
+
+func pendingDBRestoreMarkerPath() string {
+	return filepath.Join(pendingDBRestoreBaseDir(), "pending.json")
+}
+
+func writePendingDBRestoreMarker(marker *pendingDBRestoreMarker) error {
+	if marker == nil {
+		return common.NewError("恢复任务标记为空")
+	}
+	if err := os.MkdirAll(pendingDBRestoreBaseDir(), 0o740); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(marker)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(pendingDBRestoreMarkerPath(), raw, 0o640)
+}
+
+func readPendingDBRestoreMarker() (*pendingDBRestoreMarker, error) {
+	raw, err := os.ReadFile(pendingDBRestoreMarkerPath())
+	if err != nil {
+		return nil, err
+	}
+	var payload pendingDBRestoreMarker
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	return &payload, nil
+}
+
+func clearPendingDBRestoreMarker() {
+	_ = os.Remove(pendingDBRestoreMarkerPath())
+}
+
+func cleanupPendingDBRestoreBaseDir() {
+	entries, err := os.ReadDir(pendingDBRestoreBaseDir())
+	if err != nil {
+		return
+	}
+	if len(entries) == 0 {
+		_ = os.Remove(pendingDBRestoreBaseDir())
+	}
 }

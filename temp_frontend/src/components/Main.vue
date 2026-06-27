@@ -53,7 +53,7 @@
       </v-row>
       <v-row>
         <v-col v-for="i in reloadItems" :key="i" cols="12" sm="6" md="3">
-          <v-card class="rounded-lg" variant="outlined" :height="i.startsWith('i-') ? 228 : 210"
+          <v-card class="rounded-lg" variant="outlined" :height="i === 'i-sbd' ? 244 : i.startsWith('i-') ? 228 : 210"
                   :title="menuItems.flatMap(cat => cat.value).find(m => m.value === i)?.title">
             <v-card-text style="padding: 0 16px;" align="center" justify="center">
               <Gauge v-if="i.charAt(0) === 'g'" :tilesData="tilesData" :type="i" />
@@ -61,30 +61,135 @@
               <template v-if="i === 'i-sys'">
                 <v-row class="home-info-grid">
                   <v-col cols="3">{{ $t('main.info.host') }}</v-col>
-                  <v-col cols="9" style="text-wrap: nowrap; overflow: hidden">{{ tilesData.sys?.hostName }}</v-col>
+                  <v-col cols="9">
+                    <div class="home-copy-row">
+                      <span class="home-copy-value">{{ hostNameLabel }}</span>
+                      <v-btn
+                        v-if="hostNameLabel !== '-'"
+                        icon
+                        size="x-small"
+                        variant="text"
+                        class="home-copy-btn"
+                        :aria-label="$t('copyToClipboard')"
+                        @click.stop="void copyPlainText(hostNameLabel)"
+                      >
+                        <v-icon icon="mdi-content-copy" />
+                        <v-tooltip activator="parent" location="top" :text="$t('copyToClipboard')" />
+                      </v-btn>
+                    </div>
+                  </v-col>
                   <v-col cols="3">{{ $t('main.info.cpu') }}</v-col>
                   <v-col cols="9">
-                    <v-chip density="compact" variant="flat">
-                      <v-tooltip activator="parent" location="top" style="direction: ltr;">
-                        {{ tilesData.sys?.cpuType }}
-                      </v-tooltip>
-                      {{ tilesData.sys?.cpuCount }} {{ $t('main.info.core') }}
+                    <v-menu
+                      v-if="cpuTypeLabel !== '-'"
+                      open-on-hover
+                      open-on-click
+                      location="end"
+                      :close-on-content-click="false"
+                      :open-delay="80"
+                      :close-delay="220"
+                    >
+                      <template #activator="{ props }">
+                        <v-chip v-bind="props" density="compact" variant="flat">
+                          {{ cpuCountLabel }}
+                        </v-chip>
+                      </template>
+                      <v-card class="home-detail-card" rounded="lg">
+                        <div class="home-detail-row">
+                          <span class="home-detail-text">{{ cpuTypeLabel }}</span>
+                          <v-btn
+                            icon
+                            size="x-small"
+                            variant="text"
+                            class="home-copy-btn"
+                            :aria-label="$t('copyToClipboard')"
+                            @click.stop="void copyPlainText(cpuTypeLabel)"
+                          >
+                            <v-icon icon="mdi-content-copy" />
+                            <v-tooltip activator="parent" location="top" :text="$t('copyToClipboard')" />
+                          </v-btn>
+                        </div>
+                      </v-card>
+                    </v-menu>
+                    <v-chip v-else density="compact" variant="flat">
+                      {{ cpuCountLabel }}
                     </v-chip>
                   </v-col>
                   <v-col cols="3">IP</v-col>
                   <v-col cols="9">
-                    <v-chip density="compact" color="primary" variant="flat" v-if="tilesData.sys?.ipv4?.length > 0">
-                      <v-tooltip activator="parent" location="top" style="direction: ltr;">
-                        <span v-html="tilesData.sys?.ipv4?.join('<br />')"></span>
-                      </v-tooltip>
-                      IPv4
-                    </v-chip>
-                    <v-chip density="compact" color="primary" variant="flat" v-if="tilesData.sys?.ipv6?.length > 0">
-                      <v-tooltip activator="parent" location="top" style="direction: ltr;">
-                        <span v-html="tilesData.sys?.ipv6?.join('<br />')"></span>
-                      </v-tooltip>
-                      IPv6
-                    </v-chip>
+                    <div class="d-flex flex-wrap home-ip-chip-row">
+                      <v-menu
+                        v-if="ipv4List.length > 0"
+                        open-on-hover
+                        open-on-click
+                        location="end"
+                        :close-on-content-click="false"
+                        :open-delay="80"
+                        :close-delay="220"
+                      >
+                        <template #activator="{ props }">
+                          <v-chip v-bind="props" density="compact" color="primary" variant="flat">
+                            IPv4
+                          </v-chip>
+                        </template>
+                        <v-card class="home-detail-card" rounded="lg">
+                          <div
+                            v-for="(ip, index) in ipv4List"
+                            :key="`ipv4-${ip}-${index}`"
+                            class="home-detail-row"
+                          >
+                            <span class="home-detail-text">{{ ip }}</span>
+                            <v-btn
+                              icon
+                              size="x-small"
+                              variant="text"
+                              class="home-copy-btn"
+                              :aria-label="$t('copyToClipboard')"
+                              @click.stop="void copyIPAddress(ip)"
+                            >
+                              <v-icon icon="mdi-content-copy" />
+                              <v-tooltip activator="parent" location="top" :text="$t('copyToClipboard')" />
+                            </v-btn>
+                          </div>
+                        </v-card>
+                      </v-menu>
+                      <v-menu
+                        v-if="ipv6List.length > 0"
+                        open-on-hover
+                        open-on-click
+                        location="end"
+                        :close-on-content-click="false"
+                        :open-delay="80"
+                        :close-delay="220"
+                      >
+                        <template #activator="{ props }">
+                          <v-chip v-bind="props" density="compact" color="primary" variant="flat">
+                            IPv6
+                          </v-chip>
+                        </template>
+                        <v-card class="home-detail-card" rounded="lg">
+                          <div
+                            v-for="(ip, index) in ipv6List"
+                            :key="`ipv6-${ip}-${index}`"
+                            class="home-detail-row"
+                          >
+                            <span class="home-detail-text">{{ ip }}</span>
+                            <v-btn
+                              icon
+                              size="x-small"
+                              variant="text"
+                              class="home-copy-btn"
+                              :aria-label="$t('copyToClipboard')"
+                              @click.stop="void copyIPAddress(ip)"
+                            >
+                              <v-icon icon="mdi-content-copy" />
+                              <v-tooltip activator="parent" location="top" :text="$t('copyToClipboard')" />
+                            </v-btn>
+                          </div>
+                        </v-card>
+                      </v-menu>
+                      <span v-if="!hasIPAddresses">-</span>
+                    </div>
                   </v-col>
                   <v-col cols="3">kwor</v-col>
                   <v-col cols="9">
@@ -187,20 +292,20 @@
                   </v-col>
                   <v-col cols="4">{{ $t('main.info.memory') }}</v-col>
                   <v-col cols="8">
-                    <v-chip density="compact" color="primary" variant="flat">
-                      {{ formatDualMemory(tilesData.sbd?.stats) }}
+                    <v-chip class="runtime-metric-chip" density="compact" color="primary" variant="flat">
+                      {{ formatTripleMemory(tilesData.sbd?.stats) }}
                     </v-chip>
                   </v-col>
                   <v-col cols="4">{{ $t('main.info.threads') }}</v-col>
                   <v-col cols="8">
-                    <v-chip density="compact" color="primary" variant="flat">
-                      {{ formatDualThreads(tilesData.sbd?.stats) }}
+                    <v-chip class="runtime-metric-chip" density="compact" color="primary" variant="flat">
+                      {{ formatTripleThreads(tilesData.sbd?.stats) }}
                     </v-chip>
                   </v-col>
                   <v-col cols="4">{{ $t('main.info.uptime') }}</v-col>
                   <v-col cols="8">
-                    <v-chip density="compact" color="primary" variant="flat">
-                      {{ formatDualUptime(tilesData.sbd?.stats) }}
+                    <v-chip class="runtime-metric-chip" density="compact" color="primary" variant="flat">
+                      {{ formatTripleUptime(tilesData.sbd?.stats) }}
                     </v-chip>
                   </v-col>
                 </v-row>
@@ -223,6 +328,7 @@ import { computed, onBeforeUnmount, onMounted, ref, type Ref } from 'vue'
 import { i18n } from '@/locales'
 import LogVue from '@/layouts/modals/Logs.vue'
 import Backup from '@/layouts/modals/Backup.vue'
+import { push } from 'notivue'
 
 const loading = ref(false)
 const singboxRunning = ref(false)
@@ -252,9 +358,99 @@ const menuItems = [
 
 const tilesData = ref(<any>{})
 
+const normalizeStringList = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return []
+  return value
+    .map(item => String(item ?? '').trim())
+    .filter(Boolean)
+}
+
+const normalizeCopyText = (value: unknown): string => String(value ?? '').trim()
+
+const normalizeIPAddressForCopy = (value: unknown): string => {
+  const text = normalizeCopyText(value)
+  if (!text) return ''
+  const firstToken = text.split(/\s+/)[0] ?? ''
+  const [address] = firstToken.split('/')
+  return address.trim().replace(/^\[/, '').replace(/\]$/, '')
+}
+
+const fallbackCopyText = (text: string): boolean => {
+  if (typeof document === 'undefined') return false
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', 'readonly')
+  textarea.style.position = 'fixed'
+  textarea.style.opacity = '0'
+  textarea.style.pointerEvents = 'none'
+  document.body.appendChild(textarea)
+  textarea.focus()
+  textarea.select()
+  textarea.setSelectionRange(0, textarea.value.length)
+  let copied = false
+  try {
+    copied = document.execCommand('copy')
+  } finally {
+    document.body.removeChild(textarea)
+  }
+  return copied
+}
+
+const notifyCopyResult = (copied: boolean) => {
+  if (copied) {
+    push.success({
+      message: `${i18n.global.t('success')}: ${i18n.global.t('copyToClipboard')}`,
+      duration: 2200,
+    })
+    return
+  }
+  push.error({
+    title: i18n.global.t('failed'),
+    message: i18n.global.t('copyToClipboard'),
+    duration: 3000,
+  })
+}
+
+const copyText = async (value: unknown) => {
+  const text = normalizeCopyText(value)
+  if (!text) {
+    notifyCopyResult(false)
+    return
+  }
+
+  let copied = false
+  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      copied = true
+    } catch {
+      copied = false
+    }
+  }
+
+  if (!copied) {
+    copied = fallbackCopyText(text)
+  }
+  notifyCopyResult(copied)
+}
+
+const copyPlainText = async (value: unknown) => copyText(value)
+
+const copyIPAddress = async (value: unknown) => copyText(normalizeIPAddressForCopy(value))
+
 const appVersionLabel = computed(() => {
   const version = tilesData.value?.sys?.appVersion
   return typeof version === 'string' && version.trim() ? `v${version.trim()}` : '-'
+})
+
+const hostNameLabel = computed(() => {
+  const hostName = String(tilesData.value?.sys?.hostName ?? '').trim()
+  return hostName || '-'
+})
+
+const cpuTypeLabel = computed(() => {
+  const cpuType = String(tilesData.value?.sys?.cpuType ?? '').trim()
+  return cpuType || '-'
 })
 
 const toNumber = (value: unknown): number => {
@@ -266,12 +462,24 @@ const toNumber = (value: unknown): number => {
   return 0
 }
 
+const cpuCountLabel = computed(() => {
+  const cpuCount = Math.floor(toNumber(tilesData.value?.sys?.cpuCount))
+  return cpuCount > 0 ? `${cpuCount} ${i18n.global.t('main.info.core')}` : '-'
+})
+
+const ipv4List = computed(() => normalizeStringList(tilesData.value?.sys?.ipv4))
+
+const ipv6List = computed(() => normalizeStringList(tilesData.value?.sys?.ipv6))
+
+const hasIPAddresses = computed(() => ipv4List.value.length > 0 || ipv6List.value.length > 0)
+
 const toMB = (bytes: unknown): number => {
   return Math.max(0, Math.round(toNumber(bytes) / (1024 * 1024)))
 }
 
 const toMBWithOneDecimal = (bytes: unknown): string => {
-  return Math.max(0, toNumber(bytes) / (1024 * 1024)).toFixed(1)
+  const value = Math.max(0, toNumber(bytes) / (1024 * 1024)).toFixed(1)
+  return value.endsWith('.0') ? value.slice(0, -2) : value
 }
 
 const formatRuntimeMin = (seconds: unknown): string => {
@@ -290,22 +498,37 @@ const formatRuntimeMin = (seconds: unknown): string => {
   return remainHour > 0 ? `${day}d ${remainHour}h` : `${day}d`
 }
 
-const formatDualMemory = (stats: any): string => {
-  const coreCombinedLegacy = stats?.CoreCombinedMemory ?? (toNumber(stats?.CoreMemory) + toNumber(stats?.MihomoMemory))
-  const totalLegacy = stats?.TotalMemory ?? (toNumber(stats?.AppMemory) + coreCombinedLegacy)
-  const coreCombinedRSS = stats?.CoreCombinedMemoryRSS ?? (toNumber(stats?.CoreMemoryRSS) + toNumber(stats?.MihomoMemoryRSS))
-  const totalRSS = stats?.TotalMemoryRSS ?? (toNumber(stats?.AppMemoryRSS) + coreCombinedRSS)
-  const legacy = `${toMB(totalLegacy)}+${toMB(coreCombinedLegacy)} MB`
-  const vmRSS = `${toMBWithOneDecimal(totalRSS)}+${toMBWithOneDecimal(coreCombinedRSS)} MB`
-  return `${legacy} (${vmRSS})`
+const readMetricValue = (stats: any, keys: string[]): number => {
+  if (!stats || typeof stats !== 'object') return 0
+  let fallbackValue = 0
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(stats, key)) continue
+    const value = toNumber(stats[key])
+    if (value > 0) return value
+    fallbackValue = value
+  }
+  return fallbackValue
 }
 
-const formatDualThreads = (stats: any): string => {
-  return `${Math.floor(toNumber(stats?.AppThreads))}+${Math.floor(toNumber(stats?.CoreThreads))}`
+const formatTripleMemory = (stats: any): string => {
+  const appMemory = readMetricValue(stats, ['AppMemoryActual', 'AppMemoryRSS', 'AppMemory'])
+  const singboxMemory = readMetricValue(stats, ['SingboxMemoryActual', 'CoreMemoryRSS', 'CoreMemory'])
+  const mihomoMemory = readMetricValue(stats, ['MihomoMemoryActual', 'MihomoMemoryRSS', 'MihomoMemory'])
+  return `${toMBWithOneDecimal(appMemory)}+${toMBWithOneDecimal(singboxMemory)}(s)+${toMBWithOneDecimal(mihomoMemory)}(m) MB`
 }
 
-const formatDualUptime = (stats: any): string => {
-  return `${formatRuntimeMin(stats?.AppUptime)}+${formatRuntimeMin(stats?.CoreUptime)}`
+const formatTripleThreads = (stats: any): string => {
+  const appThreads = Math.floor(readMetricValue(stats, ['AppThreadsActual', 'AppThreads']))
+  const singboxThreads = Math.floor(readMetricValue(stats, ['SingboxThreadsActual', 'CoreThreads']))
+  const mihomoThreads = Math.floor(readMetricValue(stats, ['MihomoThreadsActual']))
+  return `${appThreads}+${singboxThreads}(s)+${mihomoThreads}(m)`
+}
+
+const formatTripleUptime = (stats: any): string => {
+  const appUptime = readMetricValue(stats, ['AppUptimeActual', 'AppUptime'])
+  const singboxUptime = readMetricValue(stats, ['SingboxUptimeActual', 'CoreUptime'])
+  const mihomoUptime = readMetricValue(stats, ['MihomoUptimeActual'])
+  return `${formatRuntimeMin(appUptime)}+${formatRuntimeMin(singboxUptime)}(s)+${formatRuntimeMin(mihomoUptime)}(m)`
 }
 
 const reloadItems = computed({
@@ -426,6 +649,56 @@ const restartSingbox = async () => {
   padding-bottom: 4px;
 }
 
+.home-copy-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.home-copy-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.home-copy-btn {
+  flex: 0 0 auto;
+}
+
+.home-ip-chip-row {
+  gap: 6px;
+}
+
+.home-detail-card {
+  padding: 8px 10px;
+  min-width: 180px;
+  max-width: min(440px, calc(100vw - 32px));
+}
+
+.home-detail-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.home-detail-row + .home-detail-row {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+}
+
+.home-detail-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+  direction: ltr;
+  overflow-wrap: anywhere;
+}
+
 .runtime-status-cell {
   gap: 3px;
 }
@@ -433,5 +706,17 @@ const restartSingbox = async () => {
 .runtime-status-row {
   gap: 3px;
   min-height: 22px;
+}
+
+.runtime-metric-chip {
+  max-width: 100%;
+  height: auto;
+  min-height: 24px;
+  line-height: 1.2;
+}
+
+:deep(.runtime-metric-chip .v-chip__content) {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 </style>

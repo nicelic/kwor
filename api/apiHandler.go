@@ -104,6 +104,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.InstallPanelUpdate(c)
 	case "importdb":
 		a.ApiService.ImportDb(c)
+	case "restore-db-backup":
+		a.ApiService.RestoreDBBackup(c)
 	case "addToken":
 		a.ApiService.AddToken(c)
 		a.apiv2.ReloadTokens()
@@ -375,6 +377,8 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetKeypairs(c)
 	case "getdb":
 		a.ApiService.GetDb(c)
+	case "download-db-backup":
+		a.ApiService.DownloadDBBackup(c)
 	case "tokens":
 		a.ApiService.GetTokens(c)
 	case "singbox-config":

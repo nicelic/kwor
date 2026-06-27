@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/alireza0/s-ui/config"
+	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/logger"
 
 	sqliteDriver "github.com/glebarez/sqlite"
@@ -69,6 +70,7 @@ const (
 )
 
 var (
+	systemMonitorDBStateMu  sync.Mutex
 	systemMonitorDBInitOnce sync.Once
 	systemMonitorDBInitErr  error
 	systemMonitorDB         *gorm.DB
@@ -95,11 +97,45 @@ var systemMonitorRollupDefinitions = []systemMonitorRollupDefinition{
 	},
 }
 
+func init() {
+	database.RegisterBeforeDBRestoreHook(func() error {
+		if err := systemMonitorRuntime.resetForDatabaseReload(); err != nil {
+			return err
+		}
+		return ResetSystemMonitorStore()
+	})
+	database.RegisterAfterDBRestoreHook(func() error {
+		return InitSystemMonitorStore()
+	})
+}
+
 func InitSystemMonitorStore() error {
+	systemMonitorDBStateMu.Lock()
+	defer systemMonitorDBStateMu.Unlock()
 	systemMonitorDBInitOnce.Do(func() {
 		systemMonitorDBInitErr = openSystemMonitorStore()
 	})
 	return systemMonitorDBInitErr
+}
+
+func ResetSystemMonitorStore() error {
+	systemMonitorDBStateMu.Lock()
+	defer systemMonitorDBStateMu.Unlock()
+
+	var closeErr error
+	if systemMonitorDB != nil {
+		sqlDB, err := systemMonitorDB.DB()
+		if err != nil {
+			closeErr = err
+		} else {
+			closeErr = sqlDB.Close()
+		}
+	}
+
+	systemMonitorDB = nil
+	systemMonitorDBInitErr = nil
+	systemMonitorDBInitOnce = sync.Once{}
+	return closeErr
 }
 
 func GetSystemMonitorStorePath() string {

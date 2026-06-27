@@ -197,6 +197,10 @@ func (s *ServerService) GetSingboxInfo() map[string]interface{} {
 		mihomoProcessStats = s.getProcessRuntimeStats(mihomoStats.MainPID)
 	}
 
+	appActualStats := preferRuntimeStats(appProcessStats, appStats)
+	singboxActualStats := preferManagedCoreRuntimeStats(singboxProcessStats, singboxStats)
+	mihomoActualStats := preferManagedCoreRuntimeStats(mihomoProcessStats, mihomoStats)
+
 	coreCombinedMemory := singboxStats.Memory + mihomoStats.Memory
 	coreCombinedMemoryRSS := singboxProcessStats.MemoryBytes + mihomoProcessStats.MemoryBytes
 	totalMemory := appStats.MemoryBytes + coreCombinedMemory
@@ -215,10 +219,19 @@ func (s *ServerService) GetSingboxInfo() map[string]interface{} {
 			"MihomoMemoryRSS":       mihomoProcessStats.MemoryBytes,
 			"CoreCombinedMemoryRSS": coreCombinedMemoryRSS,
 			"TotalMemoryRSS":        totalMemoryRSS,
+			"AppMemoryActual":       appActualStats.MemoryBytes,
+			"SingboxMemoryActual":   singboxActualStats.MemoryBytes,
+			"MihomoMemoryActual":    mihomoActualStats.MemoryBytes,
 			"AppThreads":            appStats.Threads,
 			"CoreThreads":           singboxStats.Tasks,
+			"AppThreadsActual":      appActualStats.Threads,
+			"SingboxThreadsActual":  singboxActualStats.Threads,
+			"MihomoThreadsActual":   mihomoActualStats.Threads,
 			"AppUptime":             appStats.Uptime,
 			"CoreUptime":            singboxStats.UptimeSec,
+			"AppUptimeActual":       appActualStats.Uptime,
+			"SingboxUptimeActual":   singboxActualStats.Uptime,
+			"MihomoUptimeActual":    mihomoActualStats.Uptime,
 
 			// keep legacy keys for compatibility with older UI
 			"NumGoroutine": appStats.Threads,
@@ -309,6 +322,27 @@ func (s *ServerService) getManagedCoreRuntimeStats(unit string, processName stri
 	}
 
 	return stats
+}
+
+func preferRuntimeStats(primary runtimeStats, fallback runtimeStats) runtimeStats {
+	if primary.MemoryBytes == 0 {
+		primary.MemoryBytes = fallback.MemoryBytes
+	}
+	if primary.Threads == 0 {
+		primary.Threads = fallback.Threads
+	}
+	if primary.Uptime == 0 {
+		primary.Uptime = fallback.Uptime
+	}
+	return primary
+}
+
+func preferManagedCoreRuntimeStats(primary runtimeStats, fallback systemdUnitStats) runtimeStats {
+	return preferRuntimeStats(primary, runtimeStats{
+		MemoryBytes: fallback.Memory,
+		Threads:     fallback.Tasks,
+		Uptime:      fallback.UptimeSec,
+	})
 }
 
 type processRuntimeStatsWithPID struct {

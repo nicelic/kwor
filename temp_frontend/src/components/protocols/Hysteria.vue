@@ -166,15 +166,17 @@ export default {
       set(v:boolean) { this.$props.data.max_concurrent_streams = v ? 1024 : undefined }
     },
     down_mbps: {
-      get() { return this.$props.data.server_down_mbps ?? 2000 },
+      get() { return this.$props.data.server_down_mbps ?? 500 },
       set(newValue:number) {
-        this.$props.data.server_down_mbps = Number.isFinite(newValue) ? newValue : 2000
+        this.$props.data.server_down_mbps = Number.isFinite(newValue) ? newValue : 500
         delete this.$props.data.down
       }
     },
     up_mbps: {
-      get() { return this.$props.data.server_up_mbps ?? 2000 },
-      set(newValue:number) { this.$props.data.server_up_mbps = Number.isFinite(newValue) ? newValue : 2000 }
+      get() { return this.$props.data.server_up_mbps ?? 500 },
+      set(newValue:number) {
+        this.$props.data.server_up_mbps = Number.isFinite(newValue) ? newValue : 500
+      }
     },
   },
   components: { Network }

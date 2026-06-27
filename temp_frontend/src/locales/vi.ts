@@ -85,11 +85,18 @@ export default {
     },
     backup: {
       title: "Sao lưu và khôi phục",
+      desc: "Tải xuống bản sao lưu sẽ đóng gói các tệp cơ sở dữ liệu trong Promanager_data/db thành zip. Khôi phục sẽ dừng các lõi đang chạy trước, thay thế thư mục db từ file zip, rồi khởi động lại bảng điều khiển mà không tự chạy lại lõi.",
       backup: "Tải xuống bản sao lưu",
       restore: "Khôi phục bản sao lưu",
-      exclStats: "Loại trừ các biểu đồ",
-      exclChanges: "Loại trừ các thay đổi",
-      sbConfig: "Tải xuống cấu hình Sing-Box",
+      downloadingTitle: "Đang chuẩn bị bản sao lưu",
+      downloadingDesc: "Đang đóng gói thư mục db để tải xuống. Vui lòng chờ.",
+      downloaded: "Đã bắt đầu tải bản sao lưu",
+      downloadFailed: "Tải bản sao lưu thất bại",
+      restoringTitle: "Đang khôi phục bản sao lưu",
+      restoringDesc: "Nếu Sing-Box hoặc Mihomo đang chạy, hệ thống sẽ dừng lõi trước khi thay thế thư mục db.",
+      restartingTitle: "Bảng điều khiển đang khởi động lại",
+      restartingDesc: "Khôi phục cơ sở dữ liệu đã hoàn tất. Đang chờ bảng điều khiển kết nối lại. Trang sẽ tự làm mới.",
+      restoreFailed: "Khôi phục bản sao lưu thất bại",
     }
   },
   objects: {

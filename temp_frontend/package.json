@@ -1,6 +1,6 @@
 {
   "name": "frontend",
-  "version": "1.5.21",
+  "version": "1.5.22",
   "private": true,
   "scripts": {
     "dev": "node ../scripts/sync-version.mjs && vite --host",

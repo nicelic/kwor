@@ -89,11 +89,18 @@
     },
     backup: {
       title: "Backup & Restore",
+      desc: "Download backup packages the database files in Promanager_data/db as a zip. Restore stops running cores first, replaces the db directory from the zip, then restarts the panel without auto-starting the cores again.",
       backup: "Download Backup",
       restore: "Restore Backup",
-      exclStats: "Exclude graphs",
-      exclChanges: "Exclude changes",
-      sbConfig: "Download Sing-Box Config",
+      downloadingTitle: "Preparing backup",
+      downloadingDesc: "Packaging the db directory for download. Please wait.",
+      downloaded: "Backup download started",
+      downloadFailed: "Backup download failed",
+      restoringTitle: "Restoring backup",
+      restoringDesc: "If Sing-Box or Mihomo is running, it will be stopped before replacing the db directory.",
+      restartingTitle: "Panel is restarting",
+      restartingDesc: "Database restore finished. Waiting for the panel to reconnect. This page will refresh automatically.",
+      restoreFailed: "Restore backup failed",
     }
   },
   objects: {
