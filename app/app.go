@@ -354,6 +354,9 @@ func (a *APP) prepareStartupData() error {
 	if syncErr := (&service.FirewallService{}).CleanupTemporaryRulesOnStartup(); syncErr != nil {
 		logger.Warning("cleanup temporary firewall rules on startup failed:", syncErr)
 	}
+	if syncErr := service.PrepareHistoryStorageOnStartup(); syncErr != nil {
+		logger.Warning("prepare history storage on startup failed:", syncErr)
+	}
 	return nil
 }
 

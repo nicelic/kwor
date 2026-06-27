@@ -6,6 +6,7 @@ import (
 
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
+	"github.com/alireza0/s-ui/logger"
 
 	"gorm.io/gorm"
 )
@@ -34,6 +35,9 @@ func (s *StatsService) SaveStats(enableTraffic bool) error {
 		setOnlines(nil, nil, nil)
 		return nil
 	}
+	if err := EnsureHistoryStorageReady(); err != nil {
+		return err
+	}
 	stats := corePtr.GetInstance().StatsTracker().GetStats()
 
 	if len(*stats) == 0 {
@@ -56,7 +60,7 @@ func (s *StatsService) SaveStats(enableTraffic bool) error {
 
 	if !enableTraffic {
 		for _, stat := range *stats {
-			if stat.Resource != "user" {
+			if normalizeStatsResource(stat.Resource) != "client" {
 				continue
 			}
 			if stat.Direction {
@@ -73,7 +77,7 @@ func (s *StatsService) SaveStats(enableTraffic bool) error {
 		return nil
 	}
 
-	err = tx.Create(&stats).Error
+	err = upsertStatsTrafficBatch(tx, *stats)
 	if err != nil {
 		return err
 	}
@@ -82,22 +86,7 @@ func (s *StatsService) SaveStats(enableTraffic bool) error {
 }
 
 func (s *StatsService) GetStats(resource string, tag string, limit int) ([]model.Stats, error) {
-	var err error
-	var result []model.Stats
-
-	currentTime := time.Now().Unix()
-	timeDiff := currentTime - (int64(limit) * 3600)
-
-	db := database.GetDB()
-	resources := []string{resource}
-	if resource == "endpoint" {
-		resources = []string{"inbound", "outbound"}
-	}
-	err = db.Model(model.Stats{}).Where("resource in ? AND tag = ? AND date_time > ?", resources, tag, timeDiff).Scan(&result).Error
-	if err != nil {
-		return nil, err
-	}
-	return result, nil
+	return queryStatsHistory(resource, tag, limit)
 }
 
 func (s *StatsService) GetOnlines() (onlines, error) {
@@ -138,5 +127,14 @@ func normalizeOnlineTags(tags []string) []string {
 func (s *StatsService) DelOldStats(days int) error {
 	oldTime := time.Now().AddDate(0, 0, -(days)).Unix()
 	db := database.GetDB()
-	return db.Where("date_time < ?", oldTime).Delete(model.Stats{}).Error
+	result := db.Where("date_time < ?", oldTime).Delete(model.Stats{})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected > 0 {
+		if err := compactMainSQLiteDB(db, false); err != nil {
+			logger.Warning("compact sqlite after deleting old stats failed: ", err)
+		}
+	}
+	return nil
 }

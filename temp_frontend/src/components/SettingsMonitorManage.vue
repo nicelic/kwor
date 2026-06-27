@@ -245,8 +245,8 @@
       </v-col>
     </v-row>
 
-    <v-row class="mt-2 monitor-range-row" align="center">
-      <v-col cols="12" lg="6">
+    <v-row class="mt-2 monitor-range-row" align="start">
+      <v-col cols="12" lg="5">
         <div class="monitor-range-switch">
           <button
             v-for="item in visibleRangeOptions"
@@ -281,7 +281,7 @@
           <v-btn color="secondary" variant="tonal" @click="applyCustomRange">查看</v-btn>
         </div>
       </v-col>
-      <v-col cols="12" lg="2">
+      <v-col cols="12" lg="3">
         <div class="monitor-toolbar-actions">
           <v-btn color="secondary" variant="tonal" @click="zoomIn">放大</v-btn>
           <v-btn color="secondary" variant="tonal" @click="zoomOut">缩小</v-btn>
@@ -298,7 +298,7 @@
       </v-col>
     </v-row>
 
-    <v-row class="mt-2 monitor-granularity-row" align="center">
+    <v-row class="mt-2 monitor-granularity-row" align="start">
       <v-col cols="12" lg="8">
         <div class="monitor-granularity-toolbar">
           <div class="monitor-granularity-toolbar__group">
@@ -2005,7 +2005,8 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 .monitor-range-switch {
-  display: inline-flex;
+  display: flex;
+  width: 100%;
   flex-wrap: wrap;
   gap: 8px;
   padding: 8px;
@@ -2048,7 +2049,12 @@ function clamp(value: number, min: number, max: number): number {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  justify-content: flex-end;
+  justify-content: flex-start;
+  width: 100%;
+}
+
+.monitor-toolbar-actions :deep(.v-btn) {
+  min-width: 92px;
 }
 
 .monitor-granularity-toolbar {
@@ -2331,12 +2337,20 @@ function clamp(value: number, min: number, max: number): number {
   .monitor-storage-guide {
     grid-template-columns: 1fr;
   }
+
+  .monitor-toolbar-actions {
+    justify-content: flex-start;
+  }
 }
 
 @media (max-width: 960px) {
   .monitor-config-field-with-unit,
   .monitor-custom-range {
     grid-template-columns: 1fr;
+  }
+
+  .monitor-toolbar-actions :deep(.v-btn) {
+    flex: 1 1 calc(50% - 4px);
   }
 }
 
@@ -2372,6 +2386,10 @@ function clamp(value: number, min: number, max: number): number {
 
   .monitor-toolbar-actions {
     justify-content: flex-start;
+  }
+
+  .monitor-toolbar-actions :deep(.v-btn) {
+    flex: 1 1 100%;
   }
 }
 </style>

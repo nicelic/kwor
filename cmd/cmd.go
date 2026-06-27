@@ -256,7 +256,7 @@ func printLikelyFailureHints(journalText string) {
 	case strings.Contains(j, "address already in use"):
 		fmt.Println("[kwor] possible cause: port conflict. Check webPort/subPort.")
 	case strings.Contains(j, "unknown time zone"), strings.Contains(j, "unknown timezone"):
-		fmt.Println("[kwor] possible cause: timezone data missing. Install tzdata or set timeLocation=Local.")
+		fmt.Println("[kwor] possible cause: timezone data missing or invalid. Install tzdata or set timeLocation to a valid IANA zone like UTC or Asia/Shanghai.")
 	case strings.Contains(j, "permission denied"):
 		fmt.Println("[kwor] possible cause: permission denied. Check executable and directory permissions.")
 	case strings.Contains(j, "no such file"), strings.Contains(j, "not found"):
@@ -598,10 +598,10 @@ func firstRunSetup() {
 	fmt.Println()
 }
 
-func handleStart() {
+func handleStart() error {
 	if service.RunningInsideContainer() {
 		printContainerLifecycleHint("start")
-		return
+		return fmt.Errorf("container deployment does not support kwor start")
 	}
 
 	firstRunInitialized := false
@@ -614,9 +614,11 @@ func handleStart() {
 			if err := exec.Command("systemctl", "start", kworServiceName).Run(); err != nil {
 				fmt.Printf("[kwor] activate systemd service failed: %v\n", err)
 				printSystemdDiagnostics(kworServiceName)
+				return err
 			} else if !waitSystemdServiceActive(kworServiceName, 8*time.Second) {
 				fmt.Println("[kwor] systemd service did not become active")
 				printSystemdDiagnostics(kworServiceName)
+				return fmt.Errorf("systemd service did not become active")
 			} else {
 				fmt.Println("[kwor] systemd service activated")
 			}
@@ -624,15 +626,15 @@ func handleStart() {
 			fmt.Println("[kwor] program running but systemd file missing, creating service...")
 			if err := createSystemdService(); err != nil {
 				fmt.Printf("[kwor] create systemd service failed: %v\n", err)
-				return
+				return err
 			}
 			if err := enableAndStartService(); err != nil {
 				fmt.Printf("[kwor] register systemd auto-start failed: %v\n", err)
-				return
+				return err
 			}
 			fmt.Println("[kwor] systemd service created and registered")
 		}
-		return
+		return nil
 	}
 
 	if isFirstRun() {
@@ -643,13 +645,13 @@ func handleStart() {
 	fmt.Println("[kwor] creating systemd service...")
 	if err := createSystemdService(); err != nil {
 		fmt.Printf("[kwor] create systemd service failed: %v\n", err)
-		return
+		return err
 	}
 
 	fmt.Println("[kwor] enabling auto-start and starting service...")
 	if err := enableAndStartService(); err != nil {
 		fmt.Printf("[kwor] start failed: %v\n", err)
-		return
+		return err
 	}
 
 	fmt.Println("[kwor] started successfully, systemd auto-start is registered")
@@ -657,6 +659,7 @@ func handleStart() {
 	if firstRunInitialized {
 		printFirstRunPanelURLs()
 	}
+	return nil
 }
 
 func handleStop() {
@@ -912,7 +915,9 @@ func ParseCmd() {
 	case "docker-bootstrap":
 		handleDockerBootstrap()
 	case "start":
-		handleStart()
+		if err := handleStart(); err != nil {
+			os.Exit(1)
+		}
 	case "stop":
 		handleStop()
 	case "resetadmin":

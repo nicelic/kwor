@@ -89,9 +89,21 @@
                 :suffix="$t('date.d')"
                 hide-details
               ></v-text-field>
+              <div class="text-caption text-medium-emphasis mt-1">{{ $t('setting.trafficAgeHint') }}</div>
             </v-col>
             <v-col cols="12" sm="6" md="4">
-              <v-text-field v-model="settings.timeLocation" :label="$t('setting.timeLoc')" hide-details></v-text-field>
+              <v-select
+                v-model="settings.timeLocation"
+                :items="mergedTimeZoneOptions"
+                item-title="title"
+                item-value="value"
+                item-props="props"
+                :label="$t('setting.timeLoc')"
+                hide-details
+                density="comfortable"
+                variant="outlined"
+                :menu-props="{ maxHeight: 360 }"
+              ></v-select>
             </v-col>
           </v-row>
 
@@ -484,6 +496,14 @@ type PanelUpdateLogView = {
   modified?: number
 }
 
+type TimeZoneOption = {
+  title: string
+  value: string
+  props?: {
+    disabled?: boolean
+  }
+}
+
 const panelStatusLoading = ref(false)
 const panelRemoteLoading = ref(false)
 const panelLoadingMoreVersions = ref(false)
@@ -514,7 +534,7 @@ const settings = ref({
   panelAssignedCertificateRecordIDs: '[]',
   sessionMaxAge: '0',
   trafficAge: '30',
-  timeLocation: 'Asia/Tehran',
+  timeLocation: 'UTC',
   subListen: '',
   subPort: '22780',
   subPath: '',
@@ -535,6 +555,125 @@ const settings = ref({
 
 const DEFAULT_WEB_PORT = '8888'
 const DEFAULT_SUB_PORT = '22780'
+const DEFAULT_TIME_LOCATION = 'UTC'
+
+const createTimeZoneHeader = (title: string): TimeZoneOption => ({
+  title,
+  value: `__header__${title}`,
+  props: {
+    disabled: true,
+  },
+})
+
+const createTimeZoneOption = (value: string, label?: string): TimeZoneOption => ({
+  title: label ? `${label} (${value})` : value,
+  value,
+})
+
+const timeZoneOptions: TimeZoneOption[] = [
+  createTimeZoneHeader('推荐国家 / 地区'),
+  createTimeZoneOption('UTC', '国际标准时间'),
+  createTimeZoneOption('Asia/Shanghai', '中国'),
+  createTimeZoneOption('Asia/Hong_Kong', '中国香港'),
+  createTimeZoneOption('Asia/Taipei', '中国台湾'),
+  createTimeZoneOption('Asia/Tokyo', '日本'),
+  createTimeZoneOption('Asia/Seoul', '韩国'),
+  createTimeZoneOption('Asia/Singapore', '新加坡'),
+  createTimeZoneOption('Asia/Bangkok', '泰国'),
+  createTimeZoneOption('Asia/Ho_Chi_Minh', '越南'),
+  createTimeZoneOption('Asia/Kuala_Lumpur', '马来西亚'),
+  createTimeZoneOption('Asia/Jakarta', '印度尼西亚'),
+  createTimeZoneOption('Asia/Manila', '菲律宾'),
+  createTimeZoneOption('Asia/Kolkata', '印度'),
+  createTimeZoneOption('Asia/Karachi', '巴基斯坦'),
+  createTimeZoneOption('Asia/Dhaka', '孟加拉国'),
+  createTimeZoneOption('Asia/Dubai', '阿联酋'),
+  createTimeZoneOption('Asia/Riyadh', '沙特阿拉伯'),
+  createTimeZoneOption('Asia/Tehran', '伊朗'),
+  createTimeZoneOption('Asia/Jerusalem', '以色列'),
+  createTimeZoneOption('Europe/London', '英国'),
+  createTimeZoneOption('Europe/Paris', '法国'),
+  createTimeZoneOption('Europe/Berlin', '德国'),
+  createTimeZoneOption('Europe/Moscow', '俄罗斯'),
+  createTimeZoneOption('Europe/Istanbul', '土耳其'),
+  createTimeZoneOption('Africa/Cairo', '埃及'),
+  createTimeZoneOption('Africa/Johannesburg', '南非'),
+  createTimeZoneOption('America/New_York', '美国东部'),
+  createTimeZoneOption('America/Chicago', '美国中部'),
+  createTimeZoneOption('America/Denver', '美国山地'),
+  createTimeZoneOption('America/Los_Angeles', '美国西部'),
+  createTimeZoneOption('America/Toronto', '加拿大东部'),
+  createTimeZoneOption('America/Vancouver', '加拿大西部'),
+  createTimeZoneOption('America/Mexico_City', '墨西哥'),
+  createTimeZoneOption('America/Sao_Paulo', '巴西'),
+  createTimeZoneOption('America/Argentina/Buenos_Aires', '阿根廷'),
+  createTimeZoneOption('Australia/Sydney', '澳大利亚悉尼'),
+  createTimeZoneOption('Australia/Perth', '澳大利亚珀斯'),
+  createTimeZoneOption('Pacific/Auckland', '新西兰'),
+  createTimeZoneHeader('亚洲'),
+  createTimeZoneOption('Asia/Kathmandu', '尼泊尔'),
+  createTimeZoneOption('Asia/Almaty', '哈萨克斯坦'),
+  createTimeZoneOption('Asia/Tashkent', '乌兹别克斯坦'),
+  createTimeZoneHeader('欧洲'),
+  createTimeZoneOption('Europe/Dublin', '爱尔兰'),
+  createTimeZoneOption('Europe/Lisbon', '葡萄牙'),
+  createTimeZoneOption('Europe/Madrid', '西班牙'),
+  createTimeZoneOption('Europe/Brussels', '比利时'),
+  createTimeZoneOption('Europe/Amsterdam', '荷兰'),
+  createTimeZoneOption('Europe/Zurich', '瑞士'),
+  createTimeZoneOption('Europe/Rome', '意大利'),
+  createTimeZoneOption('Europe/Vienna', '奥地利'),
+  createTimeZoneOption('Europe/Prague', '捷克'),
+  createTimeZoneOption('Europe/Warsaw', '波兰'),
+  createTimeZoneOption('Europe/Stockholm', '瑞典'),
+  createTimeZoneOption('Europe/Oslo', '挪威'),
+  createTimeZoneOption('Europe/Helsinki', '芬兰'),
+  createTimeZoneOption('Europe/Athens', '希腊'),
+  createTimeZoneOption('Europe/Bucharest', '罗马尼亚'),
+  createTimeZoneOption('Europe/Kyiv', '乌克兰'),
+  createTimeZoneHeader('非洲'),
+  createTimeZoneOption('Africa/Casablanca', '摩洛哥'),
+  createTimeZoneOption('Africa/Lagos', '尼日利亚'),
+  createTimeZoneOption('Africa/Nairobi', '肯尼亚'),
+  createTimeZoneHeader('美洲'),
+  createTimeZoneOption('America/Anchorage', '美国阿拉斯加'),
+  createTimeZoneOption('Pacific/Honolulu', '美国夏威夷'),
+  createTimeZoneOption('America/Bogota', '哥伦比亚'),
+  createTimeZoneOption('America/Lima', '秘鲁'),
+  createTimeZoneOption('America/Santiago', '智利'),
+  createTimeZoneOption('America/Caracas', '委内瑞拉'),
+  createTimeZoneOption('America/Montevideo', '乌拉圭'),
+  createTimeZoneHeader('大洋洲'),
+  createTimeZoneOption('Australia/Melbourne', '澳大利亚墨尔本'),
+  createTimeZoneOption('Australia/Brisbane', '澳大利亚布里斯班'),
+  createTimeZoneOption('Pacific/Fiji', '斐济'),
+  createTimeZoneOption('Pacific/Guam', '关岛'),
+]
+
+const validTimeZoneValues = new Set(timeZoneOptions.filter(item => !item.props?.disabled).map(item => item.value))
+const dynamicTimeZoneOptions = ref<TimeZoneOption[]>([])
+
+const ensureTimeZoneOption = (value: unknown) => {
+  const trimmed = String(value ?? '').trim()
+  if (!trimmed || validTimeZoneValues.has(trimmed)) return
+  if (dynamicTimeZoneOptions.value.some(item => item.value === trimmed)) return
+  dynamicTimeZoneOptions.value = [
+    createTimeZoneHeader('当前使用但未列入常用列表'),
+    createTimeZoneOption(trimmed, '当前值'),
+  ]
+}
+
+const mergedTimeZoneOptions = computed(() => {
+  if (dynamicTimeZoneOptions.value.length === 0) return timeZoneOptions
+  return [...dynamicTimeZoneOptions.value, ...timeZoneOptions]
+})
+
+const normalizeTimeLocationValue = (value: unknown) => {
+  const trimmed = String(value ?? '').trim()
+  if (validTimeZoneValues.has(trimmed)) return trimmed
+  if (trimmed !== '') return trimmed
+  return DEFAULT_TIME_LOCATION
+}
 
 onMounted(async () => {
   loadData()
@@ -556,8 +695,13 @@ const loadData = async () => {
 }
 
 const setData = (data: any) => {
-  settings.value = data
-  oldSettings.value = { ...data }
+  ensureTimeZoneOption(data?.timeLocation)
+  const normalized = {
+    ...data,
+    timeLocation: normalizeTimeLocationValue(data?.timeLocation),
+  }
+  settings.value = normalized
+  oldSettings.value = { ...normalized }
   void nextTick().then(scheduleHeavyTabWarmup)
 }
 
@@ -1014,6 +1158,7 @@ const applyPortDefaultsBeforeSave = () => {
 
 const buildSettingsSavePayload = (value: Record<string, any>) => {
   const payload = { ...value }
+  payload.timeLocation = normalizeTimeLocationValue(payload.timeLocation)
   // Certificate binding IDs are controlled by certificate center apply actions.
   delete payload.panelAssignedCertificateRecordID
   delete payload.panelAssignedCertificateRecordIDs

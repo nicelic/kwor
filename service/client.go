@@ -502,7 +502,7 @@ func (s *ClientService) DepleteClients() ([]uint, error) {
 		if err != nil {
 			return nil, err
 		}
-		err = tx.Model(model.Changes{}).Create(&changes).Error
+		err = recordChanges(tx, changes)
 		if err != nil {
 			return nil, err
 		}

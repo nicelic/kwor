@@ -854,6 +854,11 @@ func (s *MihomoNftTrafficService) CollectAndSaveTraffic() error {
 	} else {
 		logger.Warning("failed to load trafficAge for mihomo nft collection: ", err)
 	}
+	if saveTraffic {
+		if err := EnsureHistoryStorageReady(); err != nil {
+			return err
+		}
+	}
 
 	tx := db.Begin()
 	if tx.Error != nil {
@@ -910,25 +915,25 @@ func (s *MihomoNftTrafficService) CollectAndSaveTraffic() error {
 			inboundOnlineSet[st.Tag] = struct{}{}
 
 			if saveTraffic && deltaIn > 0 {
-				if err := tx.Create(&model.Stats{
+				if err := upsertStatsTraffic(tx, model.Stats{
 					DateTime:  now,
 					Resource:  "mihomo_inbound",
 					Tag:       st.Tag,
 					Direction: true,
 					Traffic:   deltaIn,
-				}).Error; err != nil {
+				}); err != nil {
 					tx.Rollback()
 					return err
 				}
 			}
 			if saveTraffic && deltaOut > 0 {
-				if err := tx.Create(&model.Stats{
+				if err := upsertStatsTraffic(tx, model.Stats{
 					DateTime:  now,
 					Resource:  "mihomo_inbound",
 					Tag:       st.Tag,
 					Direction: false,
 					Traffic:   deltaOut,
-				}).Error; err != nil {
+				}); err != nil {
 					tx.Rollback()
 					return err
 				}
@@ -1043,13 +1048,13 @@ func (s *MihomoNftTrafficService) writeClientStats(tx *gorm.DB, deltas []inbound
 
 		if agg.upTotal > 0 {
 			if saveTraffic {
-				if err := tx.Create(&model.Stats{
+				if err := upsertStatsTraffic(tx, model.Stats{
 					DateTime:  now,
 					Resource:  "mihomo_client",
 					Tag:       name,
 					Direction: true,
 					Traffic:   agg.upTotal,
-				}).Error; err != nil {
+				}); err != nil {
 					return nil, err
 				}
 			}
@@ -1061,13 +1066,13 @@ func (s *MihomoNftTrafficService) writeClientStats(tx *gorm.DB, deltas []inbound
 
 		if agg.downTotal > 0 {
 			if saveTraffic {
-				if err := tx.Create(&model.Stats{
+				if err := upsertStatsTraffic(tx, model.Stats{
 					DateTime:  now,
 					Resource:  "mihomo_client",
 					Tag:       name,
 					Direction: false,
 					Traffic:   agg.downTotal,
-				}).Error; err != nil {
+				}); err != nil {
 					return nil, err
 				}
 			}

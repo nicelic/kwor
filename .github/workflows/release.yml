@@ -108,4 +108,4 @@ jobs:
             release-assets/kwor-linux-amd64.tar.gz
             release-assets/kwor-linux-arm64.tar.gz
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          body: ""

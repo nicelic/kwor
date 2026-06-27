@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -72,6 +73,122 @@ var defaultMihomoConfig = `{
   }
 }`
 
+var supportedTimeLocations = []string{
+	"UTC",
+	"Asia/Shanghai",
+	"Asia/Hong_Kong",
+	"Asia/Taipei",
+	"Asia/Tokyo",
+	"Asia/Seoul",
+	"Asia/Singapore",
+	"Asia/Bangkok",
+	"Asia/Ho_Chi_Minh",
+	"Asia/Kuala_Lumpur",
+	"Asia/Jakarta",
+	"Asia/Manila",
+	"Asia/Kolkata",
+	"Asia/Karachi",
+	"Asia/Dhaka",
+	"Asia/Kathmandu",
+	"Asia/Almaty",
+	"Asia/Tashkent",
+	"Asia/Dubai",
+	"Asia/Riyadh",
+	"Asia/Tehran",
+	"Asia/Jerusalem",
+	"Europe/London",
+	"Europe/Dublin",
+	"Europe/Lisbon",
+	"Europe/Madrid",
+	"Europe/Paris",
+	"Europe/Brussels",
+	"Europe/Amsterdam",
+	"Europe/Berlin",
+	"Europe/Zurich",
+	"Europe/Rome",
+	"Europe/Vienna",
+	"Europe/Prague",
+	"Europe/Warsaw",
+	"Europe/Stockholm",
+	"Europe/Oslo",
+	"Europe/Helsinki",
+	"Europe/Athens",
+	"Europe/Bucharest",
+	"Europe/Kyiv",
+	"Europe/Istanbul",
+	"Europe/Moscow",
+	"Africa/Cairo",
+	"Africa/Casablanca",
+	"Africa/Lagos",
+	"Africa/Nairobi",
+	"Africa/Johannesburg",
+	"America/New_York",
+	"America/Chicago",
+	"America/Denver",
+	"America/Los_Angeles",
+	"America/Anchorage",
+	"Pacific/Honolulu",
+	"America/Toronto",
+	"America/Vancouver",
+	"America/Mexico_City",
+	"America/Bogota",
+	"America/Lima",
+	"America/Santiago",
+	"America/Caracas",
+	"America/Sao_Paulo",
+	"America/Argentina/Buenos_Aires",
+	"America/Montevideo",
+	"Australia/Sydney",
+	"Australia/Melbourne",
+	"Australia/Brisbane",
+	"Australia/Perth",
+	"Pacific/Auckland",
+	"Pacific/Fiji",
+	"Pacific/Guam",
+}
+
+var supportedTimeLocationSet = func() map[string]struct{} {
+	set := make(map[string]struct{}, len(supportedTimeLocations))
+	for _, value := range supportedTimeLocations {
+		set[value] = struct{}{}
+	}
+	return set
+}()
+
+var supportedTimeLocationLowerMap = func() map[string]string {
+	set := make(map[string]string, len(supportedTimeLocations))
+	for _, value := range supportedTimeLocations {
+		set[strings.ToLower(value)] = value
+	}
+	return set
+}()
+
+var timeLocationAliasLowerMap = map[string]string{
+	"etc/utc":                       "UTC",
+	"etc/gmt":                       "UTC",
+	"etc/gmt0":                      "UTC",
+	"etc/greenwich":                 "UTC",
+	"gmt":                           "UTC",
+	"gmt0":                          "UTC",
+	"utc0":                          "UTC",
+	"zulu":                          "UTC",
+	"local":                         "",
+	"asia/calcutta":                 "Asia/Kolkata",
+	"asia/chongqing":                "Asia/Shanghai",
+	"asia/harbin":                   "Asia/Shanghai",
+	"asia/katmandu":                 "Asia/Kathmandu",
+	"asia/saigon":                   "Asia/Ho_Chi_Minh",
+	"europe/kiev":                   "Europe/Kyiv",
+	"us/eastern":                    "America/New_York",
+	"us/central":                    "America/Chicago",
+	"us/mountain":                   "America/Denver",
+	"us/arizona":                    "America/Denver",
+	"us/pacific":                    "America/Los_Angeles",
+	"canada/eastern":                "America/Toronto",
+	"america/buenos_aires":          "America/Argentina/Buenos_Aires",
+	"america/argentina/buenosaires": "America/Argentina/Buenos_Aires",
+}
+
 var defaultValueMap = map[string]string{
 	"webListen":                          "",
 	"webDomain":                          "",
@@ -120,7 +237,7 @@ var defaultValueMap = map[string]string{
 	"acmeAutoUpgrade":                    "true",
 	"panelAssignedCertificateRecordID":   "0",
 	"panelAssignedCertificateRecordIDs":  "[]",
-	"timeLocation":                       "Asia/Tehran",
+	"timeLocation":                       "UTC",
 	"subListen":                          "",
 	"subPort":                            "22780",
 	"subDomain":                          "",
@@ -169,6 +286,141 @@ var defaultValueMap = map[string]string{
 type SettingService struct {
 }
 
+func extractTimeLocationFromZoneinfoPath(raw string) string {
+	trimmed := filepath.ToSlash(strings.TrimSpace(raw))
+	if trimmed == "" {
+		return ""
+	}
+	for _, prefix := range []string{"/zoneinfo/posix/", "zoneinfo/posix/", "/zoneinfo/right/", "zoneinfo/right/"} {
+		if idx := strings.Index(trimmed, prefix); idx >= 0 {
+			return strings.Trim(trimmed[idx+len(prefix):], "/")
+		}
+	}
+	if idx := strings.Index(trimmed, "/zoneinfo/"); idx >= 0 {
+		return strings.Trim(trimmed[idx+len("/zoneinfo/"):], "/")
+	}
+	if idx := strings.Index(trimmed, "zoneinfo/"); idx >= 0 {
+		return strings.Trim(trimmed[idx+len("zoneinfo/"):], "/")
+	}
+	return ""
+}
+
+func normalizeTimeLocationName(raw string) string {
+	trimmed := strings.TrimSpace(strings.TrimPrefix(raw, ":"))
+	if trimmed == "" {
+		return ""
+	}
+
+	if extracted := extractTimeLocationFromZoneinfoPath(trimmed); extracted != "" {
+		trimmed = extracted
+	}
+
+	if _, ok := supportedTimeLocationSet[trimmed]; ok {
+		return trimmed
+	}
+
+	lower := strings.ToLower(trimmed)
+	if normalized, ok := timeLocationAliasLowerMap[lower]; ok {
+		return normalized
+	}
+	if normalized, ok := supportedTimeLocationLowerMap[lower]; ok {
+		return normalized
+	}
+	if _, err := time.LoadLocation(trimmed); err == nil {
+		return trimmed
+	}
+	return ""
+}
+
+func readTimeLocationFile(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		return strings.Trim(trimmed, "\"'")
+	}
+	return ""
+}
+
+func readTimeLocationConfigValue(path string, keys ...string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+
+	keyMap := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		keyMap[strings.ToUpper(strings.TrimSpace(key))] = struct{}{}
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = line[:idx]
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.ToUpper(strings.TrimSpace(parts[0]))
+		if _, ok := keyMap[key]; !ok {
+			continue
+		}
+		return strings.Trim(strings.TrimSpace(parts[1]), "\"'")
+	}
+	return ""
+}
+
+func readLocaltimeZoneinfoName(path string) string {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return ""
+	}
+	return extractTimeLocationFromZoneinfoPath(resolved)
+}
+
+func detectSystemTimeLocationName() string {
+	candidates := []string{
+		os.Getenv("TZ"),
+		readTimeLocationFile("/etc/timezone"),
+		readLocaltimeZoneinfoName("/etc/localtime"),
+		readTimeLocationConfigValue("/etc/sysconfig/clock", "ZONE", "TIMEZONE"),
+		readTimeLocationConfigValue("/etc/conf.d/clock", "ZONE", "TIMEZONE"),
+	}
+
+	for _, candidate := range candidates {
+		if normalized := normalizeTimeLocationName(candidate); normalized != "" {
+			return normalized
+		}
+	}
+	return ""
+}
+
+func defaultTimeLocationValue() string {
+	if detected := detectSystemTimeLocationName(); detected != "" {
+		return detected
+	}
+	return defaultValueMap["timeLocation"]
+}
+
+func normalizeTimeLocationSettingValue(raw string, fallback string) string {
+	if normalized := normalizeTimeLocationName(raw); normalized != "" {
+		return normalized
+	}
+	if normalized := normalizeTimeLocationName(fallback); normalized != "" {
+		return normalized
+	}
+	return defaultValueMap["timeLocation"]
+}
+
 func generateRandomSubPath() string {
 	var builder strings.Builder
 	builder.Grow(8)
@@ -201,6 +453,9 @@ func (s *SettingService) defaultSettingValue(key string) (string, error) {
 	if key == "subPath" {
 		return generateRandomSubPath(), nil
 	}
+	if key == "timeLocation" {
+		return defaultTimeLocationValue(), nil
+	}
 	value, ok := defaultValueMap[key]
 	if !ok {
 		return "", common.NewErrorf("key <%v> not in defaultValueMap", key)
@@ -230,6 +485,28 @@ func (s *SettingService) ensureSubPathSetting() (string, error) {
 	return normalized, nil
 }
 
+func (s *SettingService) ensureTimeLocationSetting() (string, error) {
+	setting, err := s.getSetting("timeLocation")
+	if database.IsNotFound(err) {
+		value := defaultTimeLocationValue()
+		if saveErr := s.saveSetting("timeLocation", value); saveErr != nil {
+			return "", saveErr
+		}
+		return value, nil
+	}
+	if err != nil {
+		return "", err
+	}
+
+	normalized := normalizeTimeLocationSettingValue(setting.Value, defaultTimeLocationValue())
+	if normalized != setting.Value {
+		if saveErr := s.saveSetting("timeLocation", normalized); saveErr != nil {
+			return "", saveErr
+		}
+	}
+	return normalized, nil
+}
+
 func (s *SettingService) GetAllSetting() (*map[string]string, error) {
 	db := database.GetDB()
 	settings := make([]*model.Setting, 0)
@@ -243,8 +520,12 @@ func (s *SettingService) GetAllSetting() (*map[string]string, error) {
 		allSetting[setting.Key] = setting.Value
 	}
 
-	for key, defaultValue := range defaultValueMap {
+	for key := range defaultValueMap {
 		if _, exists := allSetting[key]; !exists {
+			defaultValue, valueErr := s.defaultSettingValue(key)
+			if valueErr != nil {
+				return nil, valueErr
+			}
 			err = s.saveSetting(key, defaultValue)
 			if err != nil {
 				return nil, err
@@ -258,6 +539,12 @@ func (s *SettingService) GetAllSetting() (*map[string]string, error) {
 		return nil, err
 	}
 	allSetting["subPath"] = subPath
+
+	timeLocation, err := s.ensureTimeLocationSetting()
+	if err != nil {
+		return nil, err
+	}
+	allSetting["timeLocation"] = timeLocation
 
 	// Due to security principles
 	delete(allSetting, "secret")
@@ -296,6 +583,9 @@ func (s *SettingService) getSetting(key string) (*model.Setting, error) {
 func (s *SettingService) getString(key string) (string, error) {
 	if key == "subPath" {
 		return s.ensureSubPathSetting()
+	}
+	if key == "timeLocation" {
+		return s.ensureTimeLocationSetting()
 	}
 	setting, err := s.getSetting(key)
 	if database.IsNotFound(err) {
@@ -527,33 +817,25 @@ func (s *SettingService) SaveSystemMonitorSettings(sampleIntervalSec int, primar
 }
 
 func (s *SettingService) GetTimeLocation() (*time.Location, error) {
-	l, err := s.getString("timeLocation")
+	if runtime.GOOS != "linux" {
+		return time.Local, nil
+	}
+
+	locationName, err := s.ensureTimeLocationSetting()
 	if err != nil {
 		return nil, err
 	}
-	if runtime.GOOS == "windows" {
-		l = "Local"
-	}
-	locationName := strings.TrimSpace(l)
-	if locationName == "" {
-		locationName = defaultValueMap["timeLocation"]
-	}
+
 	location, err := time.LoadLocation(locationName)
 	if err == nil {
 		return location, nil
 	}
 
-	defaultLocation := defaultValueMap["timeLocation"]
-	if defaultLocation != "" && defaultLocation != locationName {
-		location, defaultErr := time.LoadLocation(defaultLocation)
-		if defaultErr == nil {
-			logger.Errorf("location <%v> not exist, using default location: %v", locationName, defaultLocation)
-			return location, nil
-		}
+	if saveErr := s.saveSetting("timeLocation", defaultValueMap["timeLocation"]); saveErr != nil {
+		logger.Warning("save fallback time location failed:", saveErr)
 	}
-
-	logger.Warningf("location <%v> not exist, fallback to Local", locationName)
-	return time.Local, nil
+	logger.Warningf("location <%v> not exist, fallback to UTC", locationName)
+	return time.UTC, nil
 }
 
 func (s *SettingService) GetSubListen() (string, error) {
@@ -692,6 +974,10 @@ func (s *SettingService) Save(tx *gorm.DB, data json.RawMessage) error {
 	delete(settings, panelAssignedCertificateRecordIDsSubKey)
 
 	for key, obj := range settings {
+		if key == "timeLocation" {
+			obj = normalizeTimeLocationSettingValue(obj, defaultTimeLocationValue())
+		}
+
 		if key == "serverTlsStoreEnabled" {
 			enabled, _ := strconv.ParseBool(obj)
 			obj = strconv.FormatBool(enabled)
@@ -932,6 +1218,9 @@ func (s *SettingService) fileExists(path string) error {
 func (s *SettingService) getStringTx(tx *gorm.DB, key string) (string, error) {
 	if key == "subPath" {
 		return generateRandomSubPath(), nil
+	}
+	if key == "timeLocation" {
+		return defaultTimeLocationValue(), nil
 	}
 	setting := &model.Setting{}
 	err := tx.Model(model.Setting{}).Where("key = ?", key).Order("id DESC").First(setting).Error

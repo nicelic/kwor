@@ -768,6 +768,17 @@ func (s *NftTrafficService) CollectAndSaveTraffic() error {
 	}
 
 	now := time.Now().Unix()
+	saveTraffic := true
+	if trafficAge, err := (&SettingService{}).GetTrafficAge(); err == nil {
+		saveTraffic = trafficAge > 0
+	} else {
+		logger.Warning("failed to load trafficAge for nft collection: ", err)
+	}
+	if saveTraffic {
+		if err := EnsureHistoryStorageReady(); err != nil {
+			return err
+		}
+	}
 
 	tx := db.Begin()
 	var txErr error
@@ -834,26 +845,26 @@ func (s *NftTrafficService) CollectAndSaveTraffic() error {
 			inboundOnlineSet[st.Tag] = struct{}{}
 
 			// Write inbound Stats records
-			if deltaIn > 0 {
-				txErr = tx.Create(&model.Stats{
+			if saveTraffic && deltaIn > 0 {
+				txErr = upsertStatsTraffic(tx, model.Stats{
 					DateTime:  now,
 					Resource:  "inbound",
 					Tag:       st.Tag,
 					Direction: true, // upload
 					Traffic:   deltaIn,
-				}).Error
+				})
 				if txErr != nil {
 					return txErr
 				}
 			}
-			if deltaOut > 0 {
-				txErr = tx.Create(&model.Stats{
+			if saveTraffic && deltaOut > 0 {
+				txErr = upsertStatsTraffic(tx, model.Stats{
 					DateTime:  now,
 					Resource:  "inbound",
 					Tag:       st.Tag,
 					Direction: false, // download
 					Traffic:   deltaOut,
-				}).Error
+				})
 				if txErr != nil {
 					return txErr
 				}
@@ -878,7 +889,7 @@ func (s *NftTrafficService) CollectAndSaveTraffic() error {
 		if txErr != nil {
 			return txErr
 		}
-		userOnlines, txErr = s.writeClientStats(tx, deltas, now)
+		userOnlines, txErr = s.writeClientStats(tx, deltas, now, saveTraffic)
 		if txErr != nil {
 			return txErr
 		}
@@ -890,7 +901,7 @@ func (s *NftTrafficService) CollectAndSaveTraffic() error {
 
 // writeClientStats aggregates inbound deltas for each client's active bindings
 // and writes Stats records with resource="client".
-func (s *NftTrafficService) writeClientStats(tx *gorm.DB, deltas []inboundDelta, now int64) ([]string, error) {
+func (s *NftTrafficService) writeClientStats(tx *gorm.DB, deltas []inboundDelta, now int64, saveTraffic bool) ([]string, error) {
 	// Build inbound delta map
 	deltaMap := make(map[uint]*inboundDelta)
 	for i := range deltas {
@@ -978,14 +989,16 @@ func (s *NftTrafficService) writeClientStats(tx *gorm.DB, deltas []inboundDelta,
 		}
 		userOnlineSet[name] = struct{}{}
 		if agg.upTotal > 0 {
-			if err := tx.Create(&model.Stats{
-				DateTime:  now,
-				Resource:  "client",
-				Tag:       name,
-				Direction: true,
-				Traffic:   agg.upTotal,
-			}).Error; err != nil {
-				return nil, err
+			if saveTraffic {
+				if err := upsertStatsTraffic(tx, model.Stats{
+					DateTime:  now,
+					Resource:  "client",
+					Tag:       name,
+					Direction: true,
+					Traffic:   agg.upTotal,
+				}); err != nil {
+					return nil, err
+				}
 			}
 			// Update client.up
 			if err := tx.Model(&model.Client{}).Where("id = ?", clientId).
@@ -994,14 +1007,16 @@ func (s *NftTrafficService) writeClientStats(tx *gorm.DB, deltas []inboundDelta,
 			}
 		}
 		if agg.downTotal > 0 {
-			if err := tx.Create(&model.Stats{
-				DateTime:  now,
-				Resource:  "client",
-				Tag:       name,
-				Direction: false,
-				Traffic:   agg.downTotal,
-			}).Error; err != nil {
-				return nil, err
+			if saveTraffic {
+				if err := upsertStatsTraffic(tx, model.Stats{
+					DateTime:  now,
+					Resource:  "client",
+					Tag:       name,
+					Direction: false,
+					Traffic:   agg.downTotal,
+				}); err != nil {
+					return nil, err
+				}
 			}
 			// Update client.down
 			if err := tx.Model(&model.Client{}).Where("id = ?", clientId).

@@ -60,8 +60,8 @@
               <History v-if="i.charAt(0) === 'h'" :tilesData="tilesData" :type="i" />
               <template v-if="i === 'i-sys'">
                 <v-row class="home-info-grid">
-                  <v-col cols="3">{{ $t('main.info.host') }}</v-col>
-                  <v-col cols="9">
+                  <v-col cols="3" class="home-info-label">{{ $t('main.info.host') }}</v-col>
+                  <v-col cols="9" class="home-info-value">
                     <div class="home-copy-row">
                       <span class="home-copy-value">{{ hostNameLabel }}</span>
                       <v-btn
@@ -78,8 +78,8 @@
                       </v-btn>
                     </div>
                   </v-col>
-                  <v-col cols="3">{{ $t('main.info.cpu') }}</v-col>
-                  <v-col cols="9">
+                  <v-col cols="3" class="home-info-label">{{ $t('main.info.cpu') }}</v-col>
+                  <v-col cols="9" class="home-info-value">
                     <v-menu
                       v-if="cpuTypeLabel !== '-'"
                       open-on-hover
@@ -115,8 +115,8 @@
                       {{ cpuCountLabel }}
                     </v-chip>
                   </v-col>
-                  <v-col cols="3">IP</v-col>
-                  <v-col cols="9">
+                  <v-col cols="3" class="home-info-label">IP</v-col>
+                  <v-col cols="9" class="home-info-value">
                     <div class="d-flex flex-wrap home-ip-chip-row">
                       <v-menu
                         v-if="ipv4List.length > 0"
@@ -191,20 +191,20 @@
                       <span v-if="!hasIPAddresses">-</span>
                     </div>
                   </v-col>
-                  <v-col cols="3">kwor</v-col>
-                  <v-col cols="9">
+                  <v-col cols="3" class="home-info-label">kwor</v-col>
+                  <v-col cols="9" class="home-info-value">
                     <v-chip density="compact" color="blue">
                       {{ appVersionLabel }}
                     </v-chip>
                   </v-col>
-                  <v-col cols="3">{{ $t('main.info.uptime') }}</v-col>
-                  <v-col cols="9">{{ HumanReadable.formatSecond(tilesData.uptime) }}</v-col>
+                  <v-col cols="3" class="home-info-label">{{ $t('main.info.uptime') }}</v-col>
+                  <v-col cols="9" class="home-info-value">{{ HumanReadable.formatSecond(tilesData.uptime) }}</v-col>
                 </v-row>
               </template>
               <template v-if="i === 'i-sbd'">
                 <v-row class="home-info-grid">
-                  <v-col cols="4">{{ $t('main.info.running') }}</v-col>
-                  <v-col cols="8" class="d-flex flex-column align-start runtime-status-cell">
+                  <v-col cols="4" class="home-info-label">{{ $t('main.info.running') }}</v-col>
+                  <v-col cols="8" class="home-info-value d-flex flex-column runtime-status-cell">
                     <div class="d-flex align-center flex-wrap runtime-status-row">
                       <span class="text-caption">Sing-Box</span>
                       <v-chip density="compact" :color="singboxRunning ? 'success' : 'error'" variant="flat">
@@ -290,20 +290,20 @@
                       </v-btn>
                     </div>
                   </v-col>
-                  <v-col cols="4">{{ $t('main.info.memory') }}</v-col>
-                  <v-col cols="8">
+                  <v-col cols="4" class="home-info-label">{{ $t('main.info.memory') }}</v-col>
+                  <v-col cols="8" class="home-info-value">
                     <v-chip class="runtime-metric-chip" density="compact" color="primary" variant="flat">
                       {{ formatTripleMemory(tilesData.sbd?.stats) }}
                     </v-chip>
                   </v-col>
-                  <v-col cols="4">{{ $t('main.info.threads') }}</v-col>
-                  <v-col cols="8">
+                  <v-col cols="4" class="home-info-label">{{ $t('main.info.threads') }}</v-col>
+                  <v-col cols="8" class="home-info-value">
                     <v-chip class="runtime-metric-chip" density="compact" color="primary" variant="flat">
                       {{ formatTripleThreads(tilesData.sbd?.stats) }}
                     </v-chip>
                   </v-col>
-                  <v-col cols="4">{{ $t('main.info.uptime') }}</v-col>
-                  <v-col cols="8">
+                  <v-col cols="4" class="home-info-label">{{ $t('main.info.uptime') }}</v-col>
+                  <v-col cols="8" class="home-info-value">
                     <v-chip class="runtime-metric-chip" density="compact" color="primary" variant="flat">
                       {{ formatTripleUptime(tilesData.sbd?.stats) }}
                     </v-chip>
@@ -649,11 +649,26 @@ const restartSingbox = async () => {
   padding-bottom: 4px;
 }
 
+.home-info-label {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.home-info-value {
+  min-width: 0;
+  text-align: center;
+}
+
 .home-copy-row {
   display: flex;
   align-items: center;
   gap: 4px;
   min-width: 0;
+  width: fit-content;
+  max-width: 100%;
+  margin-inline: auto;
 }
 
 .home-copy-value {
@@ -670,6 +685,7 @@ const restartSingbox = async () => {
 
 .home-ip-chip-row {
   gap: 6px;
+  justify-content: center;
 }
 
 .home-detail-card {
@@ -701,11 +717,13 @@ const restartSingbox = async () => {
 
 .runtime-status-cell {
   gap: 3px;
+  align-items: center;
 }
 
 .runtime-status-row {
   gap: 3px;
   min-height: 22px;
+  justify-content: center;
 }
 
 .runtime-metric-chip {

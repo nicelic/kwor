@@ -22,7 +22,14 @@ func (s *StatsJob) Run() {
 		logger.Warning("port hop refresh failed: ", refreshErr)
 	}
 
-	err := s.StatsService.SaveStats(s.enableTraffic)
+	enableTraffic := s.enableTraffic
+	if trafficAge, trafficErr := (&service.SettingService{}).GetTrafficAge(); trafficErr == nil {
+		enableTraffic = trafficAge > 0
+	} else {
+		logger.Warning("failed to load trafficAge for stats job: ", trafficErr)
+	}
+
+	err := s.StatsService.SaveStats(enableTraffic)
 	if err != nil {
 		logger.Warning("Get stats failed: ", err)
 		return
@@ -30,7 +37,7 @@ func (s *StatsJob) Run() {
 
 	// Collect nftables-based traffic AFTER core stats transaction is fully committed.
 	// This avoids SQLite lock conflicts since CollectAndSaveTraffic uses its own transaction.
-	if s.enableTraffic {
+	if enableTraffic {
 		if nftErr := s.StatsService.NftTrafficService.CollectAndSaveTraffic(); nftErr != nil {
 			logger.Warning("nftables traffic collection failed: ", nftErr)
 		}

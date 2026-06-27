@@ -148,6 +148,7 @@ func (s *ConfigService) StopCore() error {
 func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initUsers string, loginUser string, hostname string) (objs []string, err error) {
 	objs = []string{obj}
 	postCommitHooks := make([]func() error, 0)
+	compactStatsAfterCommit := false
 
 	db := database.GetDB()
 	tx := db.Begin()
@@ -244,6 +245,11 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 		for _, hook := range postCommitHooks {
 			if hookErr := hook(); hookErr != nil {
 				logger.Warning("post-commit hook failed: ", hookErr)
+			}
+		}
+		if compactStatsAfterCommit {
+			if compactErr := compactMainSQLiteDB(db, true); compactErr != nil {
+				logger.Warning("compact sqlite after disabling stats history failed: ", compactErr)
 			}
 		}
 
@@ -374,6 +380,9 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 	case "settings":
 		err = s.SettingService.Save(tx, data)
 		if err == nil {
+			compactStatsAfterCommit = shouldCompactStatsAfterSettingsSave(data)
+		}
+		if err == nil {
 			postCommitHooks = append(postCommitHooks, func() error {
 				if err := ApplyPanelTLSRuntimeSettings(PanelSelfSignedTargetPanel); err != nil {
 					logger.Warning("apply web tls runtime settings failed: ", err)
@@ -500,13 +509,13 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 	}
 
 	dt := time.Now().Unix()
-	err = tx.Create(&model.Changes{
+	err = recordChange(tx, model.Changes{
 		DateTime: dt,
 		Actor:    loginUser,
 		Key:      obj,
 		Action:   act,
 		Obj:      data,
-	}).Error
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -652,32 +661,42 @@ func (s *ConfigService) CheckChanges(lu string) (bool, error) {
 	if lu == "" {
 		return true, nil
 	}
+	intLu, err := strconv.ParseInt(lu, 10, 64)
+	if err != nil {
+		return true, nil
+	}
 	if LastUpdate == 0 {
 		db := database.GetDB()
 		var count int64
-		err := db.Model(model.Changes{}).Where("date_time > " + lu).Count(&count).Error
+		err := db.Model(model.Changes{}).Where("date_time > ?", intLu).Count(&count).Error
 		if err == nil {
 			LastUpdate = time.Now().Unix()
 		}
 		return count > 0, err
 	} else {
-		intLu, err := strconv.ParseInt(lu, 10, 64)
 		return LastUpdate > intLu, err
 	}
 }
 
 func (s *ConfigService) GetChanges(actor string, chngKey string, count string) []model.Changes {
 	c, _ := strconv.Atoi(count)
-	whereString := "`id`>0"
-	if len(actor) > 0 {
-		whereString += " and `actor`='" + actor + "'"
+	if c <= 0 {
+		c = 10
 	}
-	if len(chngKey) > 0 {
-		whereString += " and `key`='" + chngKey + "'"
+	if c > 100 {
+		c = 100
 	}
+
 	db := database.GetDB()
 	var chngs []model.Changes
-	err := db.Model(model.Changes{}).Where(whereString).Order("`id` desc").Limit(c).Scan(&chngs).Error
+	query := db.Model(model.Changes{})
+	if actor != "" {
+		query = query.Where("actor = ?", actor)
+	}
+	if chngKey != "" {
+		query = query.Where("key = ?", chngKey)
+	}
+	err := query.Order("`id` desc").Limit(c).Scan(&chngs).Error
 	if err != nil {
 		logger.Warning(err)
 	}
@@ -1261,4 +1280,23 @@ func (s *ConfigService) forceSyncMihomoClientIDsToSubManager(hostname string, id
 		LastUpdate = time.Now().Unix()
 	}
 	return existing, nil
+}
+
+func shouldCompactStatsAfterSettingsSave(data json.RawMessage) bool {
+	settings := map[string]interface{}{}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return false
+	}
+	value, ok := settings["trafficAge"]
+	if !ok || value == nil {
+		return false
+	}
+	switch typed := value.(type) {
+	case string:
+		return typed == "0"
+	case float64:
+		return typed == 0
+	default:
+		return false
+	}
 }

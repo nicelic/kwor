@@ -30,7 +30,6 @@ RUN go build -ldflags="-w -s" -o kwor main.go
 # ---- Runtime stage ----
 FROM alpine
 LABEL org.opencontainers.image.source="https://github.com/nicelic/kwor"
-ENV TZ=Asia/Tehran
 ENV KWOR_RUNTIME_MODE=docker
 WORKDIR /app
 RUN set -ex && apk add --no-cache --upgrade bash tzdata ca-certificates nftables curl wget iproute2 openssl procps tar unzip socat

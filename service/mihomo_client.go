@@ -594,7 +594,7 @@ func (s *MihomoClientService) DepleteClients() ([]uint, error) {
 	}
 
 	if len(changes) > 0 {
-		if err = tx.Model(model.Changes{}).Create(&changes).Error; err != nil {
+		if err = recordChanges(tx, changes); err != nil {
 			tx.Rollback()
 			return nil, err
 		}
