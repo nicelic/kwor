@@ -828,7 +828,6 @@ func handleAdminSubcommand(args []string) {
 	adminFlags := flag.NewFlagSet("admin", flag.ContinueOnError)
 	adminFlags.SetOutput(os.Stdout)
 
-	show := adminFlags.Bool("show", false, "show current admin credentials")
 	reset := adminFlags.Bool("reset", false, "reset admin credentials to admin/admin")
 	username := adminFlags.String("username", "", "set admin username")
 	password := adminFlags.String("password", "", "set admin password")
@@ -838,8 +837,6 @@ func handleAdminSubcommand(args []string) {
 	}
 
 	switch {
-	case *show:
-		showAdmin()
 	case *reset:
 		resetAdmin()
 	case adminFlags.NFlag() == 0:
@@ -869,7 +866,7 @@ func ParseCmd() {
 		fmt.Println("    migrate        migrate the database to the current version")
 		fmt.Println("    uri            print current panel access URL(s)")
 		fmt.Println("    setting        show or update panel/subscription settings")
-		fmt.Println("    admin          show or update admin credentials")
+		fmt.Println("    admin          update admin credentials")
 	}
 
 	flag.Parse()

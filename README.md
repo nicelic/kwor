@@ -2,6 +2,8 @@
 
 **An Advanced Web Panel • Built on SagerNet/Sing-Box and Mihomo**
 
+Modified from [S-UI](https://github.com/alireza0/s-ui).
+
 [![License](https://img.shields.io/badge/license-GPL%20V3-blue.svg?longCache=true)](https://www.gnu.org/licenses/gpl-3.0.en.html)
 
 > **Disclaimer:** This project is only for personal learning and communication, please do not use it for illegal purposes, please do not use it in a production environment.
@@ -88,7 +90,6 @@ The installer also accepts a bare version such as `1.5.7` and normalizes it to `
 6. Common manual management commands:
    ```sh
    /opt/kwor/kwor_amd64 uri
-   /opt/kwor/kwor_amd64 admin -show
    /opt/kwor/kwor_amd64 stop
    /opt/kwor/kwor_amd64 uninstall
    ```
