@@ -1,5 +1,5 @@
 <template>
-  <v-dialog transition="dialog-bottom-transition" width="90%" max-width="520">
+  <v-dialog v-model="dialogVisible" transition="dialog-bottom-transition" width="90%" max-width="520">
     <v-card class="rounded-lg">
       <v-card-title>
         <v-row>
@@ -76,12 +76,18 @@ const overlayDesc = ref('')
 const reconnectTimerId = ref<number | null>(null)
 
 const busy = computed(() => downloading.value || restoring.value)
+const dialogVisible = computed({
+  get: () => props.visible,
+  set: (value: boolean) => {
+    if (!value && busy.value) return
+    props.control.visible = value
+  },
+})
 
 const t = (key: string) => i18n.global.t(key)
 
 const closeDialog = () => {
-  if (busy.value) return
-  props.control.visible = false
+  dialogVisible.value = false
 }
 
 const clearReconnectTimer = () => {
@@ -212,12 +218,7 @@ const restoreBackup = () => {
 
     try {
       props.control.visible = false
-      const msg = await HttpUtils.post('api/restore-db-backup', formData, {
-        headers: {
-          'Content-Type': 'multipart/form-data',
-        },
-        silentAuthCheck: true,
-      })
+      const msg = await HttpUtils.post('api/restore-db-backup', formData, { silentAuthCheck: true })
 
       if (!msg.success) {
         push.error({

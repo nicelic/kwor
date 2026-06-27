@@ -1,6 +1,6 @@
 <template>
   <LogVue v-model="logModal.visible" :control="logModal" :visible="logModal.visible" />
-  <Backup v-model="backupModal.visible" :control="backupModal" :visible="backupModal.visible" />
+  <Backup :control="backupModal" :visible="backupModal.visible" />
   <v-container class="fill-height" :loading="loading">
     <v-responsive :class="reloadItems.length > 0 ? 'fill-height text-center' : 'align-center'">
       <v-row class="d-flex align-center justify-center">
