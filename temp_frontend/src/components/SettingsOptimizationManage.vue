@@ -204,12 +204,12 @@
           <v-divider />
           <v-card-text>
             <div class="text-body-2 text-medium-emphasis mb-3">
-              仅展示非注释的 nameserver，多个 DNS 用空格分隔。保存时会自动补全 nameserver，并同样执行删旧重建与重新锁定流程。
+              仅展示非注释的 nameserver，支持空格、换行或混合输入。保存时会自动补全 nameserver，并尽量保留你当前使用的分隔显示方式。
             </div>
             <div class="dns-quick-layout">
               <v-textarea
                 v-model="dnsNameServerInput"
-                label="DNS 地址（空格分隔）"
+                label="DNS 地址（支持空格/换行混合）"
                 variant="outlined"
                 :rows="getDnsNameServerRows()"
                 auto-grow
@@ -442,6 +442,7 @@ type OptimizationOverview = {
   configPath: string
   content: string
   nameServers: string[]
+  nameServersInput: string
   activeNameServers: string[]
   immutable: boolean
   error?: string
@@ -475,6 +476,7 @@ const logOverview = ref<OptimizationOverview>({
   configPath: '',
   content: '',
   nameServers: [],
+  nameServersInput: '',
   activeNameServers: [],
   immutable: false,
   error: '',
@@ -486,6 +488,7 @@ const sysctlOverview = ref<OptimizationOverview>({
   configPath: '',
   content: '',
   nameServers: [],
+  nameServersInput: '',
   activeNameServers: [],
   immutable: false,
   error: '',
@@ -497,6 +500,7 @@ const dnsOverview = ref<OptimizationOverview>({
   configPath: '',
   content: '',
   nameServers: [],
+  nameServersInput: '',
   activeNameServers: [],
   immutable: false,
   error: '',
@@ -597,6 +601,7 @@ const normalizeOverview = (raw: unknown): OptimizationOverview => {
     configPath: readString(data, 'configPath', ''),
     content: readString(data, 'content', ''),
     nameServers: readStringArray(data, 'nameServers'),
+    nameServersInput: readString(data, 'nameServersInput', ''),
     activeNameServers: readStringArray(data, 'activeNameServers'),
     immutable: readBool(data, 'immutable', false),
     error: readString(data, 'error', ''),
@@ -649,7 +654,7 @@ const applySysctlOverview = (raw: unknown) => {
 const applyDnsOverview = (raw: unknown) => {
   const next = normalizeOverview(raw)
   dnsOverview.value = next
-  dnsNameServerInput.value = next.nameServers.join(' ')
+  dnsNameServerInput.value = next.nameServersInput || next.nameServers.join(' ')
   dnsEditorContent.value = next.content
 }
 

@@ -7,12 +7,29 @@ const props = defineProps({
   type: String
 })
 
+const toFiniteNumber = (value: unknown): number => {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : 0
+  }
+  if (typeof value === 'string') {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : 0
+  }
+  return 0
+}
+
+const clampPercent = (value: number): number => {
+  if (!Number.isFinite(value)) return 0
+  if (value < 0) return 0
+  if (value > 100) return 100
+  return value
+}
+
 const data = computed(() => {
   const d = props.tilesData
-  if (!d.mem && !d.cpu) return { percent: 0, text: '-' }
   switch (props.type) {
     case 'g-cpu':
-      return { percent: d.cpu, text: Math.ceil(d.cpu) + "%" }
+      return cpuGaugeData(d.cpu)
     case 'g-mem':
       return gaugeData(d.mem)
     case 'g-dsk':
@@ -23,27 +40,41 @@ const data = computed(() => {
   return { percent: 0, text: '-'}
 })
 
+const cpuGaugeData = (value: unknown): any => {
+  const percent = clampPercent(Math.ceil(toFiniteNumber(value)))
+  return {
+    percent,
+    text: `${percent}%`,
+  }
+}
+
 const gaugeData = (d:any) :any => {
   if (!d) return { percent: 0, text: '-' }
-  const curr = HumanReadable.sizeFormat(d.current,0).split(' ')
-  const total = HumanReadable.sizeFormat(d.total,0).split(' ')
-  if (curr[1] == total[1]) curr[1] = ''
+  const current = toFiniteNumber(d.current)
+  const total = toFiniteNumber(d.total)
+  if (total <= 0) {
+    return { percent: 0, text: '-' }
+  }
+  const curr = HumanReadable.sizeFormat(current, 0).split(' ')
+  const totalText = HumanReadable.sizeFormat(total, 0).split(' ')
+  if (curr[1] === totalText[1]) curr[1] = ''
   return {
-    percent: Math.ceil(d.current*100/d.total),
-    text: curr[0] + "<sup>" + (curr[1]?? ' ') + "</sup>/" +  total[0] + "<sup>" + (total[1]?? '') + "</sup>"
+    percent: clampPercent(Math.ceil(current * 100 / total)),
+    text: curr[0] + "<sup>" + (curr[1] ?? ' ') + "</sup>/" + totalText[0] + "<sup>" + (totalText[1] ?? '') + "</sup>"
   }
 }
 
 const cssTransformRotateValue = computed(() => {
-  const percentageAsFraction = data.value.percent / 100
+  const percentageAsFraction = clampPercent(data.value.percent) / 100
   const halfPercentage = percentageAsFraction / 2
 
   return `${halfPercentage}turn`
 })
 
 const gaugeColor = computed(() => {
-  if (data.value.percent > 90) return 'error'
-  if (data.value.percent > 70) return 'warning'
+  const percent = clampPercent(data.value.percent)
+  if (percent > 90) return 'error'
+  if (percent > 70) return 'warning'
   return 'info'
 })
 </script>

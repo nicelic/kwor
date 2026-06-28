@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	systemLinuxDNSContentKey = "systemLinuxDnsContent"
-	systemLinuxDNSPathKey    = "systemLinuxDnsPath"
+	systemLinuxDNSContentKey          = "systemLinuxDnsContent"
+	systemLinuxDNSPathKey             = "systemLinuxDnsPath"
+	systemLinuxDNSNameServersInputKey = "systemLinuxDnsNameServersInput"
 
 	defaultSystemLinuxDNSPath = "/etc/resolv.conf"
 )
@@ -27,6 +28,7 @@ type SystemLinuxDNSOptimizationOverview struct {
 	ConfigPath        string   `json:"configPath"`
 	Content           string   `json:"content"`
 	NameServers       []string `json:"nameServers"`
+	NameServersInput  string   `json:"nameServersInput"`
 	ActiveNameServers []string `json:"activeNameServers"`
 	Immutable         bool     `json:"immutable"`
 	Error             string   `json:"error,omitempty"`
@@ -71,6 +73,11 @@ func (s *SystemLinuxDNSOptimizationService) GetOverview() (*SystemLinuxDNSOptimi
 
 	overview.Content = content
 	overview.NameServers = extractActiveLinuxNameServers(content)
+	nameServersInput, inputErr := s.resolveManagedLinuxDNSNameServersInput(content, overview.NameServers)
+	if inputErr != nil {
+		return nil, inputErr
+	}
+	overview.NameServersInput = nameServersInput
 	overview.ActiveNameServers = activeNameServers
 
 	if pathEntryExists(path) {
@@ -105,6 +112,14 @@ func (s *SystemLinuxDNSOptimizationService) SaveContent(content string) error {
 	if err := s.setString(systemLinuxDNSContentKey, normalized); err != nil {
 		return err
 	}
+	nameServers := extractActiveLinuxNameServers(normalized)
+	nameServersInput, inputErr := s.resolveManagedLinuxDNSNameServersInput(normalized, nameServers)
+	if inputErr != nil {
+		return inputErr
+	}
+	if err := s.persistManagedLinuxDNSNameServersInput(normalized, nameServers, nameServersInput); err != nil {
+		return err
+	}
 	return s.setString(systemLinuxDNSPathKey, path)
 }
 
@@ -130,6 +145,9 @@ func (s *SystemLinuxDNSOptimizationService) SaveNameServers(nameServersText stri
 		return err
 	}
 	if err := s.setString(systemLinuxDNSContentKey, nextContent); err != nil {
+		return err
+	}
+	if err := s.persistManagedLinuxDNSNameServersInput(nextContent, nameServers, nameServersText); err != nil {
 		return err
 	}
 	return s.setString(systemLinuxDNSPathKey, appliedPath)
@@ -233,6 +251,100 @@ func normalizeLinuxNameServerInput(raw string) []string {
 		result = append(result, v)
 	}
 	return result
+}
+
+func normalizeLinuxNameServerInputText(raw string) string {
+	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	normalized = strings.ReplaceAll(normalized, ",", " ")
+	lines := strings.Split(normalized, "\n")
+	rebuilt := make([]string, 0, len(lines))
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		rebuilt = append(rebuilt, strings.Join(fields, " "))
+	}
+	return strings.Join(rebuilt, "\n")
+}
+
+func buildLinuxDNSNameServersInputFromContent(content string, nameServers []string) string {
+	if len(nameServers) == 0 {
+		return ""
+	}
+
+	normalized := strings.ReplaceAll(content, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	lines := strings.Split(normalized, "\n")
+
+	resultLines := make([]string, 0, len(nameServers))
+	seen := 0
+	for _, line := range lines {
+		server, ok := parseActiveLinuxNameServerLine(line)
+		if !ok {
+			continue
+		}
+
+		resultLines = append(resultLines, server)
+		seen++
+		if seen >= len(nameServers) {
+			break
+		}
+	}
+
+	if len(resultLines) == 0 {
+		return strings.Join(nameServers, " ")
+	}
+	return strings.Join(resultLines, "\n")
+}
+
+func areLinuxNameServerListsEqual(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *SystemLinuxDNSOptimizationService) resolveManagedLinuxDNSNameServersInput(content string, nameServers []string) (string, error) {
+	savedInput, err := s.getString(systemLinuxDNSNameServersInputKey)
+	if err != nil {
+		return "", err
+	}
+
+	normalizedSavedInput := normalizeLinuxNameServerInputText(savedInput)
+	if normalizedSavedInput != "" {
+		if areLinuxNameServerListsEqual(normalizeLinuxNameServerInput(normalizedSavedInput), nameServers) {
+			return normalizedSavedInput, nil
+		}
+		if err := s.setString(systemLinuxDNSNameServersInputKey, ""); err != nil {
+			return "", err
+		}
+	}
+
+	rebuilt := buildLinuxDNSNameServersInputFromContent(content, nameServers)
+	if err := s.persistManagedLinuxDNSNameServersInput(content, nameServers, rebuilt); err != nil {
+		return "", err
+	}
+	return rebuilt, nil
+}
+
+func (s *SystemLinuxDNSOptimizationService) persistManagedLinuxDNSNameServersInput(content string, nameServers []string, rawInput string) error {
+	normalizedInput := normalizeLinuxNameServerInputText(rawInput)
+	if len(nameServers) == 0 {
+		return s.setString(systemLinuxDNSNameServersInputKey, "")
+	}
+
+	if !areLinuxNameServerListsEqual(normalizeLinuxNameServerInput(normalizedInput), nameServers) {
+		normalizedInput = buildLinuxDNSNameServersInputFromContent(content, nameServers)
+	}
+
+	return s.setString(systemLinuxDNSNameServersInputKey, normalizedInput)
 }
 
 func replaceActiveLinuxNameServers(content string, nameServers []string) string {

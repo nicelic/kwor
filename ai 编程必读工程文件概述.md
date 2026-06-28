@@ -321,7 +321,7 @@
 
 也就是说：
 
-- `subPort` 默认值来自 `service/setting.go`
+- `subPort` 会在 `service/setting.go` 中首次缺失时自动随机生成可用端口
 - `subPath` 若为空，会在 `service/setting.go` 中自动生成随机路径
 
 因此不要再把“首次启动默认订阅路径固定是 `/sub/`”当成当前事实。
@@ -1983,6 +1983,7 @@ npm.cmd run build
 5. 如果版本号已经变更并且准备发版：
    - 先确认 `config/version`
    - 再同步前端版本元数据
+   - 再确认所有要发布的源码都已经提交到当前 `HEAD`
    - 再创建新的 `v<version>` Tag
    - 再推送 Tag，让 GitHub Release / Actions 跟随新 Tag 产出
 6. `bash <(curl -Ls https://raw.githubusercontent.com/nicelic/kwor/main/install.sh)` 默认安装逻辑：
@@ -2012,6 +2013,50 @@ npm.cmd run build
    - 这是**改写已有 Tag**
    - 不是“新增版本”
    - 要明确知道这会改变该版本在 GitHub 上对应的提交
+
+## 15.3 当前统一发版命令
+
+以后本项目默认使用下面这个脚本来发版，不再靠手工猜测顺序：
+
+```bash
+node scripts/release-publish.mjs --push
+```
+
+这个脚本会做 4 件事：
+
+1. 运行 `scripts/sync-version.mjs`
+2. 检查当前工作区里所有**会进入发布产物的源码**是否已经提交
+3. 按 `config/version` 创建本地 Tag：`v<version>`
+4. 推送当前 `HEAD` 到 `main`，再推送该 Tag，让 GitHub Actions 构建 release
+
+它专门防止下面这种错误：
+
+- 本地已经改了 `temp_frontend/src/*`、`service/*`、`web/*`
+- 但这些修改还没有进入当前提交
+- 然后直接去重发已有版本 Tag 或新建 Tag
+- 结果 GitHub Release 还是从**旧提交**构建，于是发布出来的二进制仍然是旧 UI / 旧后端
+
+要点：
+
+- **GitHub Release 构建只认 Tag 指向的提交，不认你本地工作区里尚未提交的文件**
+- 所以“本地看起来已经改好”不等于“发布产物一定带上这些改动”
+- 只要脚本发现发布相关源码仍然未提交，就会直接中止，不允许继续打 Tag
+
+如果用户明确要求“把已有版本号重新指到最新提交并覆盖旧 release”，才使用：
+
+```bash
+node scripts/release-publish.mjs --push --retag
+```
+
+这表示：
+
+- 允许把现有 `v<version>` 强制移动到当前提交
+- 再强制推送该 Tag
+- 让 GitHub Actions 基于**当前提交**重建同版本 release
+
+---
+
+最后更新：`2026-06-29`
 
 ---
 

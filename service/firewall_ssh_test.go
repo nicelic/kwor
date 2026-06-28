@@ -117,3 +117,33 @@ func TestProbeSSHConfig_ResolvesIncludeAndSkipsMatchSection(t *testing.T) {
 		t.Fatalf("gatewayports mismatch: got %q", probe.GatewayPorts)
 	}
 }
+
+func TestRenderSSHConfigWithDirectiveOverrides_InsertsBeforeInclude(t *testing.T) {
+	input := strings.Join([]string{
+		"# managed by distro",
+		"Include /etc/ssh/sshd_config.d/*.conf",
+		"",
+	}, "\n")
+
+	updated, changed := renderSSHConfigWithDirectiveOverrides([]byte(input), map[string]string{
+		sshDirectivePort:               "2222",
+		sshDirectiveAllowTcpForwarding: "yes",
+	})
+	if !changed {
+		t.Fatalf("expected config render to change")
+	}
+
+	resultLines := strings.Split(strings.TrimSpace(string(updated)), "\n")
+	if len(resultLines) < 4 {
+		t.Fatalf("updated config too short: %q", string(updated))
+	}
+	if resultLines[1] != "Port 2222" {
+		t.Fatalf("expected inserted Port before Include, got lines: %#v", resultLines)
+	}
+	if resultLines[2] != "AllowTcpForwarding yes" {
+		t.Fatalf("expected inserted AllowTcpForwarding before Include, got lines: %#v", resultLines)
+	}
+	if resultLines[3] != "Include /etc/ssh/sshd_config.d/*.conf" {
+		t.Fatalf("expected Include to stay after inserted directives, got lines: %#v", resultLines)
+	}
+}

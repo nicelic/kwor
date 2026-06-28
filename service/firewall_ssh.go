@@ -421,8 +421,20 @@ func renderSSHConfigWithDirectiveOverrides(content []byte, directives map[string
 		}
 	}
 
+	insertIndex := globalEnd
+	for index := 0; index < globalEnd; index++ {
+		key, _, _, ok := parseSSHDirectiveLine(lines[index])
+		if !ok {
+			continue
+		}
+		if key == "include" {
+			insertIndex = index
+			break
+		}
+	}
+
 	changed := false
-	applied := make(map[string]bool, len(normalized))
+	appliedBeforeInsert := make(map[string]bool, len(normalized))
 	for index := 0; index < globalEnd; index++ {
 		key, _, indent, ok := parseSSHDirectiveLine(lines[index])
 		if !ok {
@@ -437,22 +449,24 @@ func renderSSHConfigWithDirectiveOverrides(content []byte, directives map[string
 			lines[index] = next
 			changed = true
 		}
-		applied[key] = true
+		if index < insertIndex {
+			appliedBeforeInsert[key] = true
+		}
 	}
 
 	insertLines := make([]string, 0)
 	for _, key := range sshDirectiveStableOrder {
 		value, exists := normalized[key]
-		if !exists || applied[key] {
+		if !exists || appliedBeforeInsert[key] {
 			continue
 		}
 		insertLines = append(insertLines, sshDirectiveCanonicalName[key]+" "+value)
-		applied[key] = true
+		appliedBeforeInsert[key] = true
 	}
 
 	extraKeys := make([]string, 0)
 	for key := range normalized {
-		if applied[key] {
+		if appliedBeforeInsert[key] {
 			continue
 		}
 		extraKeys = append(extraKeys, key)
@@ -463,9 +477,9 @@ func renderSSHConfigWithDirectiveOverrides(content []byte, directives map[string
 	}
 
 	if len(insertLines) > 0 {
-		prefix := append([]string{}, lines[:globalEnd]...)
+		prefix := append([]string{}, lines[:insertIndex]...)
 		prefix = append(prefix, insertLines...)
-		lines = append(prefix, lines[globalEnd:]...)
+		lines = append(prefix, lines[insertIndex:]...)
 		changed = true
 	}
 

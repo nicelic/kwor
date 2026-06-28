@@ -274,6 +274,18 @@ capture_command_output() {
     return "${status}"
 }
 
+run_target_start_command() {
+    # Preserve first-run prompts and other interactive output when the installer
+    # is attached to a terminal. Buffer output only for non-interactive sessions.
+    if [[ -t 0 && -t 1 ]]; then
+        reset_last_command_output
+        "${TARGET_BIN_PATH}" start
+        return $?
+    fi
+
+    capture_command_output "${TARGET_BIN_PATH}" start
+}
+
 normalize_missing_dependency_name() {
     case "$1" in
         systemctl | systemd-analyze | systemd-run)
@@ -957,7 +969,7 @@ start_target_instance() {
         failure_output="${LAST_COMMAND_OUTPUT}"
     fi
 
-    if capture_command_output "${TARGET_BIN_PATH}" start; then
+    if run_target_start_command; then
         repair_systemd_after_target_start
         rm -f "${BACKUP_BIN_PATH}"
         return 0

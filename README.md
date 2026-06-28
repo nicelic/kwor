@@ -34,7 +34,7 @@ Modified from [S-UI](https://github.com/alireza0/s-ui).
 - Default Install Directory: `/opt/kwor`
 - Panel Port: 8888
 - Panel Path: /app/
-- Subscription Port: 22780
+- Subscription Port: auto-selected on first initialization from `25000-65000` with local TCP/UDP availability checks
 - Subscription Path: auto-generated random path on first initialization
 - Admin Credentials: interactive setup is handled by `kwor start` on first install
 
@@ -230,6 +230,29 @@ The frontend source lives in `temp_frontend/`. A full build:
    ```sh
    ./kwor
    ```
+
+### Release publishing
+
+To publish the current source as a GitHub release without manually comparing history, use the repo helper:
+
+```sh
+node scripts/release-publish.mjs --push
+```
+
+What it does:
+
+1. Syncs frontend version metadata from `config/version`
+2. Refuses to tag if release-relevant source files still have uncommitted changes
+3. Creates `v<config/version>` at the current `HEAD`
+4. Pushes `HEAD` to `main` and pushes the tag so GitHub Actions can build the release assets
+
+If you intentionally need to move an existing version tag to the current commit, use:
+
+```sh
+node scripts/release-publish.mjs --push --retag
+```
+
+This matters because GitHub Releases always build from the committed tag target, not from your local working tree. If frontend or backend changes are only local and not committed yet, the published binary will still contain the older UI/code.
 
 </details>
 

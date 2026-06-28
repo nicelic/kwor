@@ -670,12 +670,9 @@ func (s *FirewallService) renderLocked(force bool) error {
 		return nil
 	}
 
-	previousRenderHash := firewallState.lastRenderHash
-	previousRuntimeHash := firewallState.lastRuntimeHash
-
-	// Apply the whole managed table in a single nft batch so external-rule
-	// observation and rule refreshes do not open a transient allow window.
-	script, err := buildManagedFirewallScript(managedRows, geoRows, tableExists)
+		// Apply the whole managed table in a single nft batch so external-rule
+		// observation and rule refreshes do not open a transient allow window.
+		script, err := buildManagedFirewallScript(managedRows, geoRows, tableExists)
 	if err != nil {
 		return err
 	}
@@ -692,15 +689,8 @@ func (s *FirewallService) renderLocked(force bool) error {
 		firewallState.lastRuntimeHash = runtimeHashAfterApply
 	}
 
-	shouldFlushConntrack := force || hash != previousRenderHash ||
-		(runtimeHashBeforeApply != "" && previousRuntimeHash != "" && runtimeHashBeforeApply != previousRuntimeHash)
-	if shouldFlushConntrack {
-		if err := flushConntrackTable(); err != nil {
-			logger.Warning("failed to flush conntrack after firewall reconcile: ", err)
-		}
+		return nil
 	}
-	return nil
-}
 
 func loadFirewallRulesLocked() ([]model.FirewallRule, error) {
 	db := database.GetDB()

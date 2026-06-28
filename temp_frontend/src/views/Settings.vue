@@ -452,7 +452,7 @@ import SettingsMonitorManageVue from '@/components/SettingsMonitorManage.vue'
 const locale = useLocale()
 const tab = ref('t1')
 const loading: Ref = inject('loading') ?? ref(false)
-const oldSettings = ref({})
+const oldSettings = ref<Record<string, any>>({})
 const subJsonExtRef = ref<any>(null)
 const subClashExtRef = ref<any>(null)
 const subJsonTabBooted = ref(false)
@@ -1153,7 +1153,8 @@ const normalizePort = (value: unknown, defaultValue: string) => {
 
 const applyPortDefaultsBeforeSave = () => {
   settings.value.webPort = normalizePort(settings.value.webPort, DEFAULT_WEB_PORT)
-  settings.value.subPort = normalizePort(settings.value.subPort, DEFAULT_SUB_PORT)
+  const fallbackSubPort = normalizePort(oldSettings.value?.subPort, DEFAULT_SUB_PORT)
+  settings.value.subPort = normalizePort(settings.value.subPort, fallbackSubPort)
 }
 
 const buildSettingsSavePayload = (value: Record<string, any>) => {

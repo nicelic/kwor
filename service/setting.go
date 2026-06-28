@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -224,6 +225,7 @@ var defaultValueMap = map[string]string{
 	"systemSysctlPath":                   "",
 	"systemLinuxDnsContent":              "",
 	"systemLinuxDnsPath":                 "",
+	"systemLinuxDnsNameServersInput":     "",
 	"systemMTUEnabled":                   "false",
 	"systemMTUValue":                     "1500",
 	"systemMTUScriptPath":                "",
@@ -282,6 +284,12 @@ var defaultValueMap = map[string]string{
 	"config":                             defaultConfig,
 	"version":                            config.GetVersion(),
 }
+
+const (
+	initialRandomSubPortMin  = 25000
+	initialRandomSubPortMax  = 65000
+	initialRandomSubPortStep = 10
+)
 
 type SettingService struct {
 }
@@ -435,6 +443,96 @@ func generateRandomSubPath() string {
 	return builder.String()
 }
 
+func normalizeInitialRandomSubPortStart(port int) int {
+	if port < initialRandomSubPortMin {
+		port = initialRandomSubPortMin
+	}
+	if port > initialRandomSubPortMax {
+		port = initialRandomSubPortMax
+	}
+
+	offset := port - initialRandomSubPortMin
+	return initialRandomSubPortMin + (offset/initialRandomSubPortStep)*initialRandomSubPortStep
+}
+
+func buildInitialRandomSubPortSequence(start int) []int {
+	start = normalizeInitialRandomSubPortStart(start)
+	total := ((initialRandomSubPortMax - initialRandomSubPortMin) / initialRandomSubPortStep) + 1
+	ports := make([]int, 0, total)
+	current := start
+	for i := 0; i < total; i++ {
+		ports = append(ports, current)
+		current += initialRandomSubPortStep
+		if current > initialRandomSubPortMax {
+			current = initialRandomSubPortMin
+		}
+	}
+	return ports
+}
+
+func probeSubscriptionPortAvailable(port int) bool {
+	if port <= 0 || port > 65535 {
+		return false
+	}
+
+	addr := ":" + strconv.Itoa(port)
+
+	tcpListener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return false
+	}
+	defer tcpListener.Close()
+
+	udpConn, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		return false
+	}
+	defer udpConn.Close()
+
+	return true
+}
+
+func chooseInitialRandomSubPortFromStart(start int, availabilityChecker func(int) bool) (int, error) {
+	if availabilityChecker == nil {
+		availabilityChecker = probeSubscriptionPortAvailable
+	}
+
+	for _, port := range buildInitialRandomSubPortSequence(start) {
+		if availabilityChecker(port) {
+			return port, nil
+		}
+	}
+
+	return 0, common.NewErrorf(
+		"no available subscription port found in range %d-%d with step %d",
+		initialRandomSubPortMin,
+		initialRandomSubPortMax,
+		initialRandomSubPortStep,
+	)
+}
+
+func chooseInitialRandomSubPort() (int, error) {
+	total := ((initialRandomSubPortMax - initialRandomSubPortMin) / initialRandomSubPortStep) + 1
+	start := initialRandomSubPortMin + common.RandomInt(total)*initialRandomSubPortStep
+	return chooseInitialRandomSubPortFromStart(start, nil)
+}
+
+func normalizeSubPortOrGenerate(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed != "" {
+		port, err := strconv.Atoi(trimmed)
+		if err == nil && port > 0 && port <= 65535 {
+			return strconv.Itoa(port), nil
+		}
+	}
+
+	port, err := chooseInitialRandomSubPort()
+	if err != nil {
+		return "", err
+	}
+	return strconv.Itoa(port), nil
+}
+
 func normalizeSubPathOrGenerate(subPath string) string {
 	trimmed := strings.TrimSpace(subPath)
 	if trimmed == "" {
@@ -452,6 +550,13 @@ func normalizeSubPathOrGenerate(subPath string) string {
 func (s *SettingService) defaultSettingValue(key string) (string, error) {
 	if key == "subPath" {
 		return generateRandomSubPath(), nil
+	}
+	if key == "subPort" {
+		port, err := chooseInitialRandomSubPort()
+		if err != nil {
+			return "", err
+		}
+		return strconv.Itoa(port), nil
 	}
 	if key == "timeLocation" {
 		return defaultTimeLocationValue(), nil
@@ -479,6 +584,34 @@ func (s *SettingService) ensureSubPathSetting() (string, error) {
 	normalized := normalizeSubPathOrGenerate(setting.Value)
 	if normalized != setting.Value {
 		if saveErr := s.saveSetting("subPath", normalized); saveErr != nil {
+			return "", saveErr
+		}
+	}
+	return normalized, nil
+}
+
+func (s *SettingService) ensureSubPortSetting() (string, error) {
+	setting, err := s.getSetting("subPort")
+	if database.IsNotFound(err) {
+		value, valueErr := normalizeSubPortOrGenerate("")
+		if valueErr != nil {
+			return "", valueErr
+		}
+		if saveErr := s.saveSetting("subPort", value); saveErr != nil {
+			return "", saveErr
+		}
+		return value, nil
+	}
+	if err != nil {
+		return "", err
+	}
+
+	normalized, normalizeErr := normalizeSubPortOrGenerate(setting.Value)
+	if normalizeErr != nil {
+		return "", normalizeErr
+	}
+	if normalized != strings.TrimSpace(setting.Value) {
+		if saveErr := s.saveSetting("subPort", normalized); saveErr != nil {
 			return "", saveErr
 		}
 	}
@@ -540,6 +673,12 @@ func (s *SettingService) GetAllSetting() (*map[string]string, error) {
 	}
 	allSetting["subPath"] = subPath
 
+	subPort, err := s.ensureSubPortSetting()
+	if err != nil {
+		return nil, err
+	}
+	allSetting["subPort"] = subPort
+
 	timeLocation, err := s.ensureTimeLocationSetting()
 	if err != nil {
 		return nil, err
@@ -561,6 +700,7 @@ func (s *SettingService) GetAllSetting() (*map[string]string, error) {
 	delete(allSetting, "systemMonitorArchiveRetentionDays")
 	delete(allSetting, systemLinuxDNSContentKey)
 	delete(allSetting, systemLinuxDNSPathKey)
+	delete(allSetting, systemLinuxDNSNameServersInputKey)
 
 	return &allSetting, nil
 }
@@ -583,6 +723,9 @@ func (s *SettingService) getSetting(key string) (*model.Setting, error) {
 func (s *SettingService) getString(key string) (string, error) {
 	if key == "subPath" {
 		return s.ensureSubPathSetting()
+	}
+	if key == "subPort" {
+		return s.ensureSubPortSetting()
 	}
 	if key == "timeLocation" {
 		return s.ensureTimeLocationSetting()
@@ -1218,6 +1361,13 @@ func (s *SettingService) fileExists(path string) error {
 func (s *SettingService) getStringTx(tx *gorm.DB, key string) (string, error) {
 	if key == "subPath" {
 		return generateRandomSubPath(), nil
+	}
+	if key == "subPort" {
+		port, err := chooseInitialRandomSubPort()
+		if err != nil {
+			return "", err
+		}
+		return strconv.Itoa(port), nil
 	}
 	if key == "timeLocation" {
 		return defaultTimeLocationValue(), nil

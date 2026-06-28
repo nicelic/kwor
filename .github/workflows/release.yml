@@ -50,6 +50,18 @@ jobs:
           test -f "User Manual.md" || { echo "Missing User Manual.md in repository root" >&2; exit 1; }
           test -f "使用手册.md" || { echo "Missing 使用手册.md in repository root" >&2; exit 1; }
 
+      - name: Validate release tag matches config/version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          VERSION="$(tr -d '\r\n' < config/version)"
+          TAG="${GITHUB_REF_NAME}"
+          EXPECTED_TAG="v${VERSION}"
+          test -n "$VERSION" || { echo "config/version is empty" >&2; exit 1; }
+          if [ "$TAG" != "$EXPECTED_TAG" ]; then
+            echo "Tag ${TAG} does not match config/version ${VERSION}" >&2
+            exit 1
+          fi
+
       - name: Build frontend
         run: |
           cd temp_frontend

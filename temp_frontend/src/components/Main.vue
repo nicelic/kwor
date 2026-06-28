@@ -336,34 +336,94 @@ const singboxLoading = ref(false)
 const mihomoRunning = ref(false)
 const mihomoLoading = ref(false)
 const menu = ref(false)
-const menuItems = [
-  { title: i18n.global.t('main.gauges'), value: [
-    { title: i18n.global.t('main.gauge.cpu'), value: 'g-cpu' },
-    { title: i18n.global.t('main.gauge.mem'), value: 'g-mem' },
-    { title: i18n.global.t('main.gauge.dsk'), value: 'g-dsk' },
-    { title: i18n.global.t('main.gauge.swp'), value: 'g-swp' },
-  ] },
-  { title: i18n.global.t('main.charts'), value: [
-    { title: i18n.global.t('main.chart.cpu'), value: 'h-cpu' },
-    { title: i18n.global.t('main.chart.mem'), value: 'h-mem' },
-    { title: i18n.global.t('main.chart.net'), value: 'h-net' },
-    { title: i18n.global.t('main.chart.pnet'), value: 'hp-net' },
-    { title: i18n.global.t('main.chart.dio'), value: 'h-dio' },
-  ] },
-  { title: i18n.global.t('main.infos'), value: [
-    { title: i18n.global.t('main.info.sys'), value: 'i-sys' },
-    { title: i18n.global.t('main.info.sbd'), value: 'i-sbd' },
-  ] },
-]
+const tileSections = [
+  {
+    titleKey: 'main.gauges',
+    items: [
+      { titleKey: 'main.gauge.cpu', value: 'g-cpu' },
+      { titleKey: 'main.gauge.mem', value: 'g-mem' },
+      { titleKey: 'main.gauge.dsk', value: 'g-dsk' },
+      { titleKey: 'main.gauge.swp', value: 'g-swp' },
+    ],
+  },
+  {
+    titleKey: 'main.charts',
+    items: [
+      { titleKey: 'main.chart.cpu', value: 'h-cpu' },
+      { titleKey: 'main.chart.mem', value: 'h-mem' },
+      { titleKey: 'main.chart.net', value: 'h-net' },
+      { titleKey: 'main.chart.pnet', value: 'hp-net' },
+      { titleKey: 'main.chart.dio', value: 'h-dio' },
+    ],
+  },
+  {
+    titleKey: 'main.infos',
+    items: [
+      { titleKey: 'main.info.sys', value: 'i-sys' },
+      { titleKey: 'main.info.sbd', value: 'i-sbd' },
+    ],
+  },
+] as const
+const reloadItemOrder = tileSections.flatMap(section => section.items.map(item => item.value))
+const reloadItemSet = new Set<string>(reloadItemOrder)
+const menuItems = computed(() => {
+  void i18n.global.locale.value
+  return tileSections.map(section => ({
+    title: i18n.global.t(section.titleKey),
+    value: section.items.map(item => ({
+      title: i18n.global.t(item.titleKey),
+      value: item.value,
+    })),
+  }))
+})
+const tileTitleMap = computed<Map<string, string>>(() => new Map(
+  menuItems.value.flatMap(section => section.value).map(item => [item.value, item.title]),
+))
 
 const tilesData = ref(<any>{})
 
 const normalizeStringList = (value: unknown): string[] => {
   if (!Array.isArray(value)) return []
-  return value
-    .map(item => String(item ?? '').trim())
-    .filter(Boolean)
+  const normalized: string[] = []
+  const seen = new Set<string>()
+  for (const item of value) {
+    const text = String(item ?? '').trim()
+    if (!text || seen.has(text)) continue
+    seen.add(text)
+    normalized.push(text)
+  }
+  return normalized
 }
+
+const areStringArraysEqual = (left: string[], right: string[]): boolean => {
+  if (left.length !== right.length) return false
+  return left.every((item, index) => item === right[index])
+}
+
+const sanitizeReloadItems = (value: unknown): string[] => {
+  const rawValues = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(',')
+      : []
+  const selected = new Set<string>()
+  for (const item of rawValues) {
+    const text = String(item ?? '').trim()
+    if (!reloadItemSet.has(text)) continue
+    selected.add(text)
+  }
+  return reloadItemOrder.filter(item => selected.has(item))
+}
+
+const persistReloadItems = (value: string[]) => {
+  if (value.length > 0) {
+    localStorage.setItem('reloadItems', value.join(','))
+    return
+  }
+  localStorage.removeItem('reloadItems')
+}
+
+const resolveTileTitle = (value: string): string => tileTitleMap.value.get(value) ?? value
 
 const normalizeCopyText = (value: unknown): string => String(value ?? '').trim()
 
@@ -484,18 +544,20 @@ const toMBWithOneDecimal = (bytes: unknown): string => {
 
 const formatRuntimeMin = (seconds: unknown): string => {
   const totalSeconds = Math.max(0, Math.floor(toNumber(seconds)))
-  if (totalSeconds <= 0) return '0min'
+  if (totalSeconds <= 0) return `0${i18n.global.t('date.m')}`
 
   const totalMinutes = Math.max(1, Math.floor(totalSeconds / 60))
   if (totalMinutes < 60) {
-    return `${totalMinutes}min`
+    return `${totalMinutes}${i18n.global.t('date.m')}`
   }
   if (totalMinutes < 60 * 24) {
-    return `${Math.floor(totalMinutes / 60)}h`
+    return `${Math.floor(totalMinutes / 60)}${i18n.global.t('date.h')}`
   }
   const day = Math.floor(totalMinutes / (60 * 24))
   const remainHour = Math.floor((totalMinutes % (60 * 24)) / 60)
-  return remainHour > 0 ? `${day}d ${remainHour}h` : `${day}d`
+  return remainHour > 0
+    ? `${day}${i18n.global.t('date.d')} ${remainHour}${i18n.global.t('date.h')}`
+    : `${day}${i18n.global.t('date.d')}`
 }
 
 const readMetricValue = (stats: any, keys: string[]): number => {
@@ -532,19 +594,55 @@ const formatTripleUptime = (stats: any): string => {
 }
 
 const reloadItems = computed({
-  get() { return Data().reloadItems },
+  get() {
+    return sanitizeReloadItems(Data().reloadItems)
+  },
   set(v: string[]) {
-    if (Data().reloadItems.length === 0 && v.length > 0) startTimer()
-    if (Data().reloadItems.length > 0 && v.length === 0) stopTimer()
-    Data().reloadItems = v
-    v.length > 0 ? localStorage.setItem('reloadItems', v.join(',')) : localStorage.removeItem('reloadItems')
+    const previous = sanitizeReloadItems(Data().reloadItems)
+    const next = sanitizeReloadItems(v)
+
+    if (areStringArraysEqual(previous, next)) {
+      if (!areStringArraysEqual(Data().reloadItems, next)) {
+        Data().reloadItems = next
+        persistReloadItems(next)
+      }
+      return
+    }
+
+    Data().reloadItems = next
+    persistReloadItems(next)
+
+    if (previous.length === 0 && next.length > 0) {
+      void reloadData()
+      startTimer()
+      return
+    }
+
+    if (previous.length > 0 && next.length === 0) {
+      stopTimer()
+      tilesData.value = {}
+      return
+    }
+
+    if (next.length > 0) {
+      void reloadData()
+    }
   }
 })
 
 const reloadData = async () => {
-  const request = [...new Set(reloadItems.value.map(r => r.split('-')[1]))]
-  const data = await HttpUtils.get('api/status', { r: request.join(',') })
-  if (data.success) {
+  const request = [...new Set(
+    reloadItems.value
+      .map(r => r.split('-')[1] ?? '')
+      .filter((item): item is string => item.length > 0),
+  )]
+  if (request.length === 0) {
+    tilesData.value = {}
+    await loadCoreStatuses()
+    return
+  }
+  const data = await HttpUtils.get('api/status', { r: request.join(',') }, { silentAuthCheck: true })
+  if (data.success && data.obj) {
     tilesData.value = data.obj
   }
   await loadCoreStatuses()
@@ -552,7 +650,7 @@ const reloadData = async () => {
 
 const loadSingboxCoreStatus = async () => {
   try {
-    const data = await HttpUtils.get('api/core-status')
+    const data = await HttpUtils.get('api/core-status', {}, { silentAuthCheck: true })
     singboxRunning.value = data.success && data.obj ? data.obj.running === true : false
   } catch {
     singboxRunning.value = false
@@ -561,7 +659,7 @@ const loadSingboxCoreStatus = async () => {
 
 const loadMihomoCoreStatus = async () => {
   try {
-    const data = await HttpUtils.get('api/mihomo-core-status')
+    const data = await HttpUtils.get('api/mihomo-core-status', {}, { silentAuthCheck: true })
     mihomoRunning.value = data.success && data.obj ? data.obj.running === true : false
   } catch {
     mihomoRunning.value = false
@@ -602,6 +700,7 @@ const restartMihomoCore = async () => runCoreAction('api/mihomo-coreRestart', mi
 let intervalId: ReturnType<typeof setInterval> | null = null
 
 const startTimer = () => {
+  if (intervalId) return
   intervalId = setInterval(() => {
     void reloadData()
   }, 2000)
@@ -615,11 +714,19 @@ const stopTimer = () => {
 }
 
 onMounted(() => {
-  void loadCoreStatuses()
-  if (Data().reloadItems.length !== 0) {
+  const rawReloadItems = [...Data().reloadItems]
+  const normalizedReloadItems = reloadItems.value
+  if (!areStringArraysEqual(rawReloadItems, normalizedReloadItems)) {
+    Data().reloadItems = normalizedReloadItems
+    persistReloadItems(normalizedReloadItems)
+  }
+
+  if (normalizedReloadItems.length !== 0) {
     void reloadData()
     startTimer()
+    return
   }
+  void loadCoreStatuses()
 })
 
 onBeforeUnmount(() => {

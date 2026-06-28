@@ -122,6 +122,28 @@ export default {
     }
   },
   methods: {
+    toFiniteNumber(value: unknown) {
+      if (typeof value === 'number') {
+        return Number.isFinite(value) ? value : 0
+      }
+      if (typeof value === 'string') {
+        const parsed = Number(value)
+        return Number.isFinite(parsed) ? parsed : 0
+      }
+      return 0
+    },
+    clampPercent(value: unknown) {
+      const numberValue = this.toFiniteNumber(value)
+      if (numberValue < 0) return 0
+      if (numberValue > 100) return 100
+      return numberValue
+    },
+    getPerSecondDelta(current: unknown, previous: unknown) {
+      const currentValue = this.toFiniteNumber(current)
+      const previousValue = this.toFiniteNumber(previous)
+      if (currentValue < previousValue) return 0
+      return Math.max(0, (currentValue - previousValue) / 2)
+    },
     updateData1(value1: number) {
       const newData = <number[]>[]
       if (this.data.datasets){
@@ -175,36 +197,42 @@ export default {
   },
   watch: {
     tilesData(v:any) {
+      if (!v || typeof v !== 'object') return
       switch (this.$props.type) {
         case 'h-cpu':
-          this.updateData1(v.cpu)
+          this.updateData1(this.clampPercent(v.cpu))
           break
         case 'h-mem':
-          this.updateData1(v.mem.current*100/v.mem.total)
+          if (!v.mem) break
+          if (this.toFiniteNumber(v.mem.total) <= 0) {
+            this.updateData1(0)
+            break
+          }
+          this.updateData1(this.clampPercent(this.toFiniteNumber(v.mem.current) * 100 / this.toFiniteNumber(v.mem.total)))
           break
         case 'h-net':
-          if (this.oldValues.net.sent) {
-            const downSpeed = (v.net.recv-this.oldValues.net.recv)/2  // Each 2 sec
-            const upSpeed = (v.net.sent-this.oldValues.net.sent)/2  // Each 2 sec
+          if (v.net && Object.keys(this.oldValues.net).length > 0) {
+            const downSpeed = this.getPerSecondDelta(v.net.recv, this.oldValues.net.recv)
+            const upSpeed = this.getPerSecondDelta(v.net.sent, this.oldValues.net.sent)
             this.updateData2(upSpeed,downSpeed)
           }
-          this.oldValues.net = v.net
+          this.oldValues.net = v.net ?? {}
           break
         case 'hp-net':
-          if (this.oldValues.net.psent) {
-            const downSpeed = (v.net.precv-this.oldValues.net.precv)/2  // Each 2 sec
-            const upSpeed = (v.net.psent-this.oldValues.net.psent)/2  // Each 2 sec
+          if (v.net && Object.keys(this.oldValues.net).length > 0) {
+            const downSpeed = this.getPerSecondDelta(v.net.precv, this.oldValues.net.precv)
+            const upSpeed = this.getPerSecondDelta(v.net.psent, this.oldValues.net.psent)
             this.updateData2(upSpeed,downSpeed)
           }
-          this.oldValues.net = v.net
+          this.oldValues.net = v.net ?? {}
           break
         case 'h-dio':
-          if (this.oldValues.dio.read) {
-            const downSpeed = (v.dio.read-this.oldValues.dio.read)/2  // Each 2 sec
-            const upSpeed = (v.dio.write-this.oldValues.dio.write)/2  // Each 2 sec
+          if (v.dio && Object.keys(this.oldValues.dio).length > 0) {
+            const downSpeed = this.getPerSecondDelta(v.dio.read, this.oldValues.dio.read)
+            const upSpeed = this.getPerSecondDelta(v.dio.write, this.oldValues.dio.write)
             this.updateData2(upSpeed,downSpeed)
           }
-          this.oldValues.dio = v.dio
+          this.oldValues.dio = v.dio ?? {}
           break
       }
     }

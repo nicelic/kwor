@@ -2284,6 +2284,7 @@ func collectSSHPortsFromFile(path string, visited map[string]struct{}, ports map
 	}
 
 	lines := strings.Split(string(content), "\n")
+	inMatchBlock := false
 	for _, rawLine := range lines {
 		line := stripSSHConfigComment(rawLine)
 		if line == "" {
@@ -2294,6 +2295,13 @@ func collectSSHPortsFromFile(path string, visited map[string]struct{}, ports map
 			continue
 		}
 		key := strings.ToLower(fields[0])
+		if key == "match" {
+			inMatchBlock = true
+			continue
+		}
+		if inMatchBlock {
+			continue
+		}
 		switch key {
 		case "port":
 			for _, value := range fields[1:] {

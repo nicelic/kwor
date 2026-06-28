@@ -141,10 +141,10 @@ func TestFirewallNftablesOverviewStates(t *testing.T) {
 			wantAutoInstall:   false,
 			wantErrorContains: "Linux only",
 		},
-		{
-			name: "linux missing binary",
-			setup: func() {
-				firewallRuntimeGOOS = "linux"
+			{
+				name: "linux missing binary",
+				setup: func() {
+					firewallRuntimeGOOS = "linux"
 				nftRuntimeGOOS = "linux"
 				firewallSupportedFn = func() bool { return false }
 				firewallGeteuid = func() int { return 0 }
@@ -154,7 +154,7 @@ func TestFirewallNftablesOverviewStates(t *testing.T) {
 			wantReason:        firewallNftReasonMissingBinary,
 			wantInstalled:     false,
 			wantAutoInstall:   true,
-			wantErrorContains: "archive.debian.org",
+				wantErrorContains: "apt-get update",
 		},
 		{
 			name: "linux installed but permission denied",
@@ -259,14 +259,14 @@ func TestDetectFirewallNftInstallPlanSelectsExpectedCommands(t *testing.T) {
 		wantFirstCommand    string
 		wantFirstManualStep string
 	}{
-		{
-			name:             "apt-get",
-			fields:           map[string]string{"ID": "debian", "ID_LIKE": "debian", "VERSION_ID": "10", "VERSION_CODENAME": "buster"},
-			paths:            map[string]string{"apt-get": "/usr/bin/apt-get"},
-			wantName:         "apt-get",
-			wantSystemFamily: "debian",
-			wantFirstCommand: "archive.debian.org",
-		},
+			{
+				name:             "apt-get",
+				fields:           map[string]string{"ID": "debian", "ID_LIKE": "debian", "VERSION_ID": "10", "VERSION_CODENAME": "buster"},
+				paths:            map[string]string{"apt-get": "/usr/bin/apt-get"},
+				wantName:         "apt-get",
+				wantSystemFamily: "debian",
+				wantFirstCommand: "apt-get update",
+			},
 		{
 			name:             "dnf",
 			fields:           map[string]string{"ID": "fedora", "ID_LIKE": "fedora"},
@@ -371,16 +371,14 @@ func TestBuildDebianUbuntuFirewallNftInstallPlanUsesOfficialSourcesAndServiceSta
 		name                string
 		fields              map[string]string
 		manager             string
-		wantRewriteContains []string
 		wantUpdateCommand   string
 		wantInstallCommand  string
 		wantManualUpdate    string
 		wantManualInstall   string
 		wantServiceContains string
-		wantSourceListPath  string
 	}{
 		{
-			name: "debian 10 archive sources",
+			name: "debian 10 install plan",
 			fields: map[string]string{
 				"ID":               "debian",
 				"ID_LIKE":          "debian",
@@ -388,16 +386,14 @@ func TestBuildDebianUbuntuFirewallNftInstallPlanUsesOfficialSourcesAndServiceSta
 				"VERSION_CODENAME": "buster",
 			},
 			manager:             "apt-get",
-			wantRewriteContains: []string{"archive.debian.org/debian", "archive.debian.org/debian-security", "buster"},
-			wantUpdateCommand:   "apt-get -o Acquire::Check-Valid-Until=false update",
+			wantUpdateCommand:   "apt-get update",
 			wantInstallCommand:  "apt-get install -y nftables",
-			wantManualUpdate:    "apt-get -o Acquire::Check-Valid-Until=false update",
+			wantManualUpdate:    "apt-get update",
 			wantManualInstall:   "apt-get install -y nftables",
 			wantServiceContains: "systemctl enable --now nftables",
-			wantSourceListPath:  "/etc/apt/sources.list",
 		},
 		{
-			name: "debian 12 primary and security sources",
+			name: "debian 12 install plan",
 			fields: map[string]string{
 				"ID":               "debian",
 				"ID_LIKE":          "debian",
@@ -405,16 +401,14 @@ func TestBuildDebianUbuntuFirewallNftInstallPlanUsesOfficialSourcesAndServiceSta
 				"VERSION_CODENAME": "bookworm",
 			},
 			manager:             "apt-get",
-			wantRewriteContains: []string{"deb.debian.org/debian", "security.debian.org/debian-security", "bookworm-security", "non-free-firmware"},
 			wantUpdateCommand:   "apt-get update",
 			wantInstallCommand:  "apt-get install -y nftables",
 			wantManualUpdate:    "apt-get update",
 			wantManualInstall:   "apt-get install -y nftables",
 			wantServiceContains: "systemctl enable --now nftables",
-			wantSourceListPath:  "/etc/apt/sources.list",
 		},
 		{
-			name: "ubuntu 18.04 official archive and security",
+			name: "ubuntu 18.04 install plan",
 			fields: map[string]string{
 				"ID":               "ubuntu",
 				"ID_LIKE":          "debian",
@@ -422,13 +416,11 @@ func TestBuildDebianUbuntuFirewallNftInstallPlanUsesOfficialSourcesAndServiceSta
 				"VERSION_CODENAME": "bionic",
 			},
 			manager:             "apt-get",
-			wantRewriteContains: []string{"archive.ubuntu.com/ubuntu", "security.ubuntu.com/ubuntu", "bionic-security", "multiverse"},
 			wantUpdateCommand:   "apt-get update",
 			wantInstallCommand:  "apt-get install -y nftables",
 			wantManualUpdate:    "apt-get update",
 			wantManualInstall:   "apt-get install -y nftables",
 			wantServiceContains: "systemctl enable --now nftables",
-			wantSourceListPath:  "/etc/apt/sources.list",
 		},
 	}
 
@@ -438,22 +430,13 @@ func TestBuildDebianUbuntuFirewallNftInstallPlanUsesOfficialSourcesAndServiceSta
 			if plan == nil {
 				t.Fatal("expected install plan, got nil")
 			}
-			if plan.SourceListPath != testCase.wantSourceListPath {
-				t.Fatalf("source list path mismatch: got=%q want=%q", plan.SourceListPath, testCase.wantSourceListPath)
-			}
-			if len(plan.InstallPlan) != 3 {
+			if len(plan.InstallPlan) != 2 {
 				t.Fatalf("unexpected install plan length: %d", len(plan.InstallPlan))
 			}
-			rewrite := strings.Join(plan.InstallPlan[0], " ")
-			for _, want := range testCase.wantRewriteContains {
-				if !strings.Contains(rewrite, want) {
-					t.Fatalf("rewrite command mismatch: got=%q want substring=%q", rewrite, want)
-				}
-			}
-			if got := strings.Join(plan.InstallPlan[1], " "); got != testCase.wantUpdateCommand {
+			if got := strings.Join(plan.InstallPlan[0], " "); got != testCase.wantUpdateCommand {
 				t.Fatalf("update command mismatch: got=%q want=%q", got, testCase.wantUpdateCommand)
 			}
-			if got := strings.Join(plan.InstallPlan[2], " "); got != testCase.wantInstallCommand {
+			if got := strings.Join(plan.InstallPlan[1], " "); got != testCase.wantInstallCommand {
 				t.Fatalf("install command mismatch: got=%q want=%q", got, testCase.wantInstallCommand)
 			}
 			if len(plan.PostInstallPlan) != 1 {
@@ -462,19 +445,16 @@ func TestBuildDebianUbuntuFirewallNftInstallPlanUsesOfficialSourcesAndServiceSta
 			if got := strings.Join(plan.PostInstallPlan[0], " "); !strings.Contains(got, testCase.wantServiceContains) {
 				t.Fatalf("post-install command mismatch: got=%q want substring=%q", got, testCase.wantServiceContains)
 			}
-			if len(plan.ManualCommands) != 4 {
+			if len(plan.ManualCommands) != 3 {
 				t.Fatalf("unexpected manual command count: %d", len(plan.ManualCommands))
 			}
-			if got := plan.ManualCommands[0]; !strings.Contains(got, testCase.wantRewriteContains[0]) {
-				t.Fatalf("manual rewrite command mismatch: got=%q want substring=%q", got, testCase.wantRewriteContains[0])
+			if plan.ManualCommands[0] != testCase.wantManualUpdate {
+				t.Fatalf("manual update command mismatch: got=%q want=%q", plan.ManualCommands[0], testCase.wantManualUpdate)
 			}
-			if plan.ManualCommands[1] != testCase.wantManualUpdate {
-				t.Fatalf("manual update command mismatch: got=%q want=%q", plan.ManualCommands[1], testCase.wantManualUpdate)
+			if plan.ManualCommands[1] != testCase.wantManualInstall {
+				t.Fatalf("manual install command mismatch: got=%q want=%q", plan.ManualCommands[1], testCase.wantManualInstall)
 			}
-			if plan.ManualCommands[2] != testCase.wantManualInstall {
-				t.Fatalf("manual install command mismatch: got=%q want=%q", plan.ManualCommands[2], testCase.wantManualInstall)
-			}
-			if got := plan.ManualCommands[3]; !strings.Contains(got, testCase.wantServiceContains) {
+			if got := plan.ManualCommands[2]; !strings.Contains(got, testCase.wantServiceContains) {
 				t.Fatalf("manual service command mismatch: got=%q want substring=%q", got, testCase.wantServiceContains)
 			}
 		})
@@ -559,7 +539,7 @@ func TestInstallNftablesReturnsRefreshedOverviewAfterSuccess(t *testing.T) {
 		return installed
 	}
 
-	executed := make([]string, 0, 4)
+		executed := make([]string, 0, 3)
 	firewallRunInstall = func(command []string) error {
 		executed = append(executed, strings.Join(command, " "))
 		if len(command) >= 2 && command[0] == "apt-get" && command[1] == "install" {
@@ -577,21 +557,18 @@ func TestInstallNftablesReturnsRefreshedOverviewAfterSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InstallNftables returned error: %v", err)
 	}
-	if len(executed) != 4 {
-		t.Fatalf("unexpected install command count: %d (%v)", len(executed), executed)
-	}
-	if !strings.Contains(executed[0], "archive.debian.org/debian") || !strings.Contains(executed[0], "/etc/apt/sources.list") {
-		t.Fatalf("first install command mismatch: %q", executed[0])
-	}
-	if executed[1] != "apt-get -o Acquire::Check-Valid-Until=false update" {
-		t.Fatalf("second install command mismatch: %q", executed[1])
-	}
-	if executed[2] != "apt-get install -y nftables" {
-		t.Fatalf("third install command mismatch: %q", executed[2])
-	}
-	if !strings.Contains(executed[3], "systemctl enable --now nftables") {
-		t.Fatalf("fourth install command mismatch: %q", executed[3])
-	}
+		if len(executed) != 3 {
+			t.Fatalf("unexpected install command count: %d (%v)", len(executed), executed)
+		}
+		if executed[0] != "apt-get update" {
+			t.Fatalf("first install command mismatch: %q", executed[0])
+		}
+		if executed[1] != "apt-get install -y nftables" {
+			t.Fatalf("second install command mismatch: %q", executed[1])
+		}
+		if !strings.Contains(executed[2], "systemctl enable --now nftables") {
+			t.Fatalf("third install command mismatch: %q", executed[2])
+		}
 	if !overview.Nftables.Installed {
 		t.Fatal("expected nftables to be marked installed after install")
 	}
@@ -635,12 +612,9 @@ func TestInstallNftablesWithoutSudoReturnsManualCommands(t *testing.T) {
 	if !strings.Contains(message, "requires root or passwordless sudo") {
 		t.Fatalf("unexpected permission error: %q", message)
 	}
-	if !strings.Contains(message, "archive.debian.org/debian") {
-		t.Fatalf("manual rewrite command missing from error: %q", message)
-	}
-	if !strings.Contains(message, "apt-get -o Acquire::Check-Valid-Until=false update") {
-		t.Fatalf("manual update command missing from error: %q", message)
-	}
+		if !strings.Contains(message, "apt-get update") {
+			t.Fatalf("manual update command missing from error: %q", message)
+		}
 	if !strings.Contains(message, "apt-get install -y nftables") {
 		t.Fatalf("manual commands missing from error: %q", message)
 	}

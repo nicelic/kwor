@@ -510,16 +510,35 @@ func (s *ServerService) GetSystemInfo() map[string]interface{} {
 	// get ip address
 	netInterfaces, _ := net.Interfaces()
 	for i := 0; i < len(netInterfaces); i++ {
-		if len(netInterfaces[i].Flags) > 2 && netInterfaces[i].Flags[0] == "up" && netInterfaces[i].Flags[1] != "loopback" {
-			addrs := netInterfaces[i].Addrs
-
-			for _, address := range addrs {
-				if strings.Contains(address.Addr, ".") {
-					ipv4 = append(ipv4, address.Addr)
-				} else if address.Addr[0:6] != "fe80::" {
-					ipv6 = append(ipv6, address.Addr)
-				}
+		iface := netInterfaces[i]
+		isUp := false
+		isLoopback := false
+		for _, flag := range iface.Flags {
+			switch strings.ToLower(strings.TrimSpace(flag)) {
+			case "up":
+				isUp = true
+			case "loopback":
+				isLoopback = true
 			}
+		}
+		if !isUp || isLoopback {
+			continue
+		}
+
+		addrs := iface.Addrs
+		for _, address := range addrs {
+			addrText := strings.TrimSpace(address.Addr)
+			if addrText == "" {
+				continue
+			}
+			if strings.Contains(addrText, ".") {
+				ipv4 = append(ipv4, addrText)
+				continue
+			}
+			if strings.HasPrefix(strings.ToLower(addrText), "fe80::") {
+				continue
+			}
+			ipv6 = append(ipv6, addrText)
 		}
 	}
 	info["ipv4"] = ipv4

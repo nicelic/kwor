@@ -14,15 +14,15 @@
                   <div class="text-overline firewall-hero__eyebrow">NFTABLES FIREWALL</div>
                   <div class="text-h5 font-weight-bold">入站防火墙</div>
                   <div class="text-body-2 text-medium-emphasis mt-1">
-                    以面板托管链路放行界面、按需保留 SSH / 订阅，并扫描展示外部已存在的放行规则。
+                    以面板托管链路接管入站放行；SSH / 订阅按需保留。外部扫描结果仅用于展示和删除，不会自动并入面板放行链。
                   </div>
                 </div>
               </div>
               <div class="firewall-hero__controls">
-                <div
-                  v-if="overview.nftables.supported && !overview.nftables.installed"
-                  class="firewall-hero__install">
-                  <div class="text-caption text-medium-emphasis mb-2">缺少 nft 命令</div>
+	                <div
+	                  v-if="overview.nftables.supported && !overview.nftables.installed"
+	                  class="firewall-hero__install">
+	                  <div class="text-caption text-medium-emphasis mb-2">缺少 nft 命令</div>
                   <v-btn
                     color="primary"
                     prepend-icon="mdi-download"
@@ -31,10 +31,13 @@
                     @click="installNftables">
                     下载 nftables
                   </v-btn>
-                  <div class="text-caption text-medium-emphasis mt-2">
-                    {{ overview.nftables.packageManager || overview.nftables.systemFamily || 'Linux' }}
-                  </div>
-                </div>
+	                  <div class="text-caption text-medium-emphasis mt-2">
+	                    {{ overview.nftables.packageManager || overview.nftables.systemFamily || 'Linux' }}
+	                  </div>
+	                  <div class="text-caption text-medium-emphasis mt-1">
+	                    自动安装仅执行包管理器安装与服务启动，不再改写系统软件源配置。
+	                  </div>
+	                </div>
                 <div class="firewall-hero__switch">
                   <div class="text-caption text-medium-emphasis mb-1">总开关</div>
                   <v-switch
@@ -147,23 +150,32 @@
                 <div class="firewall-metric firewall-metric--detail">
                   <div class="text-caption text-medium-emphasis">外部扫描</div>
                   <div class="text-h5 mt-1">{{ overview.externalCount }}</div>
-                  <div class="text-caption text-medium-emphasis mt-2">系统中已扫描到的外部放行规则数</div>
+                  <div class="text-caption text-medium-emphasis mt-2">系统中已扫描到的外部放行规则数，仅供展示与清理，不代表会被面板托管链自动放行</div>
                 </div>
               </v-col>
               <v-col cols="12" md="4">
                 <div class="firewall-metric firewall-metric--detail">
-                  <div class="d-flex align-start justify-space-between ga-3 flex-wrap">
-                    <div>
-                      <div class="text-caption text-medium-emphasis">TCP 半开</div>
-                      <div class="text-h5 mt-1">{{ formatMetricCount(overview.tcpSynRecvCount) }}</div>
+                  <div class="firewall-tcp-metric">
+                    <div class="firewall-tcp-metric__primary">
+                      <div class="text-caption text-medium-emphasis">系统活跃</div>
+                      <div class="text-h5 mt-1">{{ formatMetricCount(overview.tcpActiveCount) }}</div>
                     </div>
-                    <div class="firewall-metric__meta">
-                      <div>系统活跃 {{ formatMetricCount(overview.tcpActiveCount) }}</div>
-                      <div>已建立 {{ formatMetricCount(overview.tcpEstablishedCount) }}</div>
-                      <div>异常累计 {{ formatMetricCount(overview.tcpAnomalyTotal) }}</div>
+                    <div class="firewall-tcp-metric__meta">
+                      <div class="firewall-tcp-metric__meta-row">
+                        <span>已建立</span>
+                        <strong>{{ formatMetricCount(overview.tcpEstablishedCount) }}</strong>
+                      </div>
+                      <div class="firewall-tcp-metric__meta-row">
+                        <span>TCP 半开</span>
+                        <strong>{{ formatMetricCount(overview.tcpSynRecvCount) }}</strong>
+                      </div>
+                      <div class="firewall-tcp-metric__meta-row">
+                        <span>异常累计</span>
+                        <strong>{{ formatMetricCount(overview.tcpAnomalyTotal) }}</strong>
+                      </div>
                     </div>
                   </div>
-                  <div class="text-caption text-medium-emphasis mt-2">按系统全局 TCP 状态统计，不限端口；半开高更像 SYN 压力，异常累计为系统自启动以来的 Syncookies / ListenDrops / ListenOverflows 总和。</div>
+                  <div class="text-caption text-medium-emphasis mt-2">按系统全局 TCP 状态统计，不限端口；系统活跃包含已建立、TCP 半开，以及 SYN_SENT / FIN_WAIT / CLOSE_WAIT / LAST_ACK / CLOSING 等活动态连接，异常累计为系统自启动以来的 Syncookies / ListenDrops / ListenOverflows 总和。</div>
                 </div>
               </v-col>
               <v-col cols="12" md="4">
@@ -242,7 +254,7 @@
               type="info"
               density="comfortable"
               class="mt-4">
-              开启时会重建面板自己的防火墙链，并重新扫描系统里已有的放行规则用于展示。界面保留始终强制存在，SSH 和订阅可按需移除或恢复。
+              开启时会重建面板自己的防火墙链，只放行系统保留端口、GeoIP 白名单命中项和面板规则；外部扫描规则仅用于展示与删除。界面保留始终强制存在，SSH 和订阅可按需移除或恢复。
             </v-alert>
           </v-card-text>
         </v-card>
@@ -477,7 +489,7 @@
           type="info"
           density="comfortable"
           class="mb-4 firewall-geo__note">
-          GeoIP 规则会先于上方放行规则进行匹配；同端口选择“只放行”时，仅允许命中国家访问，其余来源会直接丢弃。规则文件缓存目录：Promanager_data/geoip。当前最近一次全局刷新：{{ geoLastRefreshLabel }}。
+          GeoIP 规则会先于上方放行规则进行匹配；同端口选择“只放行”时，会把该端口变成来源白名单，仅允许命中国家访问，其余来源会直接丢弃，后面的普通放行规则不会再接管这部分流量。规则文件缓存目录：Promanager_data/geoip。当前最近一次全局刷新：{{ geoLastRefreshLabel }}。
         </v-alert>
 
         <v-row class="mb-2">
@@ -797,7 +809,7 @@
           </v-alert>
 
           <v-alert variant="tonal" type="info" density="comfortable" class="mt-4">
-            这里的 GeoIP 规则与上方规则表独立保存。防火墙关闭时依然可以创建、编辑并按更新周期刷新缓存；开启后会热更新替换内存中的旧规则并同步更新实体文件。
+            这里的 GeoIP 规则与上方规则表独立保存。防火墙关闭时依然可以创建、编辑并按更新周期刷新缓存；开启后会热更新替换内存中的旧规则并同步更新实体文件。GeoIP 规则只影响面板托管链，不会自动吸收系统里其他外部放行规则。
           </v-alert>
         </v-card-text>
         <v-card-actions>
@@ -2105,6 +2117,40 @@ onBeforeUnmount(() => {
   text-align: right;
 }
 
+.firewall-tcp-metric {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 18px;
+}
+
+.firewall-tcp-metric__primary {
+  min-width: 0;
+}
+
+.firewall-tcp-metric__meta {
+  min-width: 112px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.firewall-tcp-metric__meta-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.78);
+  white-space: nowrap;
+}
+
+.firewall-tcp-metric__meta-row strong {
+  font-size: 14px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.96);
+}
+
 .firewall-hero {
   position: relative;
   overflow: hidden;
@@ -2334,6 +2380,14 @@ onBeforeUnmount(() => {
 
   .firewall-geo__interval {
     width: 100%;
+  }
+
+  .firewall-tcp-metric {
+    grid-template-columns: 1fr;
+  }
+
+  .firewall-tcp-metric__meta {
+    min-width: 0;
   }
 }
 </style>

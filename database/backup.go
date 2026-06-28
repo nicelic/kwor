@@ -350,6 +350,9 @@ func RestoreDBBackupArchive(file multipart.File, panelRestarter func() error, st
 	if panelRestarter == nil {
 		return common.NewError("面板重启回调不可用")
 	}
+	if HasPendingDBRestore() {
+		return common.NewError("已有待处理的备份恢复任务，请等待当前恢复完成后再试")
+	}
 
 	archiveData, err := io.ReadAll(file)
 	if err != nil {
@@ -364,37 +367,42 @@ func RestoreDBBackupArchive(file multipart.File, panelRestarter func() error, st
 		return common.NewError("备份压缩包中没有 db 文件")
 	}
 
-	if stopRunningCores != nil {
-		if err := stopRunningCores(); err != nil {
-			return err
-		}
-	}
-
 	stageRoot := pendingDBRestoreBaseDir()
 	stageDir := filepath.Join(stageRoot, fmt.Sprintf("stage-%d", time.Now().UnixNano()))
+	cleanupStage := func() {
+		_ = os.RemoveAll(stageDir)
+		cleanupPendingDBRestoreBaseDir()
+	}
 
 	if err := os.MkdirAll(stageDir, 0o740); err != nil {
 		return common.NewErrorf("创建恢复临时目录失败: %v", err)
 	}
 
 	if err := extractDBArchiveEntries(entries, stageDir); err != nil {
-		_ = os.RemoveAll(stageDir)
+		cleanupStage()
 		return err
 	}
 
 	if err := validateRestoredDatabaseSet(stageDir); err != nil {
-		_ = os.RemoveAll(stageDir)
+		cleanupStage()
 		return err
 	}
 
+	if stopRunningCores != nil {
+		if err := stopRunningCores(); err != nil {
+			cleanupStage()
+			return err
+		}
+	}
+
 	if err := writePendingDBRestoreMarker(&pendingDBRestoreMarker{StageDir: stageDir}); err != nil {
-		_ = os.RemoveAll(stageDir)
+		cleanupStage()
 		return common.NewErrorf("写入恢复任务失败: %v", err)
 	}
 
 	if err := panelRestarter(); err != nil {
 		clearPendingDBRestoreMarker()
-		_ = os.RemoveAll(stageDir)
+		cleanupStage()
 		return common.NewErrorf("重启面板失败: %v", err)
 	}
 
@@ -764,18 +772,21 @@ func readDBBackupArchiveEntries(data []byte) (map[string][]byte, error) {
 	}
 
 	entries := make(map[string][]byte)
+	seenNames := make(map[string]struct{})
 	for _, file := range reader.File {
 		if file.FileInfo().IsDir() {
 			continue
 		}
 
-		name := filepath.ToSlash(strings.TrimSpace(file.Name))
-		if name == "" {
-			continue
+		name, err := normalizeDBBackupArchiveEntryName(file.Name)
+		if err != nil {
+			return nil, err
 		}
-		if strings.HasPrefix(name, "/") || strings.Contains(name, "../") {
-			return nil, common.NewErrorf("备份压缩包包含非法路径: %s", name)
+		lowerName := strings.ToLower(name)
+		if _, exists := seenNames[lowerName]; exists {
+			return nil, common.NewErrorf("备份压缩包包含重复文件: %s", name)
 		}
+		seenNames[lowerName] = struct{}{}
 
 		rc, err := file.Open()
 		if err != nil {
@@ -793,6 +804,23 @@ func readDBBackupArchiveEntries(data []byte) (map[string][]byte, error) {
 	}
 
 	return entries, nil
+}
+
+func normalizeDBBackupArchiveEntryName(rawName string) (string, error) {
+	name := filepath.ToSlash(strings.TrimSpace(rawName))
+	if name == "" {
+		return "", common.NewError("备份压缩包包含空文件名")
+	}
+	if strings.HasPrefix(name, "/") || strings.Contains(name, "../") {
+		return "", common.NewErrorf("备份压缩包包含非法路径: %s", name)
+	}
+	if strings.Contains(name, "/") || strings.Contains(name, ":") {
+		return "", common.NewErrorf("备份压缩包只允许包含 db 目录根层级文件: %s", name)
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".db") {
+		return "", common.NewErrorf("备份压缩包包含不支持的文件类型: %s", name)
+	}
+	return name, nil
 }
 
 func extractDBArchiveEntries(entries map[string][]byte, stageDir string) error {

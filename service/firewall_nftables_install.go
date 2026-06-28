@@ -34,7 +34,6 @@ type FirewallNftablesStatus struct {
 	VersionID            string   `json:"versionId,omitempty"`
 	Codename             string   `json:"codename,omitempty"`
 	PackageManager       string   `json:"packageManager,omitempty"`
-	SourceListPath       string   `json:"sourceListPath,omitempty"`
 	ManualCommands       []string `json:"manualCommands"`
 	Reason               string   `json:"reason"`
 }
@@ -45,7 +44,6 @@ type firewallNftInstallPlan struct {
 	DistributionID  string
 	VersionID       string
 	Codename        string
-	SourceListPath  string
 	InstallPlan     [][]string
 	PostInstallPlan [][]string
 	ManualCommands  []string
@@ -228,10 +226,6 @@ func detectFirewallLinuxSystemFamily(fields map[string]string) string {
 	}
 }
 
-func shouldUseDebianArchiveSource(distribution firewallLinuxDistribution) bool {
-	return distribution.ID == "debian" && distribution.Major > 0 && distribution.Major <= 10
-}
-
 func supportedDebianOrUbuntuNftInstall(distribution firewallLinuxDistribution) bool {
 	switch distribution.ID {
 	case "debian":
@@ -250,24 +244,6 @@ func buildDebianNftablesSourcesList(distribution firewallLinuxDistribution) stri
 	}
 
 	var lines []string
-	if shouldUseDebianArchiveSource(distribution) {
-		base := "http://archive.debian.org/debian"
-		lines = append(lines,
-			fmt.Sprintf("deb %s %s main contrib non-free", base, codename),
-		)
-		if distribution.Major == 10 {
-			lines = append(lines,
-				fmt.Sprintf("deb %s %s-updates main contrib non-free", base, codename),
-				"deb http://archive.debian.org/debian-security buster/updates main contrib non-free",
-			)
-		} else {
-			lines = append(lines,
-				"deb http://archive.debian.org/debian-security stretch/updates main contrib non-free",
-			)
-		}
-		return strings.Join(lines, "\n") + "\n"
-	}
-
 	components := "main contrib non-free"
 	if distribution.Major >= 12 || distribution.Major == 0 {
 		components += " non-free-firmware"
@@ -298,57 +274,8 @@ func buildUbuntuNftablesSourcesList(distribution firewallLinuxDistribution) stri
 	return strings.Join(lines, "\n") + "\n"
 }
 
-func buildFirewallNftablesSourcesList(distribution firewallLinuxDistribution) string {
-	switch distribution.ID {
-	case "debian":
-		return buildDebianNftablesSourcesList(distribution)
-	case "ubuntu":
-		return buildUbuntuNftablesSourcesList(distribution)
-	default:
-		return ""
-	}
-}
-
-func buildAptSourceRewriteCommand(distribution firewallLinuxDistribution) []string {
-	if !supportedDebianOrUbuntuNftInstall(distribution) {
-		return nil
-	}
-	sourceList := buildFirewallNftablesSourcesList(distribution)
-	if strings.TrimSpace(sourceList) == "" {
-		return nil
-	}
-	script := fmt.Sprintf(
-		"set -eu\n"+
-			"mkdir -p /etc/apt\n"+
-			"if [ -f /etc/apt/sources.list ]; then cp -a /etc/apt/sources.list /etc/apt/sources.list.kwor.bak.$(date +%%Y%%m%%d%%H%%M%%S); fi\n"+
-			"cat > /etc/apt/sources.list <<'KWOR_APT_SOURCES'\n%sKWOR_APT_SOURCES\n"+
-			"find /etc/apt/sources.list.d -maxdepth 1 -type f \\( -name '*.list' -o -name '*.sources' \\) -exec sh -c 'mv \"$1\" \"$1.kwor.disabled\"' _ {} \\; 2>/dev/null || true\n",
-		sourceList,
-	)
-	return []string{"sh", "-c", script}
-}
-
-func buildAptManualSourceCommand(distribution firewallLinuxDistribution) string {
-	sourceList := buildFirewallNftablesSourcesList(distribution)
-	if sourceList == "" {
-		return ""
-	}
-	script := fmt.Sprintf(
-		"set -eu\n"+
-			"mkdir -p /etc/apt\n"+
-			"if [ -f /etc/apt/sources.list ]; then cp -a /etc/apt/sources.list /etc/apt/sources.list.kwor.bak.$(date +%%Y%%m%%d%%H%%M%%S); fi\n"+
-			"cat > /etc/apt/sources.list <<'KWOR_APT_SOURCES'\n%sKWOR_APT_SOURCES\n"+
-			"find /etc/apt/sources.list.d -maxdepth 1 -type f \\( -name '*.list' -o -name '*.sources' \\) -exec sh -c 'mv \"$1\" \"$1.kwor.disabled\"' _ {} \\; 2>/dev/null || true\n",
-		sourceList,
-	)
-	return "sh -c " + shellSingleQuote(script)
-}
-
 func buildAptUpdateCommand(managerName string, distribution firewallLinuxDistribution) []string {
 	command := []string{managerName}
-	if shouldUseDebianArchiveSource(distribution) {
-		command = append(command, "-o", "Acquire::Check-Valid-Until=false")
-	}
 	command = append(command, "update")
 	return command
 }
@@ -371,10 +298,6 @@ func buildDebianUbuntuFirewallNftInstallPlan(fields map[string]string, managerNa
 	if !supportedDebianOrUbuntuNftInstall(distribution) {
 		return nil
 	}
-	sourceRewrite := buildAptSourceRewriteCommand(distribution)
-	if len(sourceRewrite) == 0 {
-		return nil
-	}
 	updateCommand := buildAptUpdateCommand(managerName, distribution)
 	installCommand := []string{managerName, "install", "-y", "nftables"}
 	return &firewallNftInstallPlan{
@@ -383,9 +306,7 @@ func buildDebianUbuntuFirewallNftInstallPlan(fields map[string]string, managerNa
 		DistributionID: distribution.ID,
 		VersionID:      distribution.Version,
 		Codename:       distribution.Codename,
-		SourceListPath: "/etc/apt/sources.list",
 		InstallPlan: [][]string{
-			sourceRewrite,
 			updateCommand,
 			installCommand,
 		},
@@ -393,7 +314,6 @@ func buildDebianUbuntuFirewallNftInstallPlan(fields map[string]string, managerNa
 			buildNftablesServiceStartCommand(),
 		},
 		ManualCommands: []string{
-			buildAptManualSourceCommand(distribution),
 			strings.Join(updateCommand, " "),
 			strings.Join(installCommand, " "),
 			buildNftablesServiceManualCommand(),
@@ -615,15 +535,14 @@ func buildFirewallNftablesStatus(available bool) FirewallNftablesStatus {
 	status.DistributionID = distribution.ID
 	status.VersionID = distribution.Version
 	status.Codename = distribution.Codename
-	if plan != nil {
-		status.PackageManager = plan.Name
-		status.SystemFamily = firstNonEmpty(plan.SystemFamily, systemFamily, "unknown")
-		status.DistributionID = firstNonEmpty(plan.DistributionID, status.DistributionID)
-		status.VersionID = firstNonEmpty(plan.VersionID, status.VersionID)
-		status.Codename = firstNonEmpty(plan.Codename, status.Codename)
-		status.SourceListPath = plan.SourceListPath
-		status.ManualCommands = buildFirewallManualCommands(plan, privilege)
-	}
+		if plan != nil {
+			status.PackageManager = plan.Name
+			status.SystemFamily = firstNonEmpty(plan.SystemFamily, systemFamily, "unknown")
+			status.DistributionID = firstNonEmpty(plan.DistributionID, status.DistributionID)
+			status.VersionID = firstNonEmpty(plan.VersionID, status.VersionID)
+			status.Codename = firstNonEmpty(plan.Codename, status.Codename)
+			status.ManualCommands = buildFirewallManualCommands(plan, privilege)
+		}
 	status.AutoInstallSupported = plan != nil && !plan.Immutable && privilege.canAutoInstall()
 
 	if binaryPath, err := resolveNftBinaryPath(); err == nil {
