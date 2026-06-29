@@ -285,13 +285,20 @@
               <td>{{ pkg.name }}</td>
               <td>{{ pkg.status || '-' }}</td>
               <td>
-                <v-chip v-if="pkg.isPinnedKernel" size="x-small" color="success" class="mr-1">{{ t('kernelManager.cleanupPinned') }}</v-chip>
-                <v-chip v-if="pkg.isCurrentKernel" size="x-small" color="info" class="mr-1">{{ t('kernelManager.cleanupCurrent') }}</v-chip>
-                <v-chip v-if="pkg.isImage" size="x-small" color="primary" class="mr-1 kernel-cleanup-tag--image">image</v-chip>
-                <v-chip v-if="pkg.isHeaders" size="x-small" color="secondary" class="mr-1">headers</v-chip>
+                <v-chip v-if="pkg.isPinnedKernel" size="x-small" color="success" variant="flat" class="mr-1">{{ t('kernelManager.cleanupPinned') }}</v-chip>
+                <v-chip v-if="pkg.isCurrentKernel" size="x-small" color="info" variant="flat" class="mr-1">{{ t('kernelManager.cleanupCurrent') }}</v-chip>
+                <v-chip v-if="pkg.isImage" size="x-small" color="primary" variant="flat" class="mr-1 kernel-cleanup-tag--image">image</v-chip>
+                <v-chip v-if="pkg.isHeaders" size="x-small" color="secondary" variant="flat" class="mr-1">headers</v-chip>
               </td>
               <td>
-                <v-chip size="x-small" :color="pkg.risk === 'high' ? 'error' : 'success'">
+                <v-chip
+                  size="x-small"
+                  variant="flat"
+                  :color="pkg.risk === 'high' ? 'error' : 'success'"
+                  :class="[
+                    'kernel-cleanup-risk-chip',
+                    pkg.risk === 'high' ? 'kernel-cleanup-risk-chip--high' : 'kernel-cleanup-risk-chip--normal',
+                  ]">
                   {{ pkg.risk === 'high' ? t('kernelManager.cleanupRiskHigh') : t('kernelManager.cleanupRiskNormal') }}
                 </v-chip>
               </td>
@@ -1180,6 +1187,28 @@ onBeforeUnmount(() => {
 .kernel-provider-select {
   min-width: 220px;
   max-width: 320px;
+}
+
+.kernel-cleanup-risk-chip {
+  min-width: 54px;
+  justify-content: center;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.kernel-cleanup-risk-chip--high {
+  background: rgba(239, 68, 68, 0.28) !important;
+  color: #fee2e2 !important;
+}
+
+.kernel-cleanup-risk-chip--normal {
+  background: rgba(34, 197, 94, 0.24) !important;
+  color: #dcfce7 !important;
+}
+
+.kernel-cleanup-risk-chip :deep(.v-chip__content) {
+  color: inherit !important;
 }
 
 .kernel-cleanup-tag--image,

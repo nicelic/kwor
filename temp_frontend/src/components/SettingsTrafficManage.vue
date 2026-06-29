@@ -61,6 +61,7 @@
                   {{ overview.vnstat.installed ? '下载 / 重装' : '下载 / 安装' }}
                 </v-btn>
                 <v-btn
+                  class="traffic-update-btn"
                   variant="outlined"
                   color="primary"
                   prepend-icon="mdi-cloud-search"
@@ -176,20 +177,33 @@
             <div class="mt-3">
               <DatePick
                 :expiry="resetPickerEpoch"
+                input-id="traffic-reset-day-picker"
                 picker-type="date"
                 :label-text="resetDayLabel"
                 :zero-text="disabledLabel"
                 @submit="onSubmitResetDayPicker" />
             </div>
+            <div class="mt-3">
+              <DatePick
+                :expiry="expiryPickerEpoch"
+                input-id="traffic-expiry-date-picker"
+                picker-type="date"
+                :label-text="expiryDateLabel"
+                :zero-text="disabledLabel"
+                @submit="onSubmitExpiryDatePicker" />
+            </div>
             <div class="text-caption text-medium-emphasis mt-2">
               {{ monthlyHint }}
             </div>
-            <v-btn
-              class="mt-3"
-              color="primary"
-              variant="tonal"
-              :loading="savingSettings"
-              :disabled="savingSettings || !hasPendingSettingsChanges"
+            <div class="text-caption text-medium-emphasis mt-1">
+              {{ expiryHint }}
+            </div>
+              <v-btn
+                class="mt-3 traffic-save-btn"
+                color="primary"
+                variant="tonal"
+                :loading="savingSettings"
+                :disabled="savingSettings || !hasPendingSettingsChanges"
               @click="saveTrafficSettings">
               {{ t('actions.save') }}
             </v-btn>
@@ -206,6 +220,9 @@
             </div>
             <div class="mt-1 text-caption text-medium-emphasis">
               {{ nextResetLabel }}: {{ nextResetAtLabel }}
+            </div>
+            <div class="mt-1 text-caption text-medium-emphasis">
+              {{ expiryDateLabel }}: {{ expiryStatusLabel }}
             </div>
             <div class="traffic-settings__actions mt-4">
               <v-btn
@@ -253,6 +270,8 @@ type TrafficOverview = {
   accumTotal: number
   limitGiB: number
   resetDay: number
+  expiryDate: string
+  expired: boolean
   nextResetAt: number
   updatedAt: number
   vnstat: VnstatStatus
@@ -304,9 +323,11 @@ const props = withDefaults(defineProps<{
 
 const { t } = useI18n()
 const resetDayLabel = '\u6d41\u91cf\u91cd\u7f6e\u65e5\u671f'
+const expiryDateLabel = '\u6d41\u91cf\u5230\u671f\u671f\u9650'
 const disabledLabel = '\u672a\u542f\u7528'
 const daySuffix = '\u53f7'
 const monthlyHint = '\u6bcf\u6708\u5728\u8be5\u65e5 00:00 \u91cd\u7f6e\uff1b\u82e5\u5f53\u6708\u5929\u6570\u4e0d\u8db3\u5219\u81ea\u52a8\u5728\u6708\u672b\u6700\u540e\u4e00\u5929 00:00 \u91cd\u7f6e\u3002'
+const expiryHint = '\u5230\u8fbe\u8be5\u65e5 00:00 \u540e\uff0c\u5c06\u6309\u6d41\u91cf\u7528\u5c3d\u5904\u7406\u5e76\u5c01\u7981\u6d41\u91cf\u3002'
 const resetPeriodConfirmText = '\u662f\u5426\u91cd\u7f6e\u5de6\u4fa7\u6d41\u91cf\u7edf\u8ba1\uff1f'
 const resetTotalConfirmText = '\u662f\u5426\u91cd\u7f6e\u603b\u4f7f\u7528\u6d41\u91cf\uff1f'
 const nextResetLabel = '\u4e0b\u4e00\u6b21\u91cd\u7f6e\u65f6\u95f4'
@@ -351,6 +372,8 @@ const overview = ref<TrafficOverview>({
   accumTotal: 0,
   limitGiB: 0,
   resetDay: 0,
+  expiryDate: '',
+  expired: false,
   nextResetAt: 0,
   updatedAt: 0,
   vnstat: {
@@ -384,8 +407,11 @@ const vnstatUpdateInfo = ref<VnstatUpdateInfo>({
 const limitGiBInput = ref(0)
 const resetDayInput = ref(0)
 const resetPickerEpoch = ref(0)
+const expiryDateInput = ref('')
+const expiryPickerEpoch = ref(0)
 const savedLimitGiB = ref(0)
 const savedResetDay = ref(0)
+const savedExpiryDate = ref('')
 let pollingTimer: number | null = null
 
 const createIdleVnstatUpdateInfo = (status: VnstatStatus = overview.value.vnstat): VnstatUpdateInfo => ({
@@ -505,10 +531,14 @@ const limitBytes = computed(() => (
 ))
 const hasPendingSettingsChanges = computed(() => (
   normalizeLimitGiB(limitGiBInput.value) !== savedLimitGiB.value ||
-  normalizeResetDay(resetDayInput.value) !== savedResetDay.value
+  normalizeResetDay(resetDayInput.value) !== savedResetDay.value ||
+  normalizeExpiryDateInput(expiryDateInput.value) !== savedExpiryDate.value
 ))
 const hasPendingResetDayChanges = computed(() => (
   normalizeResetDay(resetDayInput.value) !== savedResetDay.value
+))
+const hasPendingExpiryDateChanges = computed(() => (
+  normalizeExpiryDateInput(expiryDateInput.value) !== savedExpiryDate.value
 ))
 const usageBytes = computed(() => overview.value.accumTotal)
 const usagePercent = computed(() => (
@@ -602,11 +632,48 @@ const nextResetAtLabel = computed(() => {
   }
   return date.toLocaleString()
 })
+const expiryDateDisplay = computed(() => (
+  normalizeExpiryDateInput(expiryDateInput.value)
+))
+const expiryStatusLabel = computed(() => {
+  if (expiryDateDisplay.value === '') {
+    return disabledLabel
+  }
+  if (overview.value.expired && !hasPendingExpiryDateChanges.value) {
+    return `${expiryDateDisplay.value} (已到期)`
+  }
+  return `${expiryDateDisplay.value} (已设置)`
+})
 
 const normalizeResetDay = (value: number) => {
   if (!Number.isFinite(value) || value <= 0) return 0
   if (value > 31) return 31
   return Math.floor(value)
+}
+
+const normalizeExpiryDateInput = (value: string) => {
+  const trimmed = value.trim()
+  if (trimmed === '') {
+    return ''
+  }
+  const normalized = trimmed.replace(/\//g, '-').replace(/\./g, '-')
+  const match = normalized.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/)
+  if (match == null) {
+    return ''
+  }
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const candidate = new Date(year, month - 1, day, 0, 0, 0, 0)
+  if (
+    !Number.isFinite(candidate.getTime()) ||
+    candidate.getFullYear() !== year ||
+    candidate.getMonth() !== month - 1 ||
+    candidate.getDate() !== day
+  ) {
+    return ''
+  }
+  return `${year.toString().padStart(4, '0')}-${month.toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`
 }
 
 const daysInMonth = (year: number, monthIndex: number) => (
@@ -668,6 +735,30 @@ const buildPickerEpochFromResetDay = (day: number) => {
   return Math.floor(next.getTime() / 1000)
 }
 
+const buildPickerEpochFromExpiryDate = (value: string) => {
+  const normalized = normalizeExpiryDateInput(value)
+  if (normalized === '') {
+    return 0
+  }
+  const match = normalized.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (match == null) {
+    return 0
+  }
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const parsed = new Date(year, month - 1, day, 0, 0, 0, 0)
+  if (
+    !Number.isFinite(parsed.getTime()) ||
+    parsed.getFullYear() !== year ||
+    parsed.getMonth() !== month - 1 ||
+    parsed.getDate() !== day
+  ) {
+    return 0
+  }
+  return Math.floor(parsed.getTime() / 1000)
+}
+
 const parseEpochSeconds = (value: unknown): number | null => {
   if (typeof value === 'number' && Number.isFinite(value)) {
     const abs = Math.abs(value)
@@ -718,6 +809,24 @@ const onSubmitResetDayPicker = (rawValue: unknown) => {
   resetPickerEpoch.value = Math.floor(selected.getTime() / 1000)
 }
 
+const onSubmitExpiryDatePicker = (rawValue: unknown) => {
+  const epochSeconds = parseEpochSeconds(rawValue)
+  if (epochSeconds == null) {
+    return
+  }
+  if (epochSeconds <= 0) {
+    expiryDateInput.value = ''
+    expiryPickerEpoch.value = 0
+    return
+  }
+  const selected = new Date(epochSeconds * 1000)
+  const year = selected.getFullYear().toString().padStart(4, '0')
+  const month = (selected.getMonth() + 1).toString().padStart(2, '0')
+  const day = selected.getDate().toString().padStart(2, '0')
+  expiryDateInput.value = `${year}-${month}-${day}`
+  expiryPickerEpoch.value = Math.floor(selected.getTime() / 1000)
+}
+
 type ApplyOverviewOptions = {
   forceSyncDraft?: boolean
 }
@@ -726,12 +835,15 @@ const syncDraftFromSavedSettings = () => {
   limitGiBInput.value = savedLimitGiB.value
   resetDayInput.value = savedResetDay.value
   resetPickerEpoch.value = buildPickerEpochFromResetDay(savedResetDay.value)
+  expiryDateInput.value = savedExpiryDate.value
+  expiryPickerEpoch.value = buildPickerEpochFromExpiryDate(savedExpiryDate.value)
 }
 
 const applyOverview = (raw: Partial<TrafficOverview>, options: ApplyOverviewOptions = {}) => {
   const input = raw as TrafficOverviewRaw
   const normalizedLimitGiB = normalizeLimitGiB(readNumberField(input, ['limitGiB', 'limit_gib'], 0))
   const normalizedResetDay = normalizeResetDay(readNumberField(input, ['resetDay', 'reset_day'], 0))
+  const normalizedExpiryDate = normalizeExpiryDateInput(readStringField(input, ['expiryDate', 'expiry_date'], ''))
   const shouldSyncDraft = options.forceSyncDraft || !hasPendingSettingsChanges.value
   const previousVnstat = overview.value.vnstat
   const vnstat = normalizeVnstatStatus(input.vnstat)
@@ -749,6 +861,8 @@ const applyOverview = (raw: Partial<TrafficOverview>, options: ApplyOverviewOpti
     accumTotal: readNumberField(input, ['accumTotal', 'accum_total'], 0),
     limitGiB: normalizedLimitGiB,
     resetDay: normalizedResetDay,
+    expiryDate: normalizedExpiryDate,
+    expired: readBoolField(input, ['expired'], false),
     nextResetAt: readNumberField(input, ['nextResetAt', 'next_reset_at'], 0),
     updatedAt: readNumberField(input, ['updatedAt', 'updated_at'], Math.floor(Date.now() / 1000)),
     vnstat,
@@ -757,6 +871,7 @@ const applyOverview = (raw: Partial<TrafficOverview>, options: ApplyOverviewOpti
   enabledInput.value = overview.value.enabled
   savedLimitGiB.value = normalizedLimitGiB
   savedResetDay.value = normalizedResetDay
+  savedExpiryDate.value = normalizedExpiryDate
 
   if (shouldSyncDraft) {
     syncDraftFromSavedSettings()
@@ -921,6 +1036,7 @@ const saveTrafficSettings = async () => {
   const payload = {
     limit_gib: normalizeLimitGiB(limitGiBInput.value),
     reset_day: normalizeResetDay(resetDayInput.value),
+    expiry_date: normalizeExpiryDateInput(expiryDateInput.value),
   }
   try {
     const msg = await HttpUtils.post('api/traffic-overview-settings', payload, {
@@ -1080,6 +1196,22 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
 }
 
+.traffic-update-btn {
+  min-width: 112px;
+}
+
+.traffic-update-btn.v-btn--disabled {
+  opacity: 1;
+  color: rgba(255, 255, 255, 0.88) !important;
+  border-color: rgba(var(--v-theme-primary), 0.35) !important;
+  background: rgba(var(--v-theme-surface-variant), 0.22) !important;
+}
+
+.traffic-update-btn.v-btn--disabled :deep(.v-btn__content),
+.traffic-update-btn.v-btn--disabled :deep(.v-icon) {
+  opacity: 1;
+}
+
 .metric-card {
   padding: 12px;
   min-height: 110px;
@@ -1136,6 +1268,21 @@ onBeforeUnmount(() => {
 
 .traffic-settings__actions .v-btn {
   flex: 1 1 140px;
+}
+
+.traffic-save-btn {
+  min-width: 110px;
+}
+
+.traffic-save-btn.v-btn--disabled {
+  opacity: 1;
+  color: rgba(255, 255, 255, 0.92) !important;
+  background: rgba(var(--v-theme-primary), 0.16) !important;
+  box-shadow: inset 0 0 0 1px rgba(var(--v-theme-primary), 0.22);
+}
+
+.traffic-save-btn.v-btn--disabled :deep(.v-btn__content) {
+  opacity: 1;
 }
 
 @media (max-width: 720px) {

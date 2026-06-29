@@ -57,10 +57,10 @@
               <v-chip size="small" :color="overview.installed ? 'success' : 'warning'" variant="flat">
                 {{ overview.installed ? 'acme.sh 已安装' : 'acme.sh 未安装' }}
               </v-chip>
-              <v-chip size="small" color="primary" variant="tonal">
+              <v-chip size="small" color="primary" variant="flat" class="acme-hero-chip acme-hero-chip--version">
                 版本：{{ overview.version || '-' }}
               </v-chip>
-              <v-chip size="small" color="secondary" variant="tonal">
+              <v-chip size="small" color="secondary" variant="flat" class="acme-hero-chip acme-hero-chip--ca">
                 默认 CA：{{ caLabel(overview.preferredCA) }}
               </v-chip>
             </div>
@@ -131,6 +131,7 @@
                 @update:model-value="onAcmeVersionChanged" />
               <div class="acme-runtime__button-group">
                 <v-btn
+                  class="acme-runtime-btn acme-runtime-btn--install"
                   color="primary"
                   prepend-icon="mdi-download"
                   :loading="installing"
@@ -139,6 +140,7 @@
                   下载 / 重装
                 </v-btn>
                 <v-btn
+                  class="acme-runtime-btn acme-runtime-btn--check"
                   variant="outlined"
                   color="primary"
                   prepend-icon="mdi-cloud-search"
@@ -148,6 +150,7 @@
                   检测更新
                 </v-btn>
                 <v-btn
+                  class="acme-runtime-btn acme-runtime-btn--danger"
                   variant="outlined"
                   color="error"
                   prepend-icon="mdi-delete-outline"
@@ -4262,6 +4265,33 @@ onBeforeUnmount(() => {
   margin-top: 16px;
 }
 
+.acme-hero__chips :deep(.v-chip) {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.acme-hero-chip {
+  min-height: 28px;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.acme-hero-chip--version {
+  min-width: 96px;
+  background: rgba(59, 130, 246, 0.34) !important;
+  color: #eff6ff !important;
+}
+
+.acme-hero-chip--ca {
+  min-width: 118px;
+  background: rgba(20, 184, 166, 0.24) !important;
+  color: #ecfeff !important;
+}
+
+.acme-hero-chip--version :deep(.v-chip__content),
+.acme-hero-chip--ca :deep(.v-chip__content) {
+  color: inherit !important;
+}
+
 .acme-metric {
   height: 100%;
   padding: 14px;
@@ -4295,6 +4325,44 @@ onBeforeUnmount(() => {
   align-items: center;
   flex-wrap: wrap;
   gap: 10px;
+}
+
+.acme-runtime-btn {
+  min-width: 112px;
+}
+
+.acme-runtime-btn.acme-runtime-btn--check {
+  background: rgba(59, 130, 246, 0.08) !important;
+  border-color: rgba(96, 165, 250, 0.42) !important;
+  color: #dbeafe !important;
+}
+
+.acme-runtime-btn.acme-runtime-btn--danger {
+  background: rgba(239, 68, 68, 0.08) !important;
+  border-color: rgba(248, 113, 113, 0.48) !important;
+  color: #fee2e2 !important;
+}
+
+.acme-runtime-btn.acme-runtime-btn--check.v-btn--disabled,
+.acme-runtime-btn.acme-runtime-btn--danger.v-btn--disabled {
+  opacity: 1;
+}
+
+.acme-runtime-btn.acme-runtime-btn--check.v-btn--disabled {
+  background: rgba(59, 130, 246, 0.12) !important;
+  color: #bfdbfe !important;
+}
+
+.acme-runtime-btn.acme-runtime-btn--danger.v-btn--disabled {
+  background: rgba(239, 68, 68, 0.14) !important;
+  color: #fecaca !important;
+}
+
+.acme-runtime-btn.acme-runtime-btn--check :deep(.v-btn__content),
+.acme-runtime-btn.acme-runtime-btn--danger :deep(.v-btn__content),
+.acme-runtime-btn.acme-runtime-btn--check :deep(.v-icon),
+.acme-runtime-btn.acme-runtime-btn--danger :deep(.v-icon) {
+  opacity: 1;
 }
 
 .acme-account-selection {

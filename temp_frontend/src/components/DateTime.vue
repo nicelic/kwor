@@ -1,6 +1,6 @@
 <template>
   <v-text-field
-    id="expiry"
+    :id="resolvedInputId"
     :label="displayLabel"
     v-model="dateFormatted"
     prepend-inner-icon="mdi-calendar"
@@ -12,7 +12,7 @@
     @input="Input=$event"
     :locale="pickerLocale"
     :format="resolvedPickerFormat"
-    element="expiry"
+    :element="resolvedInputId"
     :compact-time="pickerType === 'datetime'"
     :type="pickerType">
       <template v-slot:next-month>
@@ -47,6 +47,13 @@ import 'moment/locale/vi'
 import 'moment/locale/zh-cn'
 import 'moment/locale/zh-tw'
 
+let datePickerInputIdSeed = 0
+
+function buildDatePickerInputId() {
+  datePickerInputIdSeed += 1
+  return `date-picker-input-${datePickerInputIdSeed}`
+}
+
 export default {
   props: {
     expiry: {
@@ -73,12 +80,17 @@ export default {
       type: String,
       default: 'exact',
     },
+    inputId: {
+      type: String,
+      default: '',
+    },
   },
   emits: ['submit'],
   data() {
     return {
       menu: false,
       input: new Date(),
+      generatedInputId: buildDatePickerInputId(),
     }
   },
   components: { DatePicker },
@@ -119,6 +131,10 @@ export default {
         default:
           return 'YYYY/MM/DD HH:mm'
       }
+    },
+    resolvedInputId() {
+      const custom = String(this.inputId ?? '').trim()
+      return custom.length > 0 ? custom : this.generatedInputId
     },
     dateFormatted() {
       if (this.displayEpoch == 0) {

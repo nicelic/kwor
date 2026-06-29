@@ -69,8 +69,10 @@ type tlsSha256Request struct {
 type trafficOverviewSettingsRequest struct {
 	LimitGiB       *float64 `json:"limit_gib" form:"limit_gib"`
 	ResetDay       *int     `json:"reset_day" form:"reset_day"`
+	ExpiryDate     *string  `json:"expiry_date" form:"expiry_date"`
 	LimitGiBCompat *float64 `json:"limitGiB" form:"limitGiB"`
 	ResetDayCompat *int     `json:"resetDay" form:"resetDay"`
+	ExpiryDateCompat *string `json:"expiryDate" form:"expiryDate"`
 }
 
 type trafficOverviewSwitchRequest struct {
@@ -788,12 +790,13 @@ func (a *ApiService) SaveTrafficOverviewSettings(c *gin.Context) {
 
 	limitGiB, limitExists := pickTrafficOverviewLimitGiB(req)
 	resetDay, resetExists := pickTrafficOverviewResetDay(req)
+	expiryDate, expiryDateProvided := pickTrafficOverviewExpiryDate(req)
 	if !limitExists || !resetExists {
 		jsonMsg(c, "", fmt.Errorf("limit_gib and reset_day are required"))
 		return
 	}
 
-	if err := a.TrafficOverviewService.UpdateTrafficOverviewSettings(limitGiB, resetDay); err != nil {
+	if err := a.TrafficOverviewService.UpdateTrafficOverviewSettings(limitGiB, resetDay, expiryDate, expiryDateProvided); err != nil {
 		jsonMsg(c, "", err)
 		return
 	}
@@ -881,6 +884,16 @@ func pickTrafficOverviewResetDay(req trafficOverviewSettingsRequest) (int, bool)
 		return *req.ResetDayCompat, true
 	}
 	return 0, false
+}
+
+func pickTrafficOverviewExpiryDate(req trafficOverviewSettingsRequest) (string, bool) {
+	if req.ExpiryDate != nil {
+		return *req.ExpiryDate, true
+	}
+	if req.ExpiryDateCompat != nil {
+		return *req.ExpiryDateCompat, true
+	}
+	return "", false
 }
 
 func (a *ApiService) ResetTrafficOverview(c *gin.Context) {

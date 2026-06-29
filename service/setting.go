@@ -205,6 +205,7 @@ var defaultValueMap = map[string]string{
 	"trafficOverviewLimitGiB":            "0",
 	"trafficOverviewEnabled":             "true",
 	"trafficOverviewResetDay":            "0",
+	"trafficOverviewExpiryDate":          "",
 	"trafficOverviewState":               "{}",
 	"trafficOverviewSnapshot":            "{}",
 	"trafficOverviewCapState":            "{}",

@@ -39,6 +39,9 @@ func TestSaveTrafficOverviewSettingsPersistsResetDay(t *testing.T) {
 	if (*settings)["trafficOverviewResetDay"] != "13" {
 		t.Fatalf("trafficOverviewResetDay=%q, want %q", (*settings)["trafficOverviewResetDay"], "13")
 	}
+	if (*settings)["trafficOverviewExpiryDate"] != "" {
+		t.Fatalf("trafficOverviewExpiryDate=%q, want empty", (*settings)["trafficOverviewExpiryDate"])
+	}
 }
 
 func TestSaveTrafficOverviewSettingsAcceptsJSONPayload(t *testing.T) {
@@ -46,7 +49,7 @@ func TestSaveTrafficOverviewSettingsAcceptsJSONPayload(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
-	body := `{"limit_gib":64.25,"reset_day":17}`
+	body := `{"limit_gib":64.25,"reset_day":17,"expiry_date":"2027-05-04"}`
 	req := httptest.NewRequest("POST", "/api/traffic-overview-settings", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	ctx.Request = req
@@ -69,6 +72,9 @@ func TestSaveTrafficOverviewSettingsAcceptsJSONPayload(t *testing.T) {
 	if (*settings)["trafficOverviewResetDay"] != "17" {
 		t.Fatalf("trafficOverviewResetDay=%q, want %q", (*settings)["trafficOverviewResetDay"], "17")
 	}
+	if (*settings)["trafficOverviewExpiryDate"] != "2027-05-04" {
+		t.Fatalf("trafficOverviewExpiryDate=%q, want %q", (*settings)["trafficOverviewExpiryDate"], "2027-05-04")
+	}
 }
 
 func TestSaveTrafficOverviewSettingsAcceptsMultipartPayload(t *testing.T) {
@@ -81,6 +87,9 @@ func TestSaveTrafficOverviewSettingsAcceptsMultipartPayload(t *testing.T) {
 	}
 	if err := writer.WriteField("reset_day", "22"); err != nil {
 		t.Fatalf("write reset_day field failed: %v", err)
+	}
+	if err := writer.WriteField("expiry_date", "2028-07-18"); err != nil {
+		t.Fatalf("write expiry_date field failed: %v", err)
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close multipart writer failed: %v", err)
@@ -110,12 +119,15 @@ func TestSaveTrafficOverviewSettingsAcceptsMultipartPayload(t *testing.T) {
 	if (*settings)["trafficOverviewResetDay"] != "22" {
 		t.Fatalf("trafficOverviewResetDay=%q, want %q", (*settings)["trafficOverviewResetDay"], "22")
 	}
+	if (*settings)["trafficOverviewExpiryDate"] != "2028-07-18" {
+		t.Fatalf("trafficOverviewExpiryDate=%q, want %q", (*settings)["trafficOverviewExpiryDate"], "2028-07-18")
+	}
 }
 
 func TestSaveTrafficOverviewSettingsRejectsMissingField(t *testing.T) {
 	initTrafficOverviewAPITestDB(t)
 
-	if err := (&service.TrafficOverviewService{}).UpdateTrafficOverviewSettings(0, 13); err != nil {
+	if err := (&service.TrafficOverviewService{}).UpdateTrafficOverviewSettings(0, 13, "", false); err != nil {
 		t.Fatalf("seed reset day failed: %v", err)
 	}
 
@@ -140,6 +152,95 @@ func TestSaveTrafficOverviewSettingsRejectsMissingField(t *testing.T) {
 	}
 	if (*settings)["trafficOverviewResetDay"] != "13" {
 		t.Fatalf("reset day should stay unchanged, got %q", (*settings)["trafficOverviewResetDay"])
+	}
+}
+
+func TestSaveTrafficOverviewSettingsOmittedExpiryDateKeepsPreviousValue(t *testing.T) {
+	initTrafficOverviewAPITestDB(t)
+
+	if err := (&service.TrafficOverviewService{}).UpdateTrafficOverviewSettings(32, 9, "2027-05-04", true); err != nil {
+		t.Fatalf("seed expiry date failed: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	body := `{"limit_gib":48.5,"reset_day":10}`
+	req := httptest.NewRequest("POST", "/api/traffic-overview-settings", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	apiSvc := &ApiService{}
+	apiSvc.SaveTrafficOverviewSettings(ctx)
+
+	msg := decodeAPIMessage(t, rec.Body.String())
+	if !msg.Success {
+		t.Fatalf("expected success response, got error: %s", msg.Msg)
+	}
+
+	settings, err := (&service.SettingService{}).GetAllSetting()
+	if err != nil {
+		t.Fatalf("load settings failed: %v", err)
+	}
+	if (*settings)["trafficOverviewExpiryDate"] != "2027-05-04" {
+		t.Fatalf("trafficOverviewExpiryDate=%q, want %q", (*settings)["trafficOverviewExpiryDate"], "2027-05-04")
+	}
+}
+
+func TestSaveTrafficOverviewSettingsEmptyExpiryDateClearsValue(t *testing.T) {
+	initTrafficOverviewAPITestDB(t)
+
+	if err := (&service.TrafficOverviewService{}).UpdateTrafficOverviewSettings(32, 9, "2027-05-04", true); err != nil {
+		t.Fatalf("seed expiry date failed: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	body := `{"limit_gib":32,"reset_day":9,"expiry_date":""}`
+	req := httptest.NewRequest("POST", "/api/traffic-overview-settings", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	apiSvc := &ApiService{}
+	apiSvc.SaveTrafficOverviewSettings(ctx)
+
+	msg := decodeAPIMessage(t, rec.Body.String())
+	if !msg.Success {
+		t.Fatalf("expected success response, got error: %s", msg.Msg)
+	}
+
+	settings, err := (&service.SettingService{}).GetAllSetting()
+	if err != nil {
+		t.Fatalf("load settings failed: %v", err)
+	}
+	if (*settings)["trafficOverviewExpiryDate"] != "" {
+		t.Fatalf("trafficOverviewExpiryDate=%q, want empty", (*settings)["trafficOverviewExpiryDate"])
+	}
+}
+
+func TestSaveTrafficOverviewSettingsAcceptsCompatibilityExpiryDateField(t *testing.T) {
+	initTrafficOverviewAPITestDB(t)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	body := `{"limitGiB":16,"resetDay":6,"expiryDate":"2029-08-01"}`
+	req := httptest.NewRequest("POST", "/api/traffic-overview-settings", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	apiSvc := &ApiService{}
+	apiSvc.SaveTrafficOverviewSettings(ctx)
+
+	msg := decodeAPIMessage(t, rec.Body.String())
+	if !msg.Success {
+		t.Fatalf("expected success response, got error: %s", msg.Msg)
+	}
+
+	settings, err := (&service.SettingService{}).GetAllSetting()
+	if err != nil {
+		t.Fatalf("load settings failed: %v", err)
+	}
+	if (*settings)["trafficOverviewExpiryDate"] != "2029-08-01" {
+		t.Fatalf("trafficOverviewExpiryDate=%q, want %q", (*settings)["trafficOverviewExpiryDate"], "2029-08-01")
 	}
 }
 

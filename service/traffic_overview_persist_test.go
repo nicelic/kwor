@@ -13,11 +13,11 @@ func TestTrafficOverviewSettingsPersistAcrossServiceInstances(t *testing.T) {
 	initTrafficOverviewTestDB(t)
 
 	svc := &TrafficOverviewService{}
-	if err := svc.UpdateTrafficOverviewSettings(128.64, 15); err != nil {
+	if err := svc.UpdateTrafficOverviewSettings(128.64, 15, "", false); err != nil {
 		t.Fatalf("update settings failed: %v", err)
 	}
 
-	limitGiB, resetDay, _, err := svc.getOverviewConfig()
+	limitGiB, resetDay, expiryDate, _, _, err := svc.getOverviewConfig()
 	if err != nil {
 		t.Fatalf("read settings from same service failed: %v", err)
 	}
@@ -27,14 +27,55 @@ func TestTrafficOverviewSettingsPersistAcrossServiceInstances(t *testing.T) {
 	if resetDay != 15 {
 		t.Fatalf("resetDay = %d, want 15", resetDay)
 	}
+	if expiryDate != "" {
+		t.Fatalf("expiryDate = %q, want empty", expiryDate)
+	}
 
 	other := &TrafficOverviewService{}
-	otherLimit, otherResetDay, _, otherErr := other.getOverviewConfig()
+	otherLimit, otherResetDay, otherExpiryDate, _, _, otherErr := other.getOverviewConfig()
 	if otherErr != nil {
 		t.Fatalf("read settings from another service failed: %v", otherErr)
 	}
-	if otherLimit != 128.64 || otherResetDay != 15 {
-		t.Fatalf("persisted settings mismatch: got limit %.2f day %d", otherLimit, otherResetDay)
+	if otherLimit != 128.64 || otherResetDay != 15 || otherExpiryDate != "" {
+		t.Fatalf("persisted settings mismatch: got limit %.2f day %d expiry %q", otherLimit, otherResetDay, otherExpiryDate)
+	}
+}
+
+func TestTrafficOverviewExpiryDatePersistsAcrossServiceInstances(t *testing.T) {
+	initTrafficOverviewTestDB(t)
+
+	svc := &TrafficOverviewService{}
+	if err := svc.UpdateTrafficOverviewSettings(88.5, 12, "2027-05-04", true); err != nil {
+		t.Fatalf("update settings with expiry failed: %v", err)
+	}
+
+	limitGiB, resetDay, expiryDate, expiryBoundary, _, err := svc.getOverviewConfig()
+	if err != nil {
+		t.Fatalf("read settings from same service failed: %v", err)
+	}
+	if limitGiB != 88.5 {
+		t.Fatalf("limitGiB = %.2f, want 88.5", limitGiB)
+	}
+	if resetDay != 12 {
+		t.Fatalf("resetDay = %d, want 12", resetDay)
+	}
+	if expiryDate != "2027-05-04" {
+		t.Fatalf("expiryDate = %q, want %q", expiryDate, "2027-05-04")
+	}
+	if expiryBoundary.IsZero() {
+		t.Fatal("expiryBoundary should not be zero")
+	}
+
+	other := &TrafficOverviewService{}
+	_, _, otherExpiryDate, otherExpiryBoundary, _, otherErr := other.getOverviewConfig()
+	if otherErr != nil {
+		t.Fatalf("read settings from another service failed: %v", otherErr)
+	}
+	if otherExpiryDate != "2027-05-04" {
+		t.Fatalf("other expiryDate = %q, want %q", otherExpiryDate, "2027-05-04")
+	}
+	if otherExpiryBoundary.IsZero() {
+		t.Fatal("other expiryBoundary should not be zero")
 	}
 }
 
@@ -63,7 +104,7 @@ func TestSetTrafficOverviewEnabledFalsePersistsPauseSnapshot(t *testing.T) {
 		t.Fatalf("disable traffic overview failed: %v", err)
 	}
 
-	_, _, enabled, err := svc.getOverviewConfig()
+	_, _, _, _, enabled, err := svc.getOverviewConfig()
 	if err != nil {
 		t.Fatalf("read overview config failed: %v", err)
 	}
@@ -210,6 +251,70 @@ func TestCleanupTrafficCapOnShutdownMarksStateInactiveButPreservesLimitReached(t
 	}
 	if len(state.AllowedPorts) != len(initial.AllowedPorts) {
 		t.Fatalf("allowed ports should be preserved: got=%v want=%v", state.AllowedPorts, initial.AllowedPorts)
+	}
+}
+
+func TestParseTrafficOverviewExpiryDateTriggersAtMidnight(t *testing.T) {
+	loc := time.FixedZone("UTC+8", 8*60*60)
+
+	normalized, boundary, err := parseTrafficOverviewExpiryDate("2027-05-04", loc)
+	if err != nil {
+		t.Fatalf("parseTrafficOverviewExpiryDate failed: %v", err)
+	}
+	if normalized != "2027-05-04" {
+		t.Fatalf("normalized = %q, want %q", normalized, "2027-05-04")
+	}
+
+	before := time.Date(2027, time.May, 3, 23, 59, 59, 0, loc)
+	atBoundary := time.Date(2027, time.May, 4, 0, 0, 0, 0, loc)
+	if isTrafficOverviewExpired(boundary, before) {
+		t.Fatal("did not expect expiry before boundary")
+	}
+	if !isTrafficOverviewExpired(boundary, atBoundary) {
+		t.Fatal("expected expiry at boundary 00:00")
+	}
+}
+
+func TestEvaluateTrafficOverviewCapReachedHonorsExpiryAndExistingCapState(t *testing.T) {
+	if !evaluateTrafficOverviewCapReached(false, 0, 0, false, "", true, true) {
+		t.Fatal("expected expired overview to be treated as cap reached")
+	}
+	if !evaluateTrafficOverviewCapReached(false, 100, limitGiBToBytes(100), true, "", false, true) {
+		t.Fatal("expected over-limit overview to be treated as cap reached")
+	}
+	if !evaluateTrafficOverviewCapReached(true, 100, 0, false, "vnstat unavailable", false, true) {
+		t.Fatal("expected previous cap state to persist when live overview is unavailable")
+	}
+	if evaluateTrafficOverviewCapReached(false, 0, 0, false, "", false, false) {
+		t.Fatal("did not expect cap reached when no limit and not expired")
+	}
+}
+
+func TestGetTrafficOverviewMarksExpiredWithoutVnstatRuntime(t *testing.T) {
+	initTrafficOverviewTestDB(t)
+
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatalf("load location failed: %v", err)
+	}
+	if err := (&SettingService{}).SaveSetting("timeLocation", "Asia/Shanghai"); err != nil {
+		t.Fatalf("save time location failed: %v", err)
+	}
+
+	expiredDate := time.Now().In(loc).AddDate(0, 0, -1).Format("2006-01-02")
+	if err := (&TrafficOverviewService{}).UpdateTrafficOverviewSettings(0, 0, expiredDate, true); err != nil {
+		t.Fatalf("save expired date failed: %v", err)
+	}
+
+	overview, err := (&TrafficOverviewService{}).GetTrafficOverview()
+	if err != nil {
+		t.Fatalf("GetTrafficOverview failed: %v", err)
+	}
+	if !overview.Expired {
+		t.Fatalf("expected overview to be expired for date %s", expiredDate)
+	}
+	if overview.ExpiryDate != expiredDate {
+		t.Fatalf("overview expiryDate = %q, want %q", overview.ExpiryDate, expiredDate)
 	}
 }
 

@@ -38,10 +38,10 @@
               <v-chip size="small" :color="overview.available ? 'success' : 'warning'" variant="flat">
                 {{ overview.available ? copy.available : copy.unavailable }}
               </v-chip>
-              <v-chip size="small" color="secondary" variant="tonal">
+              <v-chip size="small" color="secondary" variant="flat" class="pf-hero-chip pf-hero-chip--sync">
                 {{ copy.lastSync }}: {{ lastSyncLabel }}
               </v-chip>
-              <v-chip size="small" color="primary" variant="tonal">
+              <v-chip size="small" color="primary" variant="flat" class="pf-hero-chip pf-hero-chip--count">
                 {{ copy.ruleCount }} {{ overview.rules.length }}
               </v-chip>
             </div>
@@ -488,6 +488,34 @@ const {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.pf-hero__chips :deep(.v-chip) {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.pf-hero-chip {
+  min-height: 28px;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.pf-hero-chip--sync {
+  min-width: 138px;
+  background: rgba(20, 184, 166, 0.24) !important;
+  color: #ecfeff !important;
+}
+
+.pf-hero-chip--count {
+  min-width: 84px;
+  justify-content: center;
+  background: rgba(59, 130, 246, 0.34) !important;
+  color: #eff6ff !important;
+}
+
+.pf-hero-chip--sync :deep(.v-chip__content),
+.pf-hero-chip--count :deep(.v-chip__content) {
+  color: inherit !important;
 }
 
 .pf-metric,

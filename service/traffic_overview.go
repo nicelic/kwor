@@ -41,6 +41,8 @@ type TrafficOverview struct {
 	AccumTotal  int64               `json:"accumTotal"`
 	LimitGiB    float64             `json:"limitGiB"`
 	ResetDay    int                 `json:"resetDay"`
+	ExpiryDate  string              `json:"expiryDate,omitempty"`
+	Expired     bool                `json:"expired"`
 	NextResetAt int64               `json:"nextResetAt"`
 	UpdatedAt   int64               `json:"updatedAt"`
 	Vnstat      VnstatPackageStatus `json:"vnstat"`
@@ -106,6 +108,7 @@ const (
 	trafficOverviewLimitGiBKey       = "trafficOverviewLimitGiB"
 	trafficOverviewEnabledKey        = "trafficOverviewEnabled"
 	trafficOverviewResetDayKey       = "trafficOverviewResetDay"
+	trafficOverviewExpiryDateKey     = "trafficOverviewExpiryDate"
 	trafficOverviewSnapshotKey       = "trafficOverviewSnapshot"
 	trafficOverviewCapStateKey       = "trafficOverviewCapState"
 	trafficOverviewPauseStateKey     = "trafficOverviewPauseState"
@@ -210,14 +213,16 @@ func (s *TrafficOverviewService) GetTrafficOverview() (*TrafficOverview, error) 
 		Status:    "stopped",
 		UpdatedAt: time.Now().Unix(),
 	}
-	limitGiB, resetDay, enabled, configErr := s.getOverviewConfig()
+	limitGiB, resetDay, expiryDate, expiryBoundary, enabled, configErr := s.getOverviewConfig()
 	if configErr != nil {
 		overview.Error = configErr.Error()
 		return overview, nil
 	}
 	overview.LimitGiB = limitGiB
 	overview.ResetDay = resetDay
+	overview.ExpiryDate = expiryDate
 	now := time.Now().In(s.getOverviewLocation())
+	overview.Expired = isTrafficOverviewExpired(expiryBoundary, now)
 	if nextResetAt, ok := nextClientMonthlyResetBoundary(resetDay, now); ok && !nextResetAt.IsZero() {
 		overview.NextResetAt = nextResetAt.Unix()
 	}
@@ -334,9 +339,13 @@ func (s *TrafficOverviewService) GetTrafficOverview() (*TrafficOverview, error) 
 	return overview, nil
 }
 
-func (s *TrafficOverviewService) UpdateTrafficOverviewSettings(limitGiB float64, resetDay int) error {
+func (s *TrafficOverviewService) UpdateTrafficOverviewSettings(limitGiB float64, resetDay int, expiryDate string, expiryDateProvided bool) error {
 	limitGiB = normalizeLimitGiB(limitGiB)
 	resetDay = normalizeResetDay(resetDay)
+	normalizedExpiryDate, err := normalizeTrafficOverviewExpiryDate(expiryDate)
+	if err != nil {
+		return err
+	}
 
 	settingSvc := &SettingService{}
 	if err := settingSvc.setString(trafficOverviewLimitGiBKey, strconv.FormatFloat(limitGiB, 'f', 2, 64)); err != nil {
@@ -344,6 +353,11 @@ func (s *TrafficOverviewService) UpdateTrafficOverviewSettings(limitGiB float64,
 	}
 	if err := settingSvc.setString(trafficOverviewResetDayKey, strconv.Itoa(resetDay)); err != nil {
 		return err
+	}
+	if expiryDateProvided {
+		if err := settingSvc.setString(trafficOverviewExpiryDateKey, normalizedExpiryDate); err != nil {
+			return err
+		}
 	}
 	if err := s.ReconcileTrafficCap(); err != nil {
 		logger.Warning("reconcile traffic cap after settings update failed:", err)
@@ -423,7 +437,7 @@ func (s *TrafficOverviewService) pauseTrafficOverviewAccounting() error {
 		return err
 	}
 
-	_, resetDay, _, cfgErr := s.getOverviewConfig()
+	_, resetDay, _, _, _, cfgErr := s.getOverviewConfig()
 	if cfgErr != nil {
 		return cfgErr
 	}
@@ -546,7 +560,7 @@ func (s *TrafficOverviewService) resumeTrafficOverviewAccounting() error {
 	if err != nil {
 		return err
 	}
-	_, resetDay, _, cfgErr := s.getOverviewConfig()
+	_, resetDay, _, _, _, cfgErr := s.getOverviewConfig()
 	if cfgErr != nil {
 		return cfgErr
 	}
@@ -1373,7 +1387,7 @@ func (s *TrafficOverviewService) ResetAllTrafficOverviewStats() error {
 		return err
 	}
 
-	_, resetDay, _, cfgErr := s.getOverviewConfig()
+	_, resetDay, _, _, _, cfgErr := s.getOverviewConfig()
 	if cfgErr != nil {
 		return cfgErr
 	}
@@ -1455,7 +1469,7 @@ func (s *TrafficOverviewService) ResetPeriodTrafficOverviewStats() error {
 		return err
 	}
 
-	_, resetDay, _, cfgErr := s.getOverviewConfig()
+	_, resetDay, _, _, _, cfgErr := s.getOverviewConfig()
 	if cfgErr != nil {
 		return cfgErr
 	}
@@ -1669,13 +1683,18 @@ func (s *TrafficOverviewService) reconcileTrafficCapFromOverview(overview *Traff
 	}
 
 	limitGiB := 0.0
+	expired := false
 	if overview != nil {
 		limitGiB = normalizeLimitGiB(overview.LimitGiB)
+		expired = overview.Expired
 	}
 	if limitGiB <= 0 {
-		loadedLimitGiB, _, _, err := s.getOverviewConfig()
+		loadedLimitGiB, _, _, expiryBoundary, _, err := s.getOverviewConfig()
 		if err == nil {
 			limitGiB = normalizeLimitGiB(loadedLimitGiB)
+			if overview == nil {
+				expired = isTrafficOverviewExpired(expiryBoundary, time.Now().In(s.getOverviewLocation()))
+			}
 		}
 	}
 
@@ -1695,14 +1714,32 @@ func (s *TrafficOverviewService) reconcileTrafficCapFromOverview(overview *Traff
 
 	hasRules := hasTrafficCapRules()
 	active := state.Active || hasRules
-	limitReached := state.LimitReached
-	if limitGiB <= 0 {
-		limitReached = false
-	} else if overview != nil && overview.Available && strings.TrimSpace(overview.Error) == "" {
-		limitReached = overview.AccumTotal >= limitGiBToBytes(limitGiB)
-	}
+	limitReached := evaluateTrafficOverviewCapReached(
+		state.LimitReached,
+		limitGiB,
+		func() int64 {
+			if overview == nil {
+				return 0
+			}
+			return overview.AccumTotal
+		}(),
+		func() bool {
+			if overview == nil {
+				return false
+			}
+			return overview.Available
+		}(),
+		func() string {
+			if overview == nil {
+				return ""
+			}
+			return overview.Error
+		}(),
+		expired,
+		overview != nil,
+	)
 
-	desiredActive := limitGiB > 0 && limitReached
+	desiredActive := (limitGiB > 0 || expired) && limitReached
 
 	if desiredActive {
 		needsRuleRefresh := !active || !intSliceEqual(state.AllowedPorts, allowedPorts) || !hasRules
@@ -1731,12 +1768,12 @@ func (s *TrafficOverviewService) reconcileTrafficCapFromOverview(overview *Traff
 	return s.saveCapStateLocked(state)
 }
 
-func (s *TrafficOverviewService) getOverviewConfig() (float64, int, bool, error) {
+func (s *TrafficOverviewService) getOverviewConfig() (float64, int, string, time.Time, bool, error) {
 	settingSvc := &SettingService{}
 
 	limitRaw, err := settingSvc.getString(trafficOverviewLimitGiBKey)
 	if err != nil {
-		return 0, 0, true, err
+		return 0, 0, "", time.Time{}, true, err
 	}
 	limitGiB := 0.0
 	if strings.TrimSpace(limitRaw) != "" {
@@ -1747,7 +1784,7 @@ func (s *TrafficOverviewService) getOverviewConfig() (float64, int, bool, error)
 
 	resetRaw, err := settingSvc.getString(trafficOverviewResetDayKey)
 	if err != nil {
-		return 0, 0, true, err
+		return 0, 0, "", time.Time{}, true, err
 	}
 	resetDay := 0
 	if strings.TrimSpace(resetRaw) != "" {
@@ -1756,12 +1793,21 @@ func (s *TrafficOverviewService) getOverviewConfig() (float64, int, bool, error)
 		}
 	}
 
-	enabled, err := settingSvc.getBool(trafficOverviewEnabledKey)
+	expiryRaw, err := settingSvc.getString(trafficOverviewExpiryDateKey)
 	if err != nil {
-		return 0, 0, true, err
+		return 0, 0, "", time.Time{}, true, err
+	}
+	expiryDate, expiryBoundary, expiryErr := parseTrafficOverviewExpiryDate(expiryRaw, s.getOverviewLocation())
+	if expiryErr != nil {
+		return 0, 0, "", time.Time{}, true, expiryErr
 	}
 
-	return normalizeLimitGiB(limitGiB), normalizeResetDay(resetDay), enabled, nil
+	enabled, err := settingSvc.getBool(trafficOverviewEnabledKey)
+	if err != nil {
+		return 0, 0, "", time.Time{}, true, err
+	}
+
+	return normalizeLimitGiB(limitGiB), normalizeResetDay(resetDay), expiryDate, expiryBoundary, enabled, nil
 }
 
 func (s *TrafficOverviewService) loadRuntimeState() (trafficOverviewRuntimeState, error) {
@@ -2189,6 +2235,49 @@ func normalizeResetDay(value int) int {
 	return value
 }
 
+func normalizeTrafficOverviewExpiryDate(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", nil
+	}
+	parsed, err := time.Parse("2006-01-02", trimmed)
+	if err != nil {
+		return "", fmt.Errorf("invalid expiry_date, expected YYYY-MM-DD: %w", err)
+	}
+	return parsed.Format("2006-01-02"), nil
+}
+
+func parseTrafficOverviewExpiryDate(value string, loc *time.Location) (string, time.Time, error) {
+	normalized, err := normalizeTrafficOverviewExpiryDate(value)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	if normalized == "" {
+		return "", time.Time{}, nil
+	}
+	if loc == nil {
+		loc = time.Local
+	}
+	parsed, err := time.ParseInLocation("2006-01-02", normalized, loc)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("parse expiry date failed: %w", err)
+	}
+	return normalized, parsed, nil
+}
+
+func isTrafficOverviewExpired(boundary time.Time, now time.Time) bool {
+	if boundary.IsZero() {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if now.Location() != boundary.Location() {
+		now = now.In(boundary.Location())
+	}
+	return !now.Before(boundary)
+}
+
 func isFiniteFloat(value float64) bool {
 	return !math.IsInf(value, 0) && !math.IsNaN(value)
 }
@@ -2221,6 +2310,21 @@ func limitGiBToBytes(limitGiB float64) int64 {
 		return 0
 	}
 	return int64(total)
+}
+
+func evaluateTrafficOverviewCapReached(previous bool, limitGiB float64, accumTotal int64, available bool, errText string, expired bool, hasOverview bool) bool {
+	if expired {
+		return true
+	}
+
+	normalizedLimitGiB := normalizeLimitGiB(limitGiB)
+	if normalizedLimitGiB <= 0 {
+		return false
+	}
+	if hasOverview && available && strings.TrimSpace(errText) == "" {
+		return accumTotal >= limitGiBToBytes(normalizedLimitGiB)
+	}
+	return previous
 }
 
 func intSliceEqual(left []int, right []int) bool {
