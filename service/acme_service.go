@@ -10,8 +10,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"io"
+	"io/fs"
 	"math"
 	"net/http"
 	"net/mail"
@@ -301,6 +301,7 @@ type AcmeIssuePayload struct {
 type AcmeRenewPayload struct {
 	ID          uint
 	Force       bool
+	Manual      bool
 	ApplyTarget string
 }
 
@@ -1208,6 +1209,8 @@ func (s *AcmeService) Issue(payload AcmeIssuePayload) (*AcmeActionResult, error)
 	}
 	defer cleanupAcmeWorkingTree(homeDir, domains[0], useECC)
 	commandArgs := buildAcmeIssueCommandArgs(domains, challenge, webroot, dnsProvider, keyLength, caServer, customArgs, certificateType == acmeCertificateTypeIP, ipFamilyMode)
+	commandArgs = ensureAcmeFreshIssueArgs(commandArgs)
+	logSession.append("手动签发默认强制重新签发，避免复用旧证书")
 	dnsEnv := []string{}
 	if useDNSChallenge {
 		parsedEnv, parseErr := normalizeAcmeEnvAssignments(dnsEnvText)
@@ -1501,8 +1504,11 @@ func (s *AcmeService) Renew(payload AcmeRenewPayload) (*AcmeActionResult, error)
 
 	defer cleanupAcmeWorkingTree(homeDir, domains[0], entry.UseECC)
 	commandArgs := buildAcmeIssueCommandArgs(domains, challenge, webroot, dnsProvider, keyLength, strings.TrimSpace(entry.CAServer), customArgs, isIPCert, ipFamilyMode)
-	if payload.Force {
-		commandArgs = append(commandArgs, "--force")
+	if payload.Manual || payload.Force {
+		commandArgs = ensureAcmeFreshIssueArgs(commandArgs)
+		if logSession != nil {
+			logSession.append("手动续签默认强制重新签发，避免复用旧证书")
+		}
 	}
 	output, err := runCommandOutputWithTimeoutEnvLog(3*time.Minute, scriptPath, append(acmeHomeArgs(homeDir), commandArgs...), renewEnv, logSession)
 	if err != nil {
@@ -3789,6 +3795,27 @@ func buildAcmeIssueCommandArgs(domains []string, challenge string, webroot strin
 		args = append(args, strings.Fields(customArgs)...)
 	}
 	return args
+}
+
+func ensureAcmeFreshIssueArgs(args []string) []string {
+	if hasAnyAcmeArg(args, "--force", "-f") {
+		return args
+	}
+	return append(args, "--force")
+}
+
+func hasAnyAcmeArg(args []string, names ...string) bool {
+	if len(args) == 0 || len(names) == 0 {
+		return false
+	}
+	for _, arg := range args {
+		for _, name := range names {
+			if arg == name {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func normalizeAcmeDomains(text string) []string {

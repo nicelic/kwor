@@ -213,7 +213,7 @@ export default {
     extra: "Sự kiện đặt lại lưu lượng",
     resetTraffic: "Đặt lại lưu lượng đã dùng (có hiệu lực sau khi lưu)",
     expiryHint: "Hết hạn có hiệu lực lúc 00:00 sau khi ngày đã chọn kết thúc",
-    resetEventHint: "0 hoặc để trống sẽ tắt; chọn 5 nghĩa là đặt lại lúc 00:00 ngày 6 hằng tháng",
+    resetEventHint: "0 hoặc để trống sẽ tắt; chọn 5 nghĩa là đặt lại lúc 00:00 ngày 5 hằng tháng",
   },
   bulk: {
     order: "Sắp xếp",

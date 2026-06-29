@@ -390,7 +390,7 @@ export default {
     extra: "流量重置事件",
     resetTraffic: "重置已用流量（保存后生效）",
     expiryHint: "到期在所选日期结束后的 00:00 生效",
-    resetEventHint: "0 或留空表示关闭；选择 5 表示每月 5 日结束后在 6 日 00:00 重置",
+    resetEventHint: "0 或留空表示关闭；选择 5 表示每月 5 日 00:00 重置",
   },
   bulk: {
     order: "排序",

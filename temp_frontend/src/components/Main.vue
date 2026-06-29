@@ -53,15 +53,20 @@
       </v-row>
       <v-row>
         <v-col v-for="i in reloadItems" :key="i" cols="12" sm="6" md="3">
-          <v-card class="rounded-lg" variant="outlined" :height="i === 'i-sbd' ? 244 : i.startsWith('i-') ? 228 : 210"
-                  :title="menuItems.flatMap(cat => cat.value).find(m => m.value === i)?.title">
+          <v-card
+            class="rounded-lg"
+            :class="{ 'home-info-card': i.startsWith('i-') }"
+            variant="outlined"
+            :style="i.startsWith('i-') ? infoTileCardStyle : metricTileCardStyle"
+            :title="menuItems.flatMap(cat => cat.value).find(m => m.value === i)?.title"
+          >
             <v-card-text style="padding: 0 16px;" align="center" justify="center">
               <Gauge v-if="i.charAt(0) === 'g'" :tilesData="tilesData" :type="i" />
               <History v-if="i.charAt(0) === 'h'" :tilesData="tilesData" :type="i" />
               <template v-if="i === 'i-sys'">
-                <v-row class="home-info-grid">
-                  <v-col cols="3" class="home-info-label">{{ $t('main.info.host') }}</v-col>
-                  <v-col cols="9" class="home-info-value">
+                <v-row class="home-info-grid" no-gutters>
+                  <v-col cols="4" class="home-info-label">{{ $t('main.info.host') }}</v-col>
+                  <v-col cols="8" class="home-info-value">
                     <div class="home-copy-row">
                       <span class="home-copy-value">{{ hostNameLabel }}</span>
                       <v-btn
@@ -78,8 +83,8 @@
                       </v-btn>
                     </div>
                   </v-col>
-                  <v-col cols="3" class="home-info-label">{{ $t('main.info.cpu') }}</v-col>
-                  <v-col cols="9" class="home-info-value">
+                  <v-col cols="4" class="home-info-label">{{ $t('main.info.cpu') }}</v-col>
+                  <v-col cols="8" class="home-info-value">
                     <v-menu
                       v-if="cpuTypeLabel !== '-'"
                       open-on-hover
@@ -115,8 +120,8 @@
                       {{ cpuCountLabel }}
                     </v-chip>
                   </v-col>
-                  <v-col cols="3" class="home-info-label">IP</v-col>
-                  <v-col cols="9" class="home-info-value">
+                  <v-col cols="4" class="home-info-label">IP</v-col>
+                  <v-col cols="8" class="home-info-value">
                     <div class="d-flex flex-wrap home-ip-chip-row">
                       <v-menu
                         v-if="ipv4List.length > 0"
@@ -191,18 +196,18 @@
                       <span v-if="!hasIPAddresses">-</span>
                     </div>
                   </v-col>
-                  <v-col cols="3" class="home-info-label">kwor</v-col>
-                  <v-col cols="9" class="home-info-value">
+                  <v-col cols="4" class="home-info-label">kwor</v-col>
+                  <v-col cols="8" class="home-info-value">
                     <v-chip density="compact" color="blue">
                       {{ appVersionLabel }}
                     </v-chip>
                   </v-col>
-                  <v-col cols="3" class="home-info-label">{{ $t('main.info.uptime') }}</v-col>
-                  <v-col cols="9" class="home-info-value">{{ HumanReadable.formatSecond(tilesData.uptime) }}</v-col>
+                  <v-col cols="4" class="home-info-label">{{ $t('main.info.uptime') }}</v-col>
+                  <v-col cols="8" class="home-info-value">{{ HumanReadable.formatSecond(tilesData.uptime) }}</v-col>
                 </v-row>
               </template>
               <template v-if="i === 'i-sbd'">
-                <v-row class="home-info-grid">
+                <v-row class="home-info-grid" no-gutters>
                   <v-col cols="4" class="home-info-label">{{ $t('main.info.running') }}</v-col>
                   <v-col cols="8" class="home-info-value d-flex flex-column runtime-status-cell">
                     <div class="d-flex align-center flex-wrap runtime-status-row">
@@ -379,6 +384,9 @@ const menuItems = computed(() => {
 const tileTitleMap = computed<Map<string, string>>(() => new Map(
   menuItems.value.flatMap(section => section.value).map(item => [item.value, item.title]),
 ))
+
+const metricTileCardStyle = { height: '210px' }
+const infoTileCardStyle = { minHeight: '244px', height: 'auto' }
 
 const tilesData = ref(<any>{})
 
@@ -745,10 +753,15 @@ const restartSingbox = async () => {
 </script>
 
 <style scoped>
+.home-info-card {
+  align-self: stretch;
+}
+
 .home-info-grid {
   margin: 0;
   row-gap: 2px;
   line-height: 1.15;
+  align-items: center;
 }
 
 .home-info-grid > .v-col {
@@ -761,11 +774,15 @@ const restartSingbox = async () => {
   align-items: center;
   justify-content: center;
   text-align: center;
+  white-space: nowrap;
 }
 
 .home-info-value {
   min-width: 0;
   text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .home-copy-row {

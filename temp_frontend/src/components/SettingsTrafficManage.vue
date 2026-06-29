@@ -253,6 +253,7 @@ type TrafficOverview = {
   accumTotal: number
   limitGiB: number
   resetDay: number
+  nextResetAt: number
   updatedAt: number
   vnstat: VnstatStatus
   error?: string
@@ -305,7 +306,7 @@ const { t } = useI18n()
 const resetDayLabel = '\u6d41\u91cf\u91cd\u7f6e\u65e5\u671f'
 const disabledLabel = '\u672a\u542f\u7528'
 const daySuffix = '\u53f7'
-const monthlyHint = '\u6bcf\u6708\u6309\u8be5\u65e5\u671f\u91cd\u7f6e\uff1b\u82e5\u5f53\u6708\u5929\u6570\u4e0d\u8db3\u5219\u81ea\u52a8\u5728\u6708\u5e95\u91cd\u7f6e\u3002'
+const monthlyHint = '\u6bcf\u6708\u5728\u8be5\u65e5 00:00 \u91cd\u7f6e\uff1b\u82e5\u5f53\u6708\u5929\u6570\u4e0d\u8db3\u5219\u81ea\u52a8\u5728\u6708\u672b\u6700\u540e\u4e00\u5929 00:00 \u91cd\u7f6e\u3002'
 const resetPeriodConfirmText = '\u662f\u5426\u91cd\u7f6e\u5de6\u4fa7\u6d41\u91cf\u7edf\u8ba1\uff1f'
 const resetTotalConfirmText = '\u662f\u5426\u91cd\u7f6e\u603b\u4f7f\u7528\u6d41\u91cf\uff1f'
 const nextResetLabel = '\u4e0b\u4e00\u6b21\u91cd\u7f6e\u65f6\u95f4'
@@ -350,6 +351,7 @@ const overview = ref<TrafficOverview>({
   accumTotal: 0,
   limitGiB: 0,
   resetDay: 0,
+  nextResetAt: 0,
   updatedAt: 0,
   vnstat: {
     supported: false,
@@ -505,6 +507,9 @@ const hasPendingSettingsChanges = computed(() => (
   normalizeLimitGiB(limitGiBInput.value) !== savedLimitGiB.value ||
   normalizeResetDay(resetDayInput.value) !== savedResetDay.value
 ))
+const hasPendingResetDayChanges = computed(() => (
+  normalizeResetDay(resetDayInput.value) !== savedResetDay.value
+))
 const usageBytes = computed(() => overview.value.accumTotal)
 const usagePercent = computed(() => (
   limitBytes.value > 0 ? Math.min(100, Math.round(usageBytes.value * 100 / limitBytes.value)) : 0
@@ -582,8 +587,16 @@ const vnstatInstallMethodText = computed(() => {
 const vnstatDataPathText = computed(() => (
   overview.value.vnstat.dataPaths.length > 0 ? overview.value.vnstat.dataPaths.join(' / ') : '-'
 ))
+const draftNextResetAt = computed(() => getNextResetAt(resetDayInput.value))
+const displayNextResetAt = computed(() => (
+  hasPendingResetDayChanges.value
+    ? draftNextResetAt.value
+    : overview.value.nextResetAt > 0
+      ? new Date(overview.value.nextResetAt * 1000)
+      : null
+))
 const nextResetAtLabel = computed(() => {
-  const date = getNextResetAt(resetDayInput.value)
+  const date = displayNextResetAt.value
   if (date == null) {
     return disabledLabel
   }
@@ -628,7 +641,7 @@ const buildResetDayDisplayDate = (day: number): Date | null => {
 const computeResetBoundary = (day: number, year: number, month: number) => {
   const maxDay = daysInMonth(year, month)
   const effectiveDay = Math.min(day, maxDay)
-  return new Date(year, month, effectiveDay + 1, 0, 0, 0, 0)
+  return new Date(year, month, effectiveDay, 0, 0, 0, 0)
 }
 
 const getNextResetAt = (day: number): Date | null => {
@@ -736,6 +749,7 @@ const applyOverview = (raw: Partial<TrafficOverview>, options: ApplyOverviewOpti
     accumTotal: readNumberField(input, ['accumTotal', 'accum_total'], 0),
     limitGiB: normalizedLimitGiB,
     resetDay: normalizedResetDay,
+    nextResetAt: readNumberField(input, ['nextResetAt', 'next_reset_at'], 0),
     updatedAt: readNumberField(input, ['updatedAt', 'updated_at'], Math.floor(Date.now() / 1000)),
     vnstat,
     error: readStringField(input, ['error'], ''),

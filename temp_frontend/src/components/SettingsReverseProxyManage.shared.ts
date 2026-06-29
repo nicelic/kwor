@@ -215,6 +215,7 @@ export const createEmptyReverseProxyRuleForm = (): ReverseProxyRuleForm => ({
   name: '',
   enabled: true,
   listenProtocol: 'http',
+  listenIPsText: '',
   listenPort: 80,
   hostsText: '',
   pathPrefix: '',
@@ -491,6 +492,7 @@ const normalizeListTextInput = (value: string) => splitInputTokens(value).join('
 
 const trimReverseProxyRuleFormText = (form: ReverseProxyRuleForm) => {
   form.name = form.name.trim()
+  form.listenIPsText = normalizeListTextInput(form.listenIPsText)
   form.hostsText = normalizeListTextInput(form.hostsText)
   form.pathPrefix = form.pathPrefix.trim()
   form.targetAddressesText = normalizeListTextInput(form.targetAddressesText)
@@ -644,7 +646,7 @@ const mapTargetProtocolToBackend = (
     return { targetProtocol: 'http', httpVersionStrategy: '' }
   }
   if (raw === 'wss') {
-    return { targetProtocol: 'https', httpVersionStrategy: 'prefer_h2' }
+    return { targetProtocol: 'https', httpVersionStrategy: '' }
   }
   const normalized = normalizeVirtualProtocol(protocol)
   if (normalized === 'http') {
@@ -677,6 +679,7 @@ export const mapRuleToForm = (rule?: ReverseProxyRule): ReverseProxyRuleForm => 
   const normalizedTargetStrategy = normalizeTargetHTTPVersionStrategy(rule?.httpVersionStrategy ?? '')
   const targetStrategy = (() => {
     if (targetProtocol === 'http') return ''
+    if (targetProtocol === 'wss') return ''
     if (targetProtocol === 'h2') return 'h2_only'
     if (targetProtocol === 'h3') return 'h3_only'
     return normalizedTargetStrategy || 'prefer_h2'
@@ -687,6 +690,7 @@ export const mapRuleToForm = (rule?: ReverseProxyRule): ReverseProxyRuleForm => 
     name: rule?.name ?? '',
     enabled: rule?.enabled ?? true,
     listenProtocol,
+    listenIPsText: normalizeStringList(rule?.listenIPs ?? []).join(', '),
     listenPort: rule?.listenPort ?? 80,
     hostsText: normalizeStringList(rule?.hosts ?? []).join(', '),
     pathPrefix: rule?.pathPrefix ?? '',
@@ -735,6 +739,7 @@ export const buildReverseProxyPayload = (
   const targetPath = form.targetPath.trim()
   const listenDnsPath = form.listenDnsPath.trim()
   const targetDnsPath = form.targetDnsPath.trim()
+  const listenIPsText = normalizeListTextInput(form.listenIPsText)
   const ednsCustomIp = normalizeEDNSCustomIPv4(form.ednsCustomIp)
   const remark = form.remark.trim()
   const listenNames = splitInputTokens(hostsText)
@@ -761,7 +766,7 @@ export const buildReverseProxyPayload = (
     listenProtocol: listenProtocol.listenProtocol,
     listenProtocolAlias: listenProtocol.listenProtocolAlias || listenProtocolAlias,
     listenPort: asNumber(form.listenPort),
-    listenIPs: '',
+    listenIPs: listenIPsText,
     hosts: listenNames.join(', '),
     pathPrefix: normalizePathInput(pathPrefix, true),
     listenDnsPath: dnsProtocolUsesPath(form.listenProtocol) ? normalizePathInput(listenDnsPath, true) : '',
@@ -1092,7 +1097,10 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     if (value === 'wss') return true
     return protocolIsTLS(editingRule.value.listenProtocol)
   })
-  const targetVersionConfigurable = computed(() => !protocolIsDNS(editingRule.value.targetProtocol) && normalizeVirtualProtocol(editingRule.value.targetProtocol) === 'https')
+  const targetVersionConfigurable = computed(() => {
+    if (protocolIsDNS(editingRule.value.targetProtocol)) return false
+    return editingRule.value.targetProtocol !== 'wss' && normalizeVirtualProtocol(editingRule.value.targetProtocol) === 'https'
+  })
   const listenIsDNS = computed(() => protocolIsDNS(editingRule.value.listenProtocol))
   const targetIsDNS = computed(() => protocolIsDNS(editingRule.value.targetProtocol))
   const hasPreviewProtocol = computed(() => {
@@ -1260,7 +1268,7 @@ export function useReverseProxyManage(props: { active?: boolean }) {
         editingRule.value.targetPort = 80
       }
     } else if (value === 'wss') {
-      editingRule.value.httpVersionStrategy = 'prefer_h2'
+      editingRule.value.httpVersionStrategy = ''
       editingRule.value.upstreamTlsVerify = true
       if (!editingRule.value.targetPort || editingRule.value.targetPort === 80) {
         editingRule.value.targetPort = 443

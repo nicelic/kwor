@@ -6,11 +6,11 @@ import (
 	"time"
 )
 
-func TestComputePeriodTag_ResetDay31SwitchesAtNextMonthStart(t *testing.T) {
+func TestComputePeriodTag_ResetDay31SwitchesAtStartOfConfiguredDay(t *testing.T) {
 	loc := time.FixedZone("UTC+8", 8*60*60)
 
-	before := time.Date(2026, time.May, 31, 23, 59, 59, 0, loc)
-	after := time.Date(2026, time.June, 1, 0, 0, 0, 0, loc)
+	before := time.Date(2026, time.May, 30, 23, 59, 59, 0, loc)
+	after := time.Date(2026, time.May, 31, 0, 0, 0, 0, loc)
 
 	beforeTag := computePeriodTag(31, before)
 	afterTag := computePeriodTag(31, after)
@@ -28,11 +28,11 @@ func TestComputePeriodTag_ResetDay31SwitchesAtNextMonthStart(t *testing.T) {
 	}
 }
 
-func TestComputePeriodTag_ResetDay30SwitchesAtMonthEndPlusOne(t *testing.T) {
+func TestComputePeriodTag_ResetDay30SwitchesAtStartOfConfiguredDay(t *testing.T) {
 	loc := time.FixedZone("UTC+8", 8*60*60)
 
-	before := time.Date(2026, time.May, 30, 23, 59, 59, 0, loc)
-	after := time.Date(2026, time.May, 31, 0, 0, 0, 0, loc)
+	before := time.Date(2026, time.May, 29, 23, 59, 59, 0, loc)
+	after := time.Date(2026, time.May, 30, 0, 0, 0, 0, loc)
 
 	beforeTag := computePeriodTag(30, before)
 	afterTag := computePeriodTag(30, after)
@@ -54,8 +54,8 @@ func TestApplyPeriodResetIfNeeded_ResetsOnlyWhenBoundaryChanges(t *testing.T) {
 	loc := time.FixedZone("UTC+8", 8*60*60)
 	resetDay := 30
 
-	before := time.Date(2026, time.May, 30, 12, 0, 0, 0, loc)
-	boundary := time.Date(2026, time.May, 31, 0, 0, 0, 0, loc)
+	before := time.Date(2026, time.May, 29, 12, 0, 0, 0, loc)
+	boundary := time.Date(2026, time.May, 30, 0, 0, 0, 0, loc)
 
 	state := trafficOverviewRuntimeState{
 		PeriodTag:      computePeriodTag(resetDay, before),
@@ -168,11 +168,11 @@ func TestVnstatManagementSupportForRuntimeRejectsNonLinux(t *testing.T) {
 	}
 }
 
-func TestComputePeriodTag_ResetDay1SwitchesAtSecondDayMidnight(t *testing.T) {
+func TestComputePeriodTag_ResetDay1SwitchesAtStartOfMonth(t *testing.T) {
 	loc := time.FixedZone("UTC+8", 8*60*60)
 
-	before := time.Date(2026, time.May, 1, 23, 59, 59, 0, loc)
-	after := time.Date(2026, time.May, 2, 0, 0, 0, 0, loc)
+	before := time.Date(2026, time.April, 30, 23, 59, 59, 0, loc)
+	after := time.Date(2026, time.May, 1, 0, 0, 0, 0, loc)
 
 	beforeTag := computePeriodTag(1, before)
 	afterTag := computePeriodTag(1, after)
@@ -190,11 +190,11 @@ func TestComputePeriodTag_ResetDay1SwitchesAtSecondDayMidnight(t *testing.T) {
 	}
 }
 
-func TestComputePeriodTag_ResetDay25SwitchesAt26Midnight(t *testing.T) {
+func TestComputePeriodTag_ResetDay25SwitchesAtStartOfConfiguredDay(t *testing.T) {
 	loc := time.FixedZone("UTC+8", 8*60*60)
 
-	before := time.Date(2026, time.July, 25, 23, 59, 59, 0, loc)
-	after := time.Date(2026, time.July, 26, 0, 0, 0, 0, loc)
+	before := time.Date(2026, time.July, 24, 23, 59, 59, 0, loc)
+	after := time.Date(2026, time.July, 25, 0, 0, 0, 0, loc)
 
 	beforeTag := computePeriodTag(25, before)
 	afterTag := computePeriodTag(25, after)
@@ -215,8 +215,8 @@ func TestComputePeriodTag_ResetDay25SwitchesAt26Midnight(t *testing.T) {
 func TestComputePeriodTag_ResetDay31FallsBackForShortMonth(t *testing.T) {
 	loc := time.FixedZone("UTC+8", 8*60*60)
 
-	before := time.Date(2025, time.February, 28, 23, 59, 59, 0, loc)
-	after := time.Date(2025, time.March, 1, 0, 0, 0, 0, loc)
+	before := time.Date(2025, time.February, 27, 23, 59, 59, 0, loc)
+	after := time.Date(2025, time.February, 28, 0, 0, 0, 0, loc)
 
 	beforeTag := computePeriodTag(31, before)
 	afterTag := computePeriodTag(31, after)
@@ -231,5 +231,65 @@ func TestComputePeriodTag_ResetDay31FallsBackForShortMonth(t *testing.T) {
 	}
 	if afterTag != fmt.Sprintf("boundary:%d", expectedAfterBoundary.Unix()) {
 		t.Fatalf("unexpected tag after boundary: got %q", afterTag)
+	}
+}
+
+func TestShouldResetClientTrafficMonthly_TriggersAtConfiguredDayMidnight(t *testing.T) {
+	loc := time.FixedZone("UTC+8", 8*60*60)
+
+	beforeBoundary := time.Date(2026, time.July, 4, 23, 59, 59, 0, loc)
+	boundary := time.Date(2026, time.July, 5, 0, 0, 0, 0, loc)
+	lastReset := time.Date(2026, time.June, 5, 0, 0, 0, 0, loc).Unix()
+
+	if shouldResetClientTrafficMonthly(lastReset, 5, beforeBoundary) {
+		t.Fatal("did not expect reset before configured day boundary")
+	}
+	if !shouldResetClientTrafficMonthly(lastReset, 5, boundary) {
+		t.Fatal("expected reset at configured day boundary")
+	}
+}
+
+func TestNextClientMonthlyResetBoundary_UsesCurrentMonthBeforeBoundary(t *testing.T) {
+	loc := time.FixedZone("UTC+8", 8*60*60)
+	now := time.Date(2026, time.July, 4, 23, 59, 59, 0, loc)
+
+	nextBoundary, ok := nextClientMonthlyResetBoundary(5, now)
+	if !ok {
+		t.Fatal("expected next boundary to exist")
+	}
+
+	expected := time.Date(2026, time.July, 5, 0, 0, 0, 0, loc)
+	if !nextBoundary.Equal(expected) {
+		t.Fatalf("next boundary = %v, want %v", nextBoundary, expected)
+	}
+}
+
+func TestNextClientMonthlyResetBoundary_UsesNextMonthAtBoundary(t *testing.T) {
+	loc := time.FixedZone("UTC+8", 8*60*60)
+	now := time.Date(2026, time.July, 5, 0, 0, 0, 0, loc)
+
+	nextBoundary, ok := nextClientMonthlyResetBoundary(5, now)
+	if !ok {
+		t.Fatal("expected next boundary to exist")
+	}
+
+	expected := time.Date(2026, time.August, 5, 0, 0, 0, 0, loc)
+	if !nextBoundary.Equal(expected) {
+		t.Fatalf("next boundary = %v, want %v", nextBoundary, expected)
+	}
+}
+
+func TestNextClientMonthlyResetBoundary_FallsBackToMonthEnd(t *testing.T) {
+	loc := time.FixedZone("UTC+8", 8*60*60)
+	now := time.Date(2025, time.February, 28, 0, 0, 0, 0, loc)
+
+	nextBoundary, ok := nextClientMonthlyResetBoundary(31, now)
+	if !ok {
+		t.Fatal("expected next boundary to exist")
+	}
+
+	expected := time.Date(2025, time.March, 31, 0, 0, 0, 0, loc)
+	if !nextBoundary.Equal(expected) {
+		t.Fatalf("next boundary = %v, want %v", nextBoundary, expected)
 	}
 }

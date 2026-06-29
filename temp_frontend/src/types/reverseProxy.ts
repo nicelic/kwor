@@ -58,6 +58,7 @@ export type ReverseProxyRuleForm = {
   name: string
   enabled: boolean
   listenProtocol: 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
+  listenIPsText: string
   listenPort: number
   hostsText: string
   pathPrefix: string

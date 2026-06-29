@@ -1508,7 +1508,8 @@ func (a *ApiService) RenewAcmeCertificate(c *gin.Context) {
 	}
 
 	payload := service.AcmeRenewPayload{
-		ID: *req.ID,
+		ID:     *req.ID,
+		Manual: true,
 	}
 	if req.Force != nil {
 		payload.Force = *req.Force

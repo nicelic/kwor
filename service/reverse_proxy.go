@@ -255,6 +255,15 @@ type reverseProxyTargetCandidate struct {
 	family     string
 }
 
+func reverseProxyIsWebSocketAlias(alias string) bool {
+	switch strings.ToLower(strings.TrimSpace(alias)) {
+	case "ws", "wss":
+		return true
+	default:
+		return false
+	}
+}
+
 type reverseProxyListenBind struct {
 	network  string
 	listenIP string
@@ -614,7 +623,7 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 		row.ListenProtocol = normalized.listenProtocol
 		row.ListenProtocolAlias = normalized.listenProtocolAlias
 		row.ListenIP = ""
-		row.ListenIPList = ""
+		row.ListenIPList = encodeReverseProxyList(normalized.listenIPs)
 		row.ListenPort = normalized.listenPort
 		row.HostList = encodeReverseProxyList(normalized.hosts)
 		row.PathPrefix = normalized.pathPrefix
@@ -4256,6 +4265,10 @@ func (g *reverseProxyListenerGroup) buildUpstream(rule *model.ReverseProxyRule, 
 	if len(targets) == 0 {
 		return nil, reverseProxyTransportBundle{}, common.NewError("target addresses are empty")
 	}
+	httpVersionStrategy := strings.TrimSpace(rule.HTTPVersionStrategy)
+	if reverseProxyIsWebSocketAlias(rule.TargetProtocolAlias) {
+		httpVersionStrategy = ""
+	}
 	if cached := g.acquireCachedUpstream(rule.Id); cached != nil {
 		return buildReverseProxyTargetURL(rule, cached.HostHeader), reverseProxyTransportBundle{
 			RoundTripper: cached.RoundTripper,
@@ -4268,7 +4281,7 @@ func (g *reverseProxyListenerGroup) buildUpstream(rule *model.ReverseProxyRule, 
 	ctx, cancel := context.WithTimeout(baseCtx, reverseProxyRequestTimeout)
 	defer cancel()
 
-	resolved, serverName, hostHeader, transportMode, err := g.service.pickUpstreamTarget(ctx, strings.TrimSpace(rule.TargetProtocol), targets, rule.TargetPort, rule.IPStrategy, rule.HTTPVersionStrategy, rule.UpstreamTLSVerify)
+	resolved, serverName, hostHeader, transportMode, err := g.service.pickUpstreamTarget(ctx, strings.TrimSpace(rule.TargetProtocol), targets, rule.TargetPort, rule.IPStrategy, httpVersionStrategy, rule.UpstreamTLSVerify)
 	if err != nil {
 		return nil, reverseProxyTransportBundle{}, err
 	}

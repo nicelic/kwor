@@ -392,7 +392,7 @@
     extra: "Traffic Reset Event",
     resetTraffic: "Reset used traffic (applies after save)",
     expiryHint: "Expiry takes effect at 00:00 after the selected date ends",
-    resetEventHint: "0 or empty disables it; selecting 5 resets traffic at 00:00 on the 6th of each month",
+    resetEventHint: "0 or empty disables it; selecting 5 resets traffic at 00:00 on the 5th of each month",
   },
   bulk: {
     order: "Order",

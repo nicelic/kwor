@@ -28,22 +28,23 @@ import (
 )
 
 type TrafficOverview struct {
-	Source     string              `json:"source"`
-	Interface  string              `json:"interface"`
-	Enabled    bool                `json:"enabled"`
-	Status     string              `json:"status"`
-	Available  bool                `json:"available"`
-	Up         int64               `json:"up"`
-	Down       int64               `json:"down"`
-	Total      int64               `json:"total"`
-	AccumUp    int64               `json:"accumUp"`
-	AccumDown  int64               `json:"accumDown"`
-	AccumTotal int64               `json:"accumTotal"`
-	LimitGiB   float64             `json:"limitGiB"`
-	ResetDay   int                 `json:"resetDay"`
-	UpdatedAt  int64               `json:"updatedAt"`
-	Vnstat     VnstatPackageStatus `json:"vnstat"`
-	Error      string              `json:"error,omitempty"`
+	Source      string              `json:"source"`
+	Interface   string              `json:"interface"`
+	Enabled     bool                `json:"enabled"`
+	Status      string              `json:"status"`
+	Available   bool                `json:"available"`
+	Up          int64               `json:"up"`
+	Down        int64               `json:"down"`
+	Total       int64               `json:"total"`
+	AccumUp     int64               `json:"accumUp"`
+	AccumDown   int64               `json:"accumDown"`
+	AccumTotal  int64               `json:"accumTotal"`
+	LimitGiB    float64             `json:"limitGiB"`
+	ResetDay    int                 `json:"resetDay"`
+	NextResetAt int64               `json:"nextResetAt"`
+	UpdatedAt   int64               `json:"updatedAt"`
+	Vnstat      VnstatPackageStatus `json:"vnstat"`
+	Error       string              `json:"error,omitempty"`
 }
 
 type VnstatPackageStatus struct {
@@ -216,6 +217,10 @@ func (s *TrafficOverviewService) GetTrafficOverview() (*TrafficOverview, error) 
 	}
 	overview.LimitGiB = limitGiB
 	overview.ResetDay = resetDay
+	now := time.Now().In(s.getOverviewLocation())
+	if nextResetAt, ok := nextClientMonthlyResetBoundary(resetDay, now); ok && !nextResetAt.IsZero() {
+		overview.NextResetAt = nextResetAt.Unix()
+	}
 	overview.Enabled = enabled
 	overview.Vnstat = s.GetVnstatStatus()
 	if cached, ok := s.getSnapshotForDisplay(); ok {
@@ -268,8 +273,6 @@ func (s *TrafficOverviewService) GetTrafficOverview() (*TrafficOverview, error) 
 		overview.Status = "error"
 		return overview, nil
 	}
-
-	now := time.Now().In(s.getOverviewLocation())
 	trafficOverviewStateMu.Lock()
 	defer trafficOverviewStateMu.Unlock()
 

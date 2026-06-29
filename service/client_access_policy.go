@@ -69,7 +69,7 @@ func computeClientMonthlyResetBoundary(resetDay int, year int, month time.Month,
 		return time.Time{}
 	}
 	effectiveDay := clampResetDayToMonthEnd(resetDay, year, month, loc)
-	return time.Date(year, month, effectiveDay+1, 0, 0, 0, 0, loc)
+	return time.Date(year, month, effectiveDay, 0, 0, 0, 0, loc)
 }
 
 func latestClientMonthlyResetBoundary(resetDay int, now time.Time) (time.Time, bool) {
@@ -87,6 +87,22 @@ func latestClientMonthlyResetBoundary(resetDay int, now time.Time) (time.Time, b
 	firstOfCurrentMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, loc)
 	previousMonth := firstOfCurrentMonth.AddDate(0, -1, 0)
 	return computeClientMonthlyResetBoundary(resetDay, previousMonth.Year(), previousMonth.Month(), loc), true
+}
+
+func nextClientMonthlyResetBoundary(resetDay int, now time.Time) (time.Time, bool) {
+	resetDay = normalizeClientResetDay(resetDay)
+	if resetDay <= 0 {
+		return time.Time{}, false
+	}
+
+	loc := now.Location()
+	currentBoundary := computeClientMonthlyResetBoundary(resetDay, now.Year(), now.Month(), loc)
+	if now.Before(currentBoundary) {
+		return currentBoundary, true
+	}
+
+	firstOfNextMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, loc).AddDate(0, 1, 0)
+	return computeClientMonthlyResetBoundary(resetDay, firstOfNextMonth.Year(), firstOfNextMonth.Month(), loc), true
 }
 
 func shouldResetClientTrafficMonthly(lastReset int64, resetDay int, now time.Time) bool {
