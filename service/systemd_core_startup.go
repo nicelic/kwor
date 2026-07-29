@@ -2,7 +2,6 @@ package service
 
 import (
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
 )
@@ -119,7 +118,7 @@ func waitForSystemdUnitRemainActiveWithReader(
 }
 
 func getSystemdUnitActiveState(unit string) (string, error) {
-	out, err := exec.Command("systemctl", "is-active", unit).CombinedOutput()
+	out, err := runCommandOutputWithTimeout(shortSystemCommandTimeout, "systemctl", "is-active", unit)
 	state := strings.ToLower(strings.TrimSpace(string(out)))
 	if state != "" {
 		return state, nil
@@ -171,8 +170,7 @@ func collectSystemdStartupDiagnostics(unit string, journalLines int) string {
 	}
 
 	var parts []string
-	showOut, showErr := exec.Command(
-		"systemctl",
+	showOut, showErr := runSystemctlOutput(
 		"show",
 		unit,
 		"--property=ActiveState",
@@ -184,21 +182,20 @@ func collectSystemdStartupDiagnostics(unit string, journalLines int) string {
 		"--property=ExecStart",
 		"--property=ExecStopPost",
 		"--property=WorkingDirectory",
-	).CombinedOutput()
+	)
 	if text := strings.TrimSpace(string(showOut)); text != "" {
 		parts = append(parts, "systemctl show:\n"+text)
 	} else if showErr != nil {
 		parts = append(parts, "systemctl show error: "+showErr.Error())
 	}
 
-	journalOut, journalErr := exec.Command(
-		"journalctl",
+	journalOut, journalErr := runCommandOutputWithTimeout(systemCommandTimeout, "journalctl",
 		"-u",
 		unit,
 		"-n",
 		fmt.Sprintf("%d", journalLines),
 		"--no-pager",
-	).CombinedOutput()
+	)
 	if text := strings.TrimSpace(string(journalOut)); text != "" {
 		parts = append(parts, fmt.Sprintf("journalctl -u %s -n %d:\n%s", unit, journalLines, text))
 	} else if journalErr != nil {

@@ -128,6 +128,7 @@ func (s *Server) Start() (err error) {
 	if err != nil {
 		return err
 	}
+	var serverTLSConfig *tls.Config
 	s.setTLSListenerKey(service.PanelCertificateBalanceListenerKey(service.PanelSelfSignedTargetSub, port))
 
 	materials, _, materialErr := service.EnsurePanelTLSMaterials(&s.SettingService, service.PanelSelfSignedTargetSub, time.Now())
@@ -142,9 +143,8 @@ func (s *Server) Start() (err error) {
 			logger.Info("Sub server run http on", listener.Addr())
 		} else {
 			s.setTLSState(certs)
-			c := &tls.Config{
-				GetCertificate: s.getTLSCertificate,
-			}
+			c := network.NewHTTPServerTLSConfig(s.getTLSCertificate)
+			serverTLSConfig = c.Clone()
 			listener = network.NewManagedTLSListener(listener)
 			listener = network.NewAutoHttpsListener(listener)
 			listener = tls.NewListener(listener, c)
@@ -161,8 +161,14 @@ func (s *Server) Start() (err error) {
 	s.listener = listener
 
 	s.httpServer = &http.Server{
-		Handler:   engine,
-		ConnState: s.trackTLSConn,
+		Handler:           engine,
+		TLSConfig:         serverTLSConfig,
+		ReadTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 15 * time.Second,
+		WriteTimeout:      20 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+		ConnState:         s.trackTLSConn,
 	}
 
 	go func() {
@@ -182,6 +188,9 @@ func (s *Server) Stop() error {
 		err = s.httpServer.Shutdown(shutdownCtx)
 		if err != nil {
 			logger.Warning("sub server shutdown error:", err)
+			if closeErr := s.httpServer.Close(); closeErr != nil {
+				logger.Warning("force close sub server failed:", closeErr)
+			}
 		}
 	}
 	if s.listener != nil {
@@ -190,7 +199,7 @@ func (s *Server) Stop() error {
 	}
 	s.releaseAllTLSSelections()
 	s.cancel()
-	return nil
+	return err
 }
 
 func (s *Server) Restart() error {
@@ -250,8 +259,8 @@ func (s *Server) clearTLSState() {
 }
 
 func (s *Server) trackTLSConn(conn net.Conn, state http.ConnState) {
-	managedConn, ok := conn.(*network.ManagedTLSConn)
-	if !ok || managedConn == nil {
+	managedConn := network.ManagedTLSConnFromNetConn(conn)
+	if managedConn == nil {
 		return
 	}
 	switch state {
@@ -462,7 +471,7 @@ func (s *Server) selectBalancedTLSRuntimeCertificate(candidates []*tlsRuntimeCer
 	if len(filtered) == 0 {
 		return nil, service.PanelCertificateBalanceSelection{}
 	}
-	if len(ids) == 0 || strings.TrimSpace(listenerKey) == "" {
+	if len(ids) < 2 || strings.TrimSpace(listenerKey) == "" {
 		return filtered[0], service.PanelCertificateBalanceSelection{}
 	}
 	selectedID, selection, err := s.balanceService.Reserve(listenerKey, sniBucket, ids)

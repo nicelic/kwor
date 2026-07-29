@@ -149,6 +149,12 @@ func buildStoredMihomoRawClashProxy(tag string, outType string, outbound map[str
 	if outbound == nil {
 		return nil, false
 	}
+	if strings.EqualFold(strings.TrimSpace(outType), "shadowquic") {
+		// ShadowQUIC has a closed Mihomo schema. Imported raw Clash payloads
+		// are intentionally not merged back because they may contain fields
+		// unsupported by this protocol.
+		return util.BuildMihomoShadowQUICClashProxy(outbound, tag)
+	}
 
 	if rawProxy, ok := extractStoredMihomoImportedClashProxy(outbound); ok {
 		proxy, generated := buildStoredMihomoImportedClashProxy(tag, outType, outbound)
@@ -440,6 +446,9 @@ func normalizeMihomoGroupMembers(raw interface{}, result *mihomoProxyConversionR
 }
 
 func buildMihomoProxy(tag string, outType string, obMap map[string]interface{}) (map[string]interface{}, bool) {
+	if outType == "shadowquic" {
+		return util.BuildMihomoShadowQUICClashProxy(obMap, tag)
+	}
 	server, _ := obMap["server"].(string)
 	server = strings.TrimSpace(server)
 	serverPort, ok := toInt(obMap["server_port"])

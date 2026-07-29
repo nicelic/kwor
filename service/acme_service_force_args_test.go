@@ -34,3 +34,12 @@ func TestEnsureAcmeFreshIssueArgsDoesNotDuplicateForce(t *testing.T) {
 		t.Fatalf("expected exactly one --force, got count=%d args=%#v", count, got)
 	}
 }
+
+func TestShouldForceAcmeRenewOnlyUsesExplicitForce(t *testing.T) {
+	if shouldForceAcmeRenew(AcmeRenewPayload{Manual: true}) {
+		t.Fatal("manual renew must not imply --force")
+	}
+	if !shouldForceAcmeRenew(AcmeRenewPayload{Force: true}) {
+		t.Fatal("explicit force must request --force")
+	}
+}

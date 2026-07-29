@@ -8,11 +8,8 @@ import (
 	"crypto/x509/pkix"
 	"math/big"
 	"net"
-	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/alireza0/s-ui/database"
 )
 
 func TestCollectSNIMatchingTLSRuntimeCertificates_StrictMatch(t *testing.T) {
@@ -118,17 +115,7 @@ func TestSplitNoSNITLSRuntimeCertificateCandidatesSkipsExpired(t *testing.T) {
 	}
 }
 
-func TestSelectBalancedTLSRuntimeCertificateFallsBackWithoutSelectionOnDBError(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "web-balance-fallback.db")
-	if err := database.OpenDB(dbPath); err != nil {
-		t.Fatalf("open fallback db failed: %v", err)
-	}
-	if sqlDB, err := database.GetDB().DB(); err == nil && sqlDB != nil {
-		t.Cleanup(func() {
-			_ = sqlDB.Close()
-		})
-	}
-
+func TestSelectBalancedTLSRuntimeCertificateUsesInMemorySelection(t *testing.T) {
 	server := NewServer()
 	first := mustTLSRuntimeCertificate(t, []string{"example.com"}, nil, "fp-first")
 	second := mustTLSRuntimeCertificate(t, []string{"example.com"}, nil, "fp-second")
@@ -141,10 +128,10 @@ func TestSelectBalancedTLSRuntimeCertificateFallsBackWithoutSelectionOnDBError(t
 		"example.com",
 	)
 	if selected != first {
-		t.Fatalf("expected fallback to first candidate on db error, got %#v", selected)
+		t.Fatalf("expected first in-memory candidate, got %#v", selected)
 	}
-	if selection.CertificateRecordID != 0 || selection.ListenerKey != "" || selection.SNIBucket != "" {
-		t.Fatalf("expected empty selection on fallback, got %#v", selection)
+	if selection.CertificateRecordID != first.certRecordID || selection.ListenerKey == "" || selection.SNIBucket == "" {
+		t.Fatalf("expected tracked in-memory selection, got %#v", selection)
 	}
 }
 

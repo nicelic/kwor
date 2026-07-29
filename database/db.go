@@ -17,6 +17,32 @@ import (
 
 var db *gorm.DB
 
+// GetPersistedSystemPlatformOS returns the OS captured during the latest
+// panel start. It intentionally never probes the running host.
+func GetPersistedSystemPlatformOS() string {
+	if db == nil {
+		return ""
+	}
+	platform := &model.SystemPlatform{}
+	if err := db.First(platform, 1).Error; err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(platform.OS))
+}
+
+// GetPersistedSystemPlatformArchitecture returns the architecture captured
+// during the latest panel start. It intentionally never probes the host.
+func GetPersistedSystemPlatformArchitecture() string {
+	if db == nil {
+		return ""
+	}
+	platform := &model.SystemPlatform{}
+	if err := db.First(platform, 1).Error; err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(platform.Architecture))
+}
+
 func initUser() error {
 	// Let service.UserService handle first login as registration
 	return nil
@@ -108,11 +134,12 @@ func InitDB(dbPath string) error {
 
 	err = db.AutoMigrate(
 		&model.Setting{},
+		&model.SettingsState{},
+		&model.SystemPlatform{},
 		&model.PanelCertificate{},
 		&model.SelfSignedAuthority{},
 		&model.AcmeAccount{},
 		&model.AcmeDNSAccount{},
-		&model.AcmeCertificate{},
 		&model.CertificateRecord{},
 		&model.Tls{},
 		&model.MihomoTls{},
@@ -136,10 +163,14 @@ func InitDB(dbPath string) error {
 		&model.FirewallRule{},
 		&model.FirewallGeoRule{},
 		&model.PortForwardRule{},
+		&model.PortForwardKernelForwardState{},
 		&model.ReverseProxyRule{},
+		&model.ReverseProxySettings{},
 		&model.ReverseProxyCertificateBalanceState{},
 		&model.PanelCertificateBalanceState{},
 		&model.PortForwardLimitState{},
+		&model.PortForwardRuleTrafficState{},
+		&model.PortForwardOverviewTrafficState{},
 		&model.MihomoClientPortLimitState{},
 		&model.MihomoClientPortBlockState{},
 		&model.ClientInboundTrafficState{},
@@ -153,7 +184,16 @@ func InitDB(dbPath string) error {
 	if err != nil {
 		return err
 	}
+	if err := ensureSettingsStorage(db); err != nil {
+		return err
+	}
+	if err := ensureReverseProxySettingsSingleton(db); err != nil {
+		return err
+	}
 	if err := ensureCertificateRecordIndexes(db); err != nil {
+		return err
+	}
+	if err := ensureAcmeAccountIndexes(db); err != nil {
 		return err
 	}
 	if err := ensureReverseProxyCertificateBalanceIndexes(db); err != nil {
@@ -170,12 +210,67 @@ func InitDB(dbPath string) error {
 	return nil
 }
 
+func ensureSettingsStorage(target *gorm.DB) error {
+	if target == nil {
+		return nil
+	}
+
+	return target.Transaction(func(tx *gorm.DB) error {
+		// Legacy databases may contain duplicate keys. GetAllSetting historically
+		// resolved those by ascending id, so the largest id is the effective row.
+		if err := tx.Exec(`DELETE FROM settings
+			WHERE id NOT IN (
+				SELECT MAX(id) FROM settings GROUP BY key
+			)`).Error; err != nil {
+			return err
+		}
+		if err := tx.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_settings_key_unique ON settings(key)").Error; err != nil {
+			return err
+		}
+
+		state := model.SettingsState{Id: 1, Revision: 1}
+		return tx.Where("id = ?", state.Id).FirstOrCreate(&state).Error
+	})
+}
+
 func GetDB() *gorm.DB {
 	return db
 }
 
 func IsNotFound(err error) bool {
 	return err == gorm.ErrRecordNotFound
+}
+
+// ensureReverseProxySettingsSingleton creates the resource-policy singleton
+// during database initialization.  Its first creation also migrates legacy
+// zero rule values that previously meant the old fixed defaults; later saves
+// keep zero as the deliberate "no additional rule limit" value.
+func ensureReverseProxySettingsSingleton(target *gorm.DB) error {
+	if target == nil {
+		return nil
+	}
+	return target.Transaction(func(tx *gorm.DB) error {
+		settings := model.DefaultReverseProxySettings()
+		var existing model.ReverseProxySettings
+		err := tx.Where("id = ?", settings.Id).First(&existing).Error
+		if err == nil {
+			return nil
+		}
+		if err != nil && !IsNotFound(err) {
+			return err
+		}
+		if err := tx.Create(&settings).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.ReverseProxyRule{}).
+			Where("max_concurrent_requests = ?", 0).
+			Update("max_concurrent_requests", model.ReverseProxyLegacyMaxConcurrentRequests).Error; err != nil {
+			return err
+		}
+		return tx.Model(&model.ReverseProxyRule{}).
+			Where("dns_max_concurrent_queries = ?", 0).
+			Update("dns_max_concurrent_queries", model.ReverseProxyLegacyDNSMaxConcurrentQueries).Error
+	})
 }
 
 func ensureCertificateRecordIndexes(db *gorm.DB) error {
@@ -187,6 +282,23 @@ func ensureCertificateRecordIndexes(db *gorm.DB) error {
 	}
 	createSQL := "CREATE UNIQUE INDEX IF NOT EXISTS idx_certificate_records_display_id_nonzero ON certificate_records(display_id) WHERE display_id > 0"
 	return db.Exec(createSQL).Error
+}
+
+func ensureAcmeAccountIndexes(db *gorm.DB) error {
+	if db == nil {
+		return nil
+	}
+	if db.Migrator().HasTable(&model.AcmeAccount{}) {
+		if err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_acme_accounts_display_id_nonzero ON acme_accounts(display_id) WHERE display_id > 0").Error; err != nil {
+			return err
+		}
+	}
+	if db.Migrator().HasTable(&model.AcmeDNSAccount{}) {
+		if err := db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_acme_dns_accounts_display_id_nonzero ON acme_dns_accounts(display_id) WHERE display_id > 0").Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func ensureReverseProxyCertificateBalanceIndexes(db *gorm.DB) error {

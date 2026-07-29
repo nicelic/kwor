@@ -7,20 +7,25 @@ import (
 
 type DelStatsJob struct {
 	service.StatsService
-	trafficAge int
 }
 
-func NewDelStatsJob(ta int) *DelStatsJob {
-	return &DelStatsJob{
-		trafficAge: ta,
-	}
+func NewDelStatsJob() *DelStatsJob {
+	return &DelStatsJob{}
 }
 
 func (s *DelStatsJob) Run() {
-	err := s.StatsService.DelOldStats(s.trafficAge)
+	trafficAge, err := (&service.SettingService{}).GetTrafficAge()
+	if err != nil {
+		logger.Warning("failed to load trafficAge for cleanup job: ", err)
+		return
+	}
+	if trafficAge <= 0 {
+		return
+	}
+	err = s.StatsService.DelOldStats(trafficAge)
 	if err != nil {
 		logger.Warning("Deleting old statistics failed: ", err)
 		return
 	}
-	logger.Debug("Stats older than ", s.trafficAge, " days were deleted")
+	logger.Debug("Stats older than ", trafficAge, " days were deleted")
 }

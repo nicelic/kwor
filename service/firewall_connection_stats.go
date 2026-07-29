@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 )
@@ -17,6 +16,14 @@ type firewallConnectionStats struct {
 	TCPAnomalyTotal     int64
 	UDPSocketCount      int
 	UDPAnomalyTotal     int64
+}
+
+func clampFirewallCounter(value uint64) int64 {
+	const maxInt64 = uint64(1<<63 - 1)
+	if value > maxInt64 {
+		return int64(maxInt64)
+	}
+	return int64(value)
 }
 
 const (
@@ -43,7 +50,7 @@ var defaultFirewallConnectionStatSources = firewallConnectionStatSources{
 }
 
 func readFirewallConnectionStats() (firewallConnectionStats, error) {
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return firewallConnectionStats{}, nil
 	}
 	return readFirewallConnectionStatsFromSources(defaultFirewallConnectionStatSources)
@@ -85,13 +92,13 @@ func readFirewallConnectionStatsFromSources(sources firewallConnectionStatSource
 		appendReadError(sources.tcpExtPath, err)
 	} else {
 		tcpAnomalyTotal := tcpExtStats["SyncookiesSent"] + tcpExtStats["ListenOverflows"] + tcpExtStats["ListenDrops"]
-		stats.TCPAnomalyTotal = clampInt64FromUint64(tcpAnomalyTotal)
+		stats.TCPAnomalyTotal = clampFirewallCounter(tcpAnomalyTotal)
 	}
 	if udpStats, err := readProcNetProtocolStats(sources.udpStatPath, "Udp"); err != nil {
 		appendReadError(sources.udpStatPath, err)
 	} else {
 		udpAnomalyTotal := udpStats["NoPorts"] + udpStats["InErrors"] + udpStats["RcvbufErrors"]
-		stats.UDPAnomalyTotal = clampInt64FromUint64(udpAnomalyTotal)
+		stats.UDPAnomalyTotal = clampFirewallCounter(udpAnomalyTotal)
 	}
 
 	stats.TCPActiveCount = tcpCounts.activeCount()

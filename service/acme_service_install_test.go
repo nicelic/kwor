@@ -388,6 +388,9 @@ func TestRemoveManagedAcmePreservesExternalScriptSetting(t *testing.T) {
 	if err := svc.setString(acmeScriptPathKey, externalScript); err != nil {
 		t.Fatalf("save external script path failed: %v", err)
 	}
+	if isManagedAcmeInstallation(externalScript, externalRoot) {
+		t.Fatal("external acme.sh must not be treated as a managed installation")
+	}
 
 	if _, err := svc.removeManagedAcmeWithOptionsLocked(acmeRemoveOptions{}); err != nil {
 		t.Fatalf("removeManagedAcmeWithOptionsLocked failed: %v", err)

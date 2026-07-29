@@ -11,7 +11,6 @@ import (
 	"math/big"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -190,7 +189,7 @@ func detectPublicIPForPanelCert() panelIPDetectResult {
 	var anyCommandSucceeded bool
 
 	for _, command := range commands {
-		output, err := exec.Command(command[0], command[1:]...).Output()
+		output, err := runCommandOutputWithTimeout(shortSystemCommandTimeout, command[0], command[1:]...)
 		if err != nil {
 			continue
 		}

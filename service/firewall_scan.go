@@ -28,7 +28,10 @@ func scanExternalFirewallRules() ([]firewallObservedRule, error) {
 		return nil, nil
 	}
 
-	out, err := runNft("--handle", "--numeric", "list", "ruleset")
+	// A second --numeric keeps transport ports numeric as well. nftables 0.7
+	// already supports repeated -n/--numeric; without it, service names such
+	// as "https" cannot be parsed back into the panel's numeric port model.
+	out, err := runNft("--handle", "--numeric", "--numeric", "list", "ruleset")
 	if err != nil {
 		return nil, err
 	}

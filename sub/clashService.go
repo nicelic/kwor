@@ -30,6 +30,14 @@ type clashSelectorGroupConfig struct {
 	DefaultOutbound string
 }
 
+type clashExtensionContext struct {
+	Config           map[string]interface{}
+	LatencyURL       string
+	LatencyInterval  int
+	LatencyTolerance int
+	SelectorGroups   []clashSelectorGroupConfig
+}
+
 const (
 	clashNodeSelectorTag         = "节点选择"
 	clashAutoSelectorTag         = "自动选择"
@@ -102,44 +110,6 @@ func sanitizeLegacyClashSelectorValue(value interface{}) interface{} {
 	}
 }
 
-const basicClashConfig = `mixed-port: 7890
-allow-lan: false
-mode: rule
-log-level: info
-external-controller: 127.0.0.1:9090
-tun:
-  enable: true
-  stack: system
-  auto-route: true
-  auto-detect-interface: true
-  dns-hijack:
-    - any:53
-dns:
-  enable: true
-  ipv6: false
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/15
-  default-nameserver:
-    - udp://223.5.5.5
-    - udp://223.6.6.6
-  nameserver:
-    - "udp://8.8.8.8#\u8282\u70b9\u9009\u62e9"
-    - "tcp://8.8.8.8#\u8282\u70b9\u9009\u62e9"
-  fallback:
-    - "udp://8.8.4.4#\u8282\u70b9\u9009\u62e9"
-    - "tcp://8.8.4.4#\u8282\u70b9\u9009\u62e9"
-  proxy-server-nameserver:
-    - udp://223.5.5.5
-    - udp://223.6.6.6
-  fake-ip-filter:
-    - "*.lan"
-    - localhost
-    - "*.local"
-rules:
-  - GEOIP,Private,DIRECT
-  - MATCH,节点选择
-`
-
 func (s *ClashService) GetClash(subId string) (*string, []string, error) {
 	client, inDatas, err := s.getData(subId)
 	if err != nil {
@@ -176,7 +146,7 @@ func normalizeMihomoClashSubscriptionOutbounds(outbounds *[]map[string]interface
 }
 
 func (s *ClashService) buildClashSubscription(client *model.Client, inDatas []*model.Inbound, isMihomo bool) (*string, []string, error) {
-	namespace := "default"
+	namespace := "clash"
 	if isMihomo {
 		namespace = "mihomo"
 	}
@@ -206,21 +176,25 @@ func (s *ClashService) buildClashSubscription(client *model.Client, inDatas []*m
 	// apply client-level serverIp override to all real proxy outbounds.
 	s.JsonService.overrideServerIP(outbounds, client.ServerIp)
 
-	// 读取并处理 clash 配置
-	othersStr, latencyUrl, latencyInterval, latencyTolerance, selectorGroups, err := s.getClashConfigClean()
-	if err != nil || len(othersStr) == 0 {
-		othersStr = basicClashConfig
-		latencyUrl = defaultLatencyURL
-		latencyInterval = defaultLatencyInterval
-		latencyTolerance = defaultLatencyTolerance
-		selectorGroups = nil
-	}
-
-	result, err := s.convertToClashMeta(outbounds, latencyUrl, latencyInterval, latencyTolerance, selectorGroups, isMihomo)
+	extension, err := s.loadClashExtension()
 	if err != nil {
 		return nil, nil, err
 	}
-	resultStr := othersStr + "\n" + string(result)
+	generated, err := s.convertToClashMetaMap(
+		outbounds,
+		extension.LatencyURL,
+		extension.LatencyInterval,
+		extension.LatencyTolerance,
+		extension.SelectorGroups,
+		isMihomo,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	resultStr, err := renderMergedClashSubscription(extension.Config, generated)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	updateInterval, _ := s.SettingService.GetSubUpdates()
 	headers := util.GetHeaders(client, updateInterval)
@@ -228,73 +202,120 @@ func (s *ClashService) buildClashSubscription(client *model.Client, inDatas []*m
 	return &resultStr, headers, nil
 }
 
-// getClashConfigClean 读取 subClashExt，清理 _uiConfig，提取延迟测试参数和命名策略组。
-func (s *ClashService) getClashConfigClean() (string, string, int, int, []clashSelectorGroupConfig, error) {
+func (s *ClashService) loadClashExtension() (*clashExtensionContext, error) {
 	subClashExt, err := s.SettingService.GetSubClashExt()
 	if err != nil {
-		return "", "", 0, 0, nil, err
+		return nil, err
 	}
-
-	if len(subClashExt) == 0 {
-		return "", "", 0, 0, nil, nil
-	}
-
-	// 默认值
-	latencyUrl := defaultLatencyURL
-	latencyInterval := defaultLatencyInterval
-	latencyTolerance := defaultLatencyTolerance
-	var selectorGroups []clashSelectorGroupConfig
-
-	// 解析 YAML
-	var clashConfig map[string]interface{}
-	err = yaml.Unmarshal([]byte(subClashExt), &clashConfig)
+	clashConfig, err := service.ParseSubClashExtension(subClashExt)
 	if err != nil {
-		// 解析失败，返回原始字符串
-		return replaceLegacyClashSelectorTagsInString(subClashExt), latencyUrl, latencyInterval, latencyTolerance, nil, nil
+		return nil, err
+	}
+	if err := service.ValidateSubClashExtension(clashConfig); err != nil {
+		return nil, err
 	}
 	if normalizedConfig, ok := sanitizeLegacyClashSelectorValue(clashConfig).(map[string]interface{}); ok && normalizedConfig != nil {
 		clashConfig = normalizedConfig
 	}
+	context := &clashExtensionContext{
+		Config:           clashConfig,
+		LatencyURL:       defaultLatencyURL,
+		LatencyInterval:  defaultLatencyInterval,
+		LatencyTolerance: defaultLatencyTolerance,
+	}
 
-	// 从 _uiConfig 提取延迟测试参数
 	if uiConfig, ok := clashConfig["_uiConfig"].(map[string]interface{}); ok {
-		selectorGroups = parseClashSelectorGroupsFromUI(uiConfig)
+		context.SelectorGroups = parseClashSelectorGroupsFromUI(uiConfig)
 		if u, ok := uiConfig["latencyTestUrl"].(string); ok && u != "" {
-			latencyUrl = u
+			context.LatencyURL = u
 		}
 		if i, ok := uiConfig["latencyTestInterval"].(string); ok && i != "" {
-			// mihomo latency-test interval: only accepts seconds with "s" suffix.
 			parsed := parseMihomoLatencyIntervalSeconds(i)
 			if parsed > 0 {
-				latencyInterval = parsed
+				context.LatencyInterval = parsed
 			}
 		}
-		if t, ok := uiConfig["latencyTolerance"].(string); ok && t != "" {
-			val := 0
-			fmt.Sscanf(t, "%d", &val)
-			if val > 0 {
-				latencyTolerance = val
-			}
-		}
-		// 兼容数字类型
-		if t, ok := uiConfig["latencyTolerance"].(int); ok && t > 0 {
-			latencyTolerance = t
+		if value, ok := toInt(uiConfig["latencyTolerance"]); ok && value > 0 {
+			context.LatencyTolerance = value
 		}
 	}
 
-	// 删除 _uiConfig（不应出现在最终订阅输出中）
 	delete(clashConfig, "_uiConfig")
 	if normalized, ok := normalizeNumericTypesForYAML(clashConfig).(map[string]interface{}); ok && normalized != nil {
-		clashConfig = normalized
+		context.Config = normalized
+	}
+	return context, nil
+}
+
+func renderMergedClashSubscription(extension map[string]interface{}, generated map[string]interface{}) (string, error) {
+	merged := make(map[string]interface{}, len(extension)+len(generated))
+	for key, value := range extension {
+		if key != "_uiConfig" {
+			merged[key] = value
+		}
+	}
+	for key, value := range generated {
+		switch key {
+		case "proxies", "proxy-groups":
+			merged[key] = mergeNamedClashEntries(merged[key], value)
+		default:
+			merged[key] = value
+		}
 	}
 
-	// 重新序列化为 YAML
-	cleanYaml, err := yaml.Marshal(clashConfig)
+	raw, err := yaml.Marshal(merged)
 	if err != nil {
-		return subClashExt, latencyUrl, latencyInterval, latencyTolerance, selectorGroups, nil
+		return "", fmt.Errorf("serialize Clash subscription: %w", err)
 	}
+	return string(util.CompactSudokuCustomTablesFlowYAML(raw)), nil
+}
 
-	return string(cleanYaml), latencyUrl, latencyInterval, latencyTolerance, selectorGroups, nil
+func mergeNamedClashEntries(extension interface{}, generated interface{}) []interface{} {
+	result := make([]interface{}, 0)
+	positions := map[string]int{}
+	appendEntries := func(raw interface{}, generatedEntry bool) {
+		for _, item := range clashSequenceItems(raw) {
+			entry, ok := item.(map[string]interface{})
+			if !ok || entry == nil {
+				result = append(result, item)
+				continue
+			}
+			name := strings.TrimSpace(firstString(entry["name"]))
+			if name == "" {
+				result = append(result, entry)
+				continue
+			}
+			if index, exists := positions[name]; exists {
+				// The latest extension entry wins extension duplicates, and every
+				// generated entry wins a same-name extension entry.
+				result[index] = entry
+				continue
+			}
+			positions[name] = len(result)
+			result = append(result, entry)
+			_ = generatedEntry
+		}
+	}
+	appendEntries(extension, false)
+	appendEntries(generated, true)
+	return result
+}
+
+func clashSequenceItems(raw interface{}) []interface{} {
+	switch typed := raw.(type) {
+	case nil:
+		return nil
+	case []interface{}:
+		return typed
+	case []map[string]interface{}:
+		items := make([]interface{}, 0, len(typed))
+		for _, item := range typed {
+			items = append(items, item)
+		}
+		return items
+	default:
+		return []interface{}{typed}
+	}
 }
 
 // parseMihomoLatencyIntervalSeconds parses latency-test interval for mihomo.
@@ -586,6 +607,18 @@ func (s *ClashService) ConvertToClashMeta(outbounds *[]map[string]interface{}, l
 }
 
 func (s *ClashService) convertToClashMeta(outbounds *[]map[string]interface{}, latencyUrl string, latencyInterval int, latencyTolerance int, selectorGroups []clashSelectorGroupConfig, isMihomo bool) ([]byte, error) {
+	output, err := s.convertToClashMetaMap(outbounds, latencyUrl, latencyInterval, latencyTolerance, selectorGroups, isMihomo)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := yaml.Marshal(output)
+	if err != nil {
+		return nil, err
+	}
+	return util.CompactSudokuCustomTablesFlowYAML(raw), nil
+}
+
+func (s *ClashService) convertToClashMetaMap(outbounds *[]map[string]interface{}, latencyUrl string, latencyInterval int, latencyTolerance int, selectorGroups []clashSelectorGroupConfig, isMihomo bool) (map[string]interface{}, error) {
 	proxies := make([]interface{}, 0, len(*outbounds))
 	proxyTags := make([]string, 0, len(*outbounds))
 	outboundByTag := make(map[string]map[string]interface{}, len(*outbounds))
@@ -607,6 +640,13 @@ func (s *ClashService) convertToClashMeta(outbounds *[]map[string]interface{}, l
 		tag, _ := obMap["tag"].(string)
 		tag = strings.TrimSpace(tag)
 		if tag == "" {
+			continue
+		}
+		if outType == "shadowquic" {
+			if proxy, ok := util.BuildMihomoShadowQUICClashProxy(obMap, tag); ok {
+				proxies = append(proxies, proxy)
+				proxyTags = append(proxyTags, tag)
+			}
 			continue
 		}
 
@@ -1273,11 +1313,7 @@ func (s *ClashService) convertToClashMeta(outbounds *[]map[string]interface{}, l
 		output = normalized
 	}
 	util.ApplySudokuCustomTablesFlowYAML(output)
-	raw, err := yaml.Marshal(output)
-	if err != nil {
-		return nil, err
-	}
-	return util.CompactSudokuCustomTablesFlowYAML(raw), nil
+	return output, nil
 }
 
 func buildClashShadowTLSSSProxy(ssOutbound map[string]interface{}, shadowTLSOutbound map[string]interface{}, isMihomo bool) (map[string]interface{}, bool) {
@@ -1798,6 +1834,9 @@ func toInt(raw interface{}) (int, bool) {
 		return int(value), true
 	case float64:
 		return int(value), true
+	case json.Number:
+		num, err := strconv.Atoi(string(value))
+		return num, err == nil
 	case string:
 		value = strings.TrimSpace(value)
 		if value == "" {

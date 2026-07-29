@@ -114,6 +114,146 @@ func TestBuildMihomoClashOptions_Hysteria2OmitsFastOpenAndUnsetBandwidth(t *test
 	}
 }
 
+func TestMihomoBuildSyncedOutboundStripsPanelFieldsBeforeCaching(t *testing.T) {
+	svc := &MihomoSyncService{}
+	inbound := &model.MihomoInbound{
+		Type: "trojan",
+		Tag:  "trojan-mihomo-sync",
+		OutJson: json.RawMessage(`{
+			"type": "trojan",
+			"tag": "trojan-mihomo-sync",
+			"server": "panel.example.com",
+			"server_port": 443,
+			"metadata": {"source": "legacy"},
+			"route_tag": "trojan-mihomo-sync",
+			"user_management": {"selectable": true},
+			"users": [{"username": "legacy"}]
+		}`),
+		Options: json.RawMessage(`{}`),
+	}
+	config := map[string]interface{}{
+		"trojan": map[string]interface{}{
+			"username":   "alice",
+			"password":   "client-secret",
+			"metadata":   map[string]interface{}{"source": "client"},
+			"unexpected": "must-not-leak",
+		},
+	}
+
+	outbound, clashSource, err := svc.buildSyncedOutbound(nil, inbound, config, "alice", "", true)
+	if err != nil {
+		t.Fatalf("buildSyncedOutbound returned error: %v", err)
+	}
+	for _, payload := range []map[string]interface{}{outbound, clashSource} {
+		for _, key := range []string{"metadata", "route_tag", "user_management", "users", "unexpected"} {
+			if _, exists := payload[key]; exists {
+				t.Fatalf("Mihomo synced payload leaked %q: %#v", key, payload)
+			}
+		}
+		if got, _ := payload["username"].(string); got != "alice" {
+			t.Fatalf("expected Mihomo username to remain, got %#v", payload["username"])
+		}
+		if got, _ := payload["password"].(string); got != "client-secret" {
+			t.Fatalf("expected client password to remain, got %#v", payload["password"])
+		}
+	}
+}
+
+func TestDefaultAndMihomoSyncExcludeMixedListeners(t *testing.T) {
+	db := setupMihomoSyncTestDB(t, "mixed-sync-exclusion.db")
+
+	defaultInbound := &model.Inbound{
+		Type:    "mixed",
+		Tag:     "default-mixed",
+		Options: mustJSONRaw(t, map[string]interface{}{"listen_port": 1080}),
+		OutJson: mustJSONRaw(t, map[string]interface{}{"type": "mixed", "tag": "default-mixed"}),
+	}
+	if err := db.Create(defaultInbound).Error; err != nil {
+		t.Fatalf("create default mixed inbound failed: %v", err)
+	}
+	defaultClient := &model.Client{
+		Enable:   true,
+		Name:     "default-mixed-client",
+		Config:   mustJSONRaw(t, map[string]interface{}{"mixed": map[string]interface{}{"username": "alice", "password": "secret"}}),
+		Inbounds: mustJSONRaw(t, []uint{defaultInbound.Id}),
+		Links:    mustJSONRaw(t, []interface{}{}),
+	}
+	if err := db.Create(defaultClient).Error; err != nil {
+		t.Fatalf("create default mixed client failed: %v", err)
+	}
+	defaultLegacyTag := buildManagedClientSubTag(defaultInbound.Tag, defaultClient.Name)
+	if err := db.Create(&model.SubOutbound{
+		Type:            "mixed",
+		Tag:             defaultLegacyTag,
+		SourceType:      subOutboundSourceClient,
+		SourceClientId:  defaultClient.Id,
+		SourceInboundId: defaultInbound.Id,
+		RawOutbound:     mustJSONRaw(t, map[string]interface{}{"type": "mixed", "tag": defaultLegacyTag}),
+	}).Error; err != nil {
+		t.Fatalf("create default mixed legacy suboutbound failed: %v", err)
+	}
+
+	result, err := (&SyncService{}).SyncClientToSubManager(defaultClient.Name, "panel.example.com")
+	if err != nil {
+		t.Fatalf("default mixed sync failed: %v", err)
+	}
+	if result == nil || result.Count != 0 {
+		t.Fatalf("default mixed sync result = %#v, want zero projected nodes", result)
+	}
+	var count int64
+	if err := db.Model(model.SubOutbound{}).Where("source_type = ? AND source_client_id = ? AND source_inbound_id = ?", subOutboundSourceClient, defaultClient.Id, defaultInbound.Id).Count(&count).Error; err != nil {
+		t.Fatalf("count default mixed suboutbounds failed: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("default mixed listener must not remain in SubManager, got %d records", count)
+	}
+
+	mihomoInbound := &model.MihomoInbound{
+		Type:    "mixed",
+		Tag:     "mihomo-mixed",
+		Options: mustJSONRaw(t, map[string]interface{}{"listen_port": 1081}),
+		OutJson: mustJSONRaw(t, map[string]interface{}{"type": "mixed", "tag": "mihomo-mixed"}),
+	}
+	if err := db.Create(mihomoInbound).Error; err != nil {
+		t.Fatalf("create Mihomo mixed inbound failed: %v", err)
+	}
+	mihomoClient := &model.MihomoClient{
+		Enable:   true,
+		Name:     "mihomo-mixed-client",
+		Config:   mustJSONRaw(t, map[string]interface{}{"mixed": map[string]interface{}{"username": "alice", "password": "secret"}}),
+		Inbounds: mustJSONRaw(t, []uint{mihomoInbound.Id}),
+		Links:    mustJSONRaw(t, []interface{}{}),
+	}
+	if err := db.Create(mihomoClient).Error; err != nil {
+		t.Fatalf("create Mihomo mixed client failed: %v", err)
+	}
+	mihomoLegacyTag := buildMihomoClientSubTag(mihomoInbound.Tag, mihomoClient.Name)
+	if err := db.Create(&model.SubOutbound{
+		Type:            "mixed",
+		Tag:             mihomoLegacyTag,
+		SourceType:      subOutboundSourceMihomoClient,
+		SourceClientId:  mihomoClient.Id,
+		SourceInboundId: mihomoInbound.Id,
+		RawOutbound:     mustJSONRaw(t, map[string]interface{}{"type": "mixed", "tag": mihomoLegacyTag}),
+	}).Error; err != nil {
+		t.Fatalf("create Mihomo mixed legacy suboutbound failed: %v", err)
+	}
+
+	result, err = (&MihomoSyncService{}).SyncClientToSubManager(mihomoClient.Name, "panel.example.com")
+	if err != nil {
+		t.Fatalf("Mihomo mixed sync failed: %v", err)
+	}
+	if result == nil || result.Count != 0 {
+		t.Fatalf("Mihomo mixed sync result = %#v, want zero projected nodes", result)
+	}
+	if err := db.Model(model.SubOutbound{}).Where("source_type = ? AND source_client_id = ? AND source_inbound_id = ?", subOutboundSourceMihomoClient, mihomoClient.Id, mihomoInbound.Id).Count(&count).Error; err != nil {
+		t.Fatalf("count Mihomo mixed suboutbounds failed: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("Mihomo mixed listener must not remain in SubManager, got %d records", count)
+	}
+}
+
 func TestBuildMihomoLegacySubTags(t *testing.T) {
 	tags := buildMihomoLegacySubTags([]string{"hk2", "hk2", "hk3"}, "hy2_hk2")
 	lookup := map[string]bool{}

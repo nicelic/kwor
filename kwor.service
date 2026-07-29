@@ -1,9 +1,12 @@
+# kwor-owner:v1 resource=panel-systemd
 [Unit]
 Description=kwor Service
 After=network.target nss-lookup.target
 
 [Service]
 Type=simple
+Environment=KWOR_INTERNAL_SYSTEMD=1
+ExecCondition=/usr/local/kwor/kwor lifecycle-guard
 WorkingDirectory=/usr/local/kwor/
 ExecStart=/usr/local/kwor/kwor
 Restart=on-failure

@@ -42,18 +42,18 @@
               <Listen
                 :data="inbound"
                 :inTags="inTags"
-                :disable-detour-option="isMihomoShadowTLS"
-                :disable-tcp-options="isMihomoShadowTLS"
-                :disable-udp-options="isMihomoShadowTLS"
+                :disable-detour-option="isMihomoShadowProtocol"
+                :disable-tcp-options="isMihomoShadowProtocol"
+                :disable-udp-options="isMihomoShadowProtocol"
                 v-if="inbound.type == inTypes.TrustTunnel"
                 @listen-port-blur="handleListenPortBlur"
               />
               <Listen
                 :data="inbound"
                 :inTags="inTags"
-                :disable-detour-option="isMihomoShadowTLS"
-                :disable-tcp-options="isMihomoShadowTLS"
-                :disable-udp-options="isMihomoShadowTLS"
+                :disable-detour-option="isMihomoShadowProtocol"
+                :disable-tcp-options="isMihomoShadowProtocol"
+                :disable-udp-options="isMihomoShadowProtocol"
                 v-if="inbound.type != inTypes.Tun && inbound.type != inTypes.Mieru && inbound.type != inTypes.TrustTunnel"
                 @listen-port-blur="handleListenPortBlur"
               />
@@ -79,6 +79,7 @@
               <TrustTunnel v-if="inbound.type == inTypes.TrustTunnel" direction="in" :data="inbound" />
               <Naive v-if="inbound.type == inTypes.Naive" :inbound="inbound" :tls-configs="tlsConfigs" />
               <ShadowTls v-if="inbound.type == inTypes.ShadowTLS" direction="in" :data="inbound" :namespace="namespace" />
+              <ShadowQuic v-if="inbound.type == inTypes.ShadowQUIC" direction="in" :data="inbound" />
               <Tuic v-if="inbound.type == inTypes.TUIC" direction="in" :data="inbound" :namespace="namespace" />
               <Tun v-if="inbound.type == inTypes.Tun" :data="inbound" />
               <AnyTls v-if="inbound.type == inTypes.AnyTls" :data="inbound" direction="in" />
@@ -170,7 +171,8 @@
               <Multiplex v-if="Object.hasOwn(inbound,'multiplex')" direction="in" :data="inbound" />
             </v-window-item>
             <v-window-item value="c">
-              <OutJsonVue v-if="inbound.type != inTypes.Mieru && inbound.type != inTypes.Sudoku" :inData="inbound" :type="inbound.type" :namespace="namespace" @port-hop-range-blur="handlePortHopRangeBlur" />
+              <OutJsonVue v-if="inbound.type != inTypes.Mieru && inbound.type != inTypes.Sudoku && inbound.type != inTypes.ShadowQUIC" :inData="inbound" :type="inbound.type" :namespace="namespace" @port-hop-range-blur="handlePortHopRangeBlur" />
+              <ShadowQuic v-else-if="inbound.type == inTypes.ShadowQUIC" direction="out_json" :data="inbound.out_json" />
               <Mieru v-else-if="inbound.type == inTypes.Mieru" :data="inbound.out_json" direction="out_json" :namespace="namespace" />
               <Sudoku v-else :data="inbound.out_json" direction="out_json" />
               <Snell
@@ -266,6 +268,7 @@ import Hysteria2 from '@/components/protocols/Hysteria2.vue'
 import TrustTunnel from '@/components/protocols/TrustTunnel.vue'
 import Naive from '@/components/protocols/Naive.vue'
 import ShadowTls from '@/components/protocols/ShadowTls.vue'
+import ShadowQuic from '@/components/protocols/ShadowQuic.vue'
 import Tuic from '@/components/protocols/Tuic.vue'
 import Tun from '@/components/protocols/Tun.vue'
 import AnyTls from '@/components/protocols/AnyTls.vue'
@@ -303,7 +306,7 @@ export default {
       side: "s",
       inTypes: InTypes,
       mihomoUnsupportedTypes: ['direct', 'naive', 'hysteria'],
-      defaultUnsupportedTypes: [InTypes.Snell, InTypes.Mieru, InTypes.Sudoku, InTypes.TrustTunnel],
+      defaultUnsupportedTypes: [InTypes.Snell, InTypes.Mieru, InTypes.Sudoku, InTypes.TrustTunnel, InTypes.ShadowQUIC],
       stlsFingerprints: [
         { title: "Chrome", value: "chrome" },
         { title: "Firefox", value: "firefox" },
@@ -316,7 +319,7 @@ export default {
         { title: "Random", value: "random" },
         { title: "Randomized", value: "randomized" },
       ],
-      inboundWithUsers: ['mixed', 'socks', 'http', 'snell', 'shadowsocks', 'vmess', 'trojan', 'naive', 'hysteria', 'shadowtls', 'tuic', 'hysteria2', 'vless', 'anytls', 'mieru', 'sudoku'],
+      inboundWithUsers: ['mixed', 'socks', 'http', 'snell', 'shadowsocks', 'vmess', 'trojan', 'naive', 'hysteria', 'shadowtls', 'shadowquic', 'tuic', 'hysteria2', 'vless', 'anytls', 'mieru', 'sudoku'],
       initUsers: {
         model: 'none',
         values: <any>[],
@@ -329,6 +332,7 @@ export default {
         InTypes.Shadowsocks,
         InTypes.VMess,
         InTypes.ShadowTLS,
+        InTypes.ShadowQUIC,
         InTypes.Trojan,
         InTypes.Hysteria,
         InTypes.VLESS,
@@ -944,6 +948,7 @@ export default {
       this.initMihomoFastOpenDefaults()
       this.initShadowTlsClientDefaults()
       this.sanitizeMihomoShadowTLSUnsupportedFields()
+      this.sanitizeMihomoShadowQUICUnsupportedFields()
       this.initAnyTlsClientDefaults()
       this.initTrustTunnelClientDefaults()
       this.initNaiveClientDefaults()
@@ -1112,6 +1117,62 @@ export default {
         })
       }
     },
+    sanitizeMihomoShadowQUICUnsupportedFields() {
+      if (this.namespace !== 'mihomo' || this.inbound.type !== this.inTypes.ShadowQUIC) return
+      const inbound = this.inbound as any
+      inbound.tls_id = 0
+      delete inbound.tls
+      for (const key of [
+        'routing_mark', 'routing-mark', 'rule', 'proxy', 'detour',
+        'tcp_fast_open', 'tcp_multi_path', 'udp_fragment', 'udp_timeout',
+      ]) {
+        delete inbound[key]
+      }
+      if (inbound['jls-upstream'] && typeof inbound['jls-upstream'] === 'object' && !Array.isArray(inbound['jls-upstream'])) {
+        inbound.jls_upstream = { ...inbound['jls-upstream'], ...(inbound.jls_upstream ?? {}) }
+      }
+      delete inbound['jls-upstream']
+      if (inbound.jls_upstream && typeof inbound.jls_upstream === 'object' && !Array.isArray(inbound.jls_upstream)) {
+        const upstream = inbound.jls_upstream as Record<string, any>
+        for (const key of ['addr', 'sni', 'proxy']) {
+          if (typeof upstream[key] !== 'string') continue
+          const value = upstream[key].trim()
+          if (value === '') delete upstream[key]
+          else upstream[key] = key === 'proxy' && value.toLowerCase() === 'direct' ? 'DIRECT' : value
+        }
+        if (Object.keys(upstream).length === 0) delete inbound.jls_upstream
+      }
+      if (inbound.out_json && typeof inbound.out_json === 'object') {
+        delete inbound.out_json.tls
+      }
+    },
+    validateMihomoShadowQUICJLSUpstream(): boolean {
+      if (this.namespace !== 'mihomo' || this.inbound.type !== this.inTypes.ShadowQUIC) return true
+      const addr = typeof (this.inbound as any).jls_upstream?.addr === 'string'
+        ? (this.inbound as any).jls_upstream.addr.trim()
+        : ''
+      let host = ''
+      let portText = ''
+      const ipv6Match = addr.match(/^\[([^\]]+)\]:(\d+)$/)
+      const hostMatch = addr.match(/^([^:\s]+):(\d+)$/)
+      if (ipv6Match) {
+        host = ipv6Match[1]
+        portText = ipv6Match[2]
+      } else if (hostMatch) {
+        host = hostMatch[1]
+        portText = hostMatch[2]
+      }
+      const port = Number(portText)
+      if (host === '' || !Number.isInteger(port) || port < 1 || port > 65535) {
+        push.warning({
+          title: 'ShadowQUIC',
+          duration: 7000,
+          message: 'JLS 上游地址必填，格式为 host:port 或 [IPv6]:port。',
+        })
+        return false
+      }
+      return true
+    },
     async handlePortHopRangeBlur(rangeValue: string) {
       if (this.inbound.type !== this.inTypes.Hysteria && this.inbound.type !== this.inTypes.Hysteria2) return
       const range = (rangeValue ?? "").trim()
@@ -1159,10 +1220,13 @@ export default {
     },
     async loadData(id: number) {
       this.loading = true
-      const inboundArray = await getNamespaceStore(this.namespace).loadInbounds([id])
-      this.inbound = inboundArray[0]
-      this.initProtocolClientDefaults(false)
-      this.loading = false
+      try {
+        const inboundArray = await getNamespaceStore(this.namespace).loadInbounds([id])
+        this.inbound = inboundArray[0]
+        this.initProtocolClientDefaults(false)
+      } finally {
+        this.loading = false
+      }
     },
     updateData(id: number) {
       if (id > 0) {
@@ -1276,33 +1340,41 @@ export default {
       if (isDuplicatedTag) return
       if (!this.validateMihomoMieruClientPortRange()) return
       this.sanitizeMihomoShadowTLSUnsupportedFields()
+      this.sanitizeMihomoShadowQUICUnsupportedFields()
+      if (!this.validateMihomoShadowQUICJLSUpstream()) return
       this.sanitizeVLESSMihomoEncryptionFields()
       if (!this.validateVLESSMihomoEncryption()) return
 
       // save data
       this.loading = true
-      let clientIds = []
-      if (this.hasUser) {
-        switch (this.initUsers.model) {
-          case 'all':
-            clientIds = this.clients.map((c:any) => c.id)
-            break
-          case 'group':
-            clientIds = this.clients.filter((c:any) => this.initUsers.values.includes(c.group)).map((c:any) => c.id)
-            break
-          case 'client':
-            clientIds = this.initUsers.values
+      try {
+        let clientIds = []
+        if (this.hasUser) {
+          switch (this.initUsers.model) {
+            case 'all':
+              clientIds = this.clients.map((c:any) => c.id)
+              break
+            case 'group':
+              clientIds = this.clients.filter((c:any) => this.initUsers.values.includes(c.group)).map((c:any) => c.id)
+              break
+            case 'client':
+              clientIds = this.initUsers.values
+          }
         }
+        const currentId = this.$props.id ?? 0
+        const success = await store.save('inbounds', currentId == 0 ? 'new' : 'edit', this.inbound, clientIds)
+        if (success) this.closeModal()
+      } finally {
+        this.loading = false
       }
-      const currentId = this.$props.id ?? 0
-      const success = await store.save('inbounds', currentId == 0 ? 'new' : 'edit', this.inbound, clientIds)
-      if (success) this.closeModal()
-      this.loading = false
     },
   },
   computed: {
     isMihomoShadowTLS(): boolean {
       return this.namespace === 'mihomo' && this.inbound.type === this.inTypes.ShadowTLS
+    },
+    isMihomoShadowProtocol(): boolean {
+      return this.namespace === 'mihomo' && [this.inTypes.ShadowTLS, this.inTypes.ShadowQUIC].includes(this.inbound.type)
     },
     vlessEncryptionEnabled: {
       get(): boolean {
@@ -1489,20 +1561,26 @@ export default {
     },
     hasUser() {
       if ((this.$props.id ?? 0) > 0) return false
-      if (!this.inboundWithUsers.includes(this.inbound.type)) return false
+      const isMihomoTrustTunnel = this.namespace === 'mihomo' && this.inbound.type === InTypes.TrustTunnel
+      if (!this.inboundWithUsers.includes(this.inbound.type) && !isMihomoTrustTunnel) return false
       if (this.namespace === 'mihomo') {
         switch (this.inbound.type) {
+        case InTypes.Mixed:
+        case InTypes.SOCKS:
+        case InTypes.HTTP:
         case InTypes.Snell:
         case InTypes.Shadowsocks:
         case InTypes.VMess:
         case InTypes.Trojan:
         case InTypes.ShadowTLS:
+        case InTypes.ShadowQUIC:
         case InTypes.TUIC:
         case InTypes.Hysteria2:
         case InTypes.VLESS:
         case InTypes.AnyTls:
         case InTypes.Mieru:
         case InTypes.Sudoku:
+        case InTypes.TrustTunnel:
           break
         default:
           return false
@@ -1521,7 +1599,7 @@ export default {
   },
   components: {
     Listen, InTls, Hysteria2, TrustTunnel, Naive, Direct, Shadowsocks,
-    Users, Hysteria, ShadowTls, Snell, TProxy, Multiplex, Tuic, Tun,
+    Users, Hysteria, ShadowTls, ShadowQuic, Snell, TProxy, Multiplex, Tuic, Tun,
     AnyTls, SshInbound, Mieru, Sudoku, Transport, AddrVue, OutJsonVue, MihomoClientCommonFields
   }
 }

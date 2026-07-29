@@ -3,7 +3,6 @@ package service
 import (
 	"fmt"
 	"net/netip"
-	"os"
 	"strconv"
 	"strings"
 
@@ -21,11 +20,18 @@ func ensureManagedPortForwardBase() error {
 	if !portForwardSupported() {
 		return nil
 	}
+	if err := ensureNftRendererSupported(); err != nil {
+		return err
+	}
+	if nftUsesCompatibilityLayout() {
+		return ensureCompatibilityPortForwardBase()
+	}
+	return ensureNativePortForwardBase()
+}
 
-	if _, err := runNft("list", "table", nftFamily, portForwardNftTable); err != nil {
-		if _, addErr := runNft("add", "table", nftFamily, portForwardNftTable); addErr != nil {
-			return addErr
-		}
+func ensureNativePortForwardBase() error {
+	if err := cleanupCompatibilityPortForwardNatTables(); err != nil {
+		return err
 	}
 
 	chains := []struct {
@@ -34,11 +40,11 @@ func ensureManagedPortForwardBase() error {
 	}{
 		{
 			name: portForwardPreroutingChain,
-			spec: []string{"type", "nat", "hook", "prerouting", "priority", "dstnat", ";", "policy", "accept", ";"},
+			spec: nftPreroutingNatChainSpec(),
 		},
 		{
 			name: portForwardPostroutingChain,
-			spec: []string{"type", "nat", "hook", "postrouting", "priority", "srcnat", ";", "policy", "accept", ";"},
+			spec: nftPostroutingNatChainSpec(),
 		},
 		{
 			name: portForwardForwardChain,
@@ -53,28 +59,183 @@ func ensureManagedPortForwardBase() error {
 			spec: []string{"type", "filter", "hook", "output", "priority", "0", ";", "policy", "accept", ";"},
 		},
 	}
-
+	resources := make([]portForwardBaseChainSpec, 0, len(chains))
 	for _, chain := range chains {
-		if _, err := runNft("list", "chain", nftFamily, portForwardNftTable, chain.name); err == nil {
-			continue
+		resources = append(resources, portForwardBaseChainSpec{tableFamily: nftFamily, name: chain.name, spec: chain.spec})
+	}
+	return ensurePortForwardBaseResources(resources)
+}
+
+func ensureCompatibilityPortForwardBase() error {
+	if err := removeNativePortForwardNatChains(); err != nil {
+		return err
+	}
+
+	filterChains := []struct {
+		name string
+		spec []string
+	}{
+		{name: portForwardForwardChain, spec: []string{"type", "filter", "hook", "forward", "priority", "0", ";", "policy", "accept", ";"}},
+		{name: portForwardInputChain, spec: []string{"type", "filter", "hook", "input", "priority", "0", ";", "policy", "accept", ";"}},
+		{name: portForwardOutputChain, spec: []string{"type", "filter", "hook", "output", "priority", "0", ";", "policy", "accept", ";"}},
+	}
+	resources := make([]portForwardBaseChainSpec, 0, len(filterChains)+len(nftCompatibilityNatFamilies())*2)
+	for _, chain := range filterChains {
+		resources = append(resources, portForwardBaseChainSpec{tableFamily: nftFamily, name: chain.name, spec: chain.spec})
+	}
+
+	for _, tableFamily := range nftCompatibilityNatFamilies() {
+		resources = append(resources, portForwardBaseChainSpec{
+			tableFamily: tableFamily,
+			name:        portForwardPreroutingChain,
+			spec:        nftPreroutingNatChainSpec(),
+		})
+		// Create both NAT hooks for all compatibility tables. Linux < 4.18
+		// needs the pair for reply-path NAT; newer kernels accept it too.
+		resources = append(resources, portForwardBaseChainSpec{
+			tableFamily: tableFamily,
+			name:        portForwardPostroutingChain,
+			spec:        nftPostroutingNatChainSpec(),
+		})
+	}
+	return ensurePortForwardBaseResources(resources)
+}
+
+type portForwardBaseChainSpec struct {
+	tableFamily string
+	name        string
+	spec        []string
+}
+
+type portForwardCreatedChain struct {
+	tableFamily string
+	name        string
+}
+
+// ensurePortForwardBaseResources creates a complete base or rolls back every
+// resource created by this call. This avoids leaving an IPv4-only compatibility
+// scaffold when the corresponding ip6 table or chain is rejected.
+func ensurePortForwardBaseResources(resources []portForwardBaseChainSpec) error {
+	createdTables := make(map[string]struct{})
+	createdTableOrder := make([]string, 0, len(resources))
+	createdChains := make([]portForwardCreatedChain, 0, len(resources))
+	rollback := func() {
+		for i := len(createdChains) - 1; i >= 0; i-- {
+			chain := createdChains[i]
+			if _, createdTable := createdTables[chain.tableFamily]; createdTable {
+				continue
+			}
+			_, _ = runNft("flush", "chain", chain.tableFamily, portForwardNftTable, chain.name)
+			_, _ = runNft("delete", "chain", chain.tableFamily, portForwardNftTable, chain.name)
 		}
-		args := []string{"add", "chain", nftFamily, portForwardNftTable, chain.name, "{"}
-		args = append(args, chain.spec...)
-		args = append(args, "}")
-		if _, err := runNft(args...); err != nil {
+		for i := len(createdTableOrder) - 1; i >= 0; i-- {
+			_, _ = runNft("delete", "table", createdTableOrder[i], portForwardNftTable)
+		}
+	}
+
+	for _, resource := range resources {
+		createdTable, err := ensurePortForwardTableCreated(resource.tableFamily)
+		if err != nil {
+			rollback()
 			return err
+		}
+		if createdTable {
+			createdTables[resource.tableFamily] = struct{}{}
+			createdTableOrder = append(createdTableOrder, resource.tableFamily)
+		}
+
+		createdChain, err := ensurePortForwardChainCreated(resource.tableFamily, resource.name, resource.spec)
+		if err != nil {
+			rollback()
+			return err
+		}
+		if createdChain {
+			createdChains = append(createdChains, portForwardCreatedChain{tableFamily: resource.tableFamily, name: resource.name})
 		}
 	}
 	return nil
 }
 
-func flushManagedPortForwardChains() error {
-	if !portForwardSupported() || !portForwardTableExists() {
+func ensurePortForwardTable(tableFamily string) error {
+	_, err := ensurePortForwardTableCreated(tableFamily)
+	return err
+}
+
+func ensurePortForwardTableCreated(tableFamily string) (bool, error) {
+	if exists, err := inspectOwnedNftTableForMutation(tableFamily, portForwardNftTable); err != nil {
+		return false, err
+	} else if exists {
+		return false, nil
+	}
+	if err := createOwnedNftTable("nft-forward-"+tableFamily, tableFamily, portForwardNftTable); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func ensurePortForwardChain(tableFamily string, chainName string, spec []string) error {
+	_, err := ensurePortForwardChainCreated(tableFamily, chainName, spec)
+	return err
+}
+
+func ensurePortForwardChainCreated(tableFamily string, chainName string, spec []string) (bool, error) {
+	if _, err := runNft("list", "chain", tableFamily, portForwardNftTable, chainName); err == nil {
+		return false, nil
+	} else if !portForwardNftObjectMissing(err) {
+		return false, err
+	}
+	args := []string{"add", "chain", tableFamily, portForwardNftTable, chainName, "{"}
+	args = append(args, spec...)
+	args = append(args, "}")
+	if _, err := runNft(args...); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func cleanupCompatibilityPortForwardNatTables() error {
+	var firstErr error
+	for _, tableFamily := range nftCompatibilityNatFamilies() {
+		if err := deleteOwnedNftTableForRuntime(tableFamily, portForwardNftTable); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func removeNativePortForwardNatChains() error {
+	if exists, err := inspectOwnedNftTableForMutation(nftFamily, portForwardNftTable); err != nil {
+		return err
+	} else if !exists {
 		return nil
 	}
-	if err := ensureManagedPortForwardBase(); err != nil {
-		return err
+	var firstErr error
+	for _, chain := range []string{portForwardPreroutingChain, portForwardPostroutingChain} {
+		if _, err := runNft("list", "chain", nftFamily, portForwardNftTable, chain); err != nil {
+			if !portForwardNftObjectMissing(err) && firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if _, err := runNft("flush", "chain", nftFamily, portForwardNftTable, chain); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if _, err := runNft("delete", "chain", nftFamily, portForwardNftTable, chain); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
+	return firstErr
+}
+
+func flushManagedPortForwardChains() error {
+	if !portForwardSupported() {
+		return nil
+	}
+
+	var firstErr error
 	for _, chain := range []string{
 		portForwardPreroutingChain,
 		portForwardPostroutingChain,
@@ -82,53 +243,36 @@ func flushManagedPortForwardChains() error {
 		portForwardInputChain,
 		portForwardOutputChain,
 	} {
-		if _, err := runNft("flush", "chain", nftFamily, portForwardNftTable, chain); err != nil {
-			return err
+		if err := flushPortForwardChainIfPresent(nftFamily, chain); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
-	return nil
+	for _, tableFamily := range nftCompatibilityNatFamilies() {
+		for _, chain := range []string{portForwardPreroutingChain, portForwardPostroutingChain} {
+			if err := flushPortForwardChainIfPresent(tableFamily, chain); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
-func ensureKernelForwardingForRows(rows []model.PortForwardRule) error {
-	needIPv4 := false
-	needIPv6 := false
-	for _, row := range rows {
-		if !row.Enabled {
-			continue
-		}
-		if portForwardTargetIsLocal(row.TargetIP) {
-			continue
-		}
-		flags := portForwardFamilyFlagsFor(row.Family)
-		if !flags.ipv4 && !flags.ipv6 {
-			needIPv4 = true
-			continue
-		}
-		needIPv4 = needIPv4 || flags.ipv4
-		needIPv6 = needIPv6 || flags.ipv6
-	}
-	if needIPv4 {
-		if err := ensureKernelForwardingEnabled("/proc/sys/net/ipv4/ip_forward"); err != nil {
-			return err
-		}
-	}
-	if needIPv6 {
-		if err := ensureKernelForwardingEnabled("/proc/sys/net/ipv6/conf/all/forwarding"); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func ensureKernelForwardingEnabled(filePath string) error {
-	if readKernelForwardingEnabled(filePath) {
+func flushPortForwardChainIfPresent(tableFamily string, chain string) error {
+	if !nftNatTableExists(tableFamily, portForwardNftTable) {
 		return nil
 	}
-	return os.WriteFile(filePath, []byte("1\n"), 0o644)
+	if _, err := runNft("list", "chain", tableFamily, portForwardNftTable, chain); err != nil {
+		if portForwardNftObjectMissing(err) {
+			return nil
+		}
+		return err
+	}
+	_, err := runNft("flush", "chain", tableFamily, portForwardNftTable, chain)
+	return err
 }
 
 func readKernelForwardingEnabled(filePath string) bool {
-	body, err := os.ReadFile(filePath)
+	body, err := portForwardKernelReadFileFn(filePath)
 	if err != nil {
 		return false
 	}
@@ -136,7 +280,7 @@ func readKernelForwardingEnabled(filePath string) bool {
 }
 
 func ensureManagedPortForwardNamedCounter(counterName string) error {
-	if counterName == "" {
+	if counterName == "" || nftUsesCompatibilityLayout() {
 		return nil
 	}
 	if _, err := runNft("list", "counter", nftFamily, portForwardNftTable, counterName); err == nil {
@@ -147,7 +291,7 @@ func ensureManagedPortForwardNamedCounter(counterName string) error {
 }
 
 func deletePortForwardNamedCounter(counterName string) error {
-	if counterName == "" || !portForwardSupported() || !portForwardTableExists() {
+	if counterName == "" || nftUsesCompatibilityLayout() || !portForwardSupported() || !portForwardTableExists() {
 		return nil
 	}
 	_, err := runNft("delete", "counter", nftFamily, portForwardNftTable, counterName)
@@ -166,6 +310,13 @@ func cleanupPortForwardNftObjects(ruleID uint) {
 }
 
 func addManagedPortForwardRule(row model.PortForwardRule) (portForwardLimitRuntime, error) {
+	if nftUsesCompatibilityLayout() {
+		return addCompatibilityManagedPortForwardRule(row)
+	}
+	return addNativeManagedPortForwardRule(row)
+}
+
+func addNativeManagedPortForwardRule(row model.PortForwardRule) (portForwardLimitRuntime, error) {
 	upCounter := portForwardCounterName(row.Id, "up")
 	downCounter := portForwardCounterName(row.Id, "down")
 	if err := ensureManagedPortForwardNamedCounter(upCounter); err != nil {
@@ -231,7 +382,7 @@ func addManagedRemotePortForwardRuleForFamily(row model.PortForwardRule, family 
 		"meta", "nfproto", mapFirewallTargetFamily(family),
 	}
 	dnatArgs = appendPortForwardProtocolMatch(dnatArgs, row.Protocol)
-	dnatArgs = append(dnatArgs, "th", "dport")
+	dnatArgs = appendNftTransportPortMatch(dnatArgs, "dport")
 	dnatArgs = append(dnatArgs, buildNftPortSetArgs(row.LocalPortSpec)...)
 	dnatArgs = append(dnatArgs,
 		"counter",
@@ -285,15 +436,11 @@ func addManagedRemotePortForwardRuleForFamily(row model.PortForwardRule, family 
 	}
 
 	if row.RateLimitMbps > 0 {
-		bytesPerSecond := int64(row.RateLimitMbps) * 125000
-		limitArgs := append([]string{"add", "rule", nftFamily, portForwardNftTable, portForwardForwardChain}, trackedArgs...)
-		limitArgs = append(limitArgs,
-			"ct", "direction", "original",
-			"limit", "rate", "over", strconv.FormatInt(bytesPerSecond, 10), "bytes/second",
-			"counter",
-			"drop",
-			"comment", portForwardRuleComment(row.Id, "limit"),
-		)
+		state := portForwardBatchLimitState(row)
+		if state.status == "degraded" {
+			return state, nil
+		}
+		limitArgs := buildPortForwardMeterLimitCommand(row, family, portForwardForwardChain, trackedArgs)
 		if _, err := runNft(limitArgs...); err != nil {
 			state := portForwardLimitRuntime{
 				warning:                fmt.Sprintf("规则 %s 的 %s 限速未生效: %s", strings.TrimSpace(row.Name), portForwardProtocolDisplay(row.Protocol), strings.TrimSpace(err.Error())),
@@ -321,7 +468,7 @@ func addManagedLocalPortForwardRuleForFamily(row model.PortForwardRule, family s
 		"meta", "nfproto", mapFirewallTargetFamily(family),
 	}
 	redirectArgs = appendPortForwardProtocolMatch(redirectArgs, row.Protocol)
-	redirectArgs = append(redirectArgs, "th", "dport")
+	redirectArgs = appendNftTransportPortMatch(redirectArgs, "dport")
 	redirectArgs = append(redirectArgs, buildNftPortSetArgs(row.LocalPortSpec)...)
 	redirectArgs = append(redirectArgs,
 		"counter",
@@ -355,15 +502,11 @@ func addManagedLocalPortForwardRuleForFamily(row model.PortForwardRule, family s
 	}
 
 	if row.RateLimitMbps > 0 {
-		bytesPerSecond := int64(row.RateLimitMbps) * 125000
-		limitArgs := append([]string{"add", "rule", nftFamily, portForwardNftTable, portForwardInputChain}, trackedArgs...)
-		limitArgs = append(limitArgs,
-			"ct", "direction", "original",
-			"limit", "rate", "over", strconv.FormatInt(bytesPerSecond, 10), "bytes/second",
-			"counter",
-			"drop",
-			"comment", portForwardRuleComment(row.Id, "limit"),
-		)
+		state := portForwardBatchLimitState(row)
+		if state.status == "degraded" {
+			return state, nil
+		}
+		limitArgs := buildPortForwardMeterLimitCommand(row, family, portForwardInputChain, trackedArgs)
 		if _, err := runNft(limitArgs...); err != nil {
 			state := portForwardLimitRuntime{
 				warning:                fmt.Sprintf("规则 %s 的 %s 限速未生效: %s", strings.TrimSpace(row.Name), portForwardProtocolDisplay(row.Protocol), strings.TrimSpace(err.Error())),
@@ -382,6 +525,206 @@ func addManagedLocalPortForwardRuleForFamily(row model.PortForwardRule, family s
 		status:                 "disabled",
 		effectiveRateLimitMbps: 0,
 	}, nil
+}
+
+func addCompatibilityManagedPortForwardRule(row model.PortForwardRule) (portForwardLimitRuntime, error) {
+	families := portForwardExpandFamilies(row.Family)
+	if len(families) == 0 {
+		families = []string{portForwardFamilyIPv4}
+	}
+
+	warnings := make([]string, 0, len(families))
+	for _, family := range families {
+		var state portForwardLimitRuntime
+		var err error
+		if portForwardTargetIsLocal(row.TargetIP) {
+			state, err = addCompatibilityLocalPortForwardRuleForFamily(row, family)
+		} else {
+			state, err = addCompatibilityRemotePortForwardRuleForFamily(row, family)
+		}
+		if err != nil {
+			_ = cleanupCompatibilityPortForwardRule(row)
+			return portForwardLimitRuntime{}, err
+		}
+		if strings.TrimSpace(state.warning) != "" {
+			warnings = append(warnings, strings.TrimSpace(state.warning))
+		}
+	}
+
+	if row.RateLimitMbps > 0 {
+		if len(warnings) > 0 {
+			return portForwardLimitRuntime{
+				effectiveRateLimitMbps: 0,
+				status:                 "degraded",
+				warning:                strings.Join(warnings, "；"),
+			}, nil
+		}
+		return portForwardLimitRuntime{
+			effectiveRateLimitMbps: row.RateLimitMbps,
+			status:                 "applied",
+		}, nil
+	}
+	if len(warnings) > 0 {
+		return portForwardLimitRuntime{
+			effectiveRateLimitMbps: 0,
+			status:                 "degraded",
+			warning:                strings.Join(warnings, "；"),
+		}, nil
+	}
+	return portForwardLimitRuntime{status: "disabled"}, nil
+}
+
+func portForwardNatTableFamily(family string) string {
+	if strings.EqualFold(strings.TrimSpace(family), portForwardFamilyIPv6) {
+		return nftNatFamilyIPv6
+	}
+	return nftNatFamilyIPv4
+}
+
+func addCompatibilityRemotePortForwardRuleForFamily(row model.PortForwardRule, family string) (portForwardLimitRuntime, error) {
+	natFamily := portForwardNatTableFamily(family)
+	dnatArgs := []string{"add", "rule", natFamily, portForwardNftTable, portForwardPreroutingChain}
+	dnatArgs = appendPortForwardProtocolMatch(dnatArgs, row.Protocol)
+	dnatArgs = appendNftTransportPortMatch(dnatArgs, "dport")
+	dnatArgs = append(dnatArgs, buildNftPortSetArgs(row.LocalPortSpec)...)
+	dnatArgs = append(dnatArgs,
+		"counter",
+		"dnat", "to", portForwardNatTargetValue(row.TargetIP, row.TargetPort),
+		"comment", portForwardRuleComment(row.Id, "dnat"),
+	)
+	if _, err := runNft(dnatArgs...); err != nil {
+		return portForwardLimitRuntime{}, err
+	}
+
+	masqueradeArgs := []string{"add", "rule", natFamily, portForwardNftTable, portForwardPostroutingChain}
+	masqueradeArgs = appendPortForwardProtocolMatch(masqueradeArgs, row.Protocol)
+	masqueradeArgs = append(masqueradeArgs,
+		"ct", "status", "dnat",
+		"ct", "direction", "original",
+		"ct", "original", "proto-dst",
+	)
+	masqueradeArgs = append(masqueradeArgs, buildNftPortSetArgs(row.LocalPortSpec)...)
+	masqueradeArgs = append(masqueradeArgs,
+		"counter",
+		"masquerade",
+		"comment", portForwardRuleComment(row.Id, "snat"),
+	)
+	if _, err := runNft(masqueradeArgs...); err != nil {
+		return portForwardLimitRuntime{}, err
+	}
+
+	trackedArgs := buildPortForwardTrackedArgs(row, family)
+	downArgs := append([]string{"add", "rule", nftFamily, portForwardNftTable, portForwardForwardChain}, trackedArgs...)
+	downArgs = append(downArgs,
+		"ct", "direction", "original",
+		"counter",
+		"comment", portForwardRuleComment(row.Id, "down"),
+	)
+	if _, err := runNft(downArgs...); err != nil {
+		return portForwardLimitRuntime{}, err
+	}
+
+	upArgs := append([]string{"add", "rule", nftFamily, portForwardNftTable, portForwardForwardChain}, trackedArgs...)
+	upArgs = append(upArgs,
+		"ct", "direction", "reply",
+		"counter",
+		"comment", portForwardRuleComment(row.Id, "up"),
+	)
+	if _, err := runNft(upArgs...); err != nil {
+		return portForwardLimitRuntime{}, err
+	}
+	return addCompatibilityPortForwardLimit(row, family, portForwardForwardChain, trackedArgs)
+}
+
+func addCompatibilityLocalPortForwardRuleForFamily(row model.PortForwardRule, family string) (portForwardLimitRuntime, error) {
+	natFamily := portForwardNatTableFamily(family)
+	redirectArgs := []string{"add", "rule", natFamily, portForwardNftTable, portForwardPreroutingChain}
+	redirectArgs = appendPortForwardProtocolMatch(redirectArgs, row.Protocol)
+	redirectArgs = appendNftTransportPortMatch(redirectArgs, "dport")
+	redirectArgs = append(redirectArgs, buildNftPortSetArgs(row.LocalPortSpec)...)
+	redirectArgs = append(redirectArgs,
+		"counter",
+		"redirect", "to", fmt.Sprintf(":%d", row.TargetPort),
+		"comment", portForwardRuleComment(row.Id, "dnat"),
+	)
+	if _, err := runNft(redirectArgs...); err != nil {
+		return portForwardLimitRuntime{}, err
+	}
+
+	trackedArgs := buildPortForwardTrackedArgs(row, family)
+	downArgs := append([]string{"add", "rule", nftFamily, portForwardNftTable, portForwardInputChain}, trackedArgs...)
+	downArgs = append(downArgs,
+		"ct", "direction", "original",
+		"counter",
+		"comment", portForwardRuleComment(row.Id, "down"),
+	)
+	if _, err := runNft(downArgs...); err != nil {
+		return portForwardLimitRuntime{}, err
+	}
+
+	upArgs := append([]string{"add", "rule", nftFamily, portForwardNftTable, portForwardOutputChain}, trackedArgs...)
+	upArgs = append(upArgs,
+		"ct", "direction", "reply",
+		"counter",
+		"comment", portForwardRuleComment(row.Id, "up"),
+	)
+	if _, err := runNft(upArgs...); err != nil {
+		return portForwardLimitRuntime{}, err
+	}
+	return addCompatibilityPortForwardLimit(row, family, portForwardInputChain, trackedArgs)
+}
+
+func addCompatibilityPortForwardLimit(row model.PortForwardRule, family string, chain string, trackedArgs []string) (portForwardLimitRuntime, error) {
+	if row.RateLimitMbps <= 0 {
+		return portForwardLimitRuntime{status: "disabled"}, nil
+	}
+	state := portForwardBatchLimitState(row)
+	if state.status == "degraded" {
+		return state, nil
+	}
+	limitArgs := buildPortForwardMeterLimitCommand(row, family, chain, trackedArgs)
+	if _, err := runNft(limitArgs...); err != nil {
+		state := portForwardLimitRuntime{
+			warning:                fmt.Sprintf("规则 %s 的 %s 限速未生效: %s", strings.TrimSpace(row.Name), portForwardProtocolDisplay(row.Protocol), strings.TrimSpace(err.Error())),
+			status:                 "degraded",
+			effectiveRateLimitMbps: 0,
+		}
+		logger.Warning(state.warning)
+		return state, nil
+	}
+	return portForwardLimitRuntime{
+		status:                 "applied",
+		effectiveRateLimitMbps: row.RateLimitMbps,
+	}, nil
+}
+
+func cleanupCompatibilityPortForwardRule(row model.PortForwardRule) error {
+	comments := []string{
+		portForwardRuleComment(row.Id, "dnat"),
+		portForwardRuleComment(row.Id, "snat"),
+		portForwardRuleComment(row.Id, "down"),
+		portForwardRuleComment(row.Id, "up"),
+		portForwardRuleComment(row.Id, "limit"),
+		portForwardTrafficBlockComment(row.Id),
+	}
+	var firstErr error
+	for _, tableFamily := range nftCompatibilityNatFamilies() {
+		for _, comment := range comments[:2] {
+			for _, chain := range []string{portForwardPreroutingChain, portForwardPostroutingChain} {
+				if err := deleteNftRulesByExactComment(tableFamily, portForwardNftTable, chain, comment); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+		}
+	}
+	for _, chain := range []string{portForwardForwardChain, portForwardInputChain, portForwardOutputChain} {
+		for _, comment := range comments[2:] {
+			if err := deleteNftRulesByExactComment(nftFamily, portForwardNftTable, chain, comment); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
 func appendPortForwardProtocolMatch(args []string, protocol string) []string {
@@ -417,69 +760,45 @@ func buildPortForwardTrackedArgs(row model.PortForwardRule, family string) []str
 	return args
 }
 
-func (s *PortForwardService) savePortForwardLimitStates(states map[uint]portForwardLimitRuntime) {
-	savePortForwardLimitStates(states)
-}
-
-func readPortForwardCounterBytes() (map[string]int64, error) {
-	result := make(map[string]int64)
-	if !portForwardSupported() || !portForwardTableExists() {
-		return result, nil
-	}
-
-	out, err := runNft("list", "table", nftFamily, portForwardNftTable)
-	if err != nil {
-		return nil, err
-	}
-	for _, match := range portForwardCounterBlockRe.FindAllStringSubmatch(string(out), -1) {
-		if len(match) != 4 {
-			continue
-		}
-		value, parseErr := strconv.ParseInt(match[3], 10, 64)
-		if parseErr != nil {
-			continue
-		}
-		result[match[1]] = value
-	}
-	return result, nil
-}
-
-func portForwardFindHandleByComment(chain string, comment string) int {
-	if !portForwardSupported() || comment == "" {
-		return 0
-	}
-
-	out, err := runNft("--handle", "--numeric", "list", "chain", nftFamily, portForwardNftTable, chain)
-	if err != nil {
-		return 0
-	}
-
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		if !ruleLineHasExactComment(line, comment) || !strings.Contains(line, "handle") {
-			continue
-		}
-		match := nftHandleRe.FindStringSubmatch(line)
-		if len(match) != 2 {
-			continue
-		}
-		handle := 0
-		_, _ = fmt.Sscanf(match[1], "%d", &handle)
-		if handle > 0 {
-			return handle
-		}
-	}
-	return 0
-}
-
 func portForwardRenderIntact(activeRows []model.PortForwardRule) bool {
-	if !portForwardTableExists() {
+	snapshot, err := loadPortForwardNftSnapshot()
+	if err != nil {
 		return false
 	}
-	if len(activeRows) == 0 {
-		return true
+	return snapshot.renderIntact(activeRows, loadPortForwardLimitStateMap())
+}
+
+// parseCompatibilityPortForwardCounterBytes remains a pure text parser for
+// legacy fixtures and migrations. Runtime counter reads use the shared table
+// snapshot above instead of issuing one chain query per forwarding rule.
+func parseCompatibilityPortForwardCounterBytes(out []byte) map[string]int64 {
+	result := make(map[string]int64)
+	for _, line := range strings.Split(string(out), "\n") {
+		comment, ok := extractRuleComment(line)
+		if !ok {
+			continue
+		}
+		commentMatch := portForwardInlineCounterCommentRe.FindStringSubmatch(comment)
+		if len(commentMatch) != 3 {
+			continue
+		}
+		counterMatch := nftCounterBytesRe.FindStringSubmatch(line)
+		if len(counterMatch) != 2 {
+			continue
+		}
+		ruleID, ruleIDErr := strconv.ParseUint(commentMatch[1], 10, 64)
+		bytes, bytesErr := strconv.ParseInt(counterMatch[1], 10, 64)
+		if ruleIDErr != nil || bytesErr != nil || ruleID == 0 {
+			continue
+		}
+		counterName := portForwardCounterName(uint(ruleID), commentMatch[2])
+		result[counterName] += bytes
 	}
-	return portForwardFindHandleByComment(portForwardPreroutingChain, portForwardRuleComment(activeRows[0].Id, "dnat")) > 0
+	return result
+}
+
+func portForwardRuleLocationKey(tableFamily string, chain string) string {
+	return tableFamily + "\x00" + chain
 }
 
 func portForwardRuleComment(ruleID uint, suffix string) string {

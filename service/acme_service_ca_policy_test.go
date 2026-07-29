@@ -69,20 +69,3 @@ func TestGetOverviewOnlyReturnsLetAndZeroCAOptions(t *testing.T) {
 		t.Fatalf("expected ca options letsencrypt+zerossl, got %#v", overview.CAOptions)
 	}
 }
-
-func TestApplyAcmeAccountBindingSkipsIPCertificates(t *testing.T) {
-	row := &model.AcmeCertificate{
-		AcmeAccountID:   99,
-		AcmeAccountName: "legacy-account",
-	}
-
-	applyAcmeAccountBinding(row, acmeCertificateTypeIP, 7, "ip-should-ignore")
-	if row.AcmeAccountID != 0 || row.AcmeAccountName != "" {
-		t.Fatalf("expected ip certificate to skip account binding, got id=%d name=%q", row.AcmeAccountID, row.AcmeAccountName)
-	}
-
-	applyAcmeAccountBinding(row, acmeCertificateTypeDomain, 7, "domain-account")
-	if row.AcmeAccountID != 7 || row.AcmeAccountName != "domain-account" {
-		t.Fatalf("expected domain certificate account binding, got id=%d name=%q", row.AcmeAccountID, row.AcmeAccountName)
-	}
-}

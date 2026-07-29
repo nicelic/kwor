@@ -2,7 +2,6 @@ package service
 
 import (
 	"encoding/json"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,7 +31,7 @@ func (s *ClientRateLimitService) IsNftTableReady() bool {
 }
 
 func (s *ClientRateLimitService) InitOnStartup() {
-	if runtime.GOOS != "linux" || !nftSupported() {
+	if !IsSystemPlatformLinux() || !nftSupported() {
 		return
 	}
 	if err := s.Reconcile(true); err != nil {
@@ -41,7 +40,7 @@ func (s *ClientRateLimitService) InitOnStartup() {
 }
 
 func (s *ClientRateLimitService) EnsureRuleIntegrity() error {
-	if runtime.GOOS != "linux" || !nftSupported() {
+	if !IsSystemPlatformLinux() || !nftSupported() {
 		return nil
 	}
 	if !(&CoreManagerService{}).IsRunning() {
@@ -53,35 +52,24 @@ func (s *ClientRateLimitService) EnsureRuleIntegrity() error {
 // Reconcile recomputes effective limits from DB and syncs nft rules/state.
 func (s *ClientRateLimitService) Reconcile(applyRules bool) error {
 	db := database.GetDB()
-	tx := db.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
-
-	desired, desiredTags, err := s.collectDesiredPortLimits(tx)
+	desired, desiredTags, err := s.collectDesiredPortLimits(db)
 	if err != nil {
-		tx.Rollback()
 		return err
 	}
 
 	if applyRules {
-		err = s.reconcileWithRules(tx, desired, desiredTags)
+		err = s.reconcileWithRules(db, desired, desiredTags)
 	} else {
-		err = s.reconcileStateOnly(tx, desired, desiredTags)
+		err = s.reconcileStateOnly(db, desired, desiredTags)
 	}
 	if err != nil {
-		tx.Rollback()
 		return err
-	}
-	if commitErr := tx.Commit().Error; commitErr != nil {
-		tx.Rollback()
-		return commitErr
 	}
 	return nil
 }
 
 func (s *ClientRateLimitService) CleanupOnShutdown() {
-	if runtime.GOOS == "linux" && nftSupported() {
+	if IsSystemPlatformLinux() && nftSupported() {
 		if err := deleteRulesByCommentPrefix(singboxLimitNftRuleComments.prefix); err != nil {
 			logger.Warning("failed to cleanup client rate limit nft rules by prefix: ", err)
 		}

@@ -5,10 +5,11 @@ ARG GO_VERSION=1.26.3
 # ---- Frontend build stage ----
 FROM --platform=$BUILDPLATFORM node:22-alpine AS front-builder
 WORKDIR /app/temp_frontend
-# sync-version.mjs reads ../config/version, so bring scripts + config/version too.
+# sync-version.mjs reads versioned files from the repository root.
 COPY temp_frontend/package.json temp_frontend/package-lock.json ./
 COPY scripts/ /app/scripts/
 COPY config/version /app/config/version
+COPY docker-compose.yml README.md /app/
 RUN npm ci
 COPY temp_frontend/ ./
 RUN npm run build

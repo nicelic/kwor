@@ -59,9 +59,10 @@ type systemdUnitStats struct {
 	UptimeSec uint64
 }
 
+const systemdStatusCommandTimeout = 2 * time.Second
+
 type managedCoreRuntimeInspector interface {
 	IsRunning() bool
-	GetCoreStatus() (*CoreInfo, error)
 }
 
 func (s *ServerService) GetStatus(request string) *map[string]interface{} {
@@ -243,7 +244,7 @@ func (s *ServerService) GetSingboxInfo() map[string]interface{} {
 
 func (s *ServerService) getAppRuntimeStats() runtimeStats {
 	stats := s.getProcessRuntimeStats(int32(os.Getpid()))
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return stats
 	}
 
@@ -278,7 +279,7 @@ func (s *ServerService) getMihomoRuntimeStats() systemdUnitStats {
 
 func (s *ServerService) getManagedCoreRuntimeStats(unit string, processName string, inspector managedCoreRuntimeInspector) systemdUnitStats {
 	stats := systemdUnitStats{}
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return stats
 	}
 
@@ -286,11 +287,7 @@ func (s *ServerService) getManagedCoreRuntimeStats(unit string, processName stri
 		if inspector == nil || !inspector.IsRunning() {
 			return stats
 		}
-		info, err := inspector.GetCoreStatus()
-		if err != nil || info == nil || !info.Running {
-			return stats
-		}
-		procStats := s.findManagedCoreProcessStats(processName, info)
+		procStats := s.findManagedCoreProcessStats(processName)
 		if procStats.pid <= 0 {
 			return stats
 		}
@@ -350,10 +347,10 @@ type processRuntimeStatsWithPID struct {
 	runtimeStats
 }
 
-func (s *ServerService) findManagedCoreProcessStats(processName string, info *CoreInfo) processRuntimeStatsWithPID {
+func (s *ServerService) findManagedCoreProcessStats(processName string) processRuntimeStatsWithPID {
 	result := processRuntimeStatsWithPID{}
 	processName = strings.TrimSpace(processName)
-	if info == nil || processName == "" {
+	if processName == "" {
 		return result
 	}
 
@@ -442,7 +439,9 @@ func (s *ServerService) getCurrentServiceUnit() string {
 
 func (s *ServerService) getSystemdUnitStats(unit string) (systemdUnitStats, error) {
 	stats := systemdUnitStats{}
-	cmd := exec.Command("systemctl", "show", unit,
+	ctx, cancel := context.WithTimeout(context.Background(), systemdStatusCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemctl", "show", unit,
 		"--property=ActiveState",
 		"--property=MainPID",
 		"--property=MemoryCurrent",
@@ -477,6 +476,12 @@ func (s *ServerService) getSystemdUnitStats(unit string) (systemdUnitStats, erro
 	}
 
 	return stats, nil
+}
+
+func systemctlUnitIsActive(unit string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), systemdStatusCommandTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit).Run() == nil
 }
 
 func parseSystemdShowOutput(output string) map[string]string {
@@ -1204,8 +1209,7 @@ func (s *ServerService) generateMihomoKeyPairBySubcommand(subcommand string, pre
 		return nil, err
 	}
 
-	cmd := exec.Command(binaryPath, "generate", subcommand)
-	output, err := cmd.CombinedOutput()
+	output, err := runCommandOutputWithTimeout(coreVersionCommandTimeout, binaryPath, "generate", subcommand)
 	if err != nil {
 		details := strings.TrimSpace(string(output))
 		if details == "" {
@@ -1232,7 +1236,7 @@ func (s *ServerService) resolveMihomoBinaryPath() (string, error) {
 	}
 
 	binName := "mihomo"
-	if runtime.GOOS == "windows" {
+	if IsSystemPlatformWindows() {
 		binName = "mihomo.exe"
 	}
 

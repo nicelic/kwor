@@ -65,6 +65,12 @@ func TestDefaultClientSubscriptionsPreserveInboundSelectionOrder(t *testing.T) {
 	if strings.Join(gotClash, ",") != strings.Join(want, ",") {
 		t.Fatalf("expected default Clash proxy order %v, got %v", want, gotClash)
 	}
+
+	linksSub, _, err := (&SubService{}).GetSubs(client.Name)
+	if err != nil || linksSub == nil {
+		t.Fatalf("GetSubs failed: payload=%v err=%v", linksSub, err)
+	}
+	assertNoObsoleteManagedSubscriptionRows(t, db)
 }
 
 func TestMihomoClientSubscriptionsPreserveInboundSelectionOrder(t *testing.T) {

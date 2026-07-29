@@ -13,59 +13,34 @@ import (
 func TestPanelCertificateBalanceReservePrefersLeastActive(t *testing.T) {
 	openPanelCertificateBalanceTestDB(t)
 	svc := &PanelCertificateBalanceService{}
-	settingService := &SettingService{}
-
-	certA := createPanelBalanceTestCertificateRecord(t, "panel-balance-a")
-	certB := createPanelBalanceTestCertificateRecord(t, "panel-balance-b")
-	if err := SetAssignedCertificateRecordIDs(settingService, PanelSelfSignedTargetPanel, []uint{certA, certB}); err != nil {
-		t.Fatalf("assign panel certificate ids failed: %v", err)
-	}
+	certA := uint(11)
+	certB := uint(22)
 
 	listenerKey := PanelCertificateBalanceListenerKey(PanelSelfSignedTargetPanel, 8888)
 	bucket := NormalizePanelCertificateBalanceSNIBucket("api.example.com")
-	now := time.Now().Unix()
-	if err := database.GetDB().Create([]model.PanelCertificateBalanceState{
-		{
-			ListenerKey:         listenerKey,
-			SNIBucket:           bucket,
-			CertificateRecordID: certA,
-			ActiveConn:          3,
-			SelectedTotal:       9,
-			LastSelectedAt:      now - 1,
-			UpdatedAtUnix:       now - 1,
-		},
-		{
-			ListenerKey:         listenerKey,
-			SNIBucket:           bucket,
-			CertificateRecordID: certB,
-			ActiveConn:          1,
-			SelectedTotal:       9,
-			LastSelectedAt:      now - 2,
-			UpdatedAtUnix:       now - 2,
-		},
-	}).Error; err != nil {
-		t.Fatalf("seed panel balance rows failed: %v", err)
-	}
-
-	selectedID, selection, err := svc.Reserve(listenerKey, bucket, []uint{certA, certB})
+	firstID, _, err := svc.Reserve(listenerKey, bucket, []uint{certA, certB})
 	if err != nil {
 		t.Fatalf("reserve panel certificate failed: %v", err)
 	}
-	if selectedID != certB {
-		t.Fatalf("selected cert mismatch: got=%d want=%d", selectedID, certB)
+	if firstID != certA {
+		t.Fatalf("first selected cert mismatch: got=%d want=%d", firstID, certA)
 	}
-	if selection.CertificateRecordID != certB {
-		t.Fatalf("selection cert mismatch: got=%d want=%d", selection.CertificateRecordID, certB)
+	secondID, secondSelection, err := svc.Reserve(listenerKey, bucket, []uint{certA, certB})
+	if err != nil {
+		t.Fatalf("reserve second panel certificate failed: %v", err)
 	}
-
-	row := &model.PanelCertificateBalanceState{}
-	if err := database.GetDB().
-		Where("listener_key = ? AND sni_bucket = ? AND certificate_record_id = ?", listenerKey, bucket, certB).
-		First(row).Error; err != nil {
-		t.Fatalf("read selected balance row failed: %v", err)
+	if secondID != certB {
+		t.Fatalf("second selected cert mismatch: got=%d want=%d", secondID, certB)
 	}
-	if row.ActiveConn != 2 {
-		t.Fatalf("active_conn mismatch: got=%d want=%d", row.ActiveConn, 2)
+	if err := svc.Release(secondSelection); err != nil {
+		t.Fatalf("release second selection failed: %v", err)
+	}
+	thirdID, _, err := svc.Reserve(listenerKey, bucket, []uint{certA, certB})
+	if err != nil {
+		t.Fatalf("reserve third panel certificate failed: %v", err)
+	}
+	if thirdID != certB {
+		t.Fatalf("least-active selected cert mismatch: got=%d want=%d", thirdID, certB)
 	}
 }
 
@@ -79,31 +54,30 @@ func TestPanelCertificateBalanceReleaseAndCleanup(t *testing.T) {
 		t.Fatalf("assign panel certificate id failed: %v", err)
 	}
 
-	listenerKey := PanelCertificateBalanceListenerKey(PanelSelfSignedTargetPanel, 9443)
-	bucket := NormalizePanelCertificateBalanceSNIBucket("")
-	if err := database.GetDB().Create(&model.PanelCertificateBalanceState{
-		ListenerKey:         listenerKey,
-		SNIBucket:           bucket,
-		CertificateRecordID: certID,
-		ActiveConn:          1,
-		SelectedTotal:       3,
-		LastSelectedAt:      time.Now().Unix(),
-		UpdatedAtUnix:       time.Now().Unix(),
-	}).Error; err != nil {
-		t.Fatalf("seed panel balance row failed: %v", err)
+	secondCertID := createPanelBalanceTestCertificateRecord(t, "panel-balance-cleanup-second")
+	if err := SetAssignedCertificateRecordIDs(settingService, PanelSelfSignedTargetPanel, []uint{certID, secondCertID}); err != nil {
+		t.Fatalf("assign second panel certificate id failed: %v", err)
 	}
 
-	if err := svc.Release(PanelCertificateBalanceSelection{
-		ListenerKey:         listenerKey,
-		SNIBucket:           bucket,
-		CertificateRecordID: certID,
-	}); err != nil {
+	listenerKey := PanelCertificateBalanceListenerKey(PanelSelfSignedTargetPanel, 9443)
+	_, selection, err := svc.Reserve(listenerKey, "", []uint{certID, secondCertID})
+	if err != nil {
+		t.Fatalf("reserve panel certificate selection failed: %v", err)
+	}
+	if err := svc.Maintain(true); err != nil {
+		t.Fatalf("persist panel certificate selection failed: %v", err)
+	}
+
+	if err := svc.Release(selection); err != nil {
 		t.Fatalf("release panel certificate selection failed: %v", err)
+	}
+	if err := svc.Maintain(true); err != nil {
+		t.Fatalf("persist released panel certificate selection failed: %v", err)
 	}
 
 	row := &model.PanelCertificateBalanceState{}
 	if err := database.GetDB().
-		Where("listener_key = ? AND sni_bucket = ? AND certificate_record_id = ?", listenerKey, bucket, certID).
+		Where("listener_key = ? AND sni_bucket = ? AND certificate_record_id = ?", listenerKey, selection.SNIBucket, selection.CertificateRecordID).
 		First(row).Error; err != nil {
 		t.Fatalf("read released balance row failed: %v", err)
 	}
@@ -166,10 +140,13 @@ func TestPanelCertificateBalanceReserveConcurrentStaysBalanced(t *testing.T) {
 			t.Fatalf("reserve concurrent failed: %v", err)
 		}
 	}
+	if err := svc.Maintain(true); err != nil {
+		t.Fatalf("persist concurrent balance state failed: %v", err)
+	}
 
 	rows := make([]model.PanelCertificateBalanceState, 0)
 	if err := database.GetDB().
-		Where("listener_key = ? AND sni_bucket = ?", listenerKey, bucket).
+		Where("listener_key = ? AND sni_bucket = ?", listenerKey, panelCertificateBalanceCandidateBucket([]uint{certA, certB})).
 		Order("certificate_record_id asc").
 		Find(&rows).Error; err != nil {
 		t.Fatalf("query panel balance rows failed: %v", err)
@@ -190,7 +167,7 @@ func TestPanelCertificateBalanceReserveConcurrentStaysBalanced(t *testing.T) {
 	}
 }
 
-func TestPanelCertificateBalanceMaintainKeepsActiveStaleRows(t *testing.T) {
+func TestPanelCertificateBalanceMaintainClearsLeakedActiveStaleRows(t *testing.T) {
 	openPanelCertificateBalanceTestDB(t)
 	svc := &PanelCertificateBalanceService{}
 	settingService := &SettingService{}
@@ -236,11 +213,8 @@ func TestPanelCertificateBalanceMaintainKeepsActiveStaleRows(t *testing.T) {
 		Find(&remaining).Error; err != nil {
 		t.Fatalf("query panel remaining rows failed: %v", err)
 	}
-	if len(remaining) != 1 {
-		t.Fatalf("expected one active stale row to remain, got %d (%#v)", len(remaining), remaining)
-	}
-	if remaining[0].SNIBucket != NormalizePanelCertificateBalanceSNIBucket("stale-active.example.com") || remaining[0].ActiveConn != 2 {
-		t.Fatalf("unexpected remaining row: %#v", remaining[0])
+	if len(remaining) != 0 {
+		t.Fatalf("expected leaked stale rows to be removed, got %d (%#v)", len(remaining), remaining)
 	}
 }
 

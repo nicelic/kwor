@@ -1,6 +1,7 @@
 package network
 
 import (
+	"crypto/tls"
 	"errors"
 	"net"
 	"sync"
@@ -13,20 +14,30 @@ type dummyManagedConn struct {
 	closed bool
 }
 
-func (c *dummyManagedConn) Read(_ []byte) (int, error)         { return 0, errors.New("not implemented") }
-func (c *dummyManagedConn) Write(p []byte) (int, error)        { return len(p), nil }
-func (c *dummyManagedConn) Close() error                       { c.mu.Lock(); c.closed = true; c.mu.Unlock(); return nil }
-func (c *dummyManagedConn) LocalAddr() net.Addr                { return dummyAddr("local") }
-func (c *dummyManagedConn) RemoteAddr() net.Addr               { return dummyAddr("remote") }
-func (c *dummyManagedConn) SetDeadline(time.Time) error        { return nil }
-func (c *dummyManagedConn) SetReadDeadline(time.Time) error    { return nil }
-func (c *dummyManagedConn) SetWriteDeadline(time.Time) error   { return nil }
-func (c *dummyManagedConn) isClosed() bool                     { c.mu.Lock(); defer c.mu.Unlock(); return c.closed }
+func (c *dummyManagedConn) Read(_ []byte) (int, error)       { return 0, errors.New("not implemented") }
+func (c *dummyManagedConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (c *dummyManagedConn) Close() error                     { c.mu.Lock(); c.closed = true; c.mu.Unlock(); return nil }
+func (c *dummyManagedConn) LocalAddr() net.Addr              { return dummyAddr("local") }
+func (c *dummyManagedConn) RemoteAddr() net.Addr             { return dummyAddr("remote") }
+func (c *dummyManagedConn) SetDeadline(time.Time) error      { return nil }
+func (c *dummyManagedConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *dummyManagedConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *dummyManagedConn) isClosed() bool                   { c.mu.Lock(); defer c.mu.Unlock(); return c.closed }
 
 type dummyAddr string
 
 func (a dummyAddr) Network() string { return string(a) }
 func (a dummyAddr) String() string  { return string(a) }
+
+func TestManagedTLSConnFromNetConnUnwrapsTLSAndListenerWrappers(t *testing.T) {
+	managed := NewManagedTLSConn(&dummyManagedConn{})
+	autoHTTPS := NewAutoHttpsConn(managed)
+	tlsConn := tls.Server(autoHTTPS, &tls.Config{})
+
+	if got := ManagedTLSConnFromNetConn(tlsConn); got != managed {
+		t.Fatalf("managed tls connection mismatch: got=%p want=%p", got, managed)
+	}
+}
 
 func TestCloseManagedTLSConnectionsByFingerprintClosesOnlyMatchingConnections(t *testing.T) {
 	matched := NewManagedTLSConn(&dummyManagedConn{})

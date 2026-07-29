@@ -5,12 +5,12 @@
     width="760"
     max-width="95vw"
   >
-    <v-card class="rounded-lg">
+    <v-card class="rounded-lg core-modal-card">
       <v-card-title>
         <v-row align="center">
           <v-col cols="auto" class="d-flex align-center" style="gap: 8px;">
             <v-icon icon="mdi-engine"></v-icon>
-            <span>{{ t(coreMeta.modalTitle) }}</span>
+            <span>{{ t(singboxCore.modalTitle) }}</span>
           </v-col>
           <v-spacer></v-spacer>
           <v-col cols="auto">
@@ -25,9 +25,9 @@
 
       <v-divider></v-divider>
 
-      <v-card-text style="padding: 20px; min-height: 450px">
-        <div class="d-flex align-center mb-2" style="gap: 8px;">
-          <span class="text-h6 font-weight-bold">{{ coreMeta.coreName }}</span>
+      <v-card-text class="core-modal-body">
+        <div class="d-flex align-center flex-wrap mb-2 core-modal-summary" style="gap: 8px;">
+          <span class="text-h6 font-weight-bold">{{ singboxCore.coreName }}</span>
           <v-btn icon size="x-small" variant="text" @click="openReleasePage">
             <v-icon size="18">mdi-open-in-new</v-icon>
             <v-tooltip activator="parent" location="top">{{ t('coreManager.releasePage') }}</v-tooltip>
@@ -56,7 +56,7 @@
             variant="tonal"
             size="small"
             prepend-icon="mdi-delete"
-            :disabled="!localVersion || downloading || startingCore || stoppingCore || restartingCore || deletingCore"
+            :disabled="!installed || downloading || startingCore || stoppingCore || restartingCore || deletingCore"
             :loading="deletingCore"
             @click="deleteCore"
           >
@@ -64,14 +64,26 @@
           </v-btn>
         </div>
 
-        <div class="d-flex align-center mb-4" style="gap: 12px">
+        <div class="d-flex align-center flex-wrap mb-4" style="gap: 12px">
           <v-chip
             variant="outlined"
-            :color="localVersion ? 'success' : 'error'"
+            :color="!installed ? 'error' : compatible ? 'success' : 'error'"
             size="small"
             label
+            class="core-status-chip"
           >
-            {{ t('coreManager.local') }}: {{ localVersion || t('coreManager.notInstalled') }}
+            {{ t('coreManager.local') }}: {{ !installed ? t('coreManager.notInstalled') : compatible ? localVersion : t('coreManager.incompatible') }}
+          </v-chip>
+
+          <v-chip
+            v-if="installed && compatible && installedTargetLabel"
+            variant="outlined"
+            color="primary"
+            size="small"
+            label
+            class="core-status-chip"
+          >
+            {{ t('coreManager.installedTarget') }}: {{ installedTargetLabel }}
           </v-chip>
 
           <v-chip variant="outlined" color="info" size="small" label>
@@ -87,7 +99,7 @@
         </div>
 
         <v-card
-          v-if="versionInfo"
+          v-if="compatible && versionInfo"
           variant="tonal"
           rounded="lg"
           class="mb-4"
@@ -106,6 +118,17 @@
         </v-card>
 
         <v-alert
+          v-if="installed && !compatible"
+          type="error"
+          variant="tonal"
+          density="compact"
+          class="mb-4 core-incompatible-alert"
+        >
+          <div>{{ t('coreManager.incompatibleHint') }}</div>
+          <div class="core-incompatible-path">{{ binaryPath }}</div>
+        </v-alert>
+
+        <v-alert
           v-if="feedbackMsg"
           :type="feedbackType"
           variant="tonal"
@@ -120,7 +143,7 @@
         <v-card v-if="downloading" variant="outlined" rounded="lg" class="mb-4">
           <v-card-text>
             <div class="text-caption text-medium-emphasis mb-2">
-              {{ t('coreManager.downloading', { coreName: coreMeta.coreName, version: downloadingVersionLabel }) }}
+              {{ t('coreManager.downloading', { coreName: singboxCore.coreName, version: downloadingVersionLabel }) }}
             </div>
             <v-progress-linear
               indeterminate
@@ -134,8 +157,8 @@
         <v-divider class="mb-6"></v-divider>
 
         <div class="text-subtitle-1 font-weight-medium mb-3">{{ t('version') }}</div>
-        <v-row align="center">
-          <v-col v-if="supportsPrereleaseChannel" cols="auto">
+        <v-row align="center" class="core-version-row">
+          <v-col v-if="supportsPrereleaseChannel" cols="auto" class="core-mobile-full">
             <v-btn-toggle
               v-model="selectedChannel"
               mandatory
@@ -148,7 +171,7 @@
             </v-btn-toggle>
           </v-col>
 
-          <v-col>
+          <v-col class="core-mobile-full">
             <v-select
               v-model="selectedVersion"
               :items="displayedVersionItems"
@@ -180,7 +203,7 @@
             </v-select>
           </v-col>
 
-          <v-col cols="auto">
+          <v-col cols="auto" class="core-action-col">
             <v-btn
               color="secondary"
               variant="tonal"
@@ -193,7 +216,7 @@
             </v-btn>
           </v-col>
 
-          <v-col cols="auto">
+          <v-col cols="auto" class="core-action-col">
             <v-btn
               color="primary"
               variant="flat"
@@ -235,7 +258,7 @@
         </v-row>
 
         <v-row align="center" class="mt-2">
-          <v-col>
+          <v-col class="core-mobile-full">
             <v-text-field
               v-model="customDownloadURL"
               :label="t('coreManager.customDownloadUrl')"
@@ -247,7 +270,7 @@
               @blur="() => saveDownloadPreference()"
             ></v-text-field>
           </v-col>
-          <v-col cols="auto">
+          <v-col cols="auto" class="core-action-col">
             <v-btn
               color="secondary"
               variant="flat"
@@ -276,23 +299,6 @@
               <v-btn value="amd64" class="text-none flex-grow-1">amd64</v-btn>
               <v-btn value="arm64" class="text-none flex-grow-1">arm64</v-btn>
             </v-btn-toggle>
-          </v-col>
-
-          <v-col v-if="showLinuxAmd64LevelSelector" cols="12" class="pt-2">
-            <div class="text-caption text-medium-emphasis mb-2">
-              {{ t('coreManager.linuxAmd64Level') }}
-            </div>
-            <v-select
-              v-model="selectedAmd64Level"
-              :items="amd64LevelItems"
-              item-title="title"
-              item-value="value"
-              variant="outlined"
-              density="compact"
-              :placeholder="t('coreManager.notDetected')"
-              hide-details
-              :menu-props="{ maxHeight: 180 }"
-            ></v-select>
           </v-col>
 
           <v-col v-if="showLinuxLibcSelector" cols="12" class="pt-2">
@@ -385,7 +391,7 @@
         <v-card variant="outlined" rounded="lg">
           <v-card-text>
             <v-row align="center">
-              <v-col cols="auto">
+              <v-col cols="auto" class="core-mobile-full">
                 <div class="text-caption text-medium-emphasis">{{ t('coreManager.status') }}</div>
                 <v-chip
                   :color="coreRunning ? 'success' : 'error'"
@@ -402,13 +408,13 @@
 
               <v-spacer></v-spacer>
 
-              <v-col cols="auto" class="d-flex" style="gap: 8px">
+              <v-col cols="auto" class="d-flex flex-wrap core-action-col core-control-actions" style="gap: 8px">
                 <v-btn
                   color="success"
                   variant="flat"
                   size="small"
                   prepend-icon="mdi-play"
-                  :disabled="coreRunning || !localVersion"
+                  :disabled="coreRunning || !coreReady"
                   :loading="startingCore"
                   @click="startCore"
                 >
@@ -430,7 +436,7 @@
                   variant="flat"
                   size="small"
                   prepend-icon="mdi-restart"
-                  :disabled="!coreRunning"
+                  :disabled="!coreRunning || !coreReady"
                   :loading="restartingCore"
                   @click="restartCore"
                 >
@@ -442,9 +448,9 @@
             <v-row class="mt-3">
               <v-col cols="12">
                 <div class="text-caption text-medium-emphasis mb-1">{{ t('coreManager.configFile') }}</div>
-                <v-chip variant="tonal" size="small" label>
+                <v-chip variant="tonal" size="small" label class="core-path-chip">
                   <v-icon start size="x-small">mdi-file-cog</v-icon>
-                  {{ coreMeta.configPath }}
+                  {{ singboxCore.configPath }}
                 </v-chip>
               </v-col>
             </v-row>
@@ -452,7 +458,7 @@
             <v-row class="mt-1">
               <v-col cols="12">
                 <div class="text-caption text-medium-emphasis mb-1">{{ t('coreManager.binaryPath') }}</div>
-                <v-chip variant="tonal" size="small" label>
+                <v-chip variant="tonal" size="small" label class="core-path-chip">
                   <v-icon start size="x-small">mdi-application-cog</v-icon>
                   {{ binaryPath }}
                 </v-chip>
@@ -503,35 +509,51 @@
 </template>
 
 <script lang="ts" setup>
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import HttpUtils from '@/plugins/httputil'
-import { getNamespaceCore, type UiNamespace } from '@/store/uiNamespace'
+import { confirm } from '@/plugins/confirm'
 import { useI18n } from 'vue-i18n'
 import { HumanReadable } from '@/plugins/utils'
+import { formatPanelDateTime } from '@/plugins/panelTime'
 
-const props = withDefaults(defineProps<{
+const props = defineProps<{
   visible: boolean
-  namespace?: UiNamespace
-}>(), {
-  namespace: 'default',
-})
+}>()
 
 const emit = defineEmits(['close', 'update:modelValue'])
 const { t } = useI18n()
 
 const dialogVisible = ref(props.visible)
-const coreMeta = computed(() => getNamespaceCore(props.namespace))
-const supportsPrereleaseChannel = computed(() => coreMeta.value.supportsPrereleaseChannel)
-const showLinuxArchSelector = computed(() => (
-  coreMeta.value.binaryBaseName === 'sing-box' || coreMeta.value.binaryBaseName === 'mihomo'
-))
-const showLinuxLibcSelector = computed(() => coreMeta.value.binaryBaseName === 'sing-box')
+const singboxCore = {
+  coreName: 'sing-box',
+  modalTitle: 'coreManager.singboxTitle',
+  repoUrl: 'https://github.com/SagerNet/sing-box/releases',
+  statusEndpoint: 'api/core-status',
+  progressEndpoint: 'api/core-download-progress',
+  versionsEndpoint: 'api/core-versions',
+  updateInfoEndpoint: 'api/core-update-info',
+  updateSettingsEndpoint: 'api/core-update-settings',
+  updateAckEndpoint: 'api/core-update-ack',
+  downloadPreferenceEndpoint: 'api/core-download-preference',
+  downloadEndpoint: 'api/coreDownload',
+  startEndpoint: 'api/coreStart',
+  stopEndpoint: 'api/coreStop',
+  restartEndpoint: 'api/coreRestart',
+  deleteEndpoint: 'api/coreDelete',
+  configPath: 'Promanager_data/core/singbox/config.json',
+  binaryBaseName: 'sing-box',
+} as const
+const supportsPrereleaseChannel = computed(() => true)
+const showLinuxArchSelector = computed(() => true)
+const showLinuxLibcSelector = computed(() => true)
 
 const statusLoading = ref(false)
 const localVersion = ref('')
 const versionInfo = ref('')
 const platform = ref('')
 const coreRunning = ref(false)
+const installed = ref(false)
+const compatible = ref(false)
 
 const remoteLoading = ref(false)
 const remoteLoaded = ref(false)
@@ -539,39 +561,25 @@ const selectedChannel = ref('stable')
 const selectedVersion = ref('')
 type LinuxArchValue = 'amd64' | 'arm64'
 type LinuxLibcValue = 'glibc' | 'musl' | 'universal'
-type Amd64LevelValue = 'v3' | 'v2' | 'v1'
 type OptionalLinuxArchValue = LinuxArchValue | null
 type OptionalLinuxLibcValue = LinuxLibcValue | null
-type OptionalAmd64LevelValue = Amd64LevelValue | null
 const selectedLinuxArch = ref<OptionalLinuxArchValue>(null)
 const selectedLinuxLibc = ref<OptionalLinuxLibcValue>(null)
-const selectedAmd64Level = ref<OptionalAmd64LevelValue>(null)
 type LinuxTargetPreference = {
   arch?: string
   libc?: string
-  amd64Level?: string
   customUrl?: string
 }
 type CoreDownloadTarget = {
   os?: string
   arch?: string
   libc?: string
-  amd64Level?: string
 }
+const installedTarget = ref<CoreDownloadTarget | null>(null)
 type CoreDownloadPreference = {
   target?: CoreDownloadTarget
   customUrl?: string
 }
-const amd64LevelItems = [
-  { title: 'v3', value: 'v3' },
-  { title: 'v2', value: 'v2' },
-  { title: 'v1', value: 'v1' },
-]
-const showLinuxAmd64LevelSelector = computed(() => (
-  (coreMeta.value.binaryBaseName === 'sing-box' || coreMeta.value.binaryBaseName === 'mihomo') &&
-  selectedLinuxArch.value === 'amd64'
-))
-const requiresAmd64LevelForDownload = computed(() => coreMeta.value.binaryBaseName === 'mihomo')
 const versionList = ref<any[]>([])
 const hasMoreVersions = ref(false)
 const loadingMoreVersions = ref(false)
@@ -583,6 +591,7 @@ const downloading = ref(false)
 const downloadingVersion = ref('')
 const downloadProgressSessionId = ref('')
 const downloadProgressTimerId = ref<number | null>(null)
+let downloadProgressRequest: Promise<void> | null = null
 const startingCore = ref(false)
 const stoppingCore = ref(false)
 const restartingCore = ref(false)
@@ -645,9 +654,6 @@ const hasCompleteLinuxTargetSelection = computed(() => {
   if (!selectedLinuxArch.value) {
     return false
   }
-  if (showLinuxAmd64LevelSelector.value && requiresAmd64LevelForDownload.value && !selectedAmd64Level.value) {
-    return false
-  }
   if (showLinuxLibcSelector.value && !selectedLinuxLibc.value) {
     return false
   }
@@ -657,6 +663,7 @@ const hasCompleteLinuxTargetSelection = computed(() => {
 const canDownloadSelectedVersion = computed(() => (
   Boolean(selectedVersion.value) && hasCompleteLinuxTargetSelection.value
 ))
+const coreReady = computed(() => installed.value && compatible.value)
 
 const latestRemoteVersion = computed(() => {
   if (versionList.value.length === 0) {
@@ -691,9 +698,6 @@ const selectedLinuxPackageLabel = computed(() => {
     return t('coreManager.notDetected')
   }
   const parts = ['linux', selectedLinuxArch.value]
-  if (showLinuxAmd64LevelSelector.value) {
-    parts.push(selectedAmd64Level.value || t('coreManager.notDetected'))
-  }
   if (showLinuxLibcSelector.value) {
     parts.push(selectedLinuxLibc.value === 'universal'
       ? 'universal'
@@ -795,15 +799,25 @@ const lastCheckedAtDisplay = computed(() => {
   if (!lastCheckedAt.value) {
     return ''
   }
-  return new Date(lastCheckedAt.value * 1000).toLocaleString()
+  return formatPanelDateTime(lastCheckedAt.value * 1000)
 })
 
-const customUrlPlaceholder = computed(() => `https://github.com/.../${coreMeta.value.coreName}-xxx.tar.gz`)
+const customUrlPlaceholder = computed(() => `https://github.com/.../${singboxCore.coreName}-xxx.tar.gz`)
 
 const binaryPath = computed(() => {
   const suffix = platform.value.startsWith('windows') ? '.exe' : ''
-  const subdir = props.namespace === 'mihomo' ? 'mihomo' : 'singbox'
-  return `Promanager_data/core/${subdir}/${coreMeta.value.binaryBaseName}${suffix}`
+  return `Promanager_data/core/singbox/${singboxCore.binaryBaseName}${suffix}`
+})
+const installedTargetLabel = computed(() => {
+  const target = installedTarget.value
+  if (!target?.arch) {
+    return ''
+  }
+  const parts = [target.os || 'linux', target.arch]
+  if (target.libc) {
+    parts.push(target.libc)
+  }
+  return parts.join('/')
 })
 const getVersionTargetQuery = () => {
   const query: Record<string, string> = {}
@@ -813,9 +827,6 @@ const getVersionTargetQuery = () => {
     }
     query.target_os = 'linux'
     query.target_arch = selectedLinuxArch.value
-    if (showLinuxAmd64LevelSelector.value && selectedAmd64Level.value) {
-      query.target_amd64_level = selectedAmd64Level.value
-    }
     if (showLinuxLibcSelector.value && selectedLinuxLibc.value) {
       query.target_libc = selectedLinuxLibc.value
     }
@@ -836,7 +847,7 @@ const resetRemoteVersions = (clearSelection = true) => {
 }
 
 const legacyLinuxTargetPreferenceStorageKey = computed(() => (
-  `core-manager-linux-target:${coreMeta.value.binaryBaseName}:${props.namespace}`
+  `core-manager-linux-target:${singboxCore.binaryBaseName}:default`
 ))
 
 const normalizeLinuxArch = (value: unknown): OptionalLinuxArchValue => {
@@ -853,17 +864,9 @@ const normalizeLinuxLibc = (value: unknown): OptionalLinuxLibcValue => {
   return null
 }
 
-const normalizeAmd64LevelValue = (value: unknown): OptionalAmd64LevelValue => {
-  if (value === 'v3' || value === 'v2' || value === 'v1') {
-    return value
-  }
-  return null
-}
-
 const clearLinuxTargetSelection = () => {
   selectedLinuxArch.value = null
   selectedLinuxLibc.value = null
-  selectedAmd64Level.value = null
 }
 
 const applyTargetSelection = (target: CoreDownloadTarget | undefined | null) => {
@@ -871,12 +874,8 @@ const applyTargetSelection = (target: CoreDownloadTarget | undefined | null) => 
     clearLinuxTargetSelection()
     return
   }
-  const arch = normalizeLinuxArch(target.arch)
-  selectedLinuxArch.value = arch
+  selectedLinuxArch.value = normalizeLinuxArch(target.arch)
   selectedLinuxLibc.value = normalizeLinuxLibc(target.libc)
-  selectedAmd64Level.value = arch === 'amd64'
-    ? normalizeAmd64LevelValue(target.amd64Level)
-    : null
 }
 
 const readLegacyLinuxTargetPreference = (): LinuxTargetPreference | null => {
@@ -898,9 +897,6 @@ const buildCurrentDownloadPreference = (): CoreDownloadPreference => {
   if (showLinuxArchSelector.value && selectedLinuxArch.value) {
     target.os = 'linux'
     target.arch = selectedLinuxArch.value
-    if (selectedLinuxArch.value === 'amd64' && selectedAmd64Level.value) {
-      target.amd64Level = selectedAmd64Level.value
-    }
     if (showLinuxLibcSelector.value && selectedLinuxLibc.value) {
       target.libc = selectedLinuxLibc.value
     }
@@ -923,9 +919,6 @@ const buildDownloadPreferenceFormData = (includeTarget = true) => {
   }
   if (preference.target?.arch) {
     formData.append('target_arch', preference.target.arch)
-  }
-  if (preference.target?.amd64Level) {
-    formData.append('target_amd64_level', preference.target.amd64Level)
   }
   if (preference.target?.libc) {
     formData.append('target_libc', preference.target.libc)
@@ -950,9 +943,14 @@ const applyStatusDownloadState = (status: any) => {
       customDownloadURL.value = legacyPreference.customUrl
     }
   }
-  const installedTarget = status?.installedTarget as CoreDownloadTarget | undefined
+  const installedTarget = status?.compatible === true
+    ? status?.installedTarget as CoreDownloadTarget | undefined
+    : undefined
   if (installedTarget && (installedTarget.arch || installedTarget.os)) {
     applyTargetSelection(installedTarget)
+    return
+  }
+  if (status?.installed === true && status?.compatible !== true) {
     return
   }
   clearLinuxTargetSelection()
@@ -965,7 +963,7 @@ const saveDownloadPreference = async (includeTarget = false) => {
   preferenceSaving.value = true
   try {
     const data = await HttpUtils.post(
-      coreMeta.value.downloadPreferenceEndpoint,
+      singboxCore.downloadPreferenceEndpoint,
       buildDownloadPreferenceFormData(includeTarget),
       { silentAuthCheck: true },
     )
@@ -1016,7 +1014,7 @@ watch(selectedChannel, () => {
   }
 })
 
-watch([selectedLinuxArch, selectedLinuxLibc, selectedAmd64Level], () => {
+watch([selectedLinuxArch, selectedLinuxLibc], () => {
   if (!remoteLoaded.value) {
     return
   }
@@ -1026,23 +1024,6 @@ watch([selectedLinuxArch, selectedLinuxLibc, selectedAmd64Level], () => {
     void loadRemoteVersions(false)
   }
 })
-
-watch(
-  () => props.namespace,
-  () => {
-    stopDownloadProgressPolling()
-    resetDownloadProgress()
-    downloadProgressSessionId.value = ''
-    clearLinuxTargetSelection()
-    customDownloadURL.value = ''
-    selectedChannel.value = 'stable'
-    resetRemoteVersions()
-    feedbackMsg.value = ''
-    if (dialogVisible.value) {
-      void refreshAll()
-    }
-  },
-)
 
 const close = () => {
   stopDownloadProgressPolling()
@@ -1082,7 +1063,7 @@ const makeDownloadSessionId = () => {
   const randomPart = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(16).slice(2)}`
-  return `core-download-${coreMeta.value.binaryBaseName}-${randomPart}`
+  return `core-download-${singboxCore.binaryBaseName}-${randomPart}`
 }
 
 const stopDownloadProgressPolling = () => {
@@ -1092,30 +1073,42 @@ const stopDownloadProgressPolling = () => {
   }
 }
 
-const pollDownloadProgress = async () => {
+const pollDownloadProgress = async (): Promise<void> => {
+  if (downloadProgressRequest) return downloadProgressRequest
   const sessionId = downloadProgressSessionId.value.trim()
   if (!sessionId) {
     return
   }
-  const data = await HttpUtils.get(coreMeta.value.progressEndpoint, { id: sessionId }, { silentAuthCheck: true })
-  if (!data.success) {
-    if (!downloading.value) {
-      downloadProgress.value = {
-        ...downloadProgress.value,
-        status: 'error',
-        error: data.msg || t('coreManager.downloadProgressUnavailable'),
+  const request = (async () => {
+    const data = await HttpUtils.get(singboxCore.progressEndpoint, { id: sessionId }, { silentAuthCheck: true })
+    if (sessionId !== downloadProgressSessionId.value.trim()) return
+    if (!data.success) {
+      if (!downloading.value) {
+        downloadProgress.value = {
+          ...downloadProgress.value,
+          status: 'error',
+          error: data.msg || t('coreManager.downloadProgressUnavailable'),
+        }
+        stopDownloadProgressPolling()
       }
+      return
+    }
+    const nextProgress = normalizeCoreDownloadProgress(data.obj)
+    if (nextProgress.status === 'missing' && downloading.value) {
+      return
+    }
+    downloadProgress.value = nextProgress
+    if (nextProgress.status === 'success' || nextProgress.status === 'error' || nextProgress.status === 'missing') {
       stopDownloadProgressPolling()
     }
-    return
-  }
-  const nextProgress = normalizeCoreDownloadProgress(data.obj)
-  if (nextProgress.status === 'missing' && downloading.value) {
-    return
-  }
-  downloadProgress.value = nextProgress
-  if (nextProgress.status === 'success' || nextProgress.status === 'error' || nextProgress.status === 'missing') {
-    stopDownloadProgressPolling()
+  })()
+  downloadProgressRequest = request
+  try {
+    await request
+  } finally {
+    if (downloadProgressRequest === request) {
+      downloadProgressRequest = null
+    }
   }
 }
 
@@ -1129,6 +1122,16 @@ const startDownloadProgressPolling = (sessionId: string) => {
     void pollDownloadProgress()
   }, 800)
   void pollDownloadProgress()
+}
+
+const handleVisibilityChange = () => {
+  if (document.visibilityState === 'visible') {
+    if (dialogVisible.value && downloadProgressSessionId.value) {
+      startDownloadProgressPolling(downloadProgressSessionId.value)
+    }
+    return
+  }
+  stopDownloadProgressPolling()
 }
 
 const refreshAll = async (forceUpdateCheck = false) => {
@@ -1154,12 +1157,15 @@ const resetVersionDisplay = () => {
 
 const loadCoreStatus = async () => {
   try {
-    const data = await HttpUtils.get(coreMeta.value.statusEndpoint)
+    const data = await HttpUtils.get(singboxCore.statusEndpoint)
     if (data.success && data.obj) {
+      installed.value = data.obj.installed === true
+      compatible.value = data.obj.compatible === true
       localVersion.value = data.obj.localVersion || ''
       versionInfo.value = data.obj.versionInfo || ''
       coreRunning.value = data.obj.running === true
       platform.value = data.obj.platform || ''
+      installedTarget.value = data.obj.installedTarget || null
       applyStatusDownloadState(data.obj)
     }
   } catch (error) {
@@ -1182,7 +1188,7 @@ const loadRemoteVersions = async (append: boolean) => {
   }
 
   try {
-    const data = await HttpUtils.get(coreMeta.value.versionsEndpoint, {
+    const data = await HttpUtils.get(singboxCore.versionsEndpoint, {
       channel: effectiveChannel.value,
       offset: requestOffset,
       limit: requestLimit,
@@ -1255,7 +1261,7 @@ const applyCoreUpdateInfo = (info: any) => {
 const loadCoreUpdateInfo = async (forceCheck: boolean) => {
   try {
     const data = await HttpUtils.get(
-      coreMeta.value.updateInfoEndpoint,
+      singboxCore.updateInfoEndpoint,
       forceCheck ? { force: 'true' } : {},
     )
     if (data.success && data.obj) {
@@ -1289,7 +1295,7 @@ const saveAutoCheckSettings = async () => {
   autoCheckSaving.value = true
   feedbackMsg.value = ''
   try {
-    const data = await HttpUtils.post(coreMeta.value.updateSettingsEndpoint, {
+    const data = await HttpUtils.post(singboxCore.updateSettingsEndpoint, {
       enabled: autoCheckEnabled.value ? 'true' : 'false',
       interval: String(intervalHours ?? 12),
     })
@@ -1315,7 +1321,7 @@ const ackCoreUpdateNotice = async () => {
   pendingStableVersion.value = ''
   pendingAlphaVersion.value = ''
   try {
-    const data = await HttpUtils.post(coreMeta.value.updateAckEndpoint, {})
+    const data = await HttpUtils.post(singboxCore.updateAckEndpoint, {})
     if (data.success && data.obj) {
       applyCoreUpdateInfo(data.obj)
     }
@@ -1340,7 +1346,7 @@ const downloadCore = async () => {
   downloadProgressSessionId.value = sessionId
   resetDownloadProgress()
   downloadProgress.value.id = sessionId
-  downloadProgress.value.core = coreMeta.value.coreName
+  downloadProgress.value.core = singboxCore.coreName
   downloadProgress.value.status = 'running'
   startDownloadProgressPolling(sessionId)
   feedbackMsg.value = ''
@@ -1352,19 +1358,16 @@ const downloadCore = async () => {
     if (showLinuxArchSelector.value && selectedLinuxArch.value) {
       formData.append('target_os', 'linux')
       formData.append('target_arch', selectedLinuxArch.value)
-      if (showLinuxAmd64LevelSelector.value && selectedAmd64Level.value) {
-        formData.append('target_amd64_level', selectedAmd64Level.value)
-      }
     }
     if (showLinuxLibcSelector.value && selectedLinuxLibc.value) {
       formData.append('target_libc', selectedLinuxLibc.value)
     }
-    const data = await HttpUtils.post(coreMeta.value.downloadEndpoint, formData)
+    const data = await HttpUtils.post(singboxCore.downloadEndpoint, formData)
     await pollDownloadProgress()
     if (data.success) {
       const version = data.obj?.version || ''
       feedbackMsg.value = t('coreManager.downloadSuccess', {
-        coreName: coreMeta.value.coreName,
+        coreName: singboxCore.coreName,
         version,
       })
       feedbackType.value = 'success'
@@ -1413,7 +1416,7 @@ const downloadCoreFromCustomURL = async () => {
   downloadProgressSessionId.value = sessionId
   resetDownloadProgress()
   downloadProgress.value.id = sessionId
-  downloadProgress.value.core = coreMeta.value.coreName
+  downloadProgress.value.core = singboxCore.coreName
   downloadProgress.value.status = 'running'
   startDownloadProgressPolling(sessionId)
   feedbackMsg.value = ''
@@ -1422,7 +1425,7 @@ const downloadCoreFromCustomURL = async () => {
     const formData = new FormData()
     formData.append('custom_url', url)
     formData.append('downloadSessionId', sessionId)
-    const data = await HttpUtils.post(coreMeta.value.downloadEndpoint, formData)
+    const data = await HttpUtils.post(singboxCore.downloadEndpoint, formData)
     await pollDownloadProgress()
     if (data.success) {
       const version = data.obj?.version || ''
@@ -1462,16 +1465,19 @@ const downloadCoreFromCustomURL = async () => {
 }
 
 const openReleasePage = () => {
-  window.open(coreMeta.value.repoUrl, '_blank')
+  window.open(singboxCore.repoUrl, '_blank')
 }
 
 const startCore = async () => {
+  if (!coreReady.value) {
+    return
+  }
   startingCore.value = true
   feedbackMsg.value = ''
   try {
-    const data = await HttpUtils.post(coreMeta.value.startEndpoint, {})
+    const data = await HttpUtils.post(singboxCore.startEndpoint, {})
     if (data.success) {
-      feedbackMsg.value = t('coreManager.startSuccess', { coreName: coreMeta.value.coreName })
+      feedbackMsg.value = t('coreManager.startSuccess', { coreName: singboxCore.coreName })
       feedbackType.value = 'success'
     } else {
       feedbackMsg.value = data.msg || t('coreManager.startFailed')
@@ -1496,9 +1502,9 @@ const stopCore = async () => {
   stoppingCore.value = true
   feedbackMsg.value = ''
   try {
-    const data = await HttpUtils.post(coreMeta.value.stopEndpoint, {})
+    const data = await HttpUtils.post(singboxCore.stopEndpoint, {})
     if (data.success) {
-      feedbackMsg.value = t('coreManager.stopSuccess', { coreName: coreMeta.value.coreName })
+      feedbackMsg.value = t('coreManager.stopSuccess', { coreName: singboxCore.coreName })
       feedbackType.value = 'info'
     } else {
       feedbackMsg.value = data.msg || t('coreManager.stopFailed')
@@ -1520,12 +1526,15 @@ const stopCore = async () => {
 }
 
 const restartCore = async () => {
+  if (!coreReady.value) {
+    return
+  }
   restartingCore.value = true
   feedbackMsg.value = ''
   try {
-    const data = await HttpUtils.post(coreMeta.value.restartEndpoint, {})
+    const data = await HttpUtils.post(singboxCore.restartEndpoint, {})
     if (data.success) {
-      feedbackMsg.value = t('coreManager.restartSuccess', { coreName: coreMeta.value.coreName })
+      feedbackMsg.value = t('coreManager.restartSuccess', { coreName: singboxCore.coreName })
       feedbackType.value = 'success'
     } else {
       feedbackMsg.value = data.msg || t('coreManager.restartFailed')
@@ -1547,27 +1556,32 @@ const restartCore = async () => {
 }
 
 const deleteCore = async () => {
-  if (deletingCore.value || !localVersion.value) {
+  if (deletingCore.value || !installed.value) {
     return
   }
 
-  const confirmDelete = window.confirm(
-    t('coreManager.deleteCoreConfirm', { coreName: coreMeta.value.coreName }),
-  )
-  if (!confirmDelete) {
+  const confirmDelete = await confirm({
+    message: t('coreManager.deleteCoreConfirm', { coreName: singboxCore.coreName }),
+    severity: 'danger',
+    confirmText: t('confirmDialog.actions.delete'),
+  })
+  if (!confirmDelete || deletingCore.value || !installed.value) {
     return
   }
 
   deletingCore.value = true
   feedbackMsg.value = ''
   try {
-    const data = await HttpUtils.post(coreMeta.value.deleteEndpoint, {})
+    const data = await HttpUtils.post(singboxCore.deleteEndpoint, {})
     if (data.success) {
-      feedbackMsg.value = t('coreManager.deleteSuccess', { coreName: coreMeta.value.coreName })
+      feedbackMsg.value = t('coreManager.deleteSuccess', { coreName: singboxCore.coreName })
       feedbackType.value = 'success'
       localVersion.value = ''
       versionInfo.value = ''
       coreRunning.value = false
+      installed.value = false
+      compatible.value = false
+      installedTarget.value = null
       await loadCoreStatus()
       await loadCoreUpdateInfo(false)
       return
@@ -1583,4 +1597,89 @@ const deleteCore = async () => {
     deletingCore.value = false
   }
 }
+
+onMounted(() => {
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+  }
+})
+
+onBeforeUnmount(() => {
+  stopDownloadProgressPolling()
+  if (typeof document !== 'undefined') {
+    document.removeEventListener('visibilitychange', handleVisibilityChange)
+  }
+})
 </script>
+
+<style scoped>
+.core-modal-body {
+  min-height: 450px;
+  padding: 20px;
+}
+
+.core-path-chip {
+  max-width: 100%;
+  height: auto;
+}
+
+.core-path-chip :deep(.v-chip__content) {
+  padding-block: 6px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.core-status-chip {
+  max-width: 100%;
+  height: auto;
+}
+
+.core-status-chip :deep(.v-chip__content) {
+  padding-block: 6px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.core-incompatible-alert {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.core-incompatible-path {
+  margin-top: 6px;
+  font-family: monospace;
+  word-break: break-all;
+}
+
+@media (max-width: 600px) {
+  .core-modal-body {
+    min-height: 0;
+    padding: 12px;
+  }
+
+  .core-modal-summary .v-spacer {
+    flex-basis: 100%;
+    height: 0;
+  }
+
+  .core-mobile-full,
+  .core-action-col {
+    flex: 0 0 100%;
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .core-action-col > .v-btn {
+    width: 100%;
+  }
+
+  .core-control-actions {
+    justify-content: stretch;
+  }
+
+  .core-control-actions > .v-btn {
+    flex: 1 1 80px;
+    width: auto;
+  }
+}
+</style>

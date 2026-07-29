@@ -47,6 +47,8 @@
 </template>
 
 <script lang="ts" setup>
+import { formatPanelDateTime } from '@/plugins/panelTime'
+
 interface PortLogItem {
   id: string
   timestamp: number
@@ -64,6 +66,6 @@ defineEmits(['close', 'clear'])
 
 const formatTime = (timestamp: number): string => {
   if (!timestamp) return "-"
-  return new Date(timestamp).toLocaleString()
+  return formatPanelDateTime(timestamp)
 }
 </script>

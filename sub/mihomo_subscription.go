@@ -66,6 +66,9 @@ func loadMihomoSubscriptionData(subID string) (*model.Client, []*model.Inbound, 
 		if mihomoInbound == nil {
 			continue
 		}
+		if util.IsSubscriptionServerOnlyInboundType(mihomoInbound.Type) {
+			continue
+		}
 
 		baseInbound := mihomoInbound.ToBase()
 		if len(baseInbound.OutJson) < 5 {
@@ -107,10 +110,18 @@ func normalizeMihomoSubscriptionOutJSON(inbound *model.Inbound) error {
 	if outbound == nil {
 		outbound = map[string]interface{}{}
 	}
+	util.StripSubscriptionOutboundPanelFields(outbound)
 
 	migrateLegacyMihomoCommonFields(outbound, inbound.Type)
 	if inbound.Type == "shadowtls" {
 		sanitizeMihomoShadowTLSSubscriptionOutJSON(outbound)
+	}
+	if inbound.Type == "shadowquic" {
+		// ShadowQUIC never uses mihomo_TLS. Clear legacy relation state before
+		// callers refresh subscription TLS fields from the inbound model.
+		inbound.TlsId = 0
+		inbound.Tls = nil
+		util.SanitizeMihomoShadowQUICInboundTemplate(outbound)
 	}
 
 	if inbound.Type == "tuic" {

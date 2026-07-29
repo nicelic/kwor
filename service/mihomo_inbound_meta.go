@@ -37,11 +37,11 @@ func buildMihomoInboundUserManagement(inboundType string, shadowTLSVersion int) 
 	switch inboundType {
 	case "mixed", "socks", "http":
 		return MihomoInboundUserManagement{
-			Selectable:     false,
+			Selectable:     true,
 			UsesUsersField: true,
-			Mode:           "auth_users",
+			Mode:           "users_list",
 			IdentityType:   "username",
-			Reason:         "proxy_auth_not_user_managed",
+			Reason:         "proxy_auth_users",
 		}
 	case "vmess":
 		return MihomoInboundUserManagement{
@@ -114,6 +114,14 @@ func buildMihomoInboundUserManagement(inboundType string, shadowTLSVersion int) 
 			Mode:           "users_list",
 			IdentityType:   "username",
 			Reason:         "trusttunnel_username_password_users",
+		}
+	case "shadowquic":
+		return MihomoInboundUserManagement{
+			Selectable:     true,
+			UsesUsersField: true,
+			Mode:           "users_list",
+			IdentityType:   "username",
+			Reason:         "shadowquic_username_password_users",
 		}
 	case "shadowtls":
 		if shadowTLSVersion >= 3 {

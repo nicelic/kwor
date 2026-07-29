@@ -18,8 +18,11 @@ func MigrateDb() {
 }
 
 func MigrateDbWithError() (err error) {
+	return migrateDBAtPath(config.GetDBPath())
+}
+
+func migrateDBAtPath(path string) (err error) {
 	// void running on first install
-	path := config.GetDBPath()
 	_, err = os.Stat(path)
 	if err != nil {
 		fmt.Println("Database not found")
@@ -30,7 +33,19 @@ func MigrateDbWithError() (err error) {
 	if err != nil {
 		return err
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := sqlDB.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
 	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
 	defer func() {
 		if err == nil {
 			if commitErr := tx.Commit().Error; commitErr != nil {

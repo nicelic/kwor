@@ -23,6 +23,8 @@ func normalizeMihomoListenerCompatFields(listener map[string]interface{}, listen
 		normalizeMihomoTUICListener(listener)
 	case "shadowtls":
 		normalizeMihomoShadowTLSListener(listener)
+	case "shadowquic":
+		normalizeMihomoShadowQUICListener(listener)
 	case "shadowsocks":
 		normalizeMihomoShadowsocksListener(listener)
 	case "vmess":
@@ -294,6 +296,153 @@ func normalizeMihomoShadowTLSListener(listener map[string]interface{}) {
 
 	normalizeMihomoShadowsocksListener(listener)
 	normalizeMihomoListenerMuxOption(listener)
+}
+
+func normalizeMihomoShadowQUICListener(listener map[string]interface{}) {
+	if listener == nil {
+		return
+	}
+
+	source := make(map[string]interface{}, len(listener))
+	for key, value := range listener {
+		source[key] = value
+	}
+
+	clean := map[string]interface{}{
+		"type": "shadowquic",
+	}
+	if name := strings.TrimSpace(firstString(source["name"])); name != "" {
+		clean["name"] = name
+	}
+	if listen := strings.TrimSpace(firstString(source["listen"])); listen != "" {
+		clean["listen"] = listen
+	}
+	if port, ok := toInt(source["port"]); ok && port > 0 && port <= 65535 {
+		clean["port"] = port
+	}
+	// addUsers owns this field and removes any legacy Options.users value
+	// before this normalizer runs. Preserve only the normalized JSON list.
+	if users, ok := source["users"].([]interface{}); ok && len(users) > 0 {
+		clean["users"] = users
+	}
+
+	upstreamSource, _ := source["jls-upstream"].(map[string]interface{})
+	if canonical, ok := source["jls_upstream"].(map[string]interface{}); ok && canonical != nil {
+		if upstreamSource == nil {
+			upstreamSource = map[string]interface{}{}
+		}
+		for key, value := range canonical {
+			upstreamSource[key] = value
+		}
+	}
+	if upstreamSource != nil {
+		upstream := map[string]interface{}{}
+		if addr := strings.TrimSpace(firstString(upstreamSource["addr"])); addr != "" {
+			upstream["addr"] = addr
+		}
+		if sni := strings.TrimSpace(firstString(upstreamSource["sni"])); sni != "" {
+			upstream["sni"] = sni
+		}
+		if proxy := normalizeMihomoShadowQUICJLSProxyTarget(firstString(upstreamSource["proxy"])); proxy != "" {
+			upstream["proxy"] = proxy
+		}
+		if rateLimit, ok := toInt(firstNonNil(upstreamSource["rate_limit"], upstreamSource["rate-limit"])); ok && rateLimit >= 0 {
+			upstream["rate-limit"] = rateLimit
+		}
+		if len(upstream) > 0 {
+			clean["jls-upstream"] = upstream
+		}
+	}
+
+	if values := util.NormalizeMihomoShadowQUICALPN(source["alpn"]); len(values) > 0 {
+		clean["alpn"] = values
+	}
+	if versions := util.NormalizeMihomoShadowQUICVersions(firstNonNil(source["quic-versions"], source["quic_versions"])); len(versions) > 0 {
+		clean["quic-versions"] = versions
+	}
+	for _, field := range []struct {
+		target string
+		source []string
+	}{
+		{target: "zero-rtt", source: []string{"zero-rtt", "zero_rtt"}},
+		{target: "ignore-client-bandwidth", source: []string{"ignore-client-bandwidth", "ignore_client_bandwidth"}},
+		{target: "disable-mtu-discovery", source: []string{"disable-mtu-discovery", "disable_mtu_discovery"}},
+	} {
+		values := make([]interface{}, 0, len(field.source))
+		for _, key := range field.source {
+			values = append(values, source[key])
+		}
+		if value, ok := toBool(firstNonNil(values...)); ok {
+			clean[field.target] = value
+		}
+	}
+	for _, field := range []struct {
+		target string
+		source []string
+	}{
+		{target: "congestion-controller", source: []string{"congestion-controller", "congestion_controller"}},
+	} {
+		values := make([]interface{}, 0, len(field.source))
+		for _, key := range field.source {
+			values = append(values, source[key])
+		}
+		if value, ok := util.NormalizeMihomoShadowQUICCongestionController(firstNonNil(values...)); ok {
+			clean[field.target] = value
+		}
+	}
+	if profile, ok := util.NormalizeMihomoBBRProfile(firstNonNil(source["bbr-profile"], source["bbr_profile"])); ok {
+		clean["bbr-profile"] = profile
+	}
+	for _, field := range []string{"up", "down"} {
+		if value := normalizeMihomoShadowQUICListenerBandwidth(source[field]); value != "" {
+			clean[field] = value
+		}
+	}
+	for _, field := range []struct {
+		target string
+		source []string
+	}{
+		{target: "cwnd", source: []string{"cwnd"}},
+		{target: "max-idle-time", source: []string{"max-idle-time", "max_idle_time"}},
+		{target: "max-datagram-frame-size", source: []string{"max-datagram-frame-size", "max_datagram_frame_size"}},
+		{target: "recv-window-conn", source: []string{"recv-window-conn", "recv_window_conn"}},
+		{target: "recv-window", source: []string{"recv-window", "recv_window"}},
+	} {
+		values := make([]interface{}, 0, len(field.source))
+		for _, key := range field.source {
+			values = append(values, source[key])
+		}
+		if value, ok := toInt(firstNonNil(values...)); ok && value >= 0 {
+			clean[field.target] = value
+		}
+	}
+
+	for key := range listener {
+		delete(listener, key)
+	}
+	for key, value := range clean {
+		listener[key] = value
+	}
+}
+
+func normalizeMihomoShadowQUICListenerBandwidth(raw interface{}) string {
+	switch value := raw.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return strings.TrimSpace(fmt.Sprint(value))
+	default:
+		return ""
+	}
+}
+
+func firstNonNil(values ...interface{}) interface{} {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
 }
 
 func normalizeMihomoShadowTLSHandshake(raw interface{}) map[string]interface{} {

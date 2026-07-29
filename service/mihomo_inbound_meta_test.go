@@ -2,6 +2,21 @@ package service
 
 import "testing"
 
+func TestBuildMihomoInboundUserManagementProxyAuth(t *testing.T) {
+	for _, inboundType := range []string{"mixed", "socks", "http"} {
+		t.Run(inboundType, func(t *testing.T) {
+			got := buildMihomoInboundUserManagement(inboundType, 0)
+
+			if !got.Selectable || !got.UsesUsersField {
+				t.Fatalf("expected %s to support bound users, got %#v", inboundType, got)
+			}
+			if got.Mode != "users_list" || got.IdentityType != "username" {
+				t.Fatalf("unexpected %s user management shape: %#v", inboundType, got)
+			}
+		})
+	}
+}
+
 func TestBuildMihomoInboundUserManagementSudoku(t *testing.T) {
 	got := buildMihomoInboundUserManagement("sudoku", 0)
 

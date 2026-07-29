@@ -11,7 +11,7 @@ import (
 	"github.com/alireza0/s-ui/database/model"
 )
 
-func TestCertificateListBlocksDeleteWhenDefaultTLSUsesCertificate(t *testing.T) {
+func TestCertificateDeleteDetachesDefaultTLSBinding(t *testing.T) {
 	db := setupMihomoSyncTestDB(t, "cert-default-tls-usage.db")
 	record := upsertTestCertificateRecord(t, "default-tls.example.com")
 
@@ -30,19 +30,22 @@ func TestCertificateListBlocksDeleteWhenDefaultTLSUsesCertificate(t *testing.T) 
 		t.Fatalf("list certificates failed: %v", err)
 	}
 	view := findCertificateRecordView(t, views, record.Id)
-	if !view.DeleteBlocked || !view.InUseByTLS {
-		t.Fatalf("expected default TLS usage to block delete, got %#v", view)
+	if view.DeleteBlocked || !view.InUseByTLS {
+		t.Fatalf("expected default TLS usage to be informational only, got %#v", view)
 	}
 	if !strings.Contains(view.UsageLabel, "default-listener") {
 		t.Fatalf("expected usage label to include tls name, got %q", view.UsageLabel)
 	}
 
-	if _, err := (&AcmeService{}).Delete(AcmeDeletePayload{ID: record.Id}); err == nil {
-		t.Fatalf("expected delete to fail while certificate is used by default TLS")
+	if _, err := (&AcmeService{}).Delete(AcmeDeletePayload{ID: record.Id}); err != nil {
+		t.Fatalf("delete while default TLS is bound failed: %v", err)
+	}
+	if err := db.Where("id = ?", tlsRow.Id).First(tlsRow).Error; err != nil || tlsRow.CertificateRecordID != 0 {
+		t.Fatalf("expected default TLS binding cleared, row=%#v err=%v", tlsRow, err)
 	}
 }
 
-func TestCertificateListBlocksDeleteWhenMihomoTLSUsesCertificate(t *testing.T) {
+func TestCertificateDeleteDetachesMihomoTLSBinding(t *testing.T) {
 	db := setupMihomoSyncTestDB(t, "cert-mihomo-tls-usage.db")
 	record := upsertTestCertificateRecord(t, "mihomo-tls.example.com")
 
@@ -61,15 +64,18 @@ func TestCertificateListBlocksDeleteWhenMihomoTLSUsesCertificate(t *testing.T) {
 		t.Fatalf("list certificates failed: %v", err)
 	}
 	view := findCertificateRecordView(t, views, record.Id)
-	if !view.DeleteBlocked || !view.InUseByMihomo {
-		t.Fatalf("expected mihomo TLS usage to block delete, got %#v", view)
+	if view.DeleteBlocked || !view.InUseByMihomo {
+		t.Fatalf("expected Mihomo TLS usage to be informational only, got %#v", view)
 	}
 	if !strings.Contains(view.UsageLabel, "mihomo-listener") {
 		t.Fatalf("expected usage label to include mihomo tls name, got %q", view.UsageLabel)
 	}
 
-	if _, err := (&AcmeService{}).Delete(AcmeDeletePayload{ID: record.Id}); err == nil {
-		t.Fatalf("expected delete to fail while certificate is used by mihomo TLS")
+	if _, err := (&AcmeService{}).Delete(AcmeDeletePayload{ID: record.Id}); err != nil {
+		t.Fatalf("delete while Mihomo TLS is bound failed: %v", err)
+	}
+	if err := db.Where("id = ?", tlsRow.Id).First(tlsRow).Error; err != nil || tlsRow.CertificateRecordID != 0 {
+		t.Fatalf("expected Mihomo TLS binding cleared, row=%#v err=%v", tlsRow, err)
 	}
 }
 

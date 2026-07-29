@@ -112,6 +112,30 @@ func TestMergeClientProtocolConfigForNamespaceKeepsMihomoMieruUsername(t *testin
 	}
 }
 
+func TestMergeClientProtocolConfigKeepsMieruOutOfSingboxButAllowsClash(t *testing.T) {
+	config := map[string]interface{}{
+		"name":     "legacy-alice",
+		"password": "secret",
+	}
+
+	singboxOutbound := map[string]interface{}{"type": "mieru"}
+	mergeClientProtocolConfig(singboxOutbound, config, &model.Inbound{TlsId: 1})
+	for _, key := range []string{"username", "password"} {
+		if _, exists := singboxOutbound[key]; exists {
+			t.Fatalf("sing-box Mieru projection must not carry %q: %#v", key, singboxOutbound)
+		}
+	}
+
+	clashOutbound := map[string]interface{}{"type": "mieru"}
+	mergeClientProtocolConfigForNamespace(clashOutbound, config, &model.Inbound{TlsId: 1}, "clash")
+	if got, _ := clashOutbound["username"].(string); got != "legacy-alice" {
+		t.Fatalf("expected Clash Mieru legacy username, got %#v", clashOutbound["username"])
+	}
+	if got, _ := clashOutbound["password"].(string); got != "secret" {
+		t.Fatalf("expected Clash Mieru password, got %#v", clashOutbound["password"])
+	}
+}
+
 func TestMergeClientProtocolConfigForNamespaceKeepsMihomoSnellPSK(t *testing.T) {
 	outbound := map[string]interface{}{
 		"type": "snell",
@@ -124,6 +148,60 @@ func TestMergeClientProtocolConfigForNamespaceKeepsMihomoSnellPSK(t *testing.T) 
 
 	if got, _ := outbound["psk"].(string); got != "secret-pass" {
 		t.Fatalf("expected mihomo snell psk to be merged, got %#v", outbound["psk"])
+	}
+}
+
+func TestMergeClientProtocolConfigRejectsPanelAndUnknownFields(t *testing.T) {
+	outbound := map[string]interface{}{
+		"type": "vless",
+	}
+	config := map[string]interface{}{
+		"uuid":            "11111111-1111-1111-1111-111111111111",
+		"flow":            "xtls-rprx-vision",
+		"username":        "alice",
+		"metadata":        map[string]interface{}{"source": "panel"},
+		"user_management": map[string]interface{}{"selectable": true},
+		"route_tag":       "vless-443",
+		"server_port":     1,
+		"unexpected":      "must-not-leak",
+	}
+
+	mergeClientProtocolConfigForNamespace(outbound, config, &model.Inbound{TlsId: 1}, "mihomo")
+
+	for _, key := range []string{"metadata", "user_management", "route_tag", "server_port", "unexpected"} {
+		if _, exists := outbound[key]; exists {
+			t.Fatalf("non-client config field %q leaked into outbound: %#v", key, outbound)
+		}
+	}
+	if got, _ := outbound["uuid"].(string); got != "11111111-1111-1111-1111-111111111111" {
+		t.Fatalf("expected vless uuid to be retained, got %#v", outbound["uuid"])
+	}
+	if got, _ := outbound["username"].(string); got != "alice" {
+		t.Fatalf("expected Mihomo vless username to be retained, got %#v", outbound["username"])
+	}
+	if got, _ := outbound["flow"].(string); got != "xtls-rprx-vision" {
+		t.Fatalf("expected TLS vless flow to be retained, got %#v", outbound["flow"])
+	}
+}
+
+func TestMergeClientProtocolConfigForNamespaceReplacesShadowQUICTemplateCredentials(t *testing.T) {
+	outbound := map[string]interface{}{
+		"type":     "shadowquic",
+		"username": "template-user",
+		"password": "template-password",
+	}
+	config := map[string]interface{}{
+		"username": "alice",
+		"password": "client-secret",
+	}
+
+	mergeClientProtocolConfigForNamespace(outbound, config, &model.Inbound{}, "mihomo")
+
+	if got, _ := outbound["username"].(string); got != "alice" {
+		t.Fatalf("expected client ShadowQUIC username, got %#v", outbound["username"])
+	}
+	if got, _ := outbound["password"].(string); got != "client-secret" {
+		t.Fatalf("expected client ShadowQUIC password, got %#v", outbound["password"])
 	}
 }
 
@@ -146,10 +224,9 @@ func TestMergeClientProtocolConfigSkipsFlowWhenTLSDisabled(t *testing.T) {
 	}
 }
 
-func TestMergeClientProtocolConfigFillsEmptyOutboundFields(t *testing.T) {
+func TestMergeClientProtocolConfigDoesNotFillServerFieldsFromClientConfig(t *testing.T) {
 	outbound := map[string]interface{}{
-		"type":         "hysteria2",
-		"server_ports": []interface{}{},
+		"type": "hysteria2",
 	}
 	config := map[string]interface{}{
 		"server_ports": []interface{}{"41000:45000"},
@@ -157,9 +234,8 @@ func TestMergeClientProtocolConfigFillsEmptyOutboundFields(t *testing.T) {
 
 	mergeClientProtocolConfig(outbound, config, &model.Inbound{TlsId: 1})
 
-	serverPorts, ok := outbound["server_ports"].([]interface{})
-	if !ok || len(serverPorts) != 1 || serverPorts[0] != "41000:45000" {
-		t.Fatalf("expected empty outbound server_ports to be filled, got %v", outbound["server_ports"])
+	if _, exists := outbound["server_ports"]; exists {
+		t.Fatalf("client-only config must not add server_ports to outbound: %#v", outbound)
 	}
 }
 
@@ -233,6 +309,106 @@ func TestBuildSyncedOutboundKeepsServerWhenHostEmpty(t *testing.T) {
 
 	if got, _ := outbound["server"].(string); got != "149.104.4.31" {
 		t.Fatalf("expected original server to be preserved, got %v", outbound["server"])
+	}
+}
+
+func TestBuildSyncedOutboundStripsPanelFieldsBeforeCaching(t *testing.T) {
+	svc := &SyncService{}
+	inbound := &model.Inbound{
+		OutJson: json.RawMessage(`{
+			"type": "trojan",
+			"tag": "trojan-sync",
+			"server": "panel.example.com",
+			"server_port": 443,
+			"metadata": {"source": "legacy"},
+			"route_tag": "trojan-sync",
+			"user_management": {"selectable": true},
+			"users": [{"username": "legacy"}]
+		}`),
+		Options: json.RawMessage(`{}`),
+	}
+	config := map[string]interface{}{
+		"trojan": map[string]interface{}{
+			"password":   "client-secret",
+			"metadata":   map[string]interface{}{"source": "client"},
+			"unexpected": "must-not-leak",
+		},
+	}
+
+	outbound, clashSource, err := svc.buildSyncedOutbound(nil, inbound, config, "alice", "", true)
+	if err != nil {
+		t.Fatalf("buildSyncedOutbound returned error: %v", err)
+	}
+	for _, payload := range []map[string]interface{}{outbound, clashSource} {
+		for _, key := range []string{"metadata", "route_tag", "user_management", "users", "unexpected"} {
+			if _, exists := payload[key]; exists {
+				t.Fatalf("synced payload leaked %q: %#v", key, payload)
+			}
+		}
+		if got, _ := payload["password"].(string); got != "client-secret" {
+			t.Fatalf("expected client password to remain, got %#v", payload["password"])
+		}
+	}
+}
+
+func TestBuildSyncedOutboundKeepsMieruCredentialsOnlyInClashProjection(t *testing.T) {
+	svc := &SyncService{}
+	inbound := &model.Inbound{
+		OutJson: json.RawMessage(`{
+			"type": "mieru",
+			"tag": "mieru-node",
+			"server": "panel.example.com",
+			"server_port": 16939
+		}`),
+		Options: json.RawMessage(`{}`),
+	}
+	clientConfig := map[string]interface{}{
+		"mieru": map[string]interface{}{
+			"name":       "legacy-alice",
+			"password":   "secret",
+			"metadata":   map[string]interface{}{"panel": true},
+			"unexpected": "drop",
+		},
+	}
+
+	rawOutbound, clashSource, err := svc.buildSyncedOutbound(nil, inbound, clientConfig, "alice", "", true)
+	if err != nil {
+		t.Fatalf("buildSyncedOutbound returned error: %v", err)
+	}
+	for _, key := range []string{"username", "password", "metadata", "unexpected"} {
+		if _, exists := rawOutbound[key]; exists {
+			t.Fatalf("sing-box RawOutbound leaked %q: %#v", key, rawOutbound)
+		}
+	}
+	if got, _ := clashSource["username"].(string); got != "legacy-alice" {
+		t.Fatalf("expected Clash source username, got %#v", clashSource["username"])
+	}
+	if got, _ := clashSource["password"].(string); got != "secret" {
+		t.Fatalf("expected Clash source password, got %#v", clashSource["password"])
+	}
+	for _, key := range []string{"metadata", "unexpected"} {
+		if _, exists := clashSource[key]; exists {
+			t.Fatalf("Clash source leaked %q: %#v", key, clashSource)
+		}
+	}
+	clashOptions, err := buildMihomoClashOptions(clashSource, "s_mieru-node")
+	if err != nil {
+		t.Fatalf("buildMihomoClashOptions returned error: %v", err)
+	}
+	proxy := map[string]interface{}{}
+	if err := json.Unmarshal(clashOptions, &proxy); err != nil {
+		t.Fatalf("decode Mieru ClashOptions failed: %v", err)
+	}
+	if got, _ := proxy["username"].(string); got != "legacy-alice" {
+		t.Fatalf("expected cached ClashOptions username, got %#v", proxy["username"])
+	}
+	if got, _ := proxy["password"].(string); got != "secret" {
+		t.Fatalf("expected cached ClashOptions password, got %#v", proxy["password"])
+	}
+	for _, key := range []string{"metadata", "unexpected"} {
+		if _, exists := proxy[key]; exists {
+			t.Fatalf("cached ClashOptions leaked %q: %#v", key, proxy)
+		}
 	}
 }
 

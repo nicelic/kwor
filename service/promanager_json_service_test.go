@@ -1,6 +1,11 @@
 package service
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/alireza0/s-ui/database/model"
+)
 
 type stubClientJSONService struct {
 	called bool
@@ -39,5 +44,42 @@ func TestGetClientJsonSubscription_UsesConfiguredJsonService(t *testing.T) {
 	}
 	if result == nil || *result != payload {
 		t.Fatalf("unexpected subscription payload: %#v", result)
+	}
+}
+
+func TestBuildClientOutboundsFallbackExcludesMixedAndMieru(t *testing.T) {
+	client := &model.Client{
+		Config: json.RawMessage(`{
+			"mixed": {"username": "mixed-user", "password": "mixed-secret"},
+			"mieru": {"username": "mieru-user", "password": "mieru-secret"}
+		}`),
+	}
+	inbounds := []*model.Inbound{
+		{
+			Type: "mixed",
+			OutJson: json.RawMessage(`{
+				"type": "mixed",
+				"tag": "mixed-node",
+				"server": "panel.example.com",
+				"server_port": 1080
+			}`),
+		},
+		{
+			Type: "mieru",
+			OutJson: json.RawMessage(`{
+				"type": "mieru",
+				"tag": "mieru-node",
+				"server": "panel.example.com",
+				"server_port": 16939
+			}`),
+		},
+	}
+
+	outbounds, tags, err := (&ProManagerService{}).buildClientOutbounds(client, inbounds)
+	if err != nil {
+		t.Fatalf("buildClientOutbounds returned error: %v", err)
+	}
+	if len(*outbounds) != 0 || len(*tags) != 0 {
+		t.Fatalf("mixed and Mieru must be absent from sing-box fallback output, got outbounds=%#v tags=%#v", outbounds, tags)
 	}
 }

@@ -15,6 +15,7 @@ export const InTypes = {
   Naive: 'naive',
   Hysteria: 'hysteria',
   ShadowTLS: 'shadowtls',
+  ShadowQUIC: 'shadowquic',
   TUIC: 'tuic',
   Hysteria2: 'hysteria2',
   TrustTunnel: 'trusttunnel',
@@ -151,6 +152,29 @@ export interface ShadowTLS extends InboundBasics {
   wildcard_sni?: string
   // Shadowsocks 配置，用于生成组合的入站
   ss_config?: ShadowsocksConfig
+}
+export interface ShadowQUICJLSUpstream {
+  addr: string
+  sni?: string
+  proxy?: string
+  rate_limit?: number
+}
+export interface ShadowQUIC extends InboundBasics {
+  jls_upstream?: ShadowQUICJLSUpstream
+  alpn?: string[]
+  quic_versions?: string[]
+  zero_rtt?: boolean
+  congestion_controller?: string
+  up?: string
+  down?: string
+  ignore_client_bandwidth?: boolean
+  cwnd?: number
+  bbr_profile?: string
+  max_idle_time?: number
+  max_datagram_frame_size?: number
+  recv_window_conn?: number
+  recv_window?: number
+  disable_mtu_discovery?: boolean
 }
 export interface VLESS extends InboundBasics {
   multiplex?: iMultiplex
@@ -295,6 +319,7 @@ type InterfaceMap = {
   naive: Naive
   hysteria: Hysteria
   shadowtls: ShadowTLS
+  shadowquic: ShadowQUIC
   tuic: TUIC
   hysteria2: Hysteria2
   trusttunnel: TrustTunnel
@@ -358,6 +383,7 @@ const defaultValues: Record<InType, Inbound> = {
     tls_id: 0,
   },
   shadowtls: <ShadowTLS>{ type: InTypes.ShadowTLS, version: 3, handshake: { server: 'addons.mozilla.org', server_port: 443 }, handshake_for_server_name: {}, strict_mode: true, ss_config: { method: '2022-blake3-aes-128-gcm', network: 'tcp', udp_over_tcp: { enabled: true, version: 2 }, multiplex: { enabled: true, protocol: 'smux', max_connections: 250, max_streams: 8, padding: true } } },
+  shadowquic: <ShadowQUIC>{ type: InTypes.ShadowQUIC, tls_id: 0 },
   tuic: <TUIC>{ type: InTypes.TUIC, congestion_control: "cubic", tls_id: 0 },
   hysteria2: <Hysteria2>{ type: InTypes.Hysteria2, tls_id: 0, server_up_mbps: 500, server_down_mbps: 500 },
   trusttunnel: <TrustTunnel>{ type: InTypes.TrustTunnel, tls_id: 0, network: ['tcp'], congestion_controller: "bbr" },

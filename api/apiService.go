@@ -2,7 +2,9 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -38,7 +40,6 @@ type ApiService struct {
 	service.PanelService
 	service.StatsService
 	service.ServerService
-	service.SystemMonitorService
 	service.SyncService
 	service.MihomoSyncService
 	service.IPDetectService
@@ -58,6 +59,36 @@ type ApiService struct {
 	service.CertificateInventoryService
 	service.SelfSignedService
 	service.PanelUpdateService
+	service.PanelUninstallService
+
+	coreManagerOverride       *service.CoreManagerService
+	mihomoCoreManagerOverride *service.MihomoCoreManagerService
+}
+
+func (a *ApiService) SetCoreManagers(coreManager *service.CoreManagerService, mihomoCoreManager *service.MihomoCoreManagerService) {
+	if a == nil {
+		return
+	}
+	a.coreManagerOverride = coreManager
+	a.mihomoCoreManagerOverride = mihomoCoreManager
+}
+
+func (a *ApiService) coreManagerService() *service.CoreManagerService {
+	if a != nil && a.coreManagerOverride != nil {
+		return a.coreManagerOverride
+	}
+	return &a.CoreManagerService
+}
+
+func (a *ApiService) mihomoCoreManagerService() *service.MihomoCoreManagerService {
+	if a != nil && a.mihomoCoreManagerOverride != nil {
+		return a.mihomoCoreManagerOverride
+	}
+	return &a.MihomoCoreManagerService
+}
+
+var panelUninstallScheduler = func(uninstallService *service.PanelUninstallService) (*service.PanelUninstallResult, error) {
+	return uninstallService.Schedule()
 }
 
 type tlsSha256Request struct {
@@ -67,12 +98,12 @@ type tlsSha256Request struct {
 }
 
 type trafficOverviewSettingsRequest struct {
-	LimitGiB       *float64 `json:"limit_gib" form:"limit_gib"`
-	ResetDay       *int     `json:"reset_day" form:"reset_day"`
-	ExpiryDate     *string  `json:"expiry_date" form:"expiry_date"`
-	LimitGiBCompat *float64 `json:"limitGiB" form:"limitGiB"`
-	ResetDayCompat *int     `json:"resetDay" form:"resetDay"`
-	ExpiryDateCompat *string `json:"expiryDate" form:"expiryDate"`
+	LimitGiB         *float64 `json:"limit_gib" form:"limit_gib"`
+	ResetDay         *int     `json:"reset_day" form:"reset_day"`
+	ExpiryDate       *string  `json:"expiry_date" form:"expiry_date"`
+	LimitGiBCompat   *float64 `json:"limitGiB" form:"limitGiB"`
+	ResetDayCompat   *int     `json:"resetDay" form:"resetDay"`
+	ExpiryDateCompat *string  `json:"expiryDate" form:"expiryDate"`
 }
 
 type trafficOverviewSwitchRequest struct {
@@ -87,12 +118,6 @@ type trafficOverviewVnstatUpdateRequest struct {
 	Source string `json:"source" form:"source"`
 }
 
-type systemMonitorSettingsRequest struct {
-	SampleIntervalSec     *int `json:"sample_interval_sec" form:"sample_interval_sec"`
-	PrimaryRetentionHours *int `json:"primary_retention_hours" form:"primary_retention_hours"`
-	ArchiveRetentionDays  *int `json:"archive_retention_days" form:"archive_retention_days"`
-}
-
 type firewallSwitchRequest struct {
 	Enabled *bool `json:"enabled" form:"enabled"`
 }
@@ -103,10 +128,6 @@ type firewallRuleDeleteRequest struct {
 
 type firewallGeoSettingsRequest struct {
 	IntervalMinutes *int `json:"intervalMinutes" form:"intervalMinutes"`
-}
-
-type reverseProxyReorderRequest struct {
-	IDs []uint `json:"ids" form:"ids"`
 }
 
 type firewallSSHPortRequest struct {
@@ -189,34 +210,37 @@ type acmeRemoveRequest struct {
 }
 
 type acmeIssueRequest struct {
-	Domains         *string `json:"domains" form:"domains"`
-	CertificateType *string `json:"certificateType" form:"certificateType"`
-	Challenge       *string `json:"challenge" form:"challenge"`
-	Webroot         *string `json:"webroot" form:"webroot"`
-	DNSProvider     *string `json:"dnsProvider" form:"dnsProvider"`
-	DNSEnv          *string `json:"dnsEnv" form:"dnsEnv"`
-	Server          *string `json:"server" form:"server"`
-	KeyLength       *string `json:"keyLength" form:"keyLength"`
-	CustomArgs      *string `json:"customArgs" form:"customArgs"`
-	AcmeAccountID   *uint   `json:"acmeAccountId" form:"acmeAccountId"`
-	DNSAccountID    *uint   `json:"dnsAccountId" form:"dnsAccountId"`
-	AutoRenew       *bool   `json:"autoRenew" form:"autoRenew"`
-	Remark          *string `json:"remark" form:"remark"`
-	ApplyTarget     *string `json:"applyTarget" form:"applyTarget"`
-	PushDir         *string `json:"pushDir" form:"pushDir"`
-	LogSessionID    *string `json:"logSessionId" form:"logSessionId"`
+	ExistingRecordID *uint   `json:"existingRecordId" form:"existingRecordId"`
+	Domains          *string `json:"domains" form:"domains"`
+	CertificateType  *string `json:"certificateType" form:"certificateType"`
+	Challenge        *string `json:"challenge" form:"challenge"`
+	Webroot          *string `json:"webroot" form:"webroot"`
+	DNSProvider      *string `json:"dnsProvider" form:"dnsProvider"`
+	DNSEnv           *string `json:"dnsEnv" form:"dnsEnv"`
+	Server           *string `json:"server" form:"server"`
+	KeyLength        *string `json:"keyLength" form:"keyLength"`
+	CustomArgs       *string `json:"customArgs" form:"customArgs"`
+	AcmeAccountID    *uint   `json:"acmeAccountId" form:"acmeAccountId"`
+	DNSAccountID     *uint   `json:"dnsAccountId" form:"dnsAccountId"`
+	AutoRenew        *bool   `json:"autoRenew" form:"autoRenew"`
+	Remark           *string `json:"remark" form:"remark"`
+	ApplyTarget      *string `json:"applyTarget" form:"applyTarget"`
+	PushDir          *string `json:"pushDir" form:"pushDir"`
+	LogSessionID     *string `json:"logSessionId" form:"logSessionId"`
 }
 
 type acmeRenewRequest struct {
-	ID          *uint   `json:"id" form:"id"`
-	Force       *bool   `json:"force" form:"force"`
-	ApplyTarget *string `json:"applyTarget" form:"applyTarget"`
-	PushDir     *string `json:"pushDir" form:"pushDir"`
+	ID           *uint   `json:"id" form:"id"`
+	Force        *bool   `json:"force" form:"force"`
+	ApplyTarget  *string `json:"applyTarget" form:"applyTarget"`
+	PushDir      *string `json:"pushDir" form:"pushDir"`
+	LogSessionID *string `json:"logSessionId" form:"logSessionId"`
 }
 
 type acmePushRequest struct {
 	ID        *uint   `json:"id" form:"id"`
 	TargetDir *string `json:"targetDir" form:"targetDir"`
+	Clear     *bool   `json:"clear" form:"clear"`
 }
 
 type acmeSetAutoRenewRequest struct {
@@ -243,16 +267,22 @@ type acmeViewRequest struct {
 }
 
 type acmeAccountSaveRequest struct {
-	ID        *uint   `json:"id" form:"id"`
-	Name      *string `json:"name" form:"name"`
-	Email     *string `json:"email" form:"email"`
-	Server    *string `json:"server" form:"server"`
-	KeyLength *string `json:"keyLength" form:"keyLength"`
-	Remark    *string `json:"remark" form:"remark"`
+	ID               *uint   `json:"id" form:"id"`
+	Name             *string `json:"name" form:"name"`
+	Email            *string `json:"email" form:"email"`
+	Server           *string `json:"server" form:"server"`
+	AccountKeyLength *string `json:"accountKeyLength" form:"accountKeyLength"`
+	KeyLength        *string `json:"keyLength" form:"keyLength"`
+	Remark           *string `json:"remark" form:"remark"`
 }
 
 type acmeAccountDeleteRequest struct {
 	ID *uint `json:"id" form:"id"`
+}
+
+type acmeAccountRotateKeyRequest struct {
+	ID               *uint   `json:"id" form:"id"`
+	AccountKeyLength *string `json:"accountKeyLength" form:"accountKeyLength"`
 }
 
 type acmeDNSAccountSaveRequest struct {
@@ -686,6 +716,26 @@ func (a *ApiService) GetSettings(c *gin.Context) {
 	jsonObj(c, data, err)
 }
 
+// GetSubscriptionURI returns the current request's calculated subscription
+// base URI without loading the complete runtime data set.
+func normalizeSubscriptionBaseURI(value string) (string, error) {
+	return service.NormalizeSubscriptionBaseURI(value)
+}
+
+func (a *ApiService) GetSubscriptionURI(c *gin.Context) {
+	subURI, err := a.SettingService.GetFinalSubURI(getHostname(c))
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	subURI, err = normalizeSubscriptionBaseURI(subURI)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, gin.H{"subURI": subURI}, nil)
+}
+
 func (a *ApiService) GetStats(c *gin.Context) {
 	resource := c.Query("resource")
 	namespace := strings.TrimSpace(c.Query("namespace"))
@@ -714,62 +764,6 @@ func (a *ApiService) GetStatus(c *gin.Context) {
 	request := c.Query("r")
 	result := a.ServerService.GetStatus(request)
 	jsonObj(c, result, nil)
-}
-
-func (a *ApiService) GetSystemMonitorOverview(c *gin.Context) {
-	result, err := a.SystemMonitorService.GetOverview()
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	jsonObj(c, result, nil)
-}
-
-func (a *ApiService) GetSystemMonitorHistory(c *gin.Context) {
-	startSec, _ := strconv.ParseInt(strings.TrimSpace(c.Query("start")), 10, 64)
-	endSec, _ := strconv.ParseInt(strings.TrimSpace(c.Query("end")), 10, 64)
-	bucketSeconds, _ := strconv.Atoi(strings.TrimSpace(c.Query("bucket_sec")))
-	customValue, _ := strconv.Atoi(strings.TrimSpace(c.Query("value")))
-	result, err := a.SystemMonitorService.GetHistory(service.SystemMonitorHistoryQuery{
-		RangeKey:             c.Query("range"),
-		CustomValue:          customValue,
-		CustomUnit:           c.Query("unit"),
-		RequestedGranularity: c.Query("granularity"),
-		StartSec:             startSec,
-		EndSec:               endSec,
-		BucketSeconds:        bucketSeconds,
-	})
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	jsonObj(c, result, nil)
-}
-
-func (a *ApiService) SaveSystemMonitorSettings(c *gin.Context) {
-	req := systemMonitorSettingsRequest{}
-	if err := c.ShouldBind(&req); err != nil {
-		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
-		return
-	}
-	if req.SampleIntervalSec == nil || req.PrimaryRetentionHours == nil || req.ArchiveRetentionDays == nil {
-		jsonMsg(c, "", fmt.Errorf("sample_interval_sec, primary_retention_hours and archive_retention_days are required"))
-		return
-	}
-	if err := a.SystemMonitorService.SaveSettings(*req.SampleIntervalSec, *req.PrimaryRetentionHours, *req.ArchiveRetentionDays); err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	a.GetSystemMonitorOverview(c)
-}
-
-func (a *ApiService) ResetSystemMonitorStats(c *gin.Context) {
-	overview, err := a.SystemMonitorService.ClearStats()
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	jsonObj(c, overview, nil)
 }
 
 func (a *ApiService) GetTrafficOverview(c *gin.Context) {
@@ -843,18 +837,22 @@ func (a *ApiService) GetTrafficOverviewVnstatUpdateInfo(c *gin.Context) {
 	jsonObj(c, result, nil)
 }
 
+func (a *ApiService) GetTrafficOverviewVnstatInstallStatus(c *gin.Context) {
+	jsonObj(c, a.TrafficOverviewService.GetManagedVnstatInstallJob(c.Query("jobId")), nil)
+}
+
 func (a *ApiService) InstallTrafficOverviewVnstat(c *gin.Context) {
 	req := trafficOverviewVnstatInstallRequest{}
 	if err := c.ShouldBind(&req); err != nil {
 		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
 		return
 	}
-	overview, err := a.TrafficOverviewService.InstallManagedVnstat(req.Source)
+	job, err := a.TrafficOverviewService.StartManagedVnstatInstall(req.Source)
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
 	}
-	jsonObj(c, overview, nil)
+	jsonObj(c, job, nil)
 }
 
 func (a *ApiService) RemoveTrafficOverviewVnstat(c *gin.Context) {
@@ -1338,6 +1336,24 @@ func (a *ApiService) GetAcmeLog(c *gin.Context) {
 	jsonObj(c, session, nil)
 }
 
+func (a *ApiService) GetAcmeTask(c *gin.Context) {
+	id := strings.TrimSpace(c.Query("id"))
+	if id == "" {
+		jsonMsg(c, "", fmt.Errorf("id is required"))
+		return
+	}
+	task, err := a.AcmeService.GetTask(id)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, task, nil)
+}
+
+func (a *ApiService) GetActiveAcmeTasks(c *gin.Context) {
+	jsonObj(c, a.AcmeService.GetActiveTasks(), nil)
+}
+
 func (a *ApiService) GetAcmeIPPortStatus(c *gin.Context) {
 	result, err := a.AcmeService.GetIPCertificatePortStatus()
 	if err != nil {
@@ -1433,74 +1449,27 @@ func (a *ApiService) UpgradeAcme(c *gin.Context) {
 }
 
 func (a *ApiService) IssueAcmeCertificate(c *gin.Context) {
-	req := acmeIssueRequest{}
-	if err := c.ShouldBind(&req); err != nil {
-		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
+	a.issueAcmeCertificate(c, false)
+}
+
+func (a *ApiService) ReissueAcmeCertificate(c *gin.Context) {
+	a.issueAcmeCertificate(c, true)
+}
+
+func (a *ApiService) IssueAcmeCertificateTask(c *gin.Context) {
+	a.issueAcmeCertificateTask(c, false)
+}
+
+func (a *ApiService) ReissueAcmeCertificateTask(c *gin.Context) {
+	a.issueAcmeCertificateTask(c, true)
+}
+
+func (a *ApiService) issueAcmeCertificate(c *gin.Context, requireExistingRecord bool) {
+	payload, err := a.parseAcmeIssuePayload(c, requireExistingRecord)
+	if err != nil {
+		jsonMsg(c, "", err)
 		return
 	}
-
-	certificateType := "domain"
-	if req.CertificateType != nil {
-		certificateType = strings.TrimSpace(*req.CertificateType)
-	}
-	normalizedCertificateType := normalizeAcmeIssueCertificateType(certificateType)
-	if normalizedCertificateType == "domain" && (req.AcmeAccountID == nil || *req.AcmeAccountID == 0) {
-		jsonMsg(c, "", fmt.Errorf("acmeAccountId is required for domain certificate"))
-		return
-	}
-
-	payload := service.AcmeIssuePayload{}
-	if req.Domains != nil {
-		payload.DomainsText = strings.TrimSpace(*req.Domains)
-	}
-	if req.CertificateType != nil {
-		payload.CertificateType = strings.TrimSpace(*req.CertificateType)
-	}
-	if req.Challenge != nil {
-		payload.Challenge = strings.TrimSpace(*req.Challenge)
-	}
-	if req.Webroot != nil {
-		payload.Webroot = strings.TrimSpace(*req.Webroot)
-	}
-	if req.DNSProvider != nil {
-		payload.DNSProvider = strings.TrimSpace(*req.DNSProvider)
-	}
-	if req.DNSEnv != nil {
-		payload.DNSEnvText = *req.DNSEnv
-	}
-	if req.Server != nil {
-		payload.Server = strings.TrimSpace(*req.Server)
-	}
-	if req.KeyLength != nil {
-		payload.KeyLength = strings.TrimSpace(*req.KeyLength)
-	}
-	if req.CustomArgs != nil {
-		payload.CustomArgs = strings.TrimSpace(*req.CustomArgs)
-	}
-	if normalizedCertificateType == "domain" && req.AcmeAccountID != nil {
-		payload.AcmeAccountID = *req.AcmeAccountID
-	}
-	if req.DNSAccountID != nil {
-		payload.DNSAccountID = *req.DNSAccountID
-	}
-	payload.AutoRenew = true
-	if req.AutoRenew != nil {
-		payload.AutoRenew = *req.AutoRenew
-	}
-	if req.Remark != nil {
-		payload.Remark = strings.TrimSpace(*req.Remark)
-	}
-	if req.ApplyTarget != nil {
-		payload.ApplyTarget = strings.TrimSpace(*req.ApplyTarget)
-	}
-	if req.PushDir != nil {
-		payload.PushDir = strings.TrimSpace(*req.PushDir)
-		payload.PushExplicit = payload.PushDir != ""
-	}
-	if req.LogSessionID != nil {
-		payload.LogSessionID = strings.TrimSpace(*req.LogSessionID)
-	}
-
 	result, err := a.AcmeService.Issue(payload)
 	if err != nil {
 		jsonMsg(c, "", err)
@@ -1509,26 +1478,119 @@ func (a *ApiService) IssueAcmeCertificate(c *gin.Context) {
 	jsonObj(c, result, nil)
 }
 
-func (a *ApiService) RenewAcmeCertificate(c *gin.Context) {
-	req := acmeRenewRequest{}
-	if err := c.ShouldBind(&req); err != nil {
-		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
+func (a *ApiService) issueAcmeCertificateTask(c *gin.Context, requireExistingRecord bool) {
+	payload, err := a.parseAcmeIssuePayload(c, requireExistingRecord)
+	if err != nil {
+		jsonMsg(c, "", err)
 		return
 	}
-	if req.ID == nil || *req.ID == 0 {
-		jsonMsg(c, "", fmt.Errorf("id is required"))
+	var task *service.AcmeTaskView
+	if requireExistingRecord {
+		task, err = a.AcmeService.StartReissueTask(payload)
+	} else {
+		task, err = a.AcmeService.StartIssueTask(payload)
+	}
+	if err != nil {
+		jsonMsg(c, "", err)
 		return
+	}
+	jsonObj(c, task, nil)
+}
+
+func (a *ApiService) parseAcmeIssuePayload(c *gin.Context, requireExistingRecord bool) (service.AcmeIssuePayload, error) {
+	req := acmeIssueRequest{}
+	if err := c.ShouldBind(&req); err != nil {
+		return service.AcmeIssuePayload{}, fmt.Errorf("invalid request body: %w", err)
+	}
+	if requireExistingRecord && (req.ExistingRecordID == nil || *req.ExistingRecordID == 0) {
+		return service.AcmeIssuePayload{}, fmt.Errorf("existingRecordId is required")
 	}
 
-	payload := service.AcmeRenewPayload{
-		ID:     *req.ID,
-		Manual: true,
+	certificateType := "domain"
+	if req.CertificateType != nil {
+		certificateType = strings.TrimSpace(*req.CertificateType)
 	}
-	if req.Force != nil {
-		payload.Force = *req.Force
+	normalizedCertificateType := normalizeAcmeIssueCertificateType(certificateType)
+	if !requireExistingRecord && normalizedCertificateType == "domain" && (req.AcmeAccountID == nil || *req.AcmeAccountID == 0) {
+		return service.AcmeIssuePayload{}, fmt.Errorf("acmeAccountId is required for domain certificate")
+	}
+
+	payload := service.AcmeIssuePayload{}
+	if req.ExistingRecordID != nil {
+		payload.ExistingRecordID = *req.ExistingRecordID
+	}
+	if req.Domains != nil {
+		payload.DomainsText = strings.TrimSpace(*req.Domains)
+		payload.DomainsProvided = true
+	}
+	if req.CertificateType != nil {
+		payload.CertificateType = strings.TrimSpace(*req.CertificateType)
+		payload.CertificateTypeProvided = true
+	}
+	if req.Challenge != nil {
+		payload.Challenge = strings.TrimSpace(*req.Challenge)
+		payload.ChallengeProvided = true
+	}
+	if req.Webroot != nil {
+		payload.Webroot = strings.TrimSpace(*req.Webroot)
+		payload.WebrootProvided = true
+	}
+	if req.DNSProvider != nil {
+		payload.DNSProvider = strings.TrimSpace(*req.DNSProvider)
+		payload.DNSProviderProvided = true
+	}
+	if req.DNSEnv != nil {
+		payload.DNSEnvText = *req.DNSEnv
+		payload.DNSEnvProvided = true
+	}
+	if req.Server != nil {
+		payload.Server = strings.TrimSpace(*req.Server)
+	}
+	if req.KeyLength != nil {
+		payload.KeyLength = strings.TrimSpace(*req.KeyLength)
+		payload.KeyLengthProvided = true
+	}
+	if req.CustomArgs != nil {
+		payload.CustomArgs = strings.TrimSpace(*req.CustomArgs)
+		payload.CustomArgsProvided = true
+	}
+	if req.AcmeAccountID != nil {
+		payload.AcmeAccountID = *req.AcmeAccountID
+		payload.AcmeAccountProvided = true
+	}
+	if req.DNSAccountID != nil {
+		payload.DNSAccountID = *req.DNSAccountID
+		payload.DNSAccountProvided = true
+	}
+	payload.AutoRenew = true
+	if req.AutoRenew != nil {
+		payload.AutoRenew = *req.AutoRenew
+		payload.AutoRenewProvided = true
+	}
+	if req.Remark != nil {
+		payload.Remark = strings.TrimSpace(*req.Remark)
+		payload.RemarkProvided = true
 	}
 	if req.ApplyTarget != nil {
 		payload.ApplyTarget = strings.TrimSpace(*req.ApplyTarget)
+		payload.ApplyTargetProvided = true
+	}
+	if req.PushDir != nil {
+		payload.PushDir = strings.TrimSpace(*req.PushDir)
+		payload.PushDirProvided = true
+		payload.PushExplicit = payload.PushDir != ""
+	}
+	if req.LogSessionID != nil {
+		payload.LogSessionID = strings.TrimSpace(*req.LogSessionID)
+	}
+	return payload, nil
+}
+
+func (a *ApiService) RenewAcmeCertificate(c *gin.Context) {
+	payload, err := a.parseAcmeRenewPayload(c)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
 	}
 	result, err := a.AcmeService.Renew(payload)
 	if err != nil {
@@ -1536,6 +1598,44 @@ func (a *ApiService) RenewAcmeCertificate(c *gin.Context) {
 		return
 	}
 	jsonObj(c, result, nil)
+}
+
+func (a *ApiService) RenewAcmeCertificateTask(c *gin.Context) {
+	payload, err := a.parseAcmeRenewPayload(c)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	task, err := a.AcmeService.StartRenewTask(payload)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, task, nil)
+}
+
+func (a *ApiService) parseAcmeRenewPayload(c *gin.Context) (service.AcmeRenewPayload, error) {
+	req := acmeRenewRequest{}
+	if err := c.ShouldBind(&req); err != nil {
+		return service.AcmeRenewPayload{}, fmt.Errorf("invalid request body: %w", err)
+	}
+	if req.ID == nil || *req.ID == 0 {
+		return service.AcmeRenewPayload{}, fmt.Errorf("id is required")
+	}
+
+	payload := service.AcmeRenewPayload{
+		ID: *req.ID,
+	}
+	if req.Force != nil {
+		payload.Force = *req.Force
+	}
+	if req.ApplyTarget != nil {
+		payload.ApplyTarget = strings.TrimSpace(*req.ApplyTarget)
+	}
+	if req.LogSessionID != nil {
+		payload.LogSessionID = strings.TrimSpace(*req.LogSessionID)
+	}
+	return payload, nil
 }
 
 func (a *ApiService) PushAcmeCertificate(c *gin.Context) {
@@ -1548,14 +1648,24 @@ func (a *ApiService) PushAcmeCertificate(c *gin.Context) {
 		jsonMsg(c, "", fmt.Errorf("id is required"))
 		return
 	}
-	if req.TargetDir == nil || strings.TrimSpace(*req.TargetDir) == "" {
+	clear := req.Clear != nil && *req.Clear
+	targetDir := ""
+	if req.TargetDir != nil {
+		targetDir = strings.TrimSpace(*req.TargetDir)
+	}
+	if !clear && targetDir == "" {
 		jsonMsg(c, "", fmt.Errorf("targetDir is required"))
+		return
+	}
+	if clear && targetDir != "" {
+		jsonMsg(c, "", fmt.Errorf("targetDir must be empty when clear is true"))
 		return
 	}
 
 	result, err := a.AcmeService.Push(service.AcmePushPayload{
 		ID:        *req.ID,
-		TargetDir: strings.TrimSpace(*req.TargetDir),
+		TargetDir: targetDir,
+		Clear:     clear,
 	})
 	if err != nil {
 		jsonMsg(c, "", err)
@@ -1720,29 +1830,58 @@ func (a *ApiService) SaveAcmeAccount(c *gin.Context) {
 		jsonMsg(c, "", fmt.Errorf("name is required"))
 		return
 	}
-	if req.Email == nil || strings.TrimSpace(*req.Email) == "" {
-		jsonMsg(c, "", fmt.Errorf("email is required"))
-		return
-	}
-
 	payload := service.AcmeAccountPayload{
-		Name:  strings.TrimSpace(*req.Name),
-		Email: strings.Join(strings.Fields(*req.Email), ""),
+		Name: strings.TrimSpace(*req.Name),
+	}
+	if req.Email != nil {
+		payload.Email = strings.TrimSpace(*req.Email)
+		payload.EmailProvided = true
 	}
 	if req.ID != nil {
 		payload.ID = *req.ID
 	}
 	if req.Server != nil {
 		payload.Server = strings.TrimSpace(*req.Server)
+		payload.ServerProvided = true
 	}
-	if req.KeyLength != nil {
+	if req.AccountKeyLength != nil {
+		payload.AccountKeyLength = strings.TrimSpace(*req.AccountKeyLength)
+		payload.AccountKeyLengthProvided = true
+	} else if req.KeyLength != nil {
 		payload.KeyLength = strings.TrimSpace(*req.KeyLength)
+		payload.AccountKeyLengthProvided = true
 	}
 	if req.Remark != nil {
 		payload.Remark = strings.TrimSpace(*req.Remark)
+		payload.RemarkProvided = true
 	}
 
 	result, err := a.AcmeService.SaveAcmeAccount(payload)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, result, nil)
+}
+
+func (a *ApiService) RotateAcmeAccountKey(c *gin.Context) {
+	req := acmeAccountRotateKeyRequest{}
+	if err := c.ShouldBind(&req); err != nil {
+		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+	if req.ID == nil || *req.ID == 0 {
+		jsonMsg(c, "", fmt.Errorf("id is required"))
+		return
+	}
+	if req.AccountKeyLength == nil || strings.TrimSpace(*req.AccountKeyLength) == "" {
+		jsonMsg(c, "", fmt.Errorf("accountKeyLength is required"))
+		return
+	}
+	result, err := a.AcmeService.RotateAcmeAccountKey(service.AcmeAccountRotateKeyPayload{
+		ID:               *req.ID,
+		AccountKeyLength: strings.TrimSpace(*req.AccountKeyLength),
+	})
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
@@ -1787,16 +1926,17 @@ func (a *ApiService) SaveAcmeDNSAccount(c *gin.Context) {
 	payload := service.AcmeDNSAccountPayload{
 		Name:         strings.TrimSpace(*req.Name),
 		ProviderCode: strings.TrimSpace(*req.ProviderCode),
-		EnvJSON:      "{}",
 	}
 	if req.ID != nil {
 		payload.ID = *req.ID
 	}
-	if req.EnvJSON != nil && strings.TrimSpace(*req.EnvJSON) != "" {
+	if req.EnvJSON != nil {
 		payload.EnvJSON = strings.TrimSpace(*req.EnvJSON)
+		payload.EnvJSONProvided = true
 	}
 	if req.Remark != nil {
 		payload.Remark = strings.TrimSpace(*req.Remark)
+		payload.RemarkProvided = true
 	}
 
 	result, err := a.AcmeService.SaveDNSAccount(payload)
@@ -2052,29 +2192,7 @@ func (a *ApiService) DeletePortForwardRule(c *gin.Context) {
 	a.GetPortForwardOverview(c)
 }
 
-func (a *ApiService) GetReverseProxyOverview(c *gin.Context) {
-	overview, err := a.ReverseProxyService.GetOverview()
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	jsonObj(c, overview, nil)
-}
-
-func (a *ApiService) SaveReverseProxyRule(c *gin.Context) {
-	req := service.ReverseProxyRulePayload{}
-	if err := c.ShouldBind(&req); err != nil {
-		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
-		return
-	}
-	if err := a.ReverseProxyService.UpsertRule(req); err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	a.GetReverseProxyOverview(c)
-}
-
-func (a *ApiService) DeleteReverseProxyRule(c *gin.Context) {
+func (a *ApiService) ResetPortForwardRuleTraffic(c *gin.Context) {
 	req := firewallRuleDeleteRequest{}
 	if err := c.ShouldBind(&req); err != nil {
 		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
@@ -2084,15 +2202,158 @@ func (a *ApiService) DeleteReverseProxyRule(c *gin.Context) {
 		jsonMsg(c, "", fmt.Errorf("id is required"))
 		return
 	}
-	if err := a.ReverseProxyService.DeleteRule(*req.ID); err != nil {
+	if err := a.PortForwardService.ResetRuleTraffic(*req.ID); err != nil {
 		jsonMsg(c, "", err)
+		return
+	}
+	a.GetPortForwardOverview(c)
+}
+
+func (a *ApiService) ResetPortForwardOverviewTraffic(c *gin.Context) {
+	if err := a.PortForwardService.ResetOverviewTraffic(); err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	a.GetPortForwardOverview(c)
+}
+
+func (a *ApiService) GetReverseProxyOverview(c *gin.Context) {
+	overview, err := a.ReverseProxyService.GetOverview()
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, overview, nil)
+}
+
+// GetReverseProxyRuntime deliberately returns only volatile counters and
+// listener state.  The settings page uses it for its short polling interval,
+// avoiding a SQLite/certificate inventory read every few seconds.
+func (a *ApiService) GetReverseProxyRuntime(c *gin.Context) {
+	runtime, err := a.ReverseProxyService.GetRuntimeOverview()
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, runtime, nil)
+}
+
+func (a *ApiService) writeReverseProxyMutationError(c *gin.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	var obj interface{}
+	if service.IsReverseProxyRevisionConflict(err) {
+		currentRevision, revisionErr := a.ReverseProxyService.CurrentRevision()
+		if revisionErr == nil {
+			obj = map[string]interface{}{
+				"code":            "revision_conflict",
+				"currentRevision": currentRevision,
+			}
+		} else {
+			obj = map[string]interface{}{"code": "revision_conflict"}
+		}
+	}
+	jsonMsgObj(c, "", obj, err)
+	return true
+}
+
+func (a *ApiService) SaveReverseProxySettings(c *gin.Context) {
+	req := service.ReverseProxySettingsPayload{}
+	if err := c.ShouldBind(&req); err != nil {
+		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+	if req.ExpectedRevision == nil {
+		jsonMsg(c, "", fmt.Errorf("expectedRevision is required"))
+		return
+	}
+	if err := a.ReverseProxyService.SaveResourceSettings(req); a.writeReverseProxyMutationError(c, err) {
+		return
+	}
+	a.GetReverseProxyOverview(c)
+}
+
+func (a *ApiService) SaveReverseProxyRule(c *gin.Context) {
+	req := service.ReverseProxyRulePayload{}
+	if err := c.ShouldBind(&req); err != nil {
+		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+	if req.ExpectedRevision == nil {
+		jsonMsg(c, "", fmt.Errorf("expectedRevision is required"))
+		return
+	}
+	if err := a.ReverseProxyService.UpsertRule(req); a.writeReverseProxyMutationError(c, err) {
+		return
+	}
+	a.GetReverseProxyOverview(c)
+}
+
+func (a *ApiService) SetReverseProxyRuleStatus(c *gin.Context) {
+	req := service.ReverseProxyRuleStatusPayload{}
+	if err := c.ShouldBind(&req); err != nil {
+		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+	if req.ID == 0 {
+		jsonMsg(c, "", fmt.Errorf("id is required"))
+		return
+	}
+	if req.ExpectedRevision == nil {
+		jsonMsg(c, "", fmt.Errorf("expectedRevision is required"))
+		return
+	}
+	result, err := a.ReverseProxyService.SetRuleEnabled(req)
+	if a.writeReverseProxyMutationError(c, err) {
+		return
+	}
+	jsonObj(c, result, nil)
+}
+
+func (a *ApiService) MoveReverseProxyRule(c *gin.Context) {
+	req := service.ReverseProxyRuleMovePayload{}
+	if err := c.ShouldBind(&req); err != nil {
+		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+	if req.ID == 0 {
+		jsonMsg(c, "", fmt.Errorf("id is required"))
+		return
+	}
+	if req.ExpectedRevision == nil {
+		jsonMsg(c, "", fmt.Errorf("expectedRevision is required"))
+		return
+	}
+	result, err := a.ReverseProxyService.MoveRule(req)
+	if a.writeReverseProxyMutationError(c, err) {
+		return
+	}
+	jsonObj(c, result, nil)
+}
+
+func (a *ApiService) DeleteReverseProxyRule(c *gin.Context) {
+	req := service.ReverseProxyRuleDeletePayload{}
+	if err := c.ShouldBind(&req); err != nil {
+		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+	if req.ID == 0 {
+		jsonMsg(c, "", fmt.Errorf("id is required"))
+		return
+	}
+	if req.ExpectedRevision == nil {
+		jsonMsg(c, "", fmt.Errorf("expectedRevision is required"))
+		return
+	}
+	if err := a.ReverseProxyService.DeleteRuleWithRevision(req); a.writeReverseProxyMutationError(c, err) {
 		return
 	}
 	a.GetReverseProxyOverview(c)
 }
 
 func (a *ApiService) ReorderReverseProxyRules(c *gin.Context) {
-	req := reverseProxyReorderRequest{}
+	req := service.ReverseProxyRuleReorderPayload{}
 	if err := c.ShouldBind(&req); err != nil {
 		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
 		return
@@ -2101,10 +2362,11 @@ func (a *ApiService) ReorderReverseProxyRules(c *gin.Context) {
 		jsonMsg(c, "", fmt.Errorf("ids are required"))
 		return
 	}
-	if err := a.ReverseProxyService.ReorderRules(service.ReverseProxyRuleReorderPayload{
-		IDs: req.IDs,
-	}); err != nil {
-		jsonMsg(c, "", err)
+	if req.ExpectedRevision == nil {
+		jsonMsg(c, "", fmt.Errorf("expectedRevision is required"))
+		return
+	}
+	if err := a.ReverseProxyService.ReorderRules(req); a.writeReverseProxyMutationError(c, err) {
 		return
 	}
 	a.GetReverseProxyOverview(c)
@@ -2301,41 +2563,9 @@ func (a *ApiService) GetKernelDownloadProgress(c *gin.Context) {
 }
 
 func (a *ApiService) InstallKernelPackages(c *gin.Context) {
-	req := kernelActionRequest{}
-	if err := c.ShouldBind(&req); err != nil {
-		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
-		return
-	}
-	provider := ""
-	if req.Provider != nil {
-		provider = strings.TrimSpace(*req.Provider)
-	}
-	if provider == "" {
-		jsonMsg(c, "", fmt.Errorf("provider is required"))
-		return
-	}
-	if provider == "xanmod" && (req.Line == nil || strings.TrimSpace(*req.Line) == "") {
-		jsonMsg(c, "", fmt.Errorf("line is required"))
-		return
-	}
-	if req.Version == nil || strings.TrimSpace(*req.Version) == "" {
-		jsonMsg(c, "", fmt.Errorf("version is required"))
-		return
-	}
-	if provider == "xanmod" && (req.Arch == nil || strings.TrimSpace(*req.Arch) == "") {
-		jsonMsg(c, "", fmt.Errorf("arch is required"))
-		return
-	}
-
-	line := ""
-	if req.Line != nil {
-		line = strings.TrimSpace(*req.Line)
-	}
-	arch := ""
-	if req.Arch != nil {
-		arch = strings.TrimSpace(*req.Arch)
-	}
-	result, err := a.KernelManagerService.InstallDownloadedPackages(provider, line, *req.Version, arch)
+	// Installation is intentionally driven by the persisted completed-download
+	// marker rather than the browser's current provider/version selection.
+	result, err := a.KernelManagerService.InstallDownloadedKernel()
 	jsonObj(c, result, err)
 }
 
@@ -2470,7 +2700,7 @@ func (a *ApiService) GetDb(c *gin.Context) {
 		return
 	}
 	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Content-Disposition", "attachment; filename=kwor_"+time.Now().Format("20060102-150405")+".db")
+	c.Header("Content-Disposition", "attachment; filename=kwor_"+service.PanelNow().Format("20060102-150405")+".db")
 	c.Writer.Write(db)
 }
 
@@ -2496,6 +2726,10 @@ func (a *ApiService) postActions(c *gin.Context) (string, json.RawMessage, error
 }
 
 func (a *ApiService) Login(c *gin.Context) {
+	if !isPanelLoginTransportAllowed(c) {
+		jsonMsg(c, "", errors.New("panel login requires https"))
+		return
+	}
 	remoteIP := getRemoteIp(c)
 	loginUser, err := a.UserService.Login(c.Request.FormValue("user"), c.Request.FormValue("pass"), remoteIP)
 	if err != nil {
@@ -2550,7 +2784,13 @@ func (a *ApiService) Save(c *gin.Context, loginUser string) {
 	act := c.Request.FormValue("action")
 	data := c.Request.FormValue("data")
 	initUsers := c.Request.FormValue("initUsers")
-	objs, err := a.ConfigService.Save(obj, act, json.RawMessage(data), initUsers, loginUser, hostname)
+	if obj == "settings" {
+		a.saveLegacySettings(c, loginUser, data)
+		return
+	}
+	preparedData := json.RawMessage(data)
+
+	objs, err := a.ConfigService.Save(obj, act, preparedData, initUsers, loginUser, hostname)
 	if err != nil {
 		jsonMsg(c, "save", err)
 		return
@@ -2570,11 +2810,6 @@ func (a *ApiService) RestartApp(c *gin.Context) {
 	jsonMsg(c, "restartApp", err)
 }
 
-func (a *ApiService) RestartSb(c *gin.Context) {
-	err := a.ConfigService.RestartCore()
-	jsonMsg(c, "restartSb", err)
-}
-
 func (a *ApiService) LinkConvert(c *gin.Context) {
 	link := c.Request.FormValue("link")
 	result, _, err := util.GetOutbound(link, 0)
@@ -2582,6 +2817,7 @@ func (a *ApiService) LinkConvert(c *gin.Context) {
 }
 
 func (a *ApiService) ImportDb(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, database.MaxDatabaseImportUploadBytes())
 	file, _, err := c.Request.FormFile("db")
 	if err != nil {
 		jsonMsg(c, "", err)
@@ -2593,6 +2829,7 @@ func (a *ApiService) ImportDb(c *gin.Context) {
 }
 
 func (a *ApiService) RestoreDBBackup(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, database.MaxDBBackupArchiveUploadBytes())
 	file, _, err := c.Request.FormFile("backup")
 	if err != nil {
 		jsonMsg(c, "", err)
@@ -2723,7 +2960,7 @@ func (a *ApiService) GetSingboxConfig(c *gin.Context) {
 		return
 	}
 	c.Header("Content-Type", "application/json")
-	c.Header("Content-Disposition", "attachment; filename=config_"+time.Now().Format("20060102-150405")+".json")
+	c.Header("Content-Disposition", "attachment; filename=config_"+service.PanelNow().Format("20060102-150405")+".json")
 	c.Writer.Write(rawConfig)
 }
 
@@ -3058,7 +3295,7 @@ func (a *ApiService) GetPanelUpdateStatus(c *gin.Context) {
 
 func (a *ApiService) GetPanelUpdateVersions(c *gin.Context) {
 	offset, limit := parsePanelVersionWindowQuery(c)
-	result, err := a.PanelUpdateService.GetRemoteVersions(offset, limit)
+	result, err := a.PanelUpdateService.GetRemoteVersionsContext(c.Request.Context(), offset, limit)
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
@@ -3092,88 +3329,13 @@ func (a *ApiService) InstallPanelUpdate(c *gin.Context) {
 	jsonObj(c, result, nil)
 }
 
-// === CoreManager API ===
-
-// GetCoreStatus returns core status (local version and running state).
-func (a *ApiService) GetCoreManagerStatus(c *gin.Context) {
-	info, err := a.CoreManagerService.GetCoreStatus()
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	jsonObj(c, info, nil)
-}
-
-func parseCoreVersionWindowQuery(c *gin.Context) (string, int, int, service.CoreDownloadTarget) {
-	channel := strings.TrimSpace(c.Query("channel"))
-	if channel == "" {
-		channel = "stable"
-	}
-
-	offset := 0
-	limit := 5
-
-	if offsetRaw := strings.TrimSpace(c.Query("offset")); offsetRaw != "" {
-		if parsed, err := strconv.Atoi(offsetRaw); err == nil && parsed >= 0 {
-			offset = parsed
-		}
-		if limitRaw := strings.TrimSpace(c.Query("limit")); limitRaw != "" {
-			if parsed, err := strconv.Atoi(limitRaw); err == nil && parsed > 0 {
-				limit = parsed
-			}
-		} else if perPageRaw := strings.TrimSpace(c.Query("per_page")); perPageRaw != "" {
-			if parsed, err := strconv.Atoi(perPageRaw); err == nil && parsed > 0 {
-				limit = parsed
-			}
-		}
-	} else {
-		page := 1
-		if pageRaw := strings.TrimSpace(c.Query("page")); pageRaw != "" {
-			if parsed, err := strconv.Atoi(pageRaw); err == nil && parsed > 0 {
-				page = parsed
-			}
-		}
-		if perPageRaw := strings.TrimSpace(c.Query("per_page")); perPageRaw != "" {
-			if parsed, err := strconv.Atoi(perPageRaw); err == nil && parsed > 0 {
-				limit = parsed
-			}
-		}
-		offset = (page - 1) * limit
-	}
-
-	target := service.CoreDownloadTarget{
-		OS:         strings.TrimSpace(c.Query("target_os")),
-		Arch:       strings.TrimSpace(c.Query("target_arch")),
-		Libc:       strings.TrimSpace(c.Query("target_libc")),
-		Amd64Level: strings.TrimSpace(c.Query("target_amd64_level")),
-	}
-
-	return channel, offset, limit, target
-}
-
-// GetCoreRemoteVersions returns available remote core versions.
-func (a *ApiService) GetCoreRemoteVersions(c *gin.Context) {
-	channel, offset, limit, target := parseCoreVersionWindowQuery(c)
-	result, err := a.CoreManagerService.GetRemoteVersionsWindow(channel, offset, limit, target)
+func (a *ApiService) UninstallPanel(c *gin.Context) {
+	result, err := panelUninstallScheduler(&a.PanelUninstallService)
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
 	}
 	jsonObj(c, result, nil)
-}
-
-func parseCoreIntervalHours(raw string) (int, error) {
-	trimmed := strings.TrimSpace(strings.ToLower(raw))
-	trimmed = strings.TrimSuffix(trimmed, "h")
-	trimmed = strings.TrimSpace(trimmed)
-	if trimmed == "" {
-		return 0, fmt.Errorf("interval is required")
-	}
-	intervalHours, err := strconv.Atoi(trimmed)
-	if err != nil || intervalHours <= 0 {
-		return 0, fmt.Errorf("interval must be a positive hour value, e.g. 12 or 12h")
-	}
-	return intervalHours, nil
 }
 
 func parseSubGroupIntervalMinutes(raw string) (int, error) {
@@ -3221,400 +3383,4 @@ func (a *ApiService) SaveSubGroupAutoUpdateSettings(c *gin.Context) {
 		return
 	}
 	jsonObj(c, info, nil)
-}
-
-// GetCoreUpdateInfo returns auto-check settings and update markers.
-func (a *ApiService) GetCoreUpdateInfo(c *gin.Context) {
-	forceCheck := strings.EqualFold(c.Query("force"), "true")
-	info, err := a.CoreManagerService.GetCoreUpdateInfo(forceCheck)
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	jsonObj(c, info, nil)
-}
-
-// SaveCoreUpdateSettings updates auto-check switch and interval.
-func (a *ApiService) SaveCoreUpdateSettings(c *gin.Context) {
-	enabledRaw := strings.TrimSpace(c.Request.FormValue("enabled"))
-	enabled := strings.EqualFold(enabledRaw, "true") || enabledRaw == "1"
-
-	intervalRaw := c.Request.FormValue("interval")
-	intervalHours, err := parseCoreIntervalHours(intervalRaw)
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-
-	err = a.CoreManagerService.SetCoreAutoCheckSettings(enabled, intervalHours)
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-
-	if enabled {
-		if checkErr := a.CoreManagerService.CheckAndMarkCoreUpdates(true); checkErr != nil {
-			logger.Warning("check core updates after settings update failed: ", checkErr)
-		}
-	}
-
-	info, err := a.CoreManagerService.GetCoreUpdateInfo(false)
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	jsonObj(c, info, nil)
-}
-
-// AckCoreUpdateNotice clears pending update markers.
-func (a *ApiService) AckCoreUpdateNotice(c *gin.Context) {
-	err := a.CoreManagerService.ClearCoreUpdatePending()
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	info, err := a.CoreManagerService.GetCoreUpdateInfo(false)
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	jsonObj(c, info, nil)
-}
-
-func (a *ApiService) syncNftablesWithCoreState() {
-	if a.CoreManagerService.IsRunning() {
-		(&service.NftTrafficService{}).InitOnStartup()
-		(&service.ClientRateLimitService{}).InitOnStartup()
-		(&service.ClientPortBlockService{}).InitOnStartup()
-		return
-	}
-	(&service.NftTrafficService{}).CleanupOnShutdown()
-	(&service.ClientRateLimitService{}).CleanupOnShutdown()
-	(&service.ClientPortBlockService{}).CleanupOnShutdown()
-}
-
-func (a *ApiService) syncMihomoNftablesWithCoreState() {
-	if a.MihomoCoreManagerService.IsRunning() {
-		(&service.MihomoNftTrafficService{}).InitOnStartup()
-		(&service.MihomoClientRateLimitService{}).InitOnStartup()
-		(&service.MihomoClientPortBlockService{}).InitOnStartup()
-		return
-	}
-	(&service.MihomoNftTrafficService{}).CleanupOnShutdown()
-	(&service.MihomoClientRateLimitService{}).CleanupOnShutdown()
-	(&service.MihomoClientPortBlockService{}).CleanupOnShutdown()
-}
-
-// DownloadCoreManager downloads the specified core version.
-func (a *ApiService) DownloadCoreManager(c *gin.Context) {
-	customURL := strings.TrimSpace(c.Request.FormValue("custom_url"))
-	version := strings.TrimSpace(c.Request.FormValue("version"))
-	targetOS := strings.TrimSpace(c.Request.FormValue("target_os"))
-	targetArch := strings.TrimSpace(c.Request.FormValue("target_arch"))
-	targetLibc := strings.TrimSpace(c.Request.FormValue("target_libc"))
-	targetAmd64Level := strings.TrimSpace(c.Request.FormValue("target_amd64_level"))
-	downloadSessionID := strings.TrimSpace(c.Request.FormValue("downloadSessionId"))
-
-	var (
-		localVer string
-		err      error
-	)
-	if customURL != "" {
-		if !strings.HasPrefix(customURL, "http://") && !strings.HasPrefix(customURL, "https://") {
-			jsonMsg(c, "", fmt.Errorf("custom_url must start with http:// or https://"))
-			return
-		}
-		localVer, err = a.CoreManagerService.DownloadCoreFromURL(customURL, downloadSessionID)
-		if err == nil {
-			if saveErr := a.CoreManagerService.SaveCustomDownloadURL(customURL); saveErr != nil {
-				logger.Warning("save core custom download url failed: ", saveErr)
-			}
-		}
-	} else {
-		if version == "" {
-			jsonMsg(c, "", fmt.Errorf("version or custom_url is required"))
-			return
-		}
-		localVer, err = a.CoreManagerService.DownloadCore(version, service.CoreDownloadTarget{
-			OS:         targetOS,
-			Arch:       targetArch,
-			Libc:       targetLibc,
-			Amd64Level: targetAmd64Level,
-		}, downloadSessionID)
-	}
-
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	a.syncNftablesWithCoreState()
-	jsonObj(c, map[string]string{"version": localVer}, nil)
-}
-
-func (a *ApiService) SaveCoreDownloadPreference(c *gin.Context) {
-	customURL := strings.TrimSpace(c.Request.FormValue("custom_url"))
-	preference, err := a.CoreManagerService.GetDownloadPreference()
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	target := service.CoreDownloadTarget{
-		OS:         strings.TrimSpace(c.Request.FormValue("target_os")),
-		Arch:       strings.TrimSpace(c.Request.FormValue("target_arch")),
-		Libc:       strings.TrimSpace(c.Request.FormValue("target_libc")),
-		Amd64Level: strings.TrimSpace(c.Request.FormValue("target_amd64_level")),
-	}
-	if _, exists := c.Request.Form["target_os"]; exists {
-		preference.Target.OS = target.OS
-	}
-	if _, exists := c.Request.Form["target_arch"]; exists {
-		preference.Target.Arch = target.Arch
-	}
-	if _, exists := c.Request.Form["target_libc"]; exists {
-		preference.Target.Libc = target.Libc
-	}
-	if _, exists := c.Request.Form["target_amd64_level"]; exists {
-		preference.Target.Amd64Level = target.Amd64Level
-	}
-	preference.CustomURL = customURL
-	err = a.CoreManagerService.SaveDownloadPreference(preference)
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	preference, err = a.CoreManagerService.GetDownloadPreference()
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	jsonObj(c, preference, nil)
-}
-
-// StartCoreManager starts the core process.
-func (a *ApiService) StartCoreManager(c *gin.Context) {
-	err := a.CoreManagerService.StartCore()
-	if err == nil {
-		a.syncNftablesWithCoreState()
-	}
-	jsonMsg(c, "startCore", err)
-}
-
-// StopCoreManager stops the core process.
-func (a *ApiService) StopCoreManager(c *gin.Context) {
-	err := a.CoreManagerService.StopCore()
-	if err == nil {
-		a.syncNftablesWithCoreState()
-	}
-	jsonMsg(c, "stopCore", err)
-}
-
-// RestartCoreManager restarts the core process.
-func (a *ApiService) RestartCoreManager(c *gin.Context) {
-	err := a.CoreManagerService.RestartCore()
-	if err == nil {
-		a.syncNftablesWithCoreState()
-	}
-	jsonMsg(c, "restartCore", err)
-}
-
-func (a *ApiService) DeleteCoreManager(c *gin.Context) {
-	err := a.CoreManagerService.DeleteCore()
-	if err == nil {
-		a.syncNftablesWithCoreState()
-	}
-	jsonMsg(c, "deleteCore", err)
-}
-
-func (a *ApiService) GetMihomoCoreManagerStatus(c *gin.Context) {
-	info, err := a.MihomoCoreManagerService.GetCoreStatus()
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	jsonObj(c, info, nil)
-}
-
-func (a *ApiService) GetMihomoCoreRemoteVersions(c *gin.Context) {
-	channel, offset, limit, target := parseCoreVersionWindowQuery(c)
-	result, err := a.MihomoCoreManagerService.GetRemoteVersionsWindow(channel, offset, limit, target)
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	jsonObj(c, result, nil)
-}
-
-func (a *ApiService) GetMihomoCoreUpdateInfo(c *gin.Context) {
-	forceCheck := strings.EqualFold(c.Query("force"), "true")
-	info, err := a.MihomoCoreManagerService.GetCoreUpdateInfo(forceCheck)
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	jsonObj(c, info, nil)
-}
-
-func (a *ApiService) GetCoreDownloadProgress(c *gin.Context) {
-	id := strings.TrimSpace(c.Query("id"))
-	if id == "" {
-		jsonMsg(c, "", fmt.Errorf("id is required"))
-		return
-	}
-	progress := service.GetCoreDownloadProgress(id)
-	jsonObj(c, progress, nil)
-}
-
-func (a *ApiService) SaveMihomoCoreUpdateSettings(c *gin.Context) {
-	enabledRaw := strings.TrimSpace(c.Request.FormValue("enabled"))
-	enabled := strings.EqualFold(enabledRaw, "true") || enabledRaw == "1"
-
-	intervalRaw := c.Request.FormValue("interval")
-	intervalHours, err := parseCoreIntervalHours(intervalRaw)
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-
-	err = a.MihomoCoreManagerService.SetCoreAutoCheckSettings(enabled, intervalHours)
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-
-	if enabled {
-		if checkErr := a.MihomoCoreManagerService.CheckAndMarkCoreUpdates(true); checkErr != nil {
-			logger.Warning("check mihomo core updates after settings update failed: ", checkErr)
-		}
-	}
-
-	info, err := a.MihomoCoreManagerService.GetCoreUpdateInfo(false)
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	jsonObj(c, info, nil)
-}
-
-func (a *ApiService) AckMihomoCoreUpdateNotice(c *gin.Context) {
-	err := a.MihomoCoreManagerService.ClearCoreUpdatePending()
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	info, err := a.MihomoCoreManagerService.GetCoreUpdateInfo(false)
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	jsonObj(c, info, nil)
-}
-
-func (a *ApiService) DownloadMihomoCoreManager(c *gin.Context) {
-	customURL := strings.TrimSpace(c.Request.FormValue("custom_url"))
-	version := strings.TrimSpace(c.Request.FormValue("version"))
-	targetOS := strings.TrimSpace(c.Request.FormValue("target_os"))
-	targetArch := strings.TrimSpace(c.Request.FormValue("target_arch"))
-	targetAmd64Level := strings.TrimSpace(c.Request.FormValue("target_amd64_level"))
-	downloadSessionID := strings.TrimSpace(c.Request.FormValue("downloadSessionId"))
-
-	var (
-		localVer string
-		err      error
-	)
-	if customURL != "" {
-		if !strings.HasPrefix(customURL, "http://") && !strings.HasPrefix(customURL, "https://") {
-			jsonMsg(c, "", fmt.Errorf("custom_url must start with http:// or https://"))
-			return
-		}
-		localVer, err = a.MihomoCoreManagerService.DownloadCoreFromURL(customURL, downloadSessionID)
-		if err == nil {
-			if saveErr := a.MihomoCoreManagerService.SaveCustomDownloadURL(customURL); saveErr != nil {
-				logger.Warning("save mihomo custom download url failed: ", saveErr)
-			}
-		}
-	} else {
-		if version == "" {
-			jsonMsg(c, "", fmt.Errorf("version or custom_url is required"))
-			return
-		}
-		localVer, err = a.MihomoCoreManagerService.DownloadCore(version, service.CoreDownloadTarget{
-			OS:         targetOS,
-			Arch:       targetArch,
-			Amd64Level: targetAmd64Level,
-		}, downloadSessionID)
-	}
-
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	a.syncMihomoNftablesWithCoreState()
-	jsonObj(c, map[string]string{"version": localVer}, nil)
-}
-
-func (a *ApiService) SaveMihomoCoreDownloadPreference(c *gin.Context) {
-	customURL := strings.TrimSpace(c.Request.FormValue("custom_url"))
-	preference, err := a.MihomoCoreManagerService.GetDownloadPreference()
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	target := service.CoreDownloadTarget{
-		OS:         strings.TrimSpace(c.Request.FormValue("target_os")),
-		Arch:       strings.TrimSpace(c.Request.FormValue("target_arch")),
-		Amd64Level: strings.TrimSpace(c.Request.FormValue("target_amd64_level")),
-	}
-	if _, exists := c.Request.Form["target_os"]; exists {
-		preference.Target.OS = target.OS
-	}
-	if _, exists := c.Request.Form["target_arch"]; exists {
-		preference.Target.Arch = target.Arch
-	}
-	if _, exists := c.Request.Form["target_amd64_level"]; exists {
-		preference.Target.Amd64Level = target.Amd64Level
-	}
-	preference.CustomURL = customURL
-	err = a.MihomoCoreManagerService.SaveDownloadPreference(preference)
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	preference, err = a.MihomoCoreManagerService.GetDownloadPreference()
-	if err != nil {
-		jsonMsg(c, "", err)
-		return
-	}
-	jsonObj(c, preference, nil)
-}
-
-func (a *ApiService) StartMihomoCoreManager(c *gin.Context) {
-	err := a.MihomoCoreManagerService.StartCore()
-	if err == nil {
-		a.syncMihomoNftablesWithCoreState()
-	}
-	jsonMsg(c, "startCore", err)
-}
-
-func (a *ApiService) StopMihomoCoreManager(c *gin.Context) {
-	err := a.MihomoCoreManagerService.StopCore()
-	if err == nil {
-		a.syncMihomoNftablesWithCoreState()
-	}
-	jsonMsg(c, "stopCore", err)
-}
-
-func (a *ApiService) RestartMihomoCoreManager(c *gin.Context) {
-	err := a.MihomoCoreManagerService.RestartCore()
-	if err == nil {
-		a.syncMihomoNftablesWithCoreState()
-	}
-	jsonMsg(c, "restartCore", err)
-}
-
-func (a *ApiService) DeleteMihomoCoreManager(c *gin.Context) {
-	err := a.MihomoCoreManagerService.DeleteCore()
-	if err == nil {
-		a.syncMihomoNftablesWithCoreState()
-	}
-	jsonMsg(c, "deleteCore", err)
 }

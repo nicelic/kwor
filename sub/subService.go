@@ -42,10 +42,14 @@ func (s *SubService) buildSubsForClient(client *model.Client, mihomo bool) (*str
 		clientInfo = s.getClientInfo(client)
 	}
 
-	linksArray := s.LinkService.GetLinks(&client.Links, "all", clientInfo)
+	storedLinks, err := s.filterServerOnlyLocalLinks(client, mihomo)
+	if err != nil {
+		return nil, nil, err
+	}
+	linksArray := s.LinkService.GetLinks(&storedLinks, "all", clientInfo)
 	if util.NormalizeSubscriptionServerHost(client.ServerIp) != "" {
 		if localLinks, err := s.buildCurrentLocalLinks(client, mihomo, clientInfo); err == nil {
-			linksArray = append(localLinks, s.LinkService.GetLinks(&client.Links, "external", "")...)
+			linksArray = append(localLinks, s.LinkService.GetLinks(&storedLinks, "external", "")...)
 		}
 	}
 	result := strings.Join(linksArray, "\n")
@@ -58,6 +62,70 @@ func (s *SubService) buildSubsForClient(client *model.Client, mihomo bool) (*str
 	}
 
 	return &result, headers, nil
+}
+
+// filterServerOnlyLocalLinks removes stale locally generated links for server
+// listeners that cannot be subscribed. It leaves externally supplied links
+// untouched, even when their remarks happen to match an inbound tag.
+func (s *SubService) filterServerOnlyLocalLinks(client *model.Client, mihomo bool) (json.RawMessage, error) {
+	if client == nil || len(client.Links) == 0 {
+		return nil, nil
+	}
+
+	var inboundIDs []uint
+	if err := json.Unmarshal(client.Inbounds, &inboundIDs); err != nil {
+		return nil, err
+	}
+	if len(inboundIDs) == 0 {
+		return append(json.RawMessage(nil), client.Links...), nil
+	}
+
+	serverOnlyTags := make(map[string]struct{})
+	db := database.GetDB()
+	if mihomo {
+		var inbounds []model.MihomoInbound
+		if err := db.Model(model.MihomoInbound{}).Where("id in ?", inboundIDs).Find(&inbounds).Error; err != nil {
+			return nil, err
+		}
+		for _, inbound := range inbounds {
+			if util.IsSubscriptionServerOnlyInboundType(inbound.Type) {
+				serverOnlyTags[strings.TrimSpace(inbound.Tag)] = struct{}{}
+			}
+		}
+	} else {
+		var inbounds []model.Inbound
+		if err := db.Model(model.Inbound{}).Where("id in ?", inboundIDs).Find(&inbounds).Error; err != nil {
+			return nil, err
+		}
+		for _, inbound := range inbounds {
+			if util.IsSubscriptionServerOnlyInboundType(inbound.Type) {
+				serverOnlyTags[strings.TrimSpace(inbound.Tag)] = struct{}{}
+			}
+		}
+	}
+	if len(serverOnlyTags) == 0 {
+		return append(json.RawMessage(nil), client.Links...), nil
+	}
+
+	links := []Link{}
+	if err := json.Unmarshal(client.Links, &links); err != nil {
+		return nil, err
+	}
+	filtered := make([]Link, 0, len(links))
+	for _, link := range links {
+		if link.Type == "local" {
+			if _, serverOnly := serverOnlyTags[strings.TrimSpace(link.Remark)]; serverOnly {
+				continue
+			}
+		}
+		filtered = append(filtered, link)
+	}
+
+	raw, err := json.Marshal(filtered)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(raw), nil
 }
 
 func (s *SubService) buildCurrentLocalLinks(client *model.Client, mihomo bool, clientInfo string) ([]string, error) {

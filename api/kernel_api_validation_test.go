@@ -3,13 +3,28 @@ package api
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/alireza0/s-ui/database"
+	"github.com/alireza0/s-ui/service"
 	"github.com/gin-gonic/gin"
 )
 
 func TestKernelAPIValidation(t *testing.T) {
+	if err := database.InitDB(filepath.Join(t.TempDir(), "kwor.db")); err != nil {
+		t.Fatalf("initialize test database failed: %v", err)
+	}
+	if sqlDB, err := database.GetDB().DB(); err == nil && sqlDB != nil {
+		t.Cleanup(func() {
+			_ = sqlDB.Close()
+		})
+	}
+	if _, err := service.RefreshSystemPlatform(); err != nil {
+		t.Fatalf("refresh test system platform failed: %v", err)
+	}
+
 	svc := &ApiService{}
 
 	t.Run("versions line required", func(t *testing.T) {
@@ -76,13 +91,10 @@ func TestKernelAPIValidation(t *testing.T) {
 		}
 	})
 
-	t.Run("install arch required", func(t *testing.T) {
-		rec, msg := performKernelAPIPostJSON(t, svc.InstallKernelPackages, `{"provider":"xanmod","line":"lts","version":"6.18.27-xanmod1"}`)
-		if msg.Success {
-			t.Fatalf("expected failure when arch is missing")
-		}
-		if rec.Code != 200 || !strings.Contains(msg.Msg, "arch is required") {
-			t.Fatalf("unexpected response: code=%d msg=%q", rec.Code, msg.Msg)
+	t.Run("install does not depend on current selection", func(t *testing.T) {
+		rec, msg := performKernelAPIPostJSON(t, svc.InstallKernelPackages, `{}`)
+		if rec.Code != 200 || strings.Contains(msg.Msg, "provider is required") || strings.Contains(msg.Msg, "arch is required") {
+			t.Fatalf("install should be driven by completed-download marker, got code=%d msg=%q", rec.Code, msg.Msg)
 		}
 	})
 
@@ -126,15 +138,6 @@ func TestKernelAPIValidation(t *testing.T) {
 		}
 	})
 
-	t.Run("install provider required", func(t *testing.T) {
-		rec, msg := performKernelAPIPostJSON(t, svc.InstallKernelPackages, `{"line":"lts","version":"6.18.27-xanmod1","arch":"x64v3"}`)
-		if msg.Success {
-			t.Fatalf("expected failure when provider is missing")
-		}
-		if rec.Code != 200 || !strings.Contains(msg.Msg, "provider is required") {
-			t.Fatalf("unexpected response: code=%d msg=%q", rec.Code, msg.Msg)
-		}
-	})
 }
 
 func performKernelAPIGet(t *testing.T, handler func(*gin.Context), url string) (*httptest.ResponseRecorder, Msg) {

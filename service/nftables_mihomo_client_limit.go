@@ -2,7 +2,6 @@ package service
 
 import (
 	"encoding/json"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -31,7 +30,7 @@ func (s *MihomoClientRateLimitService) IsNftTableReady() bool {
 }
 
 func (s *MihomoClientRateLimitService) InitOnStartup() {
-	if runtime.GOOS != "linux" || !nftSupported() {
+	if !IsSystemPlatformLinux() || !nftSupported() {
 		return
 	}
 	if err := s.Reconcile(true); err != nil {
@@ -40,7 +39,7 @@ func (s *MihomoClientRateLimitService) InitOnStartup() {
 }
 
 func (s *MihomoClientRateLimitService) EnsureRuleIntegrity() error {
-	if runtime.GOOS != "linux" || !nftSupported() {
+	if !IsSystemPlatformLinux() || !nftSupported() {
 		return nil
 	}
 	if !(&MihomoCoreManagerService{}).IsRunning() {
@@ -52,35 +51,24 @@ func (s *MihomoClientRateLimitService) EnsureRuleIntegrity() error {
 // Reconcile recomputes effective limits from DB and syncs nft rules/state.
 func (s *MihomoClientRateLimitService) Reconcile(applyRules bool) error {
 	db := database.GetDB()
-	tx := db.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
-
-	desired, desiredTags, err := s.collectDesiredPortLimits(tx)
+	desired, desiredTags, err := s.collectDesiredPortLimits(db)
 	if err != nil {
-		tx.Rollback()
 		return err
 	}
 
 	if applyRules {
-		err = s.reconcileWithRules(tx, desired, desiredTags)
+		err = s.reconcileWithRules(db, desired, desiredTags)
 	} else {
-		err = s.reconcileStateOnly(tx, desired, desiredTags)
+		err = s.reconcileStateOnly(db, desired, desiredTags)
 	}
 	if err != nil {
-		tx.Rollback()
 		return err
-	}
-	if commitErr := tx.Commit().Error; commitErr != nil {
-		tx.Rollback()
-		return commitErr
 	}
 	return nil
 }
 
 func (s *MihomoClientRateLimitService) CleanupOnShutdown() {
-	if runtime.GOOS == "linux" && nftSupported() {
+	if IsSystemPlatformLinux() && nftSupported() {
 		if err := deleteRulesByCommentPrefix(mihomoLimitNftRuleComments.prefix); err != nil {
 			logger.Warning("failed to cleanup mihomo client rate limit nft rules by prefix: ", err)
 		}

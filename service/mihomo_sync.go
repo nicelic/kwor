@@ -59,7 +59,7 @@ func (s *MihomoSyncService) SyncClientToSubManager(clientName string, hostname s
 		return nil, err
 	}
 
-	LastUpdate = time.Now().Unix()
+	markLastUpdate(time.Now().Unix())
 	if err := RunManagedRuntimeHookScope(tx); err != nil {
 		return nil, err
 	}
@@ -166,6 +166,9 @@ func (s *MihomoSyncService) syncClientSubOutbounds(
 		if inbound == nil {
 			continue
 		}
+		if isServerOnlySubscriptionInbound(inbound.Type, inbound.OutJson) {
+			continue
+		}
 		tag := buildMihomoClientSubTag(inbound.Tag, client.Name)
 		if tag == "" {
 			continue
@@ -258,6 +261,9 @@ func (s *MihomoSyncService) syncClientSubOutbounds(
 			logger.Warningf("[MihomoSync] skip inbound id=%d: not found", inboundID)
 			continue
 		}
+		if isServerOnlySubscriptionInbound(inbound.Type, inbound.OutJson) {
+			continue
+		}
 
 		desiredTag := desiredTags[inboundID]
 		if desiredTag == "" {
@@ -317,7 +323,11 @@ func (s *MihomoSyncService) syncClientSubOutbounds(
 			if force && len(inboundIDs) == 0 {
 				return nil, fmt.Errorf("mihomo client %s has no inbounds", client.Name)
 			}
-			return nil, nil
+			return &SyncResult{
+				ClientName: client.Name,
+				Action:     action,
+				Count:      0,
+			}, nil
 		}
 		if removedCount == 0 {
 			return nil, fmt.Errorf("no valid outbound configs found for mihomo client %s", client.Name)
@@ -377,6 +387,9 @@ func (s *MihomoSyncService) hasManagedSubOutbounds(
 	for _, inboundID := range newInboundIDs {
 		inbound := inboundMap[inboundID]
 		if inbound == nil {
+			continue
+		}
+		if isServerOnlySubscriptionInbound(inbound.Type, inbound.OutJson) {
 			continue
 		}
 		tag := buildMihomoClientSubTag(inbound.Tag, client.Name)
@@ -625,6 +638,28 @@ func (s *MihomoSyncService) buildSyncedOutbound(
 	if inbound == nil {
 		return nil, nil, fmt.Errorf("mihomo inbound is nil")
 	}
+	if isServerOnlySubscriptionInbound(inbound.Type, inbound.OutJson) {
+		return nil, nil, fmt.Errorf("mixed is a server-only listener and cannot be synchronized")
+	}
+	isShadowQUIC := strings.EqualFold(strings.TrimSpace(inbound.Type), "shadowquic")
+
+	// ShadowQUIC listener options are the source of its shared client fields.
+	// Refresh on every subscription sync so stale templates cannot reintroduce
+	// server-owned values that were later disabled in the inbound editor.
+	if isShadowQUIC {
+		previousOutJSON := append(json.RawMessage(nil), inbound.OutJson...)
+		if len(inbound.OutJson) == 0 {
+			inbound.OutJson = []byte("{}")
+		}
+		if err := fillMihomoOutJson(inbound, serverHost); err != nil {
+			return nil, nil, fmt.Errorf("failed to refresh shadowquic out_json: %v", err)
+		}
+		if string(previousOutJSON) != string(inbound.OutJson) {
+			if err := db.Model(model.MihomoInbound{}).Where("id = ?", inbound.Id).Update("out_json", inbound.OutJson).Error; err != nil {
+				logger.Warningf("[MihomoSync] failed to persist refreshed ShadowQUIC out_json for inbound %s: %v", inbound.Tag, err)
+			}
+		}
+	}
 
 	if len(inbound.OutJson) < 5 {
 		if len(inbound.OutJson) == 0 {
@@ -650,11 +685,18 @@ func (s *MihomoSyncService) buildSyncedOutbound(
 			return nil, nil, fmt.Errorf("failed to parse regenerated out_json: %v", err)
 		}
 	}
+	util.StripSubscriptionOutboundPanelFields(outbound)
+	if isShadowQUIC {
+		util.SanitizeMihomoShadowQUICInboundTemplate(outbound)
+	}
 
 	applyServerHostOverride(outbound, serverHost)
 
 	baseInbound := inbound.ToBase()
 	protocol, _ := outbound["type"].(string)
+	if util.IsSubscriptionServerOnlyInboundType(protocol) {
+		return nil, nil, fmt.Errorf("mixed is a server-only listener and cannot be synchronized")
+	}
 	if protocol == "trusttunnel" {
 		util.SanitizeTrustTunnelOutbound(outbound)
 	}
@@ -669,9 +711,13 @@ func (s *MihomoSyncService) buildSyncedOutbound(
 		config, _ := clientConfig[protocol].(map[string]interface{})
 		mergeClientProtocolConfigForNamespace(outbound, config, &baseInbound, "mihomo", clientName)
 	}
-	hydrateOutboundTLSFromInboundTLS(outbound, &baseInbound)
-	if baseInbound.Tls != nil {
-		refreshManagedSubscriptionOutboundTLS(outbound, baseInbound.Tls)
+	if protocol == "shadowquic" {
+		util.SanitizeMihomoShadowQUICOutbound(outbound)
+	} else {
+		hydrateOutboundTLSFromInboundTLS(outbound, &baseInbound)
+		if baseInbound.Tls != nil {
+			refreshManagedSubscriptionOutboundTLS(outbound, baseInbound.Tls)
+		}
 	}
 
 	clashSource, err := cloneMihomoOutboundMap(outbound)

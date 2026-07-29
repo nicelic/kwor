@@ -146,29 +146,32 @@ export default {
       }
       this.clients = []
       this.loading = true
-      for(let i=0;i<this.count;i++){
-        const name = this.genByPattern(this.bulkData.name, i)
-        this.clients.push(createClient({
-          enable: true,
-          name: name,
-          config: randomConfigs(name, this.namespace),
-          inbounds: this.bulkData.clientInbounds,
-          links: [],
-          volume: this.bulkData.Volume*(1024 ** 3),
-          expiry: this.bulkData.expiry,
-          up: 0,
-          down: 0,
-          desc: this.genByPattern(this.bulkData.desc, i),
-          group: this.bulkData.group
-        }, this.namespace))
+      try {
+        for(let i=0;i<this.count;i++){
+          const name = this.genByPattern(this.bulkData.name, i)
+          this.clients.push(createClient({
+            enable: true,
+            name: name,
+            config: randomConfigs(name, this.namespace),
+            inbounds: this.bulkData.clientInbounds,
+            links: [],
+            volume: this.bulkData.Volume*(1024 ** 3),
+            expiry: this.bulkData.expiry,
+            up: 0,
+            down: 0,
+            desc: this.genByPattern(this.bulkData.desc, i),
+            group: this.bulkData.group
+          }, this.namespace))
+        }
+        // Check duplicate names
+        const store = getNamespaceStore(this.namespace)
+        const isDuplicateName = store.checkBulkClientNames(this.clients.map(c => c.name))
+        if (isDuplicateName) return
+        const success = await store.save('clients', 'addbulk', this.clients)
+        if (success) this.closeModal()
+      } finally {
+        this.loading = false
       }
-      // Check duplicate names
-      const store = getNamespaceStore(this.namespace)
-      const isDuplicateName = store.checkBulkClientNames(this.clients.map(c => c.name))
-      if (isDuplicateName) return
-      const success = await store.save('clients', 'addbulk', this.clients)
-      if (success) this.closeModal()
-      this.loading = false
     },
     genByPattern(pattern: any[], order :number){
       if (pattern.length == 0) return RandomUtil.randomSeq(8)

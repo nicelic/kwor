@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -36,6 +37,7 @@ import (
 	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/network"
 	"github.com/alireza0/s-ui/util/common"
+	"golang.org/x/net/idna"
 	"gorm.io/gorm"
 )
 
@@ -49,28 +51,42 @@ const (
 	acmeDefaultKeyLengthKey    = "acmeDefaultKeyLength"
 	acmeAutoUpgradeKey         = "acmeAutoUpgrade"
 	acmeManagedPathManifestKey = "acmeManagedPathManifest"
+	acmeRuntimeSchemaV2Key     = "acmeRuntimeSchemaV2"
 
-	defaultAcmePreferredCA           = "letsencrypt"
-	defaultAcmeChallenge             = "standalone"
-	defaultAcmeKeyLength             = "ec-256"
-	defaultAcmeAutoRenewDays         = 30
-	defaultAcmeInstallScriptURL      = "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh"
-	acmeGitHubReleasesAPI            = "https://api.github.com/repos/acmesh-official/acme.sh/releases"
-	acmeGitHubReleaseTagAPI          = "https://api.github.com/repos/acmesh-official/acme.sh/releases/tags/"
-	acmeGitHubTagsAPI                = "https://api.github.com/repos/acmesh-official/acme.sh/tags"
-	acmeLogMaxLines                  = 800
-	acmeLogTTL                       = 30 * time.Minute
-	acmeCertificateTypeDomain        = "domain"
-	acmeCertificateTypeIP            = "ip"
-	acmeLEProductionDirectory        = "https://acme-v02.api.letsencrypt.org/directory"
-	acmeLEStagingDirectory           = "https://acme-staging-v02.api.letsencrypt.org/directory"
-	acmeZeroSSLDirectory             = "https://acme.zerossl.com/v2/DV90"
-	acmeIPCertificateMaxIPs          = 100
-	acmeIPCertificatePortHTTP        = 80
-	acmeIPCertificatePortALPN        = 443
-	acmeMaskedEnvValue               = "********"
-	acmeManagedWorkspaceStagePrefix  = "acme-home-stage-"
-	acmeManagedWorkspaceBackupPrefix = "acme-home-backup-"
+	defaultAcmePreferredCA                         = "letsencrypt"
+	defaultAcmeChallenge                           = "standalone"
+	defaultAcmeKeyLength                           = "ec-256"
+	defaultAcmeAutoRenewDays                       = 30
+	defaultAcmeInstallScriptURL                    = "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh"
+	acmeGitHubReleasesAPI                          = "https://api.github.com/repos/acmesh-official/acme.sh/releases"
+	acmeGitHubReleaseTagAPI                        = "https://api.github.com/repos/acmesh-official/acme.sh/releases/tags/"
+	acmeGitHubTagsAPI                              = "https://api.github.com/repos/acmesh-official/acme.sh/tags"
+	acmeGitHubResponseMaxBytes               int64 = 4 * 1024 * 1024
+	acmeLogMaxLines                                = 800
+	acmeLogTTL                                     = 30 * time.Minute
+	acmeTaskTTL                                    = 30 * time.Minute
+	acmeTaskQueueCapacity                          = 32
+	acmeTaskResultOutputMaxRunes                   = 4096
+	acmeDomainCertificateMaxNames                  = 100
+	acmeCertificateTypeDomain                      = "domain"
+	acmeCertificateTypeIP                          = "ip"
+	acmeLEProductionDirectory                      = "https://acme-v02.api.letsencrypt.org/directory"
+	acmeLEStagingDirectory                         = "https://acme-staging-v02.api.letsencrypt.org/directory"
+	acmeZeroSSLDirectory                           = "https://acme.zerossl.com/v2/DV90"
+	acmeIPCertificateMaxIPs                        = 100
+	acmeIPCertificatePortHTTP                      = 80
+	acmeIPCertificatePortALPN                      = 443
+	acmeMaskedEnvValue                             = "********"
+	acmeManagedWorkspaceStagePrefix                = "acme-home-stage-"
+	acmeManagedWorkspaceBackupPrefix               = "acme-home-backup-"
+	acmeAutoRenewRetryPhaseRapid                   = "rapid_retry"
+	acmeAutoRenewRetryPhasePeriodic                = "periodic_retry"
+	acmeAutoRenewRetryPhaseExpiredDisabled         = "expired_disabled"
+	acmeAutoRenewRapidRetryLimit                   = 3
+	acmeAutoRenewBatchDuration                     = time.Hour
+	acmeAutoRenewRapidRetryInterval                = 10 * time.Minute
+	acmeAutoRenewPeriodicRetryInterval             = 6 * time.Hour
+	certificateAutoRenewBatchStateSettingKey       = "certificateAutoRenewBatchStateV1"
 )
 
 type acmeIPFamilyMode string
@@ -94,6 +110,7 @@ var (
 	acmeLogIDPattern    = regexp.MustCompile(`^[A-Za-z0-9_-]{8,96}$`)
 	acmeAnsiCodePattern = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
 	acmeLogSessionStore = newAcmeLogStore()
+	acmeAutoRenewBatch  = acmeAutoRenewBatchState{}
 
 	acmeManagedRootFileNames = map[string]struct{}{
 		"acme.sh":         {},
@@ -122,6 +139,32 @@ var (
 	}
 )
 
+type acmeAutoRenewBatchState struct {
+	mu           sync.Mutex
+	loaded       bool
+	startedAt    int64
+	endsAt       int64
+	candidateIDs map[uint]struct{}
+	completedIDs map[uint]struct{}
+}
+
+type acmeAutoRenewBatchPersistentState struct {
+	StartedAt int64 `json:"startedAt"`
+	EndsAt    int64 `json:"endsAt"`
+}
+
+func init() {
+	database.RegisterDBResetHook(func() {
+		acmeAutoRenewBatch.mu.Lock()
+		defer acmeAutoRenewBatch.mu.Unlock()
+		acmeAutoRenewBatch.loaded = false
+		acmeAutoRenewBatch.startedAt = 0
+		acmeAutoRenewBatch.endsAt = 0
+		acmeAutoRenewBatch.candidateIDs = nil
+		acmeAutoRenewBatch.completedIDs = nil
+	})
+}
+
 var defaultAcmeCAOptions = []AcmeCAOption{
 	{Name: "Let's Encrypt", Value: "letsencrypt"},
 	{Name: "ZeroSSL", Value: "zerossl"},
@@ -149,7 +192,7 @@ var defaultAcmeDNSProviderCatalog = []AcmeDNSProviderMeta{
 	{
 		Name:         "Cloudflare",
 		ProviderCode: "dns_cf",
-		Helper:       "acme.sh 官方: dns_cf；支持 Token 模式（CF_Token + CF_Account_ID/CF_Zone_ID）或 Global Key 模式（CF_Email + CF_Key）",
+		Helper:       "acme.sh 官方: dns_cf；支持 Token 模式（CF_Token 可单独使用，CF_Account_ID/CF_Zone_ID 可选）或 Global Key 模式（CF_Email + CF_Key）",
 		Fields: []AcmeDNSFieldDef{
 			{Key: "CF_Token", Label: "API Token", Required: false},
 			{Key: "CF_Account_ID", Label: "Account ID（可选）", Required: false},
@@ -171,11 +214,12 @@ var defaultAcmeDNSProviderCatalog = []AcmeDNSProviderMeta{
 	{
 		Name:         "华为云",
 		ProviderCode: "dns_huaweicloud",
-		Helper:       "acme.sh 官方: dns_huaweicloud",
+		Helper:       "acme.sh 官方: dns_huaweicloud；HUAWEICLOUD_Region 可选，默认 ap-southeast-1",
 		Fields: []AcmeDNSFieldDef{
 			{Key: "HUAWEICLOUD_Username", Label: "用户名", Required: true},
 			{Key: "HUAWEICLOUD_Password", Label: "密码", Required: true},
 			{Key: "HUAWEICLOUD_DomainName", Label: "DomainName", Required: true},
+			{Key: "HUAWEICLOUD_Region", Label: "Region（可选）", Required: false, Placeholder: "cn-north-4"},
 		},
 	},
 	{
@@ -253,39 +297,48 @@ type AcmeDNSFieldDef struct {
 }
 
 type AcmeAccountView struct {
-	Id        uint   `json:"id"`
-	Name      string `json:"name"`
-	Email     string `json:"email"`
-	Server    string `json:"server"`
-	KeyLength string `json:"keyLength"`
-	Remark    string `json:"remark"`
-	CreatedAt int64  `json:"createdAt"`
-	UpdatedAt int64  `json:"updatedAt"`
+	Id               uint   `json:"id"`
+	DisplayID        uint64 `json:"displayId"`
+	ResourceID       string `json:"resourceId"`
+	Name             string `json:"name"`
+	Email            string `json:"email"`
+	Server           string `json:"server"`
+	AccountKeyLength string `json:"accountKeyLength"`
+	Registered       bool   `json:"registered"`
+	Remark           string `json:"remark"`
+	CreatedAt        int64  `json:"createdAt"`
+	UpdatedAt        int64  `json:"updatedAt"`
 }
 
 type AcmeDNSAccountView struct {
-	Id           uint              `json:"id"`
-	Name         string            `json:"name"`
-	ProviderName string            `json:"providerName"`
-	ProviderCode string            `json:"providerCode"`
-	Env          map[string]string `json:"env"`
-	Remark       string            `json:"remark"`
-	CreatedAt    int64             `json:"createdAt"`
-	UpdatedAt    int64             `json:"updatedAt"`
+	Id             uint              `json:"id"`
+	DisplayID      uint64            `json:"displayId"`
+	ResourceID     string            `json:"resourceId"`
+	Name           string            `json:"name"`
+	ProviderName   string            `json:"providerName"`
+	ProviderCode   string            `json:"providerCode"`
+	ProviderLocked bool              `json:"providerLocked"`
+	Env            map[string]string `json:"env"`
+	Remark         string            `json:"remark"`
+	CreatedAt      int64             `json:"createdAt"`
+	UpdatedAt      int64             `json:"updatedAt"`
 }
 
 type AcmeCertificateView = CertificateRecordView
 
 type AcmeIssuePayload struct {
-	DomainsText     string
-	CertificateType string
-	Challenge       string
-	Webroot         string
-	DNSProvider     string
-	DNSEnvText      string
-	Server          string
-	KeyLength       string
-	CustomArgs      string
+	// ExistingRecordID turns an issuance into an in-place reissue. The
+	// certificate inventory row and its panel/subscription assignments remain.
+	ExistingRecordID uint
+	DomainsText      string
+	CertificateType  string
+	Challenge        string
+	Webroot          string
+	DNSProvider      string
+	DNSEnvText       string
+	Server           string
+	KeyLength        string
+	CustomArgs       string
 
 	AcmeAccountID uint
 	DNSAccountID  uint
@@ -296,18 +349,41 @@ type AcmeIssuePayload struct {
 	PushDir      string
 	PushExplicit bool
 	LogSessionID string
+
+	// The HTTP API keeps its existing JSON shape but records which optional
+	// fields were actually supplied. Reissue merges only omitted values from
+	// the current certificate record, so an explicit value can still override
+	// its prior configuration.
+	DomainsProvided         bool
+	CertificateTypeProvided bool
+	ChallengeProvided       bool
+	WebrootProvided         bool
+	DNSProviderProvided     bool
+	DNSEnvProvided          bool
+	KeyLengthProvided       bool
+	CustomArgsProvided      bool
+	AcmeAccountProvided     bool
+	DNSAccountProvided      bool
+	AutoRenewProvided       bool
+	RemarkProvided          bool
+	ApplyTargetProvided     bool
+	PushDirProvided         bool
 }
 
 type AcmeRenewPayload struct {
-	ID          uint
-	Force       bool
-	Manual      bool
-	ApplyTarget string
+	ID    uint
+	Force bool
+	// Manual is retained for wire compatibility with older callers. It no
+	// longer changes force semantics: only Force requests a fresh issuance.
+	Manual       bool
+	ApplyTarget  string
+	LogSessionID string
 }
 
 type AcmePushPayload struct {
 	ID        uint
 	TargetDir string
+	Clear     bool
 }
 
 type AcmeSetAutoRenewPayload struct {
@@ -340,12 +416,25 @@ type AcmeRemovePayload struct {
 }
 
 type AcmeAccountPayload struct {
-	ID        uint
-	Name      string
-	Email     string
-	Server    string
+	ID               uint
+	Name             string
+	Email            string
+	Server           string
+	AccountKeyLength string
+	// KeyLength is only accepted during the schema transition from the old API.
+	// It is never used as a certificate key-length setting again.
 	KeyLength string
 	Remark    string
+
+	EmailProvided            bool
+	ServerProvided           bool
+	AccountKeyLengthProvided bool
+	RemarkProvided           bool
+}
+
+type AcmeAccountRotateKeyPayload struct {
+	ID               uint
+	AccountKeyLength string
 }
 
 type AcmeDNSAccountPayload struct {
@@ -354,6 +443,9 @@ type AcmeDNSAccountPayload struct {
 	ProviderCode string
 	EnvJSON      string
 	Remark       string
+
+	EnvJSONProvided bool
+	RemarkProvided  bool
 }
 
 type AcmeActionResult struct {
@@ -361,6 +453,23 @@ type AcmeActionResult struct {
 	Certificate *AcmeCertificateView `json:"certificate,omitempty"`
 	Msg         string               `json:"msg,omitempty"`
 	Output      string               `json:"output,omitempty"`
+	Warnings    []string             `json:"warnings,omitempty"`
+}
+
+// AcmeTaskView exposes a short-lived, in-memory background operation. It
+// deliberately contains only the already-safe action view; certificate PEM
+// material and DNS credentials never enter task responses or log sessions.
+type AcmeTaskView struct {
+	ID           string            `json:"id"`
+	Operation    string            `json:"operation"`
+	Status       string            `json:"status"`
+	LogSessionID string            `json:"logSessionId"`
+	StartedAt    int64             `json:"startedAt"`
+	UpdatedAt    int64             `json:"updatedAt"`
+	FinishedAt   int64             `json:"finishedAt,omitempty"`
+	Error        string            `json:"error,omitempty"`
+	Warnings     []string          `json:"warnings,omitempty"`
+	Result       *AcmeActionResult `json:"result,omitempty"`
 }
 
 type AcmeVersionItem struct {
@@ -400,15 +509,25 @@ type acmeLegacyDNSCandidate struct {
 	env      map[string]string
 }
 
+type acmeDNSRuntimeConfig struct {
+	ProviderCode string
+	EnvPairs     []string
+	AccountName  string
+}
+
 type AcmeLogSessionView struct {
-	Id         string   `json:"id"`
-	Title      string   `json:"title"`
-	Status     string   `json:"status"`
-	Lines      []string `json:"lines"`
-	Error      string   `json:"error,omitempty"`
-	StartedAt  int64    `json:"startedAt"`
-	UpdatedAt  int64    `json:"updatedAt"`
-	FinishedAt int64    `json:"finishedAt,omitempty"`
+	Id         string            `json:"id"`
+	Title      string            `json:"title"`
+	Status     string            `json:"status"`
+	Lines      []string          `json:"lines"`
+	Error      string            `json:"error,omitempty"`
+	TaskID     string            `json:"taskId,omitempty"`
+	TaskStatus string            `json:"taskStatus,omitempty"`
+	Warnings   []string          `json:"warnings,omitempty"`
+	Result     *AcmeActionResult `json:"result,omitempty"`
+	StartedAt  int64             `json:"startedAt"`
+	UpdatedAt  int64             `json:"updatedAt"`
+	FinishedAt int64             `json:"finishedAt,omitempty"`
 }
 
 type AcmeIPPortStatus struct {
@@ -453,7 +572,7 @@ func (s *AcmeService) GetOverview() (*AcmeOverview, error) {
 	}
 
 	overview := &AcmeOverview{
-		Supported: runtime.GOOS == "linux",
+		Supported: IsSystemPlatformLinux(),
 	}
 
 	overview.ContactEmail = normalizeAcmeEmail(s.readSettingWithDefault(acmeContactEmailKey, ""))
@@ -541,15 +660,19 @@ func (s *AcmeService) EnsureOverviewRuntimeConsistency(force bool) error {
 	if err := cleanupLegacyCertificateManagedDirs(); err != nil {
 		return err
 	}
-	if runtime.GOOS == "linux" {
-		if err := s.migrateLegacyDNSSecretsFromAccountConf(); err != nil {
-			return err
-		}
-	}
 	if err := s.cleanupNonDNSCertificateDNSReferences(); err != nil {
 		return err
 	}
-	if err := s.syncInventoryFromAcmeDB(); err != nil {
+	if err := s.scrubLegacyAcmeCertificateRuntimeFields(); err != nil {
+		return err
+	}
+	if err := certificateInventory.RepairDisplayIDs(); err != nil {
+		return err
+	}
+	if err := repairAcmeAccountDisplayIDs(database.GetDB()); err != nil {
+		return err
+	}
+	if err := repairDNSAccountDisplayIDs(database.GetDB()); err != nil {
 		return err
 	}
 
@@ -616,18 +739,17 @@ func (s *AcmeService) GetIPCertificatePortStatus() (*AcmeIPPortStatus, error) {
 	return status, nil
 }
 
-func (s *AcmeService) MigrateLegacyDNSSecretsOnStartup() error {
-	if runtime.GOOS != "linux" {
-		return nil
-	}
-	return s.migrateLegacyDNSSecretsFromAccountConf()
+// MigrateLegacyAcmeRuntimeOnStartup performs the one-time conversion from the
+// retired shared acme.sh directory and mirror table into database-only state.
+func (s *AcmeService) MigrateLegacyAcmeRuntimeOnStartup() error {
+	return s.migrateLegacyAcmeRuntimeOnStartup()
 }
 
 func (s *AcmeService) GetRemoteVersionsPage(page int, perPage int) (*AcmeVersionListResult, error) {
 	acmeOperationMu.Lock()
 	defer acmeOperationMu.Unlock()
 
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return &AcmeVersionListResult{
 			Versions: []AcmeVersionItem{},
 			Page:     1,
@@ -677,7 +799,7 @@ func (s *AcmeService) CheckUpdate() (*AcmeVersionCheckResult, error) {
 	defer acmeOperationMu.Unlock()
 
 	result := &AcmeVersionCheckResult{
-		Supported: runtime.GOOS == "linux",
+		Supported: IsSystemPlatformLinux(),
 		Installed: false,
 	}
 	if !result.Supported {
@@ -737,7 +859,7 @@ func (s *AcmeService) InstallOrReinstall(payload AcmeInstallPayload) (*AcmeActio
 	acmeOperationMu.Lock()
 	defer acmeOperationMu.Unlock()
 
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return nil, common.NewError("ACME certificate management is only supported on Linux")
 	}
 
@@ -834,6 +956,10 @@ func (s *AcmeService) InstallOrReinstall(payload AcmeInstallPayload) (*AcmeActio
 		return nil, common.NewError("staged acme.sh install is incomplete: ", err)
 	}
 
+	acmeOwnership, err := BeginAcmeHostOwnership([]string{managedAcmeHomeDir()}, nil)
+	if err != nil {
+		return nil, common.NewError("record pending managed acme ownership failed: ", err)
+	}
 	scriptPath, err := s.activateManagedAcmeInstallLocked(stagedHomeDir)
 	if err != nil {
 		return nil, err
@@ -845,6 +971,12 @@ func (s *AcmeService) InstallOrReinstall(payload AcmeInstallPayload) (*AcmeActio
 
 	if err := s.setString(acmeScriptPathKey, scriptPath); err != nil {
 		return nil, err
+	}
+	if err := VerifyAndActivateHostResource(acmeOwnership.ID); err != nil {
+		return nil, common.NewError("activate managed acme ownership failed: ", err)
+	}
+	if err := syncManagedAcmeCertificateOwnership(); err != nil {
+		return nil, common.NewError("refresh managed acme ownership failed: ", err)
 	}
 	if payload.EmailProvided {
 		if err := s.setString(acmeContactEmailKey, contact); err != nil {
@@ -885,7 +1017,7 @@ func (s *AcmeService) Upgrade() (*AcmeActionResult, error) {
 	acmeOperationMu.Lock()
 	defer acmeOperationMu.Unlock()
 
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return nil, common.NewError("ACME certificate management is only supported on Linux")
 	}
 
@@ -926,7 +1058,7 @@ func (s *AcmeService) RemoveManagedAcme(payload AcmeRemovePayload) (*AcmeActionR
 	acmeOperationMu.Lock()
 	defer acmeOperationMu.Unlock()
 
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return nil, common.NewError("ACME certificate management is only supported on Linux")
 	}
 	return s.removeManagedAcmeWithOptionsLocked(acmeRemoveOptions{
@@ -947,12 +1079,22 @@ func (s *AcmeService) RemoveManagedAcmeForUninstall() (*AcmeActionResult, error)
 
 func (s *AcmeService) Issue(payload AcmeIssuePayload) (*AcmeActionResult, error) {
 	logSession := acmeLogSessionStore.start(payload.LogSessionID, "证书签发")
+	finishOperation, operationErr := logSession.ensureManagedOperation("issue")
+	if operationErr != nil {
+		logSession.fail(operationErr.Error())
+		return nil, operationErr
+	}
+	defer finishOperation()
 	logSession.append("进入 ACME 签发队列")
 	acmeOperationMu.Lock()
 	defer acmeOperationMu.Unlock()
+	if err := logSession.operationContext().Err(); err != nil {
+		logSession.fail("ACME 签发任务已取消")
+		return nil, err
+	}
 	logSession.append("开始执行 ACME 签发")
 
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		logSession.fail("ACME certificate management is only supported on Linux")
 		return nil, common.NewError("ACME certificate management is only supported on Linux")
 	}
@@ -964,7 +1106,30 @@ func (s *AcmeService) Issue(payload AcmeIssuePayload) (*AcmeActionResult, error)
 	}
 	logSession.append("已找到 acme.sh: " + scriptPath)
 
+	var existingRecord *model.CertificateRecord
+	if payload.ExistingRecordID > 0 {
+		existing, err := certificateInventory.GetRecordByID(payload.ExistingRecordID)
+		if err != nil {
+			logSession.fail(err.Error())
+			return nil, err
+		}
+		if strings.TrimSpace(existing.SourceType) != CertificateSourceACME {
+			message := "只有 ACME 证书可以编辑并重新签发"
+			logSession.fail(message)
+			return nil, common.NewError(message)
+		}
+		existingRecord = existing
+		applyAcmeReissueDefaults(&payload, existingRecord)
+	}
+
 	certificateType := normalizeAcmeCertificateType(payload.CertificateType)
+	if existingRecord != nil {
+		if normalizeAcmeCertificateType(existingRecord.CertificateType) != certificateType {
+			message := "编辑并重新签发不能改变证书类型"
+			logSession.fail(message)
+			return nil, common.NewError(message)
+		}
+	}
 	if certificateType == acmeCertificateTypeIP {
 		logSession.append("证书类型: IP 证书")
 	} else {
@@ -975,7 +1140,11 @@ func (s *AcmeService) Issue(payload AcmeIssuePayload) (*AcmeActionResult, error)
 		}
 	}
 
-	domains := normalizeAcmeIssueIdentifiers(payload.DomainsText, certificateType)
+	domains, domainErr := validateAcmeIssueIdentifiers(payload.DomainsText, certificateType)
+	if domainErr != nil {
+		logSession.fail(domainErr.Error())
+		return nil, domainErr
+	}
 	if len(domains) == 0 {
 		message := "domain list is required"
 		if certificateType == acmeCertificateTypeIP {
@@ -1005,6 +1174,11 @@ func (s *AcmeService) Issue(payload AcmeIssuePayload) (*AcmeActionResult, error)
 			return nil, common.NewError("IP 证书只能使用 HTTP Standalone 或 TLS ALPN 验证")
 		}
 	}
+	if certificateType == acmeCertificateTypeDomain && hasAcmeWildcardDomain(domains) && challenge != "dns" {
+		message := "通配符域名只能使用 DNS 验证"
+		logSession.fail(message)
+		return nil, common.NewError(message)
+	}
 	logSession.append("验证方式: " + challenge)
 	ipFamilyMode := detectAcmeIPFamilyMode(domains)
 	if certificateType == acmeCertificateTypeIP {
@@ -1013,7 +1187,7 @@ func (s *AcmeService) Issue(payload AcmeIssuePayload) (*AcmeActionResult, error)
 		logSession.append("端口空闲只代表本机未占用，不代表外部 IPv6 一定可达")
 	}
 	keyLength := normalizeAcmeKeyLength(payload.KeyLength)
-	if keyLength == "" {
+	if keyLength == "" && !payload.KeyLengthProvided {
 		keyLength = normalizeAcmeKeyLength(s.readSettingWithDefault(acmeDefaultKeyLengthKey, defaultAcmeKeyLength))
 	}
 	if keyLength == "" {
@@ -1022,27 +1196,8 @@ func (s *AcmeService) Issue(payload AcmeIssuePayload) (*AcmeActionResult, error)
 	useECC := strings.HasPrefix(strings.ToLower(keyLength), "ec-")
 	logSession.append("证书算法: " + keyLength)
 
-	caServer := ""
-	if certificateType == acmeCertificateTypeDomain {
-		serverInput := strings.TrimSpace(payload.Server)
-		if serverInput != "" && !isSupportedAcmeDomainServer(serverInput) {
-			logSession.fail("域名证书仅支持 Let's Encrypt 或 ZeroSSL")
-			return nil, common.NewError("域名证书仅支持 Let's Encrypt 或 ZeroSSL")
-		}
-		caServer = normalizeSupportedAcmeDomainServer(serverInput)
-		if caServer == "" {
-			caServer = normalizeSupportedAcmeDomainServer(s.readSettingWithDefault(acmePreferredCAKey, defaultAcmePreferredCA))
-		}
-		if caServer == "" {
-			caServer = defaultAcmePreferredCA
-		}
-	} else {
-		caServer = acmeLEProductionDirectory
-	}
-	logSession.append("CA 平台: " + caServer)
-
 	webroot := strings.TrimSpace(payload.Webroot)
-	if webroot == "" {
+	if webroot == "" && !payload.WebrootProvided {
 		webroot = strings.TrimSpace(s.readSettingWithDefault(acmeDefaultWebrootKey, ""))
 	}
 	useDNSChallenge := shouldUseAcmeDNSChallenge(certificateType, challenge)
@@ -1077,107 +1232,100 @@ func (s *AcmeService) Issue(payload AcmeIssuePayload) (*AcmeActionResult, error)
 	}
 	useDNSChallenge = shouldUseAcmeDNSChallenge(certificateType, challenge)
 	dnsProvider := strings.TrimSpace(payload.DNSProvider)
-	if useDNSChallenge && dnsProvider == "" {
+	if useDNSChallenge && dnsProvider == "" && !payload.DNSProviderProvided {
 		dnsProvider = strings.TrimSpace(s.readSettingWithDefault(acmeDefaultDNSProviderKey, ""))
 	}
 	if !useDNSChallenge {
 		dnsProvider = ""
 	}
 	dnsEnvText := strings.TrimSpace(payload.DNSEnvText)
-	customArgs := strings.TrimSpace(payload.CustomArgs)
-	acmeAccountName := ""
-	dnsAccountName := ""
-	acmeAccountEmail := ""
-	if certificateType == acmeCertificateTypeDomain && payload.AcmeAccountID > 0 {
-		account := &model.AcmeAccount{}
-		if err := database.GetDB().Where("id = ?", payload.AcmeAccountID).First(account).Error; err != nil {
+	customArgs, customArgsErr := validateAcmeCustomArgs(payload.CustomArgs)
+	if customArgsErr != nil {
+		logSession.fail(customArgsErr.Error())
+		return nil, customArgsErr
+	}
+	var account *model.AcmeAccount
+	caServer := ""
+	if certificateType == acmeCertificateTypeDomain {
+		if err := database.GetDB().Where("id = ? AND system = ?", payload.AcmeAccountID, false).First(&account).Error; err != nil {
 			logSession.fail(err.Error())
 			return nil, err
 		}
-		acmeAccountName = strings.TrimSpace(account.Name)
-		if acmeAccountName != "" {
-			logSession.append("使用 ACME 账号: " + acmeAccountName)
-		}
-		if strings.TrimSpace(account.Server) != "" {
-			accountServer := normalizeSupportedAcmeDomainServer(account.Server)
-			if accountServer == "" {
-				logSession.fail("所选 ACME 账号的 CA 平台无效，仅支持 Let's Encrypt 或 ZeroSSL")
-				return nil, common.NewError("所选 ACME 账号的 CA 平台无效，仅支持 Let's Encrypt 或 ZeroSSL")
-			}
-			caServer = accountServer
-		}
-		if strings.TrimSpace(account.KeyLength) != "" {
-			keyLength = normalizeAcmeKeyLength(account.KeyLength)
-			if keyLength == "" {
-				keyLength = defaultAcmeKeyLength
-			}
-			useECC = strings.HasPrefix(strings.ToLower(keyLength), "ec-")
-		}
-		acmeAccountEmail = normalizeAcmeEmail(strings.TrimSpace(account.Email))
-		if acmeAccountEmail == "" {
-			message := "所选 ACME 账号未配置邮箱，请到“ACME 账号管理”补全后重试"
+		caServer = normalizeSupportedAcmeDomainServer(account.Server)
+		if caServer == "" {
+			message := "所选 ACME 账号的 CA 平台无效，仅支持 Let's Encrypt 或 ZeroSSL"
 			logSession.fail(message)
 			return nil, common.NewError(message)
 		}
-		logSession.append("使用 ACME 账号邮箱: " + acmeAccountEmail)
-		if err := s.ensureAcmeAccountEmailForServer(scriptPath, homeDir, acmeAccountEmail, caServer, logSession); err != nil {
-			if isAcmeInvalidContactError(err) {
-				message := "ACME 账号邮箱格式无效，请到“ACME 账号管理”修正邮箱后重试"
-				logSession.fail(message + ": " + err.Error())
-				return nil, common.NewError(message)
-			}
-			message := "同步 ACME 账号邮箱失败，请检查账号邮箱或 CA 账号状态后重试"
-			logSession.fail(message + ": " + err.Error())
-			return nil, common.NewError(message)
-		}
-	}
-	if certificateType == acmeCertificateTypeIP {
-		if payload.AcmeAccountID > 0 {
-			logSession.append("IP 证书流程忽略 ACME 账号参数")
+		logSession.append("使用 ACME 账号: " + strings.TrimSpace(account.Name))
+	} else {
+		contact := strings.TrimSpace(s.readSettingWithDefault(acmeContactEmailKey, ""))
+		var accountErr error
+		account, accountErr = s.ensureIPRuntimeAccount(contact)
+		if accountErr != nil {
+			logSession.fail(accountErr.Error())
+			return nil, accountErr
 		}
 		caServer = acmeLEProductionDirectory
-		logSession.append("IP 证书强制使用 Let's Encrypt shortlived profile")
-		contactEmail := normalizeAcmeEmail(s.readSettingWithDefault(acmeContactEmailKey, ""))
-		if contactEmail == "" {
-			logSession.append("未设置联系邮箱，跳过账号邮箱同步")
-		} else {
-			logSession.append("使用联系邮箱同步 IP 证书账号: " + contactEmail)
-			if err := s.ensureAcmeAccountEmailForServer(scriptPath, homeDir, contactEmail, caServer, logSession); err != nil {
-				if isAcmeInvalidContactError(err) {
-					message := "联系邮箱格式无效，请在 acme.sh 运行时修正后重试"
-					logSession.fail(message + ": " + err.Error())
-					return nil, common.NewError(message)
-				}
-				message := "IP 证书通道联系邮箱同步失败，请检查 CA 账号状态后重试"
-				logSession.fail(message + ": " + err.Error())
+		logSession.append("IP 证书使用独立系统运行态")
+	}
+	logSession.append("最终 CA 平台: " + caServer)
+	logSession.append("最终证书算法: " + keyLength)
+
+	dnsEnv := []string{}
+	var dnsAccount *model.AcmeDNSAccount
+	manualDNSProvider := ""
+	manualDNSEnvText := ""
+	manualDNSAccountID := uint(0)
+	manualDNSAccountCommitted := false
+	if useDNSChallenge {
+		if payload.DNSAccountID > 0 && strings.TrimSpace(dnsEnvText) != "" {
+			message := "已选择 DNS 账号时不能同时填写手工 DNS 环境变量；请先保存到该账号或取消选择后自动新建账号"
+			logSession.fail(message)
+			return nil, common.NewError(message)
+		}
+		if payload.DNSAccountID == 0 {
+			if strings.TrimSpace(dnsProvider) == "" {
+				message := "手工 DNS 凭据必须选择 DNS Provider"
+				logSession.fail(message)
 				return nil, common.NewError(message)
 			}
+			runtimeDNS, runtimeErr := resolveAcmeDNSRuntimeConfig(0, dnsProvider, dnsEnvText)
+			if runtimeErr != nil {
+				logSession.fail(runtimeErr.Error())
+				return nil, runtimeErr
+			}
+			dnsProvider = runtimeDNS.ProviderCode
+			dnsEnv = runtimeDNS.EnvPairs
+			manualDNSProvider = dnsProvider
+			manualDNSEnvText = dnsEnvText
+			logSession.append("手工 DNS 凭据已校验，将在 ACME 签发成功后创建并绑定 DNS 账号")
+		} else {
+			runtimeDNS, runtimeErr := resolveAcmeDNSRuntimeConfig(payload.DNSAccountID, dnsProvider, "")
+			if runtimeErr != nil {
+				logSession.fail(runtimeErr.Error())
+				return nil, runtimeErr
+			}
+			requestedProvider := strings.TrimSpace(dnsProvider)
+			if providerMeta, ok := lookupAcmeDNSProvider(requestedProvider); ok {
+				requestedProvider = providerMeta.ProviderCode
+			}
+			if payload.DNSProviderProvided && requestedProvider != "" && requestedProvider != runtimeDNS.ProviderCode {
+				message := "已选择 DNS 账号时必须使用该账号绑定的 DNS Provider"
+				logSession.fail(message)
+				return nil, common.NewError(message)
+			}
+			dnsProvider = runtimeDNS.ProviderCode
+			dnsEnv = runtimeDNS.EnvPairs
+			dnsAccount = &model.AcmeDNSAccount{}
+			if err := database.GetDB().Where("id = ?", payload.DNSAccountID).First(dnsAccount).Error; err != nil {
+				logSession.fail(err.Error())
+				return nil, err
+			}
+			if runtimeDNS.AccountName != "" {
+				logSession.append("使用 DNS 账号: " + runtimeDNS.AccountName)
+			}
 		}
-	} else {
-		logSession.append("最终 CA 平台: " + caServer)
-		logSession.append("最终证书算法: " + keyLength)
-	}
-
-	dnsEnvFromAccount := []string{}
-	if useDNSChallenge && payload.DNSAccountID > 0 {
-		dnsAccount := &model.AcmeDNSAccount{}
-		if err := database.GetDB().Where("id = ?", payload.DNSAccountID).First(dnsAccount).Error; err != nil {
-			logSession.fail(err.Error())
-			return nil, err
-		}
-		dnsAccountName = strings.TrimSpace(dnsAccount.Name)
-		if dnsAccountName != "" {
-			logSession.append("使用 DNS 账号: " + dnsAccountName)
-		}
-		if strings.TrimSpace(dnsAccount.ProviderCode) != "" {
-			dnsProvider = strings.TrimSpace(dnsAccount.ProviderCode)
-		}
-		envMap, err := parseAcmeEnvJSON(dnsAccount.EnvJSON)
-		if err != nil {
-			logSession.fail(err.Error())
-			return nil, err
-		}
-		dnsEnvFromAccount = envMapToEnvPairs(envMap)
 	}
 	if challenge == "webroot" && strings.TrimSpace(webroot) == "" {
 		logSession.fail("webroot challenge requires webroot path")
@@ -1207,28 +1355,30 @@ func (s *AcmeService) Issue(payload AcmeIssuePayload) (*AcmeActionResult, error)
 	if certificateType == acmeCertificateTypeIP {
 		logAcmeIPFamilyListenStrategy(logSession, ipFamilyMode)
 	}
-	defer cleanupAcmeWorkingTree(homeDir, domains[0], useECC)
+	runtime, runtimeErr := newAcmeOperationRuntime(account)
+	if runtimeErr != nil {
+		logSession.fail(runtimeErr.Error())
+		return nil, runtimeErr
+	}
+	runtimeSnapshotSaved := false
+	defer func() {
+		if !runtimeSnapshotSaved {
+			if snapshotErr := runtime.snapshot(); snapshotErr != nil && logSession != nil {
+				logSession.append("保存 ACME 临时运行态失败: " + snapshotErr.Error())
+			}
+		}
+		runtime.cleanup()
+	}()
+	if err := s.ensureOperationRuntimeAccount(scriptPath, homeDir, runtime, account, caServer, logSession); err != nil {
+		logSession.fail(err.Error())
+		return nil, common.NewError("准备 ACME 账号运行态失败: ", err)
+	}
 	commandArgs := buildAcmeIssueCommandArgs(domains, challenge, webroot, dnsProvider, keyLength, caServer, customArgs, certificateType == acmeCertificateTypeIP, ipFamilyMode)
 	commandArgs = ensureAcmeFreshIssueArgs(commandArgs)
 	logSession.append("手动签发默认强制重新签发，避免复用旧证书")
-	dnsEnv := []string{}
-	if useDNSChallenge {
-		parsedEnv, parseErr := normalizeAcmeEnvAssignments(dnsEnvText)
-		if parseErr != nil {
-			logSession.fail(parseErr.Error())
-			return nil, parseErr
-		}
-		dnsEnv = parsedEnv
-		if len(dnsEnvFromAccount) > 0 {
-			dnsEnv = mergeEnvPairs(dnsEnvFromAccount, dnsEnv)
-		}
-		if len(dnsEnv) > 0 {
-			defer s.cleanupAcmeAccountConfSecrets(homeDir, dnsEnv, logSession)
-		}
-	}
 
 	logSession.append("执行 acme.sh --issue")
-	output, err := runCommandOutputWithTimeoutEnvLog(3*time.Minute, scriptPath, append(acmeHomeArgs(homeDir), commandArgs...), dnsEnv, logSession)
+	output, err := runCommandOutputWithTimeoutEnvLog(3*time.Minute, scriptPath, append(runtime.commandArgs(homeDir), commandArgs...), dnsEnv, logSession)
 	skippedBecauseDomainsUnchanged := false
 	if err != nil {
 		if isAcmeDomainsNotChangedError(err) {
@@ -1240,82 +1390,77 @@ func (s *AcmeService) Issue(payload AcmeIssuePayload) (*AcmeActionResult, error)
 			return nil, common.NewError("issue certificate failed: ", err)
 		}
 	}
+	if err := runtime.snapshot(); err != nil {
+		logSession.fail(err.Error())
+		return nil, err
+	}
+	runtimeSnapshotSaved = true
 
 	if skippedBecauseDomainsUnchanged {
 		logSession.append("未触发重新签发，开始安装已有证书文件")
 	} else {
 		logSession.append("签发成功，开始安装证书文件")
 	}
-	paths, cleanupInstalledCert, err := s.installCertToManagedDir(scriptPath, homeDir, domains[0], useECC, dnsEnv, logSession)
+	paths, cleanupInstalledCert, err := s.installCertToManagedDirWithArgs(scriptPath, runtime.commandArgs(homeDir), domains[0], useECC, dnsEnv, logSession)
 	if err != nil {
 		logSession.fail(err.Error())
 		return nil, err
 	}
 	defer cleanupInstalledCert()
+	if manualDNSProvider != "" {
+		created, createErr := s.createManualDNSAccountLocked(manualDNSProvider, manualDNSEnvText)
+		if createErr != nil {
+			logSession.fail(createErr.Error())
+			return nil, createErr
+		}
+		dnsAccount = created
+		manualDNSAccountID = created.Id
+		defer func() {
+			if manualDNSAccountID == 0 || manualDNSAccountCommitted {
+				return
+			}
+			_ = database.GetDB().Where("id = ?", manualDNSAccountID).Delete(&model.AcmeDNSAccount{}).Error
+		}()
+		logSession.append("已创建并准备绑定 DNS 账号: " + created.Name)
+	}
 
-	certEntry, err := s.upsertCertificateFromPaths(0, domains, certificateType, acmeCertProfileForType(certificateType), challenge, keyLength, caServer, useECC, homeDir, webroot, dnsProvider, dnsEnvText, customArgs, paths, time.Now().Unix())
+	certEntry, err := s.upsertAcmeCertificateRecordFromPaths(payload.ExistingRecordID, domains, certificateType, challenge, keyLength, caServer, useECC, webroot, dnsProvider, customArgs, account, dnsAccount, paths, payload.AutoRenew, payload.Remark, payload.ApplyTarget, payload.PushDir)
 	if err != nil {
 		logSession.fail(err.Error())
 		return nil, err
 	}
-	applyAcmeAccountBinding(certEntry, certificateType, payload.AcmeAccountID, acmeAccountName)
-	if useDNSChallenge {
-		certEntry.DNSAccountID = payload.DNSAccountID
-		certEntry.DNSAccountName = dnsAccountName
-	} else {
-		certEntry.DNSAccountID = 0
-		certEntry.DNSAccountName = ""
-	}
-	certEntry.AutoRenew = payload.AutoRenew
-	certEntry.PushDir = strings.TrimSpace(payload.PushDir)
-	certEntry.Remark = strings.TrimSpace(payload.Remark)
-	certEntry.Webroot = webroot
-	certEntry.DNSProvider = dnsProvider
-	certEntry.DNSEnvText = dnsEnvText
-	certEntry.CustomArgs = customArgs
+	manualDNSAccountCommitted = manualDNSAccountID == 0 || certEntry.DNSAccountID == manualDNSAccountID
 	certEntry.LastOutput = strings.TrimSpace(output)
-	if normalizedApplyTarget, ok := normalizeAcmeApplyTarget(payload.ApplyTarget); ok {
-		certEntry.ApplyTarget = string(normalizedApplyTarget)
-	} else {
-		certEntry.ApplyTarget = ""
-	}
 	if err := database.GetDB().Save(certEntry).Error; err != nil {
 		logSession.fail(err.Error())
 		return nil, err
 	}
-	if _, upsertErr := upsertInventoryFromAcme(certEntry); upsertErr != nil {
-		logSession.fail(upsertErr.Error())
-		return nil, upsertErr
-	}
 
+	warnings := make([]string, 0)
 	if certificateType != acmeCertificateTypeIP {
 		if err := s.persistAcmeDefaults(payload, challenge, keyLength, caServer, dnsProvider, useDNSChallenge); err != nil {
-			logSession.fail(err.Error())
-			return nil, err
+			warnings = append(warnings, "保存 ACME 默认配置失败: "+strings.TrimSpace(err.Error()))
 		}
 	}
 
 	logSession.append("执行签发后动作")
-	if err := s.applyIssuePostActions(certEntry, payload.ApplyTarget, payload.PushDir, payload.PushExplicit); err != nil {
-		logSession.fail(err.Error())
-		return nil, err
-	}
-	if _, upsertErr := upsertInventoryFromAcme(certEntry); upsertErr != nil {
-		logSession.fail(upsertErr.Error())
-		return nil, upsertErr
-	}
+	materialChanged := existingRecord == nil || normalizeCertificateFingerprint(existingRecord.Fingerprint) != normalizeCertificateFingerprint(certEntry.Fingerprint)
+	warnings = append(warnings, s.applyCertificateRecordPostActionsWithCoreRestart(certEntry, payload.ApplyTarget, payload.PushDir, payload.PushExplicit, materialChanged)...)
 	if err := s.EnsureOverviewRuntimeConsistency(true); err != nil {
-		logSession.fail(err.Error())
-		return nil, err
+		warnings = append(warnings, "刷新证书运行态一致性失败: "+strings.TrimSpace(err.Error()))
 	}
+	warnings = persistCertificatePostActionWarnings(certEntry, warnings)
 
-	overview, err := s.GetOverview()
-	if err != nil {
-		logSession.fail(err.Error())
-		return nil, err
+	var overview *AcmeOverview
+	if loadedOverview, overviewErr := s.GetOverview(); overviewErr != nil {
+		warnings = persistCertificatePostActionWarnings(certEntry, append(warnings, "刷新证书概览失败: "+strings.TrimSpace(overviewErr.Error())))
+	} else {
+		overview = loadedOverview
 	}
-	view := convertAcmeCertificate(certEntry)
-	if skippedBecauseDomainsUnchanged {
+	view := convertCertificateRecord(certEntry)
+	if len(warnings) > 0 {
+		logSession.finish("证书签发完成，但有后置动作警告")
+	} else if skippedBecauseDomainsUnchanged {
 		logSession.finish("域名未变化，已同步已有证书")
 	} else {
 		logSession.finish("证书签发完成")
@@ -1324,57 +1469,66 @@ func (s *AcmeService) Issue(payload AcmeIssuePayload) (*AcmeActionResult, error)
 		Overview:    overview,
 		Certificate: &view,
 		Output:      strings.TrimSpace(output),
+		Warnings:    warnings,
 	}, nil
 }
 
 func (s *AcmeService) Renew(payload AcmeRenewPayload) (*AcmeActionResult, error) {
+	logSession := acmeLogSessionStore.start(payload.LogSessionID, "证书续签")
+	finishOperation, operationErr := logSession.ensureManagedOperation("renew")
+	if operationErr != nil {
+		logSession.fail(operationErr.Error())
+		return nil, operationErr
+	}
+	defer finishOperation()
+	logSession.append("进入 ACME 续签队列")
 	acmeOperationMu.Lock()
 	defer acmeOperationMu.Unlock()
+	if err := logSession.operationContext().Err(); err != nil {
+		logSession.fail("ACME 续签任务已取消")
+		return nil, err
+	}
+	logSession.append("开始执行 ACME 续签")
 
 	if payload.ID == 0 {
+		logSession.fail("certificate id is required")
 		return nil, common.NewError("certificate id is required")
 	}
 	row, getErr := certificateInventory.GetRecordByID(payload.ID)
 	if getErr != nil {
+		logSession.fail(getErr.Error())
 		return nil, getErr
 	}
 	if row.SourceType != CertificateSourceACME {
-		return s.renewInventorySelfSignedCertificate(row)
-	}
-	if runtime.GOOS != "linux" {
-		return nil, common.NewError("ACME certificate management is only supported on Linux")
-	}
-
-	acmeID := payload.ID
-	if row.SourceRef != "" {
-		if parsed, parseErr := strconv.ParseUint(strings.TrimSpace(row.SourceRef), 10, 64); parseErr == nil {
-			acmeID = uint(parsed)
+		result, err := s.renewInventorySelfSignedCertificate(row)
+		if err != nil {
+			logSession.fail(err.Error())
+			return nil, err
 		}
+		logSession.finish("自签证书续签完成")
+		return result, nil
 	}
-
-	entry, err := s.findCertificateByID(acmeID)
-	if err != nil {
-		return nil, err
+	if !IsSystemPlatformLinux() {
+		logSession.fail("ACME certificate management is only supported on Linux")
+		return nil, common.NewError("ACME certificate management is only supported on Linux")
 	}
 
 	scriptPath, homeDir, installed := s.resolveAcmeScript()
 	if !installed {
+		logSession.fail("acme.sh is not installed")
 		return nil, common.NewError("acme.sh is not installed")
 	}
-	if strings.TrimSpace(entry.AcmeHome) != "" {
-		homeDir = strings.TrimSpace(entry.AcmeHome)
-	}
 
-	certificateType := acmeCertificateTypeForEntry(entry)
-	isIPCert := isAcmeIPCertificate(entry)
-	domains := decodeCertificateDomains(entry.DomainSet)
-	if len(domains) == 0 && strings.TrimSpace(entry.MainDomain) != "" {
-		domains = []string{strings.TrimSpace(entry.MainDomain)}
+	certificateType := normalizeAcmeCertificateType(row.CertificateType)
+	isIPCert := certificateType == acmeCertificateTypeIP
+	domains := decodeCertificateDomains(row.DomainSet)
+	if len(domains) == 0 && strings.TrimSpace(row.MainDomain) != "" {
+		domains = []string{strings.TrimSpace(row.MainDomain)}
 	}
 	if len(domains) == 0 {
 		return nil, common.NewError("certificate domains are empty")
 	}
-	challenge := normalizeAcmeChallenge(entry.Challenge)
+	challenge := normalizeAcmeChallenge(row.Challenge)
 	if challenge == "" {
 		challenge = "standalone"
 	}
@@ -1382,118 +1536,105 @@ func (s *AcmeService) Renew(payload AcmeRenewPayload) (*AcmeActionResult, error)
 		challenge = normalizeAcmeIPChallenge(challenge)
 		if challenge == "" {
 			err := common.NewError("IP certificates only support standalone or alpn challenge")
-			_ = s.markCertificateError(entry.Id, err.Error())
+			_ = s.markCertificateError(row.Id, err.Error())
 			return nil, err
 		}
 	}
-	webroot := strings.TrimSpace(entry.Webroot)
+	webroot := strings.TrimSpace(row.Webroot)
 	if webroot == "" {
 		webroot = strings.TrimSpace(s.readSettingWithDefault(acmeDefaultWebrootKey, ""))
 	}
-	keyLength := normalizeAcmeKeyLength(entry.KeyLength)
+	keyLength := normalizeAcmeKeyLength(row.KeyLength)
 	if keyLength == "" {
 		keyLength = normalizeAcmeKeyLength(s.readSettingWithDefault(acmeDefaultKeyLengthKey, defaultAcmeKeyLength))
 	}
 	if keyLength == "" {
 		keyLength = defaultAcmeKeyLength
 	}
-	dnsProvider, providerErr := resolveAcmeDNSProviderFromAccount(entry.DNSAccountID, entry.DNSProvider)
-	if providerErr != nil {
-		return nil, providerErr
+	useECC := strings.HasPrefix(strings.ToLower(keyLength), "ec-")
+	dnsProvider := strings.TrimSpace(row.DNSProvider)
+	customArgs, customArgsErr := validateAcmeCustomArgs(row.CustomArgs)
+	if customArgsErr != nil {
+		_ = s.markCertificateError(row.Id, customArgsErr.Error())
+		return nil, customArgsErr
 	}
-	customArgs := strings.TrimSpace(entry.CustomArgs)
 	useDNSChallenge := shouldUseAcmeDNSChallenge(certificateType, challenge)
 	ipFamilyMode := acmeIPFamilyUnknown
 	if isIPCert {
 		ipFamilyMode = detectAcmeIPFamilyMode(domains)
 	}
 
-	var logSession *acmeLogSession
-	logSessionFinished := false
-	if !useDNSChallenge && isAcmePortChallenge(challenge) {
-		logTitle := "ACME certificate renew"
-		if isIPCert {
-			logTitle = "IP certificate renew"
-		}
-		logSession = acmeLogSessionStore.start("", logTitle)
-		logSession.append("renew target: " + entry.MainDomain)
-		if isIPCert {
-			logSession.append("IP family mode: " + acmeIPFamilyModeLabel(ipFamilyMode))
-			logSession.append("port appears free locally, but external IPv6 reachability is not guaranteed")
-			logAcmeIPFamilyListenStrategy(logSession, ipFamilyMode)
-		}
-		defer func() {
-			if logSession == nil || logSessionFinished {
-				return
-			}
-			logSession.finish("certificate renew flow finished")
-		}()
+	logSession.append("续签目标: " + row.MainDomain)
+	if isIPCert {
+		logSession.append("IP 地址族: " + acmeIPFamilyModeLabel(ipFamilyMode))
+		logSession.append("端口空闲只代表本机未占用，不代表外部 IPv6 一定可达")
+		logAcmeIPFamilyListenStrategy(logSession, ipFamilyMode)
 	}
 
 	var challengeDecision acmeChallengePortDecision
 	if !useDNSChallenge && isAcmePortChallenge(challenge) {
 		snapshot, snapshotErr := collectAcmeChallengePortSnapshot()
 		if snapshotErr != nil {
-			if logSession != nil {
-				logSession.fail(snapshotErr.Error())
-				logSessionFinished = true
-			}
-			_ = s.markCertificateError(entry.Id, snapshotErr.Error())
+			logSession.fail(snapshotErr.Error())
+			_ = s.markCertificateError(row.Id, snapshotErr.Error())
 			return nil, snapshotErr
 		}
 		decision, decisionErr := selectAcmeChallengePortDecision(certificateType, challenge, snapshot)
 		if decisionErr != nil {
-			if logSession != nil {
-				logSession.fail(decisionErr.Error())
-				logSessionFinished = true
-			}
-			_ = s.markCertificateError(entry.Id, decisionErr.Error())
+			logSession.fail(decisionErr.Error())
+			_ = s.markCertificateError(row.Id, decisionErr.Error())
 			return nil, decisionErr
 		}
 		challengeDecision = decision
 		challenge = decision.Challenge
 		useDNSChallenge = shouldUseAcmeDNSChallenge(certificateType, challenge)
-		if logSession != nil {
-			if challengeDecision.Switched {
-				logSession.append(fmt.Sprintf("port challenge switched: %s -> %s (%s)", challengeDecision.InputChallenge, challengeDecision.Challenge, challengeDecision.Reason))
-			} else {
-				logSession.append(fmt.Sprintf("port challenge selected: %s (%s)", challengeDecision.Challenge, challengeDecision.Reason))
-			}
+		if challengeDecision.Switched {
+			logSession.append(fmt.Sprintf("port challenge switched: %s -> %s (%s)", challengeDecision.InputChallenge, challengeDecision.Challenge, challengeDecision.Reason))
+		} else {
+			logSession.append(fmt.Sprintf("port challenge selected: %s (%s)", challengeDecision.Challenge, challengeDecision.Reason))
 		}
 	}
 	if challenge == "webroot" && strings.TrimSpace(webroot) == "" {
 		err := common.NewError("webroot challenge requires webroot path")
-		_ = s.markCertificateError(entry.Id, err.Error())
+		_ = s.markCertificateError(row.Id, err.Error())
 		return nil, err
+	}
+	renewEnv := []string{}
+	var dnsAccount *model.AcmeDNSAccount
+	if useDNSChallenge {
+		if row.DNSAccountID == 0 {
+			err := common.NewError("DNS 账号已删除，证书不可自动续签")
+			_ = s.disableAutoRenewForMissingAccount(row.Id, err.Error())
+			return nil, err
+		}
+		runtimeDNS, runtimeErr := resolveAcmeDNSRuntimeConfig(row.DNSAccountID, dnsProvider, "")
+		if runtimeErr != nil {
+			if database.IsNotFound(runtimeErr) {
+				_ = s.disableAutoRenewForMissingAccount(row.Id, "DNS 账号已删除，证书不可自动续签")
+			}
+			_ = s.markCertificateError(row.Id, runtimeErr.Error())
+			return nil, runtimeErr
+		}
+		dnsProvider = runtimeDNS.ProviderCode
+		renewEnv = runtimeDNS.EnvPairs
+		dnsAccount = &model.AcmeDNSAccount{}
+		if err := database.GetDB().Where("id = ?", row.DNSAccountID).First(dnsAccount).Error; err != nil {
+			_ = s.disableAutoRenewForMissingAccount(row.Id, "DNS 账号已删除，证书不可自动续签")
+			return nil, err
+		}
 	}
 	if challenge == "dns" && strings.TrimSpace(dnsProvider) == "" {
 		err := common.NewError("dns challenge requires dns provider (for example dns_cf)")
-		_ = s.markCertificateError(entry.Id, err.Error())
+		_ = s.markCertificateError(row.Id, err.Error())
 		return nil, err
-	}
-
-	renewEnv := []string{}
-	if useDNSChallenge {
-		parsedEnv, parseErr := resolveAcmeDNSRuntimeEnv(entry.DNSAccountID, entry.DNSEnvText)
-		if parseErr != nil {
-			_ = s.markCertificateError(entry.Id, parseErr.Error())
-			return nil, parseErr
-		}
-		renewEnv = parsedEnv
-		if len(renewEnv) > 0 {
-			defer s.cleanupAcmeAccountConfSecrets(homeDir, renewEnv, nil)
-		}
 	}
 
 	var tempFirewall *acmeTemporaryFirewallRule
 	if !useDNSChallenge && isAcmePortChallenge(challenge) && challengeDecision.Port > 0 {
 		prepared, prepareErr := s.prepareTemporaryAcmeFirewallRule(challengeDecision.Port, logSession)
 		if prepareErr != nil {
-			if logSession != nil {
-				logSession.fail(prepareErr.Error())
-				logSessionFinished = true
-			}
-			_ = s.markCertificateError(entry.Id, prepareErr.Error())
+			logSession.fail(prepareErr.Error())
+			_ = s.markCertificateError(row.Id, prepareErr.Error())
 			return nil, prepareErr
 		}
 		tempFirewall = prepared
@@ -1502,106 +1643,141 @@ func (s *AcmeService) Renew(payload AcmeRenewPayload) (*AcmeActionResult, error)
 		}
 	}
 
-	defer cleanupAcmeWorkingTree(homeDir, domains[0], entry.UseECC)
-	commandArgs := buildAcmeIssueCommandArgs(domains, challenge, webroot, dnsProvider, keyLength, strings.TrimSpace(entry.CAServer), customArgs, isIPCert, ipFamilyMode)
-	if payload.Manual || payload.Force {
+	var account *model.AcmeAccount
+	caServer := ""
+	if isIPCert {
+		contact := strings.TrimSpace(s.readSettingWithDefault(acmeContactEmailKey, ""))
+		var accountErr error
+		account, accountErr = s.ensureIPRuntimeAccount(contact)
+		if accountErr != nil {
+			return nil, accountErr
+		}
+		caServer = acmeLEProductionDirectory
+	} else {
+		if row.AcmeAccountID == 0 {
+			err := common.NewError("ACME 账号已删除，证书不可自动续签")
+			_ = s.disableAutoRenewForMissingAccount(row.Id, err.Error())
+			return nil, err
+		}
+		account = &model.AcmeAccount{}
+		if err := database.GetDB().Where("id = ? AND system = ?", row.AcmeAccountID, false).First(account).Error; err != nil {
+			_ = s.disableAutoRenewForMissingAccount(row.Id, "ACME 账号已删除，证书不可自动续签")
+			return nil, err
+		}
+		caServer = normalizeSupportedAcmeDomainServer(account.Server)
+		if caServer == "" {
+			err := common.NewError("所选 ACME 账号的 CA 平台无效")
+			_ = s.markCertificateError(row.Id, err.Error())
+			return nil, err
+		}
+	}
+	runtime, runtimeErr := newAcmeOperationRuntime(account)
+	if runtimeErr != nil {
+		return nil, runtimeErr
+	}
+	runtimeSnapshotSaved := false
+	defer func() {
+		if !runtimeSnapshotSaved {
+			_ = runtime.snapshot()
+		}
+		runtime.cleanup()
+	}()
+	if err := s.ensureOperationRuntimeAccount(scriptPath, homeDir, runtime, account, caServer, logSession); err != nil {
+		_ = s.markCertificateError(row.Id, err.Error())
+		return nil, common.NewError("准备 ACME 账号运行态失败: ", err)
+	}
+	commandArgs := buildAcmeIssueCommandArgs(domains, challenge, webroot, dnsProvider, keyLength, caServer, customArgs, isIPCert, ipFamilyMode)
+	if shouldForceAcmeRenew(payload) {
 		commandArgs = ensureAcmeFreshIssueArgs(commandArgs)
-		if logSession != nil {
-			logSession.append("手动续签默认强制重新签发，避免复用旧证书")
-		}
+		logSession.append("强制续签已附加 --force")
+	} else {
+		logSession.append("普通续签不附加 --force；域名未变化时只同步现有证书")
 	}
-	output, err := runCommandOutputWithTimeoutEnvLog(3*time.Minute, scriptPath, append(acmeHomeArgs(homeDir), commandArgs...), renewEnv, logSession)
+	output, err := runCommandOutputWithTimeoutEnvLog(3*time.Minute, scriptPath, append(runtime.commandArgs(homeDir), commandArgs...), renewEnv, logSession)
+	skippedBecauseDomainsUnchanged := false
 	if err != nil {
-		if logSession != nil {
+		if isAcmeDomainsNotChangedError(err) {
+			skippedBecauseDomainsUnchanged = true
+			output = strings.TrimSpace(err.Error())
+			logSession.append("域名未变化，继续同步已有证书文件")
+		} else {
 			logSession.fail(err.Error())
-			logSessionFinished = true
+			_ = s.markCertificateError(row.Id, err.Error())
+			return nil, common.NewError("renew certificate failed: ", err)
 		}
-		_ = s.markCertificateError(entry.Id, err.Error())
-		return nil, common.NewError("renew certificate failed: ", err)
 	}
+	if err := runtime.snapshot(); err != nil {
+		return nil, err
+	}
+	runtimeSnapshotSaved = true
 
-	paths, cleanupInstalledCert, tempErr := createAcmeTempInstallPaths(entry.MainDomain)
+	paths, cleanupInstalledCert, tempErr := s.installCertToManagedDirWithArgs(scriptPath, runtime.commandArgs(homeDir), row.MainDomain, useECC, renewEnv, logSession)
 	if tempErr != nil {
 		return nil, tempErr
 	}
 	defer cleanupInstalledCert()
-	if err := s.installCertByRecord(scriptPath, homeDir, entry, paths, renewEnv, logSession); err != nil {
-		return nil, err
-	}
 
-	updated, err := s.upsertCertificateFromPaths(
-		entry.Id,
+	updated, err := s.upsertAcmeCertificateRecordFromPaths(
+		row.Id,
 		domains,
 		certificateType,
-		acmeCertProfileForType(certificateType),
 		challenge,
 		keyLength,
-		strings.TrimSpace(entry.CAServer),
-		entry.UseECC,
-		homeDir,
+		caServer,
+		useECC,
 		webroot,
 		dnsProvider,
-		strings.TrimSpace(entry.DNSEnvText),
 		customArgs,
+		account,
+		dnsAccount,
 		paths,
-		time.Now().Unix(),
+		row.AutoRenew,
+		row.Remark,
+		row.ApplyTarget,
+		row.PushDir,
 	)
 	if err != nil {
 		return nil, err
 	}
-	updated.LastIssuedAt = entry.LastIssuedAt
-	updated.AcmeAccountID = entry.AcmeAccountID
-	updated.AcmeAccountName = entry.AcmeAccountName
-	if useDNSChallenge {
-		updated.DNSAccountID = entry.DNSAccountID
-		updated.DNSAccountName = entry.DNSAccountName
-	} else {
-		updated.DNSAccountID = 0
-		updated.DNSAccountName = ""
-	}
-	updated.AutoRenew = entry.AutoRenew
-	updated.PushDir = entry.PushDir
-	updated.PushFiles = entry.PushFiles
-	updated.Remark = entry.Remark
-	updated.ApplyTarget = entry.ApplyTarget
-	updated.Webroot = webroot
-	updated.DNSProvider = dnsProvider
-	updated.DNSEnvText = strings.TrimSpace(entry.DNSEnvText)
-	updated.CustomArgs = customArgs
 	updated.LastOutput = strings.TrimSpace(output)
 	if err := database.GetDB().Save(updated).Error; err != nil {
 		return nil, err
 	}
-	if _, upsertErr := upsertInventoryFromAcme(updated); upsertErr != nil {
-		return nil, upsertErr
-	}
 
 	applyTarget := strings.TrimSpace(payload.ApplyTarget)
-	if err := s.applyIssuePostActions(updated, applyTarget, "", false); err != nil {
-		return nil, err
-	}
-	if _, upsertErr := upsertInventoryFromAcme(updated); upsertErr != nil {
-		return nil, upsertErr
-	}
+	materialChanged := normalizeCertificateFingerprint(row.Fingerprint) != normalizeCertificateFingerprint(updated.Fingerprint)
+	warnings := s.applyCertificateRecordPostActionsWithCoreRestart(updated, applyTarget, "", false, materialChanged)
 	if err := s.EnsureOverviewRuntimeConsistency(true); err != nil {
-		return nil, err
+		warnings = append(warnings, "刷新证书运行态一致性失败: "+strings.TrimSpace(err.Error()))
 	}
+	warnings = persistCertificatePostActionWarnings(updated, warnings)
 
-	overview, err := s.GetOverview()
-	if err != nil {
-		return nil, err
+	var overview *AcmeOverview
+	if loadedOverview, overviewErr := s.GetOverview(); overviewErr != nil {
+		warnings = persistCertificatePostActionWarnings(updated, append(warnings, "刷新证书概览失败: "+strings.TrimSpace(overviewErr.Error())))
+	} else {
+		overview = loadedOverview
 	}
-	view := convertAcmeCertificate(updated)
-	if logSession != nil {
-		logSession.finish("certificate renew completed")
-		logSessionFinished = true
+	view := convertCertificateRecord(updated)
+	if len(warnings) > 0 {
+		logSession.finish("证书续签完成，但有后置动作警告")
+	} else if skippedBecauseDomainsUnchanged {
+		logSession.finish("域名未变化，已同步已有证书")
+	} else {
+		logSession.finish("证书续签完成")
 	}
 	return &AcmeActionResult{
 		Overview:    overview,
 		Certificate: &view,
 		Output:      strings.TrimSpace(output),
+		Warnings:    warnings,
 	}, nil
 }
+
+func shouldForceAcmeRenew(payload AcmeRenewPayload) bool {
+	return payload.Force
+}
+
 func (s *AcmeService) Push(payload AcmePushPayload) (*AcmeActionResult, error) {
 	acmeOperationMu.Lock()
 	defer acmeOperationMu.Unlock()
@@ -1613,31 +1789,63 @@ func (s *AcmeService) Push(payload AcmePushPayload) (*AcmeActionResult, error) {
 	if getErr != nil {
 		return nil, getErr
 	}
+	if payload.Clear {
+		if !row.PushEnabled {
+			return nil, common.NewError("certificate has no verified directory push state")
+		}
+		if err := removeVerifiedCertificateFiles(row.PushDir, row.PushFilePaths); err != nil {
+			return nil, err
+		}
+		row.PushEnabled = false
+		row.PushDir = ""
+		row.PushFilePaths = ""
+		row.PushFiles = ""
+		if err := persistCertificatePushState(row); err != nil {
+			return nil, err
+		}
+		if err := s.EnsureOverviewRuntimeConsistency(true); err != nil {
+			return nil, err
+		}
+		if err := clearCertificatePostActionError(row); err != nil {
+			return nil, err
+		}
+		overview, err := s.GetOverview()
+		if err != nil {
+			return nil, err
+		}
+		view := convertCertificateRecord(row)
+		return &AcmeActionResult{
+			Overview:    overview,
+			Certificate: &view,
+			Msg:         "证书目录推送记录已清除",
+		}, nil
+	}
 	targetDir := strings.TrimSpace(payload.TargetDir)
 	if targetDir == "" {
 		return nil, common.NewError("target directory is required")
 	}
+	if strings.TrimSpace(row.SourceType) == CertificateSourceACME {
+		if _, err := beginManagedAcmeCertificatePushOwnership(targetDir); err != nil {
+			return nil, common.NewError("record pending certificate push ownership failed: ", err)
+		}
+	}
 
-	sourceEntry, err := loadAcmeSourceEntryForInventoryRow(row)
+	pushState, err := syncCertificateDirectoryPushState(targetDir, row.PushEnabled, row.PushDir, row.PushFilePaths, row.CertPEM, row.KeyPEM, row.FullchainPEM, row.ChainPEM)
 	if err != nil {
 		return nil, err
 	}
 
-	pushState, err := syncCertificateDirectoryPushState(targetDir, row.PushDir, row.PushFiles, row.CertPEM, row.KeyPEM, row.FullchainPEM, row.ChainPEM)
-	if err != nil {
-		return nil, err
-	}
-
+	row.PushEnabled = pushState.PushEnabled
 	row.PushDir = pushState.PushDir
-	row.PushFiles = pushState.PushFiles
-	if sourceEntry != nil {
-		sourceEntry.PushDir = pushState.PushDir
-		sourceEntry.PushFiles = pushState.PushFiles
-	}
-	if err := persistCertificatePushState(row, sourceEntry); err != nil {
+	row.PushFilePaths = pushState.PushFilePaths
+	row.PushFiles = ""
+	if err := persistCertificatePushState(row); err != nil {
 		return nil, err
 	}
 	if err := s.EnsureOverviewRuntimeConsistency(true); err != nil {
+		return nil, err
+	}
+	if err := clearCertificatePostActionError(row); err != nil {
 		return nil, err
 	}
 
@@ -1679,6 +1887,9 @@ func (s *AcmeService) Apply(payload AcmeApplyPayload) (*AcmeActionResult, error)
 		return nil, err
 	}
 	if err := s.EnsureOverviewRuntimeConsistency(true); err != nil {
+		return nil, err
+	}
+	if err := clearCertificatePostActionError(row); err != nil {
 		return nil, err
 	}
 
@@ -1756,6 +1967,10 @@ func (s *AcmeService) SetAutoRenew(payload AcmeSetAutoRenewPayload) (*AcmeAction
 	}
 	if row.SourceType == CertificateSourceSelfSigned {
 		row.AutoRenew = payload.AutoRenew
+		clearCertificateAutoRenewRetryFields(row)
+		if payload.AutoRenew {
+			row.LastError = ""
+		}
 		if err := database.GetDB().Save(row).Error; err != nil {
 			return nil, err
 		}
@@ -1780,23 +1995,34 @@ func (s *AcmeService) SetAutoRenew(payload AcmeSetAutoRenewPayload) (*AcmeAction
 	if row.SourceType != CertificateSourceACME {
 		return nil, common.NewError("仅 ACME 或自签证书可设置自动续签")
 	}
-	acmeID := payload.ID
-	if row.SourceRef != "" {
-		if parsed, parseErr := strconv.ParseUint(strings.TrimSpace(row.SourceRef), 10, 64); parseErr == nil {
-			acmeID = uint(parsed)
+	if payload.AutoRenew {
+		certificateType := normalizeAcmeCertificateType(row.CertificateType)
+		if certificateType != acmeCertificateTypeIP {
+			if row.AcmeAccountID == 0 {
+				return nil, common.NewError("请在“编辑并重新签发”中选择 ACME 账号后再开启自动续签")
+			}
+			account := &model.AcmeAccount{}
+			if err := database.GetDB().Where("id = ? AND system = ?", row.AcmeAccountID, false).First(account).Error; err != nil {
+				return nil, common.NewError("关联的 ACME 账号不存在，请重新签发后再开启自动续签")
+			}
+		}
+		if shouldUseAcmeDNSChallenge(certificateType, row.Challenge) {
+			if row.DNSAccountID == 0 {
+				return nil, common.NewError("请在“编辑并重新签发”中选择 DNS 账号后再开启自动续签")
+			}
+			dnsAccount := &model.AcmeDNSAccount{}
+			if err := database.GetDB().Where("id = ?", row.DNSAccountID).First(dnsAccount).Error; err != nil {
+				return nil, common.NewError("关联的 DNS 账号不存在，请重新签发后再开启自动续签")
+			}
 		}
 	}
-
-	entry, err := s.findCertificateByID(acmeID)
-	if err != nil {
-		return nil, err
+	row.AutoRenew = payload.AutoRenew
+	clearCertificateAutoRenewRetryFields(row)
+	if payload.AutoRenew {
+		row.LastError = ""
 	}
-	entry.AutoRenew = payload.AutoRenew
-	if err := database.GetDB().Save(entry).Error; err != nil {
+	if err := database.GetDB().Save(row).Error; err != nil {
 		return nil, err
-	}
-	if _, upsertErr := upsertInventoryFromAcme(entry); upsertErr != nil {
-		return nil, upsertErr
 	}
 	if err := s.EnsureOverviewRuntimeConsistency(true); err != nil {
 		return nil, err
@@ -1806,7 +2032,7 @@ func (s *AcmeService) SetAutoRenew(payload AcmeSetAutoRenewPayload) (*AcmeAction
 	if err != nil {
 		return nil, err
 	}
-	view := convertAcmeCertificate(entry)
+	view := convertCertificateRecord(row)
 	msg := "自动续签已关闭"
 	if payload.AutoRenew {
 		msg = "自动续签已开启"
@@ -1829,71 +2055,26 @@ func (s *AcmeService) Delete(payload AcmeDeletePayload) (*AcmeActionResult, erro
 	if getErr != nil {
 		return nil, getErr
 	}
-	if certificateAssignedRecordMatches(PanelSelfSignedTargetPanel, row.Id) || certificateAssignedRecordMatches(PanelSelfSignedTargetSub, row.Id) {
-		return nil, common.NewError("certificate is in use by panel or subscription")
-	}
-	if err := ensureCertificateRecordNotUsedByTLS(row.Id); err != nil {
-		return nil, err
-	}
-	if err := ensureCertificateRecordNotUsedByReverseProxy(row.Id); err != nil {
-		return nil, err
-	}
-	if err := removeTrackedCertificateFilesFromDirectory(strings.TrimSpace(row.PushDir), parseTrackedPushFiles(row.PushFiles)); err != nil {
-		return nil, err
-	}
-	if row.SourceType != CertificateSourceACME {
-		if row.SourceType == CertificateSourceImported {
-			if err := clearLegacySettingsPathCertificateSource(&SettingService{}, row.SourceRef); err != nil {
-				return nil, err
-			}
-		}
-		if err := certificateInventory.DeleteByID(payload.ID); err != nil {
+	if row.PushEnabled {
+		if err := removeVerifiedCertificateFiles(row.PushDir, row.PushFilePaths); err != nil {
 			return nil, err
 		}
-		if err := s.EnsureOverviewRuntimeConsistency(true); err != nil {
+	}
+	if row.SourceType == CertificateSourceImported {
+		if err := clearLegacySettingsPathCertificateSource(&SettingService{}, row.SourceRef); err != nil {
 			return nil, err
 		}
-		overview, overviewErr := s.GetOverview()
-		if overviewErr != nil {
-			return nil, overviewErr
-		}
-		return &AcmeActionResult{
-			Overview: overview,
-			Msg:      "certificate deleted",
-		}, nil
 	}
-	acmeID := payload.ID
-	if row.SourceRef != "" {
-		if parsed, parseErr := strconv.ParseUint(strings.TrimSpace(row.SourceRef), 10, 64); parseErr == nil {
-			acmeID = uint(parsed)
-		}
-	}
-	_, findErr := s.findCertificateByID(acmeID)
-	if findErr != nil {
-		if database.IsNotFound(findErr) {
-			if err := certificateInventory.DeleteByID(payload.ID); err != nil {
-				return nil, err
-			}
-			if err := s.EnsureOverviewRuntimeConsistency(true); err != nil {
-				return nil, err
-			}
-			overview, overviewErr := s.GetOverview()
-			if overviewErr != nil {
-				return nil, overviewErr
-			}
-			return &AcmeActionResult{
-				Overview: overview,
-				Msg:      "certificate deleted",
-			}, nil
-		}
-		return nil, findErr
-	}
-	if err := database.GetDB().Where("id = ?", acmeID).Delete(&model.AcmeCertificate{}).Error; err != nil {
+	bindings, err := detachAndDeleteCertificateRecord(row)
+	if err != nil {
 		return nil, err
 	}
-	if err := certificateInventory.DeleteByID(payload.ID); err != nil {
-		return nil, err
+	if row.SourceType == CertificateSourceACME {
+		if err := syncManagedAcmeCertificateOwnership(); err != nil {
+			return nil, fmt.Errorf("clear deleted certificate ownership: %w", err)
+		}
 	}
+	syncDetachedCertificateBindings(bindings)
 	if err := s.EnsureOverviewRuntimeConsistency(true); err != nil {
 		return nil, err
 	}
@@ -1904,8 +2085,189 @@ func (s *AcmeService) Delete(payload AcmeDeletePayload) (*AcmeActionResult, erro
 	}
 	return &AcmeActionResult{
 		Overview: overview,
-		Msg:      "certificate deleted",
+		Msg:      "证书已删除，关联应用绑定已解除",
 	}, nil
+}
+
+type detachedCertificateBindings struct {
+	panelTargets   []PanelSelfSignedTarget
+	defaultTLSIDs  []uint
+	mihomoTLSIDs   []uint
+	reverseChanged bool
+}
+
+// detachAndDeleteCertificateRecord removes every database-level reference to
+// one certificate before deleting its material row. ACME/DNS account rows are
+// intentionally not touched: they are independent reusable credentials.
+func detachAndDeleteCertificateRecord(row *model.CertificateRecord) (detachedCertificateBindings, error) {
+	if row == nil || row.Id == 0 {
+		return detachedCertificateBindings{}, common.NewError("certificate record is required")
+	}
+	return detachAndDeleteCertificateRecords([]model.CertificateRecord{*row}, nil)
+}
+
+func detachAndDeleteCertificateRecords(rows []model.CertificateRecord, finalize func(*gorm.DB) error) (detachedCertificateBindings, error) {
+	result := detachedCertificateBindings{}
+	certificateIDs := make([]uint, 0, len(rows))
+	certificateIDSet := make(map[uint]struct{}, len(rows))
+	for i := range rows {
+		id := rows[i].Id
+		if id == 0 {
+			continue
+		}
+		if _, exists := certificateIDSet[id]; exists {
+			continue
+		}
+		certificateIDSet[id] = struct{}{}
+		certificateIDs = append(certificateIDs, id)
+	}
+	if len(certificateIDs) == 0 && finalize == nil {
+		return result, nil
+	}
+
+	settingService := &SettingService{}
+	previousAssignments := map[PanelSelfSignedTarget][]uint{}
+	for _, target := range []PanelSelfSignedTarget{PanelSelfSignedTargetPanel, PanelSelfSignedTargetSub} {
+		assigned, err := GetAssignedCertificateRecordIDs(settingService, target)
+		if err != nil {
+			return result, err
+		}
+		hasRemovedAssignment := false
+		next := make([]uint, 0, len(assigned))
+		for _, id := range assigned {
+			if _, removed := certificateIDSet[id]; removed {
+				hasRemovedAssignment = true
+				continue
+			}
+			next = append(next, id)
+		}
+		if !hasRemovedAssignment {
+			continue
+		}
+		previousAssignments[target] = append([]uint(nil), assigned...)
+		if err := SetAssignedCertificateRecordIDs(settingService, target, next); err != nil {
+			return result, err
+		}
+		result.panelTargets = append(result.panelTargets, target)
+	}
+
+	db := database.GetDB()
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if len(certificateIDs) > 0 {
+			if err := tx.Model(&model.Tls{}).
+				Where("certificate_record_id IN ?", certificateIDs).
+				Pluck("id", &result.defaultTLSIDs).Error; err != nil {
+				return err
+			}
+			if len(result.defaultTLSIDs) > 0 {
+				if err := tx.Model(&model.Tls{}).Where("certificate_record_id IN ?", certificateIDs).Update("certificate_record_id", 0).Error; err != nil {
+					return err
+				}
+			}
+			if err := tx.Model(&model.MihomoTls{}).
+				Where("certificate_record_id IN ?", certificateIDs).
+				Pluck("id", &result.mihomoTLSIDs).Error; err != nil {
+				return err
+			}
+			if len(result.mihomoTLSIDs) > 0 {
+				if err := tx.Model(&model.MihomoTls{}).Where("certificate_record_id IN ?", certificateIDs).Update("certificate_record_id", 0).Error; err != nil {
+					return err
+				}
+			}
+		}
+
+		reverseRows := make([]model.ReverseProxyRule, 0)
+		if err := tx.Model(&model.ReverseProxyRule{}).
+			Select("id", "enabled", "listen_protocol", "listen_protocol_alias", "certificate_record_id", "certificate_record_list").
+			Find(&reverseRows).Error; err != nil {
+			return err
+		}
+		for i := range reverseRows {
+			current := reverseProxyRuleCertificateIDs(&reverseRows[i])
+			next := make([]uint, 0, len(current))
+			for _, id := range current {
+				if _, removed := certificateIDSet[id]; !removed {
+					next = append(next, id)
+				}
+			}
+			if len(next) == len(current) {
+				continue
+			}
+			primaryID := uint(0)
+			if len(next) > 0 {
+				primaryID = next[0]
+			}
+			updates := map[string]interface{}{
+				"certificate_record_id":   primaryID,
+				"certificate_record_list": encodeReverseProxyUintList(next),
+			}
+			listenAlias := normalizeReverseProxyProtocolAlias(reverseRows[i].ListenProtocolAlias, reverseRows[i].ListenProtocol)
+			if len(next) == 0 && reverseProxyListenerUsesManagedCertificates(reverseRows[i].ListenProtocol, listenAlias) {
+				updates["enabled"] = false
+				updates["runtime_status"] = "disabled"
+				updates["last_error"] = ""
+			}
+			if err := tx.Model(&model.ReverseProxyRule{}).Where("id = ?", reverseRows[i].Id).Updates(updates).Error; err != nil {
+				return err
+			}
+			result.reverseChanged = true
+		}
+		if result.reverseChanged {
+			settings, settingsErr := loadReverseProxySettingsTx(tx)
+			if settingsErr != nil {
+				return settingsErr
+			}
+			if bumpErr := reverseProxyBumpRevisionTx(tx, settings); bumpErr != nil {
+				return bumpErr
+			}
+		}
+
+		if len(certificateIDs) > 0 {
+			if err := tx.Where("certificate_record_id IN ?", certificateIDs).Delete(&model.PanelCertificateBalanceState{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("certificate_record_id IN ?", certificateIDs).Delete(&model.ReverseProxyCertificateBalanceState{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("id IN ?", certificateIDs).Delete(&model.CertificateRecord{}).Error; err != nil {
+				return err
+			}
+		}
+		if finalize != nil {
+			return finalize(tx)
+		}
+		return nil
+	})
+	if err == nil {
+		return result, nil
+	}
+
+	// Settings were changed before the transaction so their canonical filtering
+	// could still see the record. Restore them if the database deletion failed.
+	for target, ids := range previousAssignments {
+		if restoreErr := SetAssignedCertificateRecordIDs(settingService, target, ids); restoreErr != nil {
+			logger.Warning("restore certificate assignment after delete rollback failed: ", restoreErr)
+		}
+	}
+	return detachedCertificateBindings{}, err
+}
+
+// Runtime refreshes happen only after the short DB transaction commits. A
+// failed external refresh is logged: the binding is already safely removed and
+// the normal runtime reconciler will retry from the now-authoritative database.
+func syncDetachedCertificateBindings(bindings detachedCertificateBindings) {
+	for _, target := range bindings.panelTargets {
+		if err := ApplyPanelTLSRuntimeSettings(target); err != nil {
+			logger.Warning("refresh panel TLS after certificate deletion failed: ", err)
+		}
+	}
+	if _, err := ForceSyncTLSPathBindingsForTLSIDs(bindings.defaultTLSIDs, bindings.mihomoTLSIDs, ""); err != nil {
+		logger.Warning("refresh TLS bindings after certificate deletion failed: ", err)
+	}
+	noteReverseProxyCertificateInventoryChanged()
+	if err := (&ReverseProxyService{}).SyncCertificateInventoryNow(); err != nil {
+		logger.Warning("refresh reverse proxy after certificate deletion failed: ", err)
+	}
 }
 
 func (s *AcmeService) renewInventorySelfSignedCertificate(row *model.CertificateRecord) (*AcmeActionResult, error) {
@@ -1967,7 +2329,6 @@ func (s *AcmeService) renewInventorySelfSignedCertificate(row *model.Certificate
 		Remark:             strings.TrimSpace(row.Remark),
 		PushDir:            strings.TrimSpace(row.PushDir),
 		PushExplicit:       false,
-		TrackedPushFiles:   strings.TrimSpace(row.PushFiles),
 		ApplyTarget:        strings.TrimSpace(row.ApplyTarget),
 	}
 	return (&SelfSignedService{}).Issue(payload)
@@ -1978,55 +2339,89 @@ func (s *AcmeService) SaveAcmeAccount(payload AcmeAccountPayload) (*AcmeActionRe
 	defer acmeOperationMu.Unlock()
 
 	name := strings.TrimSpace(payload.Name)
-	email, emailErr := validateAcmeEmail(payload.Email)
-	if emailErr != nil {
-		return nil, emailErr
-	}
-	serverInput := strings.TrimSpace(payload.Server)
-	server := normalizeSupportedAcmeDomainServer(serverInput)
-	keyLength := normalizeAcmeKeyLength(payload.KeyLength)
-	remark := strings.TrimSpace(payload.Remark)
-
 	if name == "" {
 		return nil, common.NewError("acme 账号名称不能为空")
-	}
-	if serverInput != "" && server == "" {
-		return nil, common.NewError("acme 账号 CA 平台仅支持 letsencrypt 或 zerossl")
-	}
-	if server == "" {
-		server = normalizeSupportedAcmeDomainServer(s.readSettingWithDefault(acmePreferredCAKey, defaultAcmePreferredCA))
-		if server == "" {
-			server = defaultAcmePreferredCA
-		}
-	}
-	if keyLength == "" {
-		keyLength = normalizeAcmeKeyLength(s.readSettingWithDefault(acmeDefaultKeyLengthKey, defaultAcmeKeyLength))
-	}
-	if keyLength == "" {
-		keyLength = defaultAcmeKeyLength
 	}
 
 	entry := &model.AcmeAccount{}
 	db := database.GetDB()
+	isUpdate := payload.ID > 0
 	if payload.ID > 0 {
 		if err := db.Where("id = ?", payload.ID).First(entry).Error; err != nil {
 			return nil, err
 		}
+		if entry.System {
+			return nil, common.NewError("系统 ACME 运行态不能在账号管理中修改")
+		}
+	}
+
+	serverInput := strings.TrimSpace(payload.Server)
+	serverProvided := payload.ServerProvided || serverInput != ""
+	server := ""
+	if isUpdate && !serverProvided {
+		server = normalizeSupportedAcmeDomainServer(entry.Server)
+	} else {
+		server = normalizeSupportedAcmeDomainServer(serverInput)
+		if serverInput != "" && server == "" {
+			return nil, common.NewError("acme 账号 CA 平台仅支持 letsencrypt 或 zerossl")
+		}
+		if server == "" {
+			server = normalizeSupportedAcmeDomainServer(s.readSettingWithDefault(acmePreferredCAKey, defaultAcmePreferredCA))
+			if server == "" {
+				server = defaultAcmePreferredCA
+			}
+		}
+	}
+	if server == "" {
+		return nil, common.NewError("acme 账号 CA 平台仅支持 letsencrypt 或 zerossl")
+	}
+
+	emailProvided := payload.EmailProvided || strings.TrimSpace(payload.Email) != ""
+	emailInput := payload.Email
+	if isUpdate && !emailProvided {
+		emailInput = entry.Email
+	}
+	email, emailErr := validateAcmeAccountEmailForServer(emailInput, server)
+	if emailErr != nil {
+		return nil, emailErr
+	}
+
+	accountKeyProvided := payload.AccountKeyLengthProvided || strings.TrimSpace(payload.AccountKeyLength) != "" || strings.TrimSpace(payload.KeyLength) != ""
+	accountKeyLength := ""
+	accountKeyUnchanged := isUpdate && !accountKeyProvided
+	if !accountKeyUnchanged {
+		accountKeyLength = normalizeAcmeKeyLength(payload.AccountKeyLength)
+		if accountKeyLength == "" {
+			accountKeyLength = normalizeAcmeKeyLength(payload.KeyLength)
+		}
+		if accountKeyLength == "" {
+			accountKeyLength = defaultAcmeKeyLength
+		}
+	}
+
+	remark := strings.TrimSpace(payload.Remark)
+	if isUpdate && !payload.RemarkProvided && remark == "" {
+		remark = entry.Remark
+	}
+	if entry.Registered && normalizeSupportedAcmeDomainServer(entry.Server) != server {
+		return nil, common.NewError("已注册 ACME 账号不能变更 CA 平台；请新建账号")
+	}
+	if entry.Registered && accountKeyProvided && accountKeyLength != effectiveAcmeAccountKeyLength(entry) {
+		return nil, common.NewError("已注册 ACME 账号的密钥算法请使用“轮换账号密钥”操作")
 	}
 	entry.Name = name
 	entry.Email = email
 	entry.Server = server
-	entry.KeyLength = keyLength
+	if !accountKeyUnchanged {
+		entry.KeyLength = accountKeyLength
+		entry.AccountKeyLength = accountKeyLength
+	}
 	entry.Remark = remark
+	if err := ensureAcmeAccountDisplayID(db, entry); err != nil {
+		return nil, err
+	}
 
 	if err := db.Save(entry).Error; err != nil {
-		return nil, err
-	}
-
-	if err := s.setString(acmePreferredCAKey, server); err != nil {
-		return nil, err
-	}
-	if err := s.setString(acmeDefaultKeyLengthKey, keyLength); err != nil {
 		return nil, err
 	}
 	if err := s.EnsureOverviewRuntimeConsistency(true); err != nil {
@@ -2069,7 +2464,30 @@ func (s *AcmeService) DeleteAcmeAccount(id uint) (*AcmeActionResult, error) {
 	if id == 0 {
 		return nil, common.NewError("acme 账号 id 不能为空")
 	}
-	if err := database.GetDB().Where("id = ?", id).Delete(&model.AcmeAccount{}).Error; err != nil {
+	db := database.GetDB()
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		entry := &model.AcmeAccount{}
+		if err := tx.Where("id = ?", id).First(entry).Error; err != nil {
+			return err
+		}
+		if entry.System {
+			return common.NewError("系统 ACME 运行态不能删除")
+		}
+		if err := tx.Model(&model.CertificateRecord{}).
+			Where("source_type = ? AND acme_account_id = ?", CertificateSourceACME, id).
+			Updates(map[string]interface{}{
+				"acme_account_id":            0,
+				"acme_account_name":          "",
+				"auto_renew":                 false,
+				"auto_renew_retry_phase":     "",
+				"auto_renew_retry_count":     0,
+				"auto_renew_next_retry_at":   0,
+				"auto_renew_last_attempt_at": 0,
+			}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(entry).Error
+	}); err != nil {
 		return nil, err
 	}
 	if err := s.EnsureOverviewRuntimeConsistency(true); err != nil {
@@ -2083,13 +2501,67 @@ func (s *AcmeService) DeleteAcmeAccount(id uint) (*AcmeActionResult, error) {
 	return &AcmeActionResult{Overview: overview}, nil
 }
 
+func (s *AcmeService) RotateAcmeAccountKey(payload AcmeAccountRotateKeyPayload) (*AcmeActionResult, error) {
+	acmeOperationMu.Lock()
+	defer acmeOperationMu.Unlock()
+
+	if payload.ID == 0 {
+		return nil, common.NewError("acme 账号 id 不能为空")
+	}
+	keyLength := normalizeAcmeKeyLength(payload.AccountKeyLength)
+	if keyLength == "" {
+		return nil, common.NewError("不支持的 ACME 账号密钥算法")
+	}
+	account := &model.AcmeAccount{}
+	if err := database.GetDB().Where("id = ?", payload.ID).First(account).Error; err != nil {
+		return nil, err
+	}
+	if account.System || !account.Registered || len(account.RuntimeState) == 0 {
+		return nil, common.NewError("该 ACME 账号尚未注册，首次签发时会按所选密钥算法注册")
+	}
+	scriptPath, homeDir, installed := s.resolveAcmeScript()
+	if !installed {
+		return nil, common.NewError("acme.sh is not installed")
+	}
+	runtime, err := newAcmeOperationRuntime(account)
+	if err != nil {
+		return nil, err
+	}
+	runtimeSnapshotSaved := false
+	defer func() {
+		if !runtimeSnapshotSaved {
+			if snapshotErr := runtime.snapshot(); snapshotErr != nil {
+				logger.Warning("保存账号密钥轮换运行态失败: ", snapshotErr)
+			}
+		}
+		runtime.cleanup()
+	}()
+	args := append(runtime.commandArgs(homeDir), "--update-account-key", "--accountkeylength", keyLength, "--server", strings.TrimSpace(account.Server))
+	if _, err := runCommandOutputWithTimeoutEnvLog(90*time.Second, scriptPath, args, nil, nil); err != nil {
+		return nil, common.NewError("轮换 ACME 账号密钥失败: ", err)
+	}
+	account.AccountKeyLength = keyLength
+	account.KeyLength = keyLength
+	if err := runtime.snapshot(); err != nil {
+		return nil, err
+	}
+	runtimeSnapshotSaved = true
+	if err := s.EnsureOverviewRuntimeConsistency(true); err != nil {
+		return nil, err
+	}
+	overview, err := s.GetOverview()
+	if err != nil {
+		return nil, err
+	}
+	return &AcmeActionResult{Overview: overview, Msg: "ACME 账号密钥已轮换"}, nil
+}
+
 func (s *AcmeService) SaveDNSAccount(payload AcmeDNSAccountPayload) (*AcmeActionResult, error) {
 	acmeOperationMu.Lock()
 	defer acmeOperationMu.Unlock()
 
 	name := strings.TrimSpace(payload.Name)
 	providerCode := strings.TrimSpace(payload.ProviderCode)
-	remark := strings.TrimSpace(payload.Remark)
 	if name == "" {
 		return nil, common.NewError("dns 账号名称不能为空")
 	}
@@ -2097,39 +2569,64 @@ func (s *AcmeService) SaveDNSAccount(payload AcmeDNSAccountPayload) (*AcmeAction
 	if !ok {
 		return nil, common.NewError("不支持的 dns 提供商: ", providerCode)
 	}
-	envMap, err := parseAcmeEnvJSON(payload.EnvJSON)
-	if err != nil {
-		return nil, err
-	}
-	envMap = sanitizeDNSAccountEnvForProvider(providerMeta, envMap)
-
 	entry := &model.AcmeDNSAccount{}
 	db := database.GetDB()
 	existingEnvMap := map[string]string{}
+	isUpdate := payload.ID > 0
+	sameProvider := false
 	if payload.ID > 0 {
 		if err := db.Where("id = ?", payload.ID).First(entry).Error; err != nil {
 			return nil, err
 		}
-		existingEnvMap, _ = parseAcmeEnvJSON(entry.EnvJSON)
+		if !strings.EqualFold(strings.TrimSpace(entry.ProviderCode), providerMeta.ProviderCode) {
+			referenced, referenceErr := isDNSAccountReferencedByCertificateRecord(db, entry.Id)
+			if referenceErr != nil {
+				return nil, referenceErr
+			}
+			if referenced {
+				return nil, common.NewError("已绑定 ACME 证书的 DNS 账号不能更改供应商；可在同一供应商下轮换凭据，或新建账号后重新签发证书")
+			}
+		}
+		sameProvider = strings.EqualFold(strings.TrimSpace(entry.ProviderCode), providerMeta.ProviderCode)
+		if sameProvider {
+			existingEnvMap, _ = parseAcmeEnvJSON(entry.EnvJSON)
+		}
 	}
-	if payload.ID > 0 && !strings.EqualFold(strings.TrimSpace(entry.ProviderCode), providerMeta.ProviderCode) {
-		existingEnvMap = map[string]string{}
+
+	envProvided := payload.EnvJSONProvided || strings.TrimSpace(payload.EnvJSON) != ""
+	envRaw := payload.EnvJSON
+	if isUpdate && !envProvided && sameProvider {
+		envRaw = entry.EnvJSON
+	} else if !envProvided {
+		envRaw = "{}"
 	}
+	envMap, err := parseAcmeEnvJSON(envRaw)
+	if err != nil {
+		return nil, err
+	}
+	envMap = sanitizeDNSAccountEnvForProvider(providerMeta, envMap)
 	envMap = mergeAcmeDNSAccountEnv(existingEnvMap, envMap)
 	if err := validateDNSProviderEnv(providerMeta, envMap); err != nil {
 		return nil, err
 	}
 
-	envRaw, err := json.Marshal(envMap)
+	envJSON, err := json.Marshal(envMap)
 	if err != nil {
 		return nil, err
+	}
+	remark := strings.TrimSpace(payload.Remark)
+	if isUpdate && !payload.RemarkProvided && remark == "" {
+		remark = entry.Remark
 	}
 
 	entry.Name = name
 	entry.ProviderName = providerMeta.Name
 	entry.ProviderCode = providerMeta.ProviderCode
-	entry.EnvJSON = string(envRaw)
+	entry.EnvJSON = string(envJSON)
 	entry.Remark = remark
+	if err := ensureDNSAccountDisplayID(db, entry); err != nil {
+		return nil, err
+	}
 
 	if err := db.Save(entry).Error; err != nil {
 		return nil, err
@@ -2158,26 +2655,24 @@ func (s *AcmeService) DeleteDNSAccount(id uint) (*AcmeActionResult, error) {
 	}
 	db := database.GetDB()
 	if err := db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("id = ?", id).Delete(&model.AcmeDNSAccount{}).Error; err != nil {
-			return err
-		}
-		if err := tx.Model(&model.AcmeCertificate{}).
-			Where("dns_account_id = ?", id).
-			Updates(map[string]interface{}{
-				"dns_account_id":   0,
-				"dns_account_name": "",
-			}).Error; err != nil {
+		entry := &model.AcmeDNSAccount{}
+		if err := tx.Where("id = ?", id).First(entry).Error; err != nil {
 			return err
 		}
 		if err := tx.Model(&model.CertificateRecord{}).
 			Where("source_type = ? AND dns_account_id = ?", CertificateSourceACME, id).
 			Updates(map[string]interface{}{
-				"dns_account_id":   0,
-				"dns_account_name": "",
+				"dns_account_id":             0,
+				"dns_account_name":           "",
+				"auto_renew":                 false,
+				"auto_renew_retry_phase":     "",
+				"auto_renew_retry_count":     0,
+				"auto_renew_next_retry_at":   0,
+				"auto_renew_last_attempt_at": 0,
 			}).Error; err != nil {
 			return err
 		}
-		return nil
+		return tx.Delete(entry).Error
 	}); err != nil {
 		return nil, err
 	}
@@ -2199,89 +2694,395 @@ func (s *AcmeService) RunAutoRenew() (int, error) {
 	}
 	defer acmeAutoRenewRunning.Store(false)
 
+	now := time.Now().Unix()
 	renewedCount := 0
 	failedMessages := make([]string, 0)
-
-	if runtime.GOOS == "linux" {
-		_, _, installed := s.resolveAcmeScript()
-		if installed {
-			rows := make([]model.AcmeCertificate, 0)
-			if err := database.GetDB().Where("auto_renew = ?", true).Order("not_after ASC, id ASC").Find(&rows).Error; err != nil {
-				return 0, err
-			}
-			for i := range rows {
-				entry := rows[i]
-				freshEntry := &model.AcmeCertificate{}
-				if err := database.GetDB().Where("id = ?", entry.Id).First(freshEntry).Error; err != nil {
-					if database.IsNotFound(err) {
-						logger.Info("acme auto-renew skipped removed certificate id: ", entry.Id)
-						continue
-					}
-					failedMessages = append(failedMessages, fmt.Sprintf("%s: refresh certificate failed: %v", entry.MainDomain, err))
-					continue
-				}
-				now := time.Now().Unix()
-				windowSeconds := computeAutoRenewWindowSeconds(freshEntry)
-				if !shouldAutoRenewCertificate(freshEntry, now, windowSeconds) {
-					logger.Info("acme auto-renew skipped by fresh-check for certificate: ", strings.TrimSpace(freshEntry.MainDomain))
-					continue
-				}
-
-				recordID, err := certificateRecordIDForACMEEntry(freshEntry)
-				if err != nil {
-					failedMessages = append(failedMessages, fmt.Sprintf("%s: %v", freshEntry.MainDomain, err))
-					continue
-				}
-
-				_, err = s.Renew(AcmeRenewPayload{
-					ID:    recordID,
-					Force: false,
-				})
-				if err != nil {
-					failedMessages = append(failedMessages, fmt.Sprintf("%s: %v", freshEntry.MainDomain, err))
-					continue
-				}
-				renewedCount++
-			}
-		}
-	}
-
-	selfSignedRows := make([]model.CertificateRecord, 0)
+	rows := make([]model.CertificateRecord, 0)
 	if err := database.GetDB().
-		Where("source_type = ? AND auto_renew = ?", CertificateSourceSelfSigned, true).
+		Where("source_type IN ? AND auto_renew = ?", []string{CertificateSourceACME, CertificateSourceSelfSigned}, true).
 		Order("not_after ASC, id ASC").
-		Find(&selfSignedRows).Error; err != nil {
-		return renewedCount, err
+		Find(&rows).Error; err != nil {
+		return 0, err
 	}
-	for i := range selfSignedRows {
-		row := selfSignedRows[i]
-		freshRow, freshErr := certificateInventory.GetRecordByID(row.Id)
+
+	processable := make([]model.CertificateRecord, 0, len(rows))
+	for i := range rows {
+		row := rows[i]
+		if row.NotAfter > 0 && row.NotAfter <= now {
+			if err := disableExpiredCertificateAutoRenew(row.Id, now); err != nil {
+				failedMessages = append(failedMessages, fmt.Sprintf("%s: disable expired auto-renew failed: %v", row.MainDomain, err))
+			}
+			continue
+		}
+		if row.SourceType == CertificateSourceACME && !IsSystemPlatformLinux() {
+			continue
+		}
+		processable = append(processable, row)
+	}
+
+	candidateIDs := collectAutoRenewBatchCandidates(processable, now)
+	for _, id := range candidateIDs {
+		if autoRenewBatchCandidateCompleted(id) {
+			continue
+		}
+		freshRow, freshErr := certificateInventory.GetRecordByID(id)
 		if freshErr != nil {
 			if database.IsNotFound(freshErr) {
-				logger.Info("acme auto-renew skipped removed self-signed certificate id: ", row.Id)
+				removeAutoRenewBatchCandidate(id)
 				continue
 			}
-			failedMessages = append(failedMessages, fmt.Sprintf("%s: refresh self-signed certificate failed: %v", row.MainDomain, freshErr))
+			failedMessages = append(failedMessages, fmt.Sprintf("certificate %d: refresh failed: %v", id, freshErr))
 			continue
 		}
-		now := time.Now().Unix()
-		if !shouldAutoRenewInventorySelfSigned(freshRow, now) {
-			logger.Info("acme auto-renew skipped self-signed by fresh-check for certificate: ", strings.TrimSpace(freshRow.MainDomain))
+		if !freshRow.AutoRenew {
+			removeAutoRenewBatchCandidate(id)
 			continue
 		}
-		_, err := s.Renew(AcmeRenewPayload{ID: freshRow.Id})
+		if autoRenewBatchCandidateAlreadyRenewed(freshRow) {
+			markAutoRenewBatchCandidateCompleted(id)
+			continue
+		}
+		attemptAt := time.Now().Unix()
+		if freshRow.NotAfter > 0 && freshRow.NotAfter <= attemptAt {
+			if err := disableExpiredCertificateAutoRenew(freshRow.Id, attemptAt); err != nil {
+				failedMessages = append(failedMessages, fmt.Sprintf("%s: disable expired auto-renew failed: %v", freshRow.MainDomain, err))
+			}
+			removeAutoRenewBatchCandidate(id)
+			continue
+		}
+		if !certificateAutoRenewAttemptDue(freshRow, attemptAt) {
+			continue
+		}
+		if err := markCertificateAutoRenewAttempt(freshRow.Id, attemptAt); err != nil {
+			failedMessages = append(failedMessages, fmt.Sprintf("%s: record automatic attempt failed: %v", freshRow.MainDomain, err))
+			continue
+		}
+
+		payload := AcmeRenewPayload{ID: freshRow.Id}
+		if freshRow.SourceType == CertificateSourceACME {
+			// Automatic renewal has already selected this record from its
+			// inventory-derived window, so a fresh issuance is required.
+			payload.Force = true
+		}
+		_, err := s.Renew(payload)
 		if err != nil {
-			failedMessages = append(failedMessages, fmt.Sprintf("%s: %v", freshRow.MainDomain, err))
+			if stateErr := recordCertificateAutoRenewFailure(freshRow.Id, attemptAt, err); stateErr != nil {
+				failedMessages = append(failedMessages, fmt.Sprintf("%s: %v (save retry state failed: %v)", freshRow.MainDomain, err, stateErr))
+			} else {
+				failedMessages = append(failedMessages, fmt.Sprintf("%s: %v", freshRow.MainDomain, err))
+			}
 			continue
 		}
+		markAutoRenewBatchCandidateCompleted(freshRow.Id)
 		renewedCount++
 	}
+
+	finishAutoRenewBatchIfReady(time.Now().Unix())
 
 	if len(failedMessages) > 0 {
 		return renewedCount, common.NewError(strings.Join(failedMessages, "; "))
 	}
 
 	return renewedCount, nil
+}
+
+func collectAutoRenewBatchCandidates(rows []model.CertificateRecord, nowUnix int64) []uint {
+	acmeAutoRenewBatch.mu.Lock()
+	defer acmeAutoRenewBatch.mu.Unlock()
+	loadAutoRenewBatchWindowLocked()
+
+	active := acmeAutoRenewBatch.startedAt > 0 && acmeAutoRenewBatch.endsAt > acmeAutoRenewBatch.startedAt
+	if !active {
+		triggered := false
+		for i := range rows {
+			if certificateStartsAutoRenewBatch(&rows[i], nowUnix) {
+				triggered = true
+				break
+			}
+		}
+		if !triggered {
+			return nil
+		}
+		acmeAutoRenewBatch.startedAt = nowUnix
+		acmeAutoRenewBatch.endsAt = nowUnix + int64(acmeAutoRenewBatchDuration/time.Second)
+		persistAutoRenewBatchWindowLocked()
+		logger.Infof("certificate auto-renew batch opened: start=%d end=%d", acmeAutoRenewBatch.startedAt, acmeAutoRenewBatch.endsAt)
+		acmeAutoRenewBatch.candidateIDs = make(map[uint]struct{})
+		acmeAutoRenewBatch.completedIDs = make(map[uint]struct{})
+	}
+	if acmeAutoRenewBatch.candidateIDs == nil {
+		acmeAutoRenewBatch.candidateIDs = make(map[uint]struct{})
+	}
+	if acmeAutoRenewBatch.completedIDs == nil {
+		acmeAutoRenewBatch.completedIDs = make(map[uint]struct{})
+	}
+
+	for i := range rows {
+		phase := strings.TrimSpace(rows[i].AutoRenewRetryPhase)
+		if phase == acmeAutoRenewRetryPhaseRapid && rows[i].AutoRenewLastAttemptAt >= acmeAutoRenewBatch.startedAt {
+			acmeAutoRenewBatch.candidateIDs[rows[i].Id] = struct{}{}
+			continue
+		}
+		if nowUnix <= acmeAutoRenewBatch.endsAt && certificateJoinsAutoRenewBatch(&rows[i], acmeAutoRenewBatch.endsAt) {
+			acmeAutoRenewBatch.candidateIDs[rows[i].Id] = struct{}{}
+		}
+	}
+
+	ids := make([]uint, 0, len(acmeAutoRenewBatch.candidateIDs))
+	for id := range acmeAutoRenewBatch.candidateIDs {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+func certificateStartsAutoRenewBatch(entry *model.CertificateRecord, nowUnix int64) bool {
+	if entry == nil || !entry.AutoRenew || entry.Id == 0 {
+		return false
+	}
+	phase := strings.TrimSpace(entry.AutoRenewRetryPhase)
+	if phase == acmeAutoRenewRetryPhaseRapid || phase == acmeAutoRenewRetryPhasePeriodic {
+		return entry.AutoRenewNextRetryAt > 0 && entry.AutoRenewNextRetryAt <= nowUnix
+	}
+	return certificateNormalAutoRenewAt(entry) <= nowUnix
+}
+
+func certificateJoinsAutoRenewBatch(entry *model.CertificateRecord, batchEndsAt int64) bool {
+	if entry == nil || !entry.AutoRenew || entry.Id == 0 || batchEndsAt <= 0 {
+		return false
+	}
+	phase := strings.TrimSpace(entry.AutoRenewRetryPhase)
+	if phase == acmeAutoRenewRetryPhaseRapid || phase == acmeAutoRenewRetryPhasePeriodic {
+		return entry.AutoRenewNextRetryAt > 0 && entry.AutoRenewNextRetryAt <= batchEndsAt
+	}
+	return certificateNormalAutoRenewAt(entry) <= batchEndsAt
+}
+
+func certificateNormalAutoRenewAt(entry *model.CertificateRecord) int64 {
+	if entry == nil || entry.NotAfter <= 0 {
+		return int64(^uint64(0) >> 1)
+	}
+	windowSeconds := computeAutoRenewWindowSecondsForRecord(entry)
+	if strings.TrimSpace(entry.SourceType) == CertificateSourceSelfSigned {
+		windowSeconds = int64(defaultSelfSignedDurationValue/3) * 24 * 3600
+		if windowSeconds <= 0 {
+			windowSeconds = 30 * 24 * 3600
+		}
+	}
+	return entry.NotAfter - windowSeconds
+}
+
+func certificateAutoRenewAttemptDue(entry *model.CertificateRecord, nowUnix int64) bool {
+	if entry == nil || !entry.AutoRenew {
+		return false
+	}
+	phase := strings.TrimSpace(entry.AutoRenewRetryPhase)
+	if phase == acmeAutoRenewRetryPhaseRapid || phase == acmeAutoRenewRetryPhasePeriodic {
+		return entry.AutoRenewNextRetryAt > 0 && entry.AutoRenewNextRetryAt <= nowUnix
+	}
+	return true
+}
+
+func markCertificateAutoRenewAttempt(id uint, nowUnix int64) error {
+	if id == 0 {
+		return nil
+	}
+	return database.GetDB().Model(&model.CertificateRecord{}).Where("id = ?", id).Update("auto_renew_last_attempt_at", nowUnix).Error
+}
+
+func recordCertificateAutoRenewFailure(id uint, nowUnix int64, renewErr error) error {
+	row, err := certificateInventory.GetRecordByID(id)
+	if err != nil {
+		if database.IsNotFound(err) {
+			removeAutoRenewBatchCandidate(id)
+			return nil
+		}
+		return err
+	}
+	if !row.AutoRenew {
+		removeAutoRenewBatchCandidate(id)
+		return nil
+	}
+	if row.NotAfter > 0 && row.NotAfter <= nowUnix {
+		removeAutoRenewBatchCandidate(id)
+		return disableExpiredCertificateAutoRenew(id, nowUnix)
+	}
+
+	phase, retryCount, nextRetryAt := nextCertificateAutoRenewFailureState(row.AutoRenewRetryPhase, row.AutoRenewRetryCount, nowUnix)
+	return database.GetDB().Model(&model.CertificateRecord{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"auto_renew_retry_phase":     phase,
+		"auto_renew_retry_count":     retryCount,
+		"auto_renew_next_retry_at":   nextRetryAt,
+		"auto_renew_last_attempt_at": nowUnix,
+		"last_error":                 strings.TrimSpace(renewErr.Error()),
+	}).Error
+}
+
+func nextCertificateAutoRenewFailureState(currentPhase string, completedRapidRetries int, nowUnix int64) (string, int, int64) {
+	currentPhase = strings.TrimSpace(currentPhase)
+	switch currentPhase {
+	case acmeAutoRenewRetryPhaseRapid:
+		completedRapidRetries++
+		if completedRapidRetries >= acmeAutoRenewRapidRetryLimit {
+			return acmeAutoRenewRetryPhasePeriodic, acmeAutoRenewRapidRetryLimit, nowUnix + int64(acmeAutoRenewPeriodicRetryInterval/time.Second)
+		}
+		return acmeAutoRenewRetryPhaseRapid, completedRapidRetries, nowUnix + int64(acmeAutoRenewRapidRetryInterval/time.Second)
+	case acmeAutoRenewRetryPhasePeriodic:
+		return acmeAutoRenewRetryPhasePeriodic, acmeAutoRenewRapidRetryLimit, nowUnix + int64(acmeAutoRenewPeriodicRetryInterval/time.Second)
+	default:
+		return acmeAutoRenewRetryPhaseRapid, 0, nowUnix + int64(acmeAutoRenewRapidRetryInterval/time.Second)
+	}
+}
+
+func disableExpiredCertificateAutoRenew(id uint, nowUnix int64) error {
+	if id == 0 {
+		return nil
+	}
+	return database.GetDB().Model(&model.CertificateRecord{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"auto_renew":                 false,
+		"auto_renew_retry_phase":     acmeAutoRenewRetryPhaseExpiredDisabled,
+		"auto_renew_retry_count":     0,
+		"auto_renew_next_retry_at":   0,
+		"auto_renew_last_attempt_at": nowUnix,
+		"last_error":                 "证书已到期，自动续签已停用",
+	}).Error
+}
+
+func clearCertificateAutoRenewRetryFields(row *model.CertificateRecord) {
+	if row == nil {
+		return
+	}
+	row.AutoRenewRetryPhase = ""
+	row.AutoRenewRetryCount = 0
+	row.AutoRenewNextRetryAt = 0
+	row.AutoRenewLastAttemptAt = 0
+}
+
+func autoRenewBatchCandidateCompleted(id uint) bool {
+	acmeAutoRenewBatch.mu.Lock()
+	defer acmeAutoRenewBatch.mu.Unlock()
+	_, completed := acmeAutoRenewBatch.completedIDs[id]
+	return completed
+}
+
+func autoRenewBatchCandidateAlreadyRenewed(row *model.CertificateRecord) bool {
+	if row == nil || strings.TrimSpace(row.AutoRenewRetryPhase) != "" {
+		return false
+	}
+	acmeAutoRenewBatch.mu.Lock()
+	defer acmeAutoRenewBatch.mu.Unlock()
+	return acmeAutoRenewBatch.startedAt > 0 && row.LastRenewedAt >= acmeAutoRenewBatch.startedAt
+}
+
+func markAutoRenewBatchCandidateCompleted(id uint) {
+	acmeAutoRenewBatch.mu.Lock()
+	defer acmeAutoRenewBatch.mu.Unlock()
+	if acmeAutoRenewBatch.completedIDs == nil {
+		acmeAutoRenewBatch.completedIDs = make(map[uint]struct{})
+	}
+	acmeAutoRenewBatch.completedIDs[id] = struct{}{}
+}
+
+func removeAutoRenewBatchCandidate(id uint) {
+	acmeAutoRenewBatch.mu.Lock()
+	defer acmeAutoRenewBatch.mu.Unlock()
+	delete(acmeAutoRenewBatch.candidateIDs, id)
+	delete(acmeAutoRenewBatch.completedIDs, id)
+}
+
+func finishAutoRenewBatchIfReady(nowUnix int64) {
+	acmeAutoRenewBatch.mu.Lock()
+	if acmeAutoRenewBatch.startedAt == 0 || nowUnix < acmeAutoRenewBatch.endsAt {
+		acmeAutoRenewBatch.mu.Unlock()
+		return
+	}
+	ids := make([]uint, 0, len(acmeAutoRenewBatch.candidateIDs))
+	for id := range acmeAutoRenewBatch.candidateIDs {
+		ids = append(ids, id)
+	}
+	acmeAutoRenewBatch.mu.Unlock()
+
+	rapidCount := int64(0)
+	if len(ids) > 0 {
+		if err := database.GetDB().Model(&model.CertificateRecord{}).
+			Where("id IN ? AND auto_renew = ? AND auto_renew_retry_phase = ?", ids, true, acmeAutoRenewRetryPhaseRapid).
+			Count(&rapidCount).Error; err != nil {
+			logger.Warning("check certificate rapid retry state failed: ", err)
+			return
+		}
+	}
+	if rapidCount > 0 {
+		return
+	}
+
+	acmeAutoRenewBatch.mu.Lock()
+	defer acmeAutoRenewBatch.mu.Unlock()
+	if acmeAutoRenewBatch.startedAt > 0 && nowUnix >= acmeAutoRenewBatch.endsAt {
+		logger.Infof("certificate auto-renew batch closed: start=%d end=%d", acmeAutoRenewBatch.startedAt, acmeAutoRenewBatch.endsAt)
+		acmeAutoRenewBatch.startedAt = 0
+		acmeAutoRenewBatch.endsAt = 0
+		acmeAutoRenewBatch.candidateIDs = nil
+		acmeAutoRenewBatch.completedIDs = nil
+		persistAutoRenewBatchWindowLocked()
+	}
+}
+
+func currentCertificateAutoRenewBatchWindow() (int64, int64, bool) {
+	acmeAutoRenewBatch.mu.Lock()
+	defer acmeAutoRenewBatch.mu.Unlock()
+	loadAutoRenewBatchWindowLocked()
+	active := acmeAutoRenewBatch.startedAt > 0 && acmeAutoRenewBatch.endsAt > acmeAutoRenewBatch.startedAt
+	return acmeAutoRenewBatch.startedAt, acmeAutoRenewBatch.endsAt, active
+}
+
+func loadAutoRenewBatchWindowLocked() {
+	if acmeAutoRenewBatch.loaded {
+		return
+	}
+	acmeAutoRenewBatch.loaded = true
+	if database.GetDB() == nil {
+		return
+	}
+	setting, err := (&SettingService{}).getSetting(certificateAutoRenewBatchStateSettingKey)
+	if database.IsNotFound(err) {
+		return
+	}
+	if err != nil {
+		logger.Warning("load certificate auto-renew batch state failed: ", err)
+		return
+	}
+	persisted := acmeAutoRenewBatchPersistentState{}
+	if err := json.Unmarshal([]byte(setting.Value), &persisted); err != nil {
+		logger.Warning("parse certificate auto-renew batch state failed: ", err)
+		return
+	}
+	if persisted.StartedAt > 0 && persisted.EndsAt > persisted.StartedAt {
+		acmeAutoRenewBatch.startedAt = persisted.StartedAt
+		acmeAutoRenewBatch.endsAt = persisted.EndsAt
+		logger.Infof("certificate auto-renew batch restored: start=%d end=%d", persisted.StartedAt, persisted.EndsAt)
+	}
+}
+
+func persistAutoRenewBatchWindowLocked() {
+	if database.GetDB() == nil {
+		return
+	}
+	raw, err := json.Marshal(acmeAutoRenewBatchPersistentState{
+		StartedAt: acmeAutoRenewBatch.startedAt,
+		EndsAt:    acmeAutoRenewBatch.endsAt,
+	})
+	if err != nil {
+		logger.Warning("marshal certificate auto-renew batch state failed: ", err)
+		return
+	}
+	if err := (&SettingService{}).saveSetting(certificateAutoRenewBatchStateSettingKey, string(raw)); err != nil {
+		logger.Warning("persist certificate auto-renew batch state failed: ", err)
+	}
+}
+
+func isCertificateAutoRenewBatchOpen() bool {
+	_, _, active := currentCertificateAutoRenewBatchWindow()
+	return active
 }
 
 func shouldAutoRenewInventorySelfSigned(entry *model.CertificateRecord, nowUnix int64) bool {
@@ -2295,66 +3096,39 @@ func shouldAutoRenewInventorySelfSigned(entry *model.CertificateRecord, nowUnix 
 	return entry.NotAfter <= nowUnix+windowSeconds
 }
 
-func (s *AcmeService) listCertificates() ([]AcmeCertificateView, error) {
-	return certificateInventory.List()
+func shouldAutoRenewCertificateRecord(entry *model.CertificateRecord, nowUnix int64, windowSeconds int64) bool {
+	if entry == nil || !entry.AutoRenew || entry.NotAfter <= 0 {
+		return false
+	}
+	if windowSeconds <= 0 {
+		windowSeconds = 30 * 24 * 3600
+	}
+	return entry.NotAfter <= nowUnix+windowSeconds
 }
 
-func (s *AcmeService) syncInventoryFromAcmeDB() error {
-	rows := make([]model.AcmeCertificate, 0)
-	if err := database.GetDB().Find(&rows).Error; err != nil {
-		return err
+func computeAutoRenewWindowSecondsForRecord(entry *model.CertificateRecord) int64 {
+	defaultWindow := int64(defaultAcmeAutoRenewDays) * 24 * 3600
+	if entry == nil || entry.NotBefore <= 0 || entry.NotAfter <= entry.NotBefore {
+		return defaultWindow
 	}
-	activeIDs := make(map[string]struct{}, len(rows))
-	for i := range rows {
-		activeIDs[strconv.FormatUint(uint64(rows[i].Id), 10)] = struct{}{}
-		if _, err := upsertInventoryFromAcme(&rows[i]); err != nil {
-			return err
-		}
+	validityDays := float64(entry.NotAfter-entry.NotBefore) / 86400.0
+	if validityDays > 40 {
+		return defaultWindow
 	}
-	inventoryRows := make([]model.CertificateRecord, 0)
-	if err := database.GetDB().
-		Where("source_type = ?", CertificateSourceACME).
-		Find(&inventoryRows).Error; err != nil {
-		return err
+	windowDays := int64(math.Floor(validityDays / 3.0))
+	if windowDays < 1 {
+		windowDays = 1
 	}
-	for i := range inventoryRows {
-		sourceRef := strings.TrimSpace(inventoryRows[i].SourceRef)
-		if sourceRef == "" {
-			if err := certificateInventory.DeleteByID(inventoryRows[i].Id); err != nil {
-				return err
-			}
-			continue
-		}
-		if _, ok := activeIDs[sourceRef]; ok {
-			continue
-		}
-		if _, parseErr := strconv.ParseUint(sourceRef, 10, 64); parseErr != nil {
-			if err := certificateInventory.DeleteByID(inventoryRows[i].Id); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := certificateInventory.DeleteByID(inventoryRows[i].Id); err != nil {
-			return err
-		}
-	}
-	if err := certificateInventory.RepairDisplayIDs(); err != nil {
-		return err
-	}
-	return nil
+	return windowDays * 24 * 3600
+}
+
+func (s *AcmeService) listCertificates() ([]AcmeCertificateView, error) {
+	return certificateInventory.List()
 }
 
 func (s *AcmeService) cleanupNonDNSCertificateDNSReferences() error {
 	db := database.GetDB()
 	return db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&model.AcmeCertificate{}).
-			Where("LOWER(TRIM(challenge)) <> ? AND (dns_account_id <> 0 OR TRIM(dns_account_name) <> '')", "dns").
-			Updates(map[string]interface{}{
-				"dns_account_id":   0,
-				"dns_account_name": "",
-			}).Error; err != nil {
-			return err
-		}
 		if err := tx.Model(&model.CertificateRecord{}).
 			Where("source_type = ? AND LOWER(TRIM(challenge)) <> ? AND (dns_account_id <> 0 OR TRIM(dns_account_name) <> '')", CertificateSourceACME, "dns").
 			Updates(map[string]interface{}{
@@ -2367,23 +3141,71 @@ func (s *AcmeService) cleanupNonDNSCertificateDNSReferences() error {
 	})
 }
 
+// scrubLegacyAcmeCertificateRuntimeFields removes data that was meaningful
+// only to the retired shared acme.sh runtime. In particular, DNSEnvText could
+// contain provider credentials and must not remain in database backups after
+// DNS accounts became the sole credential store.
+func (s *AcmeService) scrubLegacyAcmeCertificateRuntimeFields() error {
+	db := database.GetDB()
+	rows := make([]model.CertificateRecord, 0)
+	if err := db.Where("source_type = ?", CertificateSourceACME).Find(&rows).Error; err != nil {
+		return err
+	}
+
+	return db.Transaction(func(tx *gorm.DB) error {
+		for i := range rows {
+			entry := &rows[i]
+			hasLegacyRuntimeData := strings.TrimSpace(entry.AcmeHome) != "" ||
+				strings.TrimSpace(entry.DNSEnvText) != "" ||
+				strings.TrimSpace(entry.RenewConfig) != "" ||
+				strings.TrimSpace(entry.CertPath) != "" ||
+				strings.TrimSpace(entry.KeyPath) != "" ||
+				strings.TrimSpace(entry.FullchainPath) != "" ||
+				strings.TrimSpace(entry.ChainPath) != ""
+			if !hasLegacyRuntimeData {
+				continue
+			}
+
+			if err := tx.Model(&model.CertificateRecord{}).Where("id = ?", entry.Id).Updates(map[string]interface{}{
+				"acme_home":      "",
+				"dns_env_text":   "",
+				"renew_config":   "",
+				"cert_path":      "",
+				"key_path":       "",
+				"fullchain_path": "",
+				"chain_path":     "",
+				// Old command logs were produced while credentials lived in
+				// account.conf or DNSEnvText, so they are not safe to retain.
+				"last_output": "",
+				"last_error":  "",
+			}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (s *AcmeService) listAcmeAccounts() ([]AcmeAccountView, error) {
 	rows := make([]model.AcmeAccount, 0)
-	if err := database.GetDB().Order("updated_at DESC, id DESC").Find(&rows).Error; err != nil {
+	if err := database.GetDB().Where("system = ?", false).Order("display_id ASC, id ASC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	result := make([]AcmeAccountView, 0, len(rows))
 	for i := range rows {
 		entry := rows[i]
 		result = append(result, AcmeAccountView{
-			Id:        entry.Id,
-			Name:      entry.Name,
-			Email:     entry.Email,
-			Server:    entry.Server,
-			KeyLength: entry.KeyLength,
-			Remark:    entry.Remark,
-			CreatedAt: entry.CreatedAt.Unix(),
-			UpdatedAt: entry.UpdatedAt.Unix(),
+			Id:               entry.Id,
+			DisplayID:        entry.DisplayID,
+			ResourceID:       acmeAccountResourceID(entry.DisplayID),
+			Name:             entry.Name,
+			Email:            entry.Email,
+			Server:           entry.Server,
+			AccountKeyLength: effectiveAcmeAccountKeyLength(&entry),
+			Registered:       entry.Registered,
+			Remark:           entry.Remark,
+			CreatedAt:        entry.CreatedAt.Unix(),
+			UpdatedAt:        entry.UpdatedAt.Unix(),
 		})
 	}
 	return result, nil
@@ -2391,7 +3213,16 @@ func (s *AcmeService) listAcmeAccounts() ([]AcmeAccountView, error) {
 
 func (s *AcmeService) listDNSAccounts() ([]AcmeDNSAccountView, error) {
 	rows := make([]model.AcmeDNSAccount, 0)
-	if err := database.GetDB().Order("updated_at DESC, id DESC").Find(&rows).Error; err != nil {
+	db := database.GetDB()
+	if err := db.Order("display_id ASC, id ASC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	ids := make([]uint, 0, len(rows))
+	for i := range rows {
+		ids = append(ids, rows[i].Id)
+	}
+	referencedIDs, err := referencedDNSAccountIDsByCertificateRecord(db, ids)
+	if err != nil {
 		return nil, err
 	}
 	result := make([]AcmeDNSAccountView, 0, len(rows))
@@ -2401,226 +3232,151 @@ func (s *AcmeService) listDNSAccounts() ([]AcmeDNSAccountView, error) {
 		envMap = sanitizeAcmeEnvMap(envMap)
 		result = append(result, AcmeDNSAccountView{
 			Id:           entry.Id,
+			DisplayID:    entry.DisplayID,
+			ResourceID:   dnsAccountResourceID(entry.DisplayID),
 			Name:         entry.Name,
 			ProviderName: entry.ProviderName,
 			ProviderCode: entry.ProviderCode,
-			Env:          envMap,
-			Remark:       entry.Remark,
-			CreatedAt:    entry.CreatedAt.Unix(),
-			UpdatedAt:    entry.UpdatedAt.Unix(),
+			ProviderLocked: func() bool {
+				_, referenced := referencedIDs[entry.Id]
+				return referenced
+			}(),
+			Env:       envMap,
+			Remark:    entry.Remark,
+			CreatedAt: entry.CreatedAt.Unix(),
+			UpdatedAt: entry.UpdatedAt.Unix(),
 		})
 	}
 	return result, nil
 }
 
-func shouldAutoRenewCertificate(entry *model.AcmeCertificate, nowUnix int64, windowSeconds int64) bool {
-	if entry == nil {
-		return false
-	}
-	if !entry.AutoRenew {
-		return false
-	}
-	if entry.NotAfter <= 0 {
-		return false
-	}
-	if nowUnix <= 0 {
-		return false
-	}
-	if windowSeconds <= 0 {
-		windowSeconds = computeAutoRenewWindowSeconds(entry)
-	}
-	return entry.NotAfter <= nowUnix+windowSeconds
-}
-
-func computeAutoRenewWindowSeconds(entry *model.AcmeCertificate) int64 {
-	defaultWindow := int64(defaultAcmeAutoRenewDays) * 24 * 3600
-	if entry == nil {
-		return defaultWindow
-	}
-	if entry.NotBefore <= 0 || entry.NotAfter <= 0 || entry.NotAfter <= entry.NotBefore {
-		return defaultWindow
-	}
-	validitySeconds := entry.NotAfter - entry.NotBefore
-	validityDays := float64(validitySeconds) / 86400.0
-	if validityDays > 40 {
-		return defaultWindow
+// referencedDNSAccountIDsByCertificateRecord intentionally reads the unified
+// certificate_records table only. acme_certificates is a retired migration
+// source and must never influence live account lifecycle decisions.
+func referencedDNSAccountIDsByCertificateRecord(db *gorm.DB, ids []uint) (map[uint]struct{}, error) {
+	result := make(map[uint]struct{})
+	if len(ids) == 0 {
+		return result, nil
 	}
 
-	windowDays := int64(math.Floor(validityDays / 3.0))
-	if windowDays < 1 {
-		windowDays = 1
-	}
-	return windowDays * 24 * 3600
-}
-
-func (s *AcmeService) findCertificateByID(id uint) (*model.AcmeCertificate, error) {
-	entry := &model.AcmeCertificate{}
-	if err := database.GetDB().Where("id = ?", id).First(entry).Error; err != nil {
+	inventoryIDs := make([]uint, 0)
+	if err := db.Model(&model.CertificateRecord{}).
+		Where("source_type = ? AND dns_account_id IN ?", CertificateSourceACME, ids).
+		Distinct("dns_account_id").
+		Pluck("dns_account_id", &inventoryIDs).Error; err != nil {
 		return nil, err
 	}
-	return entry, nil
+	for _, id := range inventoryIDs {
+		if id > 0 {
+			result[id] = struct{}{}
+		}
+	}
+	return result, nil
+}
+
+func isDNSAccountReferencedByCertificateRecord(db *gorm.DB, id uint) (bool, error) {
+	if id == 0 {
+		return false, nil
+	}
+	ids, err := referencedDNSAccountIDsByCertificateRecord(db, []uint{id})
+	if err != nil {
+		return false, err
+	}
+	_, referenced := ids[id]
+	return referenced, nil
 }
 
 type certificateDirectoryPushState struct {
-	PushDir   string
-	PushFiles string
+	PushEnabled   bool
+	PushDir       string
+	PushFilePaths string
 }
 
-func syncCertificateDirectoryPushState(targetDir string, currentDir string, currentTracked string, certPEM []byte, keyPEM []byte, fullchainPEM []byte, chainPEM []byte) (certificateDirectoryPushState, error) {
+func syncCertificateDirectoryPushState(targetDir string, currentEnabled bool, currentDir string, currentFilePaths string, certPEM []byte, keyPEM []byte, fullchainPEM []byte, chainPEM []byte) (certificateDirectoryPushState, error) {
 	targetDir = strings.TrimSpace(targetDir)
 	if targetDir == "" {
 		return certificateDirectoryPushState{}, common.NewError("target directory is empty")
 	}
 
-	currentDir = strings.TrimSpace(currentDir)
-	oldTracked := parseTrackedPushFiles(currentTracked)
-	if currentDir != "" && !sameCleanPath(currentDir, targetDir) {
-		if err := removeTrackedCertificateFilesFromDirectory(currentDir, oldTracked); err != nil {
+	if currentEnabled {
+		if err := removeVerifiedCertificateFiles(currentDir, currentFilePaths); err != nil {
 			return certificateDirectoryPushState{}, err
 		}
 	}
 
-	writeTrackedBase := oldTracked
-	if currentDir != "" && !sameCleanPath(currentDir, targetDir) {
-		writeTrackedBase = nil
-	}
-
-	writtenFiles, err := replaceCertificateInDirectoryWithTrackedFiles(targetDir, writeTrackedBase, certPEM, keyPEM, fullchainPEM, chainPEM)
+	writtenPaths, err := writeAndVerifyCertificateDirectoryPush(targetDir, certPEM, keyPEM, fullchainPEM, chainPEM)
 	if err != nil {
 		return certificateDirectoryPushState{}, err
 	}
 
 	return certificateDirectoryPushState{
-		PushDir:   targetDir,
-		PushFiles: encodeTrackedPushFiles(writtenFiles),
+		PushEnabled:   true,
+		PushDir:       filepath.Clean(targetDir),
+		PushFilePaths: encodeCertificatePushFilePaths(writtenPaths),
 	}, nil
 }
 
-func loadAcmeSourceEntryForInventoryRow(row *model.CertificateRecord) (*model.AcmeCertificate, error) {
-	if row == nil {
-		return nil, common.NewError("certificate record is nil")
-	}
-	if strings.TrimSpace(row.SourceType) != CertificateSourceACME {
-		return nil, nil
-	}
-
-	sourceRef := strings.TrimSpace(row.SourceRef)
-	if sourceRef == "" {
-		return nil, nil
-	}
-
-	sourceID, err := strconv.ParseUint(sourceRef, 10, 64)
-	if err != nil {
-		return nil, nil
-	}
-
-	entry, err := (&AcmeService{}).findCertificateByID(uint(sourceID))
-	if err != nil {
-		if database.IsNotFound(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return entry, nil
-}
-
-func persistCertificatePushState(record *model.CertificateRecord, sourceEntry *model.AcmeCertificate) error {
+func persistCertificatePushState(record *model.CertificateRecord) error {
 	if record == nil {
 		return common.NewError("certificate record is nil")
 	}
-	return database.GetDB().Transaction(func(tx *gorm.DB) error {
-		if err := tx.Save(record).Error; err != nil {
+	if err := database.GetDB().Save(record).Error; err != nil {
+		return err
+	}
+	if strings.TrimSpace(record.SourceType) == CertificateSourceACME {
+		if err := syncManagedAcmeCertificateOwnership(); err != nil {
+			return fmt.Errorf("record managed certificate ownership: %w", err)
+		}
+	}
+	return nil
+}
+
+func syncManagedAcmeCertificateOwnership() error {
+	db := database.GetDB()
+	if db == nil {
+		return errors.New("database is not ready for managed certificate ownership")
+	}
+	type certificatePushInventory struct {
+		PushEnabled   bool
+		PushDir       string
+		PushFilePaths string
+	}
+	rows := make([]certificatePushInventory, 0)
+	if err := db.Model(&model.CertificateRecord{}).
+		Select("push_enabled", "push_dir", "push_file_paths").
+		Where("source_type = ? AND push_enabled = ?", CertificateSourceACME, true).
+		Find(&rows).Error; err != nil {
+		return err
+	}
+	paths := []string{managedAcmeHomeDir()}
+	for _, row := range rows {
+		if !row.PushEnabled {
+			continue
+		}
+		files, err := parseCertificatePushFilePaths(row.PushFilePaths)
+		if err != nil {
 			return err
 		}
-		if sourceEntry != nil {
-			if err := tx.Save(sourceEntry).Error; err != nil {
-				return err
-			}
+		if err := validateCertificatePushFilePaths(row.PushDir, files); err != nil {
+			return err
 		}
-		return nil
-	})
+		for _, filePath := range files {
+			paths = append(paths, filePath)
+		}
+	}
+	return RegisterAcmeHostOwnership(paths, nil)
 }
 
-func certificateRecordIDForACMEEntry(entry *model.AcmeCertificate) (uint, error) {
-	if entry == nil || entry.Id == 0 {
-		return 0, common.NewError("acme certificate id is required")
+func beginManagedAcmeCertificatePushOwnership(targetDir string) (HostResource, error) {
+	targetDir = strings.TrimSpace(targetDir)
+	if targetDir == "" {
+		return HostResource{}, common.NewError("certificate push target directory is empty")
 	}
-	sourceRef := strconv.FormatUint(uint64(entry.Id), 10)
-	record := &model.CertificateRecord{}
-	err := database.GetDB().
-		Where("source_type = ? AND source_ref = ?", CertificateSourceACME, sourceRef).
-		First(record).Error
-	if err == nil {
-		return record.Id, nil
+	paths := make([]string, 0, 4)
+	for _, name := range []string{"cert.pem", "key.pem", "fullchain.pem", "chain.pem"} {
+		paths = append(paths, filepath.Join(targetDir, name))
 	}
-	if !database.IsNotFound(err) {
-		return 0, err
-	}
-
-	record, err = upsertInventoryFromAcme(entry)
-	if err != nil {
-		return 0, err
-	}
-	if record == nil || record.Id == 0 {
-		return 0, common.NewError("certificate inventory record is empty")
-	}
-	return record.Id, nil
-}
-
-func upsertInventoryFromAcme(entry *model.AcmeCertificate) (*model.CertificateRecord, error) {
-	if entry == nil {
-		return nil, common.NewError("certificate record is nil")
-	}
-	sourceRef := fmt.Sprintf("%d", entry.Id)
-	return certificateInventory.Upsert(CertificateUpsertPayload{
-		SourceType: CertificateSourceACME,
-		SourceRef:  sourceRef,
-
-		MainDomain: entry.MainDomain,
-		Domains:    decodeCertificateDomains(entry.DomainSet),
-
-		CertificateType: acmeCertificateTypeForEntry(entry),
-		CertProfile:     strings.TrimSpace(entry.CertProfile),
-		Challenge:       entry.Challenge,
-		KeyLength:       entry.KeyLength,
-		CAServer:        entry.CAServer,
-		UseECC:          entry.UseECC,
-		AutoRenew:       entry.AutoRenew,
-
-		AcmeAccountID:   entry.AcmeAccountID,
-		AcmeAccountName: entry.AcmeAccountName,
-		DNSAccountID:    entry.DNSAccountID,
-		DNSAccountName:  entry.DNSAccountName,
-		ApplyTarget:     entry.ApplyTarget,
-		PushDir:         entry.PushDir,
-		PushFiles:       entry.PushFiles,
-		Remark:          entry.Remark,
-
-		AcmeHome:    entry.AcmeHome,
-		Webroot:     entry.Webroot,
-		DNSProvider: entry.DNSProvider,
-		DNSEnvText:  entry.DNSEnvText,
-		CustomArgs:  entry.CustomArgs,
-
-		CertPath:      entry.CertPath,
-		KeyPath:       entry.KeyPath,
-		FullchainPath: entry.FullchainPath,
-		ChainPath:     entry.ChainPath,
-
-		CertPEM:      entry.CertPEM,
-		KeyPEM:       entry.KeyPEM,
-		FullchainPEM: entry.FullchainPEM,
-		ChainPEM:     entry.ChainPEM,
-
-		Fingerprint: entry.Fingerprint,
-		NotBefore:   entry.NotBefore,
-		NotAfter:    entry.NotAfter,
-
-		LastIssuedAt:  entry.LastIssuedAt,
-		LastRenewedAt: entry.LastRenewedAt,
-		LastError:     entry.LastError,
-		LastOutput:    entry.LastOutput,
-	})
+	return BeginAcmeHostOwnership(paths, nil)
 }
 
 type acmeManagedCertPaths struct {
@@ -2631,29 +3387,19 @@ type acmeManagedCertPaths struct {
 	BaseDir       string
 }
 
-func (s *AcmeService) installCertToManagedDir(scriptPath string, homeDir string, mainDomain string, useECC bool, envPairs []string, logSession *acmeLogSession) (*acmeManagedCertPaths, func(), error) {
+func (s *AcmeService) installCertToManagedDirWithArgs(scriptPath string, runtimeArgs []string, mainDomain string, useECC bool, envPairs []string, logSession *acmeLogSession) (*acmeManagedCertPaths, func(), error) {
 	paths, cleanup, err := createAcmeTempInstallPaths(mainDomain)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := s.installCertByDomain(scriptPath, homeDir, mainDomain, useECC, paths, envPairs, logSession); err != nil {
+	if err := s.installCertByDomainWithArgs(scriptPath, runtimeArgs, mainDomain, useECC, paths, envPairs, logSession); err != nil {
 		cleanup()
 		return nil, nil, err
 	}
 	return paths, cleanup, nil
 }
 
-func (s *AcmeService) installCertByRecord(scriptPath string, homeDir string, entry *model.AcmeCertificate, paths *acmeManagedCertPaths, envPairs []string, logSession *acmeLogSession) error {
-	if entry == nil {
-		return common.NewError("certificate record is nil")
-	}
-	if paths == nil {
-		return common.NewError("managed certificate paths are nil")
-	}
-	return s.installCertByDomain(scriptPath, homeDir, entry.MainDomain, entry.UseECC, paths, envPairs, logSession)
-}
-
-func (s *AcmeService) installCertByDomain(scriptPath string, homeDir string, mainDomain string, useECC bool, paths *acmeManagedCertPaths, envPairs []string, logSession *acmeLogSession) error {
+func (s *AcmeService) installCertByDomainWithArgs(scriptPath string, runtimeArgs []string, mainDomain string, useECC bool, paths *acmeManagedCertPaths, envPairs []string, logSession *acmeLogSession) error {
 	mainDomain = strings.TrimSpace(mainDomain)
 	if mainDomain == "" {
 		return common.NewError("main domain is empty")
@@ -2680,99 +3426,10 @@ func (s *AcmeService) installCertByDomain(scriptPath string, homeDir string, mai
 	if logSession != nil {
 		logSession.append("执行 acme.sh --install-cert")
 	}
-	if _, err := runCommandOutputWithTimeoutEnvLog(2*time.Minute, scriptPath, append(acmeHomeArgs(homeDir), args...), envPairs, logSession); err != nil {
+	if _, err := runCommandOutputWithTimeoutEnvLog(2*time.Minute, scriptPath, append(append([]string{}, runtimeArgs...), args...), envPairs, logSession); err != nil {
 		return common.NewError("install certificate files failed: ", err)
 	}
 	return nil
-}
-
-func (s *AcmeService) upsertCertificateFromPaths(
-	recordID uint,
-	domains []string,
-	certificateType string,
-	certProfile string,
-	challenge string,
-	keyLength string,
-	caServer string,
-	useECC bool,
-	homeDir string,
-	webroot string,
-	dnsProvider string,
-	dnsEnvText string,
-	customArgs string,
-	paths *acmeManagedCertPaths,
-	renewUnix int64,
-) (*model.AcmeCertificate, error) {
-	if len(domains) == 0 {
-		return nil, common.NewError("domains are empty")
-	}
-	if paths == nil {
-		return nil, common.NewError("paths are empty")
-	}
-
-	certPEM, keyPEM, fullchainPEM, chainPEM, err := readCertificateBundle(paths)
-	if err != nil {
-		return nil, err
-	}
-	fingerprint, notBefore, notAfter, err := inspectCertificateFingerprint(certPEM, keyPEM)
-	if err != nil {
-		return nil, err
-	}
-
-	mainDomain := domains[0]
-	domainJSON, err := json.Marshal(domains)
-	if err != nil {
-		return nil, err
-	}
-
-	var entry model.AcmeCertificate
-	db := database.GetDB()
-	if recordID > 0 {
-		if err := db.Where("id = ?", recordID).First(&entry).Error; err != nil {
-			return nil, err
-		}
-	} else {
-		entry = model.AcmeCertificate{}
-	}
-
-	now := time.Now().Unix()
-	entry.MainDomain = mainDomain
-	entry.DomainSet = string(domainJSON)
-	entry.CertificateType = normalizeAcmeCertificateType(certificateType)
-	entry.CertProfile = strings.TrimSpace(certProfile)
-	entry.Challenge = challenge
-	entry.KeyLength = keyLength
-	entry.CAServer = caServer
-	entry.UseECC = useECC
-	entry.AcmeHome = homeDir
-	entry.Webroot = strings.TrimSpace(webroot)
-	entry.DNSProvider = strings.TrimSpace(dnsProvider)
-	entry.DNSEnvText = strings.TrimSpace(dnsEnvText)
-	entry.CustomArgs = strings.TrimSpace(customArgs)
-	entry.CertPath = ""
-	entry.KeyPath = ""
-	entry.FullchainPath = ""
-	entry.ChainPath = ""
-	entry.CertPEM = certPEM
-	entry.KeyPEM = keyPEM
-	entry.FullchainPEM = fullchainPEM
-	entry.ChainPEM = chainPEM
-	entry.Fingerprint = fingerprint
-	entry.NotBefore = notBefore.Unix()
-	entry.NotAfter = notAfter.Unix()
-	entry.LastError = ""
-	if entry.LastIssuedAt == 0 {
-		entry.LastIssuedAt = now
-	}
-	entry.LastRenewedAt = renewUnix
-	if renewUnix <= 0 {
-		entry.LastRenewedAt = now
-	}
-
-	if err := db.Save(&entry).Error; err != nil {
-		return nil, err
-	}
-	return &entry, nil
 }
 
 func (s *AcmeService) markCertificateError(id uint, message string) error {
@@ -2780,51 +3437,135 @@ func (s *AcmeService) markCertificateError(id uint, message string) error {
 	if id == 0 {
 		return nil
 	}
-	return database.GetDB().Model(&model.AcmeCertificate{}).Where("id = ?", id).Update("last_error", message).Error
+	return database.GetDB().Model(&model.CertificateRecord{}).Where("id = ?", id).Update("last_error", message).Error
 }
 
-func (s *AcmeService) applyIssuePostActions(entry *model.AcmeCertificate, applyTarget string, pushDir string, pushExplicit bool) error {
-	if entry == nil {
-		return common.NewError("certificate record is nil")
+func (s *AcmeService) disableAutoRenewForMissingAccount(id uint, message string) error {
+	if id == 0 {
+		return nil
 	}
-	record, err := upsertInventoryFromAcme(entry)
-	if err != nil {
-		return err
+	return database.GetDB().Model(&model.CertificateRecord{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"auto_renew":                 false,
+		"auto_renew_retry_phase":     "",
+		"auto_renew_retry_count":     0,
+		"auto_renew_next_retry_at":   0,
+		"auto_renew_last_attempt_at": 0,
+		"last_error":                 strings.TrimSpace(message),
+	}).Error
+}
+
+// applyCertificateRecordPostActions applies and pushes a certificate using
+// the unified inventory record directly. Certificate material has already
+// been persisted when this is called, so each failure becomes a recoverable
+// warning instead of changing a successful issuance into a failed one.
+func (s *AcmeService) applyCertificateRecordPostActions(record *model.CertificateRecord, applyTarget string, pushDir string, pushExplicit bool) []string {
+	return s.applyCertificateRecordPostActionsWithCoreRestart(record, applyTarget, pushDir, pushExplicit, true)
+}
+
+func (s *AcmeService) applyCertificateRecordPostActionsWithCoreRestart(record *model.CertificateRecord, applyTarget string, pushDir string, pushExplicit bool, queueCoreRestart bool) []string {
+	if record == nil {
+		return []string{"证书后置动作失败：证书记录不存在"}
+	}
+	warnings := make([]string, 0)
+	appendWarning := func(action string, err error) {
+		if err == nil {
+			return
+		}
+		warnings = append(warnings, strings.TrimSpace(action)+"失败: "+strings.TrimSpace(err.Error()))
 	}
 
 	if normalizedTarget, ok := normalizeAcmeApplyTarget(applyTarget); ok {
 		if err := s.applyInventoryRecordToTarget(record, normalizedTarget); err != nil {
-			return err
+			appendWarning("应用证书", err)
+		} else {
+			targets, targetErr := assignedTargetsForCertificateRecord(record.Id)
+			if targetErr != nil {
+				appendWarning("读取应用状态", targetErr)
+			} else {
+				record.ApplyTarget = formatAssignedApplyTarget(targets)
+			}
 		}
-		targets, targetErr := assignedTargetsForCertificateRecord(record.Id)
-		if targetErr != nil {
-			return targetErr
-		}
-		applyTargetText := formatAssignedApplyTarget(targets)
-		entry.ApplyTarget = applyTargetText
-		record.ApplyTarget = applyTargetText
 	}
 
 	pushDir = strings.TrimSpace(pushDir)
+	pushTargetDir := ""
 	if pushExplicit && pushDir != "" {
-		pushState, err := syncCertificateDirectoryPushState(pushDir, entry.PushDir, entry.PushFiles, entry.CertPEM, entry.KeyPEM, entry.FullchainPEM, entry.ChainPEM)
-		if err != nil {
-			return err
-		}
-		entry.PushDir = pushState.PushDir
-		entry.PushFiles = pushState.PushFiles
-		record.PushDir = pushState.PushDir
-		record.PushFiles = pushState.PushFiles
+		pushTargetDir = pushDir
+	} else if record.PushEnabled {
+		pushTargetDir = strings.TrimSpace(record.PushDir)
 	}
-	if err := persistCertificatePushState(record, entry); err != nil {
-		return err
+	if pushTargetDir != "" && strings.TrimSpace(record.SourceType) == CertificateSourceACME {
+		if _, ownershipErr := beginManagedAcmeCertificatePushOwnership(pushTargetDir); ownershipErr != nil {
+			appendWarning("登记证书目录所有权", ownershipErr)
+			pushTargetDir = ""
+		}
+	}
+	if pushTargetDir != "" {
+		pushState, err := syncCertificateDirectoryPushState(pushTargetDir, record.PushEnabled, record.PushDir, record.PushFilePaths, record.CertPEM, record.KeyPEM, record.FullchainPEM, record.ChainPEM)
+		if err != nil {
+			appendWarning("推送证书目录", err)
+		} else {
+			record.PushEnabled = pushState.PushEnabled
+			record.PushDir = pushState.PushDir
+			record.PushFilePaths = pushState.PushFilePaths
+			record.PushFiles = ""
+		}
+	}
+	if err := persistCertificatePushState(record); err != nil {
+		appendWarning("保存推送状态", err)
 	}
 	if err := ApplyPanelTLSRuntimeSettingsForRecord(record.Id); err != nil {
+		appendWarning("刷新面板 TLS 运行态", err)
+	}
+	if _, err := ForceSyncTLSBindingsForCertificateRecordWithCoreRestart(record.Id, "", queueCoreRestart); err != nil {
+		appendWarning("刷新 TLS 绑定", err)
+	}
+	if err := (&ReverseProxyService{}).SyncCertificateInventoryNow(); err != nil {
+		appendWarning("刷新反向代理证书运行态", err)
+	}
+	return normalizeCertificatePostActionWarnings(warnings)
+}
+
+func normalizeCertificatePostActionWarnings(warnings []string) []string {
+	seen := make(map[string]struct{}, len(warnings))
+	result := make([]string, 0, len(warnings))
+	for _, warning := range warnings {
+		warning = strings.TrimSpace(warning)
+		if warning == "" {
+			continue
+		}
+		if _, exists := seen[warning]; exists {
+			continue
+		}
+		seen[warning] = struct{}{}
+		result = append(result, warning)
+	}
+	return result
+}
+
+func persistCertificatePostActionWarnings(record *model.CertificateRecord, warnings []string) []string {
+	if record == nil || record.Id == 0 {
+		return normalizeCertificatePostActionWarnings(append(warnings, "保存后置动作告警失败: 证书记录不存在"))
+	}
+	warnings = normalizeCertificatePostActionWarnings(warnings)
+	message := strings.Join(warnings, "\n")
+	if err := database.GetDB().Model(&model.CertificateRecord{}).Where("id = ?", record.Id).Update("post_action_error", message).Error; err != nil {
+		warnings = append(warnings, "保存后置动作告警失败: "+strings.TrimSpace(err.Error()))
+		warnings = normalizeCertificatePostActionWarnings(warnings)
+		message = strings.Join(warnings, "\n")
+	}
+	record.PostActionError = message
+	return warnings
+}
+
+func clearCertificatePostActionError(record *model.CertificateRecord) error {
+	if record == nil || record.Id == 0 {
+		return common.NewError("certificate record is nil")
+	}
+	if err := database.GetDB().Model(&model.CertificateRecord{}).Where("id = ?", record.Id).Update("post_action_error", "").Error; err != nil {
 		return err
 	}
-	if _, err := ForceSyncTLSBindingsForCertificateRecord(record.Id, ""); err != nil {
-		return err
-	}
+	record.PostActionError = ""
 	return nil
 }
 
@@ -2927,9 +3668,8 @@ type acmeTemporaryFirewallRule struct {
 const (
 	acmeTemporaryFirewallType     = "acme"
 	acmeTemporaryFirewallLifetime = 30 * time.Minute
-	acmeTemporaryFirewallNameFmt  = "ACME temporary allow %d/%d"
+	acmeTemporaryFirewallNameFmt  = "ACME temporary allow %d/tcp"
 	acmeTemporaryFirewallDescText = "Temporary ACME validation rule, auto removed after issue or renew"
-	acmeTemporaryFirewallPortSpec = "80, 443"
 )
 
 func collectAcmeChallengePortSnapshot() (*acmeChallengePortSnapshot, error) {
@@ -3163,9 +3903,9 @@ func ensureAcmeIPPortFree(port int, logSession *acmeLogSession) error {
 
 func (s *AcmeService) prepareTemporaryAcmeFirewallRule(port int, logSession *acmeLogSession) (*acmeTemporaryFirewallRule, error) {
 	if logSession != nil {
-		logSession.append(fmt.Sprintf("检查防火墙是否需要临时放行 80/443 tcp+udp（当前验证端口 %d/tcp）", port))
+		logSession.append(fmt.Sprintf("检查防火墙是否需要临时放行最终验证端口 %d/tcp", port))
 	}
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		if logSession != nil {
 			logSession.append("非 Linux 系统，跳过防火墙临时放行")
 		}
@@ -3193,11 +3933,11 @@ func (s *AcmeService) prepareTemporaryAcmeFirewallRule(port int, logSession *acm
 		return nil, nil
 	}
 
-	if allowed, err := firewallHasManagedDualTCPUDPPortsAllowLocked(acmeIPCertificatePortHTTP, acmeIPCertificatePortALPN); err != nil {
+	if allowed, err := firewallHasManagedDualTCPPortAllowLocked(port); err != nil {
 		return nil, err
 	} else if allowed {
 		if logSession != nil {
-			logSession.append("防火墙已完整放行 80/443 tcp+udp，无需新增规则")
+			logSession.append(fmt.Sprintf("防火墙已放行 %d/tcp，无需新增规则", port))
 		}
 		if err := firewallSvc.reconcileLocked(0); err != nil {
 			return nil, err
@@ -3205,7 +3945,7 @@ func (s *AcmeService) prepareTemporaryAcmeFirewallRule(port int, logSession *acm
 		return nil, nil
 	}
 
-	row := buildAcmeTemporaryFirewallRuleRow()
+	row := buildAcmeTemporaryFirewallRuleRow(port)
 	if err := database.GetDB().Create(&row).Error; err != nil {
 		return nil, err
 	}
@@ -3217,7 +3957,7 @@ func (s *AcmeService) prepareTemporaryAcmeFirewallRule(port int, logSession *acm
 		_ = database.GetDB().Where("id = ?", row.Id).Delete(&model.FirewallRule{}).Error
 	}()
 	if logSession != nil {
-		logSession.append(fmt.Sprintf("temporary firewall rule created id=%d, allow 80/443 tcp+udp (selected %d/tcp)", row.Id, port))
+		logSession.append(fmt.Sprintf("已创建临时防火墙规则 id=%d，放行 %d/tcp", row.Id, port))
 	}
 	if err := firewallSvc.reconcileLocked(0); err != nil {
 		keepRule = false
@@ -3234,7 +3974,7 @@ func (s *AcmeService) cleanupTemporaryAcmeFirewallRule(rule *acmeTemporaryFirewa
 		return
 	}
 	if logSession != nil {
-		logSession.append(fmt.Sprintf("开始还原防火墙，删除临时 80/443 tcp+udp 规则 id=%d", rule.id))
+		logSession.append(fmt.Sprintf("开始还原防火墙，删除临时 %d/tcp 规则 id=%d", rule.port, rule.id))
 	}
 	firewallStateMu.Lock()
 	defer firewallStateMu.Unlock()
@@ -3251,14 +3991,17 @@ func (s *AcmeService) cleanupTemporaryAcmeFirewallRule(rule *acmeTemporaryFirewa
 		return
 	}
 	if logSession != nil {
-		logSession.append("firewall restored, 80/443 tcp+udp temporary allow removed")
+		logSession.append(fmt.Sprintf("防火墙已还原，临时 %d/tcp 放行规则已删除", rule.port))
 	}
 }
 
-func buildAcmeTemporaryFirewallRuleRow() model.FirewallRule {
+func buildAcmeTemporaryFirewallRuleRow(port int) model.FirewallRule {
 	now := time.Now().Unix()
+	if port < 1 || port > 65535 {
+		port = acmeIPCertificatePortHTTP
+	}
 	return model.FirewallRule{
-		Name:              fmt.Sprintf(acmeTemporaryFirewallNameFmt, acmeIPCertificatePortHTTP, acmeIPCertificatePortALPN),
+		Name:              fmt.Sprintf(acmeTemporaryFirewallNameFmt, port),
 		Description:       acmeTemporaryFirewallDescText,
 		Enabled:           true,
 		Origin:            firewallOriginTemporary,
@@ -3267,11 +4010,43 @@ func buildAcmeTemporaryFirewallRuleRow() model.FirewallRule {
 		TemporaryExpireAt: time.Now().Add(acmeTemporaryFirewallLifetime).Unix(),
 		Direction:         firewallDirectionIngress,
 		Family:            firewallFamilyDual,
-		Protocol:          firewallProtocolTCPUDP,
-		PortSpec:          acmeTemporaryFirewallPortSpec,
+		Protocol:          firewallProtocolTCP,
+		PortSpec:          strconv.Itoa(port),
 		SourceSpec:        "",
 		LastSeenAt:        now,
 	}
+}
+
+func firewallHasManagedDualTCPPortAllowLocked(port int) (bool, error) {
+	rows, err := loadFirewallRulesLocked()
+	if err != nil {
+		return false, err
+	}
+	v4TCP := false
+	v6TCP := false
+	for _, row := range rows {
+		if !row.Enabled || !firewallRuleParticipatesInManagedChain(row) || row.Direction != firewallDirectionIngress {
+			continue
+		}
+		if strings.TrimSpace(row.SourceSpec) != "" || !firewallPortSpecContains(row.PortSpec, port) {
+			continue
+		}
+		protocol := normalizeFirewallProtocol(row.Protocol)
+		if protocol != firewallProtocolTCP && protocol != firewallProtocolTCPUDP {
+			continue
+		}
+		family := normalizeFirewallFamily(row.Family)
+		if family == firewallFamilyDual || family == firewallFamilyIPv4 {
+			v4TCP = true
+		}
+		if family == firewallFamilyDual || family == firewallFamilyIPv6 {
+			v6TCP = true
+		}
+		if v4TCP && v6TCP {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func firewallHasManagedDualTCPUDPPortAllowLocked(port int) (bool, error) {
@@ -3443,6 +4218,36 @@ func validateAcmeEmail(value string) (string, error) {
 		return "", common.NewError("acme 邮箱格式无效（示例：name@example.com）")
 	}
 	return address, nil
+}
+
+// validateAcmeAccountEmailForServer follows acme.sh account semantics: a
+// Let's Encrypt account may omit contacts, while ZeroSSL needs an email to
+// obtain EAB credentials. acme.sh accepts comma-separated contact addresses.
+func validateAcmeAccountEmailForServer(value string, server string) (string, error) {
+	parts := strings.Split(value, ",")
+	contacts := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		validated, err := validateAcmeEmail(part)
+		if err != nil {
+			return "", err
+		}
+		key := strings.ToLower(validated)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		contacts = append(contacts, validated)
+	}
+	result := strings.Join(contacts, ",")
+	if normalizeSupportedAcmeDomainServer(server) == "zerossl" && result == "" {
+		return "", common.NewError("ZeroSSL ACME 账号必须填写邮箱")
+	}
+	return result, nil
 }
 
 func isASCIIEmailAddress(value string) bool {
@@ -3797,6 +4602,54 @@ func buildAcmeIssueCommandArgs(domains []string, challenge string, webroot strin
 	return args
 }
 
+// validateAcmeCustomArgs reserves flags that control the account, CA, working
+// directories, challenge mode, or hook execution. Those values are selected
+// by the certificate record and operation runtime, not by free-form input.
+func validateAcmeCustomArgs(raw string) (string, error) {
+	customArgs := strings.TrimSpace(raw)
+	if customArgs == "" {
+		return "", nil
+	}
+	for _, token := range strings.Fields(customArgs) {
+		option := strings.ToLower(strings.TrimSpace(token))
+		if index := strings.Index(option, "="); index >= 0 {
+			option = option[:index]
+		}
+		if isManagedAcmeCustomArg(option) {
+			return "", common.NewError("附加参数不能覆盖受管 ACME 选项: ", token)
+		}
+	}
+	return customArgs, nil
+}
+
+func isManagedAcmeCustomArg(option string) bool {
+	option = strings.TrimSpace(strings.ToLower(option))
+	if option == "" {
+		return false
+	}
+	if (strings.HasPrefix(option, "-d") && !strings.HasPrefix(option, "--")) ||
+		(strings.HasPrefix(option, "-w") && !strings.HasPrefix(option, "--")) ||
+		(strings.HasPrefix(option, "-k") && !strings.HasPrefix(option, "--")) ||
+		(strings.HasPrefix(option, "-ak") && !strings.HasPrefix(option, "--")) ||
+		(strings.HasPrefix(option, "-m") && !strings.HasPrefix(option, "--")) {
+		return true
+	}
+	switch option {
+	case "--home", "--config-home", "--cert-home", "--certhome", "--accountconf",
+		"--cert-file", "--certpath", "--key-file", "--keypath", "--fullchain-file", "--fullchainpath", "--ca-file", "--capath",
+		"--server", "--staging", "--set-default-ca", "--set-default-chain",
+		"--accountkey", "--accountkeylength", "--register-account", "--update-account", "--update-account-key", "--deactivate-account", "--email", "--accountemail",
+		"--issue", "--renew", "--renew-all", "--install", "--install-cert", "--uninstall", "--upgrade", "--cron", "--revoke", "--deactivate",
+		"--domain", "--keylength", "--webroot", "--dns", "--standalone", "--alpn", "--httpport", "--tlsport", "--listen-v4", "--listen-v6", "--local-address",
+		"--cert-profile", "--certificate-profile", "--valid-to", "--eab-kid", "--eab-hmac-key",
+		"--output-insecure", "--log", "--logfile", "--syslog", "--pre-hook", "--post-hook", "--renew-hook", "--deploy-hook", "--notify-hook",
+		"--challenge-alias", "--domain-alias", "--manual", "--insecure", "--ca-bundle":
+		return true
+	default:
+		return false
+	}
+}
+
 func ensureAcmeFreshIssueArgs(args []string) []string {
 	if hasAnyAcmeArg(args, "--force", "-f") {
 		return args
@@ -3852,6 +4705,111 @@ func normalizeAcmeIssueIdentifiers(text string, certificateType string) []string
 		return normalizeAcmeIPIdentifiers(text)
 	}
 	return normalizeAcmeDomains(text)
+}
+
+// validateAcmeIssueIdentifiers is the strict path used by public ACME
+// issuance. Self-signed issuance keeps normalizeAcmeDomains so local host
+// names, localhost and IP identifiers remain compatible there.
+func validateAcmeIssueIdentifiers(text string, certificateType string) ([]string, error) {
+	if certificateType == acmeCertificateTypeIP {
+		return normalizeAcmeIPIdentifiers(text), nil
+	}
+
+	normalized := strings.ReplaceAll(text, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	normalized = strings.ReplaceAll(normalized, ",", " ")
+	fields := strings.Fields(normalized)
+	if len(fields) == 0 {
+		return []string{}, nil
+	}
+	seen := make(map[string]struct{}, len(fields))
+	result := make([]string, 0, len(fields))
+	for _, field := range fields {
+		value, err := normalizeStrictAcmeDomain(field)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	if len(result) > acmeDomainCertificateMaxNames {
+		return nil, common.NewError(fmt.Sprintf("域名证书最多支持 %d 个域名", acmeDomainCertificateMaxNames))
+	}
+	return result, nil
+}
+
+func normalizeStrictAcmeDomain(raw string) (string, error) {
+	original := strings.TrimSpace(raw)
+	if original == "" {
+		return "", common.NewError("域名不能为空")
+	}
+	if strings.ContainsAny(original, "/\\@:") {
+		return "", common.NewError("域名格式无效: ", original)
+	}
+
+	wildcard := false
+	value := original
+	if strings.HasPrefix(value, "*.") {
+		wildcard = true
+		value = strings.TrimPrefix(value, "*.")
+	}
+	if strings.Contains(value, "*") {
+		return "", common.NewError("通配符只能位于域名最前方: ", original)
+	}
+	value = strings.TrimSuffix(strings.TrimSpace(value), ".")
+	if value == "" || strings.HasPrefix(value, ".") || strings.HasSuffix(value, ".") {
+		return "", common.NewError("域名格式无效: ", original)
+	}
+	if _, err := netip.ParseAddr(strings.Trim(value, "[]")); err == nil {
+		return "", common.NewError("域名证书不能混入 IP 地址: ", original)
+	}
+
+	ascii, err := idna.Lookup.ToASCII(value)
+	if err != nil {
+		return "", common.NewError("国际化域名格式无效: ", original)
+	}
+	ascii = strings.ToLower(strings.TrimSpace(ascii))
+	if ascii == "" || len(ascii) > 253 {
+		return "", common.NewError("域名长度无效: ", original)
+	}
+	labels := strings.Split(ascii, ".")
+	if len(labels) < 2 {
+		return "", common.NewError("ACME 域名必须是完整域名: ", original)
+	}
+	for _, label := range labels {
+		if !isValidStrictAcmeDomainLabel(label) {
+			return "", common.NewError("域名标签无效: ", original)
+		}
+	}
+	if wildcard {
+		return "*." + ascii, nil
+	}
+	return ascii, nil
+}
+
+func isValidStrictAcmeDomainLabel(label string) bool {
+	if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for _, ch := range label {
+		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func hasAcmeWildcardDomain(domains []string) bool {
+	for _, domain := range domains {
+		if strings.HasPrefix(strings.TrimSpace(domain), "*.") {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeAcmeIPIdentifiers(text string) []string {
@@ -4016,23 +4974,6 @@ func shouldUseAcmeDNSChallenge(certificateType string, challenge string) bool {
 	return normalizeAcmeChallenge(challenge) == "dns"
 }
 
-func shouldBindAcmeAccount(certificateType string) bool {
-	return normalizeAcmeCertificateType(certificateType) == acmeCertificateTypeDomain
-}
-
-func applyAcmeAccountBinding(entry *model.AcmeCertificate, certificateType string, accountID uint, accountName string) {
-	if entry == nil {
-		return
-	}
-	if shouldBindAcmeAccount(certificateType) {
-		entry.AcmeAccountID = accountID
-		entry.AcmeAccountName = strings.TrimSpace(accountName)
-		return
-	}
-	entry.AcmeAccountID = 0
-	entry.AcmeAccountName = ""
-}
-
 func normalizeAcmeServer(value string) string {
 	value = strings.TrimSpace(strings.ToLower(value))
 	value = strings.TrimSuffix(value, "/")
@@ -4083,6 +5024,19 @@ func normalizeAcmeKeyLength(value string) string {
 	default:
 		return ""
 	}
+}
+
+func effectiveAcmeAccountKeyLength(entry *model.AcmeAccount) string {
+	if entry == nil {
+		return defaultAcmeKeyLength
+	}
+	if value := normalizeAcmeKeyLength(entry.AccountKeyLength); value != "" {
+		return value
+	}
+	if value := normalizeAcmeKeyLength(entry.KeyLength); value != "" {
+		return value
+	}
+	return defaultAcmeKeyLength
 }
 
 func normalizeAcmeApplyTarget(value string) (PanelSelfSignedTarget, bool) {
@@ -4140,6 +5094,9 @@ func normalizeAcmeEnvAssignments(raw string) ([]string, error) {
 		}
 		if key == "" {
 			return nil, common.NewError("invalid env line: ", line)
+		}
+		if isReservedAcmeRuntimeEnvKey(key) {
+			return nil, common.NewError("dns 环境变量不能覆盖 ACME 运行环境: ", key)
 		}
 		if _, exists := seen[key]; exists {
 			continue
@@ -4266,17 +5223,6 @@ func inspectCertificateFingerprint(certPEM []byte, keyPEM []byte) (string, time.
 	return hex.EncodeToString(sum[:]), leaf.NotBefore, leaf.NotAfter, nil
 }
 
-func convertAcmeCertificate(entry *model.AcmeCertificate) AcmeCertificateView {
-	if entry == nil {
-		return AcmeCertificateView{}
-	}
-	row, err := upsertInventoryFromAcme(entry)
-	if err != nil {
-		return AcmeCertificateView{}
-	}
-	return convertCertificateRecord(row)
-}
-
 type certificateBundleFile struct {
 	Name string
 	Data []byte
@@ -4303,41 +5249,6 @@ func sameCleanPath(a string, b string) bool {
 		return false
 	}
 	return filepath.Clean(strings.TrimSpace(a)) == filepath.Clean(strings.TrimSpace(b))
-}
-
-func isAcmeIPCertificate(entry *model.AcmeCertificate) bool {
-	if entry == nil {
-		return false
-	}
-	if strings.EqualFold(strings.TrimSpace(entry.CertificateType), acmeCertificateTypeIP) {
-		return true
-	}
-	if strings.TrimSpace(entry.CertificateType) != "" {
-		return false
-	}
-	if strings.TrimSpace(entry.CertProfile) != "" && !strings.EqualFold(strings.TrimSpace(entry.CertProfile), "shortlived") {
-		return false
-	}
-	domains := decodeCertificateDomains(entry.DomainSet)
-	if len(domains) == 0 && strings.TrimSpace(entry.MainDomain) != "" {
-		domains = []string{strings.TrimSpace(entry.MainDomain)}
-	}
-	if len(domains) == 0 {
-		return false
-	}
-	for _, domain := range domains {
-		if _, ok := normalizeAcmeIPAddressToken(domain); !ok {
-			return false
-		}
-	}
-	return true
-}
-
-func acmeCertificateTypeForEntry(entry *model.AcmeCertificate) string {
-	if isAcmeIPCertificate(entry) {
-		return acmeCertificateTypeIP
-	}
-	return acmeCertificateTypeDomain
 }
 
 func acmeCertProfileForType(certificateType string) string {
@@ -4484,6 +5395,156 @@ func cleanupLegacyCertificateManagedDir(root string, whitelist map[string]struct
 		_ = os.Remove(root)
 	}
 	return nil
+}
+
+var certificatePushFileNameSet = map[string]struct{}{
+	"cert.pem":      {},
+	"key.pem":       {},
+	"fullchain.pem": {},
+	"chain.pem":     {},
+}
+
+func decodeCertificatePushFilePaths(raw string) map[string]string {
+	paths, err := parseCertificatePushFilePaths(raw)
+	if err != nil {
+		return map[string]string{}
+	}
+	return paths
+}
+
+func parseCertificatePushFilePaths(raw string) (map[string]string, error) {
+	paths := make(map[string]string)
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return paths, nil
+	}
+	if err := json.Unmarshal([]byte(raw), &paths); err != nil {
+		return nil, common.NewError("parse certificate push file paths failed: ", err)
+	}
+	normalized := make(map[string]string, len(paths))
+	for name, filePath := range paths {
+		if _, ok := certificatePushFileNameSet[name]; !ok {
+			return nil, common.NewError("unsupported pushed certificate filename: ", name)
+		}
+		filePath = strings.TrimSpace(filePath)
+		if filePath == "" {
+			return nil, common.NewError("pushed certificate file path is empty: ", name)
+		}
+		filePath = filepath.Clean(filePath)
+		if filepath.Base(filePath) != name {
+			return nil, common.NewError("pushed certificate file path does not match filename: ", name)
+		}
+		normalized[name] = filePath
+	}
+	return normalized, nil
+}
+
+func encodeCertificatePushFilePaths(paths map[string]string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	raw, err := json.Marshal(paths)
+	if err != nil {
+		return ""
+	}
+	normalized, err := parseCertificatePushFilePaths(string(raw))
+	if err != nil || len(normalized) == 0 {
+		return ""
+	}
+	raw, err = json.Marshal(normalized)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+func validateCertificatePushFilePaths(targetDir string, paths map[string]string) error {
+	targetDir = strings.TrimSpace(targetDir)
+	if targetDir == "" {
+		return common.NewError("pushed certificate directory is empty")
+	}
+	if len(paths) == 0 {
+		return common.NewError("pushed certificate file paths are empty")
+	}
+	baseDir := filepath.Clean(targetDir)
+	for name, filePath := range paths {
+		if _, ok := certificatePushFileNameSet[name]; !ok {
+			return common.NewError("unsupported pushed certificate filename: ", name)
+		}
+		filePath = filepath.Clean(strings.TrimSpace(filePath))
+		if filepath.Base(filePath) != name {
+			return common.NewError("pushed certificate file path does not match filename: ", name)
+		}
+		rel, err := filepath.Rel(baseDir, filePath)
+		if err != nil || rel == "." || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return common.NewError("pushed certificate file path escapes target directory: ", filePath)
+		}
+	}
+	return nil
+}
+
+func removeVerifiedCertificateFiles(targetDir string, rawPaths string) error {
+	paths, err := parseCertificatePushFilePaths(rawPaths)
+	if err != nil {
+		return err
+	}
+	if err := validateCertificatePushFilePaths(targetDir, paths); err != nil {
+		return err
+	}
+	names := make([]string, 0, len(paths))
+	for name := range paths {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if err := os.Remove(paths[name]); err != nil && !os.IsNotExist(err) {
+			return common.NewError("delete ", name, " failed: ", err)
+		}
+	}
+	return nil
+}
+
+func writeAndVerifyCertificateDirectoryPush(targetDir string, certPEM []byte, keyPEM []byte, fullchainPEM []byte, chainPEM []byte) (map[string]string, error) {
+	targetDir = strings.TrimSpace(targetDir)
+	if targetDir == "" {
+		return nil, common.NewError("target directory is empty")
+	}
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		return nil, common.NewError("create target directory failed: ", err)
+	}
+	writeTargets, err := certificateBundleFiles(certPEM, keyPEM, fullchainPEM, chainPEM)
+	if err != nil {
+		return nil, err
+	}
+
+	paths := make(map[string]string, len(writeTargets))
+	written := make([]string, 0, len(writeTargets))
+	cleanupWritten := func() {
+		for _, writtenPath := range written {
+			_ = os.Remove(writtenPath)
+		}
+	}
+	for _, target := range writeTargets {
+		filePath := filepath.Join(targetDir, target.Name)
+		paths[target.Name] = filePath
+		if err := os.WriteFile(filePath, target.Data, target.Perm); err != nil {
+			cleanupWritten()
+			return nil, common.NewError("write ", target.Name, " failed: ", err)
+		}
+		written = append(written, filePath)
+	}
+	for _, target := range writeTargets {
+		actual, readErr := os.ReadFile(paths[target.Name])
+		if readErr != nil {
+			cleanupWritten()
+			return nil, common.NewError("read ", target.Name, " for verify failed: ", readErr)
+		}
+		if !bytes.Equal(actual, target.Data) {
+			cleanupWritten()
+			return nil, common.NewError("verify ", target.Name, " failed: file content does not match latest certificate")
+		}
+	}
+	return paths, nil
 }
 
 func removeCertificateBundleFromDirectory(targetDir string) error {
@@ -4719,45 +5780,49 @@ func parseAcmeEnvJSON(raw string) (map[string]string, error) {
 	return result, nil
 }
 
-func resolveAcmeDNSProviderFromAccount(dnsAccountID uint, fallback string) (string, error) {
-	fallback = strings.TrimSpace(fallback)
-	if fallback != "" {
-		return fallback, nil
+func resolveAcmeDNSRuntimeConfig(dnsAccountID uint, fallbackProvider string, dnsEnvText string) (acmeDNSRuntimeConfig, error) {
+	result := acmeDNSRuntimeConfig{
+		ProviderCode: strings.TrimSpace(fallbackProvider),
+		EnvPairs:     []string{},
 	}
-	if dnsAccountID == 0 {
-		return "", nil
-	}
-	dnsAccount := &model.AcmeDNSAccount{}
-	if err := database.GetDB().Where("id = ?", dnsAccountID).First(dnsAccount).Error; err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(dnsAccount.ProviderCode), nil
-}
+	accountEnv := []string{}
 
-func resolveAcmeDNSRuntimeEnv(dnsAccountID uint, dnsEnvText string) ([]string, error) {
-	dnsEnvText = strings.TrimSpace(dnsEnvText)
-	dnsEnv := []string{}
 	if dnsAccountID > 0 {
 		dnsAccount := &model.AcmeDNSAccount{}
-		if err := database.GetDB().Where("id = ?", dnsAccountID).First(dnsAccount).Error; err == nil {
-			envMap, parseErr := parseAcmeEnvJSON(dnsAccount.EnvJSON)
-			if parseErr != nil {
-				return nil, parseErr
-			}
-			dnsEnv = envMapToEnvPairs(envMap)
+		if err := database.GetDB().Where("id = ?", dnsAccountID).First(dnsAccount).Error; err != nil {
+			return acmeDNSRuntimeConfig{}, err
+		}
+		result.AccountName = strings.TrimSpace(dnsAccount.Name)
+		result.ProviderCode = strings.TrimSpace(dnsAccount.ProviderCode)
+		if result.ProviderCode == "" {
+			return acmeDNSRuntimeConfig{}, common.NewError("已绑定 DNS 账号未配置 DNS 供应商")
+		}
+		if _, ok := lookupAcmeDNSProvider(result.ProviderCode); !ok {
+			return acmeDNSRuntimeConfig{}, common.NewError("已绑定 DNS 账号使用不支持的 DNS 供应商: ", result.ProviderCode)
+		}
+		envMap, err := parseAcmeEnvJSON(dnsAccount.EnvJSON)
+		if err != nil {
+			return acmeDNSRuntimeConfig{}, err
+		}
+		accountEnv = envMapToEnvPairs(envMap)
+	}
+
+	manualEnv, err := normalizeAcmeEnvAssignments(strings.TrimSpace(dnsEnvText))
+	if err != nil {
+		return acmeDNSRuntimeConfig{}, err
+	}
+	result.EnvPairs = mergeEnvPairs(accountEnv, manualEnv)
+	if err := validateAcmeDNSRuntimeEnvMap(envPairsToEnvMap(result.EnvPairs)); err != nil {
+		return acmeDNSRuntimeConfig{}, err
+	}
+
+	if provider, ok := lookupAcmeDNSProvider(result.ProviderCode); ok {
+		result.ProviderCode = provider.ProviderCode
+		if err := validateDNSProviderEnv(provider, envPairsToEnvMap(result.EnvPairs)); err != nil {
+			return acmeDNSRuntimeConfig{}, err
 		}
 	}
-	if dnsEnvText == "" {
-		return dnsEnv, nil
-	}
-	parsedEnv, err := normalizeAcmeEnvAssignments(dnsEnvText)
-	if err != nil {
-		return nil, err
-	}
-	if len(dnsEnv) > 0 {
-		parsedEnv = mergeEnvPairs(dnsEnv, parsedEnv)
-	}
-	return parsedEnv, nil
+	return result, nil
 }
 
 func isMaskedAcmeEnvValue(value string) bool {
@@ -4867,20 +5932,21 @@ func isAcmeSecretEnvKey(key string) bool {
 }
 
 func validateDNSProviderEnv(provider AcmeDNSProviderMeta, env map[string]string) error {
+	if err := validateAcmeDNSRuntimeEnvMap(env); err != nil {
+		return err
+	}
 	trim := func(key string) string {
 		return strings.TrimSpace(env[key])
 	}
 	switch strings.ToLower(strings.TrimSpace(provider.ProviderCode)) {
 	case "dns_cf":
 		token := trim("CF_Token")
-		accountID := trim("CF_Account_ID")
-		zoneID := trim("CF_Zone_ID")
 		email := trim("CF_Email")
 		key := trim("CF_Key")
-		tokenMode := token != "" && (accountID != "" || zoneID != "")
+		tokenMode := token != ""
 		legacyMode := email != "" && key != ""
 		if !tokenMode && !legacyMode {
-			return common.NewError("Cloudflare DNS 需填写以下其一：CF_Token + (CF_Account_ID 或 CF_Zone_ID)，或 CF_Email + CF_Key")
+			return common.NewError("Cloudflare DNS 需填写以下其一：CF_Token，或 CF_Email + CF_Key")
 		}
 		return nil
 	case "dns_aws":
@@ -4909,41 +5975,24 @@ func (s *AcmeService) migrateLegacyDNSSecretsFromAccountConf() error {
 	acmeLegacyDNSMu.Lock()
 	defer acmeLegacyDNSMu.Unlock()
 
-	_, homeDir, installed := s.resolveAcmeScript()
-	if !installed && strings.TrimSpace(homeDir) == "" {
-		savedPath := strings.TrimSpace(s.readSettingWithDefault(acmeScriptPathKey, ""))
-		if savedPath != "" {
-			homeDir = strings.TrimSpace(filepath.Dir(savedPath))
-		}
-	}
-	homeCandidates := []string{
-		strings.TrimSpace(homeDir),
-		managedAcmeHomeDir(),
-		legacyManagedAcmeHomeDir(),
-	}
-	finalHome := ""
-	for _, candidate := range homeCandidates {
-		cleaned := strings.TrimSpace(filepath.Clean(candidate))
-		if cleaned == "" || cleaned == "." {
+	for _, homeDir := range s.legacyAcmeRuntimeHomes() {
+		homeDir = strings.TrimSpace(filepath.Clean(homeDir))
+		if homeDir == "" || homeDir == "." || !pathExists(filepath.Join(homeDir, "account.conf")) {
 			continue
 		}
-		if pathExists(filepath.Join(cleaned, "account.conf")) {
-			finalHome = cleaned
-			break
+
+		candidates, err := loadLegacyDNSCandidatesFromAccountConf(homeDir)
+		if err != nil {
+			return err
+		}
+		if len(candidates) == 0 {
+			continue
+		}
+		if err := s.persistLegacyDNSCandidates(homeDir, candidates); err != nil {
+			return err
 		}
 	}
-	if finalHome == "" {
-		return nil
-	}
-
-	candidates, err := loadLegacyDNSCandidatesFromAccountConf(finalHome)
-	if err != nil {
-		return err
-	}
-	if len(candidates) == 0 {
-		return nil
-	}
-	return s.persistLegacyDNSCandidates(finalHome, candidates)
+	return nil
 }
 
 func loadLegacyDNSCandidatesFromAccountConf(homeDir string) ([]acmeLegacyDNSCandidate, error) {
@@ -5222,6 +6271,104 @@ func isValidAcmeEnvKey(key string) bool {
 	return true
 }
 
+func isReservedAcmeRuntimeEnvKey(key string) bool {
+	key = strings.ToUpper(strings.TrimSpace(key))
+	if key == "" {
+		return false
+	}
+	if strings.HasPrefix(key, "LD_") || strings.HasPrefix(key, "DYLD_") ||
+		strings.HasPrefix(key, "LE_") || strings.HasPrefix(key, "ACCOUNT_") ||
+		strings.HasPrefix(key, "CA_") || strings.HasPrefix(key, "CERT_") ||
+		strings.HasPrefix(key, "DOMAIN_") || strings.HasPrefix(key, "ACME_") {
+		return true
+	}
+	switch key {
+	case "LE_CONFIG_HOME", "LE_WORKING_DIR", "_SCRIPT_HOME",
+		"PATH", "HOME", "PWD", "OLDPWD", "SHELL", "IFS", "ENV", "BASH_ENV",
+		"TMPDIR", "TMP", "TEMP",
+		"PYTHONPATH", "PYTHONHOME", "PERL5LIB", "PERL5OPT", "RUBYOPT", "RUBYLIB", "NODE_OPTIONS",
+		"DEBUG", "OUTPUT_INSECURE", "LOG_FILE", "LOG_LEVEL", "SYS_LOG", "FORCE", "NO_TIMESTAMP":
+		return true
+	default:
+		return false
+	}
+}
+
+func isAcmeInheritedRuntimeEnvKey(key string) bool {
+	// acme.sh's shebang uses /usr/bin/env, so retain PATH while filtering the
+	// remaining variables that could redirect its state or startup behavior.
+	return !strings.EqualFold(strings.TrimSpace(key), "PATH") && isReservedAcmeRuntimeEnvKey(key)
+}
+
+func buildAcmeCommandEnv(envPairs []string) []string {
+	values := make(map[string]string, len(os.Environ())+len(envPairs))
+	for _, pair := range os.Environ() {
+		key, value, ok := strings.Cut(pair, "=")
+		if !ok || strings.TrimSpace(key) == "" || isAcmeInheritedRuntimeEnvKey(key) {
+			continue
+		}
+		values[strings.ToUpper(key)] = key + "=" + value
+	}
+	for _, pair := range envPairs {
+		key, value, ok := strings.Cut(pair, "=")
+		key = strings.TrimSpace(key)
+		if !ok || key == "" || !isValidAcmeEnvKey(key) || isReservedAcmeRuntimeEnvKey(key) {
+			continue
+		}
+		values[strings.ToUpper(key)] = key + "=" + value
+	}
+
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]string, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, values[key])
+	}
+	return result
+}
+
+func redactAcmeCommandOutput(raw string, envPairs []string) string {
+	if raw == "" || len(envPairs) == 0 {
+		return raw
+	}
+	secretValues := make([]string, 0, len(envPairs))
+	seen := make(map[string]struct{}, len(envPairs))
+	for _, pair := range envPairs {
+		key, value, ok := strings.Cut(pair, "=")
+		if !ok || !isAcmeSecretEnvKey(key) || value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		secretValues = append(secretValues, value)
+	}
+	sort.Slice(secretValues, func(i, j int) bool {
+		return len(secretValues[i]) > len(secretValues[j])
+	})
+	for _, value := range secretValues {
+		raw = strings.ReplaceAll(raw, value, acmeMaskedEnvValue)
+	}
+	return raw
+}
+
+func validateAcmeDNSRuntimeEnvMap(env map[string]string) error {
+	for key := range env {
+		key = strings.TrimSpace(key)
+		if !isValidAcmeEnvKey(key) {
+			return common.NewError("无效 DNS 环境变量名: ", key)
+		}
+		if isReservedAcmeRuntimeEnvKey(key) {
+			return common.NewError("dns 环境变量不能覆盖 ACME 运行环境: ", key)
+		}
+	}
+	return nil
+}
+
 func envMapToEnvPairs(env map[string]string) []string {
 	if len(env) == 0 {
 		return []string{}
@@ -5241,6 +6388,24 @@ func envMapToEnvPairs(env map[string]string) []string {
 		pairs = append(pairs, key+"="+value)
 	}
 	return pairs
+}
+
+func envPairsToEnvMap(envPairs []string) map[string]string {
+	result := make(map[string]string, len(envPairs))
+	for _, pair := range envPairs {
+		pair = strings.TrimSpace(pair)
+		idx := strings.Index(pair, "=")
+		if idx <= 0 {
+			continue
+		}
+		key := strings.TrimSpace(pair[:idx])
+		value := strings.TrimSpace(pair[idx+1:])
+		if key == "" || value == "" {
+			continue
+		}
+		result[key] = value
+	}
+	return result
 }
 
 func mergeEnvPairs(base []string, override []string) []string {
@@ -5458,31 +6623,42 @@ func (s *AcmeService) removeManagedAcmeWithOptionsLocked(opts acmeRemoveOptions)
 	}
 
 	scriptPath, homeDir, installed := s.resolveAcmeScript()
-	if installed && (isManagedAcmeScriptPath(scriptPath) || isManagedAcmeHomeDir(homeDir)) {
-		if uninstallOutput, err := runCommandOutputWithTimeoutEnv(60*time.Second, scriptPath, append(acmeHomeArgs(homeDir), "--uninstall"), nil); err == nil {
-			trimmed := strings.TrimSpace(uninstallOutput)
-			if trimmed != "" {
-				outputParts = append(outputParts, trimmed)
+	managedInstallation := installed && isManagedAcmeInstallation(scriptPath, homeDir)
+	if managedInstallation {
+		uninstallOutput, uninstallErr := runCommandOutputWithTimeoutEnv(60*time.Second, scriptPath, append(acmeHomeArgs(homeDir), "--uninstall"), nil)
+		if uninstallErr != nil {
+			if runtime.GOOS == "linux" {
+				detail := strings.TrimSpace(uninstallOutput)
+				if detail != "" {
+					return nil, fmt.Errorf("uninstall managed acme.sh failed: %w: %s", uninstallErr, detail)
+				}
+				return nil, fmt.Errorf("uninstall managed acme.sh failed: %w", uninstallErr)
 			}
+			logger.Warning("skip managed acme.sh uninstall outside Linux host: ", uninstallErr)
+		}
+		trimmed := strings.TrimSpace(uninstallOutput)
+		if trimmed != "" {
+			outputParts = append(outputParts, trimmed)
 		}
 	}
 
-	if runtime.GOOS == "linux" && !runningInsideContainer() {
-		systemctlPath, lookErr := exec.LookPath("systemctl")
-		if lookErr == nil {
-			for _, unit := range acmeSystemdUnitCandidates {
-				unit = strings.TrimSpace(unit)
-				if unit == "" {
-					continue
-				}
-				if runCommandWithTimeout(10*time.Second, systemctlPath, "stop", unit) == nil {
-					removedUnits = append(removedUnits, unit+"(stopped)")
-				}
-				if runCommandWithTimeout(10*time.Second, systemctlPath, "disable", unit) == nil {
-					removedUnits = append(removedUnits, unit+"(disabled)")
-				}
+	if managedInstallation && runtime.GOOS == "linux" && !runningInsideContainer() {
+		uninstallOptions := normalizeKworUninstallOptions(KworUninstallOptions{DataDir: config.GetDataDir()})
+		for _, unit := range acmeSystemdUnitCandidates {
+			unit = strings.TrimSpace(unit)
+			if unit == "" || !legacySystemdUnitLooksOwned(unit, uninstallOptions) {
+				continue
 			}
-			_ = runCommandWithTimeout(10*time.Second, systemctlPath, "daemon-reload")
+			paths := ownedSystemdUnitArtifactPaths(unit, uninstallOptions, nil, nil, nil, true)
+			if err := removeOwnedSystemdUnit(unit, uninstallOptions, paths, nil, nil, true); err != nil {
+				return nil, fmt.Errorf("remove managed acme systemd unit %s: %w", unit, err)
+			}
+			removedUnits = append(removedUnits, unit)
+		}
+		if systemctlPath, lookErr := exec.LookPath("systemctl"); lookErr == nil {
+			if err := runCommandWithTimeout(10*time.Second, systemctlPath, "daemon-reload"); err != nil {
+				return nil, fmt.Errorf("reload systemd after managed acme cleanup: %w", err)
+			}
 			_ = runCommandWithTimeout(10*time.Second, systemctlPath, "reset-failed")
 		}
 	}
@@ -5513,10 +6689,15 @@ func (s *AcmeService) removeManagedAcmeWithOptionsLocked(opts acmeRemoveOptions)
 
 	if opts.removeRuntimeData {
 		runtimeRoot := filepath.Clean(filepath.Join(config.GetDataDir(), "acme"))
-		_ = os.RemoveAll(runtimeRoot)
+		if err := os.RemoveAll(runtimeRoot); err != nil {
+			return nil, fmt.Errorf("remove managed acme runtime data: %w", err)
+		}
 	}
 	if err := s.EnsureOverviewRuntimeConsistency(true); err != nil {
 		return nil, err
+	}
+	if err := RemoveHostResource("acme-managed-runtime"); err != nil {
+		return nil, fmt.Errorf("clear managed acme ownership: %w", err)
 	}
 
 	overview, err := s.GetOverview()
@@ -5538,36 +6719,40 @@ func (s *AcmeService) removeManagedAcmeWithOptionsLocked(opts acmeRemoveOptions)
 	}, nil
 }
 
-func (s *AcmeService) removeAcmeRowsOnlyLocked() error {
-	db := database.GetDB()
-	if err := db.Where("source_type = ?", CertificateSourceACME).Delete(&model.CertificateRecord{}).Error; err != nil {
+func isManagedAcmeInstallation(scriptPath string, homeDir string) bool {
+	return isManagedAcmeScriptPath(scriptPath) || isManagedAcmeHomeDir(homeDir)
+}
+
+func removeAcmeAccountRowsTx(tx *gorm.DB) error {
+	if err := tx.Where("1 = 1").Delete(&model.AcmeAccount{}).Error; err != nil {
 		return err
 	}
-	if err := db.Where("1 = 1").Delete(&model.AcmeCertificate{}).Error; err != nil {
-		return err
-	}
-	if err := db.Where("1 = 1").Delete(&model.AcmeAccount{}).Error; err != nil {
-		return err
-	}
-	if err := db.Where("1 = 1").Delete(&model.AcmeDNSAccount{}).Error; err != nil {
+	if err := tx.Where("1 = 1").Delete(&model.AcmeDNSAccount{}).Error; err != nil {
 		return err
 	}
 	return nil
 }
 
 func (s *AcmeService) removeAcmeCertificatesAndInventoryLocked() error {
-	if err := s.removeAcmeRowsOnlyLocked(); err != nil {
-		return err
-	}
 	db := database.GetDB()
-	if err := db.Where("1 = 1").Delete(&model.CertificateRecord{}).Error; err != nil {
+	rows := make([]model.CertificateRecord, 0)
+	if err := db.Select("id").Find(&rows).Error; err != nil {
 		return err
 	}
-	if err := db.Where("1 = 1").Delete(&model.SelfSignedAuthority{}).Error; err != nil {
+	bindings, err := detachAndDeleteCertificateRecords(rows, func(tx *gorm.DB) error {
+		if err := removeAcmeAccountRowsTx(tx); err != nil {
+			return err
+		}
+		if err := tx.Where("1 = 1").Delete(&model.SelfSignedAuthority{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("key IN ?", []string{"webCertFile", "webKeyFile", "subCertFile", "subKeyFile"}).Delete(&model.Setting{}).Error
+	})
+	if err != nil {
 		return err
 	}
-	if err := db.Where("key IN ?", []string{"webCertFile", "webKeyFile", "subCertFile", "subKeyFile"}).Delete(&model.Setting{}).Error; err != nil {
-		return err
+	if len(rows) > 0 {
+		syncDetachedCertificateBindings(bindings)
 	}
 	return nil
 }
@@ -5978,7 +7163,7 @@ func (s *AcmeService) fetchAcmeReleasePage(client *http.Client, page int, perPag
 		return nil, false, common.NewError("GitHub releases API returned ", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readBoundedHTTPResponseBody(resp.Body, acmeGitHubResponseMaxBytes)
 	if err != nil {
 		return nil, false, err
 	}
@@ -6026,7 +7211,7 @@ func (s *AcmeService) fetchAcmeTagPageByURL(client *http.Client, apiURL string, 
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, common.NewError("GitHub tags API returned ", resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := readBoundedHTTPResponseBody(resp.Body, acmeGitHubResponseMaxBytes)
 	if err != nil {
 		return nil, false, err
 	}
@@ -6447,13 +7632,16 @@ func runCommandOutputWithTimeoutEnv(timeout time.Duration, command string, args 
 }
 
 func runCommandOutputWithTimeoutEnvLog(timeout time.Duration, command string, args []string, envPairs []string, logSession *acmeLogSession) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	parent := context.Background()
+	if logSession != nil {
+		parent = logSession.operationContext()
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, command, args...)
-	if len(envPairs) > 0 {
-		cmd.Env = append(os.Environ(), envPairs...)
-	}
+	cmd.Env = buildAcmeCommandEnv(envPairs)
+	PrepareKworManagedCommandContext(parent, cmd)
 
 	var output strings.Builder
 	var outputMu sync.Mutex
@@ -6469,6 +7657,11 @@ func runCommandOutputWithTimeoutEnvLog(timeout time.Duration, command string, ar
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
+	if err := TrackKworManagedCommandContext(parent, cmd); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return "", fmt.Errorf("登记 ACME 命令进程失败: %w", err)
+	}
 
 	var wg sync.WaitGroup
 	collect := func(reader io.Reader) {
@@ -6476,7 +7669,7 @@ func runCommandOutputWithTimeoutEnvLog(timeout time.Duration, command string, ar
 		scanner := bufio.NewScanner(reader)
 		scanner.Buffer(make([]byte, 1024), 1024*1024)
 		for scanner.Scan() {
-			line := strings.TrimRight(scanner.Text(), "\r")
+			line := redactAcmeCommandOutput(strings.TrimRight(scanner.Text(), "\r"), envPairs)
 			outputMu.Lock()
 			output.WriteString(line)
 			output.WriteString("\n")
@@ -6496,7 +7689,10 @@ func runCommandOutputWithTimeoutEnvLog(timeout time.Duration, command string, ar
 	err = cmd.Wait()
 	wg.Wait()
 	if ctx.Err() == context.DeadlineExceeded {
-		return "", fmt.Errorf("command timed out (%s %s)", command, strings.Join(args, " "))
+		return "", fmt.Errorf("command timed out (%s)", command)
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return "", fmt.Errorf("command canceled (%s): %w", command, ctx.Err())
 	}
 	if err != nil {
 		outputMu.Lock()
@@ -6524,9 +7720,15 @@ type acmeLogSession struct {
 	status     string
 	lines      []string
 	errText    string
+	taskID     string
+	taskStatus string
+	warnings   []string
+	result     *AcmeActionResult
 	startedAt  int64
 	updatedAt  int64
 	finishedAt int64
+	ctx        context.Context
+	operation  *KworManagedOperationHandle
 }
 
 func newAcmeLogStore() *acmeLogStore {
@@ -6541,6 +7743,15 @@ func (s *acmeLogStore) start(id string, title string) *acmeLogSession {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pruneLocked(now)
+	if existing := s.sessions[id]; existing != nil && (existing.status == acmeTaskStatusQueued || existing.status == acmeTaskStatusRunning) {
+		if strings.TrimSpace(title) != "" {
+			existing.title = strings.TrimSpace(title)
+		}
+		existing.status = acmeTaskStatusRunning
+		existing.taskStatus = acmeTaskStatusRunning
+		existing.updatedAt = now
+		return existing
+	}
 
 	session := &acmeLogSession{
 		id:        id,
@@ -6554,6 +7765,117 @@ func (s *acmeLogStore) start(id string, title string) *acmeLogSession {
 	}
 	s.sessions[id] = session
 	return session
+}
+
+func (s *acmeLogStore) queue(id string, title string, taskID string, ctx context.Context, operation *KworManagedOperationHandle) *acmeLogSession {
+	id = normalizeAcmeLogSessionID(id)
+	now := time.Now().Unix()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneLocked(now)
+
+	session := &acmeLogSession{
+		id:         id,
+		title:      strings.TrimSpace(title),
+		status:     acmeTaskStatusQueued,
+		taskID:     strings.TrimSpace(taskID),
+		taskStatus: acmeTaskStatusQueued,
+		startedAt:  now,
+		updatedAt:  now,
+		ctx:        ctx,
+		operation:  operation,
+	}
+	if session.title == "" {
+		session.title = "ACME 任务"
+	}
+	session.appendLocked("后台任务已进入队列")
+	s.sessions[id] = session
+	return session
+}
+
+func (s *acmeLogSession) operationContext() context.Context {
+	if s == nil || s.ctx == nil {
+		return context.Background()
+	}
+	return s.ctx
+}
+
+func (s *acmeLogSession) ensureManagedOperation(kind string) (func(), error) {
+	if s == nil {
+		return func() {}, nil
+	}
+	acmeLogSessionStore.mu.Lock()
+	if s.operation != nil {
+		acmeLogSessionStore.mu.Unlock()
+		return func() {}, nil
+	}
+	acmeLogSessionStore.mu.Unlock()
+
+	ctx, operation, err := BeginKworManagedOperation("acme-" + strings.TrimSpace(kind))
+	if err != nil {
+		return nil, err
+	}
+	attached := false
+	acmeLogSessionStore.mu.Lock()
+	if s.operation == nil {
+		s.ctx = ctx
+		s.operation = operation
+		s.updatedAt = time.Now().Unix()
+		attached = true
+	}
+	acmeLogSessionStore.mu.Unlock()
+	if !attached {
+		operation.Done()
+		return func() {}, nil
+	}
+	return operation.Done, nil
+}
+
+func (s *acmeLogSession) trackCommand(cmd *exec.Cmd) error {
+	if s == nil || s.operation == nil {
+		return nil
+	}
+	return s.operation.TrackCommand(cmd)
+}
+
+func (s *acmeLogStore) setTaskState(logSessionID string, taskID string, status string, warnings []string, result *AcmeActionResult, errText string) {
+	logSessionID = strings.TrimSpace(logSessionID)
+	if logSessionID == "" {
+		return
+	}
+	now := time.Now().Unix()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session := s.sessions[logSessionID]
+	if session == nil {
+		return
+	}
+	session.taskID = strings.TrimSpace(taskID)
+	session.taskStatus = strings.TrimSpace(status)
+	session.warnings = append([]string(nil), warnings...)
+	session.result = cloneAcmeActionResult(result)
+	if status != "" {
+		session.status = status
+	}
+	if strings.TrimSpace(errText) != "" {
+		session.errText = strings.TrimSpace(errText)
+	}
+	if status == acmeTaskStatusRunning {
+		session.appendLocked("后台任务开始执行")
+	}
+	if status == acmeTaskStatusWarning {
+		session.appendLocked("证书已签发，但部分后置动作需要处理")
+	}
+	if status == acmeTaskStatusSuccess {
+		session.appendLocked("后台任务执行完成")
+	}
+	if status == acmeTaskStatusError && strings.TrimSpace(errText) != "" {
+		session.appendLocked("失败: " + strings.TrimSpace(errText))
+	}
+	session.updatedAt = now
+	if status == acmeTaskStatusSuccess || status == acmeTaskStatusWarning || status == acmeTaskStatusError {
+		session.finishedAt = now
+	}
 }
 
 func (s *acmeLogStore) get(id string) *AcmeLogSessionView {
@@ -6644,6 +7966,10 @@ func (s *acmeLogSession) snapshotLocked() *AcmeLogSessionView {
 		Status:     s.status,
 		Lines:      lines,
 		Error:      s.errText,
+		TaskID:     s.taskID,
+		TaskStatus: s.taskStatus,
+		Warnings:   append([]string(nil), s.warnings...),
+		Result:     cloneAcmeActionResult(s.result),
 		StartedAt:  s.startedAt,
 		UpdatedAt:  s.updatedAt,
 		FinishedAt: s.finishedAt,

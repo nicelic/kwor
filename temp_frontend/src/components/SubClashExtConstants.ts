@@ -9,57 +9,6 @@ export const enhancedModeOptions = [
   { title: "redir-host", value: "redir-host" },
 ]
 
-// Clash rule set sources.
-export const clashRuleSetSourceOptions = [
-  { title: "MetaCubeX Github", value: "metacubex_github" },
-  { title: "MetaCubeX CDN", value: "metacubex_cdn" },
-  { title: "QuixoticHeart Github", value: "quixoticheart_github" },
-  { title: "Loyalsoldier Github", value: "loyalsoldier_github" },
-  { title: "Loyalsoldier_IP Github", value: "loyalsoldier_ip_github" },
-  { title: "Loyalsoldier_IP CDN", value: "loyalsoldier_ip_cdn" },
-  { title: "自定义规则集完整链接", value: "" },
-]
-
-// Clash rule set URL templates.
-export const CLASH_RULE_SET_URL_TEMPLATES: Record<string, { geosite: string; geoip: string }> = {
-  metacubex_github: {
-    geosite: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/{name}.mrs',
-    geoip: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/{name}.mrs',
-  },
-  metacubex_cdn: {
-    geosite: 'https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/{name}.mrs',
-    geoip: 'https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/{name}.mrs',
-  },
-  quixoticheart_github: {
-    geosite: 'https://github.com/QuixoticHeart/rule-set/raw/refs/heads/ruleset/meta/domain/{name}.mrs',
-    geoip: 'https://github.com/QuixoticHeart/rule-set/raw/refs/heads/ruleset/meta/ipcidr/{name}.mrs',
-  },
-  loyalsoldier_github: {
-    geosite: 'https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/{name}.txt',
-    geoip: 'https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/{name}.txt',
-  },
-  loyalsoldier_ip_github: {
-    geosite: 'https://raw.githubusercontent.com/Loyalsoldier/geoip/release/clash/ipcidr/{name}.txt',
-    geoip: 'https://raw.githubusercontent.com/Loyalsoldier/geoip/release/clash/ipcidr/{name}.txt',
-  },
-  loyalsoldier_ip_cdn: {
-    geosite: 'https://fastly.jsdelivr.net/gh/Loyalsoldier/geoip@release/clash/ipcidr/{name}.txt',
-    geoip: 'https://fastly.jsdelivr.net/gh/Loyalsoldier/geoip@release/clash/ipcidr/{name}.txt',
-  },
-}
-
-// MetaCubeX 名称映射（某些名称在 MetaCubeX 中有特殊映射）
-export const CLASH_METACUBEX_NAME_MAP: Record<string, string> = {
-  'ads': 'category-ads-all',
-  'ir': 'category-ir',
-}
-
-// 需要名称映射的来源列表
-export const CLASH_SOURCES_NEED_NAME_MAP = [
-  'metacubex_github',
-  'metacubex_cdn',
-]
-
 // Clash 自定义规则类型映射（sing-box 类型 → Clash 类型）
 export const clashDomainIpTypes = [
   { title: "域名 (DOMAIN)", value: "DOMAIN" },

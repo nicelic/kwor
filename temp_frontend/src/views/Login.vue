@@ -86,21 +86,21 @@ const router = useRouter()
 const login = async () => {
   if (username.value == '' || password.value == '') return
   loading.value=true
-  const response = await HttpUtil.post('api/login',{user: username.value, pass: password.value})
-  if(response.success){
-    const warning = response.obj?.warning
-    if (typeof warning === 'string' && warning.trim().length > 0) {
-      push.warning({
-        title: 'Warning',
-        message: warning,
-        duration: 7000,
-      })
+  try {
+    const response = await HttpUtil.post('api/login',{user: username.value, pass: password.value})
+    if(response.success){
+      const warning = response.obj?.warning
+      if (typeof warning === 'string' && warning.trim().length > 0) {
+        push.warning({
+          title: 'Warning',
+          message: warning,
+          duration: 7000,
+        })
+      }
+      await new Promise(resolve => setTimeout(resolve, 500))
+      await router.push('/')
     }
-    setTimeout(() => {
-      loading.value=false
-      router.push('/')
-    }, 500)
-  } else {
+  } finally {
     loading.value=false
   }
 }

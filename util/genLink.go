@@ -11,7 +11,7 @@ import (
 	"github.com/alireza0/s-ui/util/common"
 )
 
-var InboundTypeWithLink = []string{"socks", "http", "mixed", "snell", "shadowsocks", "naive", "hysteria", "hysteria2", "anytls", "tuic", "vless", "trojan", "vmess", "mieru"}
+var InboundTypeWithLink = []string{"socks", "http", "snell", "shadowsocks", "naive", "hysteria", "hysteria2", "anytls", "tuic", "vless", "trojan", "vmess", "mieru"}
 
 type LinkParam struct {
 	Key   string
@@ -19,6 +19,9 @@ type LinkParam struct {
 }
 
 func LinkGenerator(clientConfig json.RawMessage, i *model.Inbound, hostname string) []string {
+	if i == nil || IsSubscriptionServerOnlyInboundType(i.Type) {
+		return []string{}
+	}
 	inbound, err := i.MarshalFull()
 	if err != nil {
 		return []string{}
@@ -73,11 +76,6 @@ func LinkGenerator(clientConfig json.RawMessage, i *model.Inbound, hostname stri
 		return socksLink(userConfig["socks"], Addrs)
 	case "http":
 		return httpLink(userConfig["http"], Addrs)
-	case "mixed":
-		return append(
-			socksLink(userConfig["socks"], Addrs),
-			httpLink(userConfig["http"], Addrs)...,
-		)
 	case "snell":
 		return snellLink(userConfig["snell"], *inbound, Addrs)
 	case "shadowsocks":

@@ -196,21 +196,6 @@ func (s *OutboundGroupService) Save(tx *gorm.DB, act string, data json.RawMessag
 
 		tags := parseOutboundGroupTags(group.Outbounds)
 		if len(tags) > 0 {
-			if corePtr.IsRunning() {
-				typeByTag := make(map[string]string, len(tags))
-				var groupedOutbounds []model.Outbound
-				if err := tx.Model(model.Outbound{}).Select("tag", "type").Where("tag IN ?", tags).Find(&groupedOutbounds).Error; err != nil {
-					return err
-				}
-				for _, outbound := range groupedOutbounds {
-					typeByTag[outbound.Tag] = outbound.Type
-				}
-				for _, tag := range tags {
-					if err := removeRuntimeOutboundFromCore(tag, typeByTag[tag]); err != nil {
-						logger.Warningf("[OutboundGroup] remove outbound from running core failed: %s, err: %v", tag, err)
-					}
-				}
-			}
 			if err := tx.Where("tag IN ?", tags).Delete(&model.Outbound{}).Error; err != nil {
 				return err
 			}
@@ -333,15 +318,11 @@ func (s *OutboundGroupService) RefreshSubscription(groupName string, url string,
 	}
 
 	oldMap := make(map[string]map[string]interface{})
-	oldTypeByTag := make(map[string]string)
 	for _, ob := range oldOutbounds {
 		tag, _ := ob["tag"].(string)
 		outType, _ := ob["type"].(string)
 		if tag != "" {
 			oldMap[tag+"|"+outType] = ob
-			if _, ok := oldTypeByTag[tag]; !ok || outType == "shadowtls" {
-				oldTypeByTag[tag] = outType
-			}
 		}
 	}
 
@@ -371,13 +352,6 @@ func (s *OutboundGroupService) RefreshSubscription(groupName string, url string,
 	}
 
 	if len(result.Removed) > 0 {
-		if corePtr.IsRunning() {
-			for _, tag := range result.Removed {
-				if err := removeRuntimeOutboundFromCore(tag, oldTypeByTag[tag]); err != nil {
-					logger.Warningf("[OutboundGroup] remove stale outbound from running core failed: %s, err: %v", tag, err)
-				}
-			}
-		}
 		if err := dbConn.Where("tag IN ?", result.Removed).Delete(&model.Outbound{}).Error; err != nil {
 			return nil, err
 		}
@@ -413,9 +387,8 @@ func (s *OutboundGroupService) RefreshSubscription(groupName string, url string,
 }
 
 func (s *OutboundGroupService) notifyOutboundsChanged() {
-	LastUpdate = time.Now().Unix()
+	markLastUpdate(time.Now().Unix())
 	proManager := GetProManagerService(&ConfigService{})
-	proManager.regenerateOutboundConfigs()
 	proManager.regenerateCoreConfig()
 }
 
@@ -492,27 +465,6 @@ func upsertImportedOutbound(db *gorm.DB, outbound map[string]interface{}, raw js
 		dbOutbound.Id = existing.Id
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
-	}
-
-	if corePtr.IsRunning() {
-		configData, err := resolveOutboundJSON(&dbOutbound)
-		if err != nil {
-			return err
-		}
-		runtimePayloads, err := buildRuntimeOutboundPayloads(configData, dbOutbound.Type)
-		if err != nil {
-			return err
-		}
-		if dbOutbound.Id > 0 {
-			if err := removeRuntimeOutboundFromCore(existing.Tag, existing.Type); err != nil {
-				return err
-			}
-		}
-		for _, payload := range runtimePayloads {
-			if err := corePtr.AddOutbound(payload); err != nil {
-				return err
-			}
-		}
 	}
 
 	return db.Save(&dbOutbound).Error

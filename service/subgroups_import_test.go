@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -539,5 +540,22 @@ func TestAttachSubscriptionJSONRawByTag_SkipsNonProxyRaw(t *testing.T) {
 	attached := attachSubscriptionJSONRawByTag(nodes, rawByTag)
 	if len(attached[0].JSONRaw) != 0 {
 		t.Fatalf("expected selector raw to be skipped, got %s", string(attached[0].JSONRaw))
+	}
+}
+
+func TestFetchSubscriptionJSONWithTimeoutAndLimitRejectsOversizedResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("x", 33)))
+	}))
+	defer server.Close()
+
+	if _, err := fetchSubscriptionJSONWithTimeoutAndLimit(server.URL, false, time.Second, 32); err == nil {
+		t.Fatal("expected oversized subscription response to be rejected")
+	}
+}
+
+func TestIsProxyOutboundAllowsManualMixedEndpoint(t *testing.T) {
+	if !isProxyOutbound(map[string]interface{}{"type": "mixed", "tag": "manual-mixed"}) {
+		t.Fatal("a manually configured mixed endpoint must remain importable for subscription expansion")
 	}
 }

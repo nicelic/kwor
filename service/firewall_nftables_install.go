@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,21 +20,40 @@ const (
 	firewallNftReasonUnsupportedManager = "unsupported_manager"
 	firewallNftReasonImmutableOS        = "immutable_os"
 	firewallNftReasonInstallFailed      = "install_failed"
+	firewallNftReasonCapabilityError    = "capability_error"
+	firewallNftReasonLayoutPending      = "layout_pending"
+	firewallNftReasonApplyFailed        = "apply_failed"
 	firewallNftReasonReady              = "ready"
 )
 
 type FirewallNftablesStatus struct {
-	Supported            bool     `json:"supported"`
-	Installed            bool     `json:"installed"`
-	AutoInstallSupported bool     `json:"autoInstallSupported"`
-	BinaryPath           string   `json:"binaryPath,omitempty"`
-	SystemFamily         string   `json:"systemFamily,omitempty"`
-	DistributionID       string   `json:"distributionId,omitempty"`
-	VersionID            string   `json:"versionId,omitempty"`
-	Codename             string   `json:"codename,omitempty"`
-	PackageManager       string   `json:"packageManager,omitempty"`
-	ManualCommands       []string `json:"manualCommands"`
-	Reason               string   `json:"reason"`
+	Supported               bool     `json:"supported"`
+	Installed               bool     `json:"installed"`
+	AutoInstallSupported    bool     `json:"autoInstallSupported"`
+	BinaryPath              string   `json:"binaryPath,omitempty"`
+	NftVersion              string   `json:"nftVersion,omitempty"`
+	KernelVersion           string   `json:"kernelVersion,omitempty"`
+	CompatibilityMode       string   `json:"compatibilityMode,omitempty"`
+	RendererSupported       bool     `json:"rendererSupported"`
+	SupportsJSON            bool     `json:"supportsJson"`
+	SupportsNamedCounters   bool     `json:"supportsNamedCounters"`
+	SupportsMeters          bool     `json:"supportsMeters"`
+	SupportsInetNAT         bool     `json:"supportsInetNat"`
+	SupportsTransportHeader bool     `json:"supportsTransportHeader"`
+	SupportsTableComments   bool     `json:"supportsTableComments"`
+	CapabilityError         string   `json:"capabilityError,omitempty"`
+	VersionProbeError       string   `json:"versionProbeError,omitempty"`
+	JSONProbeError          string   `json:"jsonProbeError,omitempty"`
+	MeterProbeError         string   `json:"meterProbeError,omitempty"`
+	LayoutPending           bool     `json:"layoutPending"`
+	LastApplyError          string   `json:"lastApplyError,omitempty"`
+	SystemFamily            string   `json:"systemFamily,omitempty"`
+	DistributionID          string   `json:"distributionId,omitempty"`
+	VersionID               string   `json:"versionId,omitempty"`
+	Codename                string   `json:"codename,omitempty"`
+	PackageManager          string   `json:"packageManager,omitempty"`
+	ManualCommands          []string `json:"manualCommands"`
+	Reason                  string   `json:"reason"`
 }
 
 type firewallNftInstallPlan struct {
@@ -65,12 +83,11 @@ type firewallLinuxDistribution struct {
 }
 
 var (
-	firewallRuntimeGOOS      = runtime.GOOS
 	firewallCommandLookPath  = exec.LookPath
-	firewallReadFile         = os.ReadFile
 	firewallGeteuid          = os.Geteuid
 	firewallRunInstall       = runFirewallNftInstallCommand
-	firewallOSReleasePaths   = []string{"/etc/os-release", "/usr/lib/os-release"}
+	firewallIsLinuxHost      = IsSystemPlatformLinux
+	firewallOSReleaseFields  = GetSystemPlatformReleaseFields
 	firewallNftInstallStateM sync.Mutex
 	firewallNftInstallState  = struct {
 		lastFailure string
@@ -114,14 +131,11 @@ func (ctx firewallPrivilegeContext) canAutoInstall() bool {
 }
 
 func readFirewallOsReleaseFields() map[string]string {
-	for _, path := range firewallOSReleasePaths {
-		content, err := firewallReadFile(path)
-		if err != nil {
-			continue
-		}
-		return parseOsReleaseFields(string(content))
+	fields := firewallOSReleaseFields()
+	if len(fields) == 0 {
+		return map[string]string{}
 	}
-	return map[string]string{}
+	return fields
 }
 
 func parseFirewallLinuxDistribution(fields map[string]string) firewallLinuxDistribution {
@@ -208,22 +222,11 @@ func isUbuntuVersionAtLeast(major int, minor int, minMajor int, minMinor int) bo
 }
 
 func detectFirewallLinuxSystemFamily(fields map[string]string) string {
-	idLike := strings.ToLower(strings.TrimSpace(fields["ID_LIKE"]))
-	id := strings.ToLower(strings.TrimSpace(fields["ID"]))
-	switch {
-	case strings.Contains(idLike, "debian") || id == "debian" || id == "ubuntu":
-		return "debian"
-	case strings.Contains(idLike, "rhel") || strings.Contains(idLike, "fedora") || id == "fedora" || id == "rhel" || id == "centos" || id == "rocky" || id == "almalinux" || id == "ol" || id == "oracle" || id == "amzn":
-		return "rhel"
-	case strings.Contains(idLike, "suse") || id == "sles" || id == "opensuse" || id == "opensuse-leap" || id == "opensuse-tumbleweed":
-		return "suse"
-	case strings.Contains(idLike, "arch") || id == "arch" || id == "manjaro":
-		return "arch"
-	case id == "alpine":
-		return "alpine"
-	default:
+	family := detectSystemPlatformFamily(fields["ID"], fields["ID_LIKE"])
+	if family == "" {
 		return "unknown"
 	}
+	return family
 }
 
 func supportedDebianOrUbuntuNftInstall(distribution firewallLinuxDistribution) bool {
@@ -517,9 +520,26 @@ func getFirewallNftInstallFailure() string {
 }
 
 func buildFirewallNftablesStatus(available bool) FirewallNftablesStatus {
+	capabilities := GetNftablesCapabilities()
 	status := FirewallNftablesStatus{
-		Supported: firewallRuntimeGOOS == "linux",
-		Reason:    firewallNftReasonNotLinux,
+		Supported:               firewallIsLinuxHost(),
+		Reason:                  firewallNftReasonNotLinux,
+		NftVersion:              capabilities.NftVersion,
+		KernelVersion:           capabilities.KernelVersion,
+		CompatibilityMode:       capabilities.CompatibilityMode,
+		RendererSupported:       capabilities.RendererSupported,
+		SupportsJSON:            capabilities.SupportsJSON,
+		SupportsNamedCounters:   capabilities.SupportsNamedCounters,
+		SupportsMeters:          capabilities.SupportsMeters,
+		SupportsInetNAT:         capabilities.SupportsInetNAT,
+		SupportsTransportHeader: capabilities.SupportsTransportHeader,
+		SupportsTableComments:   capabilities.SupportsTableComments,
+		CapabilityError:         capabilities.CapabilityError,
+		VersionProbeError:       capabilities.VersionProbeError,
+		JSONProbeError:          capabilities.JSONProbeError,
+		MeterProbeError:         capabilities.MeterProbeError,
+		LayoutPending:           nftCapabilityLayoutReconcilePending(),
+		LastApplyError:          nftCapabilityLayoutLastApplyError(),
 	}
 	if !status.Supported {
 		return status
@@ -535,25 +555,32 @@ func buildFirewallNftablesStatus(available bool) FirewallNftablesStatus {
 	status.DistributionID = distribution.ID
 	status.VersionID = distribution.Version
 	status.Codename = distribution.Codename
-		if plan != nil {
-			status.PackageManager = plan.Name
-			status.SystemFamily = firstNonEmpty(plan.SystemFamily, systemFamily, "unknown")
-			status.DistributionID = firstNonEmpty(plan.DistributionID, status.DistributionID)
-			status.VersionID = firstNonEmpty(plan.VersionID, status.VersionID)
-			status.Codename = firstNonEmpty(plan.Codename, status.Codename)
-			status.ManualCommands = buildFirewallManualCommands(plan, privilege)
-		}
+	if plan != nil {
+		status.PackageManager = plan.Name
+		status.SystemFamily = firstNonEmpty(plan.SystemFamily, systemFamily, "unknown")
+		status.DistributionID = firstNonEmpty(plan.DistributionID, status.DistributionID)
+		status.VersionID = firstNonEmpty(plan.VersionID, status.VersionID)
+		status.Codename = firstNonEmpty(plan.Codename, status.Codename)
+		status.ManualCommands = buildFirewallManualCommands(plan, privilege)
+	}
 	status.AutoInstallSupported = plan != nil && !plan.Immutable && privilege.canAutoInstall()
 
 	if binaryPath, err := resolveNftBinaryPath(); err == nil {
 		status.Installed = true
 		status.BinaryPath = binaryPath
-		if available {
+		switch {
+		case !status.RendererSupported:
+			status.Reason = firewallNftReasonCapabilityError
+		case !available:
+			status.Reason = firewallNftReasonPermissionDenied
+		case strings.TrimSpace(status.LastApplyError) != "":
+			status.Reason = firewallNftReasonApplyFailed
+		case status.LayoutPending:
+			status.Reason = firewallNftReasonLayoutPending
+		default:
 			status.Reason = firewallNftReasonReady
 			clearFirewallNftInstallFailure()
-			return status
 		}
-		status.Reason = firewallNftReasonPermissionDenied
 		return status
 	}
 
@@ -647,13 +674,27 @@ func buildFirewallNftablesOverviewError(status FirewallNftablesStatus) string {
 			message += ". Run manually: " + manualText
 		}
 		return message
+	case firewallNftReasonCapabilityError:
+		message := strings.TrimSpace(status.CapabilityError)
+		if message == "" {
+			message = "nftables version capability detection failed"
+		}
+		return message
+	case firewallNftReasonLayoutPending:
+		return "nftables compatibility layout is waiting for complete restore and verification"
+	case firewallNftReasonApplyFailed:
+		message := strings.TrimSpace(status.LastApplyError)
+		if message == "" {
+			message = "unknown layout apply error"
+		}
+		return "nftables compatibility layout restore failed: " + message
 	default:
 		return "nftables status is unavailable"
 	}
 }
 
 func (s *FirewallService) InstallNftables() (*FirewallOverview, error) {
-	if firewallRuntimeGOOS != "linux" {
+	if !firewallIsLinuxHost() {
 		return nil, common.NewError("nftables install is supported on Linux only")
 	}
 
@@ -662,6 +703,13 @@ func (s *FirewallService) InstallNftables() (*FirewallOverview, error) {
 	if status.Installed {
 		if available {
 			clearFirewallNftInstallFailure()
+			capabilities := RefreshNftablesCapabilities()
+			if !capabilities.RendererSupported {
+				return nil, common.NewError(buildFirewallNftablesOverviewError(buildFirewallNftablesStatus(false)))
+			}
+			if err := syncManagedNftablesAfterCapabilityRefresh(); err != nil {
+				return nil, common.NewError("nftables compatibility restore failed: ", err)
+			}
 			return s.GetOverview()
 		}
 		return nil, common.NewError(buildFirewallNftablesOverviewError(status))
@@ -684,6 +732,13 @@ func (s *FirewallService) InstallNftables() (*FirewallOverview, error) {
 	}
 
 	clearFirewallNftInstallFailure()
+	capabilities := RefreshNftablesCapabilities()
+	if !capabilities.RendererSupported {
+		return nil, common.NewError(buildFirewallNftablesOverviewError(buildFirewallNftablesStatus(false)))
+	}
+	if err := syncManagedNftablesAfterCapabilityRefresh(); err != nil {
+		return nil, common.NewError("nftables compatibility restore failed: ", err)
+	}
 	overview, err := s.GetOverview()
 	if err != nil {
 		return nil, err
@@ -693,4 +748,22 @@ func (s *FirewallService) InstallNftables() (*FirewallOverview, error) {
 		return nil, common.NewError(buildFirewallNftablesOverviewError(buildFirewallNftablesStatus(false)))
 	}
 	return overview, nil
+}
+
+// syncManagedNftablesAfterCapabilityRefresh only runs after the documented
+// cache-refresh boundaries. It deliberately does not live in overview polling:
+// a version probe/layout migration is a lifecycle operation, not a UI read.
+func syncManagedNftablesAfterCapabilityRefresh() error {
+	if !nftCapabilityLayoutReconcilePending() {
+		return nil
+	}
+	baseErr := syncManagedNftablesOnStartup()
+	// This path runs from an already-started panel, so its listeners are ready.
+	// Port forwarding is intentionally restored after those listeners rather
+	// than as part of the early firewall/traffic restore chain.
+	forwardErr := syncPortForwardNftablesAfterListenersOnStartup()
+	if baseErr != nil {
+		return baseErr
+	}
+	return forwardErr
 }

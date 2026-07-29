@@ -1,6 +1,8 @@
 package cronjob
 
 import (
+	"sync"
+
 	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/service"
 )
@@ -8,6 +10,8 @@ import (
 type StatsJob struct {
 	service.StatsService
 	enableTraffic bool
+	mu            sync.Mutex
+	running       bool
 }
 
 func NewStatsJob(saveTraffic bool) *StatsJob {
@@ -17,6 +21,12 @@ func NewStatsJob(saveTraffic bool) *StatsJob {
 }
 
 func (s *StatsJob) Run() {
+	if !s.beginRun() {
+		logger.Warning("stats job is still running; skip this scheduled run")
+		return
+	}
+	defer s.finishRun()
+
 	// Keep port-hop refresh alive even when traffic accounting is disabled.
 	if refreshErr := s.StatsService.NftTrafficService.RefreshPortHopRedirects(); refreshErr != nil {
 		logger.Warning("port hop refresh failed: ", refreshErr)
@@ -61,4 +71,20 @@ func (s *StatsJob) Run() {
 	if blockErr := (&service.MihomoClientPortBlockService{}).Reconcile((&service.MihomoCoreManagerService{}).IsRunning()); blockErr != nil {
 		logger.Warning("mihomo client block nft reconcile failed: ", blockErr)
 	}
+}
+
+func (s *StatsJob) beginRun() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		return false
+	}
+	s.running = true
+	return true
+}
+
+func (s *StatsJob) finishRun() {
+	s.mu.Lock()
+	s.running = false
+	s.mu.Unlock()
 }

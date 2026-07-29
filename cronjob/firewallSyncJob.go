@@ -1,7 +1,6 @@
 package cronjob
 
 import (
-	"runtime"
 	"time"
 
 	"github.com/alireza0/s-ui/logger"
@@ -17,7 +16,7 @@ func NewFirewallSyncJob() *FirewallSyncJob {
 }
 
 func (j *FirewallSyncJob) Run() {
-	if runtime.GOOS != "linux" {
+	if !service.IsSystemPlatformLinux() {
 		return
 	}
 	if err := j.FirewallService.SyncIfNeeded(3 * time.Second); err != nil {

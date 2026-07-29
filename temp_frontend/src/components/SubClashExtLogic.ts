@@ -3,15 +3,15 @@
 import { push } from 'notivue'
 import { i18n } from '@/locales'
 import yaml from 'yaml'
+import { probeSubscriptionRuleSets } from './subscriptionRuleSetProbe'
 import {
   defaultClashConfig,
   defaultFakeIpRange,
   clashDomainIpTypes,
-  CLASH_RULE_SET_URL_TEMPLATES,
-  CLASH_METACUBEX_NAME_MAP,
-  CLASH_SOURCES_NEED_NAME_MAP,
   CLASH_RULE_SET_NAME_OPTIONS_BY_SOURCE,
 } from './SubClashExtConstants'
+
+const SUBSCRIPTION_EXTENSION_MAX_BYTES = 4 * 1024 * 1024
 
 const CLASH_ALLOWED_RULE_SET_EXTENSIONS = new Set(['.mrs', '.yaml', '.yml', '.txt', '.list'])
 
@@ -30,10 +30,7 @@ function normalizeClashRuleSetSource(input: any): string {
     return source
   }
 
-  if (Object.prototype.hasOwnProperty.call(CLASH_RULE_SET_URL_TEMPLATES, source)) {
-    return source
-  }
-  return 'metacubex_cdn'
+	return source
 }
 
 function normalizeOptionalClashRuleSetSource(input: any): string | null {
@@ -52,11 +49,7 @@ function normalizeOptionalClashRuleSetSource(input: any): string | null {
   if (source === 'loyalsoldier_github') {
     return source
   }
-  if (Object.prototype.hasOwnProperty.call(CLASH_RULE_SET_URL_TEMPLATES, source)) {
-    return source
-  }
-
-  return null
+	return source
 }
 
 function getClashRuleSetSourceCacheKey(source: string): string {
@@ -166,31 +159,6 @@ function extractRuleSetNameFromUrl(input: string): string {
   return normalizeName(withoutExt)
 }
 
-function buildClashRuleSetUrl(source: string, prefix: 'geosite' | 'geoip', name: string): string {
-  const rawName = typeof name === 'string' ? name.trim() : ''
-  if (!rawName) return ''
-
-  if (isHttpRuleSetInput(rawName)) {
-    return rawName
-  }
-
-  const cleanName = normalizeName(rawName)
-  if (!cleanName) return ''
-
-  const normalizedSource = normalizeClashRuleSetSource(source)
-  const templates = CLASH_RULE_SET_URL_TEMPLATES[normalizedSource]
-  if (templates) {
-    let finalName = cleanName
-    if (CLASH_SOURCES_NEED_NAME_MAP.includes(normalizedSource)) {
-      finalName = CLASH_METACUBEX_NAME_MAP[cleanName] || cleanName
-    }
-    const template = prefix === 'geosite' ? templates.geosite : templates.geoip
-    return template.replace('{name}', finalName)
-  }
-
-  return ''
-}
-
 function getRuleSetEntryFormat(source: string, url: string): 'mrs' | 'text' | 'yaml' {
   const normalizedSource = normalizeClashRuleSetSource(source)
   const ext = getRuleSetUrlExtension(url)
@@ -267,21 +235,6 @@ function isSameStringArray(a: string[], b: string[]): boolean {
   return true
 }
 
-async function validateUrl(url: string): Promise<boolean> {
-  if (!url) return false
-  try {
-    const response = await fetch(url, { method: 'HEAD', mode: 'cors', signal: AbortSignal.timeout(8000) })
-    return response.ok
-  } catch {
-    try {
-      const response = await fetch(url, { method: 'HEAD', mode: 'no-cors', signal: AbortSignal.timeout(8000) })
-      return response.type === 'opaque'
-    } catch {
-      return false
-    }
-  }
-}
-
 function deepCopyClashValue<T>(value: T): T {
   return JSON.parse(JSON.stringify(value))
 }
@@ -300,11 +253,11 @@ function getMihomoLatencyIntervalError(input: any): string {
   if (!value) return ''
 
   if (/^\d+$/.test(value)) {
-    return '测试延迟间隔必须使用秒单位 s，例如 30s。'
+	return String(i18n.global.t('subscriptionEditor.clashIntervalRequired'))
   }
 
   if (!/^[1-9]\d*s$/i.test(value)) {
-    return '测试延迟间隔格式无效，仅支持“正整数 + s（秒）”，不支持 ms/m/h/d。'
+	return String(i18n.global.t('subscriptionEditor.clashIntervalInvalid'))
   }
 
   return ''
@@ -322,7 +275,7 @@ function getLatencyToleranceMsError(input: any): string {
   if (!value) return ''
 
   if (!/^[1-9]\d*$/.test(value)) {
-    return '延迟容差单位为 ms；可留空，填写时仅输入数字（不要写 ms）。'
+	return String(i18n.global.t('subscriptionEditor.toleranceInvalid'))
   }
 
   return ''
@@ -750,6 +703,7 @@ type ClashRuleSetScope = 'domain' | 'ip'
 type ClashRuleSetSourceBinding = 'global' | 'override'
 
 type ClashRuleRow = {
+	id: string
   kind: ClashRuleKind
   name: string
   customType: string
@@ -765,11 +719,13 @@ type ClashDnsPolicyRouteTarget = 'nameserver' | 'fallback' | 'direct-nameserver'
 type ClashDnsSuffixTarget = 'direct-nameserver' | 'proxy-server-nameserver' | 'nameserver' | 'fallback' | 'default-nameserver'
 type ClashDnsSuffixSelection = '节点选择' | 'proxy' | 'disable-ipv4=true' | 'disable-ipv6=true' | 'skip-cert-verify=true' | 'h3=true'
 type ClashDnsSuffixRow = {
+	id: string
   targets: ClashDnsSuffixTarget[]
   selections: ClashDnsSuffixSelection[]
 }
 
 type ClashDnsPolicyRow = {
+	id: string
   matchType: ClashDnsPolicyMatchType
   routeTarget: ClashDnsPolicyRouteTarget
   values: string[]
@@ -789,6 +745,14 @@ type ClashUdpPortRangesInputParseResult = {
 const clashRuleRouteValues: ClashRuleRoute[] = ['REJECT', 'DIRECT', 'Proxy']
 const clashRuleKindValues: ClashRuleKind[] = ['custom', 'ruleset']
 const clashRuleSetScopeValues: ClashRuleSetScope[] = ['domain', 'ip']
+let clashRowSequence = 0
+
+function stableClashRowId(raw: any, prefix: string): string {
+	const existing = typeof raw?.id === 'string' ? raw.id.trim() : ''
+	if (existing) return existing
+	clashRowSequence += 1
+	return `${prefix}-${Date.now().toString(36)}-${clashRowSequence.toString(36)}`
+}
 const clashNoResolveSupportedCustomTypes = new Set<string>(['IP-CIDR', 'IP-CIDR6', 'IP-SUFFIX', 'IP-ASN', 'GEOIP'])
 const clashNodeSelectorTag = '节点选择'
 const clashAutoSelectorTag = '自动选择'
@@ -940,7 +904,7 @@ function parseClashUdpPortRangesInput(input: any): ClashUdpPortRangesInputParseR
       return {
         ranges: [],
         normalized: '',
-        error: `端口输入格式无效：${token}。示例：443,888-999 或 443，888：999`,
+		error: String(i18n.global.t('subscriptionEditor.udpPortsInvalid', { token })),
       }
     }
     ranges.push(parsed)
@@ -1244,8 +1208,9 @@ function normalizeClashDnsSuffixSelections(input: any): ClashDnsSuffixSelection[
   })
 }
 
-function createDefaultClashDnsSuffixRow(targets: any = [], selections: any = []): ClashDnsSuffixRow {
+function createDefaultClashDnsSuffixRow(targets: any = [], selections: any = [], id?: string): ClashDnsSuffixRow {
   return {
+	id: id || stableClashRowId(null, 'clash-dns-suffix'),
     targets: normalizeClashDnsSuffixTargets(targets),
     selections: normalizeClashDnsSuffixSelections(selections),
   }
@@ -1256,7 +1221,8 @@ function normalizeClashDnsSuffixRows(input: any): ClashDnsSuffixRow[] {
   const rows = rawRows.map((raw: any) =>
     createDefaultClashDnsSuffixRow(
       raw?.targets ?? raw?.target ?? raw?.dnsTargets ?? raw?.dnsTarget,
-      raw?.selections ?? raw?.selection ?? raw?.suffixes ?? raw?.suffix
+	  raw?.selections ?? raw?.selection ?? raw?.suffixes ?? raw?.suffix,
+	  stableClashRowId(raw, 'clash-dns-suffix')
     )
   )
 
@@ -1280,6 +1246,7 @@ function filterPersistedClashDnsSuffixRows(rows: ClashDnsSuffixRow[]): ClashDnsS
   return rows
     .filter((row: ClashDnsSuffixRow) => row.targets.length > 0 && row.selections.length > 0)
     .map((row: ClashDnsSuffixRow) => ({
+	  id: row.id,
       targets: [...row.targets],
       selections: [...row.selections],
     }))
@@ -1287,6 +1254,7 @@ function filterPersistedClashDnsSuffixRows(rows: ClashDnsSuffixRow[]): ClashDnsS
 
 function cloneClashDnsSuffixRows(rows: ClashDnsSuffixRow[]): ClashDnsSuffixRow[] {
   return rows.map((row: ClashDnsSuffixRow) => ({
+	id: row.id,
     targets: [...row.targets],
     selections: [...row.selections],
   }))
@@ -1509,8 +1477,9 @@ function normalizeClashDnsPolicyValues(matchType: ClashDnsPolicyMatchType, input
   return result
 }
 
-function createDefaultClashDnsPolicyRow(routeTarget: ClashDnsPolicyRouteTarget = 'nameserver'): ClashDnsPolicyRow {
+function createDefaultClashDnsPolicyRow(routeTarget: ClashDnsPolicyRouteTarget = 'nameserver', id?: string): ClashDnsPolicyRow {
   return {
+	id: id || stableClashRowId(null, 'clash-dns-policy'),
     matchType: 'geosite',
     routeTarget,
     values: [],
@@ -1528,6 +1497,7 @@ function normalizeClashDnsPolicyRows(input: any): ClashDnsPolicyRow[] {
     const values = normalizeClashDnsPolicyValues(matchType, raw?.values, rawMatchType)
 
     return {
+	  id: stableClashRowId(raw, 'clash-dns-policy'),
       matchType,
       routeTarget,
       values,
@@ -1636,6 +1606,7 @@ function buildLegacyClashDnsPolicyRows(metaJson: any): ClashDnsPolicyRow[] {
     }
 
     rows.push({
+	  id: stableClashRowId(parsed, 'clash-dns-policy'),
       matchType: parsed.matchType,
       routeTarget,
       values: [...parsed.values],
@@ -1647,6 +1618,7 @@ function buildLegacyClashDnsPolicyRows(metaJson: any): ClashDnsPolicyRow[] {
 
 function createDefaultClashRuleRow(kind: ClashRuleKind, route: ClashRuleRoute = 'REJECT'): ClashRuleRow {
   return {
+	id: stableClashRowId(null, 'clash-rule'),
     kind,
     name: '',
     customType: 'DOMAIN-KEYWORD',
@@ -1752,6 +1724,7 @@ function normalizeClashRuleRows(input: any): ClashRuleRow[] {
     const values = normalizeClashRuleValues(raw?.values)
 
     return {
+	  id: stableClashRowId(raw, 'clash-rule'),
       kind: inferredKind,
       name,
       customType,
@@ -1785,6 +1758,7 @@ function buildLegacyClashRuleRows(config: any): ClashRuleRow[] {
     const values = normalizeClashRuleValues(valuesVal)
     if (values.length === 0) return
     slots[slot] = {
+	  id: stableClashRowId(null, 'clash-rule'),
       kind: 'custom',
       name: '',
       customType: normalizeClashCustomType(typeVal),
@@ -1800,6 +1774,7 @@ function buildLegacyClashRuleRows(config: any): ClashRuleRow[] {
     const values = normalizeClashRuleValues(valuesVal)
     if (values.length === 0) return
     slots[slot] = {
+	  id: stableClashRowId(null, 'clash-rule'),
       kind: 'ruleset',
       name: '',
       customType: 'DOMAIN-KEYWORD',
@@ -1836,39 +1811,42 @@ function buildLegacyClashRuleRows(config: any): ClashRuleRow[] {
   return normalizeClashRuleRows(rows)
 }
 
-const validationTimers: Record<string, ReturnType<typeof setTimeout>> = {}
-
 export const SubClashExtMixin = {
   created(this: any) {
+	this._probeAbortController = new AbortController()
     this.captureClashRuleRowsValidationSnapshot(this.clashRuleRows)
+  },
+  beforeUnmount(this: any) {
+	this.ruleSetResolutionRunToken = (this.ruleSetResolutionRunToken || 0) + 1
+	this._probeAbortController?.abort()
   },
   watch: {
     'settings.subClashExt': {
       handler(this: any, v: string) {
-        if (!v) {
+		const raw = typeof v === 'string' ? v : ''
+		this._rawSource = raw
+		if (!raw.trim()) {
           this.metaJson = {}
+		  this._parseError = ''
           return
         }
         try {
-          const parsed = yaml.parse(v) ?? {}
+		  const document = yaml.parseDocument(raw, { uniqueKeys: true })
+		  if (document.errors.length > 0) throw document.errors[0]
+		  const parsed = document.toJS() ?? {}
+		  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+			throw new Error(String(i18n.global.t('subscriptionEditor.yamlTopLevel')))
+		  }
           if (JSON.stringify(parsed) !== JSON.stringify(this.metaJson)) {
             this.metaJson = parsed
           }
-        } catch (_e) {
-          // Ignore invalid yaml while typing.
+		  this._parseError = ''
+		} catch (error: any) {
+		  this._parseError = String(i18n.global.t('subscriptionEditor.yamlParseFailed', { error: String(error?.message || error) }))
+		  this.metaJson = {}
         }
       },
       immediate: true,
-    },
-
-    metaJson: {
-      handler(this: any, v: any) {
-        const str = (!v || Object.keys(v).length === 0) ? '' : yaml.stringify(v)
-        if (str !== this.settings.subClashExt) {
-          this.settings.subClashExt = str
-        }
-      },
-      deep: true,
     },
 
     'metaJson._uiConfig': {
@@ -2215,6 +2193,84 @@ export const SubClashExtMixin = {
   },
 
   methods: {
+	markUserDirty(this: any) {
+	  const wasDirty = this._dirty === true
+	  this._dirty = true
+	  this._resetRequested = false
+	  this._editorSourcePending = false
+	  if (!wasDirty) this.$emit?.('dirty-change', true)
+	},
+	isDirty(this: any): boolean {
+	  return this._dirty === true
+	},
+	validateAndSerialize(this: any) {
+	  const dirty = this._dirty === true
+	  if (!dirty) {
+		return { ok: true, dirty: false, value: this._rawSource || '' }
+	  }
+	  if (this._resetRequested === true) {
+		return { ok: true, dirty: true, reset: true, value: '' }
+	  }
+	  if (this._parseError) {
+		return { ok: false, dirty: true, value: this._rawSource || '', error: this._parseError }
+	  }
+	  if (this._editorSourcePending === true) {
+		const validationError = this.validateSubscriptionForm?.()
+		let value = ''
+		try {
+		  value = (!this.metaJson || Object.keys(this.metaJson).length === 0) ? '' : yaml.stringify(this.metaJson)
+		} catch (error: any) {
+		  return { ok: false, dirty: true, value: '', error: String(i18n.global.t('subscriptionEditor.yamlSerializeFailed', { error: String(error?.message || error) })) }
+		}
+		if (new TextEncoder().encode(value).length > SUBSCRIPTION_EXTENSION_MAX_BYTES) {
+		  return { ok: false, dirty: true, value, error: String(i18n.global.t('subscriptionEditor.configTooLarge')) }
+		}
+		this.settings.subClashExt = value
+		this._rawSource = value
+		return { ok: !validationError, dirty: true, value, error: validationError || '' }
+	  }
+	  const suffixCommitted = this.commitClashDnsSuffixSelections?.()
+	  if (suffixCommitted === false) {
+		return { ok: false, dirty: true, value: this._rawSource || '', error: String(i18n.global.t('subscriptionEditor.dnsSuffixIncomplete')) }
+	  }
+	  this.commitClashRuleRows?.()
+	  this.commitClashDnsPolicyRows?.()
+	  this.regenerateClashConfig?.()
+	  const validationError = this.validateSubscriptionForm?.()
+	  let value = ''
+	  try {
+		value = (!this.metaJson || Object.keys(this.metaJson).length === 0) ? '' : yaml.stringify(this.metaJson)
+	  } catch (error: any) {
+		return { ok: false, dirty: true, value: '', error: String(i18n.global.t('subscriptionEditor.yamlSerializeFailed', { error: String(error?.message || error) })) }
+	  }
+	  if (new TextEncoder().encode(value).length > SUBSCRIPTION_EXTENSION_MAX_BYTES) {
+		return { ok: false, dirty: true, value, error: String(i18n.global.t('subscriptionEditor.configTooLarge')) }
+	  }
+	  this.settings.subClashExt = value
+	  this._rawSource = value
+	  return { ok: !validationError, dirty: true, value, error: validationError || '' }
+	},
+	validateSubscriptionForm(this: any): string {
+	  if (this.latencyTestIntervalError) return this.latencyTestIntervalError
+	  if (this.latencyToleranceError) return this.latencyToleranceError
+	  if (this.rejectUdpPortsInputError) return this.rejectUdpPortsInputError
+	  const mixedPort = Number(this.metaJson?.['mixed-port'])
+	  if (!Number.isInteger(mixedPort) || mixedPort < 1 || mixedPort > 65535) {
+		return String(i18n.global.t('subscriptionEditor.mixedPortInvalid'))
+	  }
+	  const mtu = this.metaJson?.tun?.mtu
+	  if (mtu !== undefined && (!Number.isInteger(Number(mtu)) || Number(mtu) < 576 || Number(mtu) > 65535)) {
+		return String(i18n.global.t('subscriptionEditor.tunMtuInvalid'))
+	  }
+	  return ''
+	},
+	acknowledgeSaved(this: any, value: string) {
+	  this._dirty = false
+	  this._resetRequested = false
+	  this._editorSourcePending = false
+	  this._rawSource = value
+	  this.$emit?.('dirty-change', false)
+	},
     getPreviousClashRuleRowsForValidation(this: any, oldRows: any[]): ClashRuleRow[] {
       const snapshot = this._clashRuleRowsValidationSnapshot
       if (Array.isArray(snapshot) && snapshot.length > 0) {
@@ -2226,6 +2282,9 @@ export const SubClashExtMixin = {
       this._clashRuleRowsValidationSnapshot = JSON.parse(JSON.stringify(normalizeClashRuleRows(rows)))
     },
     openEditor(this: any) {
+	  this.ruleSetResolutionRunToken = (this.ruleSetResolutionRunToken || 0) + 1
+	  this._probeAbortController?.abort()
+	  this._probeAbortController = new AbortController()
       this.enableEditor = true
     },
     resetSubClashPage(this: any) {
@@ -2239,10 +2298,21 @@ export const SubClashExtMixin = {
         }
       }
 
-      this.metaJson = {}
-      this.settings.subClashExt = ''
+	  try {
+		const document = yaml.parseDocument(String(this.canonicalDefault || '{}'), { uniqueKeys: true })
+		this.metaJson = document.errors.length > 0 ? {} : (document.toJS() ?? {})
+	  } catch {
+		this.metaJson = {}
+	  }
+	  this.settings.subClashExt = String(this.canonicalDefault || '')
+	  this._rawSource = this.settings.subClashExt
+	  this._parseError = ''
+	  this._dirty = true
+	  this._resetRequested = true
+	  this._editorSourcePending = false
       this._uiConfigLoaded = false
       this.captureClashRuleRowsValidationSnapshot(this.clashRuleRows)
+	  this.$emit?.('dirty-change', true)
 
       this.$nextTick(() => {
         this._suspendClashRegeneration = false
@@ -2250,16 +2320,25 @@ export const SubClashExtMixin = {
     },
     saveEditor(this: any, data: string) {
       try {
-        const result = yaml.parse(data)
-        if (typeof result !== 'object' || Array.isArray(result)) {
+		const document = yaml.parseDocument(data, { uniqueKeys: true })
+		if (document.errors.length > 0) throw document.errors[0]
+		const result = document.toJS()
+		if (result === null || typeof result !== 'object' || Array.isArray(result)) {
           push.error({
             message: i18n.global.t('failed') + ': ' + i18n.global.t('error.invalidData'),
             duration: 5000,
           })
-          return
-        }
+		  return
+		}
+		this.markUserDirty()
+		this._parseError = ''
+		this._resetRequested = false
+		this._editorSourcePending = true
         this.metaJson = result
         this._uiConfigLoaded = false
+		const normalized = yaml.stringify(this.metaJson)
+		this._rawSource = normalized
+		this.settings.subClashExt = normalized
         this.enableEditor = false
       } catch (_e) {
         push.error({
@@ -2302,12 +2381,21 @@ export const SubClashExtMixin = {
     },
 
     getTypeLabel(this: any, type: string): string {
-      const found = clashDomainIpTypes.find((t) => t.value === type)
-      return found ? found.title : type
+	  const keys: Record<string, string> = {
+		DOMAIN: 'subscriptionEditor.domainExact',
+		'DOMAIN-SUFFIX': 'subscriptionEditor.domainSuffix',
+		'DOMAIN-KEYWORD': 'subscriptionEditor.domainKeyword',
+		'DOMAIN-WILDCARD': 'subscriptionEditor.domainWildcard',
+		'DOMAIN-REGEX': 'subscriptionEditor.domainRegex',
+		'IP-CIDR': 'subscriptionEditor.ipCidr',
+		'IP-CIDR6': 'subscriptionEditor.ipCidr6',
+		'IP-SUFFIX': 'subscriptionEditor.ipSuffix',
+	  }
+	  return keys[type] ? `${i18n.global.t(keys[type])} (${type})` : type
     },
 
     getRuleSetScopeLabel(this: any, scope: string): string {
-      return scope === 'ip' ? 'IP 规则集' : '域名规则集'
+	  return String(i18n.global.t(scope === 'ip' ? 'subscriptionEditor.ipRuleSet' : 'subscriptionEditor.domainRuleSet'))
     },
 
     getClashRuleSetResolveContextForRow(
@@ -2387,12 +2475,12 @@ export const SubClashExtMixin = {
         if (seen.has(key)) continue
         seen.add(key)
 
-        const message = issue.code === 'custom_conflicts_ruleset'
-          ? `规则集名称冲突：自定义匹配名称“${name}”与规则集名称重复，已自动清空该名称。`
-          : `匹配类型不一致：自定义匹配名称“${name}”仅允许同匹配类型合并（当前应为 ${issue.expectedType || '同类型'}），已自动清空该名称。`
+		const message = issue.code === 'custom_conflicts_ruleset'
+		  ? String(i18n.global.t('subscriptionEditor.ruleNameConflict', { name }))
+		  : String(i18n.global.t('subscriptionEditor.ruleTypeConflict', { name, type: issue.expectedType || issue.currentType }))
 
         push.warning({
-          title: '名称已自动修正',
+		  title: String(i18n.global.t('subscriptionEditor.nameAutoFixed')),
           message,
           duration: 5000,
         })
@@ -2580,12 +2668,12 @@ export const SubClashExtMixin = {
       if (incompleteRows.length > 0) {
         const messages = incompleteRows.map(({ row, index }: { row: ClashDnsSuffixRow; index: number }) => {
           if (row.targets.length === 0) {
-            return `第 ${index + 1} 行 dns-选择 不能为空。`
+			return String(i18n.global.t('subscriptionEditor.dnsSuffixTargetsRequired', { row: index + 1 }))
           }
-          return `第 ${index + 1} 行 dns后缀 不能为空。`
+		  return String(i18n.global.t('subscriptionEditor.dnsSuffixSelectionsRequired', { row: index + 1 }))
         })
         push.error({
-          title: '保存失败',
+		  title: String(i18n.global.t('subscriptionEditor.saveFailed')),
           message: messages.join(' '),
           duration: 5000,
         })
@@ -2604,8 +2692,8 @@ export const SubClashExtMixin = {
       if (!dnsConfig || typeof dnsConfig !== 'object' || Array.isArray(dnsConfig)) {
         if (persistedRows.length > 0) {
           push.error({
-            title: '保存失败',
-            message: 'DNS 未启用或未填写，无法应用 dns后缀。',
+			title: String(i18n.global.t('subscriptionEditor.saveFailed')),
+			message: String(i18n.global.t('subscriptionEditor.dnsSuffixDnsDisabled')),
             duration: 5000,
           })
           return false
@@ -2619,8 +2707,10 @@ export const SubClashExtMixin = {
         const missingTargets = activeTargets.filter((target: ClashDnsSuffixTarget) => normalizeDnsServerList(dnsConfig[target]).length === 0)
         if (missingTargets.length > 0) {
           push.error({
-            title: '保存失败',
-            message: `${missingTargets.map((target: ClashDnsSuffixTarget) => `(${target})`).join('、')} 没有填写 DNS，无法应用 dns后缀。`,
+			title: String(i18n.global.t('subscriptionEditor.saveFailed')),
+			message: String(i18n.global.t('subscriptionEditor.dnsSuffixTargetMissing', {
+			  targets: missingTargets.map((target: ClashDnsSuffixTarget) => `(${target})`).join(', '),
+			})),
             duration: 5000,
           })
           return false
@@ -2678,7 +2768,7 @@ export const SubClashExtMixin = {
     },
 
     regenerateClashConfig(this: any) {
-      if (this._suspendClashRegeneration) return
+	  if (this._suspendClashRegeneration || this._editorSourcePending) return
       if (!this.metaJson || typeof this.metaJson !== 'object') {
         this.metaJson = {}
       }
@@ -2786,6 +2876,7 @@ export const SubClashExtMixin = {
         noResolveGlobal: normalizeOptionalBoolean(this.clashNoResolveGlobal),
         resolvedRuleSetUrls: { ...sanitizedResolvedRuleSetUrls },
         clashRuleRows: persistedRows.map((row: ClashRuleRow) => ({
+		  id: row.id,
           kind: row.kind,
           name: row.name,
           customType: row.customType,
@@ -2834,6 +2925,7 @@ export const SubClashExtMixin = {
 
       if (persistedDnsPolicyRows.length > 0 || hadDnsPolicyUiConfig) {
         nextUiConfig.clashDnsPolicyRows = persistedDnsPolicyRows.map((row: ClashDnsPolicyRow) => ({
+		  id: row.id,
           matchType: row.matchType,
           routeTarget: row.routeTarget,
           values: [...row.values],
@@ -2904,7 +2996,7 @@ export const SubClashExtMixin = {
           if (!cleanName) continue
 
           const resolvedUrl = this.getResolvedClashRuleSetUrl(prefix, rawName, sourceContext.source, sourceContext.sourceBinding)
-          const url = resolvedUrl || buildClashRuleSetUrl(sourceContext.source, prefix, rawName)
+		  const url = resolvedUrl || this.buildClashRuleSetUrlFromRegistry(sourceContext.source, prefix, rawName)
           if (!url) continue
           if (!isSupportedClashRuleSetUrl(url)) continue
           const behavior = getRuleSetEntryBehavior(sourceContext.source, prefix, cleanName)
@@ -3195,9 +3287,29 @@ export const SubClashExtMixin = {
       const options = Array.isArray(this.clashRuleSetSourceOptions) ? this.clashRuleSetSourceOptions : []
       return options
         .map((item: any) => (typeof item?.value === 'string' ? item.value.trim() : ''))
-        .filter((value: string) => value.length > 0 && Boolean(CLASH_RULE_SET_URL_TEMPLATES[value]))
+		.filter((value: string) => value.length > 0)
         .filter((value: string, idx: number, arr: string[]) => arr.indexOf(value) === idx)
     },
+	getClashRuleSetSourceOverrideOptions(this: any, scope: string) {
+	  const templateKey = scope === 'ip' ? 'ipTemplate' : 'domainTemplate'
+	  const options = (Array.isArray(this.ruleSetSources) ? this.ruleSetSources : [])
+		.filter((item: any) => typeof item?.[templateKey] === 'string' && item[templateKey].trim())
+		.map((item: any) => ({ title: item.title || item.id, value: item.id }))
+	  return [{ title: i18n.global.t('subscriptionEditor.useGlobalRuleSetSource'), value: null }, ...options]
+	},
+	buildClashRuleSetUrlFromRegistry(this: any, source: string, prefix: 'geosite' | 'geoip', rawName: string): string {
+	  if (isHttpRuleSetInput(rawName)) return rawName.trim()
+	  const entry = (Array.isArray(this.ruleSetSources) ? this.ruleSetSources : [])
+		.find((item: any) => item?.id === source)
+	  const template = prefix === 'geoip' ? entry?.ipTemplate : entry?.domainTemplate
+	  if (typeof template !== 'string' || !template.trim()) return ''
+	  let name = normalizeName(rawName)
+	  if (['metacubex_github', 'metacubex_cdn'].includes(source)) {
+		if (name === 'ads') name = 'category-ads-all'
+		if (name === 'ir') name = 'category-ir'
+	  }
+	  return template.replace('{name}', encodeURIComponent(name))
+	},
     getClashRuleSetSourceTitle(this: any, source: string): string {
       const options = Array.isArray(this.clashRuleSetSourceOptions) ? this.clashRuleSetSourceOptions : []
       const found = options.find((item: any) => item?.value === source)
@@ -3227,7 +3339,7 @@ export const SubClashExtMixin = {
         const sourceContext = this.getClashRuleSetResolveContextForRow(row)
         if (onlyGlobalRows && sourceContext.sourceBinding !== 'global') continue
         const prefix = getClashRulePrefix(row.ruleSetScope)
-        const typeLabel = row.ruleSetScope === 'ip' ? 'IP 规则集' : '域名规则集'
+		const typeLabel = String(i18n.global.t(row.ruleSetScope === 'ip' ? 'subscriptionEditor.ipRuleSet' : 'subscriptionEditor.domainRuleSet'))
         for (const rawName of row.values) {
           this.validateRuleSetEntry(rawName, prefix, typeLabel, sourceContext)
         }
@@ -3247,139 +3359,52 @@ export const SubClashExtMixin = {
       const source = normalizeClashRuleSetSource(sourceContext?.source)
       const sourceBinding: ClashRuleSetSourceBinding = sourceContext?.sourceBinding === 'override' ? 'override' : 'global'
       const allowFallback = sourceBinding === 'global'
-      const noFallbackMessage = (currentSource: string) => currentSource
-        ? `${typeLabel} ${cleanName}：当前来源 ${this.getClashRuleSetSourceTitle(currentSource)} 检测失败，不进行回退`
-        : `${typeLabel} ${cleanName}：当前所选规则集来源检测失败，不进行回退`
+	  const token = this.ruleSetResolutionRunToken || 0
+	  const currentSource = normalizeClashRuleSetSource(source)
+	  const cacheKey = fromUrl ? '' : getClashRuleSetCacheKey(prefix, cleanName, currentSource, sourceBinding)
+	  void probeSubscriptionRuleSets([{
+	    id: `${sourceBinding}:${prefix}:${cleanName}`,
+	    kind: 'clash',
+	    sourceId: currentSource,
+	    scope: prefix === 'geoip' ? 'ip' : 'domain',
+	    name: fromUrl ? undefined : cleanName,
+	    url: fromUrl ? rawName.trim() : undefined,
+	    allowFallback,
+	  }], this._probeAbortController?.signal).then(([probe]) => {
+	    if (token !== (this.ruleSetResolutionRunToken || 0) || this._probeAbortController?.signal?.aborted) return
+	    if (!probe?.valid) {
+	      if (cacheKey && this.resolvedRuleSetUrls?.[cacheKey]) {
+	        const next = { ...(this.resolvedRuleSetUrls || {}) }
+	        delete next[cacheKey]
+	        this.resolvedRuleSetUrls = next
+	        this.regenerateClashConfig()
+	      }
+	      push.warning({
+	        title: String(i18n.global.t('subscriptionEditor.probeTitle')),
+	        message: String(i18n.global.t('subscriptionEditor.probeFailed', { type: typeLabel, name: cleanName, error: probe?.error || i18n.global.t('subscriptionEditor.unavailable') })),
+	        duration: 4000,
+	      })
+	      return
+	    }
 
-      const timerKey = fromUrl
-        ? `clash-${sourceBinding}-${prefix}-url-${rawName.trim()}`
-        : `clash-${sourceBinding}-${getClashRuleSetSourceCacheKey(source)}-${prefix}-${cleanName}`
-      if (validationTimers[timerKey]) {
-        clearTimeout(validationTimers[timerKey])
-      }
-      validationTimers[timerKey] = setTimeout(async () => {
-        try {
-          const token = this.ruleSetResolutionRunToken || 0
-
-          if (fromUrl) {
-            const url = rawName.trim()
-            if (!url) return
-            if (!isSupportedClashRuleSetUrl(url)) {
-              push.error({
-                title: '规则集校验',
-                message: `${typeLabel} ${cleanName}：不支持的文件后缀。Clash 订阅仅支持 .mrs/.yaml/.yml/.txt/.list`,
-                duration: 5000,
-              })
-              return
-            }
-            const isValid = await validateUrl(url)
-            if (token !== (this.ruleSetResolutionRunToken || 0)) return
-            if (isValid) {
-              push.success({
-                title: '规则集校验',
-                message: `${typeLabel} ${cleanName}：链接可用`,
-                duration: 3000,
-              })
-            } else {
-              push.warning({
-                title: '规则集校验',
-                message: `${typeLabel} ${cleanName}：链接不可用，不进行回退`,
-                duration: 3000,
-              })
-            }
-            return
-          }
-
-          const sourceOrder = this.getClashRuleSetSourceOrderForFallback()
-          const currentSource = normalizeClashRuleSetSource(source)
-          let matchedSource = ''
-          let matchedUrl = ''
-          let notifiedNoFallback = false
-
-          if (currentSource && CLASH_RULE_SET_URL_TEMPLATES[currentSource]) {
-            const currentUrl = buildClashRuleSetUrl(currentSource, prefix, rawName)
-            if (currentUrl && isSupportedClashRuleSetUrl(currentUrl)) {
-              const currentValid = await validateUrl(currentUrl)
-              if (token !== (this.ruleSetResolutionRunToken || 0)) return
-              if (currentValid) {
-                matchedSource = currentSource
-                matchedUrl = currentUrl
-                push.success({
-                  title: '规则集校验',
-                  message: `${typeLabel} ${cleanName}：当前来源 ${this.getClashRuleSetSourceTitle(currentSource)} 可用`,
-                  duration: 3000,
-                })
-              } else {
-                push.warning({
-                  title: '规则集校验',
-                  message: allowFallback
-                    ? `${typeLabel} ${cleanName}：当前来源 ${this.getClashRuleSetSourceTitle(currentSource)} 检测失败，开始回退`
-                    : noFallbackMessage(currentSource),
-                  duration: 3000,
-                })
-                notifiedNoFallback = !allowFallback
-              }
-            }
-          }
-
-          const fallbackSources = sourceOrder.filter((source: string) => source !== currentSource)
-          if (!matchedUrl && allowFallback) {
-            for (const source of fallbackSources) {
-              const url = buildClashRuleSetUrl(source, prefix, rawName)
-              if (!url) continue
-              if (!isSupportedClashRuleSetUrl(url)) continue
-              const isValid = await validateUrl(url)
-              if (token !== (this.ruleSetResolutionRunToken || 0)) return
-              if (isValid) {
-                matchedSource = source
-                matchedUrl = url
-                break
-              }
-            }
-          }
-
-          const cacheKey = getClashRuleSetCacheKey(prefix, cleanName, currentSource, sourceBinding)
-          if (!cacheKey) return
-          if (!matchedUrl) {
-            const cached = this.resolvedRuleSetUrls?.[cacheKey]
-            if (cached) {
-              const next = { ...(this.resolvedRuleSetUrls || {}) }
-              delete next[cacheKey]
-              this.resolvedRuleSetUrls = next
-              this.regenerateClashConfig()
-            }
-            if (allowFallback || !notifiedNoFallback) {
-              push.warning({
-                title: '规则集校验',
-                message: allowFallback
-                  ? `${typeLabel} ${cleanName}：未找到可用来源`
-                  : noFallbackMessage(currentSource),
-                duration: 3000,
-              })
-            }
-            return
-          }
-
-          if (allowFallback && (!currentSource || matchedSource !== currentSource)) {
-            push.success({
-              title: '规则集校验',
-              message: `${typeLabel} ${cleanName}：已回退到 ${this.getClashRuleSetSourceTitle(matchedSource)}`,
-              duration: 3000,
-            })
-          }
-
-          const current = this.resolvedRuleSetUrls?.[cacheKey]
-          if (current?.url !== matchedUrl || current?.source !== matchedSource) {
-            this.resolvedRuleSetUrls = {
-              ...(this.resolvedRuleSetUrls || {}),
-              [cacheKey]: { url: matchedUrl, source: matchedSource },
-            }
-            this.regenerateClashConfig()
-          }
-        } finally {
-          delete validationTimers[timerKey]
-        }
-      }, 500)
+	    const matchedSource = probe.sourceId || currentSource
+	    const matchedUrl = probe.url || (fromUrl ? rawName.trim() : '')
+	    push.success({
+	      title: String(i18n.global.t('subscriptionEditor.probeTitle')),
+	      message: allowFallback && currentSource && matchedSource !== currentSource
+	        ? String(i18n.global.t('subscriptionEditor.probeFallback', { type: typeLabel, name: cleanName, source: this.getClashRuleSetSourceTitle(matchedSource) }))
+	        : String(i18n.global.t('subscriptionEditor.probeAvailable', { type: typeLabel, name: cleanName })),
+	      duration: 3000,
+	    })
+	    if (!cacheKey || !matchedUrl) return
+	    const current = this.resolvedRuleSetUrls?.[cacheKey]
+	    if (current?.url === matchedUrl && current?.source === matchedSource) return
+	    this.resolvedRuleSetUrls = {
+	      ...(this.resolvedRuleSetUrls || {}),
+	      [cacheKey]: { url: matchedUrl, source: matchedSource },
+	    }
+	    this.regenerateClashConfig()
+	  })
     },
 
     validateNewClashRuleRows(this: any, newRows: any[], oldRows: any[]) {
@@ -3410,7 +3435,7 @@ export const SubClashExtMixin = {
       for (const row of normalizedNewRows) {
         if (row.kind !== 'ruleset') continue
         const prefix = getClashRulePrefix(row.ruleSetScope)
-        const typeLabel = row.ruleSetScope === 'ip' ? 'IP 规则集' : '域名规则集'
+		const typeLabel = String(i18n.global.t(row.ruleSetScope === 'ip' ? 'subscriptionEditor.ipRuleSet' : 'subscriptionEditor.domainRuleSet'))
         const sourceContext = this.getClashRuleSetResolveContextForRow(row)
 
         for (const rawName of row.values) {
@@ -3436,6 +3461,9 @@ export const SubClashExtMixin = {
   },
 
   computed: {
+	parseError(this: any): string {
+	  return this._parseError || ''
+	},
     latencyTestIntervalError(this: any): string {
       return getMihomoLatencyIntervalError(this.latencyTestInterval)
     },
@@ -3446,14 +3474,9 @@ export const SubClashExtMixin = {
       return getClashUdpPortRangesInputError(this.rejectUdpPortsInput)
     },
     editorData(this: any): string {
+	  if (this._parseError) return this._rawSource || ''
       if (!this.metaJson || Object.keys(this.metaJson).length === 0) return ''
-      const filtered: any = {}
-      for (const key of Object.keys(this.metaJson)) {
-        if (key !== '_uiConfig') {
-          filtered[key] = this.metaJson[key]
-        }
-      }
-      return yaml.stringify(filtered)
+	  return yaml.stringify(this.metaJson)
     },
 
     // ===== Basic Settings =====

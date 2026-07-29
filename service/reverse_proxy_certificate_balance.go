@@ -1,6 +1,9 @@
 package service
 
 import (
+	"container/list"
+	"hash/crc32"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -8,7 +11,6 @@ import (
 
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
-	"github.com/alireza0/s-ui/logger"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -28,6 +30,40 @@ type ReverseProxyCertificateBalanceDiagnostic struct {
 	SelectedTotal       int64  `json:"selectedTotal"`
 	LastSelectedAt      int64  `json:"lastSelectedAt"`
 	UpdatedAtUnix       int64  `json:"updatedAtUnix"`
+}
+
+type reverseProxyCertificateBalanceRuntimeState struct {
+	ActiveConn     int64
+	SelectedTotal  int64
+	LastSelectedAt int64
+	UpdatedAtUnix  int64
+	element        *list.Element
+}
+
+type reverseProxyCertificateBalanceLRUKey struct {
+	bucket        string
+	certificateID uint
+}
+
+// Certificate selection is on the TLS handshake hot path.  Keep independent
+// LRU tables per shard so unrelated SNI buckets do not serialize every
+// handshake behind one listener-wide mutex.  The aggregate configured
+// capacity remains 16,384 entries.
+type reverseProxyCertificateBalanceShard struct {
+	mu      sync.Mutex
+	states  map[string]map[uint]*reverseProxyCertificateBalanceRuntimeState
+	lru     *list.List
+	entries int
+}
+
+const reverseProxyCertificateBalanceShardLimit = reverseProxyRuntimeTableMaxEntries / reverseProxyRuntimeTableShardCount
+
+func (g *reverseProxyListenerGroup) certificateBalanceShard(bucket string) *reverseProxyCertificateBalanceShard {
+	if g == nil {
+		return nil
+	}
+	index := int(crc32.ChecksumIEEE([]byte(reverseProxyNormalizeSNIBucket(bucket))) % reverseProxyRuntimeTableShardCount)
+	return &g.certificateBalanceShards[index]
 }
 
 var (
@@ -53,23 +89,222 @@ func (g *reverseProxyListenerGroup) selectBalancedCertificate(candidates []*reve
 		return nil, reverseProxyCertificateSelection{}, nil
 	}
 	bucket := reverseProxyNormalizeSNIBucket(sniBucket)
-	if g.service == nil {
-		selected := reverseProxyFallbackCertificateBinding(filtered)
-		if selected == nil {
-			return nil, reverseProxyCertificateSelection{}, nil
-		}
-		return selected, reverseProxyCertificateSelection{}, nil
+	return g.reserveCertificateBalanceSelection(bucket, filtered)
+}
+
+func (g *reverseProxyListenerGroup) reserveCertificateBalanceSelection(sniBucket string, candidates []*reverseProxyRuleCertificateBinding) (*reverseProxyRuleCertificateBinding, reverseProxyCertificateSelection, error) {
+	if g == nil || len(candidates) == 0 {
+		return nil, reverseProxyCertificateSelection{}, nil
 	}
-	selected, selection, err := g.service.reserveCertificateBalanceSelection(g.key, bucket, filtered)
-	if err != nil {
-		logger.Warning("reverse proxy certificate balancing fallback due to db error: ", err)
-		selected = reverseProxyFallbackCertificateBinding(filtered)
-		if selected == nil {
-			return nil, reverseProxyCertificateSelection{}, err
-		}
-		return selected, reverseProxyCertificateSelection{}, nil
+	bucket := reverseProxyNormalizeSNIBucket(sniBucket)
+	shard := g.certificateBalanceShard(bucket)
+	if shard == nil {
+		return nil, reverseProxyCertificateSelection{}, nil
 	}
-	return selected, selection, nil
+	now := time.Now()
+	nowUnix := now.Unix()
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	shard.ensureLocked()
+	shard.pruneLocked(now)
+	states := shard.states[bucket]
+	var selected reverseProxyBalanceCandidateState
+	hasSelected := false
+	for _, binding := range candidates {
+		if binding == nil || binding.CertificateRecordID == 0 {
+			continue
+		}
+		state := states[binding.CertificateRecordID]
+		candidate := reverseProxyBalanceCandidateState{
+			Binding: binding,
+		}
+		if state != nil {
+			candidate.ActiveConn = state.ActiveConn
+			candidate.LastSelectedAt = state.LastSelectedAt
+		}
+		if !hasSelected || reverseProxyBalanceCandidateLess(candidate, selected) {
+			selected = candidate
+			hasSelected = true
+		}
+	}
+	if !hasSelected || selected.Binding == nil {
+		return nil, reverseProxyCertificateSelection{}, nil
+	}
+	if states == nil {
+		states = make(map[uint]*reverseProxyCertificateBalanceRuntimeState)
+		shard.states[bucket] = states
+	}
+	state := states[selected.Binding.CertificateRecordID]
+	if state == nil {
+		shard.makeRoomLocked()
+		// Eviction can remove the last state from this bucket. Re-read its map
+		// afterwards so a new entry never becomes unreachable from the shard.
+		states = shard.states[bucket]
+		if states == nil {
+			states = make(map[uint]*reverseProxyCertificateBalanceRuntimeState)
+			shard.states[bucket] = states
+		}
+		state = states[selected.Binding.CertificateRecordID]
+		if state == nil {
+			state = &reverseProxyCertificateBalanceRuntimeState{}
+			states[selected.Binding.CertificateRecordID] = state
+			shard.entries++
+		}
+	}
+	state.ActiveConn++
+	state.SelectedTotal++
+	state.LastSelectedAt = nowUnix
+	shard.touchLocked(bucket, selected.Binding.CertificateRecordID, state, nowUnix)
+	return selected.Binding, reverseProxyCertificateSelection{
+		ListenerKey:         g.key,
+		SNIBucket:           bucket,
+		CertificateRecordID: selected.Binding.CertificateRecordID,
+	}, nil
+}
+
+func (s *reverseProxyCertificateBalanceShard) pruneLocked(now time.Time) {
+	if s == nil || len(s.states) == 0 {
+		return
+	}
+	s.ensureLocked()
+	staleBefore := now.Add(-reverseProxyRuntimeTableTTL).Unix()
+	for s.lru.Len() > 0 {
+		element := s.lru.Back()
+		key, _ := element.Value.(reverseProxyCertificateBalanceLRUKey)
+		states := s.states[key.bucket]
+		state := states[key.certificateID]
+		if state == nil {
+			s.removeStateLocked(key.bucket, key.certificateID, nil)
+			continue
+		}
+		if state.ActiveConn != 0 || (state.UpdatedAtUnix > 0 && state.UpdatedAtUnix >= staleBefore) {
+			break
+		}
+		s.removeStateLocked(key.bucket, key.certificateID, state)
+	}
+}
+
+func (s *reverseProxyCertificateBalanceShard) ensureLocked() {
+	if s == nil {
+		return
+	}
+	if s.states == nil {
+		s.states = make(map[string]map[uint]*reverseProxyCertificateBalanceRuntimeState)
+	}
+	if s.lru != nil {
+		return
+	}
+	s.lru = list.New()
+	s.entries = 0
+	for bucket, states := range s.states {
+		for certificateID, state := range states {
+			if state == nil {
+				delete(states, certificateID)
+				continue
+			}
+			state.element = s.lru.PushFront(reverseProxyCertificateBalanceLRUKey{bucket: bucket, certificateID: certificateID})
+			s.entries++
+		}
+		if len(states) == 0 {
+			delete(s.states, bucket)
+		}
+	}
+}
+
+func (s *reverseProxyCertificateBalanceShard) touchLocked(bucket string, certificateID uint, state *reverseProxyCertificateBalanceRuntimeState, nowUnix int64) {
+	if s == nil || state == nil {
+		return
+	}
+	s.ensureLocked()
+	state.UpdatedAtUnix = nowUnix
+	if state.element != nil {
+		s.lru.MoveToFront(state.element)
+		return
+	}
+	state.element = s.lru.PushFront(reverseProxyCertificateBalanceLRUKey{bucket: bucket, certificateID: certificateID})
+}
+
+func (s *reverseProxyCertificateBalanceShard) makeRoomLocked() {
+	if s == nil {
+		return
+	}
+	s.ensureLocked()
+	for s.entries >= reverseProxyCertificateBalanceShardLimit {
+		candidate := s.lru.Back()
+		for candidate != nil {
+			key, _ := candidate.Value.(reverseProxyCertificateBalanceLRUKey)
+			state := s.states[key.bucket][key.certificateID]
+			if state == nil || state.ActiveConn == 0 {
+				s.removeStateLocked(key.bucket, key.certificateID, state)
+				break
+			}
+			candidate = candidate.Prev()
+		}
+		if candidate == nil {
+			// Every entry still owns a live connection.  Keeping those counters
+			// is more important than rejecting a valid TLS handshake; this is a
+			// transient soft overflow and is pruned as connections close.
+			return
+		}
+	}
+}
+
+func (s *reverseProxyCertificateBalanceShard) removeStateLocked(bucket string, certificateID uint, state *reverseProxyCertificateBalanceRuntimeState) {
+	if s == nil {
+		return
+	}
+	removedLRU := false
+	if state != nil && state.element != nil && s.lru != nil {
+		s.lru.Remove(state.element)
+		state.element = nil
+		removedLRU = true
+	}
+	if state == nil && s.lru != nil {
+		for element := s.lru.Back(); element != nil; element = element.Prev() {
+			key, _ := element.Value.(reverseProxyCertificateBalanceLRUKey)
+			if key.bucket == bucket && key.certificateID == certificateID {
+				s.lru.Remove(element)
+				removedLRU = true
+				break
+			}
+		}
+	}
+	removedState := false
+	if states := s.states[bucket]; states != nil {
+		if _, exists := states[certificateID]; exists {
+			delete(states, certificateID)
+			removedState = true
+		}
+		if len(states) == 0 {
+			delete(s.states, bucket)
+		}
+	}
+	if (removedLRU || removedState) && s.entries > 0 {
+		s.entries--
+	}
+}
+
+func (g *reverseProxyListenerGroup) releaseCertificateBalanceSelection(selection reverseProxyCertificateSelection) {
+	if g == nil || selection.CertificateRecordID == 0 || strings.TrimSpace(selection.ListenerKey) != strings.TrimSpace(g.key) {
+		return
+	}
+	bucket := reverseProxyNormalizeSNIBucket(selection.SNIBucket)
+	nowUnix := time.Now().Unix()
+	shard := g.certificateBalanceShard(bucket)
+	if shard == nil {
+		return
+	}
+	shard.mu.Lock()
+	shard.ensureLocked()
+	if states := shard.states[bucket]; states != nil {
+		if state := states[selection.CertificateRecordID]; state != nil {
+			if state.ActiveConn > 0 {
+				state.ActiveConn--
+			}
+			shard.touchLocked(bucket, selection.CertificateRecordID, state, nowUnix)
+		}
+	}
+	shard.mu.Unlock()
 }
 
 func reverseProxyFallbackCertificateBinding(candidates []*reverseProxyRuleCertificateBinding) *reverseProxyRuleCertificateBinding {
@@ -345,6 +580,84 @@ func (s *ReverseProxyService) cleanupUnboundCertificateBalanceRows() error {
 		ids = append(ids, certID)
 	}
 	return db.Where("certificate_record_id NOT IN ?", ids).Delete(&model.ReverseProxyCertificateBalanceState{}).Error
+}
+
+func reverseProxySnapshotCertificateBalanceDiagnostics(groups map[string]*reverseProxyListenerGroup) map[uint][]ReverseProxyCertificateBalanceDiagnostic {
+	merged := make(map[uint]map[string]ReverseProxyCertificateBalanceDiagnostic)
+	for _, group := range groups {
+		if group == nil {
+			continue
+		}
+		group.mu.RLock()
+		rules := append([]*model.ReverseProxyRule(nil), group.rules...)
+		group.mu.RUnlock()
+		states := make(map[string]map[uint]reverseProxyCertificateBalanceRuntimeState)
+		for index := range group.certificateBalanceShards {
+			shard := &group.certificateBalanceShards[index]
+			shard.mu.Lock()
+			for bucket, byCertificate := range shard.states {
+				copied := states[bucket]
+				if copied == nil {
+					copied = make(map[uint]reverseProxyCertificateBalanceRuntimeState, len(byCertificate))
+					states[bucket] = copied
+				}
+				for certificateID, state := range byCertificate {
+					if state != nil {
+						copied[certificateID] = *state
+					}
+				}
+			}
+			shard.mu.Unlock()
+		}
+		for _, rule := range rules {
+			if rule == nil || rule.Id == 0 {
+				continue
+			}
+			certificateIDs := reverseProxyRuleCertificateIDs(rule)
+			if len(certificateIDs) == 0 {
+				continue
+			}
+			if merged[rule.Id] == nil {
+				merged[rule.Id] = make(map[string]ReverseProxyCertificateBalanceDiagnostic)
+			}
+			for bucket, byCertificate := range states {
+				for _, certificateID := range certificateIDs {
+					state, exists := byCertificate[certificateID]
+					if !exists {
+						continue
+					}
+					key := bucket + "|" + strconvFormatUint(certificateID)
+					diagnostic := merged[rule.Id][key]
+					diagnostic.CertificateRecordID = certificateID
+					diagnostic.SNIBucket = bucket
+					diagnostic.ActiveConn += state.ActiveConn
+					diagnostic.SelectedTotal += state.SelectedTotal
+					if state.LastSelectedAt > diagnostic.LastSelectedAt {
+						diagnostic.LastSelectedAt = state.LastSelectedAt
+					}
+					if state.UpdatedAtUnix > diagnostic.UpdatedAtUnix {
+						diagnostic.UpdatedAtUnix = state.UpdatedAtUnix
+					}
+					merged[rule.Id][key] = diagnostic
+				}
+			}
+		}
+	}
+	result := make(map[uint][]ReverseProxyCertificateBalanceDiagnostic, len(merged))
+	for ruleID, items := range merged {
+		values := make([]ReverseProxyCertificateBalanceDiagnostic, 0, len(items))
+		for _, item := range items {
+			values = append(values, item)
+		}
+		sort.Slice(values, func(i, j int) bool {
+			if values[i].CertificateRecordID != values[j].CertificateRecordID {
+				return values[i].CertificateRecordID < values[j].CertificateRecordID
+			}
+			return values[i].SNIBucket < values[j].SNIBucket
+		})
+		result[ruleID] = values
+	}
+	return result
 }
 
 func (s *ReverseProxyService) loadRuleCertificateBalanceDiagnostics(rows []model.ReverseProxyRule) (map[uint][]ReverseProxyCertificateBalanceDiagnostic, error) {

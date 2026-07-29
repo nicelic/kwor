@@ -166,19 +166,44 @@ func TestFirewallHasManagedDualTCPUDPPortsAllowLockedRequiresBothPorts(t *testin
 	}
 }
 
-func TestBuildAcmeTemporaryFirewallRuleRowUsesDualPortSpec(t *testing.T) {
-	row := buildAcmeTemporaryFirewallRuleRow()
-	if row.Name != "ACME temporary allow 80/443" {
+func TestBuildAcmeTemporaryFirewallRuleRowUsesSelectedTCPPort(t *testing.T) {
+	row := buildAcmeTemporaryFirewallRuleRow(acmeIPCertificatePortALPN)
+	if row.Name != "ACME temporary allow 443/tcp" {
 		t.Fatalf("unexpected rule name: %q", row.Name)
 	}
 	if row.Origin != firewallOriginTemporary || row.TemporaryType != acmeTemporaryFirewallType {
 		t.Fatalf("unexpected temporary rule metadata: %#v", row)
 	}
-	if row.Family != firewallFamilyDual || row.Protocol != firewallProtocolTCPUDP {
+	if row.Family != firewallFamilyDual || row.Protocol != firewallProtocolTCP {
 		t.Fatalf("unexpected temporary rule network settings: %#v", row)
 	}
-	if row.PortSpec != acmeTemporaryFirewallPortSpec {
+	if row.PortSpec != "443" {
 		t.Fatalf("unexpected temporary rule port spec: %q", row.PortSpec)
+	}
+}
+
+func TestFirewallHasManagedDualTCPPortAllowLocked(t *testing.T) {
+	setupAcmeIPBehaviorTestDB(t, "acme-port-strategy-firewall-tcp.db")
+
+	if err := database.GetDB().Create(&model.FirewallRule{
+		Name:       "tcp-only",
+		Enabled:    true,
+		Origin:     firewallOriginManual,
+		Direction:  firewallDirectionIngress,
+		Family:     firewallFamilyDual,
+		Protocol:   firewallProtocolTCP,
+		PortSpec:   "443",
+		SourceSpec: "",
+	}).Error; err != nil {
+		t.Fatalf("create rule failed: %v", err)
+	}
+
+	allowed, err := firewallHasManagedDualTCPPortAllowLocked(acmeIPCertificatePortALPN)
+	if err != nil {
+		t.Fatalf("coverage check failed: %v", err)
+	}
+	if !allowed {
+		t.Fatal("expected dual-family TCP coverage to be true")
 	}
 }
 

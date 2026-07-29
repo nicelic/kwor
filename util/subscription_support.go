@@ -33,6 +33,7 @@ var mihomoSubscriptionOutboundTypes = map[string]struct{}{
 	"mieru":       {},
 	"snell":       {},
 	"sudoku":      {},
+	"shadowquic":  {},
 	"shadowsocks": {},
 	"ssh":         {},
 	"socks":       {},
@@ -51,6 +52,7 @@ var mihomoSubscriptionClashProxyTypes = map[string]struct{}{
 	"mieru":       {},
 	"snell":       {},
 	"sudoku":      {},
+	"shadowquic":  {},
 	"ssh":         {},
 	"ss":          {},
 	"socks5":      {},
@@ -59,6 +61,13 @@ var mihomoSubscriptionClashProxyTypes = map[string]struct{}{
 	"tuic":        {},
 	"vless":       {},
 	"vmess":       {},
+}
+
+// IsSubscriptionServerOnlyInboundType identifies listener-only protocols while
+// processing an inbound. It must not be used to reject a manually configured
+// subscription outbound with the same type.
+func IsSubscriptionServerOnlyInboundType(inboundType string) bool {
+	return normalizeSubscriptionType(inboundType) == "mixed"
 }
 
 func SupportsSingboxSubscriptionOutboundType(outboundType string) bool {

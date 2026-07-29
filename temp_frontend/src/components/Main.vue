@@ -202,7 +202,7 @@
                       {{ appVersionLabel }}
                     </v-chip>
                   </v-col>
-                  <v-col cols="4" class="home-info-label">{{ $t('main.info.uptime') }}</v-col>
+                  <v-col cols="4" class="home-info-label home-info-label--system-uptime">{{ $t('main.info.systemUptime') }}</v-col>
                   <v-col cols="8" class="home-info-value">{{ HumanReadable.formatSecond(tilesData.uptime) }}</v-col>
                 </v-row>
               </template>
@@ -340,6 +340,7 @@ const singboxRunning = ref(false)
 const singboxLoading = ref(false)
 const mihomoRunning = ref(false)
 const mihomoLoading = ref(false)
+const reloading = ref(false)
 const menu = ref(false)
 const tileSections = [
   {
@@ -639,21 +640,26 @@ const reloadItems = computed({
 })
 
 const reloadData = async () => {
-  const request = [...new Set(
-    reloadItems.value
-      .map(r => r.split('-')[1] ?? '')
-      .filter((item): item is string => item.length > 0),
-  )]
-  if (request.length === 0) {
-    tilesData.value = {}
+  if (reloading.value) return
+  reloading.value = true
+  try {
+    const request = [...new Set(
+      reloadItems.value
+        .map(r => r.split('-')[1] ?? '')
+        .filter((item): item is string => item.length > 0),
+    )]
+    if (request.length === 0) {
+      tilesData.value = {}
+      return
+    }
+    const data = await HttpUtils.get('api/status', { r: request.join(',') }, { silentAuthCheck: true })
+    if (data.success && data.obj) {
+      tilesData.value = data.obj
+    }
+  } finally {
     await loadCoreStatuses()
-    return
+    reloading.value = false
   }
-  const data = await HttpUtils.get('api/status', { r: request.join(',') }, { silentAuthCheck: true })
-  if (data.success && data.obj) {
-    tilesData.value = data.obj
-  }
-  await loadCoreStatuses()
 }
 
 const loadSingboxCoreStatus = async () => {
@@ -674,11 +680,22 @@ const loadMihomoCoreStatus = async () => {
   }
 }
 
-const loadCoreStatuses = async () => {
-  await Promise.allSettled([
+let coreStatusesRequest: Promise<void> | null = null
+
+const loadCoreStatuses = (): Promise<void> => {
+  if (coreStatusesRequest) return coreStatusesRequest
+
+  const request = Promise.allSettled([
     loadSingboxCoreStatus(),
     loadMihomoCoreStatus(),
-  ])
+  ]).then(() => undefined)
+  coreStatusesRequest = request
+  void request.finally(() => {
+    if (coreStatusesRequest === request) {
+      coreStatusesRequest = null
+    }
+  })
+  return request
 }
 
 const runCoreAction = async (endpoint: string, loadingState: Ref<boolean>, reloadDelayMs: number) => {
@@ -709,6 +726,7 @@ let intervalId: ReturnType<typeof setInterval> | null = null
 
 const startTimer = () => {
   if (intervalId) return
+  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
   intervalId = setInterval(() => {
     void reloadData()
   }, 2000)
@@ -721,7 +739,23 @@ const stopTimer = () => {
   }
 }
 
+const handleVisibilityChange = () => {
+  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+    stopTimer()
+    return
+  }
+  if (reloadItems.value.length !== 0) {
+    void reloadData()
+    startTimer()
+    return
+  }
+  void loadCoreStatuses()
+}
+
 onMounted(() => {
+	if (typeof document !== 'undefined') {
+		document.addEventListener('visibilitychange', handleVisibilityChange)
+	}
   const rawReloadItems = [...Data().reloadItems]
   const normalizedReloadItems = reloadItems.value
   if (!areStringArraysEqual(rawReloadItems, normalizedReloadItems)) {
@@ -739,17 +773,14 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   stopTimer()
+	if (typeof document !== 'undefined') {
+		document.removeEventListener('visibilitychange', handleVisibilityChange)
+	}
 })
 
 const logModal = ref({ visible: false })
 
 const backupModal = ref({ visible: false })
-
-const restartSingbox = async () => {
-  loading.value = true
-  await HttpUtils.post('api/restartSb', {})
-  loading.value = false
-}
 </script>
 
 <style scoped>
@@ -775,6 +806,13 @@ const restartSingbox = async () => {
   justify-content: center;
   text-align: center;
   white-space: nowrap;
+}
+
+.home-info-label--system-uptime {
+  min-width: 0;
+  line-height: 1.15;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .home-info-value {

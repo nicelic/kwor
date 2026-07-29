@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/shirou/gopsutil/v4/net"
 )
+
+const publicIPResponseMaxBytes int64 = 1024
 
 func resetSetting() {
 	err := database.InitDB(config.GetDBPath())
@@ -138,12 +141,17 @@ func getPublicIP() string {
 				return
 			}
 			defer resp.Body.Close()
-			body, err := io.ReadAll(resp.Body)
+			if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+				ch <- result{"", fmt.Errorf("unexpected status code: %d", resp.StatusCode)}
+				return
+			}
+			body, err := io.ReadAll(io.LimitReader(resp.Body, publicIPResponseMaxBytes+1))
 			if err != nil {
 				ch <- result{"", err}
 				return
 			}
-			ch <- result{string(body), nil}
+			ip, err := parsePublicIPResponse(body)
+			ch <- result{ip, err}
 		}(api)
 	}
 
@@ -158,6 +166,26 @@ func getPublicIP() string {
 		}
 	}
 	return ""
+}
+
+func parsePublicIPResponse(body []byte) (string, error) {
+	if int64(len(body)) > publicIPResponseMaxBytes {
+		return "", fmt.Errorf("public IP response exceeds %d bytes", publicIPResponseMaxBytes)
+	}
+	ip := strings.TrimSpace(string(body))
+	if _, err := netip.ParseAddr(ip); err != nil {
+		return "", fmt.Errorf("invalid public IP response: %w", err)
+	}
+	return ip, nil
+}
+
+func hasInterfaceFlag(flags []string, target string) bool {
+	for _, flag := range flags {
+		if flag == target {
+			return true
+		}
+	}
+	return false
 }
 
 func getPanelURI() {
@@ -196,15 +224,20 @@ func getPanelURI() {
 	fmt.Println("Local address:")
 	netInterfaces, _ := net.Interfaces()
 	for i := 0; i < len(netInterfaces); i++ {
-		if len(netInterfaces[i].Flags) > 2 && netInterfaces[i].Flags[0] == "up" && netInterfaces[i].Flags[1] != "loopback" {
-			addrs := netInterfaces[i].Addrs
-			for _, address := range addrs {
-				IP := strings.Split(address.Addr, "/")[0]
-				if strings.Contains(address.Addr, ".") {
-					fmt.Println(Proto + IP + PortText + BasePath)
-				} else if address.Addr[0:6] != "fe80::" {
-					fmt.Println(Proto + "[" + IP + "]" + PortText + BasePath)
-				}
+		if !hasInterfaceFlag(netInterfaces[i].Flags, "up") || hasInterfaceFlag(netInterfaces[i].Flags, "loopback") {
+			continue
+		}
+		addrs := netInterfaces[i].Addrs
+		for _, address := range addrs {
+			IP, _, _ := strings.Cut(address.Addr, "/")
+			parsedIP, err := netip.ParseAddr(IP)
+			if err != nil {
+				continue
+			}
+			if parsedIP.Is4() {
+				fmt.Println(Proto + IP + PortText + BasePath)
+			} else if !parsedIP.IsLinkLocalUnicast() {
+				fmt.Println(Proto + "[" + IP + "]" + PortText + BasePath)
 			}
 		}
 	}

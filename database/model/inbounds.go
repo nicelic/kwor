@@ -14,6 +14,7 @@ const (
 var inboundViewOnlyFields = map[string]struct{}{
 	"route_tag":       {},
 	"user_management": {},
+	"metadata":        {},
 }
 
 var inboundRuntimeExcludedFields = map[string]struct{}{
@@ -22,6 +23,7 @@ var inboundRuntimeExcludedFields = map[string]struct{}{
 	"port_hop_interval_max":              {},
 	"port_range":                         {},
 	"naive_quic_congestion_control_omit": {},
+	"users":                              {},
 }
 
 func NormalizeHysteriaInboundOptionsMap(options map[string]interface{}) {
@@ -495,6 +497,12 @@ func (i Inbound) MarshalFull() (*map[string]interface{}, error) {
 		normalizeInboundOptionsMap(restFields, i.Type)
 
 		for k, v := range restFields {
+			if _, blocked := inboundViewOnlyFields[k]; blocked {
+				continue
+			}
+			if k == "users" {
+				continue
+			}
 			combined[k] = v
 		}
 	}

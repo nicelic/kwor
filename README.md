@@ -101,6 +101,14 @@ sudo -i
 /opt/kwor/kwor_amd64 uninstall
 ```
 
+Uninstall stops only processes and services whose exact executable path or
+ownership record proves that they belong to kwor. It force-removes recognized
+kwor resources even when their contents changed, continues with independent
+resources after an individual failure, and prints every remaining failure for
+retry. It never recursively removes the binary parent directory (for example
+`/opt/kwor`), original files recorded as pre-existing, or host resources
+without kwor ownership evidence.
+
 Installer support files after installation live under `<binary_dir>/Promanager_data/`. For a default fresh install:
 
 - `/opt/kwor/Promanager_data/install.sh`
@@ -157,8 +165,40 @@ docker run -itd \
     --network host \
     -v $PWD/Promanager_data:/app/Promanager_data \
     --name kwor --restart=unless-stopped \
-    ghcr.io/nicelic/kwor:v1.5.19
+    ghcr.io/nicelic/kwor:v1.6.0
 ```
+
+### Uninstall Docker
+
+Do not run `uninstall` inside the container to remove a Docker deployment.
+The image does not mount the Docker socket and only prints these host-side
+instructions. Back up `Promanager_data` first when needed.
+
+> Docker Compose bind mount
+
+```sh
+cd /path/to/kwor
+docker compose down --remove-orphans
+rm -rf -- ./Promanager_data
+```
+
+> Plain `docker run` bind mount or named volume
+
+```sh
+container=kwor
+mount_type="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/Promanager_data"}}{{.Type}}{{end}}{{end}}' "$container")"
+mount_name="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/Promanager_data"}}{{.Name}}{{end}}{{end}}' "$container")"
+mount_source="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/Promanager_data"}}{{.Source}}{{end}}{{end}}' "$container")"
+docker rm -f "$container"
+case "$mount_type" in
+  volume) [ -n "$mount_name" ] && docker volume rm "$mount_name" ;;
+  bind) case "$mount_source" in ''|/|/opt|/usr|/var|/home|/root) printf '%s\n' "refusing unsafe bind mount: $mount_source" >&2; exit 1 ;; esac; rm -rf -- "$mount_source" ;;
+  *) printf '%s\n' "no /app/Promanager_data mount found" >&2; exit 1 ;;
+esac
+```
+
+Both paths remove only the exact `Promanager_data` bind mount or named volume;
+they do not remove the deployment directory's parent.
 
 ### Build your own image
 
@@ -233,26 +273,36 @@ The frontend source lives in `temp_frontend/`. A full build:
 
 ### Release publishing
 
-To publish the current source as a GitHub release without manually comparing history, use the repo helper:
+To publish the current source as a GitHub release without manually comparing history, first run the local Windows release build, then use the repo helper with its output directory:
 
 ```sh
-node scripts/release-publish.mjs --push
+node scripts/release-publish.mjs --push --assets-dir <local-release-assets-dir>
 ```
 
 What it does:
 
-1. Syncs frontend version metadata from `config/version`
+1. Syncs package, Docker Compose, and README version metadata from `config/version`
 2. Refuses to tag if release-relevant source files still have uncommitted changes
 3. Creates `v<config/version>` at the current `HEAD`
-4. Pushes `HEAD` to `main` and pushes the tag so GitHub Actions can build the release assets
+4. Pushes `HEAD` to `main` and pushes the tag
+5. Creates an empty draft GitHub Release, uploads and verifies the six local build assets, then publishes it
+6. Confirms that publishing the GitHub Release has started the Docker workflow, without waiting for Docker to finish
+
+Publishing the GitHub Release is always completed before Docker begins: the `release.published` workflow trigger starts the image build only after all six assets have been uploaded and the Release is published. Stable releases publish `v<version>`, `<version>`, and `latest` at `ghcr.io/nicelic/kwor`; prerelease versions do not move `latest`. A manual Docker workflow dispatch only validates the build and does not push an image. The local machine does not need Docker or `gh`; GitHub Actions builds and pushes the image.
+
+To check an already published Docker image without pushing source, tags, releases, or images, run this from the matching Git clone:
+
+```sh
+node scripts/release-publish.mjs --verify-docker
+```
 
 If you intentionally need to move an existing version tag to the current commit, use:
 
 ```sh
-node scripts/release-publish.mjs --push --retag
+node scripts/release-publish.mjs --push --retag --assets-dir <local-release-assets-dir>
 ```
 
-This matters because GitHub Releases always build from the committed tag target, not from your local working tree. If frontend or backend changes are only local and not committed yet, the published binary will still contain the older UI/code.
+`--retag` is only valid before the GitHub Release exists. This matters because the pushed source, local release assets, Docker image, and Compose example must describe the same version. The local publishing step finishes after the six GitHub assets are verified and Docker workflow startup is confirmed; it intentionally does not wait for Docker or GHCR completion. If Docker publication later fails, rerun or repair the matching Docker workflow from GitHub Actions instead of recreating the published Release.
 
 </details>
 

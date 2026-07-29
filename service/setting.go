@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -191,99 +191,125 @@ var timeLocationAliasLowerMap = map[string]string{
 }
 
 var defaultValueMap = map[string]string{
-	"webListen":                          "",
-	"webDomain":                          "",
-	"webPort":                            "8888",
-	"secret":                             common.Random(32),
-	"webCertFile":                        "",
-	"webKeyFile":                         "",
-	"webSelfSignedCertSQLite":            "false",
-	"webPath":                            "/app/",
-	"webURI":                             "",
-	"sessionMaxAge":                      "0",
-	"trafficAge":                         "30",
-	"trafficOverviewLimitGiB":            "0",
-	"trafficOverviewEnabled":             "true",
-	"trafficOverviewResetDay":            "0",
-	"trafficOverviewExpiryDate":          "",
-	"trafficOverviewState":               "{}",
-	"trafficOverviewSnapshot":            "{}",
-	"trafficOverviewCapState":            "{}",
-	"trafficOverviewPauseState":          "{}",
-	"trafficOverviewVnstatManifest":      "{}",
-	"systemMonitorSampleIntervalSec":     "10",
-	"systemMonitorPrimaryRetentionHours": "48",
-	"systemMonitorArchiveRetentionDays":  "120",
-	"firewallEnabled":                    "false",
-	"firewallLastSyncAt":                 "0",
-	"firewallGeoUpdateIntervalMinutes":   "360",
-	"firewallGeoLastRefreshAt":           "0",
-	"systemLogDisableEnabled":            "false",
-	"systemLogJournaldContent":           defaultSystemLogJournaldContent,
-	"systemLogJournaldPath":              "",
-	"systemSysctlEnabled":                "false",
-	"systemSysctlContent":                defaultSystemSysctlContent,
-	"systemSysctlPath":                   "",
-	"systemLinuxDnsContent":              "",
-	"systemLinuxDnsPath":                 "",
-	"systemLinuxDnsNameServersInput":     "",
-	"systemMTUEnabled":                   "false",
-	"systemMTUValue":                     "1500",
-	"systemMTUScriptPath":                "",
-	"acmeScriptPath":                     "",
-	"acmeContactEmail":                   "",
-	"acmePreferredCA":                    "letsencrypt",
-	"acmeDefaultChallenge":               "standalone",
-	"acmeDefaultWebroot":                 "",
-	"acmeDefaultDNSProvider":             "",
-	"acmeDefaultKeyLength":               "ec-256",
-	"acmeAutoUpgrade":                    "true",
-	"panelAssignedCertificateRecordID":   "0",
-	"panelAssignedCertificateRecordIDs":  "[]",
-	"timeLocation":                       "UTC",
-	"subListen":                          "",
-	"subPort":                            "22780",
-	"subDomain":                          "",
-	"subCertFile":                        "",
-	"subKeyFile":                         "",
-	"subSelfSignedCertSQLite":            "false",
-	"subAssignedCertificateRecordID":     "0",
-	"subAssignedCertificateRecordIDs":    "[]",
-	"subUpdates":                         "12",
-	"subEncode":                          "true",
-	"subShowInfo":                        "false",
-	"subURI":                             "",
-	"serverTlsStoreEnabled":              "true",
-	"serverTlsStore":                     "chrome",
-	"clientTlsStoreEnabled":              "true",
-	"clientTlsStore":                     "chrome",
-	"subJsonExt":                         "",
-	"subClashExt":                        "",
-	"mihomo_config":                      defaultMihomoConfig,
-	"coreAutoCheckEnabled":               "false",
-	"coreAutoCheckIntervalHours":         "12",
-	"coreAutoCheckLastAt":                "0",
-	"coreAutoCheckLatestStable":          "",
-	"coreAutoCheckLatestAlpha":           "",
-	"coreAutoCheckPendingStable":         "",
-	"coreAutoCheckPendingAlpha":          "",
-	"coreDownloadPreference":             "{}",
-	"mihomoCoreAutoCheckEnabled":         "false",
-	"mihomoCoreAutoCheckIntervalHours":   "12",
-	"mihomoCoreAutoCheckLastAt":          "0",
-	"mihomoCoreAutoCheckLatestStable":    "",
-	"mihomoCoreAutoCheckLatestAlpha":     "",
-	"mihomoCoreAutoCheckPendingStable":   "",
-	"mihomoCoreAutoCheckPendingAlpha":    "",
-	"mihomoCoreDownloadPreference":       "{}",
-	"subGroupAutoUpdateEnabled":          "false",
-	"subGroupAutoUpdateIntervalMinutes":  "5",
-	"subGroupAutoUpdateLastAt":           "0",
-	"kernelCleanupPinnedKernel":          "",
-	"subManagerAutoSyncClientIds":        "[]",
-	"subManagerAutoSyncMihomoClientIds":  "[]",
-	"config":                             defaultConfig,
-	"version":                            config.GetVersion(),
+	"webListen":                         "",
+	"webDomain":                         "",
+	"webPort":                           "8888",
+	"secret":                            common.Random(32),
+	"webCertFile":                       "",
+	"webKeyFile":                        "",
+	"webSelfSignedCertSQLite":           "false",
+	"webPath":                           "/app/",
+	"webURI":                            "",
+	"sessionMaxAge":                     "0",
+	"trafficAge":                        "30",
+	"trafficOverviewLimitGiB":           "0",
+	"trafficOverviewEnabled":            "true",
+	"trafficOverviewResetDay":           "0",
+	"trafficOverviewExpiryDate":         "",
+	"trafficOverviewState":              "{}",
+	"trafficOverviewSnapshot":           "{}",
+	"trafficOverviewCapState":           "{}",
+	"trafficOverviewPauseState":         "{}",
+	"trafficOverviewVnstatManifest":     "{}",
+	"firewallEnabled":                   "false",
+	"firewallLastSyncAt":                "0",
+	"firewallGeoUpdateIntervalMinutes":  "360",
+	"firewallGeoLastRefreshAt":          "0",
+	"systemLogDisableEnabled":           "false",
+	"systemLogJournaldContent":          defaultSystemLogJournaldContent,
+	"systemLogJournaldPath":             "",
+	"systemSysctlEnabled":               "false",
+	"systemSysctlContent":               defaultSystemSysctlContent,
+	"systemSysctlPath":                  "",
+	"systemLinuxDnsContent":             "",
+	"systemLinuxDnsPath":                "",
+	"systemLinuxDnsNameServersInput":    "",
+	"systemMTUEnabled":                  "false",
+	"systemMTUValue":                    "1500",
+	"systemMTUScriptPath":               "",
+	"systemMTUInterface":                "",
+	"systemMTUOriginalValue":            "0",
+	"acmeScriptPath":                    "",
+	"acmeContactEmail":                  "",
+	"acmePreferredCA":                   "letsencrypt",
+	"acmeDefaultChallenge":              "standalone",
+	"acmeDefaultWebroot":                "",
+	"acmeDefaultDNSProvider":            "",
+	"acmeDefaultKeyLength":              "ec-256",
+	"acmeAutoUpgrade":                   "true",
+	"panelAssignedCertificateRecordID":  "0",
+	"panelAssignedCertificateRecordIDs": "[]",
+	"timeLocation":                      "UTC",
+	"subListen":                         "",
+	"subPort":                           "22780",
+	"subDomain":                         "",
+	"subCertFile":                       "",
+	"subKeyFile":                        "",
+	"subSelfSignedCertSQLite":           "false",
+	"subAssignedCertificateRecordID":    "0",
+	"subAssignedCertificateRecordIDs":   "[]",
+	"subUpdates":                        "12",
+	"subEncode":                         "true",
+	"subShowInfo":                       "false",
+	"subURI":                            "",
+	"serverTlsStoreEnabled":             "true",
+	"serverTlsStore":                    "chrome",
+	"clientTlsStoreEnabled":             "true",
+	"clientTlsStore":                    "chrome",
+	"subJsonExt":                        "",
+	"subClashExt":                       "",
+	"mihomo_config":                     defaultMihomoConfig,
+	"coreAutoCheckEnabled":              "false",
+	"coreAutoCheckIntervalHours":        "12",
+	"coreAutoCheckLastAt":               "0",
+	"coreAutoCheckLatestStable":         "",
+	"coreAutoCheckLatestAlpha":          "",
+	"coreAutoCheckPendingStable":        "",
+	"coreAutoCheckPendingAlpha":         "",
+	"coreDownloadPreference":            "{}",
+	"mihomoCoreAutoCheckEnabled":        "false",
+	"mihomoCoreAutoCheckIntervalHours":  "12",
+	"mihomoCoreAutoCheckLastAt":         "0",
+	"mihomoCoreAutoCheckLatestStable":   "",
+	"mihomoCoreAutoCheckLatestAlpha":    "",
+	"mihomoCoreAutoCheckPendingStable":  "",
+	"mihomoCoreAutoCheckPendingAlpha":   "",
+	"mihomoCoreDownloadPreference":      "{}",
+	"subGroupAutoUpdateEnabled":         "false",
+	"subGroupAutoUpdateIntervalMinutes": "5",
+	"subGroupAutoUpdateLastAt":          "0",
+	"kernelCleanupPinnedKernel":         "",
+	"subManagerAutoSyncClientIds":       "[]",
+	"subManagerAutoSyncMihomoClientIds": "[]",
+	"config":                            defaultConfig,
+	"version":                           config.GetVersion(),
+}
+
+// Keep this list aligned with SETTINGS_SAVE_KEYS in the settings page. Generic
+// settings saves must not overwrite state owned by dedicated feature APIs.
+var genericSettingsSaveKeys = map[string]struct{}{
+	"webListen":             {},
+	"webDomain":             {},
+	"webPort":               {},
+	"webPath":               {},
+	"webURI":                {},
+	"sessionMaxAge":         {},
+	"trafficAge":            {},
+	"timeLocation":          {},
+	"subListen":             {},
+	"subPort":               {},
+	"subPath":               {},
+	"subDomain":             {},
+	"subUpdates":            {},
+	"subEncode":             {},
+	"subShowInfo":           {},
+	"subURI":                {},
+	"serverTlsStoreEnabled": {},
+	"serverTlsStore":        {},
+	"clientTlsStoreEnabled": {},
+	"clientTlsStore":        {},
+	"subJsonExt":            {},
+	"subClashExt":           {},
 }
 
 const (
@@ -398,11 +424,14 @@ func readLocaltimeZoneinfoName(path string) string {
 
 func detectSystemTimeLocationName() string {
 	candidates := []string{
-		os.Getenv("TZ"),
-		readTimeLocationFile("/etc/timezone"),
+		readSystemTimeLocationFromTimedatectl(),
 		readLocaltimeZoneinfoName("/etc/localtime"),
+		readTimeLocationFile("/etc/timezone"),
 		readTimeLocationConfigValue("/etc/sysconfig/clock", "ZONE", "TIMEZONE"),
 		readTimeLocationConfigValue("/etc/conf.d/clock", "ZONE", "TIMEZONE"),
+		// TZ can override only the panel process. Keep it last so it never
+		// masks the actual Linux host timezone when system files are present.
+		os.Getenv("TZ"),
 	}
 
 	for _, candidate := range candidates {
@@ -413,10 +442,19 @@ func detectSystemTimeLocationName() string {
 	return ""
 }
 
-func defaultTimeLocationValue() string {
-	if detected := detectSystemTimeLocationName(); detected != "" {
-		return detected
+func readSystemTimeLocationFromTimedatectl() string {
+	command, err := exec.LookPath("timedatectl")
+	if err != nil {
+		return ""
 	}
+	output, err := runCommandOutputWithTimeout(shortSystemCommandTimeout, command, "show", "--property=Timezone", "--value")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(output)
+}
+
+func defaultTimeLocationValue() string {
 	return defaultValueMap["timeLocation"]
 }
 
@@ -431,14 +469,21 @@ func normalizeTimeLocationSettingValue(raw string, fallback string) string {
 }
 
 func generateRandomSubPath() string {
+	const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
 	var builder strings.Builder
-	builder.Grow(8)
+	builder.Grow(22)
 	builder.WriteByte('/')
-	for i := 0; i < 3; i++ {
-		builder.WriteByte(byte('A' + common.RandomInt(26)))
-	}
-	for i := 0; i < 3; i++ {
-		builder.WriteByte(byte('0' + common.RandomInt(10)))
+	for segment := 0; segment < 3; segment++ {
+		if segment > 0 {
+			builder.WriteByte('-')
+		}
+		for i := 0; i < 3; i++ {
+			builder.WriteByte(letters[common.RandomInt(len(letters))])
+		}
+		for i := 0; i < 3; i++ {
+			builder.WriteByte(byte('0' + common.RandomInt(10)))
+		}
 	}
 	builder.WriteByte('/')
 	return builder.String()
@@ -535,17 +580,11 @@ func normalizeSubPortOrGenerate(raw string) (string, error) {
 }
 
 func normalizeSubPathOrGenerate(subPath string) string {
-	trimmed := strings.TrimSpace(subPath)
-	if trimmed == "" {
+	normalized, err := normalizePanelRoutePath(subPath, true)
+	if err != nil {
 		return generateRandomSubPath()
 	}
-	if !strings.HasPrefix(trimmed, "/") {
-		trimmed = "/" + trimmed
-	}
-	if !strings.HasSuffix(trimmed, "/") {
-		trimmed += "/"
-	}
-	return trimmed
+	return normalized
 }
 
 func (s *SettingService) defaultSettingValue(key string) (string, error) {
@@ -620,25 +659,7 @@ func (s *SettingService) ensureSubPortSetting() (string, error) {
 }
 
 func (s *SettingService) ensureTimeLocationSetting() (string, error) {
-	setting, err := s.getSetting("timeLocation")
-	if database.IsNotFound(err) {
-		value := defaultTimeLocationValue()
-		if saveErr := s.saveSetting("timeLocation", value); saveErr != nil {
-			return "", saveErr
-		}
-		return value, nil
-	}
-	if err != nil {
-		return "", err
-	}
-
-	normalized := normalizeTimeLocationSettingValue(setting.Value, defaultTimeLocationValue())
-	if normalized != setting.Value {
-		if saveErr := s.saveSetting("timeLocation", normalized); saveErr != nil {
-			return "", saveErr
-		}
-	}
-	return normalized, nil
+	return s.EnsurePanelTimeLocation()
 }
 
 func (s *SettingService) GetAllSetting() (*map[string]string, error) {
@@ -655,6 +676,12 @@ func (s *SettingService) GetAllSetting() (*map[string]string, error) {
 	}
 
 	for key := range defaultValueMap {
+		// Panel time is initialized through EnsurePanelTimeLocation so its
+		// documented remote-UTC -> Linux-system -> UTC fallback is preserved.
+		// Do not let the generic defaults loop write it first.
+		if key == "timeLocation" {
+			continue
+		}
 		if _, exists := allSetting[key]; !exists {
 			defaultValue, valueErr := s.defaultSettingValue(key)
 			if valueErr != nil {
@@ -696,9 +723,8 @@ func (s *SettingService) GetAllSetting() (*map[string]string, error) {
 	delete(allSetting, "trafficOverviewCapState")
 	delete(allSetting, "trafficOverviewPauseState")
 	delete(allSetting, "trafficOverviewVnstatManifest")
-	delete(allSetting, "systemMonitorSampleIntervalSec")
-	delete(allSetting, "systemMonitorPrimaryRetentionHours")
-	delete(allSetting, "systemMonitorArchiveRetentionDays")
+	delete(allSetting, certificateCoreRestartStateSettingKey)
+	delete(allSetting, certificateAutoRenewBatchStateSettingKey)
 	delete(allSetting, systemLinuxDNSContentKey)
 	delete(allSetting, systemLinuxDNSPathKey)
 	delete(allSetting, systemLinuxDNSNameServersInputKey)
@@ -706,9 +732,83 @@ func (s *SettingService) GetAllSetting() (*map[string]string, error) {
 	return &allSetting, nil
 }
 
+// ensureSettingsSnapshotDefaults is deliberately narrower than GetAllSetting:
+// compact settings snapshots must not read two potentially multi-megabyte
+// subscription extensions merely to verify that default keys exist.
+func (s *SettingService) ensureSettingsSnapshotDefaults() error {
+	db := database.GetDB()
+	if db == nil {
+		return common.NewError("database is not ready")
+	}
+	rows := make([]model.Setting, 0, len(defaultValueMap))
+	if err := db.Model(model.Setting{}).Select("key").Find(&rows).Error; err != nil {
+		return err
+	}
+	existing := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		existing[row.Key] = struct{}{}
+	}
+	for key := range defaultValueMap {
+		if key == "timeLocation" {
+			continue
+		}
+		if _, exists := existing[key]; exists {
+			continue
+		}
+		value, err := s.defaultSettingValue(key)
+		if err != nil {
+			return err
+		}
+		if err := s.saveSetting(key, value); err != nil {
+			return err
+		}
+	}
+	if _, err := s.ensureSubPathSetting(); err != nil {
+		return err
+	}
+	if _, err := s.ensureSubPortSetting(); err != nil {
+		return err
+	}
+	_, err := s.ensureTimeLocationSetting()
+	return err
+}
+
 func (s *SettingService) ResetSettings() error {
 	db := database.GetDB()
-	return db.Where("1 = 1").Delete(model.Setting{}).Error
+	if db == nil {
+		return common.NewError("database is not ready")
+	}
+	changed := false
+	err := db.Transaction(func(tx *gorm.DB) error {
+		currentRevision, err := ensureSettingsRevisionState(tx)
+		if err != nil {
+			return err
+		}
+		deleted := tx.Where("1 = 1").Delete(model.Setting{})
+		if deleted.Error != nil {
+			return deleted.Error
+		}
+		if deleted.RowsAffected == 0 {
+			return nil
+		}
+		updated := tx.Model(&model.SettingsState{}).
+			Where("id = ? AND revision = ?", 1, currentRevision).
+			Update("revision", gorm.Expr("revision + ?", 1))
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return common.NewError("设置版本更新冲突")
+		}
+		changed = true
+		return nil
+	})
+	if err == nil && changed {
+		markLastUpdate(time.Now().Unix())
+		InvalidatePanelTimeLocationCache()
+		invalidateSubscriptionRuntimeSettings()
+	}
+	return err
 }
 
 func (s *SettingService) getSetting(key string) (*model.Setting, error) {
@@ -747,26 +847,74 @@ func (s *SettingService) getString(key string) (string, error) {
 func (s *SettingService) saveSetting(key string, value string) error {
 	setting, err := s.getSetting(key)
 	db := database.GetDB()
+	var saveErr error
 	if database.IsNotFound(err) {
-		return db.Create(&model.Setting{
+		saveErr = db.Create(&model.Setting{
 			Key:   key,
 			Value: value,
 		}).Error
 	} else if err != nil {
 		return err
+	} else {
+		setting.Key = key
+		setting.Value = value
+		saveErr = db.Save(setting).Error
 	}
-	setting.Key = key
-	setting.Value = value
-	return db.Save(setting).Error
+	if saveErr == nil {
+		if key == "timeLocation" {
+			InvalidatePanelTimeLocationCache()
+		}
+		if isSubscriptionRuntimeSettingsKey(key) {
+			invalidateSubscriptionRuntimeSettings()
+		}
+	}
+	return saveErr
+}
+
+func isPortForwardListenerSettingKey(key string) bool {
+	switch strings.TrimSpace(key) {
+	case "webListen", "webPort", "subListen", "subPort":
+		return true
+	default:
+		return false
+	}
+}
+
+// savePortForwardListenerSetting gives direct SettingService callers (CLI,
+// bootstrap and compatibility code) the same transactional listener-claim
+// protection as the normal ConfigService settings save path.
+func (s *SettingService) savePortForwardListenerSetting(key string, value string) error {
+	db := database.GetDB()
+	if db == nil {
+		return common.NewError("database is not ready")
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		setting := &model.Setting{}
+		err := tx.Model(model.Setting{}).Where("key = ?", key).Order("id DESC").First(setting).Error
+		if database.IsNotFound(err) {
+			if err := tx.Create(&model.Setting{Key: key, Value: value}).Error; err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		} else {
+			setting.Key = key
+			setting.Value = value
+			if err := tx.Save(setting).Error; err != nil {
+				return err
+			}
+		}
+		return validatePortForwardListenerClaimsAgainstActiveRules(tx)
+	})
 }
 
 func (s *SettingService) setString(key string, value string) error {
-	return s.saveSetting(key, value)
+	return s.saveEditableSettingDirect(key, value)
 }
 
 // SaveSetting is the exported version of saveSetting for external callers (e.g., cmd first-run setup)
 func (s *SettingService) SaveSetting(key string, value string) error {
-	return s.saveSetting(key, value)
+	return s.setString(key, value)
 }
 
 func (s *SettingService) getBool(key string) (bool, error) {
@@ -851,23 +999,15 @@ func (s *SettingService) GetWebPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !strings.HasPrefix(webPath, "/") {
-		webPath = "/" + webPath
-	}
-	if !strings.HasSuffix(webPath, "/") {
-		webPath += "/"
-	}
-	return webPath, nil
+	return normalizePanelRoutePath(webPath, false)
 }
 
 func (s *SettingService) SetWebPath(webPath string) error {
-	if !strings.HasPrefix(webPath, "/") {
-		webPath = "/" + webPath
+	normalized, err := normalizePanelRoutePath(webPath, false)
+	if err != nil {
+		return err
 	}
-	if !strings.HasSuffix(webPath, "/") {
-		webPath += "/"
-	}
-	return s.setString("webPath", webPath)
+	return s.setString("webPath", normalized)
 }
 
 func (s *SettingService) GetSecret() ([]byte, error) {
@@ -889,97 +1029,8 @@ func (s *SettingService) GetTrafficAge() (int, error) {
 	return s.getInt("trafficAge")
 }
 
-func (s *SettingService) GetSystemMonitorSampleIntervalSec() (int, error) {
-	value, err := s.getInt("systemMonitorSampleIntervalSec")
-	if err != nil {
-		return 10, err
-	}
-	if value < 1 {
-		value = 1
-	}
-	if value > 3600 {
-		value = 3600
-	}
-	return value, nil
-}
-
-func (s *SettingService) GetSystemMonitorPrimaryRetentionHours() (int, error) {
-	value, err := s.getInt("systemMonitorPrimaryRetentionHours")
-	if err != nil {
-		return 48, err
-	}
-	if value < 1 {
-		value = 1
-	}
-	if value > 24*365 {
-		value = 24 * 365
-	}
-	return value, nil
-}
-
-func (s *SettingService) GetSystemMonitorArchiveRetentionDays() (int, error) {
-	value, err := s.getInt("systemMonitorArchiveRetentionDays")
-	if err != nil {
-		return 120, err
-	}
-	if value < 1 {
-		value = 1
-	}
-	if value > 3650 {
-		value = 3650
-	}
-	return value, nil
-}
-
-func (s *SettingService) SaveSystemMonitorSettings(sampleIntervalSec int, primaryRetentionHours int, archiveRetentionDays int) error {
-	if sampleIntervalSec < 1 {
-		sampleIntervalSec = 1
-	}
-	if sampleIntervalSec > 3600 {
-		sampleIntervalSec = 3600
-	}
-	if primaryRetentionHours < 1 {
-		primaryRetentionHours = 1
-	}
-	if primaryRetentionHours > 24*365 {
-		primaryRetentionHours = 24 * 365
-	}
-	if archiveRetentionDays < 1 {
-		archiveRetentionDays = 1
-	}
-	if archiveRetentionDays > 3650 {
-		archiveRetentionDays = 3650
-	}
-
-	if err := s.setInt("systemMonitorSampleIntervalSec", sampleIntervalSec); err != nil {
-		return err
-	}
-	if err := s.setInt("systemMonitorPrimaryRetentionHours", primaryRetentionHours); err != nil {
-		return err
-	}
-	return s.setInt("systemMonitorArchiveRetentionDays", archiveRetentionDays)
-}
-
 func (s *SettingService) GetTimeLocation() (*time.Location, error) {
-	if runtime.GOOS != "linux" {
-		return time.Local, nil
-	}
-
-	locationName, err := s.ensureTimeLocationSetting()
-	if err != nil {
-		return nil, err
-	}
-
-	location, err := time.LoadLocation(locationName)
-	if err == nil {
-		return location, nil
-	}
-
-	if saveErr := s.saveSetting("timeLocation", defaultValueMap["timeLocation"]); saveErr != nil {
-		logger.Warning("save fallback time location failed:", saveErr)
-	}
-	logger.Warningf("location <%v> not exist, fallback to UTC", locationName)
-	return time.UTC, nil
+	return s.GetPanelTimeLocation()
 }
 
 func (s *SettingService) GetSubListen() (string, error) {
@@ -999,7 +1050,11 @@ func (s *SettingService) GetSubPath() (string, error) {
 }
 
 func (s *SettingService) SetSubPath(subPath string) error {
-	return s.setString("subPath", normalizeSubPathOrGenerate(subPath))
+	normalized, err := normalizePanelRoutePath(subPath, true)
+	if err != nil {
+		return err
+	}
+	return s.setString("subPath", normalized)
 }
 
 func (s *SettingService) GetSubDomain() (string, error) {
@@ -1019,15 +1074,15 @@ func (s *SettingService) GetSubSelfSignedCertSQLite() (bool, error) {
 }
 
 func (s *SettingService) GetSubUpdates() (int, error) {
-	return s.getInt("subUpdates")
+	return s.getSubscriptionRuntimeInt("subUpdates")
 }
 
 func (s *SettingService) GetSubEncode() (bool, error) {
-	return s.getBool("subEncode")
+	return s.getSubscriptionRuntimeBool("subEncode")
 }
 
 func (s *SettingService) GetSubShowInfo() (bool, error) {
-	return s.getBool("subShowInfo")
+	return s.getSubscriptionRuntimeBool("subShowInfo")
 }
 
 func (s *SettingService) GetSubURI() (string, error) {
@@ -1109,74 +1164,18 @@ func (s *SettingService) Save(tx *gorm.DB, data json.RawMessage) error {
 		return err
 	}
 
-	// Certificate assignment IDs are managed exclusively by certificate center flows
-	// (acme/self-signed apply). Ignore generic settings writes to prevent stale UI state
-	// from rolling back live panel/sub TLS assignments.
-	delete(settings, panelAssignedCertificateRecordIDPanelKey)
-	delete(settings, panelAssignedCertificateRecordIDSubKey)
-	delete(settings, panelAssignedCertificateRecordIDsPanelKey)
-	delete(settings, panelAssignedCertificateRecordIDsSubKey)
+	for key := range settings {
+		if _, allowed := genericSettingsSaveKeys[key]; !allowed {
+			delete(settings, key)
+		}
+	}
 
 	for key, obj := range settings {
-		if key == "timeLocation" {
-			obj = normalizeTimeLocationSettingValue(obj, defaultTimeLocationValue())
+		normalized, normalizeErr := normalizeGenericSettingValue(key, obj)
+		if normalizeErr != nil {
+			return normalizeErr
 		}
-
-		if key == "serverTlsStoreEnabled" {
-			enabled, _ := strconv.ParseBool(obj)
-			obj = strconv.FormatBool(enabled)
-		}
-
-		if key == "serverTlsStore" {
-			normalized := normalizeCertificateStoreValue(obj)
-			if normalized == "" {
-				normalized = "chrome"
-			}
-			obj = normalized
-		}
-
-		if key == "clientTlsStoreEnabled" {
-			enabled, _ := strconv.ParseBool(obj)
-			obj = strconv.FormatBool(enabled)
-		}
-
-		if key == "clientTlsStore" {
-			normalized := normalizeCertificateStoreValue(obj)
-			if normalized == "" {
-				normalized = "chrome"
-			}
-			obj = normalized
-		}
-
-		if key == "webSelfSignedCertSQLite" || key == "subSelfSignedCertSQLite" {
-			enabled, _ := strconv.ParseBool(obj)
-			obj = strconv.FormatBool(enabled)
-		}
-
-		// Secure file existence check
-		if obj != "" && (key == "webCertFile" ||
-			key == "webKeyFile" ||
-			key == "subCertFile" ||
-			key == "subKeyFile") {
-			err = s.fileExists(obj)
-			if err != nil {
-				return common.NewError(" -> ", obj, " is not exists")
-			}
-		}
-
-		// Correct Pathes start and ends with `/`
-		if key == "webPath" {
-			if !strings.HasPrefix(obj, "/") {
-				obj = "/" + obj
-			}
-			if !strings.HasSuffix(obj, "/") {
-				obj += "/"
-			}
-		}
-
-		if key == "subPath" {
-			obj = normalizeSubPathOrGenerate(obj)
-		}
+		obj = normalized
 
 		// Delete all stats if it is set to 0
 		if key == "trafficAge" && obj == "0" {
@@ -1190,11 +1189,17 @@ func (s *SettingService) Save(tx *gorm.DB, data json.RawMessage) error {
 			return err
 		}
 	}
+	// The normal settings flow runs inside ConfigService's explicit SQLite
+	// transaction. Do not invalidate the shared panel-time cache here: another
+	// goroutine could then read and cache the old committed value before this
+	// transaction commits. ConfigService invalidates it immediately after a
+	// successful commit instead. Direct timeLocation writes use saveSetting(),
+	// which is already auto-committed and invalidates the cache itself.
 	return err
 }
 
 func (s *SettingService) GetSubJsonExt() (string, error) {
-	return s.getString("subJsonExt")
+	return s.getSubscriptionRuntimeSetting("subJsonExt")
 }
 
 func (s *SettingService) GetServerTLSStoreEnabled() (bool, error) {
@@ -1214,11 +1219,11 @@ func (s *SettingService) GetServerTLSStore() (string, error) {
 }
 
 func (s *SettingService) GetClientTLSStoreEnabled() (bool, error) {
-	return s.getBool("clientTlsStoreEnabled")
+	return s.getSubscriptionRuntimeBool("clientTlsStoreEnabled")
 }
 
 func (s *SettingService) GetClientTLSStore() (string, error) {
-	store, err := s.getString("clientTlsStore")
+	store, err := s.getSubscriptionRuntimeSetting("clientTlsStore")
 	if err != nil {
 		return "", err
 	}
@@ -1244,7 +1249,7 @@ func (s *SettingService) ResolveSubscriptionTLSStore(fallback string) string {
 }
 
 func (s *SettingService) GetSubClashExt() (string, error) {
-	return s.getString("subClashExt")
+	return s.getSubscriptionRuntimeSetting("subClashExt")
 }
 
 func normalizeAutoSyncClientIDs(ids []uint) []uint {
@@ -1352,11 +1357,6 @@ func (s *SettingService) SetSubManagerAutoSyncMihomoClient(clientID uint, enable
 
 func (s *SettingService) SaveSubManagerAutoSyncMihomoClientIDs(ids []uint) error {
 	return s.setAutoSyncClientIDs("subManagerAutoSyncMihomoClientIds", ids)
-}
-
-func (s *SettingService) fileExists(path string) error {
-	_, err := os.Stat(path)
-	return err
 }
 
 func (s *SettingService) getStringTx(tx *gorm.DB, key string) (string, error) {

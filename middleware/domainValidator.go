@@ -2,24 +2,10 @@ package middleware
 
 import (
 	"net"
-	"net/http"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 )
-
-const fake504HTML = `<!DOCTYPE html>
-<html>
-<head><title>504 Gateway Time-out</title></head>
-<body>
-<center><h1>504 Gateway Time-out</h1></center>
-<hr><center>nginx</center>
-</body>
-</html>
-`
-
-const fake504Delay = 30 * time.Second
 
 func DomainValidator(domain string) gin.HandlerFunc {
 	domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
@@ -40,11 +26,7 @@ func DomainValidator(domain string) gin.HandlerFunc {
 		}
 
 		if domain != "" && host != domain {
-			time.Sleep(fake504Delay)
-			c.Header("Server", "nginx")
-			c.Header("Connection", "close")
-			c.Data(http.StatusGatewayTimeout, "text/html", []byte(fake504HTML))
-			c.Abort()
+			DelayedFake504(c)
 			return
 		}
 

@@ -4,7 +4,6 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -158,7 +157,7 @@ func (f firewallListenerFilter) matches(protocol string, port int) bool {
 
 func loadFirewallListenerSnapshot(filter firewallListenerFilter) firewallListenerSnapshot {
 	snapshot := firewallListenerSnapshot{
-		supported: runtime.GOOS == "linux",
+		supported: IsSystemPlatformLinux(),
 		checkedAt: time.Now().Unix(),
 		listeners: []FirewallPortListenerView{},
 	}

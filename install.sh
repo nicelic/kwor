@@ -1,4 +1,5 @@
 #!/bin/bash
+# kwor-owner:v1 resource=runtime-install-script
 
 set -u
 
@@ -19,9 +20,10 @@ TARGET_VERSION=""
 INSTALL_DIR=""
 INSTALL_SOURCE=""
 PACKAGE_MANAGER=""
-RUNNING_BIN_PATH=""
 SERVICE_BIN_PATH=""
 SERVICE_FILE_PATH=""
+RUNTIME_INSTALL_DIR=""
+RUNTIME_BIN_PATH=""
 DOWNLOAD_URL=""
 ARCHIVE_PATH=""
 WORK_DIR=""
@@ -536,53 +538,81 @@ resolve_target_version() {
     return 0
 }
 
-find_running_pid() {
-    local pid
-    pid="$(pgrep -x kwor 2>/dev/null | head -n 1 || true)"
-    if [[ -n "${pid}" ]]; then
-        echo "${pid}"
+normalize_binary_path() {
+    local path="${1:-}"
+    path="${path% (deleted)}"
+    if [[ -z "${path}" ]]; then
+        echo ""
         return
     fi
-    pid="$(pgrep -x kwor_amd64 2>/dev/null | head -n 1 || true)"
-    if [[ -n "${pid}" ]]; then
-        echo "${pid}"
+    if [[ -e "${path}" || -L "${path}" ]]; then
+        readlink -f "${path}" 2>/dev/null || echo "${path}"
         return
     fi
-    pid="$(pgrep -x kwor_arm64 2>/dev/null | head -n 1 || true)"
-    if [[ -n "${pid}" ]]; then
-        echo "${pid}"
-        return
-    fi
-    echo ""
+    echo "${path}"
 }
 
-resolve_running_bin_path() {
-    local pid exe_path
-    pid="$(find_running_pid)"
-    if [[ -z "${pid}" ]]; then
-        return
-    fi
-    if [[ -L "/proc/${pid}/exe" ]]; then
-        exe_path="$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)"
-        if [[ -n "${exe_path}" ]]; then
-            RUNNING_BIN_PATH="${exe_path}"
+is_supported_panel_binary_path() {
+    local path="${1:-}"
+    [[ "${path}" == /* ]] || return 1
+    case "$(basename "${path}")" in
+        kwor | kwor_amd64 | kwor_arm64) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+path_has_kwor_install_evidence() {
+    local install_dir="${1:-}"
+    local candidate
+    for candidate in \
+        "${install_dir}/${RUNTIME_SUPPORT_DIR_NAME}/install.sh" \
+        "${install_dir}/install.sh"
+    do
+        if [[ -f "${candidate}" ]] && grep -Eq 'kwor-owner:v1 resource=runtime-install-script|GH_REPO="nicelic/kwor"' "${candidate}" 2>/dev/null; then
+            return 0
         fi
-    fi
+    done
+    candidate="${install_dir}/${RUNTIME_SUPPORT_DIR_NAME}/kwor.service"
+    [[ -f "${candidate}" ]] && grep -Fq 'kwor-owner:v1 resource=panel-systemd' "${candidate}" 2>/dev/null
+}
+
+select_existing_panel_binary() {
+    local install_dir="${1:-}"
+    local candidate
+    for candidate in \
+        "${install_dir}/kwor" \
+        "${install_dir}/kwor_amd64" \
+        "${install_dir}/kwor_arm64"
+    do
+        if [[ -f "${candidate}" ]]; then
+            normalize_binary_path "${candidate}"
+            return
+        fi
+    done
+    echo ""
 }
 
 find_service_file() {
     local candidate
     for candidate in \
         "/etc/systemd/system/${SERVICE_NAME}.service" \
-        "/lib/systemd/system/${SERVICE_NAME}.service" \
-        "/usr/lib/systemd/system/${SERVICE_NAME}.service"
+        "/run/systemd/system/${SERVICE_NAME}.service" \
+        "/usr/local/lib/systemd/system/${SERVICE_NAME}.service" \
+        "/usr/lib/systemd/system/${SERVICE_NAME}.service" \
+        "/lib/systemd/system/${SERVICE_NAME}.service"
     do
-        if [[ -f "${candidate}" ]]; then
-            echo "${candidate}"
-            return
+        if [[ ! -f "${candidate}" ]]; then
+            continue
         fi
+        if service_file_is_kwor_install "${candidate}"; then
+            echo "${candidate}"
+            return 0
+        fi
+        log_error "Refusing to replace unverified systemd service: ${candidate}"
+        return 1
     done
     echo ""
+    return 0
 }
 
 extract_execstart_path() {
@@ -625,15 +655,47 @@ extract_working_directory() {
     echo "${value}"
 }
 
+service_file_is_kwor_install() {
+    local service_path="${1:-}"
+    local binary_path working_dir binary_dir
+    binary_path="$(extract_execstart_path "${service_path}")"
+    if ! is_supported_panel_binary_path "${binary_path}"; then
+        return 1
+    fi
+
+    working_dir="$(extract_working_directory "${service_path}")"
+    binary_dir="$(dirname "${binary_path}")"
+    working_dir="${working_dir%/}"
+    binary_dir="${binary_dir%/}"
+    if [[ -n "${working_dir}" && "${working_dir}" != "${binary_dir}" ]]; then
+        return 1
+    fi
+
+    if grep -Fq 'kwor-owner:v1 resource=panel-systemd' "${service_path}" 2>/dev/null; then
+        return 0
+    fi
+    if ! grep -Eq '^Description=kwor Service\r?$' "${service_path}" 2>/dev/null || \
+       ! grep -Eq '^Type=simple\r?$' "${service_path}" 2>/dev/null || \
+       ! grep -Eq '^Restart=on-failure\r?$' "${service_path}" 2>/dev/null; then
+        return 1
+    fi
+    if [[ "${binary_dir}" == "${DEFAULT_INSTALL_DIR}" || "${binary_dir}" == "/usr/local/kwor" ]]; then
+        return 0
+    fi
+    path_has_kwor_install_evidence "${binary_dir}"
+}
+
 resolve_service_bin_path() {
-    SERVICE_FILE_PATH="$(find_service_file)"
+    if ! SERVICE_FILE_PATH="$(find_service_file)"; then
+        return 1
+    fi
     if [[ -z "${SERVICE_FILE_PATH}" ]]; then
-        return
+        return 0
     fi
 
     SERVICE_BIN_PATH="$(extract_execstart_path "${SERVICE_FILE_PATH}")"
     if [[ -n "${SERVICE_BIN_PATH}" ]]; then
-        return
+        return 0
     fi
 
     local working_dir
@@ -641,29 +703,51 @@ resolve_service_bin_path() {
     if [[ -n "${working_dir}" ]]; then
         if [[ -f "${working_dir}/kwor" ]]; then
             SERVICE_BIN_PATH="$(readlink -f "${working_dir}/kwor" 2>/dev/null || echo "${working_dir}/kwor")"
-            return
+            return 0
         fi
         if [[ -f "${working_dir}/kwor_amd64" ]]; then
             SERVICE_BIN_PATH="$(readlink -f "${working_dir}/kwor_amd64" 2>/dev/null || echo "${working_dir}/kwor_amd64")"
-            return
+            return 0
         fi
         if [[ -f "${working_dir}/kwor_arm64" ]]; then
             SERVICE_BIN_PATH="$(readlink -f "${working_dir}/kwor_arm64" 2>/dev/null || echo "${working_dir}/kwor_arm64")"
+            return 0
+        fi
+    fi
+    return 0
+}
+
+resolve_runtime_install_dir() {
+    local script_path script_dir candidate_dir candidate_bin
+    RUNTIME_INSTALL_DIR=""
+    RUNTIME_BIN_PATH=""
+
+    script_path="${BASH_SOURCE[0]:-}"
+    if [[ -f "${script_path}" ]]; then
+        script_path="$(readlink -f "${script_path}" 2>/dev/null || echo "${script_path}")"
+        script_dir="$(dirname "${script_path}")"
+        candidate_dir=""
+        if [[ "$(basename "${script_dir}")" == "${RUNTIME_SUPPORT_DIR_NAME}" ]]; then
+            candidate_dir="$(dirname "${script_dir}")"
+        elif [[ -d "${script_dir}/${RUNTIME_SUPPORT_DIR_NAME}" ]]; then
+            candidate_dir="${script_dir}"
+        fi
+        if [[ -n "${candidate_dir}" ]] && path_has_kwor_install_evidence "${candidate_dir}"; then
+            candidate_bin="$(select_existing_panel_binary "${candidate_dir}")"
+            RUNTIME_INSTALL_DIR="${candidate_dir}"
+            RUNTIME_BIN_PATH="${candidate_bin}"
             return
         fi
+    fi
+
+    if path_has_kwor_install_evidence "${DEFAULT_INSTALL_DIR}"; then
+        RUNTIME_INSTALL_DIR="${DEFAULT_INSTALL_DIR}"
+        RUNTIME_BIN_PATH="$(select_existing_panel_binary "${DEFAULT_INSTALL_DIR}")"
     fi
 }
 
 resolve_install_dir() {
-    resolve_running_bin_path
-    if [[ -n "${RUNNING_BIN_PATH}" ]]; then
-        INSTALL_DIR="$(dirname "${RUNNING_BIN_PATH}")"
-        INSTALL_SOURCE="running process"
-        STOP_BIN_PATH="${RUNNING_BIN_PATH}"
-        return
-    fi
-
-    resolve_service_bin_path
+    resolve_service_bin_path || return 1
     if [[ -n "${SERVICE_BIN_PATH}" ]]; then
         INSTALL_DIR="$(dirname "${SERVICE_BIN_PATH}")"
         INSTALL_SOURCE="systemd service"
@@ -671,9 +755,17 @@ resolve_install_dir() {
         return
     fi
 
+    resolve_runtime_install_dir
+    if [[ -n "${RUNTIME_INSTALL_DIR}" ]]; then
+        INSTALL_DIR="${RUNTIME_INSTALL_DIR}"
+        INSTALL_SOURCE="runtime install script"
+        STOP_BIN_PATH="${RUNTIME_BIN_PATH}"
+        return
+    fi
+
     INSTALL_DIR="${DEFAULT_INSTALL_DIR}"
     INSTALL_SOURCE="default"
-    STOP_BIN_PATH=""
+    STOP_BIN_PATH="$(select_existing_panel_binary "${DEFAULT_INSTALL_DIR}")"
 }
 
 download_release_archive() {
@@ -716,8 +808,8 @@ prepare_install_dir() {
     mkdir -p "${TARGET_SUPPORT_DIR}"
     if [[ -n "${SERVICE_BIN_PATH}" ]]; then
         TARGET_BIN_NAME="$(basename "${SERVICE_BIN_PATH}")"
-    elif [[ -n "${RUNNING_BIN_PATH}" ]]; then
-        TARGET_BIN_NAME="$(basename "${RUNNING_BIN_PATH}")"
+    elif [[ -n "${STOP_BIN_PATH}" ]]; then
+        TARGET_BIN_NAME="$(basename "${STOP_BIN_PATH}")"
     else
         TARGET_BIN_NAME="kwor"
     fi
@@ -756,11 +848,18 @@ perform_install_attempt() {
     STAGED_BIN_PATH=""
     STAGED_INSTALL_SCRIPT_PATH=""
     STAGED_SERVICE_FILE_PATH=""
+    INSTALL_DIR=""
+    INSTALL_SOURCE=""
+    SERVICE_BIN_PATH=""
+    SERVICE_FILE_PATH=""
+    RUNTIME_INSTALL_DIR=""
+    RUNTIME_BIN_PATH=""
+    STOP_BIN_PATH=""
     reset_last_command_output
     CURRENT_STAGE="resolve_target_version"
     resolve_target_version "${1:-}" || return 1
 
-    resolve_install_dir
+    resolve_install_dir || return 1
     log_info "Resolved install directory (${INSTALL_SOURCE}): ${INSTALL_DIR}"
 
     CURRENT_STAGE="download_release_archive"
@@ -772,7 +871,7 @@ perform_install_attempt() {
     prepare_install_dir
     download_latest_install_script
     write_staged_service_file
-    stop_existing_instance
+    stop_existing_instance || return 1
     install_binary
     install_support_files
     CURRENT_STAGE="start_target_instance"
@@ -821,12 +920,15 @@ systemd_escape_unit_value() {
 write_staged_service_file() {
     STAGED_SERVICE_FILE_PATH="${WORK_DIR}/kwor.service"
     cat > "${STAGED_SERVICE_FILE_PATH}" <<EOF
+# kwor-owner:v1 resource=panel-systemd
 [Unit]
 Description=kwor Service
 After=network.target nss-lookup.target
 
 [Service]
 Type=simple
+Environment=KWOR_INTERNAL_SYSTEMD=1
+ExecCondition=$(systemd_escape_unit_value "${TARGET_BIN_PATH}") lifecycle-guard
 WorkingDirectory=$(systemd_escape_unit_value "${INSTALL_DIR}")
 ExecStart=$(systemd_escape_unit_value "${TARGET_BIN_PATH}")
 Restart=on-failure
@@ -858,28 +960,185 @@ install_support_files() {
     fi
 }
 
-stop_existing_instance() {
-    if [[ -z "${STOP_BIN_PATH}" || ! -x "${STOP_BIN_PATH}" ]]; then
-        log_info "No existing running/service-managed installation detected; proceeding as fresh install"
+process_executable_path() {
+    local pid="${1:-}"
+    local path=""
+    if [[ -z "${pid}" || ! -L "/proc/${pid}/exe" ]]; then
+        echo ""
         return
     fi
-    log_info "Stopping existing instance using: ${STOP_BIN_PATH} stop"
-    if ! "${STOP_BIN_PATH}" stop; then
-        log_warn "Failed to stop via ${STOP_BIN_PATH} stop; falling back to systemctl/pkill"
+    path="$(readlink "/proc/${pid}/exe" 2>/dev/null || true)"
+    normalize_binary_path "${path}"
+}
+
+process_start_time() {
+    local pid="${1:-}"
+    local stat_content suffix
+    local -a fields=()
+    if [[ -z "${pid}" || ! -r "/proc/${pid}/stat" ]]; then
+        return 1
     fi
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    stat_content="$(<"/proc/${pid}/stat")"
+    if [[ "${stat_content}" != *") "* ]]; then
+        return 1
     fi
-    local name
-    for name in kwor kwor_amd64 kwor_arm64; do
-        pkill -TERM -x "${name}" >/dev/null 2>&1 || true
-    done
-    sleep 2
-    for name in kwor kwor_amd64 kwor_arm64; do
-        if pgrep -x "${name}" >/dev/null 2>&1; then
-            pkill -KILL -x "${name}" >/dev/null 2>&1 || true
+    suffix="${stat_content##*) }"
+    read -r -a fields <<< "${suffix}"
+    if [[ "${#fields[@]}" -le 19 || -z "${fields[19]}" ]]; then
+        return 1
+    fi
+    echo "${fields[19]}"
+}
+
+process_matches_binary_path() {
+    local pid="${1:-}"
+    local expected actual
+    expected="$(normalize_binary_path "${2:-}")"
+    actual="$(process_executable_path "${pid}")"
+    [[ -n "${expected}" && -n "${actual}" && "${actual}" == "${expected}" ]]
+}
+
+process_identity_matches_binary_path() {
+    local pid="${1:-}"
+    local expected_start="${2:-}"
+    local expected_path="${3:-}"
+    local current_start
+    current_start="$(process_start_time "${pid}" 2>/dev/null || true)"
+    [[ -n "${current_start}" && "${current_start}" == "${expected_start}" ]] || return 1
+    process_matches_binary_path "${pid}" "${expected_path}"
+}
+
+binary_path_has_running_process() {
+    local expected_path="${1:-}"
+    local proc_exe pid
+    for proc_exe in /proc/[0-9]*/exe; do
+        [[ -L "${proc_exe}" ]] || continue
+        pid="${proc_exe#/proc/}"
+        pid="${pid%/exe}"
+        if process_matches_binary_path "${pid}" "${expected_path}"; then
+            return 0
         fi
     done
+    return 1
+}
+
+stop_processes_by_binary_path() {
+    local expected_path="${1:-}"
+    local normalized_path proc_exe pid start_time identity
+    local attempt live
+    local -a identities=()
+    normalized_path="$(normalize_binary_path "${expected_path}")"
+    if [[ -z "${normalized_path}" ]]; then
+        return 0
+    fi
+
+    for proc_exe in /proc/[0-9]*/exe; do
+        [[ -L "${proc_exe}" ]] || continue
+        pid="${proc_exe#/proc/}"
+        pid="${pid%/exe}"
+        if ! process_matches_binary_path "${pid}" "${normalized_path}"; then
+            continue
+        fi
+        start_time="$(process_start_time "${pid}" 2>/dev/null || true)"
+        if [[ -z "${start_time}" ]]; then
+            log_error "Cannot capture process identity for PID ${pid}; refusing name-based fallback"
+            return 1
+        fi
+        identities+=("${pid}:${start_time}")
+    done
+
+    if [[ "${#identities[@]}" -eq 0 ]]; then
+        return 0
+    fi
+    for identity in "${identities[@]}"; do
+        pid="${identity%%:*}"
+        start_time="${identity#*:}"
+        if process_identity_matches_binary_path "${pid}" "${start_time}" "${normalized_path}"; then
+            kill -TERM "${pid}" 2>/dev/null || true
+        fi
+    done
+
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        live=0
+        for identity in "${identities[@]}"; do
+            pid="${identity%%:*}"
+            start_time="${identity#*:}"
+            if process_identity_matches_binary_path "${pid}" "${start_time}" "${normalized_path}"; then
+                live=1
+                break
+            fi
+        done
+        [[ "${live}" -eq 0 ]] && return 0
+        sleep 0.1
+    done
+
+    for identity in "${identities[@]}"; do
+        pid="${identity%%:*}"
+        start_time="${identity#*:}"
+        if process_identity_matches_binary_path "${pid}" "${start_time}" "${normalized_path}"; then
+            kill -KILL "${pid}" 2>/dev/null || true
+        fi
+    done
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        live=0
+        for identity in "${identities[@]}"; do
+            pid="${identity%%:*}"
+            start_time="${identity#*:}"
+            if process_identity_matches_binary_path "${pid}" "${start_time}" "${normalized_path}"; then
+                live=1
+                break
+            fi
+        done
+        [[ "${live}" -eq 0 ]] && return 0
+        sleep 0.1
+    done
+
+    log_error "A process executing ${normalized_path} is still running"
+    return 1
+}
+
+stop_existing_instance() {
+    local candidate_path candidate_path_existing existing_path
+    local -a stop_paths=()
+    if [[ -z "${STOP_BIN_PATH}" ]]; then
+        log_info "No existing binary file detected; checking verified install paths for deleted running processes"
+    else
+        stop_paths+=("${STOP_BIN_PATH}")
+    fi
+
+    for candidate_path in \
+        "${INSTALL_DIR}/kwor" \
+        "${INSTALL_DIR}/kwor_amd64" \
+        "${INSTALL_DIR}/kwor_arm64"
+    do
+        existing_path=0
+        for candidate_path_existing in "${stop_paths[@]}"; do
+            if [[ "${candidate_path_existing}" == "${candidate_path}" ]]; then
+                existing_path=1
+                break
+            fi
+        done
+        [[ "${existing_path}" -eq 0 ]] && stop_paths+=("${candidate_path}")
+    done
+
+    if [[ -n "${STOP_BIN_PATH}" ]]; then
+        log_info "Stopping verified existing instance at: ${STOP_BIN_PATH}"
+    fi
+    if [[ -n "${SERVICE_FILE_PATH}" ]] && command -v systemctl >/dev/null 2>&1; then
+        systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    fi
+    for candidate_path in "${stop_paths[@]}"; do
+        stop_processes_by_binary_path "${candidate_path}" || return 1
+        if binary_path_has_running_process "${candidate_path}"; then
+            log_error "Existing kwor process remains active at ${candidate_path}"
+            return 1
+        fi
+    done
+    if [[ -n "${SERVICE_FILE_PATH}" ]] && command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${SERVICE_NAME}"; then
+        log_error "Existing verified kwor systemd service remains active"
+        return 1
+    fi
+    return 0
 }
 
 install_binary() {
@@ -906,10 +1165,28 @@ rollback_and_restart_previous() {
     log_warn "New version failed to start, rolling back previous binary"
     cp -f "${BACKUP_BIN_PATH}" "${TARGET_BIN_PATH}"
     chmod 755 "${TARGET_BIN_PATH}"
-    if "${TARGET_BIN_PATH}" start; then
+    if "${TARGET_BIN_PATH}" start && wait_for_target_runtime; then
         log_warn "Rollback start succeeded; previous version is running again"
         return 0
     fi
+    return 1
+}
+
+wait_for_target_runtime() {
+    local main_pid=""
+    local i
+    for i in $(seq 1 40); do
+        if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${SERVICE_NAME}"; then
+            main_pid="$(systemctl show "${SERVICE_NAME}" --property=MainPID --value 2>/dev/null || true)"
+            if [[ -n "${main_pid}" && "${main_pid}" != "0" ]] && process_matches_binary_path "${main_pid}" "${TARGET_BIN_PATH}"; then
+                return 0
+            fi
+        fi
+        if binary_path_has_running_process "${TARGET_BIN_PATH}"; then
+            return 0
+        fi
+        sleep 0.3
+    done
     return 1
 }
 
@@ -934,14 +1211,7 @@ start_with_repaired_systemd() {
         return 1
     fi
 
-    local i
-    for i in $(seq 1 40); do
-        if systemctl is-active --quiet "${SERVICE_NAME}"; then
-            return 0
-        fi
-        sleep 0.3
-    done
-    return 1
+    wait_for_target_runtime
 }
 
 repair_systemd_after_target_start() {
@@ -971,8 +1241,11 @@ start_target_instance() {
 
     if run_target_start_command; then
         repair_systemd_after_target_start
-        rm -f "${BACKUP_BIN_PATH}"
-        return 0
+        if wait_for_target_runtime; then
+            rm -f "${BACKUP_BIN_PATH}"
+            return 0
+        fi
+        LAST_COMMAND_OUTPUT="Target start returned success, but no process is executing ${TARGET_BIN_PATH}"
     fi
     if [[ -n "${LAST_COMMAND_OUTPUT}" ]]; then
         failure_output="${LAST_COMMAND_OUTPUT}"

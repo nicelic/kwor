@@ -136,6 +136,67 @@ func TestInboundMarshalJSON_ExcludesPortHopRuntimeOnlyFields(t *testing.T) {
 	}
 }
 
+func TestInboundUserManagementMetadataNeverReachesRuntimePayload(t *testing.T) {
+	var inbound Inbound
+	if err := json.Unmarshal([]byte(`{
+		"id": 7,
+		"type": "socks",
+		"tag": "socks-10080",
+		"listen": "::",
+		"listen_port": 10080,
+		"route_tag": "socks-10080",
+		"user_management": {"selectable": true},
+		"metadata": {"source": "panel"},
+		"users": [{"username": "legacy", "password": "legacy"}]
+	}`), &inbound); err != nil {
+		t.Fatalf("UnmarshalJSON failed: %v", err)
+	}
+
+	var options map[string]interface{}
+	if err := json.Unmarshal(inbound.Options, &options); err != nil {
+		t.Fatalf("unmarshal options failed: %v", err)
+	}
+	for _, key := range []string{"route_tag", "user_management", "metadata", "users"} {
+		if _, exists := options[key]; exists {
+			t.Fatalf("view-only field %q was persisted in Options: %#v", key, options)
+		}
+	}
+
+	// Guard historical records as well: runtime serialization must filter stale
+	// view-only metadata even if it already exists in the database column.
+	inbound.Options = mustRawMessage(t, map[string]interface{}{
+		"listen":          "::",
+		"listen_port":     10080,
+		"route_tag":       "socks-10080",
+		"user_management": map[string]interface{}{"selectable": true},
+		"metadata":        map[string]interface{}{"source": "panel"},
+		"users":           []interface{}{map[string]interface{}{"username": "legacy", "password": "legacy"}},
+	})
+	raw, err := inbound.MarshalJSON()
+	if err != nil {
+		t.Fatalf("MarshalJSON failed: %v", err)
+	}
+	payload := map[string]interface{}{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal runtime payload failed: %v", err)
+	}
+	for _, key := range []string{"route_tag", "user_management", "metadata", "users"} {
+		if _, exists := payload[key]; exists {
+			t.Fatalf("view-only field %q reached runtime payload: %#v", key, payload)
+		}
+	}
+
+	full, err := inbound.MarshalFull()
+	if err != nil {
+		t.Fatalf("MarshalFull failed: %v", err)
+	}
+	for _, key := range []string{"route_tag", "user_management", "metadata", "users"} {
+		if _, exists := (*full)[key]; exists {
+			t.Fatalf("view-only field %q reached full inbound view: %#v", key, *full)
+		}
+	}
+}
+
 func TestInboundUnmarshalJSON_NormalizesLegacyHysteriaQUICFields(t *testing.T) {
 	var inbound Inbound
 	if err := json.Unmarshal([]byte(`{

@@ -388,12 +388,15 @@ const saveConfig = async () => {
   }
 
   loading.value = true
-  const success = await store.save('config', 'set', payload)
-  if (success) {
-    const nextForm = parseForm(store.config)
-    form.value = cloneForm(nextForm)
-    oldForm.value = cloneForm(nextForm)
+  try {
+    const success = await store.save('config', 'set', payload)
+    if (success) {
+      const nextForm = parseForm(store.config)
+      form.value = cloneForm(nextForm)
+      oldForm.value = cloneForm(nextForm)
+    }
+  } finally {
+    loading.value = false
   }
-  loading.value = false
 }
 </script>

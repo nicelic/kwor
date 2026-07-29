@@ -14,6 +14,7 @@ export const OutTypes = {
   Hysteria: 'hysteria',
   VLESS: 'vless',
   ShadowTLS: 'shadowtls',
+  ShadowQUIC: 'shadowquic',
   TUIC: 'tuic',
   Hysteria2: 'hysteria2',
   AnyTls: 'anytls',
@@ -164,6 +165,29 @@ export interface ShadowTLS extends OutboundBasics, Dial {
   tls: oTls
   // Shadowsocks 配置，用于生成组合的出站
   ss_config?: ShadowsocksOutConfig
+}
+
+export interface ShadowQUIC extends OutboundBasics {
+  server: string
+  server_port: number
+  username: string
+  password: string
+  sni?: string
+  alpn?: string[]
+  quic_versions?: string[]
+  udp_over_stream?: boolean
+  zero_rtt?: boolean
+  keep_alive_interval?: number
+  congestion_controller?: string
+  up?: string
+  down?: string
+  cwnd?: number
+  bbr_profile?: string
+  max_datagram_frame_size?: number
+  max_open_streams?: number
+  recv_window_conn?: number
+  recv_window?: number
+  disable_mtu_discovery?: boolean
 }
 
 export interface VLESS extends OutboundBasics, Dial {
@@ -369,6 +393,7 @@ const defaultValues: Record<OutType, Outbound> = {
     tls: { enabled: true },
   },
   shadowtls: { type: OutTypes.ShadowTLS, version: 3, strict_mode: true, wildcard_sni: 'off', handshake: { server: 'addons.mozilla.org', server_port: 443 }, tls: { enabled: true }, ss_config: { method: '2022-blake3-aes-128-gcm', network: 'tcp', udp_over_tcp: false, multiplex: { enabled: true, protocol: 'h2mux', max_connections: 8, min_streams: 16, padding: true } } },
+  shadowquic: { type: OutTypes.ShadowQUIC },
   vless: { type: OutTypes.VLESS, tls: {}, multiplex: {}, transport: {} },
   tuic: { type: OutTypes.TUIC, congestion_control: 'cubic', tls: { enabled: true } },
   hysteria2: { type: OutTypes.Hysteria2, tls: { enabled: true } },

@@ -1,0 +1,248 @@
+package api
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/alireza0/s-ui/logger"
+	"github.com/alireza0/s-ui/service"
+	"github.com/gin-gonic/gin"
+)
+
+type mihomoCoreVersionRequest struct {
+	Channel string
+	Offset  int
+	Limit   int
+	Target  service.MihomoCoreDownloadTarget
+}
+
+type mihomoCoreDownloadRequest struct {
+	Version           string
+	CustomURL         string
+	DownloadSessionID string
+	Target            service.MihomoCoreDownloadTarget
+}
+
+type mihomoCorePreferenceRequest struct {
+	CustomURL     string
+	Target        service.MihomoCoreDownloadTarget
+	HasOS         bool
+	HasArch       bool
+	HasAMD64Level bool
+}
+
+func parseMihomoCoreVersionWindowQuery(c *gin.Context) mihomoCoreVersionRequest {
+	channel, offset, limit := parseCoreVersionWindowPagination(c)
+	return mihomoCoreVersionRequest{
+		Channel: channel,
+		Offset:  offset,
+		Limit:   limit,
+		Target: service.MihomoCoreDownloadTarget{
+			OS:         strings.TrimSpace(c.Query("target_os")),
+			Arch:       strings.TrimSpace(c.Query("target_arch")),
+			Amd64Level: strings.TrimSpace(c.Query("target_amd64_level")),
+		},
+	}
+}
+
+func parseMihomoCoreDownloadRequest(c *gin.Context) mihomoCoreDownloadRequest {
+	return mihomoCoreDownloadRequest{
+		Version:           strings.TrimSpace(c.Request.FormValue("version")),
+		CustomURL:         strings.TrimSpace(c.Request.FormValue("custom_url")),
+		DownloadSessionID: strings.TrimSpace(c.Request.FormValue("downloadSessionId")),
+		Target: service.MihomoCoreDownloadTarget{
+			OS:         strings.TrimSpace(c.Request.FormValue("target_os")),
+			Arch:       strings.TrimSpace(c.Request.FormValue("target_arch")),
+			Amd64Level: strings.TrimSpace(c.Request.FormValue("target_amd64_level")),
+		},
+	}
+}
+
+func parseMihomoCorePreferenceRequest(c *gin.Context) mihomoCorePreferenceRequest {
+	target := service.MihomoCoreDownloadTarget{
+		OS:         strings.TrimSpace(c.Request.FormValue("target_os")),
+		Arch:       strings.TrimSpace(c.Request.FormValue("target_arch")),
+		Amd64Level: strings.TrimSpace(c.Request.FormValue("target_amd64_level")),
+	}
+	_, hasOS := c.Request.Form["target_os"]
+	_, hasArch := c.Request.Form["target_arch"]
+	_, hasAMD64Level := c.Request.Form["target_amd64_level"]
+	return mihomoCorePreferenceRequest{
+		CustomURL:     strings.TrimSpace(c.Request.FormValue("custom_url")),
+		Target:        target,
+		HasOS:         hasOS,
+		HasArch:       hasArch,
+		HasAMD64Level: hasAMD64Level,
+	}
+}
+
+func (a *ApiService) GetMihomoCoreManagerStatus(c *gin.Context) {
+	info, err := a.mihomoCoreManagerService().GetCoreStatus()
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, info, nil)
+}
+
+func (a *ApiService) GetMihomoCoreRemoteVersions(c *gin.Context) {
+	request := parseMihomoCoreVersionWindowQuery(c)
+	result, err := a.mihomoCoreManagerService().GetRemoteVersionsWindow(request.Channel, request.Offset, request.Limit, request.Target)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, result, nil)
+}
+
+func (a *ApiService) GetMihomoCoreUpdateInfo(c *gin.Context) {
+	forceCheck := strings.EqualFold(c.Query("force"), "true")
+	info, err := a.mihomoCoreManagerService().GetMihomoCoreUpdateInfo(forceCheck)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, info, nil)
+}
+
+func (a *ApiService) SaveMihomoCoreUpdateSettings(c *gin.Context) {
+	enabledRaw := strings.TrimSpace(c.Request.FormValue("enabled"))
+	enabled := strings.EqualFold(enabledRaw, "true") || enabledRaw == "1"
+	intervalHours, err := parseCoreIntervalHours(c.Request.FormValue("interval"))
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	if err = a.mihomoCoreManagerService().SetCoreAutoCheckSettings(enabled, intervalHours); err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	if enabled {
+		if checkErr := a.mihomoCoreManagerService().CheckAndMarkCoreUpdates(true); checkErr != nil {
+			logger.Warning("check mihomo core updates after settings update failed: ", checkErr)
+		}
+	}
+	info, err := a.mihomoCoreManagerService().GetMihomoCoreUpdateInfo(false)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, info, nil)
+}
+
+func (a *ApiService) AckMihomoCoreUpdateNotice(c *gin.Context) {
+	if err := a.mihomoCoreManagerService().ClearCoreUpdatePending(); err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	info, err := a.mihomoCoreManagerService().GetMihomoCoreUpdateInfo(false)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, info, nil)
+}
+
+func (a *ApiService) syncMihomoNftablesWithCoreState() {
+	if a.mihomoCoreManagerService().IsRunning() {
+		(&service.MihomoNftTrafficService{}).InitOnStartup()
+		(&service.MihomoClientRateLimitService{}).InitOnStartup()
+		(&service.MihomoClientPortBlockService{}).InitOnStartup()
+		return
+	}
+	(&service.MihomoNftTrafficService{}).CleanupOnShutdown()
+	(&service.MihomoClientRateLimitService{}).CleanupOnShutdown()
+	(&service.MihomoClientPortBlockService{}).CleanupOnShutdown()
+}
+
+func (a *ApiService) DownloadMihomoCoreManager(c *gin.Context) {
+	request := parseMihomoCoreDownloadRequest(c)
+
+	var localVersion string
+	var err error
+	if request.CustomURL != "" {
+		if !strings.HasPrefix(request.CustomURL, "http://") && !strings.HasPrefix(request.CustomURL, "https://") {
+			jsonMsg(c, "", fmt.Errorf("custom_url must start with http:// or https://"))
+			return
+		}
+		localVersion, err = a.mihomoCoreManagerService().DownloadCoreFromURL(request.CustomURL, request.DownloadSessionID)
+		if err == nil {
+			if saveErr := a.mihomoCoreManagerService().SaveCustomDownloadURL(request.CustomURL); saveErr != nil {
+				logger.Warning("save mihomo custom download url failed: ", saveErr)
+			}
+		}
+	} else {
+		if request.Version == "" {
+			jsonMsg(c, "", fmt.Errorf("version or custom_url is required"))
+			return
+		}
+		localVersion, err = a.mihomoCoreManagerService().DownloadCore(request.Version, request.Target, request.DownloadSessionID)
+	}
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	a.syncMihomoNftablesWithCoreState()
+	jsonObj(c, map[string]string{"version": localVersion}, nil)
+}
+
+func (a *ApiService) SaveMihomoCoreDownloadPreference(c *gin.Context) {
+	request := parseMihomoCorePreferenceRequest(c)
+	preference, err := a.mihomoCoreManagerService().GetDownloadPreference()
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	if request.HasOS {
+		preference.Target.OS = request.Target.OS
+	}
+	if request.HasArch {
+		preference.Target.Arch = request.Target.Arch
+	}
+	if request.HasAMD64Level {
+		preference.Target.Amd64Level = request.Target.Amd64Level
+	}
+	preference.CustomURL = request.CustomURL
+	if err = a.mihomoCoreManagerService().SaveDownloadPreference(preference); err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	preference, err = a.mihomoCoreManagerService().GetDownloadPreference()
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, preference, nil)
+}
+
+func (a *ApiService) StartMihomoCoreManager(c *gin.Context) {
+	err := service.WithCertificateCoreConfigGate(a.mihomoCoreManagerService().StartCore)
+	if err == nil {
+		a.syncMihomoNftablesWithCoreState()
+	}
+	jsonMsg(c, "startCore", err)
+}
+
+func (a *ApiService) StopMihomoCoreManager(c *gin.Context) {
+	err := a.mihomoCoreManagerService().StopCore()
+	if err == nil {
+		a.syncMihomoNftablesWithCoreState()
+	}
+	jsonMsg(c, "stopCore", err)
+}
+
+func (a *ApiService) RestartMihomoCoreManager(c *gin.Context) {
+	err := service.WithCertificateCoreConfigGate(a.mihomoCoreManagerService().RestartCore)
+	if err == nil {
+		a.syncMihomoNftablesWithCoreState()
+	}
+	jsonMsg(c, "restartCore", err)
+}
+
+func (a *ApiService) DeleteMihomoCoreManager(c *gin.Context) {
+	err := a.mihomoCoreManagerService().DeleteCore()
+	if err == nil {
+		a.syncMihomoNftablesWithCoreState()
+	}
+	jsonMsg(c, "deleteCore", err)
+}

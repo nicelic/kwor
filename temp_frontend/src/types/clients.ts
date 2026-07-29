@@ -36,6 +36,7 @@ const mihomoUUIDStyleFields: ReadonlyArray<ConfigFieldLocation> = [
   { key: "tuic", field: "password" },
   { key: "hysteria2", field: "password" },
   { key: "trusttunnel", field: "password" },
+  { key: "shadowquic", field: "password" },
 ]
 const defaultAutoNamedFields: ReadonlyArray<AutoNamedFieldLocation> = [
   { key: "mixed", field: "username", aliases: ["name"] },
@@ -64,6 +65,7 @@ const mihomoAutoNamedFields: ReadonlyArray<AutoNamedFieldLocation> = [
   { key: "snell", field: "name", aliases: ["username"] },
   { key: "trojan", field: "username", aliases: ["name"] },
   { key: "hysteria2", field: "username", aliases: ["name"] },
+  { key: "shadowquic", field: "username", aliases: ["name"] },
 ]
 const defaultEditableUsernameFields = new Set<string>([
   "mixed",
@@ -84,6 +86,7 @@ const mihomoEditableUsernameFields = new Set<string>([
   "naive",
   "hysteria2",
   "trusttunnel",
+  "shadowquic",
 ])
 
 const customCredentialProtocolsByNamespace: Record<ClientConfigNamespace, ReadonlySet<string>> = {
@@ -103,6 +106,7 @@ const customCredentialProtocolsByNamespace: Record<ClientConfigNamespace, Readon
     "trojan",
     "hysteria2",
     "tuic",
+    "shadowquic",
   ]),
 }
 
@@ -424,6 +428,7 @@ const mihomoConfigKeys = [
   "tuic",
   "hysteria2",
   "trusttunnel",
+  "shadowquic",
 ]
 
 function sanitizeConfigsByNamespace(configs: Config, namespace?: string): Config {
@@ -474,6 +479,7 @@ export function shuffleConfigs(configs: Config, key?: string, namespace?: string
       case "trojan":
       case "naive":
       case "hysteria2":
+      case "shadowquic":
         assignUniqueUUIDFieldsForKey(configs, k, namespace)
         break
       case "trusttunnel":
@@ -587,6 +593,10 @@ export function randomConfigs(user: string, namespace?: string): Config {
     configs.trusttunnel = {
       username: user,
       password: "",
+    }
+    configs.shadowquic = {
+      username: user,
+      password: mixedPassword,
     }
   }
 

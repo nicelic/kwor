@@ -14,7 +14,7 @@
           :label="t('kernelManager.provider')"
           :placeholder="t('kernelManager.providerPlaceholder')"
           clearable
-          :disabled="busy" />
+          :disabled="busy || !canManageKernelPackages" />
         <v-chip size="small" :color="providerStatusColor">
           {{ providerStatusText }}
         </v-chip>
@@ -22,7 +22,16 @@
       <v-divider />
       <v-card-text>
         <v-alert
-          v-if="!hasProvider"
+          v-if="runtimeSupportMessage"
+          type="warning"
+          variant="tonal"
+          density="comfortable"
+          class="mb-4">
+          {{ runtimeSupportMessage }}
+        </v-alert>
+
+        <v-alert
+          v-if="!hasProvider && canManageKernelPackages"
           type="info"
           variant="tonal"
           density="comfortable"
@@ -31,7 +40,7 @@
         </v-alert>
 
         <v-alert
-          v-if="!overview.supported && overview.reason"
+          v-if="hasProvider && !overview.supported && overview.reason"
           type="warning"
           variant="tonal"
           density="comfortable"
@@ -39,7 +48,7 @@
           {{ overview.reason }}
         </v-alert>
 
-        <v-row v-if="hasProvider" class="mb-2">
+        <v-row v-if="hasProvider && canManageKernelPackages" class="mb-2">
           <template v-if="isXanMod">
             <v-col cols="12" sm="6" md="4">
               <v-select
@@ -50,7 +59,7 @@
                 :label="t('kernelManager.line')"
                 :placeholder="t('kernelManager.linePlaceholder')"
                 clearable
-                :disabled="busy" />
+                :disabled="busy || !canManageKernelPackages" />
             </v-col>
             <v-col cols="12" sm="6" md="4">
               <v-select
@@ -61,7 +70,7 @@
                 :label="t('kernelManager.version')"
                 :placeholder="t('kernelManager.versionPlaceholder')"
                 clearable
-                :disabled="busy || versionItems.length === 0" />
+                :disabled="busy || !canManageKernelPackages || versionItems.length === 0" />
             </v-col>
             <v-col cols="12" sm="6" md="4">
               <v-select
@@ -72,7 +81,7 @@
                 :label="t('kernelManager.arch')"
                 :placeholder="t('kernelManager.archPlaceholder')"
                 clearable
-                :disabled="busy || archItems.length === 0" />
+                :disabled="busy || !canManageKernelPackages || archItems.length === 0" />
             </v-col>
           </template>
           <template v-else>
@@ -85,13 +94,13 @@
                 :label="t('kernelManager.version')"
                 :placeholder="t('kernelManager.versionPlaceholder')"
                 clearable
-                :disabled="busy || versionItems.length === 0" />
+                :disabled="busy || !canManageKernelPackages || versionItems.length === 0" />
             </v-col>
           </template>
         </v-row>
 
         <div class="text-caption text-medium-emphasis mb-3">
-          {{ t('kernelManager.currentKernel') }}: {{ overview.currentKernel || '-' }}
+          {{ t('kernelManager.currentKernel') }}: {{ activeOverview.currentKernel || '-' }}
           <span class="mx-2">|</span>
           {{ t('kernelManager.downloadDir') }}: {{ downloadDirText }}
         </div>
@@ -130,11 +139,12 @@
         <v-row>
           <v-col cols="12" md="4">
             <v-btn
+              class="kernel-action-btn kernel-action-btn--download"
               block
               color="primary"
               prepend-icon="mdi-download"
               :loading="downloading"
-              :disabled="!canOperate || packages.length === 0 || downloading"
+              :disabled="!canDownload"
               @click="downloadPackages">
               <template #loader>
                 <span class="kernel-download-loader">
@@ -151,22 +161,24 @@
           </v-col>
           <v-col cols="12" md="4">
             <v-btn
+              class="kernel-action-btn kernel-action-btn--install"
               block
               color="secondary"
               prepend-icon="mdi-package-variant-closed-check"
               :loading="installing"
-              :disabled="!canOperate || packages.length === 0 || installing"
+              :disabled="!canInstall"
               @click="installPackages">
               {{ t('kernelManager.install') }}
             </v-btn>
           </v-col>
           <v-col cols="12" md="4">
             <v-btn
+              class="kernel-action-btn kernel-action-btn--reboot"
               block
               color="warning"
               prepend-icon="mdi-restart-alert"
               :loading="rebooting"
-              :disabled="!canOperate || rebooting"
+              :disabled="!canRebootHost || operationBusy"
               @click="rebootHost">
               {{ t('kernelManager.reboot') }}
             </v-btn>
@@ -187,7 +199,7 @@
             variant="tonal"
             color="error"
             prepend-icon="mdi-delete"
-            :disabled="busy"
+            :disabled="!canManageKernelPackages || operationBusy"
             @click="clearDownloadedKernel">
             {{ t('kernelManager.clearDownloaded') }}
           </v-btn>
@@ -218,33 +230,36 @@
         <v-row class="mb-2">
           <v-col cols="12" md="4">
             <v-btn
+              class="kernel-action-btn kernel-action-btn--scan"
               block
               color="primary"
               prepend-icon="mdi-magnify"
               :loading="cleanupLoading"
-              :disabled="busy || !overview.supported"
+              :disabled="!canManageKernelCleanup || operationBusy"
               @click="scanCleanupPackages(true)">
               {{ t('kernelManager.cleanupScan') }}
             </v-btn>
           </v-col>
           <v-col cols="12" md="4">
             <v-btn
+              class="kernel-action-btn kernel-action-btn--purge"
               block
               color="error"
               prepend-icon="mdi-delete-sweep"
               :loading="cleanupPurging"
-              :disabled="busy || !overview.supported || cleanupSelectedPackages.length === 0"
+              :disabled="!canManageKernelCleanup || operationBusy || cleanupSelectedPackages.length === 0"
               @click="purgeSelectedCleanupPackages">
               {{ t('kernelManager.cleanupPurgeSelected') }} ({{ cleanupSelectedPackages.length }})
             </v-btn>
           </v-col>
           <v-col cols="12" md="4">
             <v-btn
+              class="kernel-action-btn kernel-action-btn--auto-clean"
               block
               color="warning"
               prepend-icon="mdi-auto-fix"
               :loading="cleanupAutoPurging"
-              :disabled="busy || !overview.supported || cleanupPackages.length === 0"
+              :disabled="!canManageKernelCleanup || operationBusy || !cleanupHasScanned"
               @click="autoCleanupKernelPackages">
               {{ t('kernelManager.cleanupAuto') }}
             </v-btn>
@@ -260,6 +275,7 @@
             :label="t('kernelManager.cleanupSelectAll')"
             hide-details
             density="compact"
+            :disabled="!canManageKernelCleanup || operationBusy || cleanupPackages.length === 0"
             @update:model-value="toggleCleanupSelectAll" />
         </div>
 
@@ -280,6 +296,7 @@
                   :model-value="cleanupSelectedMap[pkg.name] === true"
                   hide-details
                   density="compact"
+                  :disabled="!canManageKernelCleanup || operationBusy"
                   @update:model-value="toggleCleanupSelection(pkg.name, $event)" />
               </td>
               <td>{{ pkg.name }}</td>
@@ -325,17 +342,23 @@
 
 <script setup lang="ts">
 import HttpUtils from '@/plugins/httputil'
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { confirm } from '@/plugins/confirm'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { Ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 type KernelOverview = {
   supported: boolean
+  linux: boolean
   reason: string
   currentKernel: string
   downloadRoot: string
   downloadedKernel?: string
   downloadedDirectory?: string
+  downloadedProvider?: string
+  downloadedLine?: string
+  downloadedVersion?: string
+  downloadedArch?: string
 }
 
 type KernelVersionItem = { name: string }
@@ -372,6 +395,10 @@ type KernelSystemCleanupInfo = {
 
 type KernelProvider = 'xanmod' | 'bbrplus'
 
+const kernelDownloadRequestTimeout = 11 * 60 * 1000
+const kernelPackageOperationTimeout = 41 * 60 * 1000
+const kernelAutoCleanupRequestTimeout = 21 * 60 * 1000
+
 const props = withDefaults(defineProps<{ active?: boolean }>(), {
   active: false,
 })
@@ -400,6 +427,7 @@ const rebootOverlay = ref(false)
 const reconnectTimerId = ref<number | null>(null)
 const downloadProgressSessionId = ref('')
 const downloadProgressTimerId = ref<number | null>(null)
+let downloadProgressRequest: Promise<void> | null = null
 const provider = ref('')
 const kernelSelectionHydrating = ref(false)
 const selectedLine = ref('')
@@ -408,14 +436,21 @@ const selectedArch = ref('')
 
 const createEmptyKernelOverview = (): KernelOverview => ({
   supported: false,
+  linux: false,
   reason: '',
   currentKernel: '',
   downloadRoot: '',
   downloadedKernel: '',
   downloadedDirectory: '',
+  downloadedProvider: '',
+  downloadedLine: '',
+  downloadedVersion: '',
+  downloadedArch: '',
 })
 
 const overview = ref<KernelOverview>(createEmptyKernelOverview())
+const runtimeOverview = ref<KernelOverview>(createEmptyKernelOverview())
+const runtimeChecked = ref(false)
 
 const versionItems = ref<KernelVersionItem[]>([])
 const archItems = ref<KernelArchItem[]>([])
@@ -425,6 +460,7 @@ const cleanupCurrentKernel = ref('')
 const cleanupPinnedKernel = ref('')
 const cleanupPackages = ref<KernelCleanupPackageItem[]>([])
 const cleanupSelectedMap = ref<Record<string, boolean>>({})
+const cleanupHasScanned = ref(false)
 const downloadProgress = ref<KernelDownloadProgress>({
   id: '',
   status: 'missing',
@@ -492,10 +528,22 @@ const normalizeKernelProviderSelection = (value: unknown): KernelProvider | '' =
 
 const selectedProvider = computed(() => normalizeKernelProviderSelection(provider.value))
 const hasProvider = computed(() => selectedProvider.value !== '')
+const activeOverview = computed(() => (hasProvider.value ? overview.value : runtimeOverview.value))
+const runtimePackageSupportAvailable = computed(() => runtimeChecked.value && runtimeOverview.value.supported)
+const runtimeLinuxAvailable = computed(() => runtimeChecked.value && runtimeOverview.value.linux)
+const runtimeSupportMessage = computed(() => {
+  if (!runtimeChecked.value) {
+    return ''
+  }
+  if (!runtimeLinuxAvailable.value || !runtimePackageSupportAvailable.value) {
+    return String(runtimeOverview.value.reason || '').trim()
+  }
+  return ''
+})
+const canManageKernelPackages = computed(() => runtimePackageSupportAvailable.value)
+const canManageKernelCleanup = computed(() => runtimeLinuxAvailable.value)
 
-const busy = computed(() => (
-  loadingOverview.value ||
-  loadingPackages.value ||
+const operationBusy = computed(() => (
   downloading.value ||
   installing.value ||
   rebooting.value ||
@@ -503,7 +551,11 @@ const busy = computed(() => (
   cleanupPurging.value ||
   cleanupAutoPurging.value
 ))
-const canOperate = computed(() => overview.value.supported && !busy.value)
+const busy = computed(() => (
+  loadingOverview.value ||
+  loadingPackages.value ||
+  operationBusy.value
+))
 const providerStatusText = computed(() => {
   if (!hasProvider.value) {
     return t('kernelManager.providerEmpty')
@@ -517,13 +569,40 @@ const providerStatusColor = computed(() => {
   return overview.value.supported ? 'success' : 'warning'
 })
 const isXanMod = computed(() => selectedProvider.value === 'xanmod')
-const downloadDirText = computed(() => downloadDirectory.value || overview.value.downloadRoot || '-')
-const downloadedKernelLabel = computed(() => String(overview.value.downloadedKernel || '').trim())
-const downloadedKernelDirectory = computed(() => String(overview.value.downloadedDirectory || '').trim())
+const downloadDirText = computed(() => downloadDirectory.value || activeOverview.value.downloadRoot || '-')
+// A completed download belongs to the host, rather than to the selection that
+// happens to be visible in the form. Keep install availability independent of
+// provider/line/version changes made after a download has completed.
+const downloadedKernelLabel = computed(() => String(runtimeOverview.value.downloadedKernel || '').trim())
+const downloadedKernelDirectory = computed(() => String(runtimeOverview.value.downloadedDirectory || '').trim())
 const hasDownloadedKernel = computed(() => (
   downloadedKernelLabel.value.length > 0 && downloadedKernelDirectory.value.length > 0
 ))
-const cleanupCurrentKernelText = computed(() => cleanupCurrentKernel.value || overview.value.currentKernel || '-')
+const packageListHasKernelPair = computed(() => (
+  packages.value.some(item => String(item.type || '').trim().toLowerCase() === 'image') &&
+  packages.value.some(item => String(item.type || '').trim().toLowerCase() === 'headers')
+))
+const isKernelSelectionComplete = computed(() => {
+  if (!hasProvider.value || !canManageKernelPackages.value || !selectedVersion.value || !packageListHasKernelPair.value) {
+    return false
+  }
+  if (isXanMod.value) {
+    return selectedLine.value.length > 0 && selectedArch.value.length > 0
+  }
+  return true
+})
+const canDownload = computed(() => (
+  isKernelSelectionComplete.value &&
+  !loadingPackages.value &&
+  !operationBusy.value
+))
+const canInstall = computed(() => (
+  canManageKernelPackages.value &&
+  hasDownloadedKernel.value &&
+  !operationBusy.value
+))
+const canRebootHost = computed(() => runtimeLinuxAvailable.value)
+const cleanupCurrentKernelText = computed(() => cleanupCurrentKernel.value || activeOverview.value.currentKernel || '-')
 const cleanupPinnedKernelText = computed(() => cleanupPinnedKernel.value || '-')
 const cleanupSelectedPackages = computed(() => (
   cleanupPackages.value
@@ -627,8 +706,43 @@ const resetKernelSelection = (nextProvider: string) => {
   cleanupCurrentKernel.value = ''
   cleanupPinnedKernel.value = ''
   cleanupPackages.value = []
+  cleanupHasScanned.value = false
   resetCleanupSelection()
   resetDownloadProgress()
+}
+
+const normalizeKernelOverview = (raw: any): KernelOverview => ({
+  supported: raw?.supported === true,
+  linux: raw?.linux === true,
+  reason: String(raw?.reason ?? ''),
+  currentKernel: String(raw?.currentKernel ?? ''),
+  downloadRoot: String(raw?.downloadRoot ?? ''),
+  downloadedKernel: String(raw?.downloadedKernel ?? ''),
+  downloadedDirectory: String(raw?.downloadedDirectory ?? ''),
+  downloadedProvider: String(raw?.downloadedProvider ?? ''),
+  downloadedLine: String(raw?.downloadedLine ?? ''),
+  downloadedVersion: String(raw?.downloadedVersion ?? ''),
+  downloadedArch: String(raw?.downloadedArch ?? ''),
+})
+
+const loadRuntimeOverview = async () => {
+  const stopLoading = beginOverviewLoading()
+  try {
+    const msg = await HttpUtils.get('api/kernel-overview', { provider: 'xanmod' })
+    if (msg.success && msg.obj) {
+      runtimeOverview.value = normalizeKernelOverview(msg.obj)
+    } else {
+      runtimeOverview.value = {
+        ...createEmptyKernelOverview(),
+        reason: String(msg.msg ?? ''),
+      }
+    }
+  } catch {
+    runtimeOverview.value = createEmptyKernelOverview()
+  } finally {
+    runtimeChecked.value = true
+    stopLoading()
+  }
 }
 
 const loadOverview = async (requestToken = beginSelectionRequest()) => {
@@ -644,14 +758,7 @@ const loadOverview = async (requestToken = beginSelectionRequest()) => {
     const msg = await HttpUtils.get('api/kernel-overview', { provider: currentProvider })
     if (!isLatestSelectionRequest(requestToken)) return
     if (msg.success && msg.obj) {
-      overview.value = {
-        supported: msg.obj.supported === true,
-        reason: String(msg.obj.reason ?? ''),
-        currentKernel: String(msg.obj.currentKernel ?? ''),
-        downloadRoot: String(msg.obj.downloadRoot ?? ''),
-        downloadedKernel: String(msg.obj.downloadedKernel ?? ''),
-        downloadedDirectory: String(msg.obj.downloadedDirectory ?? ''),
-      }
+      overview.value = normalizeKernelOverview(msg.obj)
     }
   } finally {
     stopLoading()
@@ -811,22 +918,28 @@ const applyCleanupScanResult = (obj: any) => {
     .map((item: unknown) => normalizeCleanupPackage(item))
     .filter((item: KernelCleanupPackageItem) => item.name.length > 0)
   resetCleanupSelection()
+  cleanupHasScanned.value = true
 }
 
 const scanCleanupPackages = async (needConfirm = false, requestToken?: number) => {
   const currentRequestToken = requestToken ?? beginCleanupScanRequest()
-  if (!overview.value.supported) {
+  if (!runtimeLinuxAvailable.value) {
     if (isLatestCleanupScanRequest(currentRequestToken)) {
       cleanupPackages.value = []
       cleanupCurrentKernel.value = ''
       cleanupPinnedKernel.value = ''
+      cleanupHasScanned.value = false
       resetCleanupSelection()
     }
     return
   }
   if (needConfirm) {
-    const confirmed = window.confirm(t('kernelManager.cleanupScanConfirm'))
-    if (!confirmed) return
+    const confirmed = await confirm({
+      message: t('kernelManager.cleanupScanConfirm'),
+      severity: 'info',
+      confirmText: t('confirmDialog.actions.scan'),
+    })
+    if (!confirmed || !runtimeLinuxAvailable.value || !isLatestCleanupScanRequest(currentRequestToken)) return
   }
   const stopLoading = beginCleanupLoading()
   try {
@@ -863,13 +976,25 @@ const toggleCleanupSelectAll = (checked: unknown) => {
 }
 
 const purgeSelectedCleanupPackages = async () => {
+  if (!canManageKernelCleanup.value || operationBusy.value) {
+    return
+  }
   const targets = cleanupSelectedPackages.value
   if (targets.length === 0) {
     setFeedback('warning', t('kernelManager.cleanupNeedSelection'))
     return
   }
-  const confirmed = window.confirm(t('kernelManager.cleanupPurgeConfirm', { count: targets.length }))
-  if (!confirmed) return
+  const confirmed = await confirm({
+    message: t('kernelManager.cleanupPurgeConfirm', { count: targets.length }),
+    severity: 'danger',
+    confirmText: t('confirmDialog.actions.purge'),
+  })
+  if (
+    !confirmed
+    || !canManageKernelCleanup.value
+    || operationBusy.value
+    || !targets.every(target => cleanupPackages.value.some(item => item.name === target))
+  ) return
 
   cleanupPurging.value = true
   try {
@@ -877,9 +1002,11 @@ const purgeSelectedCleanupPackages = async () => {
       headers: {
         'Content-Type': 'application/json',
       },
+      timeout: kernelPackageOperationTimeout,
     })
     if (msg.success) {
       applyKernelSuccessFeedback(t('kernelManager.cleanupPurgeDone', { count: targets.length }), msg.obj)
+      await loadRuntimeOverview()
       await loadOverview()
       await scanCleanupPackages()
     } else {
@@ -891,15 +1018,23 @@ const purgeSelectedCleanupPackages = async () => {
 }
 
 const autoCleanupKernelPackages = async () => {
-  const confirmed = window.confirm(t('kernelManager.cleanupAutoConfirm'))
-  if (!confirmed) return
+  if (!canManageKernelCleanup.value || operationBusy.value || !cleanupHasScanned.value) {
+    return
+  }
+  const confirmed = await confirm({
+    message: t('kernelManager.cleanupAutoConfirm'),
+    severity: 'danger',
+    confirmText: t('confirmDialog.actions.cleanup'),
+  })
+  if (!confirmed || !canManageKernelCleanup.value || operationBusy.value || !cleanupHasScanned.value) return
 
   cleanupAutoPurging.value = true
   try {
-    const msg = await HttpUtils.post('api/kernel-cleanup-auto', {})
+    const msg = await HttpUtils.post('api/kernel-cleanup-auto', {}, { timeout: kernelAutoCleanupRequestTimeout })
     if (msg.success) {
       const count = Array.isArray(msg.obj?.requested) ? msg.obj.requested.length : 0
       applyKernelSuccessFeedback(t('kernelManager.cleanupAutoDone', { count }), msg.obj)
+      await loadRuntimeOverview()
       await loadOverview()
       await scanCleanupPackages()
     } else {
@@ -924,18 +1059,29 @@ const stopDownloadProgressPolling = () => {
   }
 }
 
-const pollDownloadProgress = async () => {
+const pollDownloadProgress = async (): Promise<void> => {
+  if (downloadProgressRequest) return downloadProgressRequest
   const sessionId = downloadProgressSessionId.value.trim()
   if (!sessionId) return
-  const msg = await HttpUtils.get('api/kernel-download-progress', { id: sessionId }, { silentAuthCheck: true })
-  if (!msg.success) return
-  const nextProgress = normalizeKernelDownloadProgress(msg.obj)
-  if (nextProgress.status === 'missing' && downloading.value) {
-    return
-  }
-  downloadProgress.value = nextProgress
-  if (downloadProgress.value.status === 'success' || downloadProgress.value.status === 'error' || downloadProgress.value.status === 'missing') {
-    stopDownloadProgressPolling()
+  const request = (async () => {
+    const msg = await HttpUtils.get('api/kernel-download-progress', { id: sessionId }, { silentAuthCheck: true })
+    if (!msg.success || sessionId !== downloadProgressSessionId.value.trim()) return
+    const nextProgress = normalizeKernelDownloadProgress(msg.obj)
+    if (nextProgress.status === 'missing' && downloading.value) {
+      return
+    }
+    downloadProgress.value = nextProgress
+    if (downloadProgress.value.status === 'success' || downloadProgress.value.status === 'error' || downloadProgress.value.status === 'missing') {
+      stopDownloadProgressPolling()
+    }
+  })()
+  downloadProgressRequest = request
+  try {
+    await request
+  } finally {
+    if (downloadProgressRequest === request) {
+      downloadProgressRequest = null
+    }
   }
 }
 
@@ -947,6 +1093,16 @@ const startDownloadProgressPolling = (sessionId: string) => {
     void pollDownloadProgress()
   }, 800)
   void pollDownloadProgress()
+}
+
+const handleVisibilityChange = () => {
+  if (document.visibilityState === 'visible') {
+    if (downloadProgressSessionId.value) {
+      startDownloadProgressPolling(downloadProgressSessionId.value)
+    }
+    return
+  }
+  stopDownloadProgressPolling()
 }
 
 const buildSelectionFormData = (downloadSessionId = '') => {
@@ -966,8 +1122,13 @@ const buildSelectionFormData = (downloadSessionId = '') => {
 }
 
 const downloadPackages = async () => {
-  const confirmed = window.confirm(t('kernelManager.downloadConfirm'))
-  if (!confirmed) return
+  if (!canDownload.value) return
+  const confirmed = await confirm({
+    message: t('kernelManager.downloadConfirm'),
+    severity: 'info',
+    confirmText: t('confirmDialog.actions.download'),
+  })
+  if (!confirmed || !canDownload.value) return
   clearFeedback()
   const sessionId = makeDownloadSessionId()
   resetDownloadProgress()
@@ -977,7 +1138,7 @@ const downloadPackages = async () => {
   downloading.value = true
   startDownloadProgressPolling(sessionId)
   try {
-    const msg = await HttpUtils.post('api/kernel-download', buildSelectionFormData(sessionId))
+    const msg = await HttpUtils.post('api/kernel-download', buildSelectionFormData(sessionId), { timeout: kernelDownloadRequestTimeout })
     if (msg.success && msg.obj?.sessionId) {
       const normalizedSessionId = String(msg.obj.sessionId).trim()
       if (normalizedSessionId && normalizedSessionId !== downloadProgressSessionId.value) {
@@ -988,6 +1149,7 @@ const downloadPackages = async () => {
     if (msg.success) {
       const count = Array.isArray(msg.obj?.downloaded) ? msg.obj.downloaded.length : 0
       downloadDirectory.value = String(msg.obj?.directory ?? downloadDirectory.value)
+      await loadRuntimeOverview()
       await loadOverview()
       setFeedback('success', t('kernelManager.downloadDone', { count }))
     } else {
@@ -1000,12 +1162,17 @@ const downloadPackages = async () => {
 }
 
 const installPackages = async () => {
-  const confirmed = window.confirm(t('kernelManager.installConfirm'))
-  if (!confirmed) return
+  if (!canInstall.value) return
+  const confirmed = await confirm({
+    message: t('kernelManager.installConfirm'),
+    severity: 'warning',
+    confirmText: t('confirmDialog.actions.install'),
+  })
+  if (!confirmed || !canInstall.value) return
   clearFeedback()
   installing.value = true
   try {
-    const msg = await HttpUtils.post('api/kernel-install', buildSelectionFormData())
+    const msg = await HttpUtils.post('api/kernel-install', {}, { timeout: kernelPackageOperationTimeout })
     if (msg.success) {
       const installed = msg.obj?.installed === true
       const needsReboot = msg.obj?.needsReboot === true
@@ -1024,6 +1191,7 @@ const installPackages = async () => {
         successType = 'warning'
       }
       applyKernelSuccessFeedback(successText, msg.obj, successType)
+      await loadRuntimeOverview()
       await loadOverview()
       await scanCleanupPackages()
     } else {
@@ -1045,18 +1213,16 @@ const startReconnectPolling = () => {
   rebootOverlay.value = true
   const poll = async () => {
     try {
-      const resp = await fetch('./api/session', {
-        method: 'GET',
-        credentials: 'include',
-        cache: 'no-store',
+      const body = await HttpUtils.get('api/session', {}, {
+        timeout: 5000,
+        silentAuthCheck: true,
+        silentErrorToast: true,
       })
-      if (resp.ok) {
-        const body = await resp.json()
-        if (body?.success === true) {
-          window.location.reload()
-          return
-        }
+      if (body.success) {
+        window.location.reload()
+        return
       }
+      if (body.msg === 'Invalid login') return
     } catch {
       // wait for service to come back
     }
@@ -1066,8 +1232,13 @@ const startReconnectPolling = () => {
 }
 
 const rebootHost = async () => {
-  const confirmed = window.confirm(t('kernelManager.rebootConfirm'))
-  if (!confirmed) return
+  if (!canRebootHost.value || operationBusy.value) return
+  const confirmed = await confirm({
+    message: t('kernelManager.rebootConfirm'),
+    severity: 'danger',
+    confirmText: t('confirmDialog.actions.reboot'),
+  })
+  if (!confirmed || !canRebootHost.value || operationBusy.value) return
   clearFeedback()
   rebooting.value = true
   try {
@@ -1083,8 +1254,13 @@ const rebootHost = async () => {
 }
 
 const clearDownloadedKernel = async () => {
-  const confirmed = window.confirm(t('kernelManager.clearDownloadedConfirm'))
-  if (!confirmed) return
+  if (!canManageKernelPackages.value || operationBusy.value) return
+  const confirmed = await confirm({
+    message: t('kernelManager.clearDownloadedConfirm'),
+    severity: 'danger',
+    confirmText: t('confirmDialog.actions.clear'),
+  })
+  if (!confirmed || !canManageKernelPackages.value || operationBusy.value) return
   clearFeedback()
   const stopLoading = beginCleanupLoading()
   try {
@@ -1094,6 +1270,7 @@ const clearDownloadedKernel = async () => {
       overview.value.downloadedDirectory = ''
       downloadDirectory.value = ''
       setFeedback('success', t('kernelManager.clearDownloadedDone'))
+      await loadRuntimeOverview()
       await loadOverview()
       await loadPackages()
     } else {
@@ -1108,12 +1285,16 @@ const refreshKernelData = async (
   selectionRequestToken = beginSelectionRequest(),
   cleanupRequestToken = beginCleanupScanRequest(),
 ) => {
+  await loadRuntimeOverview()
   if (!selectedProvider.value) {
+    return
+  }
+  if (!canManageKernelPackages.value) {
     return
   }
   await loadOverview(selectionRequestToken)
   await loadVersions(selectionRequestToken)
-  if (overview.value.supported) {
+  if (canManageKernelCleanup.value) {
     await scanCleanupPackages(false, cleanupRequestToken)
   }
 }
@@ -1130,9 +1311,6 @@ watch(provider, async (nextProvider) => {
   resetKernelSelection(nextProvider)
   await nextTick()
   kernelSelectionHydrating.value = false
-  if (!selectedProvider.value) {
-    return
-  }
   await refreshCurrentKernelData()
 }, { immediate: true })
 
@@ -1177,9 +1355,18 @@ watch(selectedArch, async () => {
   await loadPackages(beginSelectionRequest())
 })
 
+onMounted(() => {
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+  }
+})
+
 onBeforeUnmount(() => {
   stopDownloadProgressPolling()
   clearReconnectTimer()
+  if (typeof document !== 'undefined') {
+    document.removeEventListener('visibilitychange', handleVisibilityChange)
+  }
 })
 </script>
 
@@ -1187,6 +1374,91 @@ onBeforeUnmount(() => {
 .kernel-provider-select {
   min-width: 220px;
   max-width: 320px;
+}
+
+.kernel-action-btn {
+  min-height: 38px;
+  border: 1px solid transparent !important;
+  font-weight: 700;
+  letter-spacing: 0;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+  transition:
+    background-color 0.16s ease,
+    border-color 0.16s ease,
+    box-shadow 0.16s ease,
+    transform 0.16s ease;
+}
+
+.kernel-action-btn--download {
+  background: #1d4ed8 !important;
+  border-color: #3b82f6 !important;
+  color: #eff6ff !important;
+}
+
+.kernel-action-btn--install {
+  background: #047857 !important;
+  border-color: #10b981 !important;
+  color: #ecfdf5 !important;
+}
+
+.kernel-action-btn--reboot {
+  background: #92400e !important;
+  border-color: #d97706 !important;
+  color: #fef3c7 !important;
+}
+
+.kernel-action-btn--scan {
+  background: #075985 !important;
+  border-color: #0ea5e9 !important;
+  color: #e0f2fe !important;
+}
+
+.kernel-action-btn--purge {
+  background: #b91c1c !important;
+  border-color: #ef4444 !important;
+  color: #fff1f2 !important;
+}
+
+.kernel-action-btn--auto-clean {
+  background: #9a3412 !important;
+  border-color: #f97316 !important;
+  color: #fff7ed !important;
+}
+
+.kernel-action-btn:hover:not(.v-btn--disabled) {
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.18),
+    0 8px 18px rgba(15, 23, 42, 0.22);
+  transform: translateY(-1px);
+}
+
+.kernel-action-btn:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.82);
+  outline-offset: 2px;
+}
+
+.kernel-action-btn:not(.v-btn--loading) :deep(.v-btn__content),
+.kernel-action-btn:not(.v-btn--loading) :deep(.v-icon) {
+  color: inherit !important;
+  opacity: 1;
+}
+
+.kernel-action-btn.v-btn--disabled {
+  opacity: 1 !important;
+  background: #52525b !important;
+  border-color: #71717a !important;
+  color: #e4e4e7 !important;
+  box-shadow: none;
+}
+
+.kernel-action-btn.v-btn--disabled :deep(.v-btn__overlay) {
+  background: #27272a !important;
+  opacity: 0.34 !important;
+}
+
+.kernel-action-btn.v-btn--disabled :deep(.v-btn__content),
+.kernel-action-btn.v-btn--disabled :deep(.v-icon) {
+  color: #e4e4e7 !important;
 }
 
 .kernel-cleanup-risk-chip {
@@ -1218,11 +1490,15 @@ onBeforeUnmount(() => {
 
 .kernel-download-loader {
   display: inline-flex;
+  width: 100%;
+  min-width: 0;
   align-items: center;
+  justify-content: center;
   gap: 8px;
 }
 
 .kernel-download-loader__text {
+  min-width: 0;
   white-space: nowrap;
   font-size: 12px;
   letter-spacing: 0.1px;

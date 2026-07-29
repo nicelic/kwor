@@ -46,7 +46,7 @@ func deleteRulesByCommentPrefix(prefix string) error {
 		return nil
 	}
 
-	chains := []string{nftChainIn, nftChainOut, nftChainForward, nftChainPrerouting}
+	chains := []string{nftChainIn, nftChainOut, nftChainForward}
 	var firstErr error
 	for _, chain := range chains {
 		rules, err := listRuleCommentsByPrefix(chain, prefix)
@@ -60,6 +60,15 @@ func deleteRulesByCommentPrefix(prefix string) error {
 			if err = deleteRuleByHandle(chain, rule.handle); err != nil && firstErr == nil {
 				firstErr = err
 			}
+		}
+	}
+	redirectComments, err := listNftRedirectCommentsByPrefix(prefix)
+	if err != nil && firstErr == nil {
+		firstErr = err
+	}
+	for _, comment := range redirectComments {
+		if err := deleteNftRedirectRulesByComment(comment); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	return firstErr

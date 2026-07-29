@@ -32,9 +32,9 @@
           @click="reset(vm)"
         >{{ $t('reset') }}</v-btn>
       </template>
-      <template #now-btn="{ goToday }">
+      <template #now-btn>
         <v-btn
-          @click="goToday"
+          @click="setNow"
         >{{ $t('now') }}</v-btn>
       </template>
     </DatePicker>
@@ -43,6 +43,14 @@
 <script lang="ts">
 import DatePicker from 'vue3-persian-datetime-picker'
 import { i18n } from '@/locales'
+import {
+  formatPanelDate,
+  formatPanelDateTime,
+  panelCalendarDateFromInstant,
+  panelCalendarDateToEpochSeconds,
+  panelCalendarParts,
+  panelNow,
+} from '@/plugins/panelTime'
 import 'moment/locale/vi'
 import 'moment/locale/zh-cn'
 import 'moment/locale/zh-tw'
@@ -89,7 +97,7 @@ export default {
   data() {
     return {
       menu: false,
-      input: new Date(),
+      input: panelCalendarDateFromInstant(panelNow()),
       generatedInputId: buildDatePickerInputId(),
     }
   },
@@ -141,11 +149,10 @@ export default {
         const customZeroText = (this.zeroText ?? '').trim()
         return customZeroText.length > 0 ? customZeroText : i18n.global.t('unlimited')
       }
-      const date = new Date(this.displayEpoch * 1000)
       if (this.pickerType === 'date') {
-        return date.toLocaleDateString(this.displayLocale)
+        return formatPanelDate(this.displayEpoch * 1000, this.displayLocale)
       }
-      return date.toLocaleString(this.displayLocale)
+      return formatPanelDateTime(this.displayEpoch * 1000, this.displayLocale)
     },
     expDate() {
       const raw = Number(this.expiry ?? 0)
@@ -161,14 +168,18 @@ export default {
       if (this.submitMode !== 'day-end') {
         return this.expDate
       }
-      const date = new Date(this.expDate * 1000)
-      if (date.getHours() === 0 && date.getMinutes() === 0 && date.getSeconds() === 0) {
+      const parts = panelCalendarParts(this.expDate * 1000)
+      if (parts.hour === 0 && parts.minute === 0 && parts.second === 0) {
         return Math.max(0, this.expDate - 1)
       }
       return this.expDate
     },
     Input: {
-      get() { return this.displayEpoch == 0 ? new Date() : new Date(this.displayEpoch * 1000) },
+      get() {
+        return this.displayEpoch == 0
+          ? panelCalendarDateFromInstant(panelNow())
+          : panelCalendarDateFromInstant(this.displayEpoch * 1000)
+      },
       set(v: unknown) {
         const parsed = this.coerceToDate(v)
         if (parsed == null) {
@@ -184,7 +195,7 @@ export default {
       this.input = v
     },
     setNow() {
-      this.input = new Date()
+      this.input = panelCalendarDateFromInstant(panelNow())
     },
     toDateFromEpoch(raw: number): Date | null {
       if (!Number.isFinite(raw)) {
@@ -193,7 +204,7 @@ export default {
       const abs = Math.abs(raw)
       const millis = abs > 0 && abs < 1e11 ? raw * 1000 : raw
       const date = new Date(millis)
-      return Number.isFinite(date.getTime()) ? date : null
+      return Number.isFinite(date.getTime()) ? panelCalendarDateFromInstant(date) : null
     },
     parseYMD(value: string): Date | null {
       const match = value.match(/^(\d{4})[\/.-](\d{1,2})[\/.-](\d{1,2})(?:\s.*)?$/)
@@ -254,7 +265,7 @@ export default {
       }
 
       const date = new Date(timestamp)
-      return Number.isFinite(date.getTime()) ? date : null
+      return Number.isFinite(date.getTime()) ? panelCalendarDateFromInstant(date) : null
     },
     submit() {
       const parsed = this.coerceToDate(this.input)
@@ -267,7 +278,7 @@ export default {
         next.setHours(0, 0, 0, 0)
         next.setDate(next.getDate() + 1)
       }
-      const epoch = Math.floor(next.getTime() / 1000)
+      const epoch = panelCalendarDateToEpochSeconds(next)
       if (!Number.isFinite(epoch) || epoch <= 0) {
         return
       }
@@ -275,14 +286,16 @@ export default {
     },
     reset(vm:any) {
       this.$emit('submit',0)
-      this.input = new Date()
+      this.input = panelCalendarDateFromInstant(panelNow())
       vm.visible = false
     }
   },
   watch: {
     menu(v) {
       if (v) {
-        this.input = this.displayEpoch == 0 ? new Date() : new Date(this.displayEpoch * 1000)
+        this.input = this.displayEpoch == 0
+          ? panelCalendarDateFromInstant(panelNow())
+          : panelCalendarDateFromInstant(this.displayEpoch * 1000)
       }
     }
   }

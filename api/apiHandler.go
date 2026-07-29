@@ -3,6 +3,7 @@ package api
 import (
 	"strings"
 
+	"github.com/alireza0/s-ui/service"
 	"github.com/alireza0/s-ui/util/common"
 
 	"github.com/gin-gonic/gin"
@@ -14,13 +15,19 @@ type APIHandler struct {
 }
 
 func NewAPIHandler(g *gin.RouterGroup, a2 *APIv2Handler) {
+	NewAPIHandlerWithCoreManagers(g, a2, nil, nil)
+}
+
+func NewAPIHandlerWithCoreManagers(g *gin.RouterGroup, a2 *APIv2Handler, coreManager *service.CoreManagerService, mihomoCoreManager *service.MihomoCoreManagerService) {
 	a := &APIHandler{
 		apiv2: a2,
 	}
+	a.ApiService.SetCoreManagers(coreManager, mihomoCoreManager)
 	a.initRouter(g)
 }
 
 func (a *APIHandler) initRouter(g *gin.RouterGroup) {
+	g.Use(noStoreDynamicAPIResponse)
 	g.Use(func(c *gin.Context) {
 		path := c.Request.URL.Path
 		if !strings.HasSuffix(path, "login") && !strings.HasSuffix(path, "logout") && !strings.HasSuffix(path, "session") {
@@ -34,6 +41,15 @@ func (a *APIHandler) initRouter(g *gin.RouterGroup) {
 func (a *APIHandler) postHandler(c *gin.Context) {
 	loginUser := GetLoginUser(c)
 	action := c.Param("postAction")
+	applyAPIRequestBodyLimit(c, action)
+	if action != "login" && action != "panel-uninstall" {
+		operation, err := service.BeginKworInProcessOperation("api-post-" + action)
+		if err != nil {
+			jsonMsg(c, "failed", common.NewError("卸载停工状态拒绝当前写请求: ", err))
+			return
+		}
+		defer operation.Done()
+	}
 
 	switch action {
 	case "login":
@@ -42,10 +58,12 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.ChangePass(c)
 	case "save":
 		a.ApiService.Save(c, loginUser)
+	case "settings-patch":
+		a.ApiService.SaveSettingsPatch(c, loginUser)
+	case "subscription-ruleset-probe":
+		a.ApiService.ProbeSubscriptionRuleSets(c)
 	case "restartApp":
 		a.ApiService.RestartApp(c)
-	case "restartSb":
-		a.ApiService.RestartSb(c)
 	case "linkConvert":
 		a.ApiService.LinkConvert(c)
 	case "syncToSubManager":
@@ -102,6 +120,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.SaveMihomoCoreDownloadPreference(c)
 	case "panel-update-install":
 		a.ApiService.InstallPanelUpdate(c)
+	case "panel-uninstall":
+		a.ApiService.UninstallPanel(c)
 	case "importdb":
 		a.ApiService.ImportDb(c)
 	case "restore-db-backup":
@@ -136,10 +156,6 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.InstallTrafficOverviewVnstat(c)
 	case "traffic-overview-vnstat-remove":
 		a.ApiService.RemoveTrafficOverviewVnstat(c)
-	case "system-monitor-settings":
-		a.ApiService.SaveSystemMonitorSettings(c)
-	case "system-monitor-reset":
-		a.ApiService.ResetSystemMonitorStats(c)
 	case "firewall-switch":
 		a.ApiService.SaveFirewallSwitch(c)
 	case "firewall-nftables-install":
@@ -166,12 +182,22 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.SavePortForwardRule(c)
 	case "port-forward-rule-delete":
 		a.ApiService.DeletePortForwardRule(c)
+	case "port-forward-rule-traffic-reset":
+		a.ApiService.ResetPortForwardRuleTraffic(c)
+	case "port-forward-overview-traffic-reset":
+		a.ApiService.ResetPortForwardOverviewTraffic(c)
 	case "reverse-proxy-rule":
 		a.ApiService.SaveReverseProxyRule(c)
+	case "reverse-proxy-rule-status":
+		a.ApiService.SetReverseProxyRuleStatus(c)
+	case "reverse-proxy-rule-move":
+		a.ApiService.MoveReverseProxyRule(c)
 	case "reverse-proxy-rule-delete":
 		a.ApiService.DeleteReverseProxyRule(c)
 	case "reverse-proxy-rule-reorder":
 		a.ApiService.ReorderReverseProxyRules(c)
+	case "reverse-proxy-settings":
+		a.ApiService.SaveReverseProxySettings(c)
 	case "kernel-download":
 		a.ApiService.DownloadKernelPackages(c)
 	case "kernel-install":
@@ -214,8 +240,16 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.UpgradeAcme(c)
 	case "acme-issue":
 		a.ApiService.IssueAcmeCertificate(c)
+	case "acme-reissue":
+		a.ApiService.ReissueAcmeCertificate(c)
 	case "acme-renew":
 		a.ApiService.RenewAcmeCertificate(c)
+	case "acme-issue-task":
+		a.ApiService.IssueAcmeCertificateTask(c)
+	case "acme-reissue-task":
+		a.ApiService.ReissueAcmeCertificateTask(c)
+	case "acme-renew-task":
+		a.ApiService.RenewAcmeCertificateTask(c)
 	case "acme-push":
 		a.ApiService.PushAcmeCertificate(c)
 	case "acme-set-auto-renew":
@@ -238,6 +272,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.SaveAcmeAccount(c)
 	case "acme-account-delete":
 		a.ApiService.DeleteAcmeAccount(c)
+	case "acme-account-key-rotate":
+		a.ApiService.RotateAcmeAccountKey(c)
 	case "acme-dns-account-save":
 		a.ApiService.SaveAcmeDNSAccount(c)
 	case "acme-dns-account-delete":
@@ -311,26 +347,36 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetUsers(c)
 	case "settings":
 		a.ApiService.GetSettings(c)
+	case "settings-snapshot":
+		a.ApiService.GetSettingsSnapshot(c)
+	case "subscription-settings-snapshot":
+		a.ApiService.GetSubscriptionSettingsSnapshot(c)
+	case "subscription-uri":
+		a.ApiService.GetSubscriptionURI(c)
+	case "panel-time-context":
+		a.ApiService.GetPanelTimeContext(c)
+	case "system-timezone":
+		a.ApiService.GetSystemTimeZone(c)
 	case "stats":
 		a.ApiService.GetStats(c)
 	case "status":
 		a.ApiService.GetStatus(c)
-	case "system-monitor-overview":
-		a.ApiService.GetSystemMonitorOverview(c)
-	case "system-monitor-history":
-		a.ApiService.GetSystemMonitorHistory(c)
 	case "traffic-overview":
 		a.ApiService.GetTrafficOverview(c)
 	case "traffic-overview-vnstat-versions":
 		a.ApiService.GetTrafficOverviewVnstatVersions(c)
 	case "traffic-overview-vnstat-update-info":
 		a.ApiService.GetTrafficOverviewVnstatUpdateInfo(c)
+	case "traffic-overview-vnstat-install-status":
+		a.ApiService.GetTrafficOverviewVnstatInstallStatus(c)
 	case "firewall-overview":
 		a.ApiService.GetFirewallOverview(c)
 	case "port-forward-overview":
 		a.ApiService.GetPortForwardOverview(c)
 	case "reverse-proxy-overview":
 		a.ApiService.GetReverseProxyOverview(c)
+	case "reverse-proxy-runtime":
+		a.ApiService.GetReverseProxyRuntime(c)
 	case "kernel-overview":
 		a.ApiService.GetKernelOverview(c)
 	case "kernel-versions":
@@ -367,6 +413,10 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetSelfSignedAuthorities(c)
 	case "acme-log":
 		a.ApiService.GetAcmeLog(c)
+	case "acme-task":
+		a.ApiService.GetAcmeTask(c)
+	case "acme-active-tasks":
+		a.ApiService.GetActiveAcmeTasks(c)
 	case "onlines":
 		a.ApiService.GetOnlines(c)
 	case "logs":

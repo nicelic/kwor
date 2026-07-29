@@ -2,7 +2,6 @@ package service
 
 import (
 	"encoding/json"
-	"os"
 
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
@@ -13,6 +12,45 @@ import (
 
 type EndpointService struct {
 	WarpService
+}
+
+// marshalEndpointSavePayload keeps the database-facing endpoint shape intact.
+// Endpoint.MarshalJSON intentionally emits the Core-facing configuration shape,
+// which turns WARP into wireguard and omits private Ext credentials.
+func marshalEndpointSavePayload(endpoint *model.Endpoint) (json.RawMessage, error) {
+	if endpoint == nil {
+		return nil, common.NewError("endpoint is nil")
+	}
+
+	payload := make(map[string]json.RawMessage)
+	if len(endpoint.Options) > 0 {
+		if err := json.Unmarshal(endpoint.Options, &payload); err != nil {
+			return nil, err
+		}
+	}
+
+	id, err := json.Marshal(endpoint.Id)
+	if err != nil {
+		return nil, err
+	}
+	typeValue, err := json.Marshal(endpoint.Type)
+	if err != nil {
+		return nil, err
+	}
+	tag, err := json.Marshal(endpoint.Tag)
+	if err != nil {
+		return nil, err
+	}
+	ext := endpoint.Ext
+	if len(ext) == 0 {
+		ext = json.RawMessage("null")
+	}
+
+	payload["id"] = id
+	payload["type"] = typeValue
+	payload["tag"] = tag
+	payload["ext"] = ext
+	return json.Marshal(payload)
 }
 
 func (o *EndpointService) GetAll() (*[]map[string]interface{}, error) {
@@ -63,6 +101,42 @@ func (o *EndpointService) GetAllConfig(db *gorm.DB) ([]json.RawMessage, error) {
 	return endpointsJson, nil
 }
 
+// PrepareSave performs WARP's remote API work before ConfigService opens its
+// SQLite transaction. The endpoint page is hidden, but its compatibility API
+// remains reachable and must not hold the single connection on network I/O.
+func (s *EndpointService) PrepareSave(act string, data json.RawMessage) (json.RawMessage, error) {
+	if act != "new" && act != "edit" {
+		return data, nil
+	}
+
+	var endpoint model.Endpoint
+	if err := endpoint.UnmarshalJSON(data); err != nil {
+		return nil, err
+	}
+	if endpoint.Type != "warp" {
+		return data, nil
+	}
+
+	if act == "new" {
+		if err := s.WarpService.RegisterWarp(&endpoint); err != nil {
+			return nil, err
+		}
+	} else {
+		var oldLicense string
+		if err := database.GetDB().Model(model.Endpoint{}).
+			Select("json_extract(ext, '$.license_key')").
+			Where("id = ?", endpoint.Id).
+			Find(&oldLicense).Error; err != nil {
+			return nil, err
+		}
+		if err := s.WarpService.SetWarpLicense(oldLicense, &endpoint); err != nil {
+			return nil, err
+		}
+	}
+
+	return marshalEndpointSavePayload(&endpoint)
+}
+
 func (s *EndpointService) Save(tx *gorm.DB, act string, data json.RawMessage) error {
 	var err error
 
@@ -74,47 +148,6 @@ func (s *EndpointService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 			return err
 		}
 
-		if endpoint.Type == "warp" {
-			if act == "new" {
-				err = s.WarpService.RegisterWarp(&endpoint)
-				if err != nil {
-					return err
-				}
-			} else {
-				var old_license string
-				err = tx.Model(model.Endpoint{}).Select("json_extract(ext, '$.license_key')").Where("id = ?", endpoint.Id).Find(&old_license).Error
-				if err != nil {
-					return err
-				}
-				err = s.WarpService.SetWarpLicense(old_license, &endpoint)
-				if err != nil {
-					return err
-				}
-			}
-		}
-
-		if corePtr.IsRunning() {
-			configData, err := endpoint.MarshalJSON()
-			if err != nil {
-				return err
-			}
-			if act == "edit" {
-				var oldTag string
-				err = tx.Model(model.Endpoint{}).Select("tag").Where("id = ?", endpoint.Id).Find(&oldTag).Error
-				if err != nil {
-					return err
-				}
-				err = corePtr.RemoveEndpoint(oldTag)
-				if err != nil && err != os.ErrInvalid {
-					return err
-				}
-			}
-			err = corePtr.AddEndpoint(configData)
-			if err != nil {
-				return err
-			}
-		}
-
 		err = tx.Save(&endpoint).Error
 		if err != nil {
 			return err
@@ -124,12 +157,6 @@ func (s *EndpointService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 		err = json.Unmarshal(data, &tag)
 		if err != nil {
 			return err
-		}
-		if corePtr.IsRunning() {
-			err = corePtr.RemoveEndpoint(tag)
-			if err != nil && err != os.ErrInvalid {
-				return err
-			}
 		}
 		err = tx.Where("tag = ?", tag).Delete(model.Endpoint{}).Error
 		if err != nil {

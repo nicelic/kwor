@@ -8,10 +8,19 @@ export interface Msg {
   success: boolean
   msg: string
   obj: any | null
+  failureKind?: 'api' | 'transport' | 'cancelled' | 'protocol'
 }
 
-function _handleMsg(msg: any, silent = false): void {
-  if (silent) {
+export interface HttpRequestOptions {
+  // Keeps the historic fully silent behaviour used by low-noise probes.
+  silentAuthCheck?: boolean
+  // Suppresses ordinary failure toasts, but still handles an expired login.
+  silentErrorToast?: boolean
+  [key: string]: any
+}
+
+function _handleMsg(msg: any, options: HttpRequestOptions = {}): void {
+  if (options.silentAuthCheck === true) {
     return
   }
   if (!isMsg(msg)) {
@@ -24,6 +33,9 @@ function _handleMsg(msg: any, silent = false): void {
         duration: 5000,
       })
       logout()
+      return
+    }
+    if (!msg.success && options.silentErrorToast === true) {
       return
     }
     if (msg.success) {
@@ -53,51 +65,56 @@ function _respToMsg(resp: any): Msg {
   if (data == null) {
     return { success: true, msg: "", obj: null }
   } else if (isMsg(data)) {
-    if (data.hasOwnProperty('success')) {
-        return { success: data.success, msg: data.msg, obj: data.obj || null }
-    } else {
-        return data
+    return {
+      success: data.success,
+      msg: data.msg,
+      obj: data.obj ?? null,
+      failureKind: data.success ? undefined : 'api',
     }
   } else {
-    return { success: false, msg: `unknown data: ${data}`, obj: null }
+    return { success: false, msg: `unknown data: ${data}`, obj: null, failureKind: 'protocol' }
   }
 }
 
 function isMsg(obj: any): obj is Msg {
-  return Object.hasOwn(obj,'success') && Object.hasOwn(obj,'msg') && Object.hasOwn(obj, 'obj')
+  return obj !== null
+    && typeof obj === 'object'
+    && Object.hasOwn(obj, 'success')
+    && Object.hasOwn(obj, 'msg')
+    && Object.hasOwn(obj, 'obj')
 }
   
 const HttpUtils = {
-  async get(url: string, data: object = {}, options: any = {}): Promise<Msg> {
-    const { silentAuthCheck, ...requestOptions } = options ?? {}
+  async get(url: string, data: object = {}, options: HttpRequestOptions = {}): Promise<Msg> {
+    const { silentAuthCheck, silentErrorToast, ...requestOptions } = options ?? {}
     let msg: Msg
     try {
         const resp = await api.get(url, { params: data, ...requestOptions })
         msg = _respToMsg(resp)
     } catch (e: any) {
         if (axios.isCancel(e)) {
-            msg = { success: false, msg: "", obj: null }
+            msg = { success: false, msg: "", obj: null, failureKind: 'cancelled' }
         } else {
-        msg = { success: false, msg: e.toString(), obj: null }
+            msg = { success: false, msg: e.toString(), obj: null, failureKind: 'transport' }
         }
     }
-    _handleMsg(msg, silentAuthCheck === true)
+    _handleMsg(msg, { silentAuthCheck, silentErrorToast })
     return msg
   },
-  async post(url: string, data: object | null, options: any = undefined): Promise<Msg> {
-    const { silentAuthCheck, ...requestOptions } = options ?? {}
+  async post(url: string, data: object | null, options: HttpRequestOptions = {}): Promise<Msg> {
+    const { silentAuthCheck, silentErrorToast, ...requestOptions } = options ?? {}
     let msg: Msg
     try {
         const resp = await api.post(url, data, requestOptions)
         msg = _respToMsg(resp)
     } catch (e: any) {
         if (axios.isCancel(e)) {
-            msg = { success: false, msg: "", obj: null }
+            msg = { success: false, msg: "", obj: null, failureKind: 'cancelled' }
         } else {
-        msg = { success: false, msg: e.toString(), obj: null }
+            msg = { success: false, msg: e.toString(), obj: null, failureKind: 'transport' }
         }
     }
-    _handleMsg(msg, silentAuthCheck === true)
+    _handleMsg(msg, { silentAuthCheck, silentErrorToast })
     return msg
   },
 }

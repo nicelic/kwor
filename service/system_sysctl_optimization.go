@@ -3,7 +3,6 @@ package service
 import (
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -65,7 +64,7 @@ func (s *SystemSysctlOptimizationService) GetOverview() (*SystemSysctlOptimizati
 	}
 
 	overview := &SystemSysctlOptimizationOverview{
-		Supported: runtime.GOOS == "linux",
+		Supported: IsSystemPlatformLinux(),
 		Enabled:   enabled,
 		Content:   content,
 	}
@@ -104,7 +103,7 @@ func (s *SystemSysctlOptimizationService) SetEnabled(enabled bool) error {
 	systemSysctlOptimizationMu.Lock()
 	defer systemSysctlOptimizationMu.Unlock()
 
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return common.NewError("sysctl 优化仅支持 Linux")
 	}
 
@@ -141,7 +140,7 @@ func (s *SystemSysctlOptimizationService) SaveContent(content string) error {
 	systemSysctlOptimizationMu.Lock()
 	defer systemSysctlOptimizationMu.Unlock()
 
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return common.NewError("sysctl 优化仅支持 Linux")
 	}
 
@@ -174,7 +173,7 @@ func (s *SystemSysctlOptimizationService) ReconcileOnStartup() error {
 	systemSysctlOptimizationMu.Lock()
 	defer systemSysctlOptimizationMu.Unlock()
 
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return nil
 	}
 
@@ -221,8 +220,28 @@ func (s *SystemSysctlOptimizationService) applyManagedSysctlContentLocked(conten
 	}
 
 	paths := resolveSysctlManagedPaths()
+	pendingOwnership := make([]string, 0, len(paths))
 	for _, path := range paths {
-		if err := rewriteManagedFileWithImmutable(path, content, managedFileRewriteOptions{
+		resourceID := "sysctl-dropin"
+		cleanupPolicy := HostCleanupDelete
+		if path == sysctlManagedMainPath {
+			resourceID = "sysctl-main"
+			cleanupPolicy = HostCleanupUnlockOnly
+		}
+		ownership, err := BeginHostFileOwnership(resourceID, []string{path}, cleanupPolicy)
+		if err != nil {
+			return nil, common.NewError("记录 sysctl 所有权失败: ", err)
+		}
+		if ownership.ID != "" {
+			pendingOwnership = append(pendingOwnership, ownership.ID)
+		}
+	}
+	for _, path := range paths {
+		pathContent := content
+		if path != sysctlManagedMainPath {
+			pathContent = ensureManagedSysctlOwnershipMarker(content)
+		}
+		if err := rewriteManagedFileWithImmutable(path, pathContent, managedFileRewriteOptions{
 			DisplayName: "sysctl 配置",
 		}); err != nil {
 			return nil, err
@@ -233,7 +252,20 @@ func (s *SystemSysctlOptimizationService) applyManagedSysctlContentLocked(conten
 	if err := s.setString(systemSysctlPathKey, pathValue); err != nil {
 		return nil, err
 	}
+	for _, resourceID := range pendingOwnership {
+		if err := VerifyAndActivateHostResource(resourceID); err != nil {
+			return nil, common.NewError("确认 sysctl 所有权失败: ", err)
+		}
+	}
 	return paths, nil
+}
+
+func ensureManagedSysctlOwnershipMarker(content string) string {
+	const marker = "# kwor-owner:v1 resource=sysctl-dropin\n"
+	if strings.Contains(strings.ToLower(content), kworOwnershipMarker) {
+		return content
+	}
+	return marker + content
 }
 
 func resolveSysctlManagedPaths() []string {

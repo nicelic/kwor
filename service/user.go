@@ -81,7 +81,10 @@ func (s *UserService) CheckUser(username string, password string, remoteIP strin
 		return nil
 	}
 
-	lastLoginTxt := time.Now().Format("2006-01-02 15:04:05") + " " + remoteIP
+	// Persist an absolute, self-describing instant. The old plain timestamp had
+	// no offset, so a browser in another timezone could parse and display it as
+	// the wrong login time even though the panel timezone was configured.
+	lastLoginTxt := PanelNow().UTC().Format(time.RFC3339) + " " + remoteIP
 	err = db.Model(model.User{}).
 		Where("username = ?", username).
 		Update("last_logins", &lastLoginTxt).Error

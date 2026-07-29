@@ -2,10 +2,10 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -70,7 +70,7 @@ func (s *SystemLogOptimizationService) GetOverview() (*SystemLogOptimizationOver
 	}
 
 	overview := &SystemLogOptimizationOverview{
-		Supported: runtime.GOOS == "linux",
+		Supported: IsSystemPlatformLinux(),
 		Enabled:   enabled,
 		Content:   content,
 	}
@@ -98,7 +98,7 @@ func (s *SystemLogOptimizationService) SetDisabled(enabled bool) error {
 	systemLogOptimizationMu.Lock()
 	defer systemLogOptimizationMu.Unlock()
 
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return common.NewError("系统日志优化仅支持 Linux")
 	}
 
@@ -135,7 +135,7 @@ func (s *SystemLogOptimizationService) SaveContent(content string) error {
 	systemLogOptimizationMu.Lock()
 	defer systemLogOptimizationMu.Unlock()
 
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return common.NewError("系统日志优化仅支持 Linux")
 	}
 
@@ -168,7 +168,7 @@ func (s *SystemLogOptimizationService) ReconcileOnStartup() error {
 	systemLogOptimizationMu.Lock()
 	defer systemLogOptimizationMu.Unlock()
 
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return nil
 	}
 
@@ -227,6 +227,10 @@ func (s *SystemLogOptimizationService) applyManagedJournaldContentLocked(content
 	if err != nil {
 		return "", err
 	}
+	ownership, err := BeginHostFileOwnership("journald-config", []string{path}, HostCleanupUnlockOnly)
+	if err != nil {
+		return "", common.NewError("记录 journald 所有权失败: ", err)
+	}
 
 	content = normalizeManagedJournaldContent(content)
 	if strings.TrimSpace(content) == "" {
@@ -241,6 +245,11 @@ func (s *SystemLogOptimizationService) applyManagedJournaldContentLocked(content
 
 	if err := s.setString(systemLogJournaldPathKey, path); err != nil {
 		return "", err
+	}
+	if ownership.ID != "" {
+		if err := VerifyAndActivateHostResource(ownership.ID); err != nil {
+			return "", common.NewError("确认 journald 所有权失败: ", err)
+		}
 	}
 	return path, nil
 }
@@ -299,15 +308,15 @@ func detectFileImmutable(path string) (bool, error) {
 	}
 	lsattrPath, err := exec.LookPath("lsattr")
 	if err != nil {
-		return false, nil
+		return false, fmt.Errorf("lsattr is unavailable: %w", err)
 	}
 	output, err := runCommandOutputWithTimeout(8*time.Second, lsattrPath, path)
 	if err != nil {
-		return false, nil
+		return false, err
 	}
 	fields := strings.Fields(output)
 	if len(fields) == 0 {
-		return false, nil
+		return false, errors.New("lsattr returned no file attributes")
 	}
 	return strings.Contains(fields[0], "i"), nil
 }

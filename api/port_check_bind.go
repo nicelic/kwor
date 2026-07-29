@@ -21,13 +21,29 @@ var (
 	udpRangesNoIndexKey   = regexp.MustCompile(`^udp_ranges\[\]\[(id|tag|range)\]$`)
 )
 
+const portCheckRequestMaxBytes int64 = 1024 * 1024
+
 func bindPortCheckRequest(c *gin.Context) (service.PortCheckRequest, error) {
 	req := service.PortCheckRequest{}
-	body, err := io.ReadAll(c.Request.Body)
+	body, err := readPortCheckRequestBody(c.Request.Body)
 	if err != nil {
 		return req, err
 	}
 	return parsePortCheckRequestBody(body)
+}
+
+func readPortCheckRequestBody(body io.Reader) ([]byte, error) {
+	if body == nil {
+		return nil, fmt.Errorf("port occupancy request body is empty")
+	}
+	data, err := io.ReadAll(io.LimitReader(body, portCheckRequestMaxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > portCheckRequestMaxBytes {
+		return nil, fmt.Errorf("port occupancy request exceeds %d bytes", portCheckRequestMaxBytes)
+	}
+	return data, nil
 }
 
 func parsePortCheckRequestBody(body []byte) (service.PortCheckRequest, error) {

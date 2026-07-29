@@ -1,4 +1,5 @@
 import { i18n } from "@/locales"
+import { panelNowUnix } from "@/plugins/panelTime"
 
 type OBJ = {
   [key: string]: any
@@ -97,7 +98,7 @@ export const HumanReadable = {
   },
   remainedDays(exp:number): string {
     if (exp == 0) return i18n.global.t('unlimited')
-    const now = Date.now()/1000
+    const now = panelNowUnix()
     if (exp <= now) return i18n.global.t('date.expired')
     return Math.floor((exp - now) / (3600*24)) + " " + i18n.global.t('date.d')
   }

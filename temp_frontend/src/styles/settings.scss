@@ -4,10 +4,23 @@
  * Configures SASS variables and Vuetify overwrites
  */
 
-// https://vuetifyjs.com/features/sass-variables/`
-// @use 'vuetify/settings' with (
-//   $color-pack: false
-// );
+// https://vuetifyjs.com/features/sass-variables/
+@use 'vuetify/settings' with (
+  $button-colored-disabled: false,
+  $button-disabled-opacity: 0.56
+);
+
+:root {
+  --kwor-disabled-button-background: rgba(148, 163, 184, 0.22);
+  --kwor-disabled-button-border: rgba(71, 85, 105, 0.42);
+  --kwor-disabled-button-foreground: #475569;
+}
+
+.v-theme--dark {
+  --kwor-disabled-button-background: rgba(71, 85, 105, 0.64);
+  --kwor-disabled-button-border: rgba(148, 163, 184, 0.46);
+  --kwor-disabled-button-foreground: #cbd5e1;
+}
 @font-face {
     font-display: swap;
     font-family: 'Vazirmatn';
@@ -36,4 +49,18 @@ body {
 
 .v-btn {
   letter-spacing: 0;
+}
+
+.v-btn.v-btn--disabled {
+  color: var(--kwor-disabled-button-foreground) !important;
+  opacity: 1 !important;
+}
+
+.v-btn.v-btn--disabled.v-btn--variant-elevated,
+.v-btn.v-btn--disabled.v-btn--variant-flat,
+.v-btn.v-btn--disabled.v-btn--variant-tonal,
+.v-btn.v-btn--disabled.v-btn--variant-outlined {
+  background: var(--kwor-disabled-button-background) !important;
+  border-color: var(--kwor-disabled-button-border) !important;
+  box-shadow: none;
 }

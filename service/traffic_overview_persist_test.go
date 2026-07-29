@@ -290,6 +290,25 @@ func TestEvaluateTrafficOverviewCapReachedHonorsExpiryAndExistingCapState(t *tes
 	}
 }
 
+func TestTrafficCapUsageUsesCurrentPeriodTotal(t *testing.T) {
+	limit := limitGiBToBytes(1)
+	overview := &TrafficOverview{
+		Total:      limit - 1,
+		AccumTotal: limit + 4096,
+	}
+	if evaluateTrafficOverviewCapReached(false, 1, trafficCapUsageBytes(overview), true, "", false, true) {
+		t.Fatal("historical accumulated traffic must not exhaust the current-period cap")
+	}
+
+	overview.Total = limit
+	if !evaluateTrafficOverviewCapReached(false, 1, trafficCapUsageBytes(overview), true, "", false, true) {
+		t.Fatal("current-period traffic at the cap must exhaust the cap")
+	}
+	if got := trafficCapUsageBytes(nil); got != 0 {
+		t.Fatalf("nil overview traffic cap usage = %d, want 0", got)
+	}
+}
+
 func TestGetTrafficOverviewMarksExpiredWithoutVnstatRuntime(t *testing.T) {
 	initTrafficOverviewTestDB(t)
 

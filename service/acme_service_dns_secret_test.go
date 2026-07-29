@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -161,6 +160,142 @@ func TestSanitizeDNSAccountEnvForProviderDropsOtherProviderFields(t *testing.T) 
 	}
 }
 
+func TestAcmeDNSProviderCatalogMatchesOfficialDefinitions(t *testing.T) {
+	expectedFields := map[string][]string{
+		"dns_ali":         {"Ali_Key", "Ali_Secret"},
+		"dns_tencent":     {"Tencent_SecretId", "Tencent_SecretKey"},
+		"dns_cf":          {"CF_Token", "CF_Account_ID", "CF_Zone_ID", "CF_Email", "CF_Key"},
+		"dns_aws":         {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DNS_SLOWRATE"},
+		"dns_huaweicloud": {"HUAWEICLOUD_Username", "HUAWEICLOUD_Password", "HUAWEICLOUD_DomainName", "HUAWEICLOUD_Region"},
+		"dns_gd":          {"GD_Key", "GD_Secret"},
+		"dns_vercel":      {"VERCEL_TOKEN"},
+	}
+	expectedRequired := map[string]map[string]bool{
+		"dns_ali": {
+			"Ali_Key":    true,
+			"Ali_Secret": true,
+		},
+		"dns_tencent": {
+			"Tencent_SecretId":  true,
+			"Tencent_SecretKey": true,
+		},
+		"dns_cf": {
+			"CF_Token":      false,
+			"CF_Account_ID": false,
+			"CF_Zone_ID":    false,
+			"CF_Email":      false,
+			"CF_Key":        false,
+		},
+		"dns_aws": {
+			"AWS_ACCESS_KEY_ID":     false,
+			"AWS_SECRET_ACCESS_KEY": false,
+			"AWS_DNS_SLOWRATE":      false,
+		},
+		"dns_huaweicloud": {
+			"HUAWEICLOUD_Username":   true,
+			"HUAWEICLOUD_Password":   true,
+			"HUAWEICLOUD_DomainName": true,
+			"HUAWEICLOUD_Region":     false,
+		},
+		"dns_gd": {
+			"GD_Key":    true,
+			"GD_Secret": true,
+		},
+		"dns_vercel": {
+			"VERCEL_TOKEN": true,
+		},
+	}
+	if len(defaultAcmeDNSProviderCatalog) != len(expectedFields) {
+		t.Fatalf("unexpected DNS provider catalog size: got=%d want=%d", len(defaultAcmeDNSProviderCatalog), len(expectedFields))
+	}
+	for providerCode, wantFields := range expectedFields {
+		provider, ok := lookupAcmeDNSProvider(providerCode)
+		if !ok {
+			t.Fatalf("provider %q missing from catalog", providerCode)
+		}
+		if len(provider.Fields) != len(wantFields) {
+			t.Fatalf("provider %q fields: got=%d want=%d", providerCode, len(provider.Fields), len(wantFields))
+		}
+		for index, wantKey := range wantFields {
+			field := provider.Fields[index]
+			if gotKey := field.Key; gotKey != wantKey {
+				t.Fatalf("provider %q field %d: got=%q want=%q", providerCode, index, gotKey, wantKey)
+			}
+			if wantRequired := expectedRequired[providerCode][wantKey]; field.Required != wantRequired {
+				t.Fatalf("provider %q field %q required: got=%t want=%t", providerCode, wantKey, field.Required, wantRequired)
+			}
+		}
+	}
+
+	huawei, _ := lookupAcmeDNSProvider("dns_huaweicloud")
+	region := huawei.Fields[len(huawei.Fields)-1]
+	if region.Required || region.Placeholder != "cn-north-4" {
+		t.Fatalf("unexpected HuaweiCloud Region definition: %#v", region)
+	}
+}
+
+func TestBuildLegacyDNSCandidatesIncludesHuaweiRegion(t *testing.T) {
+	candidates := buildLegacyDNSCandidatesFromEnvMap(map[string]string{
+		"HUAWEICLOUD_Username":   "user",
+		"HUAWEICLOUD_Password":   "password",
+		"HUAWEICLOUD_DomainName": "account-domain",
+		"HUAWEICLOUD_Region":     "cn-north-4",
+	})
+	for _, candidate := range candidates {
+		if candidate.provider.ProviderCode != "dns_huaweicloud" {
+			continue
+		}
+		if got := candidate.env["HUAWEICLOUD_Region"]; got != "cn-north-4" {
+			t.Fatalf("expected HuaweiCloud Region migrated, got=%q", got)
+		}
+		return
+	}
+	t.Fatal("expected HuaweiCloud legacy DNS candidate")
+}
+
+func TestResolveAcmeDNSRuntimeConfigValidatesKnownProvider(t *testing.T) {
+	runtimeConfig, err := resolveAcmeDNSRuntimeConfig(0, "dns_cf", "CF_Token=token-only")
+	if err != nil {
+		t.Fatalf("expected Cloudflare token-only runtime config valid, got err=%v", err)
+	}
+	if runtimeConfig.ProviderCode != "dns_cf" || runtimeConfig.EnvPairs[0] != "CF_Token=token-only" {
+		t.Fatalf("unexpected Cloudflare runtime config: %#v", runtimeConfig)
+	}
+
+	if _, err := resolveAcmeDNSRuntimeConfig(0, "dns_cf", ""); err == nil {
+		t.Fatal("expected missing Cloudflare credentials rejected before acme.sh execution")
+	}
+
+	if _, err := resolveAcmeDNSRuntimeConfig(0, "dns_custom", "CUSTOM_TOKEN=value"); err != nil {
+		t.Fatalf("expected unknown manual provider compatibility preserved, got err=%v", err)
+	}
+}
+
+func TestResolveAcmeDNSRuntimeConfigUsesBoundAccountProvider(t *testing.T) {
+	db := setupAcmeDNSTestDB(t, "acme-dns-runtime-account.db")
+	dnsAccount := &model.AcmeDNSAccount{
+		Name:         "cloudflare-account",
+		ProviderName: "Cloudflare",
+		ProviderCode: "dns_cf",
+		EnvJSON:      `{"CF_Token":"stored-token"}`,
+	}
+	if err := db.Create(dnsAccount).Error; err != nil {
+		t.Fatalf("create DNS account failed: %v", err)
+	}
+
+	runtimeConfig, err := resolveAcmeDNSRuntimeConfig(dnsAccount.Id, "dns_ali", "CF_Zone_ID=zone-id")
+	if err != nil {
+		t.Fatalf("resolve bound DNS account failed: %v", err)
+	}
+	if runtimeConfig.ProviderCode != "dns_cf" || runtimeConfig.AccountName != dnsAccount.Name {
+		t.Fatalf("expected bound account provider to win, got=%#v", runtimeConfig)
+	}
+	env := envPairsToEnvMap(runtimeConfig.EnvPairs)
+	if env["CF_Token"] != "stored-token" || env["CF_Zone_ID"] != "zone-id" {
+		t.Fatalf("expected stored and manual DNS env merged, got=%#v", env)
+	}
+}
+
 func TestSaveDNSAccountProviderChangeReplacesOldSecrets(t *testing.T) {
 	db := setupAcmeDNSTestDB(t, "acme-dns-provider-change.db")
 
@@ -209,6 +344,121 @@ func TestSaveDNSAccountProviderChangeReplacesOldSecrets(t *testing.T) {
 	}
 }
 
+func TestSaveDNSAccountProviderChangeRejectsReferencedAccountAndAllowsCredentialRotation(t *testing.T) {
+	db := setupAcmeDNSTestDB(t, "acme-dns-provider-lock.db")
+	dnsAccount := &model.AcmeDNSAccount{
+		Name:         "ali-account",
+		ProviderName: "阿里云",
+		ProviderCode: "dns_ali",
+		EnvJSON:      `{"Ali_Key":"old-key","Ali_Secret":"old-secret"}`,
+	}
+	if err := db.Create(dnsAccount).Error; err != nil {
+		t.Fatalf("create DNS account failed: %v", err)
+	}
+	certificate := &model.CertificateRecord{
+		SourceType:      CertificateSourceACME,
+		SourceRef:       "dns-provider-lock",
+		MainDomain:      "locked.example.com",
+		DomainSet:       `["locked.example.com"]`,
+		CertificateType: acmeCertificateTypeDomain,
+		Challenge:       "dns",
+		KeyLength:       "ec-256",
+		CAServer:        "letsencrypt",
+		UseECC:          true,
+		DNSAccountID:    dnsAccount.Id,
+		DNSAccountName:  dnsAccount.Name,
+		AutoRenew:       true,
+		CertPEM:         []byte("cert"),
+		KeyPEM:          []byte("key"),
+		FullchainPEM:    []byte("fullchain"),
+		Fingerprint:     "lock-fingerprint",
+		LastIssuedAt:    1,
+		LastRenewedAt:   1,
+	}
+	if err := db.Create(certificate).Error; err != nil {
+		t.Fatalf("create referenced certificate failed: %v", err)
+	}
+
+	svc := &AcmeService{}
+	if _, err := svc.SaveDNSAccount(AcmeDNSAccountPayload{
+		ID:           dnsAccount.Id,
+		Name:         dnsAccount.Name,
+		ProviderCode: "dns_cf",
+		EnvJSON:      `{"CF_Token":"token"}`,
+	}); err == nil {
+		t.Fatal("expected provider change for referenced DNS account rejected")
+	}
+	if err := db.Where("id = ?", dnsAccount.Id).First(dnsAccount).Error; err != nil {
+		t.Fatalf("reload locked DNS account failed: %v", err)
+	}
+	if dnsAccount.ProviderCode != "dns_ali" {
+		t.Fatalf("expected provider unchanged after rejection, got=%q", dnsAccount.ProviderCode)
+	}
+
+	accounts, err := svc.listDNSAccounts()
+	if err != nil {
+		t.Fatalf("list DNS accounts failed: %v", err)
+	}
+	if len(accounts) != 1 || !accounts[0].ProviderLocked {
+		t.Fatalf("expected referenced DNS account provider lock, got=%#v", accounts)
+	}
+
+	if _, err := svc.SaveDNSAccount(AcmeDNSAccountPayload{
+		ID:           dnsAccount.Id,
+		Name:         dnsAccount.Name,
+		ProviderCode: "dns_ali",
+		EnvJSON:      `{"Ali_Key":"rotated-key","Ali_Secret":"rotated-secret"}`,
+	}); err != nil {
+		t.Fatalf("expected same-provider credential rotation allowed, got err=%v", err)
+	}
+	if err := db.Where("id = ?", certificate.Id).First(certificate).Error; err != nil {
+		t.Fatalf("reload referenced certificate failed: %v", err)
+	}
+	if certificate.DNSAccountID != dnsAccount.Id || !certificate.AutoRenew {
+		t.Fatalf("expected credential rotation to preserve binding and auto renew: %#v", certificate)
+	}
+}
+
+func TestListDNSAccountsLocksInventoryReference(t *testing.T) {
+	db := setupAcmeDNSTestDB(t, "acme-dns-inventory-lock.db")
+	dnsAccount := &model.AcmeDNSAccount{
+		Name:         "inventory-account",
+		ProviderName: "Cloudflare",
+		ProviderCode: "dns_cf",
+		EnvJSON:      `{"CF_Token":"token"}`,
+	}
+	if err := db.Create(dnsAccount).Error; err != nil {
+		t.Fatalf("create DNS account failed: %v", err)
+	}
+	if err := db.Create(&model.CertificateRecord{
+		SourceType:      CertificateSourceACME,
+		SourceRef:       "inventory-only",
+		MainDomain:      "inventory.example.com",
+		DomainSet:       `["inventory.example.com"]`,
+		CertificateType: acmeCertificateTypeDomain,
+		Challenge:       "dns",
+		KeyLength:       "ec-256",
+		CAServer:        "letsencrypt",
+		UseECC:          true,
+		DNSAccountID:    dnsAccount.Id,
+		DNSAccountName:  dnsAccount.Name,
+		CertPEM:         []byte("cert"),
+		KeyPEM:          []byte("key"),
+		FullchainPEM:    []byte("fullchain"),
+		Fingerprint:     "inventory-lock-fingerprint",
+	}).Error; err != nil {
+		t.Fatalf("create inventory record failed: %v", err)
+	}
+
+	accounts, err := (&AcmeService{}).listDNSAccounts()
+	if err != nil {
+		t.Fatalf("list DNS accounts failed: %v", err)
+	}
+	if len(accounts) != 1 || !accounts[0].ProviderLocked {
+		t.Fatalf("expected inventory reference to lock DNS account, got=%#v", accounts)
+	}
+}
+
 func TestDeleteDNSAccountClearsCertificateReferences(t *testing.T) {
 	db := setupAcmeDNSTestDB(t, "acme-dns-delete-reference.db")
 
@@ -222,30 +472,9 @@ func TestDeleteDNSAccountClearsCertificateReferences(t *testing.T) {
 		t.Fatalf("create dns account failed: %v", err)
 	}
 
-	acmeCert := &model.AcmeCertificate{
-		MainDomain:      "example.com",
-		DomainSet:       `["example.com"]`,
-		Challenge:       "dns",
-		KeyLength:       "ec-256",
-		CAServer:        "letsencrypt",
-		UseECC:          true,
-		DNSAccountID:    dnsRow.Id,
-		DNSAccountName:  dnsRow.Name,
-		CertPEM:         []byte("cert"),
-		KeyPEM:          []byte("key"),
-		FullchainPEM:    []byte("fullchain"),
-		Fingerprint:     "fp",
-		LastIssuedAt:    1,
-		LastRenewedAt:   1,
-		CertificateType: "domain",
-	}
-	if err := db.Create(acmeCert).Error; err != nil {
-		t.Fatalf("create acme certificate failed: %v", err)
-	}
-
 	inventory := &model.CertificateRecord{
 		SourceType:      CertificateSourceACME,
-		SourceRef:       "1",
+		SourceRef:       "dns-delete-reference",
 		MainDomain:      "example.com",
 		DomainSet:       `["example.com"]`,
 		Challenge:       "dns",
@@ -268,13 +497,6 @@ func TestDeleteDNSAccountClearsCertificateReferences(t *testing.T) {
 
 	if _, err := (&AcmeService{}).DeleteDNSAccount(dnsRow.Id); err != nil {
 		t.Fatalf("delete dns account failed: %v", err)
-	}
-
-	if err := db.Where("id = ?", acmeCert.Id).First(acmeCert).Error; err != nil {
-		t.Fatalf("reload acme certificate failed: %v", err)
-	}
-	if acmeCert.DNSAccountID != 0 || acmeCert.DNSAccountName != "" {
-		t.Fatalf("expected acme certificate dns reference cleared: %#v", acmeCert)
 	}
 
 	if err := db.Where("id = ?", inventory.Id).First(inventory).Error; err != nil {
@@ -358,8 +580,7 @@ func TestValidateDNSProviderEnvCloudflareCompatibilityModes(t *testing.T) {
 	}
 
 	if err := validateDNSProviderEnv(provider, map[string]string{
-		"CF_Token":      "token",
-		"CF_Account_ID": "account",
+		"CF_Token": "token-only",
 	}); err != nil {
 		t.Fatalf("expected Cloudflare token mode valid, got err=%v", err)
 	}
@@ -372,9 +593,53 @@ func TestValidateDNSProviderEnvCloudflareCompatibilityModes(t *testing.T) {
 	}
 
 	if err := validateDNSProviderEnv(provider, map[string]string{
-		"CF_Token": "token-only",
+		"CF_Account_ID": "account-only",
 	}); err == nil {
-		t.Fatal("expected token-only Cloudflare config to be rejected")
+		t.Fatal("expected Cloudflare account ID without authentication rejected")
+	}
+}
+
+func TestDNSRuntimeEnvironmentRejectsReservedKeysAndKeepsSafeExtensions(t *testing.T) {
+	provider, ok := lookupAcmeDNSProvider("dns_cf")
+	if !ok {
+		t.Fatal("dns_cf provider not found")
+	}
+	if err := validateDNSProviderEnv(provider, map[string]string{
+		"CF_Token":           "token",
+		"AWS_DEFAULT_REGION": "us-east-1",
+	}); err != nil {
+		t.Fatalf("safe provider extension should be allowed: %v", err)
+	}
+
+	for _, raw := range []string{
+		"1INVALID=value",
+		"LE_CONFIG_HOME=/tmp/override",
+		"PATH=/tmp/override",
+		"LD_PRELOAD=/tmp/preload.so",
+	} {
+		if _, err := normalizeAcmeEnvAssignments(raw); err == nil {
+			t.Fatalf("expected runtime env %q rejected", raw)
+		}
+	}
+	if err := validateDNSProviderEnv(provider, map[string]string{
+		"CF_Token":       "token",
+		"LE_WORKING_DIR": "/tmp/override",
+	}); err == nil {
+		t.Fatal("reserved runtime variable should be rejected for saved DNS accounts")
+	}
+
+	db := setupAcmeDNSTestDB(t, "acme-dns-reserved-runtime.db")
+	account := &model.AcmeDNSAccount{
+		Name:         "invalid-runtime-env",
+		ProviderName: "Cloudflare",
+		ProviderCode: "dns_cf",
+		EnvJSON:      `{"CF_Token":"token","DYLD_INSERT_LIBRARIES":"/tmp/inject"}`,
+	}
+	if err := db.Create(account).Error; err != nil {
+		t.Fatalf("create DNS account fixture failed: %v", err)
+	}
+	if _, err := resolveAcmeDNSRuntimeConfig(account.Id, "", ""); err == nil {
+		t.Fatal("stored reserved runtime variable should be rejected before execution")
 	}
 }
 
@@ -418,56 +683,15 @@ func TestCleanupNonDNSCertificateDNSReferences(t *testing.T) {
 	db := setupAcmeDNSTestDB(t, "acme-nondns-cleanup.db")
 	svc := &AcmeService{}
 
-	nonDNSAcme := &model.AcmeCertificate{
+	nonDNSInventory := &model.CertificateRecord{
+		SourceType:      CertificateSourceACME,
+		SourceRef:       "nondns-cleanup-standalone",
 		MainDomain:      "standalone.example.com",
 		DomainSet:       `["standalone.example.com"]`,
 		CertificateType: acmeCertificateTypeDomain,
 		Challenge:       "standalone",
 		KeyLength:       "ec-256",
 		CAServer:        "letsencrypt",
-		UseECC:          true,
-		DNSAccountID:    11,
-		DNSAccountName:  "dns-standalone",
-		CertPEM:         []byte("cert-standalone"),
-		KeyPEM:          []byte("key-standalone"),
-		FullchainPEM:    []byte("fullchain-standalone"),
-		Fingerprint:     "fp-standalone",
-		LastIssuedAt:    1,
-		LastRenewedAt:   1,
-	}
-	dnsAcme := &model.AcmeCertificate{
-		MainDomain:      "dns.example.com",
-		DomainSet:       `["dns.example.com"]`,
-		CertificateType: acmeCertificateTypeDomain,
-		Challenge:       "dns",
-		KeyLength:       "ec-256",
-		CAServer:        "letsencrypt",
-		UseECC:          true,
-		DNSAccountID:    22,
-		DNSAccountName:  "dns-valid",
-		CertPEM:         []byte("cert-dns"),
-		KeyPEM:          []byte("key-dns"),
-		FullchainPEM:    []byte("fullchain-dns"),
-		Fingerprint:     "fp-dns",
-		LastIssuedAt:    1,
-		LastRenewedAt:   1,
-	}
-	if err := db.Create(nonDNSAcme).Error; err != nil {
-		t.Fatalf("create non-dns acme row failed: %v", err)
-	}
-	if err := db.Create(dnsAcme).Error; err != nil {
-		t.Fatalf("create dns acme row failed: %v", err)
-	}
-
-	nonDNSInventory := &model.CertificateRecord{
-		SourceType:      CertificateSourceACME,
-		SourceRef:       strconv.FormatUint(uint64(nonDNSAcme.Id), 10),
-		MainDomain:      nonDNSAcme.MainDomain,
-		DomainSet:       nonDNSAcme.DomainSet,
-		CertificateType: nonDNSAcme.CertificateType,
-		Challenge:       nonDNSAcme.Challenge,
-		KeyLength:       nonDNSAcme.KeyLength,
-		CAServer:        nonDNSAcme.CAServer,
 		UseECC:          true,
 		DNSAccountID:    11,
 		DNSAccountName:  "dns-standalone",
@@ -480,13 +704,13 @@ func TestCleanupNonDNSCertificateDNSReferences(t *testing.T) {
 	}
 	dnsInventory := &model.CertificateRecord{
 		SourceType:      CertificateSourceACME,
-		SourceRef:       strconv.FormatUint(uint64(dnsAcme.Id), 10),
-		MainDomain:      dnsAcme.MainDomain,
-		DomainSet:       dnsAcme.DomainSet,
-		CertificateType: dnsAcme.CertificateType,
-		Challenge:       dnsAcme.Challenge,
-		KeyLength:       dnsAcme.KeyLength,
-		CAServer:        dnsAcme.CAServer,
+		SourceRef:       "nondns-cleanup-dns",
+		MainDomain:      "dns.example.com",
+		DomainSet:       `["dns.example.com"]`,
+		CertificateType: acmeCertificateTypeDomain,
+		Challenge:       "dns",
+		KeyLength:       "ec-256",
+		CAServer:        "letsencrypt",
 		UseECC:          true,
 		DNSAccountID:    22,
 		DNSAccountName:  "dns-valid",
@@ -506,19 +730,6 @@ func TestCleanupNonDNSCertificateDNSReferences(t *testing.T) {
 
 	if err := svc.cleanupNonDNSCertificateDNSReferences(); err != nil {
 		t.Fatalf("cleanup non-dns dns references failed: %v", err)
-	}
-
-	if err := db.Where("id = ?", nonDNSAcme.Id).First(nonDNSAcme).Error; err != nil {
-		t.Fatalf("reload non-dns acme row failed: %v", err)
-	}
-	if nonDNSAcme.DNSAccountID != 0 || nonDNSAcme.DNSAccountName != "" {
-		t.Fatalf("expected non-dns acme row dns refs cleared: %#v", nonDNSAcme)
-	}
-	if err := db.Where("id = ?", dnsAcme.Id).First(dnsAcme).Error; err != nil {
-		t.Fatalf("reload dns acme row failed: %v", err)
-	}
-	if dnsAcme.DNSAccountID != 22 || dnsAcme.DNSAccountName != "dns-valid" {
-		t.Fatalf("expected dns acme row refs kept: %#v", dnsAcme)
 	}
 
 	if err := db.Where("id = ?", nonDNSInventory.Id).First(nonDNSInventory).Error; err != nil {
@@ -558,7 +769,9 @@ func TestGetOverviewReturnsAccountsAndCertificatesWhenUnsupportedOS(t *testing.T
 	}).Error; err != nil {
 		t.Fatalf("create dns account failed: %v", err)
 	}
-	if err := database.GetDB().Create(&model.AcmeCertificate{
+	if err := database.GetDB().Create(&model.CertificateRecord{
+		SourceType:      CertificateSourceACME,
+		SourceRef:       "overview-record",
 		MainDomain:      "overview.example.com",
 		DomainSet:       `["overview.example.com"]`,
 		CertificateType: acmeCertificateTypeDomain,

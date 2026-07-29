@@ -1,6 +1,32 @@
-import HttpUtils from '@/plugins/httputil'
+import HttpUtils, { type Msg } from '@/plugins/httputil'
+import { confirm } from '@/plugins/confirm'
+import { i18n } from '@/locales'
+import {
+  formatPanelDateTime,
+  panelCalendarDateToEpochSeconds,
+  panelCalendarParts,
+  panelNow,
+} from '@/plugins/panelTime'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { push } from 'notivue'
+
+export type PortForwardRuntimeConflict = {
+  ruleId: number
+  ruleName: string
+  localPortSpec: string
+  family: string
+  protocol: string
+  port: number
+  socketFamily: string
+  socketStack: string
+  stackSource: string
+  bindAddress: string
+  owners: Array<{
+    pid: number
+    name: string
+  }>
+  checkedAt: number
+}
 
 export type PortForwardRule = {
   id: number
@@ -17,16 +43,41 @@ export type PortForwardRule = {
   targetIP: string
   targetPort: number
   rateLimitMbps: number
+  trafficLimitBytes: number
+  trafficLimitGiB: number
+  trafficResetDay: number
+  trafficExpiryDate: string
   effectiveRateLimitMbps: number
   limitStatus: string
   limitWarning: string
   currentUp: number
   currentDown: number
   currentTotal: number
+  trafficNextResetAt: number
+  trafficLastResetAt: number
+  trafficLimitReached: boolean
+  trafficExpired: boolean
+  trafficBlocked: boolean
+  trafficBlockReason: string
+  runtimeConflictCount: number
 }
 
 type PortForwardOverview = {
+  supported: boolean
+  ready: boolean
   available: boolean
+  nftVersion: string
+  kernelVersion: string
+  compatibilityMode: string
+  rendererSupported: boolean
+  supportsTransportHeader: boolean
+  supportsTableComments: boolean
+  capabilityError: string
+  versionProbeError: string
+  jsonProbeError: string
+  meterProbeError: string
+  layoutPending: boolean
+  lastApplyError: string
   lastSyncAt: number
   kernelIPv4Forward: boolean
   kernelIPv6Forward: boolean
@@ -36,6 +87,7 @@ type PortForwardOverview = {
   totalDown: number
   totalTraffic: number
   rules: PortForwardRule[]
+  runtimeConflicts: PortForwardRuntimeConflict[]
   warnings?: string[]
   error?: string
 }
@@ -55,124 +107,39 @@ type PortForwardRuleForm = {
   targetIP: string
   targetPort: number
   rateLimitMbps: number
+  trafficLimitGiB: number
+  trafficResetDay: number
+  trafficExpiryDate: string
 }
 
-export const copy = {
-  heroEyebrow: 'NFTABLES FORWARDING',
-  title: '\u7aef\u53e3\u8f6c\u53d1',
-  subtitle: '\u5c06\u672c\u673a\u5165\u7ad9\u7aef\u53e3\u6620\u5c04\u5230\u8fdc\u7a0b IP:\u7aef\u53e3\u6216\u672c\u673a\u53e6\u4e00\u4e2a\u7aef\u53e3\uff0c\u53ef\u9009 TCP / UDP\u3001IPv4 / IPv6 \u4e0e\u7aef\u53e3\u9650\u901f\u3002',
-  refresh: '\u7acb\u5373\u5237\u65b0',
-  newRule: '\u65b0\u5efa\u8f6c\u53d1',
-  available: '\u53ef\u7528',
-  unavailable: '\u4e0d\u53ef\u7528',
-  unavailableHint: '\u5f53\u524d\u7cfb\u7edf\u4e0d\u652f\u6301 nftables \u8f6c\u53d1\u4e0b\u53d1\uff08\u4ec5 Linux \u652f\u6301\uff09\u3002\u4f60\u4ecd\u53ef\u4ee5\u7ef4\u62a4\u89c4\u5219\u7528\u4e8e\u8c03\u8bd5\uff0c\u4f46\u8fd0\u884c\u65f6\u4e0d\u4f1a\u751f\u6548\u3002',
-  lastSync: '\u4e0a\u6b21\u540c\u6b65',
-  ruleCount: '\u89c4\u5219',
-  enabledRules: '\u5df2\u542f\u7528\u89c4\u5219',
-  limitedRules: '\u9650\u901f\u89c4\u5219',
-  totalTraffic: '\u603b\u6d41\u91cf',
-  runtimeTitle: '\u8fd0\u884c\u6001',
-  kernelIPv4: 'IPv4 Forward',
-  kernelIPv6: 'IPv6 Forward',
-  forwardOn: '\u5df2\u6253\u5f00',
-  forwardOff: '\u672a\u6253\u5f00',
-  totalUpload: '\u603b\u4e0a\u884c',
-  totalDownload: '\u603b\u4e0b\u884c',
-  runtimeHint: '\u4e0a\u884c\u4ee3\u8868\u8fdc\u7aef\u56de\u5305\uff0c\u4e0b\u884c\u4ee3\u8868\u8fdb\u5165\u672c\u673a\u8f6c\u53d1\u7aef\u53e3\u7684\u6d41\u91cf\u3002\u9650\u901f\u53ea\u4f5c\u7528\u4e8e\u5de6\u4fa7\u672c\u5730\u7aef\u53e3\u3002',
-  tableTitle: '\u8f6c\u53d1\u89c4\u5219',
-  tableSubtitle: '\u652f\u6301\u5355\u7aef\u53e3\u3001\u591a\u7aef\u53e3\u4e0e\u7aef\u53e3\u8303\u56f4\uff0c\u53f3\u4fa7\u76ee\u6807\u7aef\u53e3\u56fa\u5b9a\u4e3a\u5355\u7aef\u53e3\u3002',
-  searchLabel: '\u641c\u7d22\u540d\u79f0 / \u672c\u5730\u7aef\u53e3 / \u76ee\u6807',
-  familyFilter: '\u53cc\u6808\u7b5b\u9009',
-  protocolFilter: '\u534f\u8bae\u7b5b\u9009',
-  allFamilies: '\u5168\u90e8\u53cc\u6808',
-  allProtocols: '\u5168\u90e8\u534f\u8bae',
-  ruleLabel: '\u89c4\u5219',
-  localLabel: '\u672c\u5730\u7aef\u53e3',
-  targetLabel: '\u51fa\u5411\u76ee\u6807',
-  laneLabel: '\u901a\u9053',
-  limitColumn: '\u9650\u5236',
-  trafficColumn: '\u7edf\u8ba1',
-  actions: '\u64cd\u4f5c',
-  enabled: '\u542f\u7528',
-  disabled: '\u505c\u7528',
-  ruleFallback: '\u672a\u547d\u540d\u89c4\u5219',
-  leftPortOnly: '\u4ec5\u9650\u5236\u5de6\u4fa7\u672c\u5730\u7aef\u53e3',
-  up: '\u4e0a',
-  down: '\u4e0b',
-  emptyText: '\u5f53\u524d\u6ca1\u6709\u5339\u914d\u5230\u7684\u8f6c\u53d1\u89c4\u5219',
-  createTitle: '\u65b0\u5efa\u7aef\u53e3\u8f6c\u53d1',
-  editTitle: '\u7f16\u8f91\u7aef\u53e3\u8f6c\u53d1',
-  dialogSubtitle: '\u5de6\u4fa7\u914d\u7f6e\u672c\u673a\u5165\u53e3\u4e0e\u8bbf\u95ee\u9650\u5236\uff0c\u53f3\u4fa7\u914d\u7f6e\u8f6c\u53d1\u76ee\u6807 IP:\u7aef\u53e3\uff1b\u76ee\u6807 IP \u7559\u7a7a\u6216\u586b\u672c\u5730 IP \u65f6\u89c6\u4e3a\u8f6c\u53d1\u5230\u672c\u673a\u7aef\u53e3\u3002',
-  nameLabel: '\u540d\u79f0',
-  descLabel: '\u8bf4\u660e',
-  localPanelTitle: '\u672c\u5730\u5165\u53e3',
-  localPanelHint: '\u5355\u6761\u89c4\u5219\u53ef\u5b9a\u4e49\u5165\u7ad9\u534f\u8bae\u3001IP \u6808\u3001\u5355\u7aef\u53e3 / \u591a\u7aef\u53e3 / \u7aef\u53e3\u8303\u56f4\u4e0e\u5165\u53e3\u9650\u901f\u3002',
-  modeLabel: '\u7aef\u53e3\u6a21\u5f0f',
-  singleMode: '\u5355\u7aef\u53e3',
-  multiMode: '\u591a\u7aef\u53e3',
-  rangeMode: '\u7aef\u53e3\u8303\u56f4',
-  startLabel: '\u8d77\u59cb\u7aef\u53e3',
-  portLabel: '\u7aef\u53e3',
-  multiLabel: '\u591a\u7aef\u53e3',
-  multiPlaceholder: '66,88,99',
-  rangeEndLabel: '\u7ed3\u675f\u7aef\u53e3',
-  targetPanelTitle: '\u51fa\u5411\u76ee\u6807',
-  targetPanelHint: '\u8fd9\u91cc\u53ea\u914d\u7f6e\u8f6c\u53d1\u540e\u7684\u76ee\u6807 IP:\u7aef\u53e3\uff1b\u76ee\u6807\u7aef\u53e3\u56fa\u5b9a\u4e3a\u5355\u7aef\u53e3\uff0c\u76ee\u6807 IP \u7559\u7a7a\u3001`127.0.0.1`\u3001`::1` \u7b49\u672c\u5730\u5730\u5740\u65f6\uff0c\u8868\u793a\u8f6c\u53d1\u5230\u672c\u673a\u53e6\u4e00\u4e2a\u7aef\u53e3\u3002',
-  protocolLabel: '\u534f\u8bae',
-  familyLabel: '\u53cc\u6808',
-  targetIPLabel: '\u76ee\u6807 IP',
-  targetPortLabel: '\u76ee\u6807\u7aef\u53e3',
-  rateLabel: '\u5165\u53e3\u9650\u901f Mbps',
-  rateHint: '\u4e0d\u586b\u6216\u586b 0 \u8868\u793a\u4e0d\u9650\u901f\uff0c\u4e14\u4e0d\u751f\u6210\u9650\u901f\u89c4\u5219\u3002\u586b\u5199\u540e\uff0c\u8be5\u89c4\u5219\u547d\u4e2d\u7684\u6bcf\u4e2a\u7aef\u53e3\u90fd\u6309\u8be5\u503c\u9650\u901f\uff0cTCP/UDP \u4e92\u4e0d\u8986\u76d6\u3002',
-  cancel: '\u53d6\u6d88',
-  save: '\u4fdd\u5b58',
-  deleteConfirm: '\u786e\u5b9a\u5220\u9664\u89c4\u5219 {name} \u5417\uff1f',
-  unlimited: '\u4e0d\u9650\u901f',
-  effectiveZero: '0 Mbps',
-  limitDegraded: '\u9650\u901f\u672a\u751f\u6548',
-  localTarget: '\u672c\u673a',
+const tr = (key: string, params?: Record<string, unknown>) => String(i18n.global.t(`portForward.${key}`, params ?? {}))
+
+const errorMessage = (error: unknown, fallback: string) => {
+  if (error instanceof Error && error.message.trim()) return error.message.trim()
+  if (typeof error === 'string' && error.trim()) return error.trim()
+  return fallback
 }
 
-export const headers = [
-  { title: copy.ruleLabel, key: 'name', sortable: false },
-  { title: copy.localLabel, key: 'local', sortable: false },
-  { title: copy.targetLabel, key: 'target', sortable: false },
-  { title: copy.laneLabel, key: 'lane', sortable: false },
-  { title: copy.limitColumn, key: 'limit', sortable: false },
-  { title: copy.trafficColumn, key: 'traffic', sortable: false },
-  { title: copy.actions, key: 'actions', sortable: false, width: 150 },
-]
-
-export const familyItems = [
-  { title: 'IPv4', value: 'ipv4' },
-  { title: 'IPv6', value: 'ipv6' },
-  { title: 'IPv4/IPv6', value: 'dual' },
-]
-
-export const familyFilterItems = [
-  { title: copy.allFamilies, value: 'all' },
-  ...familyItems,
-]
-
-export const protocolItems = [
-  { title: 'TCP', value: 'tcp' },
-  { title: 'UDP', value: 'udp' },
-  { title: 'TCP/UDP', value: 'tcp_udp' },
-]
-
-export const protocolFilterItems = [
-  { title: copy.allProtocols, value: 'all' },
-  ...protocolItems,
-]
-
-export const localModeItems = [
-  { title: copy.singleMode, value: 'single' },
-  { title: copy.multiMode, value: 'multi' },
-  { title: copy.rangeMode, value: 'range' },
-]
+const touchLocale = () => {
+  void i18n.global.locale.value
+}
 
 const emptyOverview = (): PortForwardOverview => ({
-  available: true,
+  supported: false,
+  ready: false,
+  available: false,
+  nftVersion: '',
+  kernelVersion: '',
+  compatibilityMode: 'conservative',
+  rendererSupported: false,
+  supportsTransportHeader: false,
+  supportsTableComments: false,
+  capabilityError: '',
+  versionProbeError: '',
+  jsonProbeError: '',
+  meterProbeError: '',
+  layoutPending: false,
+  lastApplyError: '',
   lastSyncAt: 0,
   kernelIPv4Forward: false,
   kernelIPv6Forward: false,
@@ -182,6 +149,7 @@ const emptyOverview = (): PortForwardOverview => ({
   totalDown: 0,
   totalTraffic: 0,
   rules: [],
+  runtimeConflicts: [],
   warnings: [],
   error: '',
 })
@@ -201,6 +169,9 @@ const createEmptyRuleForm = (): PortForwardRuleForm => ({
   targetIP: '',
   targetPort: 0,
   rateLimitMbps: 0,
+  trafficLimitGiB: 0,
+  trafficResetDay: 0,
+  trafficExpiryDate: '',
 })
 
 const toNumber = (value: unknown, fallback = 0) => {
@@ -237,12 +208,41 @@ const normalizeRule = (raw: Partial<PortForwardRule> = {}): PortForwardRule => (
   targetIP: String(raw.targetIP ?? ''),
   targetPort: toNumber(raw.targetPort),
   rateLimitMbps: toNumber(raw.rateLimitMbps),
+  trafficLimitBytes: toNumber(raw.trafficLimitBytes),
+  trafficLimitGiB: toNumber(raw.trafficLimitGiB),
+  trafficResetDay: toNumber(raw.trafficResetDay),
+  trafficExpiryDate: String(raw.trafficExpiryDate ?? ''),
   effectiveRateLimitMbps: toNumber(raw.effectiveRateLimitMbps),
   limitStatus: String(raw.limitStatus ?? ''),
   limitWarning: String(raw.limitWarning ?? ''),
   currentUp: toNumber(raw.currentUp),
   currentDown: toNumber(raw.currentDown),
   currentTotal: toNumber(raw.currentTotal),
+  trafficNextResetAt: toNumber(raw.trafficNextResetAt),
+  trafficLastResetAt: toNumber(raw.trafficLastResetAt),
+  trafficLimitReached: Boolean(raw.trafficLimitReached),
+  trafficExpired: Boolean(raw.trafficExpired),
+  trafficBlocked: Boolean(raw.trafficBlocked),
+  trafficBlockReason: String(raw.trafficBlockReason ?? ''),
+  runtimeConflictCount: toNumber(raw.runtimeConflictCount),
+})
+
+const normalizeConflict = (raw: Partial<PortForwardRuntimeConflict> = {}): PortForwardRuntimeConflict => ({
+  ruleId: toNumber(raw.ruleId),
+  ruleName: String(raw.ruleName ?? ''),
+  localPortSpec: String(raw.localPortSpec ?? ''),
+  family: normalizeFamilyValue(raw.family),
+  protocol: normalizeProtocolValue(raw.protocol),
+  port: toNumber(raw.port),
+  socketFamily: String(raw.socketFamily ?? ''),
+  socketStack: String(raw.socketStack ?? ''),
+  stackSource: String(raw.stackSource ?? ''),
+  bindAddress: String(raw.bindAddress ?? ''),
+  owners: Array.isArray(raw.owners) ? raw.owners.map(owner => ({
+    pid: toNumber(owner?.pid),
+    name: String(owner?.name ?? ''),
+  })) : [],
+  checkedAt: toNumber(raw.checkedAt),
 })
 
 const normalizeWarnings = (raw: unknown): string[] => (
@@ -251,7 +251,7 @@ const normalizeWarnings = (raw: unknown): string[] => (
 
 const formatTimestamp = (value: number) => {
   if (!value) return '-'
-  return new Date(value * 1000).toLocaleString()
+  return formatPanelDateTime(value * 1000)
 }
 
 const mapRuleToForm = (rule?: PortForwardRule): PortForwardRuleForm => ({
@@ -261,6 +261,8 @@ const mapRuleToForm = (rule?: PortForwardRule): PortForwardRuleForm => ({
   enabled: rule?.enabled ?? true,
   family: normalizeFamilyValue(rule?.family),
   protocol: normalizeProtocolValue(rule?.protocol),
+  // Legacy count records represent an inclusive range. Keep the current
+  // semantic visible instead of silently treating it as a single port.
   localPortMode: rule?.localPortMode === 'count' ? 'range' : (rule?.localPortMode ?? 'single'),
   localPortSpec: rule?.localPortSpec ?? '',
   localPortStart: rule?.localPortStart ?? 0,
@@ -269,6 +271,9 @@ const mapRuleToForm = (rule?: PortForwardRule): PortForwardRuleForm => ({
   targetIP: isLocalTargetIP(rule?.targetIP ?? '') ? '' : (rule?.targetIP ?? ''),
   targetPort: rule?.targetPort ?? 0,
   rateLimitMbps: rule?.rateLimitMbps ?? 0,
+  trafficLimitGiB: rule?.trafficLimitGiB ?? 0,
+  trafficResetDay: rule?.trafficResetDay ?? 0,
+  trafficExpiryDate: rule?.trafficExpiryDate ?? '',
 })
 
 const buildPayload = (form: PortForwardRuleForm) => ({
@@ -290,6 +295,9 @@ const buildPayload = (form: PortForwardRuleForm) => ({
   targetIP: form.targetIP.trim(),
   targetPort: toNumber(form.targetPort),
   rateLimitMbps: Math.max(0, toNumber(form.rateLimitMbps)),
+  trafficLimitGiB: Math.max(0, toNumber(form.trafficLimitGiB)),
+  trafficResetDay: Math.max(0, Math.floor(toNumber(form.trafficResetDay))),
+  trafficExpiryDate: form.trafficExpiryDate.trim(),
 })
 
 export const familyLabel = (value: string) => {
@@ -309,30 +317,50 @@ export const isLocalTargetIP = (value: string) => {
   return trimmed === '' || trimmed === 'localhost' || trimmed === '127.0.0.1' || trimmed === '::1'
 }
 
-export const targetDisplayLabel = (targetIP: string, targetPort: number) => {
-  if (isLocalTargetIP(targetIP)) {
-    return `${copy.localTarget}:${targetPort || 0}`
+const targetAddressFamily = (value: string): 'ipv4' | 'ipv6' | '' => {
+  const address = String(value ?? '').trim().replace(/^\[|\]$/g, '')
+  if (!address) return ''
+  const ipv4 = address.split('.')
+  if (ipv4.length === 4 && ipv4.every(part => /^\d+$/.test(part) && !/^0\d+/.test(part) && Number(part) >= 0 && Number(part) <= 255)) {
+    return 'ipv4'
   }
-  return `${targetIP}:${targetPort || 0}`
+  if (address.includes(':')) {
+    try {
+      // The browser parser gives the form-level check real IPv6 syntax
+      // validation; the server repeats this with netip before persistence.
+      const parsed = new URL(`http://[${address}]/`)
+      if (parsed.hostname) return 'ipv6'
+    } catch {
+      return ''
+    }
+  }
+  return ''
+}
+
+export const targetDisplayLabel = (targetIP: string, targetPort: number) => {
+  const port = targetPort || 0
+  if (isLocalTargetIP(targetIP)) {
+    return `${tr('localTarget')}:${port}`
+  }
+  const address = String(targetIP ?? '').trim().replace(/^\[|\]$/g, '')
+  return targetAddressFamily(address) === 'ipv6' ? `[${address}]:${port}` : `${address}:${port}`
 }
 
 export const localModeLabel = (value: string) => {
-  if (value === 'multi') return copy.multiMode
-  if (value === 'range') return copy.rangeMode
-  return copy.singleMode
+  if (value === 'multi') return tr('multiMode')
+  if (value === 'range' || value === 'count') return tr('rangeMode')
+  return tr('singleMode')
 }
 
 export const rateLimitLabel = (effectiveValue: number, configuredValue = 0, status = '') => {
   if (configuredValue > 0 && effectiveValue <= 0 && status === 'degraded') {
-    return copy.effectiveZero
+    return tr('effectiveZero')
   }
-  return effectiveValue > 0 ? `${effectiveValue} Mbps` : copy.unlimited
+  return effectiveValue > 0 ? `${effectiveValue} Mbps` : tr('unlimited')
 }
 
 export const formatBytes = (value: number) => {
-  if (!Number.isFinite(value) || value <= 0) {
-    return '0 B'
-  }
+  if (!Number.isFinite(value) || value <= 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   let current = value
   let index = 0
@@ -344,26 +372,201 @@ export const formatBytes = (value: number) => {
   return `${current.toFixed(digits)} ${units[index]}`
 }
 
+const trafficGiBBytes = 1024 * 1024 * 1024
+const maxTrafficLimitGiB = Number.MAX_SAFE_INTEGER / trafficGiBBytes
+
+export const formatTrafficGB = (value: number) => {
+  const bytes = Number.isFinite(value) && value > 0 ? value : 0
+  return `${(bytes / trafficGiBBytes).toFixed(2)} GB`
+}
+
+export const trafficLimitLabel = (rule: PortForwardRule) => (
+  rule.trafficLimitGiB > 0 ? `${rule.trafficLimitGiB.toFixed(2)} GB` : tr('unlimited')
+)
+
+export const trafficUsageLabel = (rule: PortForwardRule) => (
+  `${formatTrafficGB(rule.currentTotal)} / ${trafficLimitLabel(rule)}`
+)
+
+export const trafficUsagePercent = (rule: PortForwardRule) => {
+  if (!Number.isFinite(rule.trafficLimitGiB) || rule.trafficLimitGiB <= 0) return 0
+  const limitBytes = rule.trafficLimitGiB * trafficGiBBytes
+  if (limitBytes <= 0) return 0
+  return Math.min(100, Math.max(0, Math.round(rule.currentTotal * 100 / limitBytes)))
+}
+
+export const trafficBlockLabel = (rule: PortForwardRule) => {
+  if (rule.trafficBlockReason === 'expiry' || rule.trafficExpired) return tr('trafficExpiryBlocked')
+  if (rule.trafficBlockReason === 'quota' || rule.trafficLimitReached) return tr('trafficQuotaBlocked')
+  return ''
+}
+
+const normalizeTrafficResetDay = (value: unknown) => {
+  const day = Math.floor(toNumber(value))
+  return Number.isInteger(day) && day >= 0 && day <= 31 ? day : 0
+}
+
+const normalizeTrafficExpiryDate = (value: unknown) => String(value ?? '').trim()
+
+const validTrafficExpiryDate = (value: string) => {
+  if (value === '') return true
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (match == null) return false
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const parsed = new Date(year, month - 1, day, 0, 0, 0, 0)
+  return Number.isInteger(year) && Number.isInteger(month) && Number.isInteger(day) &&
+    parsed.getFullYear() === year && parsed.getMonth() === month - 1 && parsed.getDate() === day
+}
+
+const parseEpochSeconds = (value: unknown): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.floor(Math.abs(value) < 1e11 ? value : value / 1000)
+  }
+  if (value instanceof Date && Number.isFinite(value.getTime())) return Math.floor(value.getTime() / 1000)
+  if (typeof value === 'string' && value.trim() !== '') {
+    if (/^-?\d+(?:\.\d+)?$/.test(value.trim())) return parseEpochSeconds(Number(value.trim()))
+    const parsed = Date.parse(value)
+    return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : null
+  }
+  return null
+}
+
+const trafficResetPickerEpoch = (value: unknown) => {
+  const day = normalizeTrafficResetDay(value)
+  if (day <= 0) return 0
+  const now = panelCalendarParts(panelNow())
+  const lastDay = new Date(now.year, now.month, 0).getDate()
+  return panelCalendarDateToEpochSeconds(new Date(now.year, now.month - 1, Math.min(day, lastDay), 0, 0, 0, 0))
+}
+
+const trafficExpiryPickerEpoch = (value: unknown) => {
+  const date = normalizeTrafficExpiryDate(value)
+  if (!validTrafficExpiryDate(date)) return 0
+  if (date === '') return 0
+  const match = date.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (match == null) return 0
+  return panelCalendarDateToEpochSeconds(new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 0, 0, 0, 0))
+}
+
+const validPort = (value: unknown) => {
+  const port = toNumber(value)
+  return Number.isInteger(port) && port >= 1 && port <= 65535
+}
+
+const validatePortExpression = (raw: string) => {
+  const parts = raw.replace(/，/g, ',').split(',').map(item => item.trim()).filter(Boolean)
+  if (parts.length === 0 || parts.length > 128) return false
+  return parts.every(part => {
+    const match = part.match(/^(\d+)(?:\s*[-:]\s*(\d+))?$/)
+    if (!match || !validPort(match[1])) return false
+    return !match[2] || (validPort(match[2]) && Number(match[1]) <= Number(match[2]))
+  })
+}
+
+const buildRuleValidationError = (form: PortForwardRuleForm): string => {
+  if ([...form.name.trim()].length > 120) return tr('validationNameLength')
+  if ([...form.description.trim()].length > 1000) return tr('validationDescriptionLength')
+  if (form.localPortMode === 'single' && !validPort(form.localPortStart)) return tr('validationPort')
+  if (form.localPortMode === 'range' && (!validPort(form.localPortStart) || !validPort(form.localPortEnd) || toNumber(form.localPortEnd) < toNumber(form.localPortStart))) {
+    return tr('validationRange')
+  }
+  if (form.localPortMode === 'multi' && !validatePortExpression(form.localPortSpec)) return tr('validationMulti')
+  if (!validPort(form.targetPort)) return tr('validationTargetPort')
+  const rate = Number(form.rateLimitMbps)
+  if (!Number.isFinite(rate) || !Number.isInteger(rate) || rate < 0 || rate > 1000000) return tr('validationRate')
+  const trafficLimit = Number(form.trafficLimitGiB)
+  if (!Number.isFinite(trafficLimit) || trafficLimit < 0 || trafficLimit > maxTrafficLimitGiB || Math.abs(trafficLimit * 100 - Math.round(trafficLimit * 100)) > 1e-7) {
+    return tr('validationTrafficLimit')
+  }
+  if (!Number.isInteger(Number(form.trafficResetDay)) || Number(form.trafficResetDay) < 0 || Number(form.trafficResetDay) > 31) return tr('validationTrafficResetDay')
+  if (!validTrafficExpiryDate(normalizeTrafficExpiryDate(form.trafficExpiryDate))) return tr('validationTrafficExpiryDate')
+  if (!isLocalTargetIP(form.targetIP)) {
+    const targetFamily = targetAddressFamily(form.targetIP)
+    if (!targetFamily) return tr('validationTargetIP')
+    if (form.family === 'dual' || targetFamily !== normalizeFamilyValue(form.family)) return tr('validationFamily')
+  }
+  return ''
+}
+
 export function usePortForwardManage(props: { active?: boolean }) {
   const loading = ref(false)
   const refreshing = ref(false)
-  const savingRule = ref(false)
+  const mutationBusy = ref(false)
   const dialogVisible = ref(false)
+  const savingRule = computed(() => mutationBusy.value && dialogVisible.value)
   const pollTimer = ref<number | null>(null)
+  const overviewRequest = ref<Promise<Msg> | null>(null)
   const rowBusyId = ref(0)
   const lastWarningSignature = ref('')
+  const hasLoaded = ref(false)
+  const loadError = ref('')
   const searchText = ref('')
   const familyFilter = ref('all')
   const protocolFilter = ref('all')
   const overview = ref<PortForwardOverview>(emptyOverview())
   const editingRule = ref<PortForwardRuleForm>(createEmptyRuleForm())
 
+  const headers = computed(() => {
+    touchLocale()
+    return [
+      { title: tr('ruleLabel'), key: 'name', sortable: false },
+      { title: tr('localLabel'), key: 'local', sortable: false },
+      { title: tr('targetLabel'), key: 'target', sortable: false },
+      { title: tr('laneLabel'), key: 'lane', sortable: false },
+      { title: tr('limitColumn'), key: 'limit', sortable: false },
+      { title: tr('trafficColumn'), key: 'traffic', sortable: false },
+      { title: tr('actions'), key: 'actions', sortable: false, width: 188 },
+    ]
+  })
+  const familyItems = computed(() => {
+    touchLocale()
+    return [
+      { title: 'IPv4', value: 'ipv4' },
+      { title: 'IPv6', value: 'ipv6' },
+      { title: 'IPv4/IPv6', value: 'dual' },
+    ]
+  })
+  const familyFilterItems = computed(() => [{ title: tr('allFamilies'), value: 'all' }, ...familyItems.value])
+  const protocolItems = computed(() => {
+    touchLocale()
+    return [
+      { title: 'TCP', value: 'tcp' },
+      { title: 'UDP', value: 'udp' },
+      { title: 'TCP/UDP', value: 'tcp_udp' },
+    ]
+  })
+  const protocolFilterItems = computed(() => [{ title: tr('allProtocols'), value: 'all' }, ...protocolItems.value])
+  const localModeItems = computed(() => {
+    touchLocale()
+    return [
+      { title: tr('singleMode'), value: 'single' },
+      { title: tr('multiMode'), value: 'multi' },
+      { title: tr('rangeMode'), value: 'range' },
+    ]
+  })
+
   const applyOverview = (raw: Partial<PortForwardOverview> | null | undefined) => {
     const next = raw ?? {}
     overview.value = {
       ...emptyOverview(),
       ...next,
-      available: next.available !== false,
+      supported: typeof next.supported === 'boolean' ? next.supported : Boolean(next.available),
+      ready: typeof next.ready === 'boolean' ? next.ready : Boolean(next.available),
+      available: Boolean(next.available),
+      nftVersion: String(next.nftVersion ?? ''),
+      kernelVersion: String(next.kernelVersion ?? ''),
+      compatibilityMode: String(next.compatibilityMode ?? 'conservative'),
+      rendererSupported: Boolean(next.rendererSupported),
+      supportsTransportHeader: Boolean(next.supportsTransportHeader),
+      supportsTableComments: Boolean(next.supportsTableComments),
+      capabilityError: String(next.capabilityError ?? ''),
+      versionProbeError: String(next.versionProbeError ?? ''),
+      jsonProbeError: String(next.jsonProbeError ?? ''),
+      meterProbeError: String(next.meterProbeError ?? ''),
+      layoutPending: Boolean(next.layoutPending),
+      lastApplyError: String(next.lastApplyError ?? ''),
       kernelIPv4Forward: Boolean(next.kernelIPv4Forward),
       kernelIPv6Forward: Boolean(next.kernelIPv6Forward),
       enabledCount: toNumber(next.enabledCount),
@@ -375,57 +578,90 @@ export function usePortForwardManage(props: { active?: boolean }) {
       warnings: normalizeWarnings(next.warnings),
       error: String(next.error ?? ''),
       rules: Array.isArray(next.rules) ? next.rules.map(rule => normalizeRule(rule)) : [],
+      runtimeConflicts: Array.isArray(next.runtimeConflicts) ? next.runtimeConflicts.map(conflict => normalizeConflict(conflict)) : [],
     }
+    hasLoaded.value = true
+    loadError.value = ''
   }
 
   const lastSyncLabel = computed(() => (
     overview.value.lastSyncAt > 0 ? formatTimestamp(overview.value.lastSyncAt) : '-'
   ))
-
+  const compatibilityModeLabel = computed(() => {
+    touchLocale()
+    const modeMap: Record<string, string> = {
+      native: tr('modeNative'),
+      compatibility: tr('modeCompatibility'),
+      conservative: tr('modeConservative'),
+    }
+    const mode = modeMap[overview.value.compatibilityMode] || tr('modeConservative')
+    const pending = overview.value.layoutPending ? ` · ${tr('layoutPendingShort')}` : ''
+    return `${mode}${pending}`
+  })
+  const capabilityLabel = computed(() => {
+    const nftVersion = overview.value.nftVersion ? `nft ${overview.value.nftVersion}` : tr('nftVersionUnknown')
+    const kernelVersion = overview.value.kernelVersion
+      ? `${tr('kernelVersionLabel')} ${overview.value.kernelVersion}`
+      : tr('kernelVersionUnknown')
+    return `${nftVersion} · ${kernelVersion} · ${compatibilityModeLabel.value}`
+  })
+  const capabilityChipColor = computed(() => {
+    if (!overview.value.rendererSupported || overview.value.layoutPending) return 'warning'
+    return overview.value.compatibilityMode === 'native' ? 'success' : 'info'
+  })
   const dialogTitle = computed(() => (
-    editingRule.value.id > 0 ? copy.editTitle : copy.createTitle
+    editingRule.value.id > 0 ? tr('editTitle') : tr('createTitle')
   ))
-
   const localStartLabel = computed(() => (
-    editingRule.value.localPortMode === 'single' ? copy.portLabel : copy.startLabel
+    editingRule.value.localPortMode === 'single' ? tr('portLabel') : tr('startLabel')
   ))
-
   const localPreviewText = computed(() => {
     const form = editingRule.value
     let localSpec = '-'
-    if (form.localPortMode === 'single') {
-      localSpec = String(form.localPortStart || 0)
-    } else if (form.localPortMode === 'multi') {
-      localSpec = form.localPortSpec.trim() || '-'
-    } else {
-      localSpec = `${form.localPortStart || 0}-${form.localPortEnd || 0}`
-    }
-    const previewTarget = targetDisplayLabel(editingRule.value.targetIP || '', editingRule.value.targetPort)
-    return `${copy.localLabel}: ${localSpec}  ->  ${previewTarget}`
+    if (form.localPortMode === 'single') localSpec = String(form.localPortStart || 0)
+    else if (form.localPortMode === 'multi') localSpec = form.localPortSpec.trim() || '-'
+    else localSpec = `${form.localPortStart || 0}-${form.localPortEnd || 0}`
+    return `${tr('localLabel')}: ${localSpec} → ${targetDisplayLabel(form.targetIP, form.targetPort)}`
   })
-
+  const formError = computed(() => buildRuleValidationError(editingRule.value))
+  const ruleTrafficResetPickerEpoch = computed(() => trafficResetPickerEpoch(editingRule.value.trafficResetDay))
+  const ruleTrafficExpiryPickerEpoch = computed(() => trafficExpiryPickerEpoch(editingRule.value.trafficExpiryDate))
+  const overviewResetBusy = computed(() => mutationBusy.value && rowBusyId.value === -1)
+  const submitRuleTrafficResetDay = (rawValue: unknown) => {
+    const epochSeconds = parseEpochSeconds(rawValue)
+    if (epochSeconds == null) return
+    if (epochSeconds <= 0) {
+      editingRule.value.trafficResetDay = 0
+      return
+    }
+    editingRule.value.trafficResetDay = normalizeTrafficResetDay(panelCalendarParts(epochSeconds * 1000).day)
+  }
+  const submitRuleTrafficExpiryDate = (rawValue: unknown) => {
+    const epochSeconds = parseEpochSeconds(rawValue)
+    if (epochSeconds == null) return
+    if (epochSeconds <= 0) {
+      editingRule.value.trafficExpiryDate = ''
+      return
+    }
+    const selected = panelCalendarParts(epochSeconds * 1000)
+    editingRule.value.trafficExpiryDate = `${selected.year.toString().padStart(4, '0')}-${selected.month.toString().padStart(2, '0')}-${selected.day.toString().padStart(2, '0')}`
+  }
   const filteredRules = computed(() => {
     const keyword = searchText.value.trim().toLowerCase()
     return overview.value.rules.filter(rule => {
-      if (familyFilter.value !== 'all' && rule.family !== familyFilter.value) {
-        return false
-      }
-      if (protocolFilter.value !== 'all' && rule.protocol !== protocolFilter.value) {
-        return false
-      }
-      if (!keyword) {
-        return true
-      }
-      return [
-        rule.name,
-        rule.description,
-        rule.localPortSpec,
-        rule.limitWarning,
-        rule.targetIP,
-        String(rule.targetPort),
-      ].some(value => value.toLowerCase().includes(keyword))
+      if (familyFilter.value !== 'all' && rule.family !== familyFilter.value) return false
+      if (protocolFilter.value !== 'all' && rule.protocol !== protocolFilter.value) return false
+      if (!keyword) return true
+      return [rule.name, rule.description, rule.localPortSpec, rule.limitWarning, rule.trafficBlockReason, rule.targetIP, String(rule.targetPort)]
+        .some(value => value.toLowerCase().includes(keyword))
     })
   })
+
+  const conflictsForRule = (ruleID: number) => overview.value.runtimeConflicts.filter(item => item.ruleId === ruleID)
+  const formatConflictOwners = (conflict: PortForwardRuntimeConflict) => {
+    if (!conflict.owners.length) return tr('unknownProcess')
+    return conflict.owners.map(owner => owner.name ? `${owner.name} (${tr('pid')} ${owner.pid})` : `${tr('pid')} ${owner.pid}`).join(', ')
+  }
 
   const handleWarnings = (warnings: string[], showToast: boolean) => {
     const signature = warnings.join('；')
@@ -433,35 +669,45 @@ export function usePortForwardManage(props: { active?: boolean }) {
       lastWarningSignature.value = ''
       return
     }
-    if (!showToast || signature === lastWarningSignature.value) {
-      return
-    }
+    if (!showToast || signature === lastWarningSignature.value) return
     lastWarningSignature.value = signature
-    push.warning({
-      duration: 6000,
-      message: signature,
-    })
+    push.warning({ duration: 6000, message: signature })
   }
 
   const fetchOverview = async (silent = false, showWarnings = !silent) => {
-    if (!silent) {
-      loading.value = true
+    if (silent && (!props.active || (typeof document !== 'undefined' && document.visibilityState !== 'visible'))) {
+      return { success: false, msg: '', obj: null } as Msg
     }
+    if (overviewRequest.value) return overviewRequest.value
+    if (!silent) loading.value = true
+    const request = (async () => {
+      try {
+        const msg = await HttpUtils.get('api/port-forward-overview', {}, { silentAuthCheck: true })
+        if (msg.success && msg.obj) {
+          const nextOverview = msg.obj as Partial<PortForwardOverview>
+          applyOverview(nextOverview)
+          handleWarnings(normalizeWarnings(nextOverview.warnings), showWarnings)
+        } else {
+          loadError.value = msg.msg || tr('loadFailed')
+        }
+        return msg
+      } catch (error) {
+        const message = errorMessage(error, tr('loadFailed'))
+        loadError.value = message
+        return { success: false, msg: message, obj: null } as Msg
+      }
+    })()
+    overviewRequest.value = request
     try {
-      const msg = await HttpUtils.get('api/port-forward-overview')
-      if (msg.success && msg.obj) {
-        const nextOverview = msg.obj as Partial<PortForwardOverview>
-        applyOverview(nextOverview)
-        handleWarnings(normalizeWarnings(nextOverview.warnings), showWarnings)
-      }
+      return await request
     } finally {
-      if (!silent) {
-        loading.value = false
-      }
+      if (overviewRequest.value === request) overviewRequest.value = null
+      if (!silent) loading.value = false
     }
   }
 
   const refreshOverview = async () => {
+    if (mutationBusy.value) return
     refreshing.value = true
     try {
       await fetchOverview(true, true)
@@ -471,120 +717,179 @@ export function usePortForwardManage(props: { active?: boolean }) {
   }
 
   const openRuleDialog = (rule?: PortForwardRule) => {
+    if (mutationBusy.value) return
     editingRule.value = mapRuleToForm(rule)
     dialogVisible.value = true
   }
+  const closeRuleDialog = () => {
+    if (!mutationBusy.value) dialogVisible.value = false
+  }
+
+  const beginMutation = (ruleID = 0) => {
+    if (mutationBusy.value) return false
+    mutationBusy.value = true
+    rowBusyId.value = ruleID
+    return true
+  }
+  const endMutation = () => {
+    rowBusyId.value = 0
+    mutationBusy.value = false
+  }
 
   const saveRule = async () => {
-    if (savingRule.value) {
+    const validation = formError.value
+    if (validation) {
+      push.warning({ duration: 4500, message: validation })
       return
     }
-    if (editingRule.value.localPortMode === 'multi' && !editingRule.value.localPortSpec.trim()) {
-      push.warning({
-        duration: 4000,
-        message: '请填写多端口，例如 66,88,99',
-      })
-      return
-    }
-    savingRule.value = true
+    if (!beginMutation(editingRule.value.id)) return
+    const wasEditing = editingRule.value.id > 0
+    const payload = buildPayload(editingRule.value)
     try {
-      const msg = await HttpUtils.post('api/port-forward-rule', buildPayload(editingRule.value), {
-        headers: {
-          'Content-Type': 'application/json',
-        },
+      const msg = await HttpUtils.post('api/port-forward-rule', payload, {
+        headers: { 'Content-Type': 'application/json' },
+        silentAuthCheck: true,
       })
       if (msg.success && msg.obj) {
         const nextOverview = msg.obj as Partial<PortForwardOverview>
         applyOverview(nextOverview)
         dialogVisible.value = false
-        const ruleWarnings = normalizeWarnings(nextOverview.warnings)
-        const degraded = overview.value.rules.find(rule => rule.id === editingRule.value.id || (editingRule.value.id === 0 && rule.name === buildPayload(editingRule.value).name))
-        push.success({
-          duration: 4000,
-          message: editingRule.value.id > 0 ? '端口转发已更新' : '端口转发已创建',
-        })
-        if (degraded?.limitStatus === 'degraded' && degraded.limitWarning) {
-          push.warning({
-            duration: 6000,
-            message: degraded.limitWarning,
-          })
+        push.success({ duration: 4000, message: wasEditing ? tr('updated') : tr('created') })
+        const savedRule = overview.value.rules.find(rule => rule.id === payload.id || (!payload.id && rule.name === payload.name))
+        if (savedRule?.limitStatus === 'degraded' && savedRule.limitWarning) {
+          push.warning({ duration: 6000, message: savedRule.limitWarning })
         }
-        handleWarnings(ruleWarnings, true)
+        handleWarnings(normalizeWarnings(nextOverview.warnings), true)
+      } else {
+        push.warning({ duration: 6000, message: msg.msg || tr('saveFailed') })
       }
+    } catch (error) {
+      push.warning({ duration: 6000, message: errorMessage(error, tr('saveFailed')) })
     } finally {
-      savingRule.value = false
+      endMutation()
     }
   }
 
   const toggleRule = async (rule: PortForwardRule, enabled: boolean) => {
-    if (rowBusyId.value === rule.id) {
-      return
-    }
-    rowBusyId.value = rule.id
+    if (!beginMutation(rule.id)) return
     try {
       const msg = await HttpUtils.post('api/port-forward-rule', {
         ...buildPayload(mapRuleToForm(rule)),
         enabled,
       }, {
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
+        silentAuthCheck: true,
       })
       if (msg.success && msg.obj) {
         const nextOverview = msg.obj as Partial<PortForwardOverview>
         applyOverview(nextOverview)
         handleWarnings(normalizeWarnings(nextOverview.warnings), true)
+      } else {
+        push.warning({ duration: 6000, message: msg.msg || tr('saveFailed') })
       }
+    } catch (error) {
+      push.warning({ duration: 6000, message: errorMessage(error, tr('saveFailed')) })
     } finally {
-      rowBusyId.value = 0
+      endMutation()
     }
   }
 
   const removeRule = async (rule: PortForwardRule) => {
-    if (rowBusyId.value === rule.id) {
-      return
-    }
-    const confirmed = window.confirm(copy.deleteConfirm.replace('{name}', rule.name || copy.ruleFallback))
-    if (!confirmed) {
-      return
-    }
-    rowBusyId.value = rule.id
+    if (mutationBusy.value) return
+    const confirmed = await confirm({
+      message: tr('deleteConfirm', { name: rule.name || tr('ruleFallback') }),
+      severity: 'danger',
+      confirmText: tr('delete'),
+    })
+    if (!confirmed || !beginMutation(rule.id)) return
     try {
       const msg = await HttpUtils.post('api/port-forward-rule-delete', { id: rule.id }, {
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
+        silentAuthCheck: true,
       })
       if (msg.success && msg.obj) {
         applyOverview(msg.obj as Partial<PortForwardOverview>)
+        push.success({ duration: 4000, message: tr('deleted') })
+      } else {
+        push.warning({ duration: 6000, message: msg.msg || tr('deleteFailed') })
       }
+    } catch (error) {
+      push.warning({ duration: 6000, message: errorMessage(error, tr('deleteFailed')) })
     } finally {
-      rowBusyId.value = 0
+      endMutation()
+    }
+  }
+
+  const resetRuleTraffic = async (rule: PortForwardRule) => {
+    if (mutationBusy.value) return
+    const confirmed = await confirm({
+      message: tr('resetRuleTrafficConfirm', { name: rule.name || tr('ruleFallback') }),
+      severity: 'danger',
+      confirmText: tr('resetTraffic'),
+    })
+    if (!confirmed || !beginMutation(rule.id)) return
+    try {
+      const msg = await HttpUtils.post('api/port-forward-rule-traffic-reset', { id: rule.id }, {
+        headers: { 'Content-Type': 'application/json' },
+        silentAuthCheck: true,
+      })
+      if (msg.success && msg.obj) {
+        applyOverview(msg.obj as Partial<PortForwardOverview>)
+        push.success({ duration: 4000, message: tr('ruleTrafficReset') })
+      } else {
+        push.warning({ duration: 6000, message: msg.msg || tr('resetTrafficFailed') })
+      }
+    } catch (error) {
+      push.warning({ duration: 6000, message: errorMessage(error, tr('resetTrafficFailed')) })
+    } finally {
+      endMutation()
+    }
+  }
+
+  const resetOverviewTraffic = async () => {
+    if (mutationBusy.value) return
+    const confirmed = await confirm({
+      message: tr('resetOverviewTrafficConfirm'),
+      severity: 'danger',
+      confirmText: tr('resetTraffic'),
+    })
+    if (!confirmed || !beginMutation(-1)) return
+    try {
+      const msg = await HttpUtils.post('api/port-forward-overview-traffic-reset', {}, {
+        headers: { 'Content-Type': 'application/json' },
+        silentAuthCheck: true,
+      })
+      if (msg.success && msg.obj) {
+        applyOverview(msg.obj as Partial<PortForwardOverview>)
+        push.success({ duration: 4000, message: tr('overviewTrafficReset') })
+      } else {
+        push.warning({ duration: 6000, message: msg.msg || tr('resetTrafficFailed') })
+      }
+    } catch (error) {
+      push.warning({ duration: 6000, message: errorMessage(error, tr('resetTrafficFailed')) })
+    } finally {
+      endMutation()
     }
   }
 
   const stopPolling = () => {
     if (pollTimer.value != null) {
-      window.clearInterval(pollTimer.value)
+      window.clearTimeout(pollTimer.value)
       pollTimer.value = null
     }
   }
-
-  const startPolling = () => {
+  const schedulePolling = (delay = 10000) => {
     stopPolling()
-    if (!props.active) {
-      return
-    }
-    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
-      return
-    }
-    pollTimer.value = window.setInterval(() => {
-      fetchOverview(true)
-    }, 4000)
+    if (!props.active || (typeof document !== 'undefined' && document.visibilityState !== 'visible')) return
+    pollTimer.value = window.setTimeout(async () => {
+      pollTimer.value = null
+      const msg = await fetchOverview(true)
+      schedulePolling(msg.success ? 10000 : 30000)
+    }, delay)
   }
-
+  const startPolling = () => schedulePolling()
   const handleVisibilityChange = () => {
-    if (document.visibilityState === 'visible') {
+    if (document.visibilityState === 'visible' && props.active) {
       void fetchOverview(true, true)
       startPolling()
       return
@@ -600,44 +905,60 @@ export function usePortForwardManage(props: { active?: boolean }) {
     }
     stopPolling()
   })
-
   onMounted(() => {
-    if (props.active) {
-      void fetchOverview()
-    }
+    if (props.active) void fetchOverview()
     startPolling()
-    if (typeof document !== 'undefined') {
-      document.addEventListener('visibilitychange', handleVisibilityChange)
-    }
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', handleVisibilityChange)
   })
-
   onBeforeUnmount(() => {
     stopPolling()
-    if (typeof document !== 'undefined') {
-      document.removeEventListener('visibilitychange', handleVisibilityChange)
-    }
+    if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', handleVisibilityChange)
   })
 
   return {
     loading,
     refreshing,
     savingRule,
+    mutationBusy,
     dialogVisible,
     rowBusyId,
+    hasLoaded,
+    loadError,
     searchText,
     familyFilter,
     protocolFilter,
     overview,
     editingRule,
+    headers,
+    familyItems,
+    familyFilterItems,
+    protocolItems,
+    protocolFilterItems,
+    localModeItems,
     lastSyncLabel,
+    capabilityLabel,
+    capabilityChipColor,
+    compatibilityModeLabel,
     dialogTitle,
     localStartLabel,
     localPreviewText,
+    formError,
+    ruleTrafficResetPickerEpoch,
+    ruleTrafficExpiryPickerEpoch,
+    overviewResetBusy,
     filteredRules,
+    conflictsForRule,
+    formatConflictOwners,
     refreshOverview,
     openRuleDialog,
+    closeRuleDialog,
     saveRule,
     toggleRule,
     removeRule,
+    resetRuleTraffic,
+    resetOverviewTraffic,
+    submitRuleTrafficResetDay,
+    submitRuleTrafficExpiryDate,
+    t: tr,
   }
 }

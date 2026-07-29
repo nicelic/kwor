@@ -1,7 +1,7 @@
 <template>
   <v-card :subtitle="$t('mihomoCommon.title')" style="background-color: inherit;">
     <v-row>
-      <v-col cols="12" sm="6" md="4" v-if="optionUDP">
+      <v-col cols="12" sm="6" md="4" v-if="showUDPOption && optionUDP">
         <v-select
           hide-details
           label="UDP"
@@ -9,7 +9,7 @@
           v-model="udpValue">
         </v-select>
       </v-col>
-      <v-col cols="12" sm="6" md="4" v-if="optionIPVersion">
+      <v-col cols="12" sm="6" md="4" v-if="showIPVersionOption && optionIPVersion">
         <v-select
           hide-details
           :label="$t('rule.ipVer')"
@@ -17,7 +17,7 @@
           v-model="ipVersionValue">
         </v-select>
       </v-col>
-      <v-col cols="12" sm="6" md="4" v-if="optionTFO">
+      <v-col cols="12" sm="6" md="4" v-if="showTFOOption && optionTFO">
         <v-select
           hide-details
           label="TFO"
@@ -25,7 +25,7 @@
           v-model="tfoValue">
         </v-select>
       </v-col>
-      <v-col cols="12" sm="6" md="4" v-if="optionMPTCP">
+      <v-col cols="12" sm="6" md="4" v-if="showMPTCPOption && optionMPTCP">
         <v-select
           hide-details
           label="MPTCP"
@@ -33,7 +33,7 @@
           v-model="mptcpValue">
         </v-select>
       </v-col>
-      <v-col cols="12" sm="6" md="4" v-if="optionRoutingMark">
+      <v-col cols="12" sm="6" md="4" v-if="showRoutingMarkOption && optionRoutingMark">
         <v-text-field
           hide-details
           type="number"
@@ -51,7 +51,7 @@
         </v-select>
       </v-col>
     </v-row>
-    <template v-if="optionMux">
+    <template v-if="showMuxOption && optionMux">
       <v-row>
         <v-col cols="12" sm="6" md="4">
           <v-select
@@ -154,22 +154,22 @@
         </template>
         <v-card>
           <v-list>
-            <v-list-item>
+            <v-list-item v-if="showUDPOption">
               <v-switch v-model="optionUDP" color="primary" label="UDP" hide-details></v-switch>
             </v-list-item>
-            <v-list-item>
+            <v-list-item v-if="showIPVersionOption">
               <v-switch v-model="optionIPVersion" color="primary" :label="$t('rule.ipVer')" hide-details></v-switch>
             </v-list-item>
-            <v-list-item>
+            <v-list-item v-if="showTFOOption">
               <v-switch v-model="optionTFO" color="primary" label="TFO" hide-details></v-switch>
             </v-list-item>
-            <v-list-item>
+            <v-list-item v-if="showMPTCPOption">
               <v-switch v-model="optionMPTCP" color="primary" label="MPTCP" hide-details></v-switch>
             </v-list-item>
-            <v-list-item>
+            <v-list-item v-if="showRoutingMarkOption">
               <v-switch v-model="optionRoutingMark" color="primary" label="Routing Mark" hide-details></v-switch>
             </v-list-item>
-            <v-list-item>
+            <v-list-item v-if="showMuxOption">
               <v-switch v-model="optionMux" color="primary" :label="$t('objects.multiplex')" hide-details></v-switch>
             </v-list-item>
             <v-list-item v-if="showBBRProfileOption">
@@ -280,6 +280,27 @@ export default {
     }
   },
   computed: {
+    isShadowQUIC(): boolean {
+      return typeof this.$props.protocol === 'string' && this.$props.protocol.trim().toLowerCase() === 'shadowquic'
+    },
+    showUDPOption(): boolean {
+      return true
+    },
+    showIPVersionOption(): boolean {
+      return true
+    },
+    showTFOOption(): boolean {
+      return !this.isShadowQUIC
+    },
+    showMPTCPOption(): boolean {
+      return !this.isShadowQUIC
+    },
+    showRoutingMarkOption(): boolean {
+      return true
+    },
+    showMuxOption(): boolean {
+      return !this.isShadowQUIC
+    },
     optionUDP: {
       get(): boolean {
         return this.$props.data.udp !== undefined

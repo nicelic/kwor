@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/json"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/alireza0/s-ui/database"
@@ -12,30 +13,15 @@ import (
 	"gorm.io/gorm"
 )
 
-var (
-	LastUpdate int64
-	corePtr    = &dummyCore{}
-)
+var LastUpdate int64
 
-type dummyCore struct{}
+func markLastUpdate(value int64) {
+	atomic.StoreInt64(&LastUpdate, value)
+}
 
-func (c *dummyCore) IsRunning() bool                          { return false }
-func (c *dummyCore) Start(config []byte) error                { return nil }
-func (c *dummyCore) Stop() error                              { return nil }
-func (c *dummyCore) AddInbound(config json.RawMessage) error  { return nil }
-func (c *dummyCore) RemoveInbound(tag string) error           { return nil }
-func (c *dummyCore) AddOutbound(config json.RawMessage) error { return nil }
-func (c *dummyCore) RemoveOutbound(tag string) error          { return nil }
-func (c *dummyCore) AddEndpoint(config json.RawMessage) error { return nil }
-func (c *dummyCore) RemoveEndpoint(tag string) error          { return nil }
-func (c *dummyCore) AddService(config json.RawMessage) error  { return nil }
-func (c *dummyCore) RemoveService(tag string) error           { return nil }
-func (c *dummyCore) GetInstance() *dummyCore                  { return c }
-func (c *dummyCore) StatsTracker() *dummyCore                 { return c }
-func (c *dummyCore) ConnTracker() *dummyCore                  { return c }
-func (c *dummyCore) GetStats() *[]model.Stats                 { return &[]model.Stats{} }
-func (c *dummyCore) CloseConnByInbound(tag string)            {}
-func (c *dummyCore) Uptime() uint32                           { return 0 }
+func currentLastUpdate() int64 {
+	return atomic.LoadInt64(&LastUpdate)
+}
 
 type ConfigService struct {
 	ClientService
@@ -58,6 +44,27 @@ type ConfigService struct {
 	EndpointService
 }
 
+// CommittedSaveError preserves the existing post-commit failure signal while
+// allowing callers that coordinated an external reversible change to tell it
+// apart from a database rollback. The SQLite transaction has already committed.
+type CommittedSaveError struct {
+	Err error
+}
+
+func (e *CommittedSaveError) Error() string {
+	if e == nil || e.Err == nil {
+		return "设置已提交后的运行时处理失败"
+	}
+	return e.Err.Error()
+}
+
+func (e *CommittedSaveError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 type SingBoxConfig struct {
 	Log          json.RawMessage   `json:"log"`
 	Dns          json.RawMessage   `json:"dns"`
@@ -71,7 +78,7 @@ type SingBoxConfig struct {
 	Experimental json.RawMessage   `json:"experimental"`
 }
 
-func NewConfigService(core interface{}) *ConfigService {
+func NewConfigService() *ConfigService {
 	return &ConfigService{}
 }
 
@@ -125,30 +132,23 @@ func (s *ConfigService) GetConfig(data string) (*SingBoxConfig, error) {
 	return &singboxConfig, nil
 }
 
-func (s *ConfigService) IsCoreRunning() bool {
-	return false
-}
-
-func (s *ConfigService) StartCore(defaultConfig string) error {
-	return nil
-}
-
-func (s *ConfigService) RestartCore() error {
-	return nil
-}
-
-func (s *ConfigService) restartCoreWithConfig(config json.RawMessage) error {
-	return nil
-}
-
-func (s *ConfigService) StopCore() error {
-	return nil
-}
-
 func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initUsers string, loginUser string, hostname string) (objs []string, err error) {
 	objs = []string{obj}
 	postCommitHooks := make([]func() error, 0)
 	compactStatsAfterCommit := false
+	panelTimeLocationChanged := false
+	if obj == "settings" {
+		panelTimeLocationChanged, err = s.SettingService.WillChangePanelTimeLocation(data)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if obj == "endpoints" {
+		data, err = s.EndpointService.PrepareSave(act, data)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	db := database.GetDB()
 	tx := db.Begin()
@@ -170,48 +170,44 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 			return
 		}
 
-		LastUpdate = time.Now().Unix()
+		// Invalidate only after the transaction has committed. Invalidating while
+		// SettingService.Save is still inside the transaction can allow a parallel
+		// reader to cache the old database value and make the subsequent cron
+		// reload use the wrong calendar location.
+		if panelTimeLocationChanged {
+			InvalidatePanelTimeLocationCache()
+		}
+
+		markLastUpdate(time.Now().Unix())
 		managedRuntimeErr := RunManagedRuntimeHookScope(tx)
 
 		proManager := GetProManagerService(s)
 
 		switch obj {
 		case "inbounds":
-			proManager.regenerateInboundConfigs()
 			proManager.regenerateCoreConfig()
-			proManager.regenerateSubJsonConfigs()
 			postCommitHooks = append(postCommitHooks, func() error {
 				return s.syncAutoManagedDefaultClients(hostname)
 			})
 		case "outbounds":
-			proManager.regenerateOutboundConfigs()
 			proManager.regenerateCoreConfig()
 			postCommitHooks = append(postCommitHooks, func() error {
 				return s.syncAutoManagedDefaultClients(hostname)
 			})
 		case "outboundgroups":
-			proManager.regenerateOutboundConfigs()
 			proManager.regenerateCoreConfig()
 			postCommitHooks = append(postCommitHooks, func() error {
 				return s.syncAutoManagedDefaultClients(hostname)
 			})
-		case "suboutbounds":
-			// sub_json is shared by client subscriptions, suboutbounds, and subgroups.
-			// Regenerate the whole directory here so client files are preserved.
-			proManager.regenerateSubJsonConfigs()
-		case "subgroups":
-			// SubGroupService.Save already updates group files.
+		case "suboutbounds", "subgroups":
+			// Subscription payloads are rendered from SQLite on request.
 		case "clients":
-			proManager.regenerateInboundConfigs()
 			proManager.regenerateCoreConfig()
-			proManager.regenerateSubJsonConfigs()
 			postCommitHooks = append(postCommitHooks, func() error {
 				return s.syncAutoManagedDefaultClients(hostname)
 			})
 		case "tls":
-			proManager.regenerateInboundConfigs()
 			proManager.regenerateCoreConfig()
-			proManager.regenerateSubJsonConfigs()
 			postCommitHooks = append(postCommitHooks, func() error {
 				return s.syncAutoManagedDefaultClients(hostname)
 			})
@@ -221,12 +217,7 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 				return s.syncAutoManagedDefaultClients(hostname)
 			})
 		case "config", "settings":
-			proManager.regenerateInboundConfigs()
-			proManager.regenerateOutboundConfigs()
 			proManager.regenerateCoreConfig()
-			proManager.regenerateSubJsonConfigs()
-			s.SubOutboundService.RegenerateAllSubOutboundConfigs()
-			s.SubGroupService.RegenerateAllGroupConfigs()
 			postCommitHooks = append(postCommitHooks, func() error {
 				if err := s.syncAutoManagedDefaultClients(hostname); err != nil {
 					return err
@@ -248,13 +239,11 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 			}
 		}
 		if compactStatsAfterCommit {
-			if compactErr := compactMainSQLiteDB(db, true); compactErr != nil {
-				logger.Warning("compact sqlite after disabling stats history failed: ", compactErr)
-			}
+			requestMainSQLiteCompaction(db, true)
 		}
 
 		if managedRuntimeErr != nil {
-			err = managedRuntimeErr
+			err = &CommittedSaveError{Err: managedRuntimeErr}
 		}
 	}()
 
@@ -301,14 +290,10 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 			})
 		}
 
-		var inboundIds []uint
-		inboundIds, err = s.ClientService.Save(tx, act, data, hostname)
-		if err == nil && len(inboundIds) > 0 {
+		var inboundIDs []uint
+		inboundIDs, err = s.ClientService.Save(tx, act, data, hostname)
+		if err == nil && len(inboundIDs) > 0 {
 			objs = append(objs, "inbounds")
-			err = s.InboundService.RestartInbounds(tx, inboundIds)
-			if err != nil {
-				return nil, common.NewErrorf("failed to update users for inbounds: %v", err)
-			}
 		}
 
 		// Keep suboutbounds in sync when editing a client that already has synced records.
@@ -348,12 +333,11 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 		objs = append(objs, "outbounds")
 	case "suboutbounds":
 		err = s.SubOutboundService.Save(tx, act, data)
-		// SubOutboundService.Save already handles file writes/deletes.
-		// Global regeneration is handled in the deferred post-commit hook.
+		// Save keeps subscription rendering validation in the post-commit hook.
 		objs = append(objs, "subgroups")
 	case "subgroups":
 		err = s.SubGroupService.Save(tx, act, data)
-		// SubGroupService.Save already handles group file writes/deletes.
+		// Group payloads are rendered dynamically; Save only validates in memory.
 	case "services":
 		err = s.ServicesService.Save(tx, act, data)
 	case "endpoints":
@@ -376,7 +360,6 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 		if err != nil {
 			return nil, err
 		}
-		err = s.restartCoreWithConfig(normalizedConfig)
 	case "settings":
 		err = s.SettingService.Save(tx, data)
 		if err == nil {
@@ -384,6 +367,11 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 		}
 		if err == nil {
 			postCommitHooks = append(postCommitHooks, func() error {
+				if panelTimeLocationChanged {
+					if err := ReloadPanelTimeSchedule(); err != nil {
+						logger.Warning("reload panel timezone schedule failed: ", err)
+					}
+				}
 				if err := ApplyPanelTLSRuntimeSettings(PanelSelfSignedTargetPanel); err != nil {
 					logger.Warning("apply web tls runtime settings failed: ", err)
 				}
@@ -502,6 +490,11 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 	if err != nil {
 		return nil, err
 	}
+	if obj == "settings" || obj == "inbounds" || obj == "mihomo_inbounds" {
+		if err := validatePortForwardListenerClaimsAgainstActiveRules(tx); err != nil {
+			return nil, err
+		}
+	}
 	if obj == "clients" || obj == "inbounds" {
 		if err := validateManagedSubJSONFileNames(tx); err != nil {
 			return nil, err
@@ -529,11 +522,6 @@ func (s *ConfigService) applyInboundNftAction(action *InboundNftAction) error {
 	}
 
 	db := database.GetDB()
-	tx := db.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
-
 	nftSvc := &NftTrafficService{}
 	coreSvc := &CoreManagerService{}
 	coreRunning := coreSvc.IsRunning()
@@ -542,26 +530,21 @@ func (s *ConfigService) applyInboundNftAction(action *InboundNftAction) error {
 	switch action.Kind {
 	case "upsert":
 		if coreRunning {
-			err = nftSvc.UpdateInboundRules(tx, action.InboundID, action.Tag, action.Port, action.PortHopRange)
+			err = nftSvc.UpdateInboundRules(db, action.InboundID, action.Tag, action.Port, action.PortHopRange)
 		} else {
-			err = nftSvc.UpsertInboundStateOnly(tx, action.InboundID, action.Tag, action.Port, action.PortHopRange)
+			err = nftSvc.UpsertInboundStateOnly(db, action.InboundID, action.Tag, action.Port, action.PortHopRange)
 		}
 	case "remove":
 		if coreRunning {
-			err = nftSvc.RemoveInboundRules(tx, action.InboundID)
+			err = nftSvc.RemoveInboundRules(db, action.InboundID)
 		} else {
-			err = nftSvc.RemoveInboundStateOnly(tx, action.InboundID)
+			err = nftSvc.RemoveInboundStateOnly(db, action.InboundID)
 		}
 	default:
 		err = common.NewError("unknown inbound nft action: ", action.Kind)
 	}
 	if err != nil {
-		tx.Rollback()
 		return err
-	}
-	if commitErr := tx.Commit().Error; commitErr != nil {
-		tx.Rollback()
-		return commitErr
 	}
 
 	if !coreRunning {
@@ -615,11 +598,6 @@ func (s *ConfigService) applyMihomoInboundNftAction(action *InboundNftAction) er
 	}
 
 	db := database.GetDB()
-	tx := db.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
-
 	nftSvc := &MihomoNftTrafficService{}
 	coreSvc := &MihomoCoreManagerService{}
 	coreRunning := coreSvc.IsRunning()
@@ -628,26 +606,21 @@ func (s *ConfigService) applyMihomoInboundNftAction(action *InboundNftAction) er
 	switch action.Kind {
 	case "upsert":
 		if coreRunning {
-			err = nftSvc.UpdateInboundRules(tx, action.InboundID, action.Tag, action.Port, action.PortHopRange, action.RedirectTCP)
+			err = nftSvc.UpdateInboundRules(db, action.InboundID, action.Tag, action.Port, action.PortHopRange, action.RedirectTCP)
 		} else {
-			err = nftSvc.UpsertInboundStateOnly(tx, action.InboundID, action.Tag, action.Port, action.PortHopRange)
+			err = nftSvc.UpsertInboundStateOnly(db, action.InboundID, action.Tag, action.Port, action.PortHopRange)
 		}
 	case "remove":
 		if coreRunning {
-			err = nftSvc.RemoveInboundRules(tx, action.InboundID)
+			err = nftSvc.RemoveInboundRules(db, action.InboundID)
 		} else {
-			err = nftSvc.RemoveInboundStateOnly(tx, action.InboundID)
+			err = nftSvc.RemoveInboundStateOnly(db, action.InboundID)
 		}
 	default:
 		err = common.NewError("unknown mihomo inbound nft action: ", action.Kind)
 	}
 	if err != nil {
-		tx.Rollback()
 		return err
-	}
-	if commitErr := tx.Commit().Error; commitErr != nil {
-		tx.Rollback()
-		return commitErr
 	}
 
 	if !coreRunning {
@@ -665,16 +638,17 @@ func (s *ConfigService) CheckChanges(lu string) (bool, error) {
 	if err != nil {
 		return true, nil
 	}
-	if LastUpdate == 0 {
+	lastUpdate := currentLastUpdate()
+	if lastUpdate == 0 {
 		db := database.GetDB()
 		var count int64
 		err := db.Model(model.Changes{}).Where("date_time > ?", intLu).Count(&count).Error
 		if err == nil {
-			LastUpdate = time.Now().Unix()
+			markLastUpdate(time.Now().Unix())
 		}
 		return count > 0, err
 	} else {
-		return LastUpdate > intLu, err
+		return lastUpdate > intLu, err
 	}
 }
 
@@ -1148,7 +1122,7 @@ func (s *ConfigService) forceSyncDefaultClientIDsToSubManager(hostname string, i
 		return nil, err
 	}
 	if len(existing) > 0 {
-		LastUpdate = time.Now().Unix()
+		markLastUpdate(time.Now().Unix())
 	}
 	return existing, nil
 }
@@ -1277,7 +1251,7 @@ func (s *ConfigService) forceSyncMihomoClientIDsToSubManager(hostname string, id
 		return nil, err
 	}
 	if len(existing) > 0 {
-		LastUpdate = time.Now().Unix()
+		markLastUpdate(time.Now().Unix())
 	}
 	return existing, nil
 }

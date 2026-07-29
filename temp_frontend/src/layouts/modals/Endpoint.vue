@@ -93,37 +93,42 @@ export default {
       this.tab = "t1"
     },
     async changeType() {
-      // Tag change only in add endpoint
-      const tag = this.endpoint.type + "-" + RandomUtil.randomSeq(3)
-      
-      // Use previous data
-      let prevConfig = {}
-      switch (this.endpoint.type) {
-        case EpTypes.Wireguard:
-          const wgKeys = (await this.genWgKey())
-          const randomIPoctet = RandomUtil.randomIntRange(1, 255)
-          prevConfig = {
-            tag: tag,
-            listen_port: this.endpoint.listen_port ?? RandomUtil.randomIntRange(10000, 60000),
-            address: ['10.0.0.'+ randomIPoctet.toString() +'/32','fe80::'+ randomIPoctet.toString(16) +'/128'],
-            private_key: wgKeys.private_key,
-            peers: [],
-            ext: {
-              public_key: wgKeys.public_key,
-              keys: []
+      this.loading = true
+      try {
+        // Tag change only in add endpoint
+        const tag = this.endpoint.type + "-" + RandomUtil.randomSeq(3)
+
+        // Use previous data
+        let prevConfig = {}
+        switch (this.endpoint.type) {
+          case EpTypes.Wireguard:
+            const wgKeys = (await this.genWgKey())
+            const randomIPoctet = RandomUtil.randomIntRange(1, 255)
+            prevConfig = {
+              tag: tag,
+              listen_port: this.endpoint.listen_port ?? RandomUtil.randomIntRange(10000, 60000),
+              address: ['10.0.0.'+ randomIPoctet.toString() +'/32','fe80::'+ randomIPoctet.toString(16) +'/128'],
+              private_key: wgKeys.private_key,
+              peers: [],
+              ext: {
+                public_key: wgKeys.public_key,
+                keys: []
+              }
             }
-          }
-          break
-        case EpTypes.Warp:
-          prevConfig = {
-            tag: tag,
-          }
-          break
-        case EpTypes.Tailscale:
-          prevConfig = { tag: tag }
-          break
+            break
+          case EpTypes.Warp:
+            prevConfig = {
+              tag: tag,
+            }
+            break
+          case EpTypes.Tailscale:
+            prevConfig = { tag: tag }
+            break
+        }
+        this.endpoint = createEndpoint(this.endpoint.type, prevConfig)
+      } finally {
+        this.loading = false
       }
-      this.endpoint = createEndpoint(this.endpoint.type, prevConfig)
     },
     closeModal() {
       this.updateData(0) // reset
@@ -138,16 +143,17 @@ export default {
 
       // save data
       this.loading = true
-      const success = await Data().save("endpoints", this.$props.id == 0 ? "new" : "edit", this.endpoint)
-      if (success) this.closeModal()
-      this.loading = false
+      try {
+        const success = await Data().save("endpoints", this.$props.id == 0 ? "new" : "edit", this.endpoint)
+        if (success) this.closeModal()
+      } finally {
+        this.loading = false
+      }
     },
     async genWgKey(){
-      this.loading = true
       const msg = await HttpUtils.get('api/keypairs', { k: "wireguard" })
-      this.loading = false
       let result = { private_key: "", public_key: "" }
-      if (msg.success) {
+      if (msg.success && Array.isArray(msg.obj)) {
         msg.obj.forEach((line:string) => {
           if (line.startsWith("PrivateKey")){
             result.private_key = line.substring(12)
@@ -165,32 +171,41 @@ export default {
     },
     async newWgKey(){
       this.loading = true
-      const newKeys = await this.genWgKey()
-      this.endpoint.private_key = newKeys.private_key
-      if (!this.endpoint.ext) this.endpoint.ext = {keys: []}
-      this.endpoint.ext.public_key = newKeys.public_key
-      this.loading = false
+      try {
+        const newKeys = await this.genWgKey()
+        this.endpoint.private_key = newKeys.private_key
+        if (!this.endpoint.ext) this.endpoint.ext = {keys: []}
+        this.endpoint.ext.public_key = newKeys.public_key
+      } finally {
+        this.loading = false
+      }
     },
     async getWgPubKey(private_key: string) {
       if (!this.endpoint.ext) this.endpoint.ext = {keys: []}
       this.loading = true
-      const msg = await HttpUtils.get('api/keypairs', { k: "wireguard", o: private_key })
-      if (msg.success) {
-        this.endpoint.ext.public_key = msg.obj[0]
+      try {
+        const msg = await HttpUtils.get('api/keypairs', { k: "wireguard", o: private_key })
+        if (msg.success && Array.isArray(msg.obj)) {
+          this.endpoint.ext.public_key = msg.obj[0]
+        }
+      } finally {
+        this.loading = false
       }
-      this.loading = false
     },
     async addWgPeer(){
       if (this.endpoint.type != EpTypes.Wireguard) return
       this.loading = true
-      const newKeys = await this.genWgKey()
-      if (!this.endpoint.ext) this.endpoint.ext = {keys: []}
-      this.endpoint.ext.keys.push(newKeys)
-      this.endpoint.peers.push({
-        public_key: newKeys.public_key,
-        allowed_ips: [this.findFreeIP()]
-      })
-      this.loading = false
+      try {
+        const newKeys = await this.genWgKey()
+        if (!this.endpoint.ext) this.endpoint.ext = {keys: []}
+        this.endpoint.ext.keys.push(newKeys)
+        this.endpoint.peers.push({
+          public_key: newKeys.public_key,
+          allowed_ips: [this.findFreeIP()]
+        })
+      } finally {
+        this.loading = false
+      }
     },
     findFreeIP(): string{
       const peerAllowedIPs = this.endpoint.peers.map((peer: any) => peer.allowed_ips).flat()
@@ -207,12 +222,15 @@ export default {
     },
     async refreshWgPeerKey(index: number) {
       this.loading = true
-      const newKeys = await this.genWgKey()
-      if (!this.endpoint.ext) this.endpoint.ext = {keys: []}
-      const indexKeys = this.endpoint.ext.keys.findIndex((key: any) => key.public_key == this.endpoint.peers[index].public_key)
-      this.endpoint.ext.keys[indexKeys == -1 ? this.endpoint.ext.keys.length : indexKeys] = newKeys
-      this.endpoint.peers[index].public_key = newKeys.public_key
-      this.loading = false
+      try {
+        const newKeys = await this.genWgKey()
+        if (!this.endpoint.ext) this.endpoint.ext = {keys: []}
+        const indexKeys = this.endpoint.ext.keys.findIndex((key: any) => key.public_key == this.endpoint.peers[index].public_key)
+        this.endpoint.ext.keys[indexKeys == -1 ? this.endpoint.ext.keys.length : indexKeys] = newKeys
+        this.endpoint.peers[index].public_key = newKeys.public_key
+      } finally {
+        this.loading = false
+      }
     },
   },
   watch: {

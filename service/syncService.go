@@ -20,6 +20,22 @@ const subOutboundSourceClient = "client"
 const managedClientSubTagPrefix = "s_"
 const legacyManagedClientSubTagPrefix = "sm_"
 
+func isServerOnlySubscriptionInbound(inboundType string, outJSON json.RawMessage) bool {
+	if util.IsSubscriptionServerOnlyInboundType(inboundType) {
+		return true
+	}
+	if len(outJSON) == 0 {
+		return false
+	}
+
+	template := map[string]interface{}{}
+	if err := json.Unmarshal(outJSON, &template); err != nil {
+		return false
+	}
+	templateType, _ := template["type"].(string)
+	return util.IsSubscriptionServerOnlyInboundType(templateType)
+}
+
 // SyncService syncs client outbounds to SubManager.
 type SyncService struct {
 	ClientService
@@ -71,7 +87,7 @@ func (s *SyncService) SyncClientToSubManager(clientName string, hostname string)
 		return nil, err
 	}
 
-	LastUpdate = time.Now().Unix()
+	markLastUpdate(time.Now().Unix())
 	if err := RunManagedRuntimeHookScope(tx); err != nil {
 		return nil, err
 	}
@@ -227,6 +243,9 @@ func (s *SyncService) syncClientSubOutbounds(
 			logger.Warningf("[Sync] skip inbound id=%d: not found", inboundID)
 			continue
 		}
+		if isServerOnlySubscriptionInbound(inbound.Type, inbound.OutJson) {
+			continue
+		}
 		baseTag := strings.TrimSpace(inbound.Tag)
 		if baseTag == "" {
 			logger.Warningf("[Sync] skip inbound id=%d: empty inbound tag", inbound.Id)
@@ -296,14 +315,11 @@ func (s *SyncService) syncClientSubOutbounds(
 
 	if syncCount == 0 {
 		if len(desiredTagSet) == 0 {
-			if removedCount > 0 {
-				return &SyncResult{
-					ClientName: client.Name,
-					Action:     resultAction,
-					Count:      0,
-				}, nil
-			}
-			return nil, nil
+			return &SyncResult{
+				ClientName: client.Name,
+				Action:     resultAction,
+				Count:      0,
+			}, nil
 		}
 		if removedCount == 0 {
 			return nil, fmt.Errorf("no valid outbound configs found for client %s", client.Name)
@@ -334,6 +350,9 @@ func (s *SyncService) syncClientSubOutboundsFullRebuild(
 		}
 		inbound := inboundMap[inboundID]
 		if inbound == nil {
+			continue
+		}
+		if isServerOnlySubscriptionInbound(inbound.Type, inbound.OutJson) {
 			continue
 		}
 		tag := buildManagedClientSubTag(inbound.Tag, client.Name)
@@ -403,6 +422,9 @@ func (s *SyncService) syncClientSubOutboundsFullRebuild(
 			logger.Warningf("[Sync] skip inbound id=%d: not found", inboundID)
 			continue
 		}
+		if isServerOnlySubscriptionInbound(inbound.Type, inbound.OutJson) {
+			continue
+		}
 		baseTag := strings.TrimSpace(inbound.Tag)
 		if baseTag == "" {
 			logger.Warningf("[Sync] skip inbound id=%d: empty inbound tag", inbound.Id)
@@ -448,6 +470,17 @@ func (s *SyncService) syncClientSubOutboundsFullRebuild(
 	removedCount += legacyRemovedCount
 
 	if syncCount == 0 {
+		if len(desiredTagSet) == 0 && len(newInboundIDs) > 0 {
+			action := "synced"
+			if removedCount > 0 {
+				action = "updated"
+			}
+			return &SyncResult{
+				ClientName: client.Name,
+				Action:     action,
+				Count:      0,
+			}, nil
+		}
 		if len(newInboundIDs) == 0 {
 			if removedCount > 0 {
 				return &SyncResult{
@@ -485,6 +518,9 @@ func (s *SyncService) buildSyncedOutbound(
 	if inbound == nil {
 		return nil, nil, fmt.Errorf("inbound is nil")
 	}
+	if isServerOnlySubscriptionInbound(inbound.Type, inbound.OutJson) {
+		return nil, nil, fmt.Errorf("mixed is a server-only listener and cannot be synchronized")
+	}
 	if len(inbound.OutJson) < 5 {
 		if len(inbound.OutJson) == 0 {
 			inbound.OutJson = []byte("{}")
@@ -512,18 +548,23 @@ func (s *SyncService) buildSyncedOutbound(
 			return nil, nil, fmt.Errorf("failed to parse regenerated out_json: %v", err)
 		}
 	}
+	util.StripSubscriptionOutboundPanelFields(outbound)
 
 	applyServerHostOverride(outbound, serverHost)
 
 	protocol, _ := outbound["type"].(string)
+	if util.IsSubscriptionServerOnlyInboundType(protocol) {
+		return nil, nil, fmt.Errorf("mixed is a server-only listener and cannot be synchronized")
+	}
+	var protocolConfig map[string]interface{}
 	if protocol == "trusttunnel" {
 		util.SanitizeTrustTunnelOutbound(outbound)
 	}
 	if protocol == "shadowsocks" {
 		s.applyShadowsocksConfig(outbound, clientConfig, inbound)
 	} else {
-		config, _ := clientConfig[protocol].(map[string]interface{})
-		mergeClientProtocolConfig(outbound, config, inbound, clientName)
+		protocolConfig, _ = clientConfig[protocol].(map[string]interface{})
+		mergeClientProtocolConfig(outbound, protocolConfig, inbound, clientName)
 	}
 	if protocol == "hysteria" {
 		util.ApplyHysteriaInboundQUICToOutbound(outbound, inbound.Options)
@@ -536,6 +577,11 @@ func (s *SyncService) buildSyncedOutbound(
 	clashSource, err := cloneMihomoOutboundMap(outbound)
 	if err != nil {
 		return nil, nil, err
+	}
+	if protocol != "shadowsocks" {
+		// Mieru is intentionally excluded from sing-box JSON. Keep its
+		// credentials only in the Clash projection used by SubManager.
+		mergeClientProtocolConfigForNamespace(clashSource, protocolConfig, inbound, "clash", clientName)
 	}
 
 	stripSyncedSubscriptionJSONFields(outbound)
@@ -660,6 +706,9 @@ func (s *SyncService) hasManagedSubOutbounds(
 	for _, inboundID := range newInboundIDs {
 		inbound := inboundMap[inboundID]
 		if inbound == nil {
+			continue
+		}
+		if isServerOnlySubscriptionInbound(inbound.Type, inbound.OutJson) {
 			continue
 		}
 		tag := buildManagedClientSubTag(inbound.Tag, client.Name)
@@ -830,6 +879,9 @@ func replaceSyncedSubOutboundRecord(
 	var fresh model.SubOutbound
 	if err := fresh.UnmarshalJSON(outboundData); err != nil {
 		return err
+	}
+	if util.IsSubscriptionServerOnlyInboundType(fresh.Type) {
+		return fmt.Errorf("mixed is a server-only listener and cannot be synchronized as a subscription outbound")
 	}
 	fresh.Id = 0
 	fresh.Tag = subTag
@@ -1300,6 +1352,12 @@ func mergeClientProtocolConfigForNamespace(
 	}
 
 	protocol, _ := outbound["type"].(string)
+	if namespace == "mihomo" && strings.EqualFold(protocol, "shadowquic") {
+		// ShadowQUIC credentials are owned by the client record. Drop any
+		// stale inbound template values before the normal non-overwrite merge.
+		delete(outbound, "username")
+		delete(outbound, "password")
+	}
 	if protocol == "trusttunnel" {
 		util.SanitizeTrustTunnelOutbound(outbound)
 	}
@@ -1311,6 +1369,12 @@ func mergeClientProtocolConfigForNamespace(
 			continue
 		}
 		outbound[key] = value
+	}
+	if !shouldSkipClientConfigKey(namespace, protocol, "username", inbound) &&
+		strings.TrimSpace(firstString(outbound["username"])) == "" {
+		if username := util.SubscriptionClientConfigUsername(config); username != "" {
+			outbound["username"] = username
+		}
 	}
 
 	if protocol == "sudoku" {
@@ -1335,6 +1399,10 @@ func shouldSkipClientConfigKey(namespace string, protocol string, key string, in
 	switch namespace {
 	case "mihomo":
 		if util.ShouldSkipMihomoOutboundClientConfigKey(protocol, key, hasTLS) {
+			return true
+		}
+	case "clash":
+		if util.ShouldSkipClashSubscriptionClientConfigKey(protocol, key, hasTLS) {
 			return true
 		}
 	default:

@@ -9,7 +9,7 @@ import (
 	"github.com/alireza0/s-ui/database"
 )
 
-var subPathPattern = regexp.MustCompile(`^/[A-Z]{3}[0-9]{3}/$`)
+var subPathPattern = regexp.MustCompile(`^/[A-Za-z]{3}[0-9]{3}-[A-Za-z]{3}[0-9]{3}-[A-Za-z]{3}[0-9]{3}/$`)
 
 func initSubPathSettingTestDB(t *testing.T) *SettingService {
 	t.Helper()

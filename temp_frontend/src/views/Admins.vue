@@ -72,38 +72,98 @@ import ChangeModal  from '@/layouts/modals/Changes.vue'
 import TokenModal from '@/layouts/modals/Token.vue'
 import { i18n } from '@/locales'
 import HttpUtils from '@/plugins/httputil'
+import {
+  formatPanelDateTime,
+  formatPanelTime,
+  panelCalendarPartsToInstant,
+} from '@/plugins/panelTime'
 import { Ref, ref, inject, onMounted } from 'vue'
 
 const loading:Ref = inject('loading')?? ref(false)
 
 const users = ref(<any[]>[])
 
-onMounted(async () => {loadData()})
+type LoginDisplay = {
+  loginDate: string
+  loginTime: string
+  ip: string
+}
+
+const legacyLoginTimestampPattern = /^(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{1,2}):(\d{1,2})$/
+
+onMounted(() => { void loadData() })
 
 const loadData = async () => {
   loading.value = true
-  const msg = await HttpUtils.get('api/users')
-  loading.value = false
-  if (msg.success) {
-    msg.obj.forEach((u:any) => {
-      const lastLogin = u.lastLogin.split(" ")
-      const localLastLogin = lastLogin.length > 2 ? dateFormatted(Date.parse(lastLogin[0] + " " + lastLogin[1])) : "- -"
-      const loginDateTime = localLastLogin.split(" ")
-      users.value.push({
-        id: u.id,
-        username: u.username,
-        loginDate: loginDateTime[0],
-        loginTime: loginDateTime[1],
-        ip: lastLogin[2]?? "-",
+  try {
+    const msg = await HttpUtils.get('api/users')
+    if (msg.success) {
+      users.value = msg.obj.map((u:any) => {
+        const login = parseLoginRecord(u.lastLogin)
+        return {
+          id: u.id,
+          username: u.username,
+          loginDate: login.loginDate,
+          loginTime: login.loginTime,
+          ip: login.ip,
+        }
       })
-    })
+    }
+  } finally {
+    loading.value = false
   }
 }
 
-const dateFormatted = (dt: number): string => {
-  const locale = i18n.global.locale.value.replace('zh', 'zh-')
-  const date = new Date(dt)
-  return date.toLocaleString(locale)
+const displayLocale = () => {
+  return i18n.global.locale.value.replace('zh', 'zh-')
+}
+
+const parseLoginTimestamp = (raw: unknown): number | null => {
+  const value = String(raw ?? '').trim()
+  const legacy = value.match(legacyLoginTimestampPattern)
+  if (legacy != null) {
+    const year = Number(legacy[1])
+    const month = Number(legacy[2])
+    const day = Number(legacy[3])
+    const hour = Number(legacy[4])
+    const minute = Number(legacy[5])
+    const second = Number(legacy[6])
+    const validator = new Date(Date.UTC(year, month - 1, day, hour, minute, second))
+    if (
+      validator.getUTCFullYear() !== year ||
+      validator.getUTCMonth() !== month - 1 ||
+      validator.getUTCDate() !== day ||
+      validator.getUTCHours() !== hour ||
+      validator.getUTCMinutes() !== minute ||
+      validator.getUTCSeconds() !== second
+    ) {
+      return null
+    }
+    return panelCalendarPartsToInstant(year, month, day, hour, minute, second).getTime()
+  }
+
+  const timestamp = Date.parse(value)
+  return Number.isFinite(timestamp) ? timestamp : null
+}
+
+const parseLoginRecord = (raw: unknown): LoginDisplay => {
+  const value = String(raw ?? '').trim()
+  const separator = value.lastIndexOf(' ')
+  if (separator <= 0) {
+    return { loginDate: '-', loginTime: '-', ip: '-' }
+  }
+
+  const timestamp = parseLoginTimestamp(value.slice(0, separator))
+  if (timestamp == null) {
+    return { loginDate: '-', loginTime: '-', ip: value.slice(separator + 1).trim() || '-' }
+  }
+
+  const locale = displayLocale()
+  return {
+    loginDate: formatPanelDateTime(timestamp, locale, { dateStyle: 'short' }),
+    loginTime: formatPanelTime(timestamp, locale),
+    ip: value.slice(separator + 1).trim() || '-',
+  }
 }
 
 const editModal = ref({
@@ -121,13 +181,13 @@ const closeEditModal = () => {
 }
 const saveEditModal = async (data:any) => {
   loading.value=true
-  const response = await HttpUtils.post('api/changePass',data)
-  if(response.success){
-    setTimeout(() => {
-      loading.value=false
+  try {
+    const response = await HttpUtils.post('api/changePass',data)
+    if(response.success){
+      await new Promise(resolve => window.setTimeout(resolve, 500))
       editModal.value.visible = false
-    }, 500)
-  } else {
+    }
+  } finally {
     loading.value=false
   }
 }

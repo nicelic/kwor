@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,17 +46,19 @@ var (
 type KernelManagerService struct{}
 
 const (
-	kernelProviderXanMod                   = "xanmod"
-	kernelProviderBBRPlus                  = "bbrplus"
-	kernelFailedCleanupDirName             = ".failed-cleanup"
-	kernelDownloadProgressTTL              = 30 * time.Minute
-	kernelUnknownPackageSizeEstimate int64 = 50 * 1024 * 1024
+	kernelProviderXanMod                    = "xanmod"
+	kernelProviderBBRPlus                   = "bbrplus"
+	kernelFailedCleanupDirName              = ".failed-cleanup"
+	kernelDownloadProgressTTL               = 30 * time.Minute
+	kernelUnknownPackageSizeEstimate  int64 = 50 * 1024 * 1024
+	kernelSourceForgeResponseMaxBytes int64 = 8 * 1024 * 1024
 )
 
 var kernelFailedDownloadCleanupDelay = 5 * time.Second
 
 var kernelDownloadProgressStore = newKernelDownloadProgressStore()
 var kernelDownloadCleanupStore = newKernelDownloadCleanupScheduler()
+var kernelOperationMu sync.Mutex
 
 var bbrplusVersionDisplayPriority = map[string]int{
 	"6.1.81-bbrplus": 0,
@@ -169,6 +170,7 @@ var bbrplusReleaseCatalog = []bbrplusReleaseEntry{
 
 type KernelOverview struct {
 	Supported           bool   `json:"supported"`
+	Linux               bool   `json:"linux"`
 	Reason              string `json:"reason"`
 	SystemFamily        string `json:"systemFamily,omitempty"`
 	SystemID            string `json:"systemId,omitempty"`
@@ -178,6 +180,10 @@ type KernelOverview struct {
 	RebootHint          bool   `json:"rebootHint"`
 	DownloadedKernel    string `json:"downloadedKernel,omitempty"`
 	DownloadedDirectory string `json:"downloadedDirectory,omitempty"`
+	DownloadedProvider  string `json:"downloadedProvider,omitempty"`
+	DownloadedLine      string `json:"downloadedLine,omitempty"`
+	DownloadedVersion   string `json:"downloadedVersion,omitempty"`
+	DownloadedArch      string `json:"downloadedArch,omitempty"`
 }
 
 type KernelVersionItem struct {
@@ -367,7 +373,10 @@ var kernelResolveAptCommand = resolveKernelAptCommand
 var kernelRunSystemCleanup = runKernelStrictSystemCleanup
 var kernelRunPrivilegedCommand = runKernelPrivilegedCommand
 var kernelEnsureRuntimeSupported = ensureKernelRuntimeSupported
+var kernelEnsureCleanupRuntime = ensureKernelLinuxRuntime
 var kernelLookPath = exec.LookPath
+var kernelRunCommandOutput = runKernelCommandOutput
+var kernelRunCommandWithTimeout = runKernelCommandWithTimeout
 
 type kernelSystemCleanupReport struct {
 	Done     bool
@@ -798,41 +807,52 @@ func normalizeKernelDownloadSessionID(id string) string {
 	return "kernel-" + hex.EncodeToString(buf[:])
 }
 
+func acquireKernelOperationLock() (func(), error) {
+	if !kernelOperationMu.TryLock() {
+		return nil, fmt.Errorf("内核操作正在执行，请稍后再试")
+	}
+	return kernelOperationMu.Unlock, nil
+}
+
 func (s *KernelManagerService) GetOverview(provider string) (*KernelOverview, error) {
 	normalizedProvider, err := normalizeKernelProviderRequired(provider)
 	if err != nil {
 		return nil, err
 	}
 
-	fields := readKernelOSReleaseFields()
-	systemFamily := detectKernelLinuxSystemFamily(fields)
-	supported := runtime.GOOS == "linux" && systemFamily == "debian"
+	platform, err := GetSystemPlatform()
+	if err != nil {
+		return nil, fmt.Errorf("load system platform failed: %w", err)
+	}
+	isLinux := strings.EqualFold(strings.TrimSpace(platform.OS), "linux")
+	systemFamily := strings.TrimSpace(platform.SystemFamily)
+	supported := isLinux && systemFamily == "debian"
 
 	reason := ""
-	if runtime.GOOS != "linux" {
+	if !isLinux {
 		reason = "kernel management only supports linux hosts"
 	} else if systemFamily != "debian" {
 		reason = "only Debian/Ubuntu and derivatives are supported"
 	}
 
-	currentKernel := ""
-	if output, err := runKernelCommandOutput(8*time.Second, "uname", "-r"); err == nil {
-		currentKernel = strings.TrimSpace(output)
-	}
-
 	overview := &KernelOverview{
 		Supported:     supported,
+		Linux:         isLinux,
 		Reason:        reason,
 		SystemFamily:  systemFamily,
-		SystemID:      strings.ToLower(strings.TrimSpace(fields["ID"])),
-		SystemIDLike:  strings.ToLower(strings.TrimSpace(fields["ID_LIKE"])),
-		CurrentKernel: currentKernel,
+		SystemID:      strings.ToLower(strings.TrimSpace(platform.SystemID)),
+		SystemIDLike:  strings.ToLower(strings.TrimSpace(platform.SystemIDLike)),
+		CurrentKernel: strings.TrimSpace(platform.KernelRelease),
 		DownloadRoot:  s.getKernelDownloadRoot(normalizedProvider),
 		RebootHint:    kernelRebootHintRequired(),
 	}
 	if downloadedStatus, statusErr := s.GetDownloadedKernelStatus(); statusErr == nil && downloadedStatus != nil && downloadedStatus.Exists {
 		overview.DownloadedKernel = downloadedStatus.Display
 		overview.DownloadedDirectory = downloadedStatus.Directory
+		overview.DownloadedProvider = downloadedStatus.Provider
+		overview.DownloadedLine = downloadedStatus.Line
+		overview.DownloadedVersion = downloadedStatus.Version
+		overview.DownloadedArch = downloadedStatus.Arch
 	}
 
 	return overview, nil
@@ -1061,6 +1081,16 @@ func (s *KernelManagerService) GetPackages(provider, line, version, arch string)
 }
 
 func (s *KernelManagerService) DownloadPackages(provider, line, version, arch string, downloadSessionID string) (*KernelDownloadResult, error) {
+	release, lockErr := acquireKernelOperationLock()
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer release()
+
+	return s.downloadPackagesLocked(provider, line, version, arch, downloadSessionID)
+}
+
+func (s *KernelManagerService) downloadPackagesLocked(provider, line, version, arch string, downloadSessionID string) (*KernelDownloadResult, error) {
 	if err := kernelEnsureRuntimeSupported(); err != nil {
 		return nil, err
 	}
@@ -1313,6 +1343,9 @@ func (s *KernelManagerService) saveDownloadedMarker(marker kernelDownloadedMarke
 	if marker.Directory == "" {
 		return fmt.Errorf("downloaded marker directory is empty")
 	}
+	if !isKernelDownloadDirectoryWithinRoot(marker.Directory, s.getKernelDownloadRoot("")) {
+		return fmt.Errorf("downloaded marker directory is outside the kernel download root")
+	}
 	if marker.Downloaded <= 0 {
 		marker.Downloaded = time.Now().Unix()
 	}
@@ -1369,6 +1402,10 @@ func (s *KernelManagerService) GetDownloadedKernelStatus() (*KernelDownloadedSta
 	if marker == nil || marker.Version == "" || marker.Directory == "" {
 		return s.findLegacyDownloadedKernelStatus()
 	}
+	if !isKernelDownloadDirectoryWithinRoot(marker.Directory, s.getKernelDownloadRoot("")) {
+		_ = s.clearDownloadedMarker()
+		return s.findLegacyDownloadedKernelStatus()
+	}
 
 	info, statErr := os.Stat(marker.Directory)
 	if statErr != nil || info == nil || !info.IsDir() {
@@ -1384,6 +1421,12 @@ func (s *KernelManagerService) GetDownloadedKernelStatus() (*KernelDownloadedSta
 }
 
 func (s *KernelManagerService) ClearDownloadedKernel() (*KernelDownloadedClearResult, error) {
+	release, lockErr := acquireKernelOperationLock()
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer release()
+
 	root, err := s.cleanupAllKernelDownloadArtifacts()
 	if err != nil {
 		return nil, err
@@ -1413,19 +1456,30 @@ func (s *KernelManagerService) SetPinnedKernel(kernel string) error {
 }
 
 func (s *KernelManagerService) ScanCleanupPackages() (*KernelCleanupScanResponse, error) {
-	if err := kernelEnsureRuntimeSupported(); err != nil {
+	release, lockErr := acquireKernelOperationLock()
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer release()
+
+	return s.scanCleanupPackagesLocked()
+}
+
+func (s *KernelManagerService) scanCleanupPackagesLocked() (*KernelCleanupScanResponse, error) {
+	if err := kernelEnsureCleanupRuntime(); err != nil {
 		return nil, err
 	}
 
-	rawOutput, err := runKernelCommandOutput(20*time.Second, "dpkg", "--get-selections")
+	rawOutput, err := kernelRunCommandOutput(20*time.Second, "dpkg", "--get-selections")
 	if err != nil {
 		return nil, err
 	}
 
-	currentKernel := ""
-	if currentOutput, currentErr := runKernelCommandOutput(8*time.Second, "uname", "-r"); currentErr == nil {
-		currentKernel = strings.TrimSpace(currentOutput)
+	platform, platformErr := GetSystemPlatform()
+	if platformErr != nil {
+		return nil, fmt.Errorf("load system platform failed: %w", platformErr)
 	}
+	currentKernel := strings.TrimSpace(platform.KernelRelease)
 
 	pinnedKernel, err := s.GetPinnedKernel()
 	if err != nil {
@@ -1442,7 +1496,17 @@ func (s *KernelManagerService) ScanCleanupPackages() (*KernelCleanupScanResponse
 }
 
 func (s *KernelManagerService) PurgePackages(packages []string) (result *KernelCleanupPurgeResult, err error) {
-	if err := kernelEnsureRuntimeSupported(); err != nil {
+	release, lockErr := acquireKernelOperationLock()
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer release()
+
+	return s.purgePackagesLocked(packages)
+}
+
+func (s *KernelManagerService) purgePackagesLocked(packages []string) (result *KernelCleanupPurgeResult, err error) {
+	if err := kernelEnsureCleanupRuntime(); err != nil {
 		return nil, err
 	}
 
@@ -1452,7 +1516,11 @@ func (s *KernelManagerService) PurgePackages(packages []string) (result *KernelC
 		Failed:      []string{},
 		Message:     "purge completed",
 	}
+	cleanupStarted := false
 	defer func() {
+		if !cleanupStarted {
+			return
+		}
 		systemCleanup := kernelRunSystemCleanup()
 		applyKernelSystemCleanupResultPurge(result, systemCleanup)
 		if err != nil {
@@ -1472,6 +1540,27 @@ func (s *KernelManagerService) PurgePackages(packages []string) (result *KernelC
 	}
 	result.Requested = append([]string(nil), targets...)
 
+	rawSelections, scanErr := kernelRunCommandOutput(20*time.Second, "dpkg", "--get-selections")
+	if scanErr != nil {
+		err = fmt.Errorf("scan installed kernel packages before purge failed: %w", scanErr)
+		result.Message = "purge failed"
+		result.Failed = append(result.Failed, targets...)
+		return result, err
+	}
+	entries := parseKernelSelections(rawSelections)
+	if validateErr := validateKernelPurgeTargetsFromScan(entries, targets); validateErr != nil {
+		err = validateErr
+		result.Message = "purge failed"
+		result.Failed = append(result.Failed, targets...)
+		return result, err
+	}
+	if validateErr := validateKernelManualPurgeKeepsBootPair(entries, targets); validateErr != nil {
+		err = validateErr
+		result.Message = "purge failed"
+		result.Failed = append(result.Failed, targets...)
+		return result, err
+	}
+
 	aptCommand, resolveErr := kernelResolveAptCommand()
 	if resolveErr != nil {
 		err = resolveErr
@@ -1489,6 +1578,7 @@ func (s *KernelManagerService) PurgePackages(packages []string) (result *KernelC
 		return result, err
 	}
 
+	cleanupStarted = true
 	if err = kernelRunPrivilegedCommand(40*time.Minute, commandArgs[0], commandArgs[1:]...); err != nil {
 		err = fmt.Errorf("kernel purge command failed: %w", err)
 		result.Message = "purge failed"
@@ -1501,11 +1591,17 @@ func (s *KernelManagerService) PurgePackages(packages []string) (result *KernelC
 }
 
 func (s *KernelManagerService) AutoCleanupPackages() (result *KernelCleanupPurgeResult, err error) {
-	if err := kernelEnsureRuntimeSupported(); err != nil {
+	release, lockErr := acquireKernelOperationLock()
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer release()
+
+	if err := kernelEnsureCleanupRuntime(); err != nil {
 		return nil, err
 	}
 
-	scanResult, err := s.ScanCleanupPackages()
+	scanResult, err := s.scanCleanupPackagesLocked()
 	if err != nil {
 		systemCleanup := kernelRunSystemCleanup()
 		summary := buildKernelSystemCleanupSummary(nil)
@@ -1535,10 +1631,129 @@ func (s *KernelManagerService) autoCleanupPackagesFromScanResult(scanResult *Ker
 		applyKernelSystemCleanupResultPurge(result, kernelRunSystemCleanup())
 		return result, nil
 	}
-	return s.PurgePackages(targets)
+	return s.purgePackagesLocked(targets)
 }
 
 func (s *KernelManagerService) InstallDownloadedPackages(provider, line, version, arch string) (result *KernelInstallResult, err error) {
+	release, lockErr := acquireKernelOperationLock()
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer release()
+
+	return s.installDownloadedPackagesLocked(provider, line, version, arch)
+}
+
+// InstallDownloadedKernel installs the complete package pair identified by the
+// persisted completion marker. A complete legacy download directory is first
+// migrated into that marker for backward compatibility. It intentionally
+// ignores the current UI selection, which may have changed after the download
+// finished.
+func (s *KernelManagerService) InstallDownloadedKernel() (result *KernelInstallResult, err error) {
+	release, lockErr := acquireKernelOperationLock()
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer release()
+
+	status, statusErr := s.GetDownloadedKernelStatus()
+	if statusErr != nil {
+		return nil, statusErr
+	}
+	if status == nil || !status.Exists {
+		return nil, fmt.Errorf("no completed kernel download is ready for installation")
+	}
+	return s.installDownloadedPackagesLocked(status.Provider, status.Line, status.Version, status.Arch)
+}
+
+func (s *KernelManagerService) resolveDownloadedKernelInstallDir(provider, line, version, arch string) (string, error) {
+	normalizedProvider, err := normalizeKernelProviderRequired(provider)
+	if err != nil {
+		return "", err
+	}
+
+	normalizedLine := strings.TrimSpace(line)
+	normalizedVersion := strings.TrimSpace(version)
+	normalizedArch := strings.TrimSpace(arch)
+	if normalizedVersion == "" {
+		return "", fmt.Errorf("version is required")
+	}
+	if normalizedProvider == kernelProviderBBRPlus {
+		normalizedArch, err = normalizeKernelProviderArch(normalizedProvider, normalizedArch)
+		if err != nil {
+			return "", err
+		}
+		expectedDir := filepath.Join(s.getKernelDownloadRoot(normalizedProvider), normalizedVersion, normalizedArch)
+		return s.resolveKernelInstallDirCandidate(expectedDir, normalizedProvider, "", normalizedVersion, normalizedArch)
+	}
+
+	normalizedLine, normalizedVersion, normalizedArch, err = normalizeKernelLineVersionArch(normalizedLine, normalizedVersion, normalizedArch)
+	if err != nil {
+		return "", err
+	}
+	expectedDir := filepath.Join(s.getKernelDownloadRoot(normalizedProvider), normalizedLine, normalizedVersion, normalizedArch)
+	return s.resolveKernelInstallDirCandidate(expectedDir, normalizedProvider, normalizedLine, normalizedVersion, normalizedArch)
+}
+
+func (s *KernelManagerService) resolveKernelInstallDirCandidate(expectedDir, provider, line, version, arch string) (string, error) {
+	candidates := []string{expectedDir}
+	if marker, err := s.loadDownloadedMarker(); err == nil && marker != nil {
+		if kernelDownloadedMarkerMatchesSelection(marker, provider, line, version, arch) {
+			markerDir := strings.TrimSpace(marker.Directory)
+			if markerDir != "" && filepath.Clean(markerDir) != filepath.Clean(expectedDir) {
+				candidates = append([]string{markerDir}, candidates...)
+			} else if markerDir != "" {
+				candidates[0] = markerDir
+			}
+		}
+	}
+
+	root := s.getKernelDownloadRoot("")
+	for _, candidate := range candidates {
+		trimmed := strings.TrimSpace(candidate)
+		if trimmed == "" {
+			continue
+		}
+		absCandidate, err := filepath.Abs(trimmed)
+		if err != nil {
+			continue
+		}
+		if !isKernelDownloadDirectoryWithinRoot(absCandidate, root) {
+			continue
+		}
+		if _, statErr := os.Stat(absCandidate); statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) {
+				continue
+			}
+			return "", statErr
+		}
+		if err := validateKernelDownloadedPair(absCandidate); err == nil {
+			return absCandidate, nil
+		}
+	}
+	return "", fmt.Errorf("kernel download directory not found: %s", expectedDir)
+}
+
+func kernelDownloadedMarkerMatchesSelection(marker *kernelDownloadedMarker, provider, line, version, arch string) bool {
+	if marker == nil {
+		return false
+	}
+	if strings.TrimSpace(marker.Provider) != strings.TrimSpace(provider) {
+		return false
+	}
+	if strings.TrimSpace(marker.Version) != strings.TrimSpace(version) {
+		return false
+	}
+	if strings.TrimSpace(marker.Arch) != strings.TrimSpace(arch) {
+		return false
+	}
+	if provider == kernelProviderBBRPlus {
+		return true
+	}
+	return strings.TrimSpace(marker.Line) == strings.TrimSpace(line)
+}
+
+func (s *KernelManagerService) installDownloadedPackagesLocked(provider, line, version, arch string) (result *KernelInstallResult, err error) {
 	if err := kernelEnsureRuntimeSupported(); err != nil {
 		return nil, err
 	}
@@ -1561,25 +1776,24 @@ func (s *KernelManagerService) InstallDownloadedPackages(provider, line, version
 		}
 	}()
 
-	pkgs, getErr := s.GetPackages(provider, line, version, arch)
-	if getErr != nil {
-		err = getErr
+	installDir, resolveErr := s.resolveDownloadedKernelInstallDir(provider, line, version, arch)
+	if resolveErr != nil {
+		err = resolveErr
 		return result, err
 	}
-	installDir := strings.TrimSpace(pkgs.Directory)
 	imageDeb, headersDeb, findErr := findKernelInstallDebPair(installDir)
 	if findErr != nil {
 		err = findErr
 		return result, err
 	}
 
-	dpkgPath, lookErr := exec.LookPath("dpkg")
+	dpkgPath, lookErr := kernelLookPath("dpkg")
 	if lookErr != nil {
 		err = fmt.Errorf("dpkg command not found: %w", lookErr)
 		return result, err
 	}
 
-	sudoPath, _ := exec.LookPath("sudo")
+	sudoPath, _ := kernelLookPath("sudo")
 	commandArgs := buildKernelInstallCommand(dpkgPath, sudoPath, os.Geteuid(), imageDeb, headersDeb)
 	if len(commandArgs) == 0 {
 		err = fmt.Errorf("failed to build install command")
@@ -1591,7 +1805,7 @@ func (s *KernelManagerService) InstallDownloadedPackages(provider, line, version
 	result.Command = strings.Join(commandArgs, " ")
 	result.InstalledPackage = []string{imagePackage, headersPackage}
 
-	if err = runCommandWithTimeout(40*time.Minute, commandArgs[0], commandArgs[1:]...); err != nil {
+	if err = kernelRunCommandWithTimeout(40*time.Minute, commandArgs[0], commandArgs[1:]...); err != nil {
 		err = fmt.Errorf("kernel package install failed: %w", err)
 		return result, err
 	}
@@ -1693,10 +1907,10 @@ func runKernelAutoRemoveAndClean() error {
 }
 
 func resolveKernelAptCommand() (string, error) {
-	if aptGetPath, err := exec.LookPath("apt-get"); err == nil {
+	if aptGetPath, err := kernelLookPath("apt-get"); err == nil {
 		return aptGetPath, nil
 	}
-	if aptPath, err := exec.LookPath("apt"); err == nil {
+	if aptPath, err := kernelLookPath("apt"); err == nil {
 		return aptPath, nil
 	}
 	return "", fmt.Errorf("apt or apt-get command not found")
@@ -1708,14 +1922,14 @@ func runKernelPrivilegedCommand(timeout time.Duration, command string, args ...s
 		return fmt.Errorf("command is empty")
 	}
 	if os.Geteuid() != 0 {
-		if sudoPath, err := exec.LookPath("sudo"); err == nil && strings.TrimSpace(sudoPath) != "" {
+		if sudoPath, err := kernelLookPath("sudo"); err == nil && strings.TrimSpace(sudoPath) != "" {
 			sudoArgs := make([]string, 0, len(args)+2)
 			sudoArgs = append(sudoArgs, "-n", command)
 			sudoArgs = append(sudoArgs, args...)
-			return runCommandWithTimeout(timeout, sudoPath, sudoArgs...)
+			return kernelRunCommandWithTimeout(timeout, sudoPath, sudoArgs...)
 		}
 	}
-	return runCommandWithTimeout(timeout, command, args...)
+	return kernelRunCommandWithTimeout(timeout, command, args...)
 }
 
 func (s *KernelManagerService) removeKernelDownloadPath(targetPath string) error {
@@ -1761,20 +1975,26 @@ func (s *KernelManagerService) removeKernelDownloadPath(targetPath string) error
 }
 
 func (s *KernelManagerService) RebootSystem() error {
-	if err := kernelEnsureRuntimeSupported(); err != nil {
+	release, lockErr := acquireKernelOperationLock()
+	if lockErr != nil {
+		return lockErr
+	}
+	defer release()
+
+	if err := ensureKernelLinuxRuntime(); err != nil {
 		return err
 	}
 
-	rebootPath, err := exec.LookPath("reboot")
+	rebootPath, err := kernelLookPath("reboot")
 	if err != nil {
 		return fmt.Errorf("reboot command not found: %w", err)
 	}
 
-	sudoPath, _ := exec.LookPath("sudo")
+	sudoPath, _ := kernelLookPath("sudo")
 	if os.Geteuid() != 0 && strings.TrimSpace(sudoPath) != "" {
-		return runCommandWithTimeout(12*time.Second, sudoPath, "-n", rebootPath)
+		return kernelRunCommandWithTimeout(12*time.Second, sudoPath, "-n", rebootPath)
 	}
-	return runCommandWithTimeout(12*time.Second, rebootPath)
+	return kernelRunCommandWithTimeout(12*time.Second, rebootPath)
 }
 
 func (s *KernelManagerService) resolveKernelArchDirectory(provider, line, version, arch string) (string, error) {
@@ -1916,6 +2136,31 @@ func isPathWithinRoot(path string, root string) bool {
 		return true
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+// isKernelDownloadDirectoryWithinRoot verifies both the lexical path and its
+// resolved symlink target. Download markers are persistent data, so this
+// prevents a stale or modified marker from making an external directory appear
+// installable.
+func isKernelDownloadDirectoryWithinRoot(targetPath string, root string) bool {
+	absTarget, err := filepath.Abs(strings.TrimSpace(targetPath))
+	if err != nil {
+		return false
+	}
+	absRoot, err := filepath.Abs(strings.TrimSpace(root))
+	if err != nil || !isPathWithinRoot(absTarget, absRoot) {
+		return false
+	}
+
+	resolvedRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return false
+	}
+	resolvedTarget, err := filepath.EvalSymlinks(absTarget)
+	if err != nil {
+		return false
+	}
+	return isPathWithinRoot(resolvedTarget, resolvedRoot)
 }
 
 func hasAnyKernelArtifacts(dir string) bool {
@@ -2082,7 +2327,7 @@ func isKernelPackageInstalled(pkg string) bool {
 	if pkg == "" {
 		return false
 	}
-	output, err := runKernelCommandOutput(10*time.Second, "dpkg-query", "-W", "-f=${Status}", pkg)
+	output, err := kernelRunCommandOutput(10*time.Second, "dpkg-query", "-W", "-f=${Status}", pkg)
 	if err != nil {
 		return false
 	}
@@ -2194,6 +2439,100 @@ func normalizeKernelPurgeTargets(packages []string) ([]string, error) {
 		return nil, fmt.Errorf("at least one package is required")
 	}
 	return targets, nil
+}
+
+// validateKernelPurgeTargetsFromScan keeps the destructive API scoped to the
+// package rows returned by the latest server-side kernel scan. Browser state
+// is not trusted, so a syntactically valid but unrelated APT package name
+// must not reach the purge command.
+func validateKernelPurgeTargetsFromScan(entries []kernelSelectionEntry, targets []string) error {
+	available := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		name := strings.TrimSpace(entry.Name)
+		if name != "" {
+			available[name] = struct{}{}
+		}
+	}
+
+	missing := make([]string, 0)
+	for _, target := range targets {
+		name := strings.TrimSpace(target)
+		if name == "" {
+			continue
+		}
+		if _, exists := available[name]; !exists {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("kernel purge targets are not present in the latest scan: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// validateKernelManualPurgeKeepsBootPair allows removal of the currently
+// running kernel, but refuses a request that would leave no installed image or
+// headers package. The final validation is deliberately server-side because a
+// stale or modified browser request must not bypass it.
+func validateKernelManualPurgeKeepsBootPair(entries []kernelSelectionEntry, targets []string) error {
+	targetSet := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		name := strings.TrimSpace(target)
+		if name != "" {
+			targetSet[name] = struct{}{}
+		}
+	}
+	if len(targetSet) == 0 {
+		return nil
+	}
+
+	remainingImages := 0
+	remainingHeaders := 0
+	removedImages := 0
+	removedHeaders := 0
+	for _, entry := range entries {
+		if !isKernelSelectionInstalled(entry) {
+			continue
+		}
+		name := strings.TrimSpace(entry.Name)
+		lowerName := strings.ToLower(name)
+		isImage := strings.HasPrefix(lowerName, "linux-image-")
+		isHeaders := strings.HasPrefix(lowerName, "linux-headers-")
+		if !isImage && !isHeaders {
+			continue
+		}
+		_, selected := targetSet[name]
+		if isImage {
+			if selected {
+				removedImages++
+			} else {
+				remainingImages++
+			}
+		}
+		if isHeaders {
+			if selected {
+				removedHeaders++
+			} else {
+				remainingHeaders++
+			}
+		}
+	}
+
+	if removedImages > 0 || removedHeaders > 0 {
+		if remainingImages == 0 {
+			return fmt.Errorf("kernel purge would leave no installed linux-image package; keep at least one image and one headers package")
+		}
+		if remainingHeaders == 0 {
+			return fmt.Errorf("kernel purge would leave no installed linux-headers package; keep at least one image and one headers package")
+		}
+	}
+	return nil
+}
+
+func isKernelSelectionInstalled(entry kernelSelectionEntry) bool {
+	status := strings.ToLower(strings.TrimSpace(entry.Status))
+	return status == "install" || status == "hold"
 }
 
 func parseKernelSelections(raw string) []kernelSelectionEntry {
@@ -2371,7 +2710,7 @@ func normalizeKernelProviderArch(provider, arch string) (string, error) {
 	switch normalizedProvider {
 	case kernelProviderBBRPlus:
 		if normalizedArch == "" {
-			normalizedArch = strings.ToLower(strings.TrimSpace(runtime.GOARCH))
+			normalizedArch = GetSystemPlatformArchitecture()
 		}
 		switch normalizedArch {
 		case "amd64", "x86_64", "x64":
@@ -2481,44 +2820,41 @@ func extractKernelArchLevel(rawName string) string {
 	}
 }
 
-func ensureKernelRuntimeSupported() error {
-	if runtime.GOOS != "linux" {
+func ensureKernelLinuxRuntime() error {
+	platform, err := GetSystemPlatform()
+	if err != nil {
+		return fmt.Errorf("load system platform failed: %w", err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(platform.OS), "linux") {
 		return fmt.Errorf("kernel management only supports linux hosts")
 	}
-	fields := readKernelOSReleaseFields()
-	if detectKernelLinuxSystemFamily(fields) != "debian" {
+	return nil
+}
+
+func ensureKernelRuntimeSupported() error {
+	platform, err := GetSystemPlatform()
+	if err != nil {
+		return fmt.Errorf("load system platform failed: %w", err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(platform.OS), "linux") {
+		return fmt.Errorf("kernel management only supports linux hosts")
+	}
+	if strings.TrimSpace(platform.SystemFamily) != "debian" {
 		return fmt.Errorf("only Debian/Ubuntu and derivatives are supported")
 	}
 	return nil
 }
 
-func readKernelOSReleaseFields() map[string]string {
-	paths := []string{"/etc/os-release", "/usr/lib/os-release"}
-	for _, p := range paths {
-		content, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		return parseOsReleaseFields(string(content))
-	}
-	return map[string]string{}
+// detectKernelLinuxSystemFamily remains a pure conversion helper for callers
+// and tests that already operate on os-release-shaped fields. Runtime code
+// reads the persisted system platform instead of reading os-release again.
+func detectKernelLinuxSystemFamily(fields map[string]string) string {
+	return detectSystemPlatformFamily(fields["ID"], fields["ID_LIKE"])
 }
 
-func detectKernelLinuxSystemFamily(fields map[string]string) string {
-	idLike := strings.ToLower(strings.TrimSpace(fields["ID_LIKE"]))
-	id := strings.ToLower(strings.TrimSpace(fields["ID"]))
-	switch {
-	case strings.Contains(idLike, "debian") || id == "debian" || id == "ubuntu":
-		return "debian"
-	case strings.Contains(idLike, "rhel") || strings.Contains(idLike, "fedora") || id == "fedora" || id == "rhel" || id == "centos" || id == "rocky" || id == "almalinux":
-		return "rhel"
-	case strings.Contains(idLike, "suse"):
-		return "suse"
-	case strings.Contains(idLike, "arch"):
-		return "arch"
-	default:
-		return id
-	}
+func runKernelCommandWithTimeout(timeout time.Duration, command string, args ...string) error {
+	_, err := runKernelCommandOutput(timeout, command, args...)
+	return err
 }
 
 func runKernelCommandOutput(timeout time.Duration, command string, args ...string) (string, error) {
@@ -2563,7 +2899,7 @@ func fetchSourceForgeFileEntries(relativePath string) ([]sourceForgeFileEntry, e
 		return nil, fmt.Errorf("sourceforge returned HTTP %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readBoundedHTTPResponseBody(resp.Body, kernelSourceForgeResponseMaxBytes)
 	if err != nil {
 		return nil, err
 	}

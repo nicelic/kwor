@@ -793,6 +793,9 @@ func normalizeMihomoInlineRuleProviderPayload(raw interface{}) []string {
 func buildMihomoInboundAliasMap(inbounds []model.MihomoInbound) map[string]string {
 	aliasMap := make(map[string]string)
 	for _, inbound := range inbounds {
+		if strings.EqualFold(strings.TrimSpace(inbound.Type), "shadowquic") {
+			continue
+		}
 		effectiveTag := deriveEffectiveMihomoInboundRouteTagFromRaw(inbound.Tag, inbound.Type, inbound.Options)
 		if effectiveTag != "" && effectiveTag != inbound.Tag {
 			aliasMap[inbound.Tag] = effectiveTag
@@ -836,10 +839,20 @@ func buildMihomoListener(inbound model.MihomoInbound, payload map[string]interfa
 	if name != "" {
 		listener["name"] = name
 	}
-	if ref.ProxyTarget != "" {
+	listenerType := strings.ToLower(strings.TrimSpace(inbound.Type))
+	if listenerType == "shadowquic" {
+		// These are listener-level routing fields, not jls-upstream.proxy.
+		// Keep the nested JLS proxy untouched while refusing the unsupported
+		// top-level routing-mark/rule/proxy values.
+		delete(listener, "routing_mark")
+		delete(listener, "routing-mark")
+		delete(listener, "rule")
+		delete(listener, "proxy")
+		delete(listener, "detour")
+	} else if ref.ProxyTarget != "" {
 		listener["proxy"] = ref.ProxyTarget
 	}
-	if ref.RuleName != "" {
+	if listenerType != "shadowquic" && ref.RuleName != "" {
 		// Listener rule names select a same-named entry in top-level sub-rules.
 		listener["rule"] = ref.RuleName
 	}
@@ -1015,6 +1028,9 @@ func buildMihomoListenerRealityConfig(tlsMap map[string]interface{}) map[string]
 }
 
 func buildMihomoInboundRouteRef(inbound model.MihomoInbound, targets *mihomoProxyConversionResult, globalFinal string) (mihomoInboundRouteRef, error) {
+	if strings.EqualFold(strings.TrimSpace(inbound.Type), "shadowquic") {
+		return mihomoInboundRouteRef{}, nil
+	}
 	ref := mihomoInboundRouteRef{
 		DefaultTarget: globalFinal,
 	}
@@ -1039,7 +1055,7 @@ func filterSupportedMihomoListeners(inbounds []model.MihomoInbound) []model.Miho
 	supported := make([]model.MihomoInbound, 0, len(inbounds))
 	for _, inbound := range inbounds {
 		switch inbound.Type {
-		case "mixed", "socks", "http", "redirect", "tproxy", "tun", "snell", "shadowsocks", "shadowtls", "vmess", "vless", "trojan", "anytls", "tuic", "hysteria2", "mieru", "sudoku", "trusttunnel":
+		case "mixed", "socks", "http", "redirect", "tproxy", "tun", "snell", "shadowsocks", "shadowtls", "shadowquic", "vmess", "vless", "trojan", "anytls", "tuic", "hysteria2", "mieru", "sudoku", "trusttunnel":
 			supported = append(supported, inbound)
 		default:
 			logger.Warning("skip unsupported mihomo listener type: ", inbound.Type, " tag=", inbound.Tag)

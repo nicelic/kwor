@@ -33,12 +33,6 @@
             </v-col>
           </v-row>
           <v-row>
-            <v-col>ACME</v-col>
-            <v-col>
-              {{ $t(item.server?.acme == undefined ? 'no' : 'yes') }}
-            </v-col>
-          </v-row>
-          <v-row>
             <v-col>ECH</v-col>
             <v-col>
               {{ $t(item.server?.ech == undefined ? 'no' : 'yes') }}

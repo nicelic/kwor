@@ -343,26 +343,28 @@ export default {
       return true
     },
     async updateData(id: number) {
-      if (id > 0) {
-        this.loading = true
-        const newData = await getNamespaceStore(this.namespace).loadClients(id)
-        this.client = createClient(newData, this.namespace)
-        this.title = 'edit'
+      this.loading = true
+      try {
+        if (id > 0) {
+          const newData = await getNamespaceStore(this.namespace).loadClients(id)
+          this.client = createClient(newData, this.namespace)
+          this.title = 'edit'
+        } else {
+          this.client = createClient(undefined, this.namespace)
+          this.title = 'add'
+        }
+        this.initialClientName = this.client.name
+        this.clientConfig = this.client.config
+        this.links = this.client.links?.filter(l => l.type == 'local') ?? []
+        this.extLinks = this.client.links?.filter(l => l.type == 'external') ?? []
+        this.subLinks = this.client.links?.filter(l => l.type == 'sub') ?? []
+        this.speedLimitInput = this.client.speedLimitMbps > 0 ? String(this.client.speedLimitMbps) : ''
+        this.tab = 't1'
+        void this.refreshServerIps()
+        void this.fetchInboundIps()
+      } finally {
         this.loading = false
-      } else {
-        this.client = createClient(undefined, this.namespace)
-        this.title = 'add'
       }
-      this.initialClientName = this.client.name
-      this.clientConfig = this.client.config
-      this.links = this.client.links?.filter(l => l.type == 'local') ?? []
-      this.extLinks = this.client.links?.filter(l => l.type == 'external') ?? []
-      this.subLinks = this.client.links?.filter(l => l.type == 'sub') ?? []
-      this.speedLimitInput = this.client.speedLimitMbps > 0 ? String(this.client.speedLimitMbps) : ''
-      this.tab = 't1'
-      this.loading = false
-      this.refreshServerIps()
-      this.fetchInboundIps()
     },
     async refreshServerIps() {
       this.loadingIps = true
@@ -393,8 +395,9 @@ export default {
         this.autoSetFirstInboundIp()
       } catch (e) {
         console.error('Failed to fetch server IPs:', e)
+      } finally {
+        this.loadingIps = false
       }
-      this.loadingIps = false
     },
     async fetchInboundIps() {
       try {
@@ -462,23 +465,25 @@ export default {
       if (!this.validateMihomoSnellInboundBindings(clientId, this.clientInbounds)) return
 
       this.loading = true
-      const normalizedSpeedLimit = this.normalizeSpeedLimitMbps(this.speedLimitInput)
-      if (normalizedSpeedLimit == null) {
-        push.error({
-          message: '\u9650\u901f-mbps \u683c\u5f0f\u65e0\u6548\uff0c\u8bf7\u8f93\u5165 200 \u6216 200mbps',
-        })
+      try {
+        const normalizedSpeedLimit = this.normalizeSpeedLimitMbps(this.speedLimitInput)
+        if (normalizedSpeedLimit == null) {
+          push.error({
+            message: '\u9650\u901f-mbps \u683c\u5f0f\u65e0\u6548\uff0c\u8bf7\u8f93\u5165 200 \u6216 200mbps',
+          })
+          return
+        }
+        this.client.speedLimitMbps = normalizedSpeedLimit
+        this.client.config = updateConfigs(this.clientConfig, this.client.name, this.initialClientName, this.namespace)
+        this.client.links = [
+          ...this.extLinks.filter(l => l.uri != ''),
+          ...this.subLinks.filter(l => l.uri != ''),
+        ]
+        const success = await store.save('clients', clientId == 0 ? 'new' : 'edit', this.client)
+        if (success) this.closeModal()
+      } finally {
         this.loading = false
-        return
       }
-      this.client.speedLimitMbps = normalizedSpeedLimit
-      this.client.config = updateConfigs(this.clientConfig, this.client.name, this.initialClientName, this.namespace)
-      this.client.links = [
-        ...this.extLinks.filter(l => l.uri != ''),
-        ...this.subLinks.filter(l => l.uri != ''),
-      ]
-      const success = await store.save('clients', clientId == 0 ? 'new' : 'edit', this.client)
-      if (success) this.closeModal()
-      this.loading = false
     },
     requestTrafficReset() {
       this.client.up = 0

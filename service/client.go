@@ -141,15 +141,15 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 		// Sync client-inbound traffic bindings (for nftables-based per-client stats)
 		var clientInboundIds []uint
 		if jsonErr := json.Unmarshal(client.Inbounds, &clientInboundIds); jsonErr == nil {
-			if syncErr := s.NftTrafficService.SyncClientBindings(tx, client.Id, clientInboundIds); syncErr != nil {
-				logger.Warning("failed to sync client traffic bindings for ", client.Name, ": ", syncErr)
+			if queueErr := s.NftTrafficService.QueueSyncClientBindings(tx, client.Id, clientInboundIds); queueErr != nil {
+				logger.Warning("failed to queue client traffic binding sync for ", client.Name, ": ", queueErr)
 			}
 		}
 
 		// Manual reset keeps the current nft baselines aligned with the UI counters.
 		if manualTrafficReset {
-			if resetErr := s.NftTrafficService.ResetClientTraffic(tx, client.Id); resetErr != nil {
-				logger.Warning("failed to reset client nft traffic baseline for ", client.Name, ": ", resetErr)
+			if queueErr := s.NftTrafficService.QueueClientTrafficReset(tx, client.Id); queueErr != nil {
+				logger.Warning("failed to queue client nft traffic reset for ", client.Name, ": ", queueErr)
 			}
 		}
 
@@ -185,8 +185,8 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 		for _, client := range clients {
 			var clientInboundIds []uint
 			if jsonErr := json.Unmarshal(client.Inbounds, &clientInboundIds); jsonErr == nil {
-				if syncErr := s.NftTrafficService.SyncClientBindings(tx, client.Id, clientInboundIds); syncErr != nil {
-					logger.Warning("failed to sync client traffic bindings for ", client.Name, ": ", syncErr)
+				if queueErr := s.NftTrafficService.QueueSyncClientBindings(tx, client.Id, clientInboundIds); queueErr != nil {
+					logger.Warning("failed to queue client traffic binding sync for ", client.Name, ": ", queueErr)
 				}
 			}
 		}
@@ -323,8 +323,8 @@ func (s *ClientService) UpdateClientsOnInboundAdd(tx *gorm.DB, initIds string, i
 		if err != nil {
 			return err
 		}
-		if syncErr := s.NftTrafficService.SyncClientBindings(tx, client.Id, clientInbounds); syncErr != nil {
-			logger.Warning("failed to sync client traffic bindings for ", client.Name, " after inbound add: ", syncErr)
+		if queueErr := s.NftTrafficService.QueueSyncClientBindings(tx, client.Id, clientInbounds); queueErr != nil {
+			logger.Warning("failed to queue client traffic binding sync for ", client.Name, " after inbound add: ", queueErr)
 		}
 	}
 	return nil
@@ -367,8 +367,8 @@ func (s *ClientService) UpdateClientsOnInboundDelete(tx *gorm.DB, id uint, tag s
 		if err != nil {
 			return err
 		}
-		if syncErr := s.NftTrafficService.SyncClientBindings(tx, client.Id, newClientInbounds); syncErr != nil {
-			logger.Warning("failed to sync client traffic bindings for ", client.Name, " after inbound delete: ", syncErr)
+		if queueErr := s.NftTrafficService.QueueSyncClientBindings(tx, client.Id, newClientInbounds); queueErr != nil {
+			logger.Warning("failed to queue client traffic binding sync for ", client.Name, " after inbound delete: ", queueErr)
 		}
 	}
 	return nil
@@ -419,7 +419,7 @@ func (s *ClientService) UpdateLinksByInboundChange(tx *gorm.DB, inbounds *[]mode
 // and resets their traffic when the configured monthly reset boundary is reached.
 func (s *ClientService) ResetTrafficBySchedule() error {
 	db := database.GetDB()
-	now := time.Now().In(getClientAccessPolicyLocation())
+	now := PanelNow()
 
 	var clients []model.Client
 	err := db.Model(model.Client{}).
@@ -433,58 +433,41 @@ func (s *ClientService) ResetTrafficBySchedule() error {
 		return nil
 	}
 
-	tx := db.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
-
 	for _, client := range clients {
 		if !shouldResetClientTrafficMonthly(client.LastReset, client.Extra, now) {
 			continue
 		}
 		logger.Info("Resetting traffic for client ", client.Name, " (reset days: ", client.Extra, ")")
-		if resetErr := s.NftTrafficService.ResetClientTraffic(tx, client.Id); resetErr != nil {
+		if resetErr := s.NftTrafficService.ResetClientTraffic(db, client.Id); resetErr != nil {
 			logger.Warning("failed to reset traffic for client ", client.Name, ": ", resetErr)
 		}
-	}
-
-	if err = tx.Commit().Error; err != nil {
-		tx.Rollback()
-		return err
 	}
 	return nil
 }
 
 func (s *ClientService) DepleteClients() ([]uint, error) {
-	var err error
 	var clients []model.Client
 	var changes []model.Changes
-	var users []string
 	var inboundIds []uint
 
 	now := time.Now().Unix()
 	db := database.GetDB()
 
 	tx := db.Begin()
-	defer func() {
-		if err == nil {
-			tx.Commit()
-		} else {
-			tx.Rollback()
-		}
-	}()
+	if tx.Error != nil {
+		return nil, tx.Error
+	}
 
-	err = tx.Model(model.Client{}).Where("enable = true AND ((volume >0 AND up+down > volume) OR (expiry > 0 AND expiry < ?))", now).Scan(&clients).Error
-	if err != nil {
+	if err := tx.Model(model.Client{}).Where("enable = true AND ((volume >0 AND up+down > volume) OR (expiry > 0 AND expiry < ?))", now).Scan(&clients).Error; err != nil {
+		tx.Rollback()
 		return nil, err
 	}
 
 	dt := time.Now().Unix()
 	for _, client := range clients {
 		logger.Debug("Client ", client.Name, " is going to be disabled")
-		users = append(users, client.Name)
 		var userInbounds []uint
-		json.Unmarshal(client.Inbounds, &userInbounds)
+		_ = json.Unmarshal(client.Inbounds, &userInbounds)
 		// Find changed inbounds
 		inboundIds = common.UnionUintArray(inboundIds, userInbounds)
 		changes = append(changes, model.Changes{
@@ -498,15 +481,22 @@ func (s *ClientService) DepleteClients() ([]uint, error) {
 
 	// Save changes
 	if len(changes) > 0 {
-		err = tx.Model(model.Client{}).Where("enable = true AND ((volume >0 AND up+down > volume) OR (expiry > 0 AND expiry < ?))", now).Update("enable", false).Error
-		if err != nil {
+		if err := tx.Model(model.Client{}).Where("enable = true AND ((volume >0 AND up+down > volume) OR (expiry > 0 AND expiry < ?))", now).Update("enable", false).Error; err != nil {
+			tx.Rollback()
 			return nil, err
 		}
-		err = recordChanges(tx, changes)
-		if err != nil {
+		if err := recordChanges(tx, changes); err != nil {
+			tx.Rollback()
 			return nil, err
 		}
-		LastUpdate = dt
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	if len(changes) > 0 {
+		markLastUpdate(dt)
 	}
 
 	return inboundIds, nil

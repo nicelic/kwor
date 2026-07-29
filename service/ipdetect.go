@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -19,6 +18,8 @@ type IPInfo struct {
 	IsPublic bool   `json:"isPublic"`
 	Version  int    `json:"version"` // 4 或 6
 }
+
+const ipCheckResponseMaxBytes int64 = 64 * 1024
 
 // 用于验证IP的远程API列表（按优先级排序）
 var ipCheckAPIs = []string{
@@ -163,7 +164,7 @@ func (s *IPDetectService) queryAPI(client *http.Client, apiURL string) (string, 
 		return "", false
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readBoundedHTTPResponseBody(resp.Body, ipCheckResponseMaxBytes)
 	if err != nil {
 		return "", false
 	}

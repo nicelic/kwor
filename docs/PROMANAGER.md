@@ -1,195 +1,79 @@
-# ProManager - 配置监视器和生成器
+# ProManager - sing-box 最终配置生成器
 
 ## 概述
 
-ProManager 是一个配置监视器和生成器系统，用于监听 s-ui 面板中的所有配置变化，并自动生成相应的配置文件。
+`ProManagerService` 监听默认链配置变化，并从 SQLite 中的设置、入站、客户端、TLS、出站、服务和端点聚合最终 sing-box 配置。它只把逻辑路径 `core/singbox/config.json` 写入 Runtime Store 的 `managed_runtime_files` 表。
 
-## 功能
+Core 启动或校验时会按需把该配置短暂物化到 `<binary_dir>/Promanager_data/core/singbox/config.json`，使用完成后删除磁盘临时文件。数据库仍是业务配置真源。
 
-1. **监听配置变化**：监听入站、出站、用户管理、TLS、mux、多路复用、utls等配置变化
-2. **自动生成配置**：当配置变化时，自动组合生成完整的配置文件
-3. **分层存储**：按入站、出站、核心配置分别存储
+## 不再生成的副本
 
-## 目录结构
+以下路径只作为历史清理范围保留，不再生成或读取：
 
-```
-Promanager_data/
-├── inbound/          # 单入站JSON (每个入站一个文件)
-│   ├── vless-node.json
-│   ├── vmess-node.json
-│   └── ...
-├── outbound/         # 出站JSON (每个出站一个文件)
-│   ├── direct.json
-│   ├── block.json
-│   └── ...
-├── sub_json/         # JSON订阅配置 (每个用户-入站组合一个文件)
-│   ├── vless-node_user1.json
-│   ├── shadowsocks-38266_APq5xE9m.json
-│   └── ...
-├── core/             # 完整版核心配置
-│   └── config.json
-└── Inbound/          # 兼容旧版目录
-    └── inbound.json
-```
+- `Inbound/inbound.json`
+- `Inbound/<tag>.json` 与 `Inbound/<tag>_meta.json`
+- `outbound/<tag>.json` 与 `outbound/<tag>_meta.json`
+- `sub_manager/<tag>*.json`
+- `sub_json/*.json`
 
-## 配置文件格式
+Runtime Store 初始化时会幂等删除上述四个根目录中的 `.json` 逻辑记录，并清理磁盘根目录下的普通 `.json` 文件。清理不跟随符号链接，不进入嵌套目录，也不删除其他扩展名；失败只记录日志，下一次初始化重试。
 
-### 单入站配置 (inbound/*.json)
+## 最终配置内容
 
-```json
-{
-  "inbound": {
-    "type": "vless",
-    "tag": "vless-in",
-    "listen": "0.0.0.0",
-    "listen_port": 443,
-    "users": [
-      {
-        "name": "user1",
-        "uuid": "xxx-xxx-xxx",
-        "flow": "xtls-rprx-vision"
-      }
-    ],
-    "tls": {
-      "enabled": true,
-      "server_name": "example.com"
-    }
-  },
-  "metadata": {
-    "id": 1,
-    "tag": "vless-in",
-    "type": "vless",
-    "tls_id": 1,
-    "user_count": 5,
-    "updated_at": 1707500000
-  }
-}
+`GenerateFullConfig()` 聚合：
+
+- `settings.config` 中的日志、DNS、NTP、路由和实验性配置
+- `InboundService.GetAllConfig()` 生成的入站、用户、TLS 和 ShadowTLS 组合入站
+- `OutboundService.GetAllConfig()` 生成的出站和 ShadowTLS 组合出站
+- services 与 endpoints
+- 证书 Store、路由规则集、DNS 和运行期出站规范化结果
+
+最终配置的唯一默认链 Runtime Store 路径是：
+
+```text
+Promanager_data/core/singbox/config.json
 ```
 
-### 单出站配置 (outbound/*.json)
+Mihomo 的 `core/mihomo/server.yaml` 与 `core/mihomo_inbounds_meta.json` 由 `MihomoManagerService` 独立维护，不属于 ProManager 的副本清理范围。
 
-```json
-{
-  "outbound": {
-    "type": "direct",
-    "tag": "direct"
-  },
-  "metadata": {
-    "id": 1,
-    "tag": "direct",
-    "type": "direct",
-    "updated_at": 1707500000
-  }
-}
-```
+## 订阅按请求生成
 
-### 核心完整配置 (core/config.json)
+客户端、单订阅节点和订阅分组不再预生成 `sub_json` 文件。HTTP 请求到达后直接读取 SQLite 并实时渲染：
 
-```json
-{
-  "log": {
-    "level": "info"
-  },
-  "dns": {
-    "servers": [],
-    "rules": []
-  },
-  "inbounds": [...],
-  "outbounds": [...],
-  "services": [...],
-  "endpoints": [...],
-  "route": {...},
-  "experimental": {}
-}
-```
+| 类型 | 路由 | 生成服务 |
+| --- | --- | --- |
+| 默认链客户端 JSON / Clash / 链接 | `/q/client`、`/:subid` | `JsonService`、`ClashService`、`SubService` |
+| 单订阅节点 JSON / Clash | `/q/sm`、`/sm/:tag` | `SubManagerSubService` |
+| 订阅分组 JSON / Clash | `/q/group`、`/group/:groupName` | `SubManagerSubService` |
+
+`SubOutboundService` 和 `SubGroupService` 在保存后仍会执行一次内存渲染并丢弃结果，以保留原有配置合法性检查。`sub_json` 文件名清洗与冲突校验也继续保留，避免改变既有保存规则，但不会产生文件。
 
 ## 事件系统
 
-ProManager 使用事件驱动架构，支持以下事件源：
+支持的事件源包括 `inbound`、`outbound`、`client`、`tls`、`dns`、`route`、`ruleset`、`service`、`endpoint` 和 `config`。事件处理器在 500ms 窗口内合并事件，统一刷新最终 Core 配置。
 
-| 事件源 | 说明 |
-|--------|------|
-| `inbound` | 入站配置变更 |
-| `outbound` | 出站配置变更 |
-| `client` | 用户/客户端变更 |
-| `tls` | TLS配置变更 |
-| `dns` | DNS配置变更 |
-| `route` | 路由配置变更 |
-| `ruleset` | 规则集变更 |
-| `service` | 服务配置变更 |
-| `endpoint` | 端点配置变更 |
-| `config` | 核心配置变更 |
+配置保存、证书续签/TLS 重新绑定、出站分组导入等同步链路仍会更新最终 Core 配置，并保留原有自动管理客户端同步行为。
 
-事件类型：
-- `create` - 创建
-- `update` - 更新
-- `delete` - 删除
-
-## 使用方法
-
-### 获取ProManager实例
+## 兼容接口
 
 ```go
-import "github.com/alireza0/s-ui/service"
-
-// 获取单例实例
 proManager := service.GetProManagerService(configService)
-```
 
-### 触发事件
-
-```go
-// 入站变更
-proManager.OnInboundChange(service.EventCreate, "vless-in", 1)
-
-// 出站变更
-proManager.OnOutboundChange(service.EventUpdate, "direct", 1)
-
-// 用户变更
-proManager.OnClientChange(service.EventDelete, "user1", 1)
-
-// TLS变更
-proManager.OnTlsChange(service.EventUpdate, "my-tls", 1)
-
-// 核心配置变更
-proManager.OnConfigChange()
-```
-
-### 手动生成配置
-
-```go
-// 异步生成所有配置
+// 旧名称保留；现在只刷新最终 sing-box Core 配置。
 proManager.SaveInboundJson()
 
-// 同步生成完整配置
+// 只在内存中聚合并返回完整配置。
 config, err := proManager.GenerateFullConfig()
 ```
 
-## 工作原理
+`SaveInboundJson()`、Runtime Store 导出 API、订阅文件名校验 API、旧导出结构体以及 `managed_runtime_files` 表均保留，避免破坏现有 app、Core Manager、systemd 命令或潜在外部 Go 调用。
 
-1. **事件接收**：当配置发生变化时，通过 `EmitEvent` 发送事件到事件队列
-2. **批量处理**：事件处理器会在500ms内收集所有事件，然后批量处理
-3. **增量更新**：根据事件类型，只重新生成需要更新的配置
-4. **文件输出**：将生成的配置写入对应的目录
+## 修改检查
 
-## 集成点
+修改默认链生成逻辑时至少检查：
 
-ProManager 已集成到以下位置：
-
-1. **ConfigService.Save()**：在保存任何配置后自动触发
-2. 可根据需要在其他地方添加事件触发
-
-## 注意事项
-
-1. ProManager 使用异步处理，不会阻塞主流程
-2. 事件队列最大容量为100，超出会丢弃事件
-3. 停止服务时会处理完剩余事件
-4. 文件名会自动清理不安全字符
-
-## 扩展开发
-
-如需添加新的事件源或配置类型：
-
-1. 在 `ConfigEventSource` 中添加新的常量
-2. 在 `processBatchEvents` 中添加处理逻辑
-3. 添加相应的便捷方法
+1. `GenerateFullConfig()` 是否仍完整包含用户、TLS、普通/ShadowTLS 入站、出站、服务、端点和路由。
+2. `ConfigService.Save()`、证书绑定和出站分组通知是否仍刷新最终 Core 配置及自动管理客户端。
+3. JSON、Clash 和链接订阅是否继续实时读取 SQLite，且请求后没有新增废弃 Runtime Store 记录。
+4. 文件名冲突校验是否保持原有拒绝规则。
+5. Runtime Store 清理是否只作用于四个准确根目录中的 JSON，保留 Core 配置、Mihomo 元数据、未知文件、符号链接和嵌套目录。

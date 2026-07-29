@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -145,7 +144,7 @@ func migrateLegacyCoreArtifacts(root string) error {
 func sameManagedCorePath(left, right string) bool {
 	left = filepath.Clean(left)
 	right = filepath.Clean(right)
-	if runtime.GOOS == "windows" {
+	if IsSystemPlatformWindows() {
 		return strings.EqualFold(left, right)
 	}
 	return left == right
@@ -652,7 +651,7 @@ func removeDirIfEmpty(dir string) error {
 }
 
 func ensureManagedCoreCompatibilityLinks(root string) error {
-	if runtime.GOOS == "windows" {
+	if IsSystemPlatformWindows() {
 		return nil
 	}
 
@@ -722,7 +721,7 @@ func isSharedManagedCoreRootName(name string) bool {
 }
 
 func ensureCompatibilityLinksForLegacyParent(sourceParent, linkParent string) error {
-	if runtime.GOOS == "windows" {
+	if IsSystemPlatformWindows() {
 		return nil
 	}
 
@@ -757,7 +756,7 @@ func ensureCompatibilityLinksForLegacyParent(sourceParent, linkParent string) er
 }
 
 func ensureCompatibilityLinkForLegacyEntry(sourcePath, linkPath string) error {
-	if runtime.GOOS == "windows" {
+	if IsSystemPlatformWindows() {
 		return nil
 	}
 	if sourcePath == "" || linkPath == "" {
@@ -797,7 +796,7 @@ func ensureCompatibilityLinkForLegacyEntry(sourcePath, linkPath string) error {
 }
 
 func cleanupBrokenManagedCoreSymlinks(root string) error {
-	if runtime.GOOS == "windows" {
+	if IsSystemPlatformWindows() {
 		return nil
 	}
 
@@ -907,7 +906,7 @@ func resolveSymlinkPath(linkPath string) (string, error) {
 }
 
 func createLegacyCompatibilitySymlink(legacyPath, targetPath string) error {
-	if runtime.GOOS == "windows" {
+	if IsSystemPlatformWindows() {
 		return nil
 	}
 	if legacyPath == "" || targetPath == "" {

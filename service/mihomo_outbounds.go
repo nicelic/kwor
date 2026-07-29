@@ -24,6 +24,9 @@ func normalizeMihomoOutboundRawPayload(data json.RawMessage) json.RawMessage {
 	}
 
 	delete(payload, "id")
+	if outboundType, _ := payload["type"].(string); strings.EqualFold(strings.TrimSpace(outboundType), "shadowquic") {
+		util.SanitizeMihomoShadowQUICOutbound(payload)
+	}
 	normalized, err := json.Marshal(payload)
 	if err != nil {
 		return append(json.RawMessage(nil), data...)
@@ -247,6 +250,7 @@ func (s *MihomoOutboundService) Save(tx *gorm.DB, act string, data json.RawMessa
 		incomingRaw := normalizeMihomoOutboundRawPayload(data)
 		outbound.RawOutbound = incomingRaw
 		outbound.RawClashYAML = nil
+		oldTag := ""
 		if act == "edit" && len(outbound.RawOutbound) > 0 {
 			var existing model.MihomoOutbound
 			query := tx.Model(model.MihomoOutbound{})
@@ -256,7 +260,8 @@ func (s *MihomoOutboundService) Save(tx *gorm.DB, act string, data json.RawMessa
 				query = query.Where("tag = ?", outbound.Tag)
 			}
 			if err := query.Take(&existing).Error; err == nil {
-				if existing.Type == outbound.Type {
+				oldTag = strings.TrimSpace(existing.Tag)
+				if existing.Type == outbound.Type && !strings.EqualFold(strings.TrimSpace(outbound.Type), "shadowquic") {
 					if baseRaw, resolveErr := resolveMihomoOutboundJSON(&existing); resolveErr == nil {
 						outbound.RawOutbound = mergeEditableOutboundRawPayload(baseRaw, data, "mihomo", outbound.Type)
 					}
@@ -272,11 +277,35 @@ func (s *MihomoOutboundService) Save(tx *gorm.DB, act string, data json.RawMessa
 		if len(outbound.RawOutbound) == 0 {
 			outbound.RawOutbound = incomingRaw
 		}
-		return tx.Save(&outbound).Error
+		outbound.RawOutbound = sanitizeMihomoShadowQUICOutboundRaw(outbound.RawOutbound, outbound.Type)
+		if strings.EqualFold(strings.TrimSpace(outbound.Type), "shadowquic") {
+			shadowQUICRaw := map[string]interface{}{}
+			if err := json.Unmarshal(outbound.RawOutbound, &shadowQUICRaw); err != nil {
+				return err
+			}
+			if err := util.ValidateMihomoShadowQUICOutbound(shadowQUICRaw, outbound.Tag); err != nil {
+				return err
+			}
+		}
+		if err := tx.Save(&outbound).Error; err != nil {
+			return err
+		}
+		if oldTag != "" && oldTag != strings.TrimSpace(outbound.Tag) {
+			return replaceMihomoShadowQUICJLSProxyReferences(tx, oldTag, outbound.Tag)
+		}
+		return nil
 	case "del":
 		var tag string
 		if err := json.Unmarshal(data, &tag); err != nil {
 			return err
+		}
+		tag = strings.TrimSpace(tag)
+		inboundTags, err := findMihomoShadowQUICJLSProxyInboundTags(tx, tag)
+		if err != nil {
+			return err
+		}
+		if len(inboundTags) > 0 {
+			return common.NewErrorf("cannot delete mihomo outbound %q: referenced by shadowquic inbound(s): %s", tag, strings.Join(inboundTags, ", "))
 		}
 		return tx.Where("tag = ?", tag).Delete(model.MihomoOutbound{}).Error
 	default:

@@ -5,14 +5,20 @@ import { i18n } from '@/locales'
 import { Inbound } from '@/types/inbounds'
 import { Client } from '@/types/clients'
 import Data from '@/store/modules/data'
+import { normalizeSubscriptionURI, refreshSubscriptionURI } from '@/plugins/subscriptionUri'
 
 const reloadItemsKey = 'mihomo_reloadItems'
+let mihomoDataLoadPromise: Promise<void> | null = null
 
 const MihomoData = defineStore('MihomoData', {
   state: () => ({
+    isLoadingData: false,
     lastLoad: 0,
     reloadItems: localStorage.getItem(reloadItemsKey)?.split(',') ?? <string[]>[],
     subURI: '',
+    subscriptionUriVerified: false,
+    subscriptionUriRefreshing: false,
+    subscriptionUriError: '',
     enableTraffic: false,
     onlines: { inbound: <string[]>[], outbound: <string[]>[], user: <string[]>[] },
     config: <any>{},
@@ -27,23 +33,40 @@ const MihomoData = defineStore('MihomoData', {
     tlsConfigs: <any[]>[],
   }),
   actions: {
-    async loadData() {
-      const params = this.lastLoad > 0
-        ? { lu: this.lastLoad, light: 'true' }
-        : {}
-      const msg = await HttpUtils.get('api/mihomo-load', params)
-      if (msg.success) {
-        const data = msg.obj ?? {}
-        this.onlines = data.onlines ?? { inbound: [], outbound: [], user: [] }
-        if (Object.hasOwn(data, 'enableTraffic')) this.enableTraffic = data.enableTraffic === true
-        if (data.config) {
-          this.setNewData(data)
+    loadData(): Promise<void> {
+      if (mihomoDataLoadPromise) return mihomoDataLoadPromise
+      this.isLoadingData = true
+      mihomoDataLoadPromise = (async () => {
+        try {
+          const params = this.lastLoad > 0
+            ? { lu: this.lastLoad, light: 'true' }
+            : {}
+          const msg = await HttpUtils.get('api/mihomo-load', params)
+          if (msg.success) {
+            const data = msg.obj ?? {}
+            this.onlines = data.onlines ?? { inbound: [], outbound: [], user: [] }
+            if (Object.hasOwn(data, 'enableTraffic')) this.enableTraffic = data.enableTraffic === true
+            if (data.config) {
+              this.setNewData(data)
+            }
+          }
+        } finally {
+          this.isLoadingData = false
+          mihomoDataLoadPromise = null
         }
-      }
+      })()
+      return mihomoDataLoadPromise
     },
     setNewData(data: any) {
       this.lastLoad = Math.floor((new Date()).getTime() / 1000)
-      if (Object.hasOwn(data, 'subURI')) this.subURI = data.subURI ?? ''
+      if (Object.hasOwn(data, 'subURI')) {
+        const subURI = normalizeSubscriptionURI(data.subURI)
+        if (subURI) {
+          this.subURI = subURI
+          this.subscriptionUriVerified = true
+          this.subscriptionUriError = ''
+        }
+      }
       if (Object.hasOwn(data, 'enableTraffic')) this.enableTraffic = data.enableTraffic === true
       if (Object.hasOwn(data, 'config')) this.config = data.config ?? {}
       if (Object.hasOwn(data, 'clients')) this.clients = data.clients ?? []
@@ -59,6 +82,23 @@ const MihomoData = defineStore('MihomoData', {
       const defaultData = Data()
       if (Object.hasOwn(data, 'suboutbounds')) defaultData.suboutbounds = data.suboutbounds ?? []
       if (Object.hasOwn(data, 'subgroups')) defaultData.subgroups = data.subgroups ?? []
+    },
+    async refreshSubscriptionURI(): Promise<boolean> {
+      this.subscriptionUriRefreshing = true
+      this.subscriptionUriError = ''
+      try {
+        const result = await refreshSubscriptionURI()
+        if (!result.success) {
+          this.subscriptionUriError = result.error
+          return false
+        }
+        this.subURI = result.subURI
+        this.subscriptionUriVerified = true
+        this.subscriptionUriError = ''
+        return true
+      } finally {
+        this.subscriptionUriRefreshing = false
+      }
     },
     async loadInbounds(ids: number[]): Promise<Inbound[]> {
       const options = ids.length > 0 ? { id: ids.join(',') } : {}

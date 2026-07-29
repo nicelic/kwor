@@ -15,20 +15,27 @@ type ReverseProxyRule struct {
 
 	ListenProtocol      string `json:"listenProtocol" gorm:"size:16;not null;default:'http';index"`
 	ListenProtocolAlias string `json:"listenProtocolAlias" gorm:"column:listen_protocol_alias;size:16;not null;default:''"`
-	ListenIP            string `json:"listenIP" gorm:"size:255;not null;default:'';index"`
-	ListenIPList        string `json:"listenIPs" gorm:"column:listen_ip_list;type:text;not null;default:''"`
 	ListenPort          int    `json:"listenPort" gorm:"not null;default:0;index"`
 
 	HostList      string `json:"hostList" gorm:"type:text;not null;default:''"`
 	PathPrefix    string `json:"pathPrefix" gorm:"size:1024;not null;default:'/'"`
 	ListenDNSPath string `json:"listenDnsPath" gorm:"column:listen_dns_path;size:1024;not null;default:''"`
 
-	TargetProtocol      string `json:"targetProtocol" gorm:"size:16;not null;default:'http'"`
-	TargetProtocolAlias string `json:"targetProtocolAlias" gorm:"column:target_protocol_alias;size:16;not null;default:''"`
-	TargetAddresses     string `json:"targetAddresses" gorm:"type:text;not null;default:''"`
-	TargetPort          int    `json:"targetPort" gorm:"not null;default:0"`
-	TargetPath          string `json:"targetPath" gorm:"size:1024;not null;default:''"`
-	TargetDNSPath       string `json:"targetDnsPath" gorm:"column:target_dns_path;size:1024;not null;default:''"`
+	TargetProtocol            string `json:"targetProtocol" gorm:"size:16;not null;default:'http'"`
+	TargetProtocolAlias       string `json:"targetProtocolAlias" gorm:"column:target_protocol_alias;size:16;not null;default:''"`
+	TargetAddresses           string `json:"targetAddresses" gorm:"type:text;not null;default:''"`
+	TargetPort                int    `json:"targetPort" gorm:"not null;default:0"`
+	TargetPath                string `json:"targetPath" gorm:"size:1024;not null;default:''"`
+	TargetDNSPath             string `json:"targetDnsPath" gorm:"column:target_dns_path;size:1024;not null;default:''"`
+	FallbackDNSUpstreams      string `json:"fallbackDnsUpstreams" gorm:"column:fallback_dns_upstreams;type:text;not null;default:''"`
+	DNSUpstreamTimeoutSeconds int    `json:"dnsUpstreamTimeoutSeconds" gorm:"column:dns_upstream_timeout_seconds;not null;default:12"`
+	DNSCacheEnabled           bool   `json:"dnsCacheEnabled" gorm:"column:dns_cache_enabled;not null;default:false"`
+	DNSCacheSizeBytes         int    `json:"dnsCacheSizeBytes" gorm:"column:dns_cache_size_bytes;not null;default:4194304"`
+	DNSCacheMinTTL            int    `json:"dnsCacheMinTtl" gorm:"column:dns_cache_min_ttl;not null;default:0"`
+	DNSCacheMaxTTL            int    `json:"dnsCacheMaxTtl" gorm:"column:dns_cache_max_ttl;not null;default:0"`
+	DNSAllowedCIDRs           string `json:"dnsAllowedCidrs" gorm:"column:dns_allowed_cidrs;type:text;not null;default:''"`
+	DNSRateLimitQPS           int    `json:"dnsRateLimitQps" gorm:"column:dns_rate_limit_qps;not null;default:50"`
+	DNSMaxConcurrentQueries   int    `json:"dnsMaxConcurrentQueries" gorm:"column:dns_max_concurrent_queries;not null;default:128"`
 
 	EDNSEnabled            bool   `json:"ednsEnabled" gorm:"column:edns_enabled;not null;default:false"`
 	EDNSMode               string `json:"ednsMode" gorm:"column:edns_mode;size:32;not null;default:'auto'"`
@@ -43,7 +50,16 @@ type ReverseProxyRule struct {
 	IPStrategy                string `json:"ipStrategy" gorm:"size:32;not null;default:'prefer_ipv4'"`
 	HTTPVersionStrategy       string `json:"httpVersionStrategy" gorm:"size:32;not null;default:''"`
 	UpstreamTLSVerify         bool   `json:"upstreamTlsVerify" gorm:"not null;default:true"`
-	ApiPassthrough            bool   `json:"apiPassthrough" gorm:"not null;default:false"`
+	// A zero rule-level limit deliberately means that the rule relies on the
+	// panel-wide guard.  This lets operators tune a single shared ceiling
+	// without silently inheriting an unrelated hard-coded per-rule cap.
+	MaxConcurrentConnections   int   `json:"maxConcurrentConnections" gorm:"column:max_concurrent_connections;not null;default:0"`
+	MaxConcurrentRequests      int   `json:"maxConcurrentRequests" gorm:"column:max_concurrent_requests;not null;default:0"`
+	UpstreamMaxConnections     int   `json:"upstreamMaxConnections" gorm:"column:upstream_max_connections;not null;default:0"`
+	UpstreamMaxIdleConnections int   `json:"upstreamMaxIdleConnections" gorm:"column:upstream_max_idle_connections;not null;default:0"`
+	MemoryLimitBytes           int64 `json:"memoryLimitBytes" gorm:"column:memory_limit_bytes;not null;default:0"`
+	ApiPassthrough             bool  `json:"apiPassthrough" gorm:"not null;default:false"`
+	AdvertiseHTTP3             bool  `json:"advertiseHttp3" gorm:"column:advertise_http3;not null;default:false"`
 
 	Remark        string `json:"remark" gorm:"type:text;not null;default:''"`
 	LastError     string `json:"lastError" gorm:"type:text;not null;default:''"`

@@ -14,6 +14,49 @@ type clashProxyRenderEntry struct {
 	RawYAML []byte
 }
 
+func buildClashSubscriptionMapFromEntries(
+	entries []clashProxyRenderEntry,
+	latencyUrl string,
+	latencyInterval int,
+	latencyTolerance int,
+	selectorGroups []clashSelectorGroupConfig,
+) map[string]interface{} {
+	uniqueEntries := dedupeClashRenderEntries(entries)
+	proxies := make([]interface{}, 0, len(uniqueEntries))
+	nodeTags := make([]string, 0, len(uniqueEntries))
+	for _, entry := range uniqueEntries {
+		proxy, _ := sanitizeMihomoClashProxy(entry.Proxy)
+		if proxy == nil {
+			continue
+		}
+		proxyType, _ := proxy["type"].(string)
+		if !util.SupportsMihomoSubscriptionClashProxyType(proxyType) {
+			continue
+		}
+		name := strings.TrimSpace(entry.Name)
+		if name == "" {
+			name = strings.TrimSpace(firstString(proxy["name"]))
+		}
+		if name == "" {
+			continue
+		}
+		proxies = append(proxies, normalizeProxyForYAML(proxy))
+		nodeTags = append(nodeTags, name)
+	}
+
+	proxyGroups := buildFixedMihomoProxyGroups(nodeTags, latencyUrl, latencyInterval, latencyTolerance)
+	proxyGroups = append(proxyGroups, buildNamedClashProxyGroups(selectorGroups, nodeTags)...)
+	output := map[string]interface{}{
+		"proxies":      proxies,
+		"proxy-groups": proxyGroups,
+	}
+	if normalized, ok := normalizeNumericTypesForYAML(output).(map[string]interface{}); ok && normalized != nil {
+		output = normalized
+	}
+	util.ApplySudokuCustomTablesFlowYAML(output)
+	return output
+}
+
 func renderClashSubscriptionFromEntries(
 	entries []clashProxyRenderEntry,
 	latencyUrl string,

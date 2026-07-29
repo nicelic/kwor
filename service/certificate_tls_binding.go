@@ -17,16 +17,40 @@ import (
 // certificate inventory record. It keeps the TLS rows in sync after renewals or
 // re-issues, then regenerates runtime and subscription outputs for both cores.
 func SyncTLSBindingsForCertificateRecord(recordID uint, hostname string) (bool, error) {
-	return syncTLSBindingsForCertificateRecord(recordID, hostname, false)
+	return syncTLSBindingsForCertificateRecordWithGate(recordID, hostname, false, false)
 }
 
 // ForceSyncTLSBindingsForCertificateRecord refreshes and broadcasts certificate
 // binding changes even when the TLS JSON points at the same managed paths.
 func ForceSyncTLSBindingsForCertificateRecord(recordID uint, hostname string) (bool, error) {
-	return syncTLSBindingsForCertificateRecord(recordID, hostname, true)
+	return ForceSyncTLSBindingsForCertificateRecordWithCoreRestart(recordID, hostname, true)
+}
+
+func ForceSyncTLSBindingsForCertificateRecordWithCoreRestart(recordID uint, hostname string, queueCoreRestart bool) (bool, error) {
+	return syncTLSBindingsForCertificateRecordWithGate(recordID, hostname, true, queueCoreRestart)
+}
+
+func syncTLSBindingsForCertificateRecordWithGate(recordID uint, hostname string, force bool, queueCoreRestart bool) (bool, error) {
+	changed := false
+	err := withCertificateCoreConfigGate(func() error {
+		var syncErr error
+		changed, syncErr = syncTLSBindingsForCertificateRecordUnlocked(recordID, hostname, force, queueCoreRestart)
+		return syncErr
+	})
+	return changed, err
 }
 
 func ForceSyncTLSPathBindingsForTLSIDs(defaultTLSIDs []uint, mihomoTLSIDs []uint, hostname string) (bool, error) {
+	changed := false
+	err := withCertificateCoreConfigGate(func() error {
+		var syncErr error
+		changed, syncErr = forceSyncTLSPathBindingsForTLSIDsUnlocked(defaultTLSIDs, mihomoTLSIDs, hostname)
+		return syncErr
+	})
+	return changed, err
+}
+
+func forceSyncTLSPathBindingsForTLSIDsUnlocked(defaultTLSIDs []uint, mihomoTLSIDs []uint, hostname string) (bool, error) {
 	defaultTLSIDs = compactPositiveUintList(defaultTLSIDs)
 	mihomoTLSIDs = compactPositiveUintList(mihomoTLSIDs)
 	if len(defaultTLSIDs) == 0 && len(mihomoTLSIDs) == 0 {
@@ -52,9 +76,9 @@ func ForceSyncTLSPathBindingsForTLSIDs(defaultTLSIDs []uint, mihomoTLSIDs []uint
 	configSvc := &ConfigService{}
 	if len(defaultTLSIDs) > 0 {
 		manager := NewProManagerService(configSvc)
-		manager.regenerateInboundConfigs()
-		manager.regenerateCoreConfig()
-		manager.regenerateSubJsonConfigs()
+		if err := manager.RegenerateCoreConfig(); err != nil {
+			return true, err
+		}
 		if err := configSvc.syncAutoManagedDefaultClientsForCertificateBinding(hostname, defaultTLSIDs); err != nil {
 			return true, err
 		}
@@ -68,11 +92,11 @@ func ForceSyncTLSPathBindingsForTLSIDs(defaultTLSIDs []uint, mihomoTLSIDs []uint
 		}
 	}
 
-	LastUpdate = time.Now().Unix()
+	markLastUpdate(time.Now().Unix())
 	return true, nil
 }
 
-func syncTLSBindingsForCertificateRecord(recordID uint, hostname string, force bool) (bool, error) {
+func syncTLSBindingsForCertificateRecordUnlocked(recordID uint, hostname string, force bool, queueCoreRestart bool) (bool, error) {
 	if recordID == 0 {
 		return false, nil
 	}
@@ -123,9 +147,9 @@ func syncTLSBindingsForCertificateRecord(recordID uint, hostname string, force b
 
 	if defaultBroadcast {
 		manager := NewProManagerService(configSvc)
-		manager.regenerateInboundConfigs()
-		manager.regenerateCoreConfig()
-		manager.regenerateSubJsonConfigs()
+		if err := manager.RegenerateCoreConfig(); err != nil {
+			return true, err
+		}
 		if force {
 			err = configSvc.syncAutoManagedDefaultClientsForCertificateBinding(hostname, defaultTLSIDs)
 		} else {
@@ -133,6 +157,11 @@ func syncTLSBindingsForCertificateRecord(recordID uint, hostname string, force b
 		}
 		if err != nil {
 			return true, err
+		}
+		if queueCoreRestart {
+			if err := verifyAndQueueCertificateCoreRestart(certificateCoreKindSingbox, record); err != nil {
+				return true, err
+			}
 		}
 	}
 	if mihomoBroadcast {
@@ -147,12 +176,60 @@ func syncTLSBindingsForCertificateRecord(recordID uint, hostname string, force b
 		if err != nil {
 			return true, err
 		}
+		if queueCoreRestart {
+			if err := verifyAndQueueCertificateCoreRestart(certificateCoreKindMihomo, record); err != nil {
+				return true, err
+			}
+		}
 	}
 	if defaultBroadcast || mihomoBroadcast {
-		LastUpdate = time.Now().Unix()
+		markLastUpdate(time.Now().Unix())
 	}
 
 	return defaultBroadcast || mihomoBroadcast, nil
+}
+
+func verifyAndQueueCertificateCoreRestart(kind string, record *model.CertificateRecord) error {
+	if record == nil || record.Id == 0 || normalizeCertificateFingerprint(record.Fingerprint) == "" {
+		return nil
+	}
+	if !certificateCoreManagerRunning(kind) {
+		return nil
+	}
+
+	boundCount := int64(0)
+	var err error
+	switch kind {
+	case certificateCoreKindSingbox:
+		err = database.GetDB().Model(&model.Tls{}).
+			Where("certificate_record_id = ?", record.Id).
+			Count(&boundCount).Error
+	case certificateCoreKindMihomo:
+		err = database.GetDB().Model(&model.MihomoTls{}).
+			Where("certificate_record_id = ?", record.Id).
+			Count(&boundCount).Error
+	default:
+		return nil
+	}
+	if err != nil || boundCount == 0 {
+		return err
+	}
+
+	contains := false
+	switch kind {
+	case certificateCoreKindSingbox:
+		contains, err = singboxFinalConfigContainsCertificateFingerprint(record.Fingerprint)
+	case certificateCoreKindMihomo:
+		contains, err = mihomoFinalConfigContainsCertificateFingerprint(record.Fingerprint)
+	}
+	if err != nil {
+		return err
+	}
+	if !contains {
+		logger.Info("certificate is bound but absent from final ", kind, " config; skip Core restart: record=", record.Id)
+		return nil
+	}
+	return queueCertificateCoreRestart(kind, record.Id, record.Fingerprint)
 }
 
 func refreshDefaultTLSBindingsTx(tx *gorm.DB, record *model.CertificateRecord) (bool, []uint, error) {

@@ -25,6 +25,40 @@ func TestIssueAcmeCertificateRequiresAccountForDomain(t *testing.T) {
 	}
 }
 
+func TestIssueAcmeCertificateTaskRequiresAccountForDomain(t *testing.T) {
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest("POST", "/api/acme-issue-task", strings.NewReader(`{"domains":"example.com","certificateType":"domain","challenge":"dns"}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	(&ApiService{}).IssueAcmeCertificateTask(ctx)
+
+	msg := decodeAPIMessage(t, rec.Body.String())
+	if msg.Success {
+		t.Fatalf("expected async request without acmeAccountId to fail: %#v", msg)
+	}
+	if !strings.Contains(msg.Msg, "acmeAccountId is required for domain certificate") {
+		t.Fatalf("unexpected async issue error message: %q", msg.Msg)
+	}
+}
+
+func TestRenewAcmeCertificateTaskRequiresCertificateID(t *testing.T) {
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest("POST", "/api/acme-renew-task", strings.NewReader(`{"force":false}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	(&ApiService{}).RenewAcmeCertificateTask(ctx)
+
+	msg := decodeAPIMessage(t, rec.Body.String())
+	if msg.Success {
+		t.Fatalf("expected async renew request without id to fail: %#v", msg)
+	}
+	if !strings.Contains(msg.Msg, "id is required") {
+		t.Fatalf("unexpected async renew error message: %q", msg.Msg)
+	}
+}
+
 func TestNormalizeAcmeIssueCertificateType(t *testing.T) {
 	tests := []struct {
 		input string

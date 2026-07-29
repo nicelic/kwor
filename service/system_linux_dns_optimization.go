@@ -2,7 +2,6 @@ package service
 
 import (
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 
@@ -36,7 +35,7 @@ type SystemLinuxDNSOptimizationOverview struct {
 
 func (s *SystemLinuxDNSOptimizationService) GetOverview() (*SystemLinuxDNSOptimizationOverview, error) {
 	overview := &SystemLinuxDNSOptimizationOverview{
-		Supported: runtime.GOOS == "linux",
+		Supported: IsSystemPlatformLinux(),
 	}
 
 	if !overview.Supported {
@@ -96,7 +95,7 @@ func (s *SystemLinuxDNSOptimizationService) SaveContent(content string) error {
 	systemLinuxDNSOptimizationMu.Lock()
 	defer systemLinuxDNSOptimizationMu.Unlock()
 
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return common.NewError("Linux DNS 修改仅支持 Linux")
 	}
 
@@ -127,7 +126,7 @@ func (s *SystemLinuxDNSOptimizationService) SaveNameServers(nameServersText stri
 	systemLinuxDNSOptimizationMu.Lock()
 	defer systemLinuxDNSOptimizationMu.Unlock()
 
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return common.NewError("Linux DNS 修改仅支持 Linux")
 	}
 
@@ -158,6 +157,10 @@ func (s *SystemLinuxDNSOptimizationService) applyManagedLinuxDNSContentLocked(co
 	if strings.TrimSpace(path) == "" {
 		return "", common.NewError("resolv.conf 路径为空")
 	}
+	ownership, err := BeginHostFileOwnership("dns-config", []string{path}, HostCleanupUnlockOnly)
+	if err != nil {
+		return "", common.NewError("记录 resolv.conf 所有权失败: ", err)
+	}
 
 	content = normalizeManagedLinuxDNSContent(content)
 	if err := rewriteManagedFileWithImmutable(path, content, managedFileRewriteOptions{
@@ -169,6 +172,11 @@ func (s *SystemLinuxDNSOptimizationService) applyManagedLinuxDNSContentLocked(co
 
 	if err := s.setString(systemLinuxDNSPathKey, path); err != nil {
 		return "", err
+	}
+	if ownership.ID != "" {
+		if err := VerifyAndActivateHostResource(ownership.ID); err != nil {
+			return "", common.NewError("确认 resolv.conf 所有权失败: ", err)
+		}
 	}
 	return path, nil
 }

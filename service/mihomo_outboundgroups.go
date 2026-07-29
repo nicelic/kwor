@@ -166,9 +166,11 @@ func (s *MihomoOutboundGroupService) Save(tx *gorm.DB, act string, data json.Raw
 		if group.Outbounds == "" {
 			group.Outbounds = "[]"
 		}
+		oldName := ""
 		if group.Id > 0 {
 			var existing model.MihomoOutboundGroup
 			if err := tx.Where("id = ?", group.Id).First(&existing).Error; err == nil {
+				oldName = strings.TrimSpace(existing.Name)
 				if group.SortOrder <= 0 {
 					group.SortOrder = existing.SortOrder
 				}
@@ -182,7 +184,13 @@ func (s *MihomoOutboundGroupService) Save(tx *gorm.DB, act string, data json.Raw
 			}
 			group.SortOrder = nextSortOrder
 		}
-		return tx.Save(&group).Error
+		if err := tx.Save(&group).Error; err != nil {
+			return err
+		}
+		if oldName != "" && oldName != group.Name {
+			return replaceMihomoShadowQUICJLSProxyReferences(tx, oldName, group.Name)
+		}
+		return nil
 	case "del":
 		var name string
 		if err := json.Unmarshal(data, &name); err != nil {
@@ -199,6 +207,14 @@ func (s *MihomoOutboundGroupService) Save(tx *gorm.DB, act string, data json.Raw
 		}
 
 		tags := parseOutboundGroupTags(group.Outbounds)
+		targets := append([]string{name}, tags...)
+		inboundTags, err := findMihomoShadowQUICJLSProxyInboundTags(tx, targets...)
+		if err != nil {
+			return err
+		}
+		if len(inboundTags) > 0 {
+			return common.NewErrorf("cannot delete mihomo outbound group %q: referenced by shadowquic inbound(s): %s", name, strings.Join(inboundTags, ", "))
+		}
 		if len(tags) > 0 {
 			if err := tx.Where("tag IN ?", tags).Delete(&model.MihomoOutbound{}).Error; err != nil {
 				return err
@@ -353,6 +369,13 @@ func (s *MihomoOutboundGroupService) RefreshSubscription(groupName string, url s
 	}
 
 	if len(result.Removed) > 0 {
+		inboundTags, err := findMihomoShadowQUICJLSProxyInboundTags(dbConn, result.Removed...)
+		if err != nil {
+			return nil, err
+		}
+		if len(inboundTags) > 0 {
+			return nil, common.NewErrorf("cannot refresh mihomo outbound group %q: removed outbound(s) are referenced by shadowquic inbound(s): %s", groupName, strings.Join(inboundTags, ", "))
+		}
 		if err := dbConn.Where("tag IN ?", result.Removed).Delete(&model.MihomoOutbound{}).Error; err != nil {
 			return nil, err
 		}
@@ -385,7 +408,7 @@ func (s *MihomoOutboundGroupService) RefreshSubscription(groupName string, url s
 }
 
 func (s *MihomoOutboundGroupService) notifyOutboundsChanged() {
-	LastUpdate = time.Now().Unix()
+	markLastUpdate(time.Now().Unix())
 	if err := NewMihomoManagerService().RegenerateServerConfig(); err != nil {
 		logger.Warning("[MihomoOutboundGroup] regenerate mihomo server config failed: ", err)
 	}

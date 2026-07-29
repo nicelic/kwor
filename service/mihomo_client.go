@@ -74,6 +74,9 @@ func (s *MihomoClientService) Save(tx *gorm.DB, act string, data json.RawMessage
 		if _, err = synchronizeMihomoSudokuBindings(tx, []*model.MihomoClient{&client}, nil, nil); err != nil {
 			return nil, err
 		}
+		if _, err = ensureMihomoShadowQUICCredentialsForClientBindings(tx, &client); err != nil {
+			return nil, err
+		}
 		if err = validateMihomoSnellClientBindings(tx, &client); err != nil {
 			return nil, err
 		}
@@ -141,14 +144,14 @@ func (s *MihomoClientService) Save(tx *gorm.DB, act string, data json.RawMessage
 
 		var clientInboundIDs []uint
 		if jsonErr := json.Unmarshal(client.Inbounds, &clientInboundIDs); jsonErr == nil {
-			if syncErr := s.MihomoNftTrafficService.SyncClientBindings(tx, client.Id, clientInboundIDs); syncErr != nil {
-				logger.Warning("failed to sync mihomo client traffic bindings for ", client.Name, ": ", syncErr)
+			if queueErr := s.MihomoNftTrafficService.QueueSyncClientBindings(tx, client.Id, clientInboundIDs); queueErr != nil {
+				logger.Warning("failed to queue mihomo client traffic binding sync for ", client.Name, ": ", queueErr)
 			}
 		}
 
 		if manualTrafficReset {
-			if resetErr := s.MihomoNftTrafficService.ResetClientTraffic(tx, client.Id); resetErr != nil {
-				logger.Warning("failed to reset mihomo client nft traffic baseline for ", client.Name, ": ", resetErr)
+			if queueErr := s.MihomoNftTrafficService.QueueClientTrafficReset(tx, client.Id); queueErr != nil {
+				logger.Warning("failed to queue mihomo client nft traffic reset for ", client.Name, ": ", queueErr)
 			}
 		}
 	case "addbulk":
@@ -171,6 +174,11 @@ func (s *MihomoClientService) Save(tx *gorm.DB, act string, data json.RawMessage
 		if _, err = synchronizeMihomoSudokuBindings(tx, clients, nil, nil); err != nil {
 			return nil, err
 		}
+		for _, client := range clients {
+			if _, err = ensureMihomoShadowQUICCredentialsForClientBindings(tx, client); err != nil {
+				return nil, err
+			}
+		}
 		if err = validateMihomoSnellClientBindingsBatch(tx, clients); err != nil {
 			return nil, err
 		}
@@ -187,8 +195,8 @@ func (s *MihomoClientService) Save(tx *gorm.DB, act string, data json.RawMessage
 		for _, client := range clients {
 			var clientInboundIDs []uint
 			if jsonErr := json.Unmarshal(client.Inbounds, &clientInboundIDs); jsonErr == nil {
-				if syncErr := s.MihomoNftTrafficService.SyncClientBindings(tx, client.Id, clientInboundIDs); syncErr != nil {
-					logger.Warning("failed to sync mihomo client traffic bindings for ", client.Name, ": ", syncErr)
+				if queueErr := s.MihomoNftTrafficService.QueueSyncClientBindings(tx, client.Id, clientInboundIDs); queueErr != nil {
+					logger.Warning("failed to queue mihomo client traffic binding sync for ", client.Name, ": ", queueErr)
 				}
 			}
 		}
@@ -372,6 +380,11 @@ func (s *MihomoClientService) UpdateClientsOnInboundAdd(tx *gorm.DB, initIDs str
 			return err
 		}
 		client.Inbounds = inboundsRaw
+		if strings.EqualFold(strings.TrimSpace(inbound.Type), "shadowquic") {
+			if _, err := ensureMihomoShadowQUICClientCredentials(&client); err != nil {
+				return err
+			}
+		}
 
 		var clientLinks, newClientLinks []map[string]string
 		_ = json.Unmarshal(client.Links, &clientLinks)
@@ -398,8 +411,8 @@ func (s *MihomoClientService) UpdateClientsOnInboundAdd(tx *gorm.DB, initIDs str
 		if err := tx.Save(&client).Error; err != nil {
 			return err
 		}
-		if syncErr := s.MihomoNftTrafficService.SyncClientBindings(tx, client.Id, clientInbounds); syncErr != nil {
-			logger.Warning("failed to sync mihomo client traffic bindings for ", client.Name, " after inbound add: ", syncErr)
+		if queueErr := s.MihomoNftTrafficService.QueueSyncClientBindings(tx, client.Id, clientInbounds); queueErr != nil {
+			logger.Warning("failed to queue mihomo client traffic binding sync for ", client.Name, " after inbound add: ", queueErr)
 		}
 	}
 
@@ -445,8 +458,8 @@ func (s *MihomoClientService) UpdateClientsOnInboundDelete(tx *gorm.DB, id uint,
 		if err := tx.Save(&client).Error; err != nil {
 			return err
 		}
-		if syncErr := s.MihomoNftTrafficService.SyncClientBindings(tx, client.Id, newClientInbounds); syncErr != nil {
-			logger.Warning("failed to sync mihomo client traffic bindings for ", client.Name, " after inbound delete: ", syncErr)
+		if queueErr := s.MihomoNftTrafficService.QueueSyncClientBindings(tx, client.Id, newClientInbounds); queueErr != nil {
+			logger.Warning("failed to queue mihomo client traffic binding sync for ", client.Name, " after inbound delete: ", queueErr)
 		}
 	}
 
@@ -469,6 +482,11 @@ func (s *MihomoClientService) UpdateLinksByInboundChange(tx *gorm.DB, inbounds *
 
 		base := inbound.ToBase()
 		for _, client := range clients {
+			if strings.EqualFold(strings.TrimSpace(inbound.Type), "shadowquic") {
+				if _, err := ensureMihomoShadowQUICClientCredentials(&client); err != nil {
+					return err
+				}
+			}
 			var clientLinks, newClientLinks []map[string]string
 			_ = json.Unmarshal(client.Links, &clientLinks)
 			serverHost := util.ResolveSubscriptionServerHost(client.ServerIp, &base, hostname)
@@ -503,7 +521,7 @@ func (s *MihomoClientService) UpdateLinksByInboundChange(tx *gorm.DB, inbounds *
 // ResetTrafficBySchedule resets mihomo client traffic by configured monthly reset days.
 func (s *MihomoClientService) ResetTrafficBySchedule() error {
 	db := database.GetDB()
-	now := time.Now().In(getClientAccessPolicyLocation())
+	now := PanelNow()
 
 	var clients []model.MihomoClient
 	err := db.Model(model.MihomoClient{}).
@@ -516,24 +534,14 @@ func (s *MihomoClientService) ResetTrafficBySchedule() error {
 		return nil
 	}
 
-	tx := db.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
-
 	for _, client := range clients {
 		if !shouldResetClientTrafficMonthly(client.LastReset, client.Extra, now) {
 			continue
 		}
 		logger.Info("Resetting traffic for mihomo client ", client.Name, " (reset days: ", client.Extra, ")")
-		if resetErr := s.MihomoNftTrafficService.ResetClientTraffic(tx, client.Id); resetErr != nil {
+		if resetErr := s.MihomoNftTrafficService.ResetClientTraffic(db, client.Id); resetErr != nil {
 			logger.Warning("failed to reset traffic for mihomo client ", client.Name, ": ", resetErr)
 		}
-	}
-
-	if err = tx.Commit().Error; err != nil {
-		tx.Rollback()
-		return err
 	}
 	return nil
 }
@@ -598,12 +606,14 @@ func (s *MihomoClientService) DepleteClients() ([]uint, error) {
 			tx.Rollback()
 			return nil, err
 		}
-		LastUpdate = dt
 	}
 
 	if err = tx.Commit().Error; err != nil {
 		tx.Rollback()
 		return nil, err
+	}
+	if len(changes) > 0 {
+		markLastUpdate(dt)
 	}
 
 	return inboundIDs, nil

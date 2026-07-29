@@ -13,24 +13,6 @@ export const tlsStoreOptions = [
   { title: "None", value: "none" },
 ]
 
-export const ruleSetSourceOptions = [
-  { title: "KaringX GitHub", value: "karingx_github" },
-  { title: "KaringX CDN", value: "karingx_cdn" },
-  { title: "Loyalsoldier_IP Github", value: "loyalsoldier_ip_github" },
-  { title: "Loyalsoldier_IP CDN", value: "loyalsoldier_ip_cdn" },
-  { title: "QuixoticHeart Github", value: "quixoticheart_github" },
-  { title: "SagerNet Github", value: "sagernet_github" },
-  { title: "SagerNet CDN", value: "sagernet_cdn" },
-  { title: "MetaCubeX Github", value: "metacubex_github" },
-  { title: "MetaCubeX CDN", value: "metacubex_cdn" },
-  { title: "Chocolate4U Github", value: "chocolate4u_github" },
-  { title: "Chocolate4U CDN", value: "chocolate4u_cdn" },
-  { title: "lyc8503 Github", value: "lyc8503_github" },
-  { title: "lyc8503 CDN", value: "lyc8503_cdn" },
-  { title: "lyc8503 CDN 1", value: "lyc8503_cdn1" },
-  { title: "自定义规则集完整链接", value: "" },
-]
-
 export const domainIpTypes = [
   { title: "域名 (domain)", value: "domain" },
   { title: "域名后缀 (domain_suffix)", value: "domain_suffix" },
@@ -134,89 +116,6 @@ export const geo = [
 // Comment cleaned to avoid mojibake.
 // Comment cleaned to avoid mojibake.
 // Comment cleaned to avoid mojibake.
-
-export const RULE_SET_URL_TEMPLATES: Record<string, { geosite: string; geoip: string }> = {
-  // SagerNet Github
-  sagernet_github: {
-    geosite: 'https://github.com/SagerNet/sing-geosite/raw/rule-set/geosite-{name}.srs',
-    geoip: 'https://github.com/SagerNet/sing-geoip/raw/rule-set/geoip-{name}.srs',
-  },
-  // SagerNet CDN (fastly.jsdelivr)
-  sagernet_cdn: {
-    geosite: 'https://fastly.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-{name}.srs',
-    geoip: 'https://fastly.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-{name}.srs',
-  },
-  // KaringX GitHub
-  karingx_github: {
-    geosite: 'https://github.com/KaringX/karing-ruleset/raw/refs/heads/sing/geo/geosite/{name}.srs',
-    geoip: 'https://github.com/KaringX/karing-ruleset/raw/refs/heads/sing/geo/geoip/{name}.srs',
-  },
-  // KaringX CDN (fastly.jsdelivr)
-  karingx_cdn: {
-    geosite: 'https://fastly.jsdelivr.net/gh/KaringX/karing-ruleset@sing/geo/geosite/{name}.srs',
-    geoip: 'https://fastly.jsdelivr.net/gh/KaringX/karing-ruleset@sing/geo/geoip/{name}.srs',
-  },
-  // Loyalsoldier_IP Github
-  loyalsoldier_ip_github: {
-    geosite: 'https://raw.githubusercontent.com/Loyalsoldier/geoip/release/srs/{name}.srs',
-    geoip: 'https://raw.githubusercontent.com/Loyalsoldier/geoip/release/srs/{name}.srs',
-  },
-  // Loyalsoldier_IP CDN (fastly.jsdelivr)
-  loyalsoldier_ip_cdn: {
-    geosite: 'https://fastly.jsdelivr.net/gh/Loyalsoldier/geoip@release/srs/{name}.srs',
-    geoip: 'https://fastly.jsdelivr.net/gh/Loyalsoldier/geoip@release/srs/{name}.srs',
-  },
-  // QuixoticHeart Github (singbox version4)
-  quixoticheart_github: {
-    geosite: 'https://github.com/QuixoticHeart/rule-set/raw/refs/heads/ruleset/singbox/version4/{name}.srs',
-    geoip: 'https://github.com/QuixoticHeart/rule-set/raw/refs/heads/ruleset/singbox/version4/{name}.srs',
-  },
-  // MetaCubeX Github
-  metacubex_github: {
-    geosite: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/{name}.srs',
-    geoip: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/{name}.srs',
-  },
-  // MetaCubeX CDN (testingcf.jsdelivr)
-  metacubex_cdn: {
-    geosite: 'https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/{name}.srs',
-    geoip: 'https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/{name}.srs',
-  },
-  // Chocolate4U Github
-  chocolate4u_github: {
-    geosite: 'https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-{name}.srs',
-    geoip: 'https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-{name}.srs',
-  },
-  // Chocolate4U CDN (cdn.jsdelivr)
-  chocolate4u_cdn: {
-    geosite: 'https://cdn.jsdelivr.net/gh/Chocolate4U/Iran-sing-box-rules@rule-set/geosite-{name}.srs',
-    geoip: 'https://cdn.jsdelivr.net/gh/Chocolate4U/Iran-sing-box-rules@rule-set/geoip-{name}.srs',
-  },
-  // lyc8503 Github
-  lyc8503_github: {
-    geosite: 'https://github.com/lyc8503/sing-box-rules/raw/refs/heads/rule-set-geosite/geosite-{name}.srs',
-    geoip: 'https://github.com/lyc8503/sing-box-rules/raw/refs/heads/rule-set-geoip/geoip-{name}.srs',
-  },
-  // lyc8503 CDN (cdn.jsdelivr)
-  lyc8503_cdn: {
-    geosite: 'https://cdn.jsdelivr.net/gh/lyc8503/sing-box-rules@rule-set-geosite/geosite-{name}.srs',
-    geoip: 'https://cdn.jsdelivr.net/gh/lyc8503/sing-box-rules@rule-set-geoip/geoip-{name}.srs',
-  },
-  // lyc8503 CDN 1 (fastly.jsdelivr)
-  lyc8503_cdn1: {
-    geosite: 'https://fastly.jsdelivr.net/gh/lyc8503/sing-box-rules@rule-set-geosite/geosite-{name}.srs',
-    geoip: 'https://fastly.jsdelivr.net/gh/lyc8503/sing-box-rules@rule-set-geoip/geoip-{name}.srs',
-  },
-}
-
-// MetaCubeX 名称映射（部分名称在 MetaCubeX 中需要特殊映射）
-export const METACUBEX_NAME_MAP: Record<string, string> = {
-  'ads': 'category-ads-all',
-  'ir': 'category-ir',
-}
-
-// 需要名称映射的来源列表 (MetaCubeX 系列)
-// Sources requiring name mapping (MetaCubeX family).
-export const SOURCES_NEED_NAME_MAP = ['metacubex_github', 'metacubex_cdn', 'karingx_github', 'karingx_cdn']
 
 // ===== Rule Slot Mapping =====
 // Slots 1-3: custom rules (block/direct/proxy).
@@ -343,4 +242,3 @@ export const defaultDns = {
   ],
   strategy: "prefer_ipv4",
 }
-

@@ -42,7 +42,8 @@ export default createVuetify({
       },
       dark: {
         colors: {
-          primary: colors.blue.darken4,
+          primary: '#60A5FA',
+          'on-primary': '#0F172A',
           error: colors.red.accent3,
         },
       },

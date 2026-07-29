@@ -2,6 +2,7 @@ package api
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/alireza0/s-ui/service"
@@ -83,5 +84,12 @@ func TestParsePortCheckRequestBodyInvalid(t *testing.T) {
 	_, err := parsePortCheckRequestBody([]byte("not_a_valid_payload"))
 	if err == nil {
 		t.Fatal("expected parse error for invalid payload")
+	}
+}
+
+func TestReadPortCheckRequestBodyRejectsOversizedInput(t *testing.T) {
+	_, err := readPortCheckRequestBody(strings.NewReader(strings.Repeat("x", int(portCheckRequestMaxBytes)+1)))
+	if err == nil {
+		t.Fatal("expected oversized port occupancy request to be rejected")
 	}
 }

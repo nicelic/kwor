@@ -1,9 +1,14 @@
 <template>
   <SingboxCore
-    v-if="namespaceApi.showCoreControlsOnInbounds"
+    v-if="namespaceApi.showCoreControlsOnInbounds && props.namespace !== 'mihomo'"
     v-model="coreModal.visible"
     :visible="coreModal.visible"
-    :namespace="props.namespace"
+    @close="closeCoreModal"
+  />
+  <MihomoCore
+    v-else-if="namespaceApi.showCoreControlsOnInbounds"
+    v-model="coreModal.visible"
+    :visible="coreModal.visible"
     @close="closeCoreModal"
   />
   <InboundVue
@@ -186,6 +191,7 @@
 
 <script lang="ts" setup>
 import SingboxCore from '@/layouts/modals/SingboxCore.vue'
+import MihomoCore from '@/layouts/modals/MihomoCore.vue'
 import InboundVue from '@/layouts/modals/Inbound.vue'
 import Stats from '@/layouts/modals/Stats.vue'
 import PortLogs from '@/layouts/modals/PortLogs.vue'
@@ -312,6 +318,8 @@ const monitorState = ref(<Record<string, string>>{})
 const monitorIntervalId = ref(<ReturnType<typeof setInterval> | 0>0)
 const portCheckUnsupportedHinted = ref(false)
 const coreRunning = ref(false)
+let portRangeMonitorRequest: Promise<void> | null = null
+let coreUpdateMarkerRequest: Promise<void> | null = null
 
 const summarizePorts = (ports: number[]): string => {
   if (!ports || ports.length === 0) return '-'
@@ -423,62 +431,84 @@ const handleRangeStatus = (status: UDPRangeStatus) => {
   monitorState.value[stateKey] = 'free'
 }
 
-const runPortRangeMonitor = async () => {
-  const targets = getMonitorTargets()
-  if (targets.length === 0) {
-    monitorState.value = {}
-    return
-  }
-
-  const isCoreRunning = await refreshCoreRunning()
-  if (!isCoreRunning) {
-    monitorState.value = {}
-    return
-  }
-
-  const response = await checkPortOccupancy({
-    udp_ranges: targets,
-  })
-  if (!response) return
-  if (!response.supported) {
-    showUnsupportedHint()
-    return
-  }
-
-  const activeKeys = new Set<string>()
-  for (const status of response.udp_ranges ?? []) {
-    handleRangeStatus(status)
-    activeKeys.add(getStateKey(status))
-  }
-
-  for (const key of Object.keys(monitorState.value)) {
-    if (!activeKeys.has(key)) {
-      delete monitorState.value[key]
+const runPortRangeMonitor = (): Promise<void> => {
+  if (portRangeMonitorRequest) return portRangeMonitorRequest
+  const request = (async () => {
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+    const targets = getMonitorTargets()
+    if (targets.length === 0) {
+      monitorState.value = {}
+      return
     }
-  }
+
+    const isCoreRunning = await refreshCoreRunning()
+    if (!isCoreRunning) {
+      monitorState.value = {}
+      return
+    }
+
+    const response = await checkPortOccupancy({
+      udp_ranges: targets,
+    })
+    if (!response) return
+    if (!response.supported) {
+      showUnsupportedHint()
+      return
+    }
+
+    const activeKeys = new Set<string>()
+    for (const status of response.udp_ranges ?? []) {
+      handleRangeStatus(status)
+      activeKeys.add(getStateKey(status))
+    }
+
+    for (const key of Object.keys(monitorState.value)) {
+      if (!activeKeys.has(key)) {
+        delete monitorState.value[key]
+      }
+    }
+  })()
+  portRangeMonitorRequest = request
+  void request.finally(() => {
+    if (portRangeMonitorRequest === request) {
+      portRangeMonitorRequest = null
+    }
+  })
+  return request
 }
 
 const loadCoreStatus = async () => {
   await refreshCoreRunning()
 }
 
-const loadCoreUpdateMarker = async () => {
-  if (!namespaceApi.showCoreControlsOnInbounds) {
-    coreUpdateCount.value = 0
-    return
-  }
-  try {
-    const data = await HttpUtils.get(namespaceApi.core.updateInfoEndpoint)
-    if (data.success && data.obj) {
-      const stable = data.obj.pendingStable ? 1 : 0
-      const alpha = namespaceApi.core.supportsPrereleaseChannel && data.obj.pendingAlpha ? 1 : 0
-      coreUpdateCount.value = stable + alpha
-    } else {
+const loadCoreUpdateMarker = (): Promise<void> => {
+  if (coreUpdateMarkerRequest) return coreUpdateMarkerRequest
+  const request = (async () => {
+    if (!namespaceApi.showCoreControlsOnInbounds) {
+      coreUpdateCount.value = 0
+      return
+    }
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+    try {
+      const data = await HttpUtils.get(namespaceApi.core.updateInfoEndpoint)
+      if (data.success && data.obj) {
+        const stable = data.obj.pendingStable ? 1 : 0
+        const alpha = namespaceApi.core.supportsPrereleaseChannel && data.obj.pendingAlpha ? 1 : 0
+        coreUpdateCount.value = stable + alpha
+      } else {
+        coreUpdateCount.value = 0
+      }
+    } catch {
       coreUpdateCount.value = 0
     }
-  } catch {
-    coreUpdateCount.value = 0
-  }
+  })()
+  coreUpdateMarkerRequest = request
+  void request.finally(() => {
+    if (coreUpdateMarkerRequest === request) {
+      coreUpdateMarkerRequest = null
+    }
+  })
+  return request
 }
 
 const startCore = async () => {
@@ -520,6 +550,44 @@ const restartCore = async () => {
   }
 }
 
+const stopBackgroundPolling = () => {
+  if (monitorIntervalId.value !== 0) {
+    clearInterval(monitorIntervalId.value)
+    monitorIntervalId.value = 0
+  }
+  if (coreUpdateTimerId.value !== 0) {
+    clearInterval(coreUpdateTimerId.value)
+    coreUpdateTimerId.value = 0
+  }
+}
+
+const startBackgroundPolling = () => {
+  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+  if (namespaceApi.showCoreControlsOnInbounds) {
+    void loadCoreStatus()
+    void loadCoreUpdateMarker()
+    if (coreUpdateTimerId.value === 0) {
+      coreUpdateTimerId.value = setInterval(() => {
+        void loadCoreUpdateMarker()
+      }, 60000)
+    }
+  }
+  void runPortRangeMonitor()
+  if (monitorIntervalId.value === 0) {
+    monitorIntervalId.value = setInterval(() => {
+      void runPortRangeMonitor()
+    }, 30000)
+  }
+}
+
+const handleVisibilityChange = () => {
+  if (document.visibilityState === 'visible') {
+    startBackgroundPolling()
+    return
+  }
+  stopBackgroundPolling()
+}
+
 onMounted(() => {
   const rawLogs = localStorage.getItem(PORT_LOG_STORAGE_KEY)
   if (rawLogs) {
@@ -533,28 +601,17 @@ onMounted(() => {
     }
   }
 
-  if (namespaceApi.showCoreControlsOnInbounds) {
-    void loadCoreStatus()
-    void loadCoreUpdateMarker()
-    coreUpdateTimerId.value = setInterval(() => {
-      void loadCoreUpdateMarker()
-    }, 60000)
-  }
 
-  void runPortRangeMonitor()
-  monitorIntervalId.value = setInterval(() => {
-    void runPortRangeMonitor()
-  }, 30000)
+  startBackgroundPolling()
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+  }
 })
 
 onUnmounted(() => {
-  if (monitorIntervalId.value !== 0) {
-    clearInterval(monitorIntervalId.value)
-    monitorIntervalId.value = 0
-  }
-  if (coreUpdateTimerId.value !== 0) {
-    clearInterval(coreUpdateTimerId.value)
-    coreUpdateTimerId.value = 0
+  stopBackgroundPolling()
+  if (typeof document !== 'undefined') {
+    document.removeEventListener('visibilitychange', handleVisibilityChange)
   }
 })
 </script>

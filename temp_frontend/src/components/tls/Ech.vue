@@ -85,49 +85,56 @@ export default {
   methods: {
     async genECH(){
       this.loading = true
-      const msg = await HttpUtils.get('api/keypairs', {
-        k: "ech",
-        o: this.iTls.server_name?? "''"
-      })
-      this.loading = false
-      if (msg.success && this.iTls.ech && this.oTls.ech) {
-        this.iTls.ech.key_path=undefined
-        this.useEchPath = 1
-        if (msg.obj.length>0){
-          let config = <string[]>[]
-          let key = <string[]>[]
-          let isConfig = false
-          let isKey = false
-
-          msg.obj.forEach((line:string) => {
-            if (line === "-----BEGIN ECH CONFIGS-----") {
-              isConfig = true
-              isKey = false
-              config.push(line)
-            } else if (line === "-----END ECH CONFIGS-----") {
-              isConfig = false
-              config.push(line)
-            } else if (line === "-----BEGIN ECH KEYS-----") {
-              isKey = true
-              isConfig = false
-              key.push(line)
-            } else if (line === "-----END ECH KEYS-----") {
-              isKey = false
-              key.push(line)
-            } else if (isConfig) {
-              config.push(line)
-            } else if (isKey) {
-              key.push(line)
-            }
-          })
-          this.iTls.ech.key = key?? undefined
-          this.oTls.ech.config = config?? undefined
-
-        } else {
+      try {
+        const msg = await HttpUtils.get('api/keypairs', {
+          k: "ech",
+          o: this.iTls.server_name?? "''"
+        })
+        if (!msg.success || !Array.isArray(msg.obj) || !this.iTls.ech || !this.oTls.ech) {
           push.error({
             message: i18n.global.t('error') + ": " + msg.obj
           })
+          return
         }
+        if (msg.obj.length === 0) {
+          push.error({
+            message: i18n.global.t('error') + ": " + msg.obj
+          })
+          return
+        }
+
+        this.iTls.ech.key_path=undefined
+        this.useEchPath = 1
+        let config = <string[]>[]
+        let key = <string[]>[]
+        let isConfig = false
+        let isKey = false
+
+        msg.obj.forEach((line:string) => {
+          if (line === "-----BEGIN ECH CONFIGS-----") {
+            isConfig = true
+            isKey = false
+            config.push(line)
+          } else if (line === "-----END ECH CONFIGS-----") {
+            isConfig = false
+            config.push(line)
+          } else if (line === "-----BEGIN ECH KEYS-----") {
+            isKey = true
+            isConfig = false
+            key.push(line)
+          } else if (line === "-----END ECH KEYS-----") {
+            isKey = false
+            key.push(line)
+          } else if (isConfig) {
+            config.push(line)
+          } else if (isKey) {
+            key.push(line)
+          }
+        })
+        this.iTls.ech.key = key?? undefined
+        this.oTls.ech.config = config?? undefined
+      } finally {
+        this.loading = false
       }
     },
   },

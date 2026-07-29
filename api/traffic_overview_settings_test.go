@@ -297,6 +297,15 @@ func TestGetTrafficOverviewVnstatVersionsReturnsBothSources(t *testing.T) {
 			t.Fatalf("unexpected version option payload: %#v", rawVersion)
 		}
 		value, _ := item["value"].(string)
+		available, hasAvailable := item["available"].(bool)
+		if !hasAvailable {
+			t.Fatalf("version option %q is missing availability state: %#v", value, item)
+		}
+		if !available {
+			if reason, _ := item["reason"].(string); strings.TrimSpace(reason) == "" {
+				t.Fatalf("unavailable version option %q is missing its reason: %#v", value, item)
+			}
+		}
 		values = append(values, value)
 	}
 	if len(values) != 2 {
@@ -304,6 +313,27 @@ func TestGetTrafficOverviewVnstatVersionsReturnsBothSources(t *testing.T) {
 	}
 	if values[0] != "system-package" || values[1] != "github-release" {
 		t.Fatalf("version option values=%v, want [system-package github-release]", values)
+	}
+}
+
+func TestGetTrafficOverviewVnstatInstallStatusReturnsIdleWhenNoTaskExists(t *testing.T) {
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest("GET", "/api/traffic-overview-vnstat-install-status", nil)
+
+	apiSvc := &ApiService{}
+	apiSvc.GetTrafficOverviewVnstatInstallStatus(ctx)
+
+	msg := decodeAPIMessage(t, rec.Body.String())
+	if !msg.Success {
+		t.Fatalf("expected success response, got error: %s", msg.Msg)
+	}
+	payload, ok := msg.Obj.(map[string]interface{})
+	if !ok {
+		t.Fatalf("unexpected obj payload: %#v", msg.Obj)
+	}
+	if state, _ := payload["state"].(string); state != "idle" {
+		t.Fatalf("install status state=%q, want idle; payload=%#v", state, payload)
 	}
 }
 

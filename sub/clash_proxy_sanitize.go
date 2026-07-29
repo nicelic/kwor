@@ -1,6 +1,10 @@
 package sub
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/alireza0/s-ui/util"
+)
 
 func sanitizeMihomoClashProxy(proxy map[string]interface{}) (map[string]interface{}, bool) {
 	if proxy == nil {
@@ -8,7 +12,7 @@ func sanitizeMihomoClashProxy(proxy map[string]interface{}) (map[string]interfac
 	}
 
 	sanitized := cloneClashProxyMap(proxy)
-	changed := false
+	changed := stripSubscriptionClashProxyPanelFields(sanitized)
 
 	proxyType := strings.ToLower(strings.TrimSpace(firstString(sanitized["type"])))
 	switch proxyType {
@@ -28,9 +32,55 @@ func sanitizeMihomoClashProxy(proxy map[string]interface{}) (map[string]interfac
 			delete(sanitized, "down")
 			changed = true
 		}
+	case "shadowquic":
+		// ShadowQUIC only supports its official native fields. Rebuild every
+		// stored/imported Clash proxy so TLS and generic dial fields cannot be
+		// replayed from a raw YAML snippet.
+		name := strings.TrimSpace(firstString(sanitized["name"]))
+		normalized, ok := util.BuildMihomoShadowQUICClashProxy(sanitized, name)
+		if !ok {
+			return nil, true
+		}
+		return normalized, true
 	}
 
 	return sanitized, changed
+}
+
+func stripSubscriptionClashProxyPanelFields(proxy map[string]interface{}) bool {
+	if proxy == nil {
+		return false
+	}
+
+	changed := false
+	for _, key := range []string{
+		"id",
+		"tls_id",
+		"route_tag",
+		"user_management",
+		"metadata",
+		"users",
+		"inbounds",
+		"addrs",
+		"out_json",
+		"options",
+		"source_type",
+		"source_client_id",
+		"source_inbound_id",
+		"server_port",
+		"alter_id",
+		"tls_store",
+		"mihomo_common",
+		"mihomo_hy2",
+		"mihomo_fast_open",
+		"fast_open",
+	} {
+		if _, exists := proxy[key]; exists {
+			delete(proxy, key)
+			changed = true
+		}
+	}
+	return changed
 }
 
 func cloneClashProxyMap(src map[string]interface{}) map[string]interface{} {

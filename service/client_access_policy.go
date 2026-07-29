@@ -42,7 +42,7 @@ func normalizeClientSpeedLimitMbps(limit int) int {
 func getClientAccessPolicyLocation() *time.Location {
 	loc, err := (&SettingService{}).GetTimeLocation()
 	if err != nil || loc == nil {
-		return time.Local
+		return time.UTC
 	}
 	return loc
 }

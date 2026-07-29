@@ -470,6 +470,55 @@ func convertClashProxyToSubOutbound(proxy map[string]interface{}) (map[string]in
 		} else if maxStreams, ok := toIntValue(proxy["max_streams"]); ok && maxStreams >= 0 {
 			outbound["max_streams"] = maxStreams
 		}
+	case "shadowquic":
+		if username, ok := proxy["username"].(string); ok && strings.TrimSpace(username) != "" {
+			outbound["username"] = strings.TrimSpace(username)
+		}
+		if password, ok := proxy["password"].(string); ok && strings.TrimSpace(password) != "" {
+			outbound["password"] = strings.TrimSpace(password)
+		}
+		if sni, ok := proxy["sni"].(string); ok && strings.TrimSpace(sni) != "" {
+			outbound["sni"] = strings.TrimSpace(sni)
+		}
+		if alpn := toStringSliceValue(proxy["alpn"]); len(alpn) > 0 {
+			outbound["alpn"] = alpn
+		}
+		if versions := toStringSliceValue(proxy["quic-versions"]); len(versions) > 0 {
+			outbound["quic_versions"] = versions
+		}
+		for proxyKey, outboundKey := range map[string]string{
+			"udp-over-stream":       "udp_over_stream",
+			"zero-rtt":              "zero_rtt",
+			"disable-mtu-discovery": "disable_mtu_discovery",
+		} {
+			if value, ok := toBoolValue(proxy[proxyKey]); ok {
+				outbound[outboundKey] = value
+			}
+		}
+		for proxyKey, outboundKey := range map[string]string{
+			"keep-alive-interval":     "keep_alive_interval",
+			"cwnd":                    "cwnd",
+			"max-datagram-frame-size": "max_datagram_frame_size",
+			"max-open-streams":        "max_open_streams",
+			"recv-window-conn":        "recv_window_conn",
+			"recv-window":             "recv_window",
+		} {
+			if value, ok := toIntValue(proxy[proxyKey]); ok && value >= 0 {
+				outbound[outboundKey] = value
+			}
+		}
+		for proxyKey, outboundKey := range map[string]string{
+			"congestion-controller": "congestion_controller",
+			"bbr-profile":           "bbr_profile",
+			"up":                    "up",
+			"down":                  "down",
+		} {
+			if value := strings.TrimSpace(firstStringValue(proxy[proxyKey])); value != "" {
+				outbound[outboundKey] = value
+			}
+		}
+		util.SanitizeMihomoShadowQUICOutbound(outbound)
+		return outbound, true
 	}
 
 	tlsMap := map[string]interface{}{}
@@ -724,7 +773,7 @@ func clashTypeToSubType(clashType string) string {
 		return "shadowsocks"
 	case "socks5":
 		return "socks"
-	case "vmess", "vless", "trojan", "snell", "tuic", "hysteria", "hysteria2", "anytls", "http":
+	case "vmess", "vless", "trojan", "snell", "tuic", "hysteria", "hysteria2", "anytls", "http", "shadowquic":
 		return clashType
 	case "mieru":
 		return "mieru"

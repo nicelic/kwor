@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -93,9 +92,9 @@ func resolveExistingSSHConfigMainPath() (string, error) {
 
 func resolveFirewallSSHConfigStatus() FirewallSSHConfigStatus {
 	status := FirewallSSHConfigStatus{
-		Supported: runtime.GOOS == "linux",
+		Supported: IsSystemPlatformLinux(),
 		ConfigPath: func() string {
-			if runtime.GOOS != "linux" {
+			if !IsSystemPlatformLinux() {
 				return ""
 			}
 			return detectSSHConfigMainPath()
@@ -103,7 +102,7 @@ func resolveFirewallSSHConfigStatus() FirewallSSHConfigStatus {
 		Ports: []int{22},
 		Port:  22,
 	}
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		status.Error = "ssh config management is available on Linux only"
 		return status
 	}
@@ -136,7 +135,7 @@ func (s *FirewallService) UpdateSSHPort(port int) error {
 	if port < 1 || port > 65535 {
 		return common.NewError("ssh port must be in range 1-65535")
 	}
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return common.NewError("ssh config update is available on Linux only")
 	}
 
@@ -156,7 +155,7 @@ func (s *FirewallService) UpdateSSHPort(port int) error {
 }
 
 func (s *FirewallService) SetSSHProxyEnabled(enabled bool) error {
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return common.NewError("ssh config update is available on Linux only")
 	}
 
@@ -514,7 +513,7 @@ func normalizeSSHDirectiveOverrides(directives map[string]string) map[string]str
 }
 
 func validateSSHConfig(configPath string) error {
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return nil
 	}
 
@@ -546,7 +545,7 @@ func resolveSSHDExecutablePath() string {
 }
 
 func restartSSHService() error {
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return common.NewError("ssh service restart is available on Linux only")
 	}
 

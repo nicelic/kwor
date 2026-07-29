@@ -57,6 +57,7 @@
 import { i18n } from "@/locales";
 import HttpUtils from "@/plugins/httputil";
 import { HumanReadable } from "@/plugins/utils";
+import { formatPanelDateTime } from "@/plugins/panelTime";
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -160,74 +161,108 @@ export default {
     };
   },
   methods: {
-    async loadData() {
-      this.loading = true;
-      const data = await HttpUtils.get("api/stats", {
-        resource: this.resource,
-        tag: this.tag,
-        limit: this.limit,
-        namespace: this.namespace ?? "default",
-      });
-      if (data.success && data.obj) {
-        const obj = (<any[]>data.obj)
-          .slice()
-          .sort((a, b) => a.dateTime - b.dateTime);
-        const l = String(i18n.global.locale) == "fa" ? "fa-IR" : "en-US";
-        const labels = <string[]>[];
-        const uplinkData = <(number | null)[]>[];
-        const downlinkData = <(number | null)[]>[];
-        const grouped = new Map<
-          number,
-          { up: number | null; down: number | null }
-        >();
-        for (const item of obj) {
-          const bucket = Number(item.dateTime) * 1000;
-          if (!grouped.has(bucket)) {
-            grouped.set(bucket, { up: null, down: null });
-          }
-          const point = grouped.get(bucket)!;
-          if (item.direction) {
-            point.up = (point.up ?? 0) + Number(item.traffic ?? 0);
-          } else {
-            point.down = (point.down ?? 0) + Number(item.traffic ?? 0);
-          }
-        }
-        const buckets = Array.from(grouped.keys()).sort((a, b) => a - b);
-        for (const bucket of buckets) {
-          const point = grouped.get(bucket)!;
-          labels.push(this.genLable(bucket, l));
-          uplinkData.push(point.up);
-          downlinkData.push(point.down);
-        }
-        this.usage = {
-          labels: labels,
-          datasets: [
-            {
-              label: i18n.global.t("stats.upload"),
-              backgroundColor: "rgba(255, 165, 0, 0.4)",
-              borderColor: "rgba(255, 165, 0)",
-              fill: true,
-              data: uplinkData,
-            },
-            {
-              label: i18n.global.t("stats.download"),
-              backgroundColor: "rgba(0, 128, 0, 0.2)",
-              borderColor: "rgba(0, 128, 0)",
-              fill: true,
-              data: downlinkData,
-            },
-          ],
-        };
-        this.loaded = labels.length > 0;
-        this.alert = labels.length === 0;
-      } else {
-        this.alert = true;
-        this.loaded = false;
+    stopPolling() {
+      if (this.intervalId && this.intervalId != 0) {
+        clearInterval(this.intervalId);
+        this.intervalId = 0;
       }
-      this.loading = false;
+    },
+    startPolling() {
+      this.stopPolling();
+      if (!this.$props.visible) {
+        return;
+      }
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+        return;
+      }
+      this.intervalId = setInterval(() => {
+        this.loadData();
+      }, 10000);
+    },
+    handleVisibilityChange() {
+      if (document.visibilityState === "visible") {
+        if (this.$props.visible) {
+          this.loadData();
+          this.startPolling();
+        }
+        return;
+      }
+      this.stopPolling();
+    },
+    async loadData() {
+      if (this.loading) {
+        return;
+      }
+      this.loading = true;
+      try {
+        const data = await HttpUtils.get("api/stats", {
+          resource: this.resource,
+          tag: this.tag,
+          limit: this.limit,
+          namespace: this.namespace ?? "default",
+        });
+        if (data.success && data.obj) {
+          const obj = (<any[]>data.obj)
+            .slice()
+            .sort((a, b) => a.dateTime - b.dateTime);
+          const l = String(i18n.global.locale) == "fa" ? "fa-IR" : "en-US";
+          const labels = <string[]>[];
+          const uplinkData = <(number | null)[]>[];
+          const downlinkData = <(number | null)[]>[];
+          const grouped = new Map<
+            number,
+            { up: number | null; down: number | null }
+          >();
+          for (const item of obj) {
+            const bucket = Number(item.dateTime) * 1000;
+            if (!grouped.has(bucket)) {
+              grouped.set(bucket, { up: null, down: null });
+            }
+            const point = grouped.get(bucket)!;
+            if (item.direction) {
+              point.up = (point.up ?? 0) + Number(item.traffic ?? 0);
+            } else {
+              point.down = (point.down ?? 0) + Number(item.traffic ?? 0);
+            }
+          }
+          const buckets = Array.from(grouped.keys()).sort((a, b) => a - b);
+          for (const bucket of buckets) {
+            const point = grouped.get(bucket)!;
+            labels.push(this.genLable(bucket, l));
+            uplinkData.push(point.up);
+            downlinkData.push(point.down);
+          }
+          this.usage = {
+            labels: labels,
+            datasets: [
+              {
+                label: i18n.global.t("stats.upload"),
+                backgroundColor: "rgba(255, 165, 0, 0.4)",
+                borderColor: "rgba(255, 165, 0)",
+                fill: true,
+                data: uplinkData,
+              },
+              {
+                label: i18n.global.t("stats.download"),
+                backgroundColor: "rgba(0, 128, 0, 0.2)",
+                borderColor: "rgba(0, 128, 0)",
+                fill: true,
+                data: downlinkData,
+              },
+            ],
+          };
+          this.loaded = labels.length > 0;
+          this.alert = labels.length === 0;
+        } else {
+          this.alert = true;
+          this.loaded = false;
+        }
+      } finally {
+        this.loading = false;
+      }
     },
     genLable(step: number, locale: string) {
-      return new Date(step).toLocaleString(locale, {
+      return formatPanelDateTime(step, locale, {
         month: "2-digit",
         day: "2-digit",
         hour: "2-digit",
@@ -241,9 +276,7 @@ export default {
       if (v) {
         this.limit = 1;
         this.loadData();
-        this.intervalId = setInterval(() => {
-          this.loadData();
-        }, 10000);
+        this.startPolling();
       } else {
         this.loaded = false;
         this.alert = false;
@@ -252,11 +285,20 @@ export default {
           this.usage.datasets[0].data = [];
           this.usage.datasets[1].data = [];
         }
-        if (this.intervalId && this.intervalId != 0) {
-          clearInterval(this.intervalId);
-        }
+        this.stopPolling();
       }
     },
+  },
+  mounted() {
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", this.handleVisibilityChange);
+    }
+  },
+  beforeUnmount() {
+    this.stopPolling();
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this.handleVisibilityChange);
+    }
   },
 };
 </script>

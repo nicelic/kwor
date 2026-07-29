@@ -1,7 +1,6 @@
 package cronjob
 
 import (
-	"runtime"
 	"sync"
 	"time"
 
@@ -27,7 +26,7 @@ func NewMihomoNftCoreSyncJob() *MihomoNftCoreSyncJob {
 }
 
 func (s *MihomoNftCoreSyncJob) Run() {
-	if runtime.GOOS != "linux" {
+	if !service.IsSystemPlatformLinux() {
 		return
 	}
 

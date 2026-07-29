@@ -9,12 +9,13 @@ import (
 	"math/big"
 	"os"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
@@ -41,6 +42,12 @@ const (
 	portForwardForwardChain     = "pf_forward"
 	portForwardInputChain       = "pf_input"
 	portForwardOutputChain      = "pf_output"
+
+	portForwardRuleNameMaxRunes        = 120
+	portForwardRuleDescriptionMaxRunes = 1000
+	portForwardPortSpecMaxRunes        = 512
+	portForwardTargetIPMaxRunes        = 253
+	portForwardRateLimitMaxMbps        = 1000000
 )
 
 var (
@@ -49,11 +56,21 @@ var (
 	portForwardStateMu sync.Mutex
 	portForwardState   = struct {
 		lastRenderHash string
+		lastLayout     string
 		lastReconcile  time.Time
 		warnings       []string
+		nftSnapshot    *portForwardNftSnapshot
+		lastError      string
 	}{}
+	portForwardOverviewRuntimeMu sync.RWMutex
+	portForwardOverviewRuntime   struct {
+		lastSyncAt int64
+		warnings   []string
+		lastError  string
+	}
 
-	portForwardCounterBlockRe = regexp.MustCompile(`(?ms)counter\s+([A-Za-z0-9_][A-Za-z0-9_-]*)\s*\{[^{}]*?packets\s+(\d+)\s+bytes\s+(\d+)\s*\}`)
+	portForwardCounterBlockRe         = regexp.MustCompile(`(?ms)counter\s+([A-Za-z0-9_][A-Za-z0-9_-]*)\s*\{[^{}]*?packets\s+(\d+)\s+bytes\s+(\d+)\s*\}`)
+	portForwardInlineCounterCommentRe = regexp.MustCompile(`^kwor_pf_rule_(\d+)_(up|down)$`)
 
 	portForwardReconcileLocked = func(s *PortForwardService, minGap time.Duration) error {
 		return s.reconcileLocked(minGap)
@@ -79,48 +96,83 @@ type PortForwardRulePayload struct {
 	TargetIP       string `json:"targetIP"`
 	TargetPort     int    `json:"targetPort"`
 	RateLimitMbps  int    `json:"rateLimitMbps"`
+
+	// Pointer fields keep older clients compatible: an update from a client
+	// that predates traffic controls must retain existing quota settings.
+	TrafficLimitGiB   *float64 `json:"trafficLimitGiB"`
+	TrafficResetDay   *int     `json:"trafficResetDay"`
+	TrafficExpiryDate *string  `json:"trafficExpiryDate"`
 }
 
 type PortForwardRuleView struct {
 	model.PortForwardRule
-	CurrentUp              int64  `json:"currentUp"`
-	CurrentDown            int64  `json:"currentDown"`
-	CurrentTotal           int64  `json:"currentTotal"`
-	EffectiveRateLimitMbps int    `json:"effectiveRateLimitMbps"`
-	LimitStatus            string `json:"limitStatus"`
-	LimitWarning           string `json:"limitWarning"`
+	CurrentUp              int64   `json:"currentUp"`
+	CurrentDown            int64   `json:"currentDown"`
+	CurrentTotal           int64   `json:"currentTotal"`
+	TrafficLimitGiB        float64 `json:"trafficLimitGiB"`
+	TrafficNextResetAt     int64   `json:"trafficNextResetAt"`
+	TrafficLastResetAt     int64   `json:"trafficLastResetAt"`
+	TrafficLimitReached    bool    `json:"trafficLimitReached"`
+	TrafficExpired         bool    `json:"trafficExpired"`
+	TrafficBlocked         bool    `json:"trafficBlocked"`
+	TrafficBlockReason     string  `json:"trafficBlockReason"`
+	EffectiveRateLimitMbps int     `json:"effectiveRateLimitMbps"`
+	LimitStatus            string  `json:"limitStatus"`
+	LimitWarning           string  `json:"limitWarning"`
+	RuntimeConflictCount   int     `json:"runtimeConflictCount"`
 }
 
 type PortForwardOverview struct {
-	Available         bool                  `json:"available"`
-	LastSyncAt        int64                 `json:"lastSyncAt"`
-	KernelIPv4Forward bool                  `json:"kernelIPv4Forward"`
-	KernelIPv6Forward bool                  `json:"kernelIPv6Forward"`
-	EnabledCount      int                   `json:"enabledCount"`
-	LimitedCount      int                   `json:"limitedCount"`
-	TotalUp           int64                 `json:"totalUp"`
-	TotalDown         int64                 `json:"totalDown"`
-	TotalTraffic      int64                 `json:"totalTraffic"`
-	Rules             []PortForwardRuleView `json:"rules"`
-	Warnings          []string              `json:"warnings,omitempty"`
-	Error             string                `json:"error,omitempty"`
+	Supported               bool                         `json:"supported"`
+	Ready                   bool                         `json:"ready"`
+	Available               bool                         `json:"available"`
+	NftVersion              string                       `json:"nftVersion,omitempty"`
+	KernelVersion           string                       `json:"kernelVersion,omitempty"`
+	CompatibilityMode       string                       `json:"compatibilityMode,omitempty"`
+	RendererSupported       bool                         `json:"rendererSupported"`
+	SupportsTransportHeader bool                         `json:"supportsTransportHeader"`
+	SupportsTableComments   bool                         `json:"supportsTableComments"`
+	CapabilityError         string                       `json:"capabilityError,omitempty"`
+	VersionProbeError       string                       `json:"versionProbeError,omitempty"`
+	JSONProbeError          string                       `json:"jsonProbeError,omitempty"`
+	MeterProbeError         string                       `json:"meterProbeError,omitempty"`
+	LayoutPending           bool                         `json:"layoutPending"`
+	LastApplyError          string                       `json:"lastApplyError,omitempty"`
+	LastSyncAt              int64                        `json:"lastSyncAt"`
+	KernelIPv4Forward       bool                         `json:"kernelIPv4Forward"`
+	KernelIPv6Forward       bool                         `json:"kernelIPv6Forward"`
+	EnabledCount            int                          `json:"enabledCount"`
+	LimitedCount            int                          `json:"limitedCount"`
+	TotalUp                 int64                        `json:"totalUp"`
+	TotalDown               int64                        `json:"totalDown"`
+	TotalTraffic            int64                        `json:"totalTraffic"`
+	Rules                   []PortForwardRuleView        `json:"rules"`
+	RuntimeConflicts        []PortForwardRuntimeConflict `json:"runtimeConflicts"`
+	Warnings                []string                     `json:"warnings,omitempty"`
+	Error                   string                       `json:"error,omitempty"`
 }
 
 type normalizedPortForwardRule struct {
-	name           string
-	description    string
-	enabled        bool
-	family         string
-	protocol       string
-	localPortMode  string
-	localPortSpec  string
-	localPortStart int
-	localPortCount int
-	localPortEnd   int
-	targetIP       string
-	targetPort     int
-	rateLimitMbps  int
-	localPortSpans []portSpan
+	name                  string
+	description           string
+	enabled               bool
+	family                string
+	protocol              string
+	localPortMode         string
+	localPortSpec         string
+	localPortStart        int
+	localPortCount        int
+	localPortEnd          int
+	targetIP              string
+	targetPort            int
+	rateLimitMbps         int
+	trafficLimitBytes     int64
+	trafficResetDay       int
+	trafficExpiryDate     string
+	trafficLimitProvided  bool
+	trafficResetProvided  bool
+	trafficExpiryProvided bool
+	localPortSpans        []portSpan
 }
 
 type portForwardLimitStateView struct {
@@ -323,7 +375,12 @@ func findOtherProtocolConflicts(db *gorm.DB, excludeID uint, row normalizedPortF
 		if !portForwardFamiliesOverlap(existing.Family, row.family) {
 			continue
 		}
-		if !portForwardRangesOverlap(existing.LocalPortStart, existing.LocalPortEnd, row.localPortStart, row.localPortEnd) {
+		existingSpans, _, _, _, _, err := normalizePortForwardLocalPortSpec(existing.LocalPortSpec)
+		if err != nil || len(existingSpans) == 0 {
+			existingSpans = []portSpan{{start: existing.LocalPortStart, end: existing.LocalPortEnd}}
+		}
+		overlap := summarizePortForwardSpanOverlap(existingSpans, row.localPortSpans)
+		if overlap.count == 0 {
 			continue
 		}
 		limitText := "未限速"
@@ -331,10 +388,10 @@ func findOtherProtocolConflicts(db *gorm.DB, excludeID uint, row normalizedPortF
 			limitText = strconv.Itoa(existing.RateLimitMbps) + " Mbps"
 		}
 		warnings = append(warnings,
-			fmt.Sprintf("已存在 %s 规则 %s，重叠端口范围 %s，当前限速 %s",
+			fmt.Sprintf("已存在 %s 规则 %s，重叠端口 %s，当前限速 %s",
 				portForwardProtocolDisplay(existing.Protocol),
 				strings.TrimSpace(existing.Name),
-				strings.TrimSpace(existing.LocalPortSpec),
+				portForwardFormatOverlap(overlap),
 				limitText,
 			),
 		)
@@ -356,23 +413,63 @@ func loadPortForwardNftTableName() string {
 }
 
 func portForwardSupported() bool {
-	return runtime.GOOS == "linux" && nftSupported()
+	return IsSystemPlatformLinux() && nftSupported()
+}
+
+// portForwardCapabilityStatus separates static host support from the ability
+// to execute nft at this moment. Older clients only read Available, while new
+// clients can distinguish a missing Linux/nft installation from a permission
+// or kernel/runtime failure.
+func portForwardCapabilityStatus() (supported bool, ready bool, available bool, reason string) {
+	if !IsSystemPlatformLinux() {
+		return false, false, false, "nftables 转发仅支持 Linux"
+	}
+	if !nftSupported() {
+		return false, false, false, "未找到 nft 命令"
+	}
+	supported = true
+	capabilities := GetNftablesCapabilities()
+	if !capabilities.RendererSupported {
+		reason = strings.TrimSpace(capabilities.CapabilityError)
+		if reason == "" {
+			reason = "nftables 版本能力尚未就绪"
+		}
+		return supported, false, false, reason
+	}
+	if _, err := runNft("list", "tables"); err != nil {
+		return supported, false, false, strings.TrimSpace(err.Error())
+	}
+	available = true
+	if nftCapabilityLayoutReconcilePending() {
+		reason = nftCapabilityLayoutLastApplyError()
+		if strings.TrimSpace(reason) == "" {
+			reason = "nftables 兼容布局仍在等待完整恢复与校验"
+		}
+		return supported, false, available, reason
+	}
+	return supported, true, true, ""
 }
 
 func portForwardTableExists() bool {
 	if !portForwardSupported() {
 		return false
 	}
-	_, err := runNft("list", "table", nftFamily, portForwardNftTable)
-	return err == nil
+	exists, err := inspectOwnedNftTableForMutation(nftFamily, portForwardNftTable)
+	return err == nil && exists
 }
 
 func cleanupManagedPortForwardTable() error {
-	if !portForwardSupported() || !portForwardTableExists() {
+	if !portForwardSupported() {
 		return nil
 	}
-	_, err := runNft("delete", "table", nftFamily, portForwardNftTable)
-	return err
+
+	var firstErr error
+	for _, tableFamily := range append([]string{nftFamily}, nftCompatibilityNatFamilies()...) {
+		if err := deleteOwnedNftTableForRuntime(tableFamily, portForwardNftTable); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func wrapPortForwardRollbackError(actionErr error, notes ...string) error {
@@ -418,82 +515,121 @@ func mergePortForwardWarnings(primary []string, secondary []string) []string {
 }
 
 func (s *PortForwardService) GetOverview() (*PortForwardOverview, error) {
-	portForwardStateMu.Lock()
-	defer portForwardStateMu.Unlock()
-
-	available := portForwardSupported()
-	var syncErr error
-	if available {
-		syncErr = portForwardReconcileLocked(s, 2*time.Second)
-	}
+	supported, ready, available, capabilityErr := portForwardCapabilityStatus()
 
 	rows, err := loadPortForwardRulesLocked()
 	if err != nil {
 		return nil, err
 	}
-
-	counterBytes := make(map[string]int64)
-	limitStates := loadPortForwardLimitStateMap()
-	if available {
-		counterBytes, err = readPortForwardCounterBytes()
-		if err != nil && syncErr == nil {
-			syncErr = err
-		}
+	trafficRuntime, err := loadPortForwardTrafficRuntime(rows, PanelNow())
+	if err != nil {
+		return nil, err
 	}
+	limitStates := loadPortForwardLimitStateMap()
 
 	views := make([]PortForwardRuleView, 0, len(rows))
 	enabledCount := 0
 	limitedCount := 0
-	var totalUp int64
-	var totalDown int64
 	for _, row := range rows {
-		up := counterBytes[portForwardCounterName(row.Id, "up")]
-		down := counterBytes[portForwardCounterName(row.Id, "down")]
-		total := up + down
+		traffic := trafficRuntime.Rules[row.Id]
+		total := addPortForwardTrafficBytes(traffic.UsedUpBytes, traffic.UsedDownBytes)
 		views = append(views, PortForwardRuleView{
 			PortForwardRule:        row,
-			CurrentUp:              up,
-			CurrentDown:            down,
+			CurrentUp:              traffic.UsedUpBytes,
+			CurrentDown:            traffic.UsedDownBytes,
 			CurrentTotal:           total,
+			TrafficLimitGiB:        portForwardTrafficLimitGiB(row.TrafficLimitBytes),
+			TrafficNextResetAt:     traffic.NextResetAt,
+			TrafficLastResetAt:     traffic.LastResetAt,
+			TrafficLimitReached:    traffic.LimitReached,
+			TrafficExpired:         traffic.Expired,
+			TrafficBlocked:         row.Enabled && traffic.BlockReason != "",
+			TrafficBlockReason:     traffic.BlockReason,
 			EffectiveRateLimitMbps: limitStates[row.Id].EffectiveRateLimitMbps,
 			LimitStatus:            limitStates[row.Id].Status,
 			LimitWarning:           limitStates[row.Id].Warning,
 		})
 		if row.Enabled {
 			enabledCount++
-			totalUp += up
-			totalDown += down
 			if row.RateLimitMbps > 0 {
 				limitedCount++
 			}
 		}
 	}
 
-	lastSyncAt := int64(0)
-	if !portForwardState.lastReconcile.IsZero() {
-		lastSyncAt = portForwardState.lastReconcile.Unix()
+	lastSyncAt, runtimeWarnings, runtimeError := portForwardRuntimeOverviewSnapshot()
+
+	runtimeConflicts := collectPortForwardRuntimeConflicts(rows)
+	conflictsByRule := make(map[uint]int, len(runtimeConflicts))
+	for _, conflict := range runtimeConflicts {
+		conflictsByRule[conflict.RuleID]++
 	}
+	for index := range views {
+		views[index].RuntimeConflictCount = conflictsByRule[views[index].Id]
+	}
+	capabilities := GetNftablesCapabilities()
 
 	overview := &PortForwardOverview{
-		Available:         available,
-		LastSyncAt:        lastSyncAt,
-		KernelIPv4Forward: readKernelForwardingEnabled("/proc/sys/net/ipv4/ip_forward"),
-		KernelIPv6Forward: readKernelForwardingEnabled("/proc/sys/net/ipv6/conf/all/forwarding"),
-		EnabledCount:      enabledCount,
-		LimitedCount:      limitedCount,
-		TotalUp:           totalUp,
-		TotalDown:         totalDown,
-		TotalTraffic:      totalUp + totalDown,
-		Rules:             views,
-		Warnings:          append([]string(nil), portForwardState.warnings...),
+		Supported:               supported,
+		Ready:                   ready,
+		Available:               available,
+		NftVersion:              capabilities.NftVersion,
+		KernelVersion:           capabilities.KernelVersion,
+		CompatibilityMode:       capabilities.CompatibilityMode,
+		RendererSupported:       capabilities.RendererSupported,
+		SupportsTransportHeader: capabilities.SupportsTransportHeader,
+		SupportsTableComments:   capabilities.SupportsTableComments,
+		CapabilityError:         capabilities.CapabilityError,
+		VersionProbeError:       capabilities.VersionProbeError,
+		JSONProbeError:          capabilities.JSONProbeError,
+		MeterProbeError:         capabilities.MeterProbeError,
+		LayoutPending:           nftCapabilityLayoutReconcilePending(),
+		LastApplyError:          nftCapabilityLayoutLastApplyError(),
+		LastSyncAt:              lastSyncAt,
+		KernelIPv4Forward:       readKernelForwardingEnabled("/proc/sys/net/ipv4/ip_forward"),
+		KernelIPv6Forward:       readKernelForwardingEnabled("/proc/sys/net/ipv6/conf/all/forwarding"),
+		EnabledCount:            enabledCount,
+		LimitedCount:            limitedCount,
+		TotalUp:                 trafficRuntime.OverviewUp,
+		TotalDown:               trafficRuntime.OverviewDown,
+		TotalTraffic:            addPortForwardTrafficBytes(trafficRuntime.OverviewUp, trafficRuntime.OverviewDown),
+		Rules:                   views,
+		RuntimeConflicts:        runtimeConflicts,
+		Warnings:                runtimeWarnings,
 	}
 
-	if !available {
-		overview.Error = "nftables 转发仅支持 Linux"
-	} else if syncErr != nil {
-		overview.Error = strings.TrimSpace(syncErr.Error())
+	if runtimeError != "" {
+		overview.Error = runtimeError
+	} else if !ready {
+		overview.Error = capabilityErr
 	}
 	return overview, nil
+}
+
+func portForwardRuntimeOverviewSnapshot() (int64, []string, string) {
+	if portForwardStateMu.TryLock() {
+		lastSyncAt := int64(0)
+		if !portForwardState.lastReconcile.IsZero() {
+			lastSyncAt = portForwardState.lastReconcile.Unix()
+		}
+		warnings := append([]string(nil), portForwardState.warnings...)
+		lastError := strings.TrimSpace(portForwardState.lastError)
+		portForwardStateMu.Unlock()
+
+		portForwardOverviewRuntimeMu.Lock()
+		portForwardOverviewRuntime.lastSyncAt = lastSyncAt
+		portForwardOverviewRuntime.warnings = append([]string(nil), warnings...)
+		portForwardOverviewRuntime.lastError = lastError
+		portForwardOverviewRuntimeMu.Unlock()
+		return lastSyncAt, warnings, lastError
+	}
+
+	portForwardOverviewRuntimeMu.RLock()
+	lastSyncAt := portForwardOverviewRuntime.lastSyncAt
+	warnings := append([]string(nil), portForwardOverviewRuntime.warnings...)
+	lastError := portForwardOverviewRuntime.lastError
+	portForwardOverviewRuntimeMu.RUnlock()
+	return lastSyncAt, warnings, lastError
 }
 
 func (s *PortForwardService) UpsertRule(payload PortForwardRulePayload) error {
@@ -501,56 +637,83 @@ func (s *PortForwardService) UpsertRule(payload PortForwardRulePayload) error {
 	defer portForwardStateMu.Unlock()
 
 	db := database.GetDB()
+	if db == nil {
+		return common.NewError("database is not ready")
+	}
+	// Sample counters before changing a rule. Compatibility counters are reset
+	// by the following atomic redraw, so accounting must happen first.
+	existingRows, err := loadPortForwardRulesLocked()
+	if err != nil {
+		return err
+	}
+	if _, err := s.capturePortForwardTrafficLocked(existingRows); err != nil {
+		return err
+	}
 	row := model.PortForwardRule{}
 	var previous model.PortForwardRule
-	if payload.ID > 0 {
-		if err := db.Where("id = ?", payload.ID).First(&row).Error; err != nil {
-			return err
-		}
-		previous = row
-	}
 
 	normalized, err := normalizePortForwardRulePayload(payload)
 	if err != nil {
 		return err
 	}
-	if err := validatePortForwardRuleOverlap(db, payload.ID, normalized); err != nil {
-		return err
-	}
-	if err := validatePortForwardRuleAvailability(db, normalized); err != nil {
-		return err
-	}
-	protocolWarnings := findOtherProtocolConflicts(db, payload.ID, normalized)
-	if normalized.name == "" {
-		autoName, err := generateUniqueThreeDigitPortForwardName(db, payload.ID)
-		if err != nil {
+	protocolWarnings := make([]string, 0)
+	err = db.Transaction(func(tx *gorm.DB) error {
+		if payload.ID > 0 {
+			if err := tx.Where("id = ?", payload.ID).First(&row).Error; err != nil {
+				return err
+			}
+			previous = row
+		}
+		if err := validatePortForwardRuleOverlap(tx, payload.ID, normalized); err != nil {
 			return err
 		}
-		normalized.name = autoName
-	}
+		if err := validatePortForwardRuleAvailability(tx, normalized); err != nil {
+			return err
+		}
+		protocolWarnings = findOtherProtocolConflicts(tx, payload.ID, normalized)
+		if normalized.name == "" {
+			autoName, nameErr := generateUniqueThreeDigitPortForwardName(tx, payload.ID)
+			if nameErr != nil {
+				return nameErr
+			}
+			normalized.name = autoName
+		}
 
-	row.Name = normalized.name
-	row.Description = normalized.description
-	row.Enabled = normalized.enabled
-	row.Family = normalized.family
-	row.Protocol = normalized.protocol
-	row.LocalPortMode = normalized.localPortMode
-	row.LocalPortSpec = normalized.localPortSpec
-	row.LocalPortStart = normalized.localPortStart
-	row.LocalPortCount = normalized.localPortCount
-	row.LocalPortEnd = normalized.localPortEnd
-	row.TargetIP = normalized.targetIP
-	row.TargetPort = normalized.targetPort
-	row.RateLimitMbps = normalized.rateLimitMbps
+		row.Name = normalized.name
+		row.Description = normalized.description
+		row.Enabled = normalized.enabled
+		row.Family = normalized.family
+		row.Protocol = normalized.protocol
+		row.LocalPortMode = normalized.localPortMode
+		row.LocalPortSpec = normalized.localPortSpec
+		row.LocalPortStart = normalized.localPortStart
+		row.LocalPortCount = normalized.localPortCount
+		row.LocalPortEnd = normalized.localPortEnd
+		row.TargetIP = normalized.targetIP
+		row.TargetPort = normalized.targetPort
+		row.RateLimitMbps = normalized.rateLimitMbps
+		if normalized.trafficLimitProvided {
+			row.TrafficLimitBytes = normalized.trafficLimitBytes
+		}
+		if normalized.trafficResetProvided {
+			row.TrafficResetDay = normalized.trafficResetDay
+		}
+		if normalized.trafficExpiryProvided {
+			row.TrafficExpiryDate = normalized.trafficExpiryDate
+		}
 
-	if payload.ID > 0 {
-		if err := db.Save(&row).Error; err != nil {
+		if payload.ID > 0 {
+			return tx.Save(&row).Error
+		}
+		if err := tx.Create(&row).Error; err != nil {
 			return err
 		}
-	} else {
-		if err := db.Create(&row).Error; err != nil {
-			return err
-		}
+		// New rules start from zero. Existing installations without a state row
+		// are instead bootstrapped from visible nft counters by the sampler.
+		return tx.Create(&model.PortForwardRuleTrafficState{RuleId: row.Id}).Error
+	})
+	if err != nil {
+		return err
 	}
 
 	rollbackCreate := func(actionErr error) error {
@@ -559,6 +722,14 @@ func (s *PortForwardService) UpsertRule(payload PortForwardRulePayload) error {
 			if err := db.Where("id = ?", row.Id).Delete(&model.PortForwardRule{}).Error; err != nil {
 				notes = append(notes, "remove newly created rule failed: "+err.Error())
 			} else {
+				if stateErr := db.Where("rule_id = ?", row.Id).Delete(&model.PortForwardRuleTrafficState{}).Error; stateErr != nil {
+					notes = append(notes, "remove newly created traffic state failed: "+stateErr.Error())
+				}
+				// Named counters are created before the atomic script so nft can
+				// validate references in that transaction. If the script is
+				// rejected, remove counters that belonged only to this rolled-back
+				// new rule as well.
+				cleanupPortForwardNftObjects(row.Id)
 				notes = append(notes, "removed newly created rule")
 			}
 		}
@@ -600,6 +771,16 @@ func (s *PortForwardService) DeleteRule(id uint) error {
 	defer portForwardStateMu.Unlock()
 
 	db := database.GetDB()
+	if db == nil {
+		return common.NewError("database is not ready")
+	}
+	rows, err := loadPortForwardRulesLocked()
+	if err != nil {
+		return err
+	}
+	if _, err := s.capturePortForwardTrafficLocked(rows); err != nil {
+		return err
+	}
 	var row model.PortForwardRule
 	if err := db.Where("id = ?", id).First(&row).Error; err != nil {
 		return err
@@ -626,6 +807,9 @@ func (s *PortForwardService) DeleteRule(id uint) error {
 	if err := portForwardReconcileLocked(s, 0); err != nil {
 		return rollbackDelete(err)
 	}
+	if err := db.Where("rule_id = ?", id).Delete(&model.PortForwardRuleTrafficState{}).Error; err != nil {
+		logger.Warning("failed to remove deleted port-forward traffic state: ", err)
+	}
 	cleanupPortForwardNftObjects(id)
 	return nil
 }
@@ -633,28 +817,42 @@ func (s *PortForwardService) DeleteRule(id uint) error {
 func (s *PortForwardService) SyncIfNeeded(minGap time.Duration) error {
 	portForwardStateMu.Lock()
 	defer portForwardStateMu.Unlock()
-	return portForwardReconcileLocked(s, minGap)
+	err := portForwardReconcileLocked(s, minGap)
+	if err != nil {
+		portForwardState.lastError = strings.TrimSpace(err.Error())
+	} else {
+		portForwardState.lastError = ""
+	}
+	return err
 }
 
 func (s *PortForwardService) CleanupOnShutdown() {
 	portForwardStateMu.Lock()
 	defer portForwardStateMu.Unlock()
 
-	if runtime.GOOS == "linux" && portForwardSupported() {
+	if IsSystemPlatformLinux() && portForwardSupported() {
 		if err := cleanupManagedPortForwardTable(); err != nil && !portForwardNftObjectMissing(err) {
 			logger.Warning("failed to cleanup managed port-forward nft table on shutdown: ", err)
+		} else if err := restorePortForwardKernelForwarding(); err != nil {
+			logger.Warning("failed to restore managed forwarding sysctl state on shutdown: ", err)
 		}
 	}
 
 	savePortForwardLimitStates(nil)
 	portForwardState.lastRenderHash = ""
+	portForwardState.lastLayout = ""
 	portForwardState.lastReconcile = time.Time{}
 	portForwardState.warnings = nil
+	portForwardState.lastError = ""
+	portForwardState.nftSnapshot = nil
 }
 
 func (s *PortForwardService) reconcileLocked(minGap time.Duration) error {
 	if !portForwardSupported() {
 		return nil
+	}
+	if err := ensureNftRendererSupported(); err != nil {
+		return err
 	}
 
 	now := time.Now()
@@ -670,6 +868,9 @@ func (s *PortForwardService) reconcileLocked(minGap time.Duration) error {
 }
 
 func (s *PortForwardService) renderLocked(force bool) error {
+	if !portForwardSupported() {
+		return nil
+	}
 	rows, err := loadPortForwardRulesLocked()
 	if err != nil {
 		return err
@@ -682,51 +883,115 @@ func (s *PortForwardService) renderLocked(force bool) error {
 		}
 	}
 
-	hash := computePortForwardRenderHash(rows)
+	// Read each owned table once before any redraw. The same snapshot supplies
+	// persistent traffic deltas and the integrity decision below, and keeps nft
+	// command execution outside the SQLite transaction used by the sampler.
+	snapshot, snapshotErr := loadPortForwardNftSnapshot()
+	if snapshotErr != nil {
+		portForwardState.nftSnapshot = nil
+		return snapshotErr
+	}
+	portForwardState.nftSnapshot = &snapshot
+	trafficRuntime, err := syncPortForwardTrafficStateRows(rows, readPortForwardCounterBytesFromSnapshot(snapshot), PanelNow())
+	if err != nil {
+		return err
+	}
+	trafficBlocks := portForwardTrafficBlockReasons(rows, trafficRuntime)
+
+	layout := nftCapabilityLayoutSignature()
+	hash := computePortForwardRenderHashWithTrafficBlocks(rows, trafficBlocks)
 	if len(activeRows) > 0 {
 		if err := ensureKernelForwardingForRows(activeRows); err != nil {
 			return err
 		}
 	}
 
-	if !force && hash == portForwardState.lastRenderHash && portForwardRenderIntact(activeRows) {
-		return nil
+	if !force && layout == portForwardState.lastLayout && hash == portForwardState.lastRenderHash {
+		if snapshot.renderIntactWithTrafficBlocks(activeRows, loadPortForwardLimitStateMap(), trafficBlocks) {
+			// A prior restore can fail after the tables were already removed.
+			// Keep retrying that host-local cleanup even when the empty nft
+			// snapshot itself is intact.
+			if len(activeRows) == 0 {
+				if err := restorePortForwardKernelForwarding(); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+
+	if portForwardLayoutMigrationRequired(portForwardState.lastLayout, layout) {
+		if err := cleanupManagedPortForwardTable(); err != nil {
+			return err
+		}
+		portForwardState.nftSnapshot = nil
+		portForwardState.lastRenderHash = ""
+		portForwardState.lastLayout = ""
 	}
 
 	if len(activeRows) == 0 {
-		if portForwardTableExists() {
-			if err := flushManagedPortForwardChains(); err != nil {
-				return err
-			}
+		// Deleting the owned tables also removes native named counters and stale
+		// compatibility NAT chains. Leaving an empty inet table made an
+		// externally reintroduced forwarding rule invisible to integrity checks.
+		if err := cleanupManagedPortForwardTable(); err != nil {
+			return err
+		}
+		portForwardState.nftSnapshot = nil
+		if err := restorePortForwardKernelForwarding(); err != nil {
+			return err
 		}
 		savePortForwardLimitStates(nil)
 		portForwardState.warnings = nil
 		portForwardState.lastRenderHash = hash
+		portForwardState.lastLayout = layout
 		return nil
 	}
 
 	if err := ensureManagedPortForwardBase(); err != nil {
 		return err
 	}
-	if err := flushManagedPortForwardChains(); err != nil {
+	limitStates, renderWarnings, err := renderManagedPortForwardRulesAtomicWithTrafficBlocks(activeRows, trafficBlocks)
+	if err != nil {
+		// The script contains flush and add statements in one nft transaction.
+		// Do not clean up here: a batch failure must leave the previous ruleset
+		// intact so traffic never sees a transient empty forwarding chain.
 		return err
 	}
-	limitStates := make(map[uint]portForwardLimitRuntime, len(activeRows))
-	renderWarnings := make([]string, 0)
-	for _, row := range activeRows {
-		limitState, err := addManagedPortForwardRule(row)
-		if err != nil {
+	portForwardState.nftSnapshot = nil
+	savePortForwardLimitStates(limitStates)
+	if !portForwardRowsNeedKernelForwarding(activeRows) {
+		if err := restorePortForwardKernelForwarding(); err != nil {
 			return err
 		}
-		limitStates[row.Id] = limitState
-		if strings.TrimSpace(limitState.warning) != "" {
-			renderWarnings = append(renderWarnings, strings.TrimSpace(limitState.warning))
-		}
 	}
-	savePortForwardLimitStates(limitStates)
 	portForwardState.warnings = renderWarnings
-	portForwardState.lastRenderHash = hash
+	portForwardState.lastRenderHash = computePortForwardRenderHashWithTrafficBlocks(rows, trafficBlocks)
+	portForwardState.lastLayout = layout
 	return nil
+}
+
+// portForwardLayoutMigrationRequired deliberately treats an empty prior
+// signature as a cold start, not as a layout change. In the native layout the
+// table owns named counters; deleting it on every panel-only restart would
+// reset traffic totals even though neither nft nor the kernel changed.
+func portForwardLayoutMigrationRequired(previous string, current string) bool {
+	return strings.TrimSpace(previous) != "" && previous != current
+}
+
+// rollbackManagedPortForwardRender makes compatibility forwarding all-or-none
+// even when a failure occurs while creating its base chains. The caller holds
+// portForwardStateMu, so state and owned nftables tables are reset together.
+func rollbackManagedPortForwardRender(renderErr error) error {
+	cleanupErr := cleanupManagedPortForwardTable()
+	savePortForwardLimitStates(nil)
+	portForwardState.warnings = nil
+	portForwardState.lastRenderHash = ""
+	portForwardState.lastLayout = ""
+	portForwardState.nftSnapshot = nil
+	if cleanupErr != nil {
+		return wrapPortForwardRollbackError(renderErr, "remove partially rendered forwarding tables failed: "+cleanupErr.Error())
+	}
+	return renderErr
 }
 
 func loadPortForwardRulesLocked() ([]model.PortForwardRule, error) {
@@ -742,7 +1007,26 @@ func loadPortForwardRulesLocked() ([]model.PortForwardRule, error) {
 }
 
 func normalizePortForwardRulePayload(payload PortForwardRulePayload) (normalizedPortForwardRule, error) {
-	targetIP, family, err := normalizePortForwardTarget(payload.TargetIP, payload.Family)
+	name := strings.TrimSpace(payload.Name)
+	description := strings.TrimSpace(payload.Description)
+	localPortSpec := strings.TrimSpace(payload.LocalPortSpec)
+	targetIPRaw := strings.TrimSpace(payload.TargetIP)
+	if err := validatePortForwardTextField("name", name, portForwardRuleNameMaxRunes, true); err != nil {
+		return normalizedPortForwardRule{}, err
+	}
+	if err := validatePortForwardTextField("description", description, portForwardRuleDescriptionMaxRunes, true); err != nil {
+		return normalizedPortForwardRule{}, err
+	}
+	if err := validatePortForwardTextField("local port spec", localPortSpec, portForwardPortSpecMaxRunes, true); err != nil {
+		return normalizedPortForwardRule{}, err
+	}
+	if err := validatePortForwardTextField("target ip", targetIPRaw, portForwardTargetIPMaxRunes, true); err != nil {
+		return normalizedPortForwardRule{}, err
+	}
+	if localPortSpec != "" && strings.Count(localPortSpec, ",") >= 128 {
+		return normalizedPortForwardRule{}, common.NewError("local port spec contains too many segments")
+	}
+	targetIP, family, err := normalizePortForwardTarget(targetIPRaw, payload.Family)
 	if err != nil {
 		return normalizedPortForwardRule{}, err
 	}
@@ -750,7 +1034,7 @@ func normalizePortForwardRulePayload(payload PortForwardRulePayload) (normalized
 	if err != nil {
 		return normalizedPortForwardRule{}, err
 	}
-	mode, start, count, end, spec, spans, err := normalizePortForwardLocalPorts(payload.LocalPortMode, payload.LocalPortSpec, payload.LocalPortStart, payload.LocalPortCount, payload.LocalPortEnd)
+	mode, start, count, end, spec, spans, err := normalizePortForwardLocalPorts(payload.LocalPortMode, localPortSpec, payload.LocalPortStart, payload.LocalPortCount, payload.LocalPortEnd)
 	if err != nil {
 		return normalizedPortForwardRule{}, err
 	}
@@ -759,25 +1043,78 @@ func normalizePortForwardRulePayload(payload PortForwardRulePayload) (normalized
 	}
 	rateLimitMbps := payload.RateLimitMbps
 	if rateLimitMbps < 0 {
-		rateLimitMbps = 0
+		return normalizedPortForwardRule{}, common.NewError("rate limit must not be negative")
+	}
+	if rateLimitMbps > portForwardRateLimitMaxMbps {
+		return normalizedPortForwardRule{}, common.NewError("rate limit exceeds the maximum supported value")
+	}
+
+	trafficLimitBytes := int64(0)
+	trafficResetDay := 0
+	trafficExpiryDate := ""
+	trafficLimitProvided := payload.TrafficLimitGiB != nil
+	trafficResetProvided := payload.TrafficResetDay != nil
+	trafficExpiryProvided := payload.TrafficExpiryDate != nil
+	if trafficLimitProvided {
+		var trafficErr error
+		trafficLimitBytes, trafficErr = normalizePortForwardTrafficLimitGiB(*payload.TrafficLimitGiB)
+		if trafficErr != nil {
+			return normalizedPortForwardRule{}, trafficErr
+		}
+	}
+	if trafficResetProvided {
+		var trafficErr error
+		trafficResetDay, trafficErr = normalizePortForwardTrafficResetDay(*payload.TrafficResetDay)
+		if trafficErr != nil {
+			return normalizedPortForwardRule{}, trafficErr
+		}
+	}
+	if trafficExpiryProvided {
+		var trafficErr error
+		trafficExpiryDate, trafficErr = normalizePortForwardTrafficExpiryDate(*payload.TrafficExpiryDate)
+		if trafficErr != nil {
+			return normalizedPortForwardRule{}, trafficErr
+		}
 	}
 
 	return normalizedPortForwardRule{
-		name:           strings.TrimSpace(payload.Name),
-		description:    strings.TrimSpace(payload.Description),
-		enabled:        payload.Enabled,
-		family:         family,
-		protocol:       protocol,
-		localPortMode:  mode,
-		localPortSpec:  spec,
-		localPortStart: start,
-		localPortCount: count,
-		localPortEnd:   end,
-		targetIP:       targetIP,
-		targetPort:     payload.TargetPort,
-		rateLimitMbps:  rateLimitMbps,
-		localPortSpans: spans,
+		name:                  name,
+		description:           description,
+		enabled:               payload.Enabled,
+		family:                family,
+		protocol:              protocol,
+		localPortMode:         mode,
+		localPortSpec:         spec,
+		localPortStart:        start,
+		localPortCount:        count,
+		localPortEnd:          end,
+		targetIP:              targetIP,
+		targetPort:            payload.TargetPort,
+		rateLimitMbps:         rateLimitMbps,
+		trafficLimitBytes:     trafficLimitBytes,
+		trafficResetDay:       trafficResetDay,
+		trafficExpiryDate:     trafficExpiryDate,
+		trafficLimitProvided:  trafficLimitProvided,
+		trafficResetProvided:  trafficResetProvided,
+		trafficExpiryProvided: trafficExpiryProvided,
+		localPortSpans:        spans,
 	}, nil
+}
+
+func validatePortForwardTextField(field string, value string, maxRunes int, allowEmpty bool) error {
+	if value == "" && !allowEmpty {
+		return common.NewError(field, " is required")
+	}
+	if !utf8.ValidString(value) {
+		return common.NewError(field, " must be valid UTF-8")
+	}
+	if utf8.RuneCountInString(value) > maxRunes {
+		return common.NewError(field, " is too long")
+	}
+	if strings.IndexFunc(value, unicode.IsControl) >= 0 {
+		return common.NewError(field, " contains unsupported control characters")
+	}
+	return nil
 }
 
 func normalizePortForwardProtocol(raw string) (string, error) {
@@ -942,12 +1279,38 @@ func generateUniqueThreeDigitPortForwardName(db *gorm.DB, excludeID uint) (strin
 	return candidates[int(index.Int64())], nil
 }
 
-func portForwardRangesOverlap(startA int, endA int, startB int, endB int) bool {
-	return startA <= endB && startB <= endA
+func computePortForwardRenderHash(rows []model.PortForwardRule) string {
+	return computePortForwardRenderHashWithTrafficBlocks(rows, nil)
 }
 
-func computePortForwardRenderHash(rows []model.PortForwardRule) string {
-	raw, _ := json.Marshal(rows)
+func computePortForwardRenderHashWithTrafficBlocks(rows []model.PortForwardRule, trafficBlocks map[uint]string) string {
+	blockRows := make([]struct {
+		RuleID uint   `json:"ruleId"`
+		Reason string `json:"reason"`
+	}, 0, len(trafficBlocks))
+	for _, row := range rows {
+		if !row.Enabled {
+			continue
+		}
+		if reason := strings.TrimSpace(trafficBlocks[row.Id]); reason != "" {
+			blockRows = append(blockRows, struct {
+				RuleID uint   `json:"ruleId"`
+				Reason string `json:"reason"`
+			}{RuleID: row.Id, Reason: reason})
+		}
+	}
+	payload := struct {
+		Rows             []model.PortForwardRule `json:"rows"`
+		TrafficBlocks    interface{}             `json:"trafficBlocks"`
+		CapabilityLayout string                  `json:"capabilityLayout"`
+		SupportsMeters   bool                    `json:"supportsMeters"`
+	}{
+		Rows:             rows,
+		TrafficBlocks:    blockRows,
+		CapabilityLayout: nftCapabilityLayoutSignature(),
+		SupportsMeters:   GetNftablesCapabilities().SupportsMeters,
+	}
+	raw, _ := json.Marshal(payload)
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }

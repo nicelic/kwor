@@ -1,11 +1,16 @@
 ﻿import HttpUtils, { type Msg } from '@/plugins/httputil'
+import { confirm } from '@/plugins/confirm'
+import { i18n } from '@/locales'
 import type {
   ReverseProxyCertificateOption,
   ReverseProxyOverview,
+  ReverseProxyResourceSettings,
+  ReverseProxyRuntimeOverview,
   ReverseProxyRule,
   ReverseProxyRuleForm,
 } from '@/types/reverseProxy'
 import { push } from 'notivue'
+import { formatPanelDateTime } from '@/plugins/panelTime'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 export const reverseProxyCopy = {
@@ -17,6 +22,7 @@ export const reverseProxyCopy = {
   available: '可用',
   unavailable: '不可用',
   unavailableHint: '当前环境可能无法完整运行反向代理监听，但你仍然可以先维护规则和证书绑定。',
+  loadFailed: '反向代理配置加载失败',
   listeners: '监听器',
   connectionLabel: '连接数',
   connectionHint: '本地 | 目标',
@@ -56,6 +62,60 @@ export const reverseProxyCopy = {
   targetPort: '目标端口',
   targetPath: '目标基础路径',
   targetDnsPath: '目标 DNS URL 路径',
+  dnsUpstreamTimeout: '上游超时（秒）',
+  dnsUpstreamTimeoutHint: '指定等待上游服务器响应的秒数。',
+  fallbackDnsUpstreams: '后备 DNS 服务器',
+  fallbackDnsUpstreamsHint: '当主要上游没有响应或返回错误时使用。这里采用 AdGuardHome/dnsproxy 多行上游语法，不同于上方只接收目标地址的主要上游输入框；支持注释、域名规则以及 udp://、tcp://、tls://、https://、quic://、h3://、sdns://。',
+  dnsCacheTitle: 'DNS 缓存配置',
+  dnsCacheEnabled: '启用 DNS 缓存',
+  dnsCacheSizeBytes: '缓存大小',
+  dnsCacheSizeBytesHint: 'DNS 缓存大小（单位：字节）',
+  dnsCacheMinTtl: '覆盖最小 TTL 值',
+  dnsCacheMinTtlHint: '缓存 DNS 响应时，延长从上游服务器接收到的 TTL 值（秒）。填 0 表示不覆盖。',
+  dnsCacheMaxTtl: '覆盖最大 TTL 值',
+  dnsCacheMaxTtlHint: '设定 DNS 缓存条目的最大 TTL 值（秒）。填 0 表示不覆盖。',
+  dnsAccessTitle: 'DNS 访问控制',
+  dnsAllowedCidrs: '允许 CIDR',
+  dnsAllowedCidrsHint: 'DNS 固定监听全部 IPv4/IPv6 网卡，必须填写至少一个非全网 CIDR；多个 CIDR 用逗号分隔。',
+  dnsRateLimitQps: '每客户端 QPS',
+  dnsMaxConcurrentQueries: 'DNS 最大并发查询',
+  maxConcurrentConnections: '规则本地最大连接数',
+  maxConcurrentRequests: '规则最大并发请求',
+  upstreamMaxConnections: '上游最大活动连接',
+  upstreamMaxIdleConnections: '每目标最大空闲连接',
+  memoryLimitBytes: '规则内存上限（字节）',
+  resourceTitle: '资源控制',
+  resourceSubtitle: '连接、HTTP/DNS 并发与默认上游空闲连接填 0 表示不额外限额；H2/QUIC 流和正文改写必须为正数。规则填 0 时仍受全局安全阀保护。',
+  resourceEdit: '调整资源控制',
+  resourceSave: '保存资源控制',
+  listenerConnectionLimit: '每监听组连接安全阀',
+  globalHttpMaxConcurrent: '全局 HTTP 请求并发',
+  globalDnsMaxConcurrent: '全局 DNS 查询并发',
+  http2MaxConcurrentStreams: '每条 H2 连接最大流数',
+  quicMaxIncomingStreams: '每条 QUIC 双向/单向流数',
+  defaultUpstreamMaxIdleConnections: '默认每目标空闲连接',
+  memoryPoolBytes: '共享动态内存池（字节）',
+  defaultRuleMemoryLimitBytes: '默认规则内存上限（字节）',
+  responseRewriteInputBytes: '正文改写输入上限（字节）',
+  responseRewriteOutputBytes: '正文改写输出上限（字节）',
+  responseRewriteMaxConcurrent: '正文改写最大并发',
+  resourceMemoryHint: '内存池与正文改写参数会同时约束 DNS 缓存和普通反代正文改写。默认值为 8 GiB 共享池、单规则 384 MiB、输入 4 MiB、输出 8 MiB、并发 32。',
+  ruleResourceHint: '填写 0 表示不额外限制：本地连接仍受监听组安全阀保护，请求仍受全局 HTTP 并发保护，上游空闲连接使用全局默认值，内存使用全局默认规则上限。',
+  resourceInvalid: '资源控制数值无效：连接/并发必须为非负整数；H2、QUIC 与正文改写并发必须为正整数；正文改写的输入加双输出缓冲不得超过默认规则内存上限。',
+  resourceSaved: '资源控制已保存',
+  runtimeHttp: '活动 HTTP',
+  runtimeDns: '活动 DNS',
+  runtimeMemory: '内存使用',
+  runtimeCache: '缓存',
+  runtimeRewrite: '正文改写',
+  revisionConflict: '配置已被其他页面修改，已刷新为最新配置；当前草稿没有自动覆盖或重放。',
+  ipCertificateRoutingHint: 'IP 访问只使用证书真实 IP SAN。单个公网 IP 经 NAT 时，普通单 IP 证书即可；同一地址族的多个公网 IP 汇入同一内网地址时，才需要一张覆盖该地址族全部允许 IP 的证书。',
+  dnsAccessInvalid: 'DNS 每客户端 QPS 必须为 1 到 10000 的整数，DNS 最大并发必须为 0 到 4096 的整数（0 表示不额外限制）',
+  requestLimitInvalid: '规则最大并发请求必须为 0 到 10000 的整数（0 表示不额外限制）',
+  ruleResourceInvalid: '规则连接、请求、上游连接与空闲连接必须为指定范围内的非负整数；规则内存上限填 0 使用全局默认值。',
+  dnsCIDRRequired: 'DNS 监听全部网卡时必须填写至少一个非全网 CIDR 白名单',
+  dnsCacheInvalid: 'DNS 缓存大小必须是大于 0 的安全整数；TTL 必须是 0 到 4294967295 的安全整数，且最大 TTL 非 0 时不能小于最小 TTL',
+  dnsUpstreamTimeoutInvalid: '上游超时必须在 1 到 120 秒之间',
   ednsTitle: 'EDNS 客户端子网',
   ednsEnabled: '启用 EDNS 客户端子网',
   ednsMode: 'EDNS 模式',
@@ -76,6 +136,8 @@ export const reverseProxyCopy = {
   httpVersionStrategy: 'HTTP 版本策略',
   upstreamTlsVerify: '是否校验证书',
   apiPassthrough: '流式/API 透传',
+  advertiseHttp3: '向浏览器广播 HTTP/3',
+  advertiseHttp3Hint: '仅用于 HTTPS（H2+H3）。同一端口、同一域名的任一规则开启后，该域名统一广播 5 分钟；全部关闭时清理浏览器保存的 HTTP/3 路由。',
   remark: '备注',
   cancel: '取消',
   save: '保存',
@@ -93,9 +155,9 @@ export const reverseProxyCopy = {
   saveUpdated: '反向代理已更新',
   reorderSaved: '匹配顺序已更新',
   enableLabel: '启用',
-  listenPanelHint: 'Go 运行时会在该端口同时监听 IPv4 与 IPv6；这里填写的是域名命中条件，HTTP 校验域名型 Host，HTTPS/H2/H3 校验域名型 SNI；通过 IP 访问或无 SNI 访问始终允许；URL 路径按完整路径段严格匹配。',
+  listenPanelHint: '规则按端口监听全部 IPv4/IPv6 网卡。域名条件始终严格匹配 Host/SNI；留空仅允许由 IP SAN 证书覆盖的 IP 类连接。',
   targetPanelHint: '目标支持 HTTP / HTTPS / DNS。多个目标会按填写顺序依次尝试；DNS 目标之间也会按顺序回退。',
-  tlsPanelHint: '本地协议为 HTTPS、WSS、DoH、DoH3、DoT、DoQ 时必须绑定至少一张证书。',
+  tlsPanelHint: 'HTTPS、WSS、DoH、DoH3、DoT、DoQ 必须绑定证书。域名连接同时校验规则、证书 DNS SAN 与 Host/SNI；无 SNI 或 IP SNI 只使用覆盖目标 IP 的真实 IP SAN。',
   certificateRequired: '请选择至少一张 TLS 监听证书',
   certificateBound: '已绑定证书',
   currentHTTPNoCert: '当前监听协议无需证书',
@@ -104,20 +166,20 @@ export const reverseProxyCopy = {
   ruleDisabled: '已停用',
   pathRequired: '路径不能为空',
   listenMatchRequired: '域名可留空',
-  listenIPLiteralNotAllowed: '这里只能填写域名，不能填写 IP；通过 IP 访问默认允许',
+  listenIPLiteralNotAllowed: '域名条件不能填写 IP；IP 访问由证书真实 IP SAN 单独匹配',
   listenPortInlineNotAllowed: '域名里不能带端口，请把端口填在监听端口',
   targetAddressInlineNotAllowed: '目标地址 / 域名 里不能带端口，请把端口填在目标端口',
   targetRequired: '请填写至少一个目标地址',
   certRequiredSave: 'TLS 监听必须至少选择一张证书',
   dnsPathRequired: '当前 DNS 协议必须填写 URL 路径',
   dnsProtocolPairRequired: 'DNS 反代要求本地协议和目标协议都使用 DNS',
-  dnsHostUnused: 'DNS 反代不使用域名命中条件',
+  dnsHostUnused: '传统 UDP/TCP DNS 没有 SNI 或 Host，按端口进入固定规则',
   dnsHttpFieldUnused: 'DNS 反代不使用 HTTP 路径改写与 API 透传',
   listenModeHTTP: 'HTTP：仅监听明文 HTTP 请求。',
-  listenModeHTTPS: 'HTTPS：同时监听 TCP(H2) 与 UDP(H3)，浏览器按标准协商决定使用哪种版本。',
+  listenModeHTTPS: 'HTTPS：同时监听 TCP(H2) 与 UDP(H3)。默认不广播 HTTP/3，开启下方开关后浏览器才会自动优先尝试 H3。',
   listenModeH2: 'H2：仅监听 TCP，仅提供 HTTPS/HTTP2。',
   listenModeH3: 'H3：仅监听 UDP，仅提供 HTTPS/HTTP3。',
-  listenModeDNSDoH: 'DoH（DNS）：同时监听 H2 与 H3 的 DNS over HTTPS，可自定义端口和 URL 路径。',
+  listenModeDNSDoH: 'DoH（DNS）：仅监听 TCP/TLS 上的 DNS over HTTPS（H2；不会打开 H3 UDP 监听），可自定义端口和 URL 路径。',
   listenModeDNSDoHH3: 'DoH3（DNS）：仅监听 H3 的 DNS over HTTPS，可自定义端口和 URL 路径。',
   listenModeDNSDoQ: 'DoQ（DNS）：通过 QUIC 提供 DNS over QUIC，可自定义端口。',
   listenModeDNSDoT: 'DoT（DNS）：通过 TLS 提供 DNS over TLS，可自定义端口。',
@@ -134,10 +196,10 @@ export const reverseProxyCopy = {
   targetModeDNSUDP: 'UDP（DNS）：向上游发起传统 DNS UDP 请求。',
   targetModeDNSTCP: 'TCP（DNS）：向上游发起传统 DNS TCP 请求。',
   tlsModeRequired: '当前监听协议需要 TLS 证书。',
-  listenIpLocalHint: '填写后仅约束域名型 Host / SNI；通过 IP 访问或无 SNI 访问仍允许。留空时不做域名命中限制。',
+  listenIpLocalHint: '精确域名严格匹配；*.example.com 仅匹配一个最左侧标签。多个条件任一命中即可，留空时拒绝所有域名连接。',
   targetPathRewriteHint: '目标基础路径会作为上游前缀，例如填 /api 后，请求 /foo 会转发到 /api/foo。',
   apiPassthroughHint: '开启后不改写响应正文，适合 AI、SSE 与 API 直通，避免流式内容被缓冲或替换；响应头仍按反代规则处理。',
-  runtimeHint: '当请求没有命中任何规则时，Go 运行时会拒绝该请求。',
+  runtimeHint: '当请求没有命中任何规则时，HTTP 返回 404；HTTPS 的 SNI 或 Host 不匹配返回 421。',
   pathPrefixStrictHint: '填写 888 会保存为 /888；只有 /888 或 /888/后续目标路径会命中，/8888 不会命中。',
 }
 export const reverseProxyHeaders = [
@@ -155,6 +217,8 @@ export const reverseProxyHeaders = [
   { title: reverseProxyCopy.actionLabel, key: 'actions', sortable: false, width: 260 },
 ]
 
+const reverseProxyDNSMaxTTL = 4294967295
+
 export const protocolItems = [
   { title: 'HTTP', value: 'http' },
   { title: 'WS', value: 'ws' },
@@ -171,18 +235,18 @@ export const protocolItems = [
 ] as const
 
 export const ipStrategyItems = [
-  { title: 'IPv4 only', value: 'ipv4_only' },
-  { title: 'IPv6 only', value: 'ipv6_only' },
-  { title: 'Prefer IPv4', value: 'prefer_ipv4' },
-  { title: 'Prefer IPv6', value: 'prefer_ipv6' },
+  { title: '仅 IPv4', value: 'ipv4_only' },
+  { title: '仅 IPv6', value: 'ipv6_only' },
+  { title: '优先 IPv4', value: 'prefer_ipv4' },
+  { title: '优先 IPv6', value: 'prefer_ipv6' },
 ] as const
 
 export const httpVersionItems = [
-  { title: 'Dual required (Prefer H3)', value: 'dual_required_prefer_h3' },
-  { title: 'H2 only', value: 'h2_only' },
-  { title: 'H3 only', value: 'h3_only' },
-  { title: 'Prefer H2', value: 'prefer_h2' },
-  { title: 'Prefer H3', value: 'prefer_h3' },
+  { title: 'H2/H3 均需可用（优先 H3）', value: 'dual_required_prefer_h3' },
+  { title: '仅 H2', value: 'h2_only' },
+  { title: '仅 H3', value: 'h3_only' },
+  { title: '优先 H2', value: 'prefer_h2' },
+  { title: '优先 H3', value: 'prefer_h3' },
 ] as const
 
 export const ednsModeItems = [
@@ -196,7 +260,9 @@ export const ednsClientSubnetPolicyItems = [
 ] as const
 
 const emptyOverview = (): ReverseProxyOverview => ({
-  available: true,
+  revision: 0,
+  resourceSettings: defaultResourceSettings(),
+  available: false,
   started: false,
   listenerCount: 0,
   enabledCount: 0,
@@ -209,13 +275,26 @@ const emptyOverview = (): ReverseProxyOverview => ({
   error: '',
 })
 
+export const defaultResourceSettings = (): ReverseProxyResourceSettings => ({
+  listenerConnectionLimit: 4096,
+  globalHttpMaxConcurrent: 4096,
+  globalDnsMaxConcurrent: 4096,
+  http2MaxConcurrentStreams: 250,
+  quicMaxIncomingStreams: 256,
+  defaultUpstreamMaxIdleConnections: 32,
+  memoryPoolBytes: 8 * 1024 * 1024 * 1024,
+  defaultRuleMemoryLimitBytes: 384 * 1024 * 1024,
+  responseRewriteInputBytes: 4 * 1024 * 1024,
+  responseRewriteOutputBytes: 8 * 1024 * 1024,
+  responseRewriteMaxConcurrent: 32,
+})
+
 export const createEmptyReverseProxyRuleForm = (): ReverseProxyRuleForm => ({
   id: 0,
   displayId: 0,
   name: '',
   enabled: true,
   listenProtocol: 'http',
-  listenIPsText: '',
   listenPort: 80,
   hostsText: '',
   pathPrefix: '',
@@ -225,6 +304,15 @@ export const createEmptyReverseProxyRuleForm = (): ReverseProxyRuleForm => ({
   targetPort: 80,
   targetPath: '',
   targetDnsPath: '/dns-query',
+  fallbackDnsUpstreams: '',
+  dnsUpstreamTimeoutSeconds: 12,
+  dnsCacheEnabled: false,
+  dnsCacheSizeBytes: 4 * 1024 * 1024,
+  dnsCacheMinTtl: 0,
+  dnsCacheMaxTtl: 0,
+  dnsAllowedCidrsText: '',
+  dnsRateLimitQps: 50,
+  dnsMaxConcurrentQueries: 0,
   ednsEnabled: false,
   ednsMode: 'auto',
   ednsCustomIp: '',
@@ -235,14 +323,30 @@ export const createEmptyReverseProxyRuleForm = (): ReverseProxyRuleForm => ({
   listenHttpVersionStrategy: '',
   ipStrategy: 'prefer_ipv4',
   httpVersionStrategy: '',
-  upstreamTlsVerify: false,
+  upstreamTlsVerify: true,
+  maxConcurrentConnections: 0,
+  maxConcurrentRequests: 0,
+  upstreamMaxConnections: 0,
+  upstreamMaxIdleConnections: 0,
+  memoryLimitBytes: 0,
   apiPassthrough: false,
+  advertiseHttp3: false,
   remark: '',
 })
 
 const asNumber = (value: unknown, fallback = 0) => {
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : fallback
+}
+
+export const formatReverseProxyBytes = (value: number) => {
+  const bytes = Number(value)
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  const scaled = bytes / (1024 ** exponent)
+  const precision = scaled >= 100 || exponent === 0 ? 0 : (scaled >= 10 ? 1 : 2)
+  return `${scaled.toFixed(precision)} ${units[exponent]}`
 }
 
 const asString = (value: unknown, fallback = '') => {
@@ -385,8 +489,6 @@ const normalizeRule = (value: unknown): ReverseProxyRule => {
     name: asString(item.name),
     enabled: asBoolean(item.enabled, true),
     listenProtocol: deriveListenProtocolForForm(listenProtocolRaw, listenHttpVersionStrategy, listenProtocolAliasRaw),
-    listenIP: asString(item.listenIP),
-    listenIPs: normalizeStringList(item.listenIPs),
     listenPort: asNumber(item.listenPort),
     hosts: normalizeStringList(item.hosts),
     pathPrefix: asString(item.pathPrefix),
@@ -396,6 +498,15 @@ const normalizeRule = (value: unknown): ReverseProxyRule => {
     targetPort: asNumber(item.targetPort),
     targetPath: asString(item.targetPath),
     targetDnsPath: asString(item.targetDnsPath),
+    fallbackDnsUpstreams: asString(item.fallbackDnsUpstreams),
+    dnsUpstreamTimeoutSeconds: asNumber(item.dnsUpstreamTimeoutSeconds, 12),
+    dnsCacheEnabled: asBoolean(item.dnsCacheEnabled, false),
+    dnsCacheSizeBytes: asNumber(item.dnsCacheSizeBytes, 4 * 1024 * 1024),
+    dnsCacheMinTtl: asNumber(item.dnsCacheMinTtl),
+    dnsCacheMaxTtl: asNumber(item.dnsCacheMaxTtl),
+    dnsAllowedCidrs: normalizeStringList(item.dnsAllowedCidrs),
+    dnsRateLimitQps: asNumber(item.dnsRateLimitQps, 50),
+    dnsMaxConcurrentQueries: asNumber(item.dnsMaxConcurrentQueries),
     ednsEnabled: asBoolean(item.ednsEnabled, false),
     ednsMode: asString(item.ednsMode, 'auto') === 'custom' ? 'custom' : 'auto',
     ednsCustomIp: asString(item.ednsCustomIp),
@@ -410,7 +521,13 @@ const normalizeRule = (value: unknown): ReverseProxyRule => {
     ipStrategy: asString(item.ipStrategy, 'prefer_ipv4') as ReverseProxyRule['ipStrategy'],
     httpVersionStrategy,
     upstreamTlsVerify: asBoolean(item.upstreamTlsVerify, true),
+    maxConcurrentConnections: asNumber(item.maxConcurrentConnections),
+    maxConcurrentRequests: asNumber(item.maxConcurrentRequests),
+    upstreamMaxConnections: asNumber(item.upstreamMaxConnections),
+    upstreamMaxIdleConnections: asNumber(item.upstreamMaxIdleConnections),
+    memoryLimitBytes: asNumber(item.memoryLimitBytes),
     apiPassthrough: asBoolean(item.apiPassthrough, false),
+    advertiseHttp3: asBoolean(item.advertiseHttp3, false),
     remark: asString(item.remark),
     lastError: asString(item.lastError),
     runtimeStatus: asString(item.runtimeStatus),
@@ -422,9 +539,29 @@ const normalizeRule = (value: unknown): ReverseProxyRule => {
   }
 }
 
+const normalizeResourceSettings = (value: unknown): ReverseProxyResourceSettings => {
+  const item = (value ?? {}) as Partial<ReverseProxyResourceSettings>
+  const defaults = defaultResourceSettings()
+  return {
+    listenerConnectionLimit: asNumber(item.listenerConnectionLimit, defaults.listenerConnectionLimit),
+    globalHttpMaxConcurrent: asNumber(item.globalHttpMaxConcurrent, defaults.globalHttpMaxConcurrent),
+    globalDnsMaxConcurrent: asNumber(item.globalDnsMaxConcurrent, defaults.globalDnsMaxConcurrent),
+    http2MaxConcurrentStreams: asNumber(item.http2MaxConcurrentStreams, defaults.http2MaxConcurrentStreams),
+    quicMaxIncomingStreams: asNumber(item.quicMaxIncomingStreams, defaults.quicMaxIncomingStreams),
+    defaultUpstreamMaxIdleConnections: asNumber(item.defaultUpstreamMaxIdleConnections, defaults.defaultUpstreamMaxIdleConnections),
+    memoryPoolBytes: asNumber(item.memoryPoolBytes, defaults.memoryPoolBytes),
+    defaultRuleMemoryLimitBytes: asNumber(item.defaultRuleMemoryLimitBytes, defaults.defaultRuleMemoryLimitBytes),
+    responseRewriteInputBytes: asNumber(item.responseRewriteInputBytes, defaults.responseRewriteInputBytes),
+    responseRewriteOutputBytes: asNumber(item.responseRewriteOutputBytes, defaults.responseRewriteOutputBytes),
+    responseRewriteMaxConcurrent: asNumber(item.responseRewriteMaxConcurrent, defaults.responseRewriteMaxConcurrent),
+  }
+}
+
 const normalizeOverview = (value: unknown): ReverseProxyOverview => {
   const item = (value ?? {}) as Partial<ReverseProxyOverview>
   return {
+    revision: asNumber(item.revision),
+    resourceSettings: normalizeResourceSettings(item.resourceSettings),
     available: asBoolean(item.available, true),
     started: asBoolean(item.started),
     listenerCount: asNumber(item.listenerCount),
@@ -439,9 +576,41 @@ const normalizeOverview = (value: unknown): ReverseProxyOverview => {
   }
 }
 
+const normalizeRuntimeOverview = (value: unknown): ReverseProxyRuntimeOverview => {
+  const item = (value ?? {}) as Partial<ReverseProxyRuntimeOverview>
+  const rawResources = (item.resources ?? {}) as Partial<ReverseProxyRuntimeOverview['resources']>
+  const rawRules = Array.isArray(item.rules) ? item.rules : []
+  return {
+    revision: asNumber(item.revision),
+    available: asBoolean(item.available, true),
+    started: asBoolean(item.started),
+    listenerCount: asNumber(item.listenerCount),
+    lastSyncAt: asNumber(item.lastSyncAt),
+    rules: rawRules.map((raw) => {
+      const rule = raw as Partial<ReverseProxyRuntimeOverview['rules'][number]>
+      return {
+        id: asNumber(rule.id),
+        runtimeStatus: asString(rule.runtimeStatus),
+        lastError: asString(rule.lastError),
+        localConnectionCount: asNumber(rule.localConnectionCount),
+        upstreamConnectionCount: asNumber(rule.upstreamConnectionCount),
+      }
+    }),
+    resources: {
+      activeHttpRequests: asNumber(rawResources.activeHttpRequests),
+      activeDnsQueries: asNumber(rawResources.activeDnsQueries),
+      memoryUsedBytes: asNumber(rawResources.memoryUsedBytes),
+      cacheUsedBytes: asNumber(rawResources.cacheUsedBytes),
+      rewriteUsedBytes: asNumber(rawResources.rewriteUsedBytes),
+    },
+    warnings: normalizeStringList(item.warnings),
+    error: asString(item.error),
+  }
+}
+
 export const formatTimestamp = (value: number) => {
   if (!value) return '-'
-  return new Date(value * 1000).toLocaleString()
+  return formatPanelDateTime(value * 1000)
 }
 
 export const protocolLabel = (value: string) => {
@@ -466,17 +635,55 @@ export const certificateDisplay = (item: ReverseProxyRule) => item.certificateLa
 
 export const connectionCountsDisplay = (item: ReverseProxyRule) => `${item.localConnectionCount} | ${item.upstreamConnectionCount}`
 
-export const listenMatchDisplay = (item: ReverseProxyRule) => joinDisplay([
-  ...(item.listenIPs ?? []),
-  ...(item.hosts ?? []),
-])
+export const listenMatchDisplay = (item: ReverseProxyRule) => {
+  const hosts = joinDisplay(item.hosts ?? [])
+  if (hosts) return hosts
+  if (item.listenProtocol === 'dns_udp' || item.listenProtocol === 'dns_tcp') return '端口固定规则'
+  return 'IP 连接'
+}
 
 export const statusColor = (value: string) => {
   const normalized = value.trim().toLowerCase()
   if (normalized === 'running') return 'success'
   if (normalized === 'pending') return 'info'
   if (normalized === 'upstream_error' || normalized === 'proxy_error') return 'warning'
+  if (normalized === 'listener_error') return 'error'
   return 'grey'
+}
+
+export const runtimeStatusLabel = (value: string) => {
+  const normalized = value.trim().toLowerCase()
+  if (normalized === 'running') return '运行中'
+  if (normalized === 'pending') return '等待应用'
+  if (normalized === 'disabled') return '已停用'
+  if (normalized === 'upstream_error') return '上游异常'
+  if (normalized === 'proxy_error') return '代理异常'
+  if (normalized === 'listener_error') return '监听异常'
+  if (normalized === 'stopped') return '已停止'
+  return '未运行'
+}
+
+export const ipStrategyLabel = (value: string) => {
+  const normalized = value.trim().toLowerCase()
+  if (normalized === 'ipv4_only') return '仅 IPv4'
+  if (normalized === 'ipv6_only') return '仅 IPv6'
+  if (normalized === 'prefer_ipv4') return '优先 IPv4'
+  if (normalized === 'prefer_ipv6') return '优先 IPv6'
+  return '自动选择'
+}
+
+export const httpVersionStrategyLabel = (value: string, targetProtocol = '') => {
+  const normalizedProtocol = targetProtocol.trim().toLowerCase()
+  if (normalizedProtocol.startsWith('dns_')) return 'DNS 上游'
+  if (normalizedProtocol === 'http' || normalizedProtocol === 'ws') return reverseProxyCopy.targetHTTPMode
+  if (normalizedProtocol === 'wss') return 'WSS 上游'
+  const normalized = value.trim().toLowerCase()
+  if (normalized === 'dual_required_prefer_h3') return 'H2/H3 均需可用（优先 H3）'
+  if (normalized === 'h2_only') return '仅 H2'
+  if (normalized === 'h3_only') return '仅 H3'
+  if (normalized === 'prefer_h2') return '优先 H2'
+  if (normalized === 'prefer_h3') return '优先 H3'
+  return '-'
 }
 
 const normalizePathInput = (value: string, allowEmpty: boolean) => {
@@ -492,11 +699,12 @@ const normalizeListTextInput = (value: string) => splitInputTokens(value).join('
 
 const trimReverseProxyRuleFormText = (form: ReverseProxyRuleForm) => {
   form.name = form.name.trim()
-  form.listenIPsText = normalizeListTextInput(form.listenIPsText)
+  form.dnsAllowedCidrsText = normalizeListTextInput(form.dnsAllowedCidrsText)
   form.hostsText = normalizeListTextInput(form.hostsText)
   form.pathPrefix = form.pathPrefix.trim()
   form.targetAddressesText = normalizeListTextInput(form.targetAddressesText)
   form.targetPath = form.targetPath.trim()
+  form.fallbackDnsUpstreams = form.fallbackDnsUpstreams.replace(/\r\n?/g, '\n').trim()
   form.ednsCustomIp = form.ednsCustomIp.trim()
   form.remark = form.remark.trim()
 }
@@ -611,7 +819,7 @@ const mapListenProtocolToBackend = (protocol: string): {
     return { listenProtocol: 'http', listenHttpVersionStrategy: '' }
   }
   if (raw === 'wss') {
-    return { listenProtocol: 'https', listenHttpVersionStrategy: 'h2_h3' }
+    return { listenProtocol: 'https', listenHttpVersionStrategy: 'h2_only' }
   }
   const normalized = normalizeVirtualProtocol(protocol)
   if (normalized === 'http') {
@@ -690,7 +898,6 @@ export const mapRuleToForm = (rule?: ReverseProxyRule): ReverseProxyRuleForm => 
     name: rule?.name ?? '',
     enabled: rule?.enabled ?? true,
     listenProtocol,
-    listenIPsText: normalizeStringList(rule?.listenIPs ?? []).join(', '),
     listenPort: rule?.listenPort ?? 80,
     hostsText: normalizeStringList(rule?.hosts ?? []).join(', '),
     pathPrefix: rule?.pathPrefix ?? '',
@@ -700,6 +907,15 @@ export const mapRuleToForm = (rule?: ReverseProxyRule): ReverseProxyRuleForm => 
     targetPort: rule?.targetPort ?? 80,
     targetPath: rule?.targetPath ?? '',
     targetDnsPath: rule?.targetDnsPath ?? (dnsProtocolUsesPath(targetProtocol) ? '/dns-query' : ''),
+    fallbackDnsUpstreams: rule?.fallbackDnsUpstreams ?? '',
+    dnsUpstreamTimeoutSeconds: rule?.dnsUpstreamTimeoutSeconds ?? 12,
+    dnsCacheEnabled: rule?.dnsCacheEnabled ?? false,
+    dnsCacheSizeBytes: rule?.dnsCacheSizeBytes ?? (4 * 1024 * 1024),
+    dnsCacheMinTtl: rule?.dnsCacheMinTtl ?? 0,
+    dnsCacheMaxTtl: rule?.dnsCacheMaxTtl ?? 0,
+    dnsAllowedCidrsText: normalizeStringList(rule?.dnsAllowedCidrs ?? []).join(', '),
+    dnsRateLimitQps: rule?.dnsRateLimitQps ?? 50,
+    dnsMaxConcurrentQueries: rule?.dnsMaxConcurrentQueries ?? 0,
     ednsEnabled: rule?.ednsEnabled ?? false,
     ednsMode: rule?.ednsMode === 'custom' ? 'custom' : 'auto',
     ednsCustomIp: rule?.ednsCustomIp ?? '',
@@ -716,7 +932,13 @@ export const mapRuleToForm = (rule?: ReverseProxyRule): ReverseProxyRuleForm => 
     ipStrategy: rule?.ipStrategy ?? 'prefer_ipv4',
     httpVersionStrategy: targetStrategy,
     upstreamTlsVerify: targetProtocol === 'http' ? false : (rule?.upstreamTlsVerify ?? true),
+    maxConcurrentConnections: rule?.maxConcurrentConnections ?? 0,
+    maxConcurrentRequests: rule?.maxConcurrentRequests ?? 0,
+    upstreamMaxConnections: rule?.upstreamMaxConnections ?? 0,
+    upstreamMaxIdleConnections: rule?.upstreamMaxIdleConnections ?? 0,
+    memoryLimitBytes: rule?.memoryLimitBytes ?? 0,
     apiPassthrough: rule?.apiPassthrough ?? false,
+    advertiseHttp3: rule?.advertiseHttp3 ?? false,
     remark: rule?.remark ?? '',
   }
 }
@@ -739,7 +961,8 @@ export const buildReverseProxyPayload = (
   const targetPath = form.targetPath.trim()
   const listenDnsPath = form.listenDnsPath.trim()
   const targetDnsPath = form.targetDnsPath.trim()
-  const listenIPsText = normalizeListTextInput(form.listenIPsText)
+  const fallbackDnsUpstreams = form.fallbackDnsUpstreams.replace(/\r\n?/g, '\n').trim()
+  const dnsAllowedCidrsText = normalizeListTextInput(form.dnsAllowedCidrsText)
   const ednsCustomIp = normalizeEDNSCustomIPv4(form.ednsCustomIp)
   const remark = form.remark.trim()
   const listenNames = splitInputTokens(hostsText)
@@ -766,8 +989,7 @@ export const buildReverseProxyPayload = (
     listenProtocol: listenProtocol.listenProtocol,
     listenProtocolAlias: listenProtocol.listenProtocolAlias || listenProtocolAlias,
     listenPort: asNumber(form.listenPort),
-    listenIPs: listenIPsText,
-    hosts: listenNames.join(', '),
+    hosts: (!protocolIsDNS(form.listenProtocol) || protocolNeedsCertificates(form.listenProtocol)) ? listenNames.join(', ') : '',
     pathPrefix: normalizePathInput(pathPrefix, true),
     listenDnsPath: dnsProtocolUsesPath(form.listenProtocol) ? normalizePathInput(listenDnsPath, true) : '',
     targetProtocol: targetProtocol.targetProtocol,
@@ -776,6 +998,15 @@ export const buildReverseProxyPayload = (
     targetPort: asNumber(form.targetPort),
     targetPath: normalizePathInput(targetPath, true),
     targetDnsPath: dnsProtocolUsesPath(form.targetProtocol) ? normalizePathInput(targetDnsPath, true) : '',
+    fallbackDnsUpstreams: protocolIsDNS(form.listenProtocol) && protocolIsDNS(form.targetProtocol) ? fallbackDnsUpstreams : '',
+    dnsUpstreamTimeoutSeconds: protocolIsDNS(form.listenProtocol) && protocolIsDNS(form.targetProtocol) ? asNumber(form.dnsUpstreamTimeoutSeconds, 12) : 12,
+    dnsCacheEnabled: protocolIsDNS(form.listenProtocol) && protocolIsDNS(form.targetProtocol) ? form.dnsCacheEnabled : false,
+    dnsCacheSizeBytes: protocolIsDNS(form.listenProtocol) && protocolIsDNS(form.targetProtocol) ? asNumber(form.dnsCacheSizeBytes, 4 * 1024 * 1024) : (4 * 1024 * 1024),
+    dnsCacheMinTtl: protocolIsDNS(form.listenProtocol) && protocolIsDNS(form.targetProtocol) ? asNumber(form.dnsCacheMinTtl) : 0,
+    dnsCacheMaxTtl: protocolIsDNS(form.listenProtocol) && protocolIsDNS(form.targetProtocol) ? asNumber(form.dnsCacheMaxTtl) : 0,
+    dnsAllowedCidrs: protocolIsDNS(form.listenProtocol) ? dnsAllowedCidrsText : '',
+    dnsRateLimitQps: protocolIsDNS(form.listenProtocol) ? asNumber(form.dnsRateLimitQps, 50) : 50,
+    dnsMaxConcurrentQueries: protocolIsDNS(form.listenProtocol) ? asNumber(form.dnsMaxConcurrentQueries) : 0,
     ednsEnabled: protocolIsDNS(form.listenProtocol) ? form.ednsEnabled : false,
     ednsMode: protocolIsDNS(form.listenProtocol) ? form.ednsMode : 'auto',
     ednsCustomIp: protocolIsDNS(form.listenProtocol) && form.ednsEnabled && form.ednsMode === 'custom' ? ednsCustomIp : '',
@@ -788,7 +1019,13 @@ export const buildReverseProxyPayload = (
     ipStrategy: form.ipStrategy,
     httpVersionStrategy: targetProtocol.targetProtocol === 'https' ? targetProtocol.httpVersionStrategy : '',
     upstreamTlsVerify: protocolIsTLS(form.targetProtocol) ? form.upstreamTlsVerify : false,
+    maxConcurrentConnections: protocolIsDNS(form.listenProtocol) ? 0 : asNumber(form.maxConcurrentConnections),
+    maxConcurrentRequests: protocolIsDNS(form.listenProtocol) ? 0 : asNumber(form.maxConcurrentRequests),
+    upstreamMaxConnections: protocolIsDNS(form.targetProtocol) ? 0 : asNumber(form.upstreamMaxConnections),
+    upstreamMaxIdleConnections: protocolIsDNS(form.targetProtocol) ? 0 : asNumber(form.upstreamMaxIdleConnections),
+    memoryLimitBytes: asNumber(form.memoryLimitBytes),
     apiPassthrough: form.apiPassthrough,
+    advertiseHttp3: form.listenProtocol === 'https' ? form.advertiseHttp3 : false,
     remark,
   }
 }
@@ -797,29 +1034,84 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   const loading = ref(false)
   const refreshing = ref(false)
   const saving = ref(false)
+  const savingResources = ref(false)
+  const mutationBusy = ref(false)
+  const hasLoaded = ref(false)
+  const loadError = ref('')
   const dialogVisible = ref(false)
+  const resourceDialogVisible = ref(false)
   const rowBusyId = ref(0)
   const searchText = ref('')
   const overview = ref<ReverseProxyOverview>(emptyOverview())
+  const runtimeUsage = ref<ReverseProxyRuntimeOverview['resources']>({
+    activeHttpRequests: 0,
+    activeDnsQueries: 0,
+    memoryUsedBytes: 0,
+    cacheUsedBytes: 0,
+    rewriteUsedBytes: 0,
+  })
   const editingRule = ref<ReverseProxyRuleForm>(createEmptyReverseProxyRuleForm())
+  const editingResources = ref<ReverseProxyResourceSettings>(defaultResourceSettings())
+  const editingRuleRevision = ref(0)
+  const editingResourcesRevision = ref(0)
   const pollTimer = ref<number | null>(null)
   const overviewRequest = ref<Promise<Msg> | null>(null)
+  const runtimeRequest = ref<Promise<Msg> | null>(null)
+  const configurationConflict = ref(false)
+  const actionsDisabled = computed(() => mutationBusy.value || !hasLoaded.value || Boolean(loadError.value))
   let latestOverviewRequestId = 0
 
-  const applyOverview = (raw: unknown) => {
-    overview.value = normalizeOverview(raw)
+  const applyOverview = (raw: unknown, clearConflict = true) => {
+    const nextOverview = normalizeOverview(raw)
+    // A GET started before a successful write can finish afterwards.  Revisions
+    // are monotonic, so never let that stale response roll the UI back and make
+    // the following queued write use an obsolete expectedRevision.
+    if (nextOverview.revision > 0 && overview.value.revision > nextOverview.revision) return false
+    overview.value = nextOverview
+    hasLoaded.value = true
+    loadError.value = ''
+    if (!resourceDialogVisible.value) {
+      editingResources.value = { ...overview.value.resourceSettings }
+    }
+    if (clearConflict) configurationConflict.value = false
+    return true
   }
 
-  const fetchOverview = async (silent = false) => {
+  const runMutation = async (operation: () => Promise<Msg>, applySnapshot = true): Promise<Msg | null> => {
+    if (mutationBusy.value) return null
+    mutationBusy.value = true
+    try {
+      const msg = await operation()
+      if (msg.success && applySnapshot) applyOverview(msg.obj)
+      return msg
+    } finally {
+      mutationBusy.value = false
+    }
+  }
+
+  const isRevisionConflict = (msg: Msg | null) => !msg?.success && msg?.obj?.code === 'revision_conflict'
+
+  const handleRevisionConflict = async (msg: Msg | null) => {
+    if (!isRevisionConflict(msg)) return false
+    configurationConflict.value = true
+    await fetchOverview(true, true)
+    push.warning({ duration: 5000, message: reverseProxyCopy.revisionConflict })
+    return true
+  }
+
+  const fetchOverview = async (silent = false, preserveConflict = false) => {
     if (overviewRequest.value) {
       return overviewRequest.value
     }
     if (!silent) loading.value = true
     const requestId = ++latestOverviewRequestId
     const request = (async () => {
-      const msg = await HttpUtils.get('api/reverse-proxy-overview')
+      const msg = await HttpUtils.get('api/reverse-proxy-overview', {}, { silentErrorToast: silent })
       if (msg.success && requestId === latestOverviewRequestId) {
-        applyOverview(msg.obj)
+        applyOverview(msg.obj, !preserveConflict)
+      } else if (!msg.success && requestId === latestOverviewRequestId) {
+        loadError.value = msg.msg || reverseProxyCopy.loadFailed
+        overview.value.available = false
       }
       return msg
     })()
@@ -837,14 +1129,131 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   const refreshOverview = async () => {
     refreshing.value = true
     try {
-      await fetchOverview(true)
+      await fetchOverview(false)
     } finally {
       refreshing.value = false
     }
   }
 
+  const mergeRuntime = (raw: unknown) => {
+    const runtime = normalizeRuntimeOverview(raw)
+    if (runtime.revision > 0 && overview.value.revision > 0 && runtime.revision !== overview.value.revision) {
+      configurationConflict.value = true
+      // applyOverview deliberately leaves open dialog drafts intact, so the
+      // newest persisted configuration can be fetched immediately without
+      // replaying or silently overwriting a rule/resource edit in progress.
+      void fetchOverview(true, true)
+      return
+    }
+    overview.value.available = runtime.available
+    overview.value.started = runtime.started
+    overview.value.listenerCount = runtime.listenerCount
+    overview.value.lastSyncAt = runtime.lastSyncAt
+    overview.value.warnings = runtime.warnings ?? []
+    overview.value.error = runtime.error ?? ''
+    const byID = new Map(runtime.rules.map(rule => [rule.id, rule]))
+    overview.value.rules = overview.value.rules.map((rule) => {
+      const state = byID.get(rule.id)
+      if (!state || !rule.enabled) {
+        return {
+          ...rule,
+          runtimeStatus: rule.enabled ? 'pending' : 'disabled',
+          lastError: '',
+          localConnectionCount: 0,
+          upstreamConnectionCount: 0,
+        }
+      }
+      return {
+        ...rule,
+        runtimeStatus: state.runtimeStatus,
+        lastError: state.lastError,
+        localConnectionCount: state.localConnectionCount,
+        upstreamConnectionCount: state.upstreamConnectionCount,
+      }
+    })
+    runtimeUsage.value = runtime.resources
+  }
+
+  const fetchRuntime = async () => {
+    if (!props.active || !hasLoaded.value || Boolean(loadError.value)) return null
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return null
+    if (runtimeRequest.value) return runtimeRequest.value
+    const request = (async () => {
+      const msg = await HttpUtils.get('api/reverse-proxy-runtime', {}, { silentErrorToast: true })
+      if (msg.success) mergeRuntime(msg.obj)
+      return msg
+    })()
+    runtimeRequest.value = request
+    try {
+      return await request
+    } finally {
+      if (runtimeRequest.value === request) runtimeRequest.value = null
+    }
+  }
+
+  const openResourceDialog = () => {
+    if (actionsDisabled.value) return
+    editingResources.value = { ...overview.value.resourceSettings }
+    editingResourcesRevision.value = overview.value.revision
+    configurationConflict.value = false
+    resourceDialogVisible.value = true
+  }
+
+  const resourcesAreValid = (value: ReverseProxyResourceSettings) => {
+    const nonNegative = [
+      value.listenerConnectionLimit,
+      value.globalHttpMaxConcurrent,
+      value.globalDnsMaxConcurrent,
+      value.defaultUpstreamMaxIdleConnections,
+    ]
+    const positive = [
+      value.http2MaxConcurrentStreams,
+      value.quicMaxIncomingStreams,
+      value.memoryPoolBytes,
+      value.defaultRuleMemoryLimitBytes,
+      value.responseRewriteInputBytes,
+      value.responseRewriteOutputBytes,
+      value.responseRewriteMaxConcurrent,
+    ]
+    if (nonNegative.some(item => !Number.isSafeInteger(Number(item)) || Number(item) < 0)) return false
+    if (positive.some(item => !Number.isSafeInteger(Number(item)) || Number(item) <= 0)) return false
+    return Number(value.defaultRuleMemoryLimitBytes) <= Number(value.memoryPoolBytes)
+      && Number(value.responseRewriteInputBytes) + Number(value.responseRewriteOutputBytes) * 2 <= Number(value.defaultRuleMemoryLimitBytes)
+      && Number(value.memoryPoolBytes) >= 500 * 1024
+      && Number(value.defaultRuleMemoryLimitBytes) >= 500 * 1024
+      && Number(value.responseRewriteInputBytes) >= 500 * 1024
+      && Number(value.responseRewriteOutputBytes) >= 500 * 1024
+  }
+
+  const saveResources = async () => {
+    if (savingResources.value || actionsDisabled.value) return
+    if (!resourcesAreValid(editingResources.value)) {
+      push.warning({ duration: 5000, message: reverseProxyCopy.resourceInvalid })
+      return
+    }
+    const payload = {
+      ...editingResources.value,
+      expectedRevision: editingResourcesRevision.value,
+    }
+    savingResources.value = true
+    try {
+      const msg = await runMutation(() => HttpUtils.post('api/reverse-proxy-settings', payload, { headers: { 'Content-Type': 'application/json' } }))
+      if (msg?.success) {
+        resourceDialogVisible.value = false
+        push.success({ duration: 3500, message: reverseProxyCopy.resourceSaved })
+      } else {
+        await handleRevisionConflict(msg)
+      }
+    } finally {
+      savingResources.value = false
+    }
+  }
+
   const openRuleDialog = (rule?: ReverseProxyRule) => {
+    if (actionsDisabled.value) return
     editingRule.value = mapRuleToForm(rule)
+    editingRuleRevision.value = overview.value.revision
+    configurationConflict.value = false
     if (protocolIsHTTP(editingRule.value.listenProtocol)) {
       editingRule.value.certificateRecordIds = []
     }
@@ -873,18 +1282,63 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   }
 
   const saveRule = async () => {
-    if (saving.value) return
+    if (saving.value || actionsDisabled.value) return
     trimReverseProxyRuleFormText(editingRule.value)
     normalizeEDNSCustomIPInForm(editingRule.value)
     if (protocolIsDNS(editingRule.value.listenProtocol) !== protocolIsDNS(editingRule.value.targetProtocol)) {
       push.warning({ duration: 4000, message: reverseProxyCopy.dnsProtocolPairRequired })
       return
     }
-    if (!protocolIsDNS(editingRule.value.listenProtocol) && splitInputTokens(editingRule.value.hostsText).some(isIPLiteral)) {
+    if (protocolIsDNS(editingRule.value.listenProtocol)) {
+      editingRule.value.maxConcurrentConnections = 0
+      editingRule.value.maxConcurrentRequests = 0
+      editingRule.value.upstreamMaxConnections = 0
+      editingRule.value.upstreamMaxIdleConnections = 0
+      const timeout = Number(editingRule.value.dnsUpstreamTimeoutSeconds)
+      if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 120) {
+        push.warning({ duration: 4000, message: reverseProxyCopy.dnsUpstreamTimeoutInvalid })
+        return
+      }
+      const cacheSize = Number(editingRule.value.dnsCacheSizeBytes)
+      const minTtl = Number(editingRule.value.dnsCacheMinTtl)
+      const maxTtl = Number(editingRule.value.dnsCacheMaxTtl)
+      if (!Number.isSafeInteger(cacheSize) || cacheSize <= 0 || !Number.isSafeInteger(minTtl) || !Number.isSafeInteger(maxTtl) || minTtl < 0 || maxTtl < 0 || minTtl > reverseProxyDNSMaxTTL || maxTtl > reverseProxyDNSMaxTTL || (maxTtl > 0 && minTtl > maxTtl)) {
+        push.warning({ duration: 4000, message: reverseProxyCopy.dnsCacheInvalid })
+        return
+      }
+      const dnsRateLimitQps = Number(editingRule.value.dnsRateLimitQps)
+      const dnsMaxConcurrentQueries = Number(editingRule.value.dnsMaxConcurrentQueries)
+      if (!Number.isSafeInteger(dnsRateLimitQps) || dnsRateLimitQps < 1 || dnsRateLimitQps > 10000 || !Number.isSafeInteger(dnsMaxConcurrentQueries) || dnsMaxConcurrentQueries < 0 || dnsMaxConcurrentQueries > 4096) {
+        push.warning({ duration: 4000, message: reverseProxyCopy.dnsAccessInvalid })
+        return
+      }
+      if (splitInputTokens(editingRule.value.dnsAllowedCidrsText).length === 0) {
+        push.warning({ duration: 4000, message: reverseProxyCopy.dnsCIDRRequired })
+        return
+      }
+    }
+    const maxConcurrentRequests = Number(editingRule.value.maxConcurrentRequests)
+    if (!Number.isSafeInteger(maxConcurrentRequests) || maxConcurrentRequests < 0 || maxConcurrentRequests > 10000) {
+      push.warning({ duration: 4000, message: reverseProxyCopy.requestLimitInvalid })
+      return
+    }
+    const maxConcurrentConnections = Number(editingRule.value.maxConcurrentConnections)
+    const upstreamMaxConnections = Number(editingRule.value.upstreamMaxConnections)
+    const upstreamMaxIdleConnections = Number(editingRule.value.upstreamMaxIdleConnections)
+    const memoryLimitBytes = Number(editingRule.value.memoryLimitBytes)
+    if (!Number.isSafeInteger(maxConcurrentConnections) || maxConcurrentConnections < 0 || maxConcurrentConnections > 1_000_000
+      || !Number.isSafeInteger(upstreamMaxConnections) || upstreamMaxConnections < 0 || upstreamMaxConnections > 1_000_000
+      || !Number.isSafeInteger(upstreamMaxIdleConnections) || upstreamMaxIdleConnections < 0 || upstreamMaxIdleConnections > 1_000_000
+      || !Number.isSafeInteger(memoryLimitBytes) || memoryLimitBytes < 0) {
+      push.warning({ duration: 4000, message: reverseProxyCopy.ruleResourceInvalid })
+      return
+    }
+    const listenUsesDomainCondition = !protocolIsDNS(editingRule.value.listenProtocol) || protocolNeedsCertificates(editingRule.value.listenProtocol)
+    if (listenUsesDomainCondition && splitInputTokens(editingRule.value.hostsText).some(isIPLiteral)) {
       push.warning({ duration: 4000, message: reverseProxyCopy.listenIPLiteralNotAllowed })
       return
     }
-    if (!protocolIsDNS(editingRule.value.listenProtocol) && splitInputTokens(editingRule.value.hostsText).some(hasExplicitPort)) {
+    if (listenUsesDomainCondition && splitInputTokens(editingRule.value.hostsText).some(hasExplicitPort)) {
       push.warning({ duration: 4000, message: reverseProxyCopy.listenPortInlineNotAllowed })
       return
     }
@@ -919,24 +1373,30 @@ export function useReverseProxyManage(props: { active?: boolean }) {
       return
     }
 
+    const editingID = editingRule.value.id
+    const payload = {
+      ...buildReverseProxyPayload(editingRule.value, overview.value.certificates),
+      expectedRevision: editingRuleRevision.value,
+    }
     saving.value = true
     try {
-      const msg = await HttpUtils.post(
+      const msg = await runMutation(() => HttpUtils.post(
         'api/reverse-proxy-rule',
-        buildReverseProxyPayload(editingRule.value, overview.value.certificates),
+        payload,
         {
           headers: {
             'Content-Type': 'application/json',
           },
         },
-      )
-      if (msg.success) {
-        applyOverview(msg.obj)
+      ))
+      if (msg?.success) {
         dialogVisible.value = false
         push.success({
           duration: 4000,
-          message: editingRule.value.id > 0 ? reverseProxyCopy.saveUpdated : reverseProxyCopy.saveCreated,
+          message: editingID > 0 ? reverseProxyCopy.saveUpdated : reverseProxyCopy.saveCreated,
         })
+      } else {
+        await handleRevisionConflict(msg)
       }
     } finally {
       saving.value = false
@@ -944,73 +1404,87 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   }
 
   const removeRule = async (rule: ReverseProxyRule) => {
-    if (rowBusyId.value === rule.id) return
-    const confirmed = window.confirm(reverseProxyCopy.deleteConfirm.replace('{name}', rule.name || `#${rule.displayId}`))
-    if (!confirmed) return
+    if (actionsDisabled.value) return
+    const confirmed = await confirm({
+      message: reverseProxyCopy.deleteConfirm.replace('{name}', rule.name || `#${rule.displayId}`),
+      severity: 'danger',
+      confirmText: i18n.global.t('confirmDialog.actions.delete'),
+    })
+    if (!confirmed || actionsDisabled.value) return
+    const payload = { id: rule.id, expectedRevision: overview.value.revision }
     rowBusyId.value = rule.id
     try {
-      const msg = await HttpUtils.post('api/reverse-proxy-rule-delete', { id: rule.id }, {
+      const msg = await runMutation(() => HttpUtils.post('api/reverse-proxy-rule-delete', payload, {
         headers: {
           'Content-Type': 'application/json',
         },
-      })
-      if (msg.success) {
-        applyOverview(msg.obj)
-      }
+      }))
+      await handleRevisionConflict(msg)
     } finally {
       rowBusyId.value = 0
     }
   }
 
   const toggleRule = async (rule: ReverseProxyRule, enabled: boolean) => {
-    if (rowBusyId.value === rule.id) return
+    if (actionsDisabled.value) return
+    const payload = { id: rule.id, enabled, expectedRevision: overview.value.revision }
     rowBusyId.value = rule.id
     try {
-      const msg = await HttpUtils.post('api/reverse-proxy-rule', {
-        ...buildReverseProxyPayload(mapRuleToForm(rule), overview.value.certificates),
-        enabled,
-      }, {
+      const msg = await runMutation(() => HttpUtils.post('api/reverse-proxy-rule-status', payload, {
         headers: {
           'Content-Type': 'application/json',
         },
-      })
-      if (msg.success) {
-        applyOverview(msg.obj)
+      }), false)
+      if (msg?.success) {
+        const result = msg.obj ?? {}
+        overview.value.revision = asNumber(result.revision, overview.value.revision)
+        overview.value.rules = overview.value.rules.map(item => item.id === rule.id ? {
+          ...item,
+          enabled,
+          runtimeStatus: enabled ? 'pending' : 'disabled',
+          lastError: '',
+          localConnectionCount: 0,
+          upstreamConnectionCount: 0,
+        } : item)
+        overview.value.enabledCount = overview.value.rules.filter(item => item.enabled).length
+        configurationConflict.value = false
+      } else {
+        await handleRevisionConflict(msg)
       }
     } finally {
       rowBusyId.value = 0
     }
   }
 
-  const reorderRules = async (ids: number[]) => {
-    const msg = await HttpUtils.post('api/reverse-proxy-rule-reorder', { ids }, {
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    })
-    if (msg.success) {
-      applyOverview(msg.obj)
-      push.success({
-        duration: 3200,
-        message: reverseProxyCopy.reorderSaved,
-      })
-    }
-  }
-
   const moveRule = async (rule: ReverseProxyRule, direction: -1 | 1) => {
-    if (rowBusyId.value === rule.id) return
-    const ids = overview.value.rules.map(item => item.id)
-    const index = ids.findIndex(id => id === rule.id)
+    if (actionsDisabled.value) return
+    const index = overview.value.rules.findIndex(item => item.id === rule.id)
     if (index < 0) return
     const nextIndex = index + direction
-    if (nextIndex < 0 || nextIndex >= ids.length) return
-    const swapped = [...ids]
-    const temp = swapped[index]
-    swapped[index] = swapped[nextIndex]
-    swapped[nextIndex] = temp
+    if (nextIndex < 0 || nextIndex >= overview.value.rules.length) return
+    const payload = { id: rule.id, direction, expectedRevision: overview.value.revision }
+    const previousOrder = overview.value.rules[index].listOrder
+    const adjacentOrder = overview.value.rules[nextIndex].listOrder
     rowBusyId.value = rule.id
     try {
-      await reorderRules(swapped)
+      const msg = await runMutation(() => HttpUtils.post('api/reverse-proxy-rule-move', payload, {
+        headers: { 'Content-Type': 'application/json' },
+      }), false)
+      if (msg?.success) {
+        const result = msg.obj ?? {}
+        overview.value.revision = asNumber(result.revision, overview.value.revision)
+        const rules = [...overview.value.rules]
+        const current = { ...rules[index], listOrder: adjacentOrder }
+        const adjacent = { ...rules[nextIndex], listOrder: previousOrder }
+        rules[index] = adjacent
+        rules[nextIndex] = current
+        overview.value.rules = rules
+        configurationConflict.value = false
+        if (previousOrder === adjacentOrder) void fetchOverview(true)
+        push.success({ duration: 3200, message: reverseProxyCopy.reorderSaved })
+      } else {
+        await handleRevisionConflict(msg)
+      }
     } finally {
       rowBusyId.value = 0
     }
@@ -1061,7 +1535,6 @@ export function useReverseProxyManage(props: { active?: boolean }) {
       .flatMap(cert => [cert.mainDomain, ...(cert.domains ?? [])])
       .map(item => item.trim().toLowerCase())
       .filter(Boolean)
-    const hasIPSANCert = certs.some(cert => [cert.mainDomain, ...(cert.domains ?? [])].some(item => isIPLiteral(item)))
     const wildcardMatch = (pattern: string, host: string) => {
       const normalizedPattern = pattern.trim().toLowerCase()
       const normalizedHost = host.trim().toLowerCase()
@@ -1074,9 +1547,6 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     }
     const hints: string[] = []
     matches.forEach((match) => {
-      if (hasIPSANCert) {
-        return
-      }
       if (!certNames.some(name => wildcardMatch(name, match) || wildcardMatch(match, name))) {
         hints.push(`证书未覆盖域名: ${match}`)
       }
@@ -1097,11 +1567,20 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     if (value === 'wss') return true
     return protocolIsTLS(editingRule.value.listenProtocol)
   })
+  const ipCertificateRoutingHint = computed(() => {
+    if (!listenIsHTTPS.value || selectedCertificates.value.length === 0) return ''
+    return reverseProxyCopy.ipCertificateRoutingHint
+  })
   const targetVersionConfigurable = computed(() => {
     if (protocolIsDNS(editingRule.value.targetProtocol)) return false
     return editingRule.value.targetProtocol !== 'wss' && normalizeVirtualProtocol(editingRule.value.targetProtocol) === 'https'
   })
+  const listenCanAdvertiseHTTP3 = computed(() => {
+    const value = editingRule.value.listenProtocol.trim().toLowerCase()
+    return value === 'https'
+  })
   const listenIsDNS = computed(() => protocolIsDNS(editingRule.value.listenProtocol))
+  const listenIsPlainDNS = computed(() => editingRule.value.listenProtocol === 'dns_udp' || editingRule.value.listenProtocol === 'dns_tcp')
   const targetIsDNS = computed(() => protocolIsDNS(editingRule.value.targetProtocol))
   const hasPreviewProtocol = computed(() => {
     return false
@@ -1139,24 +1618,28 @@ export function useReverseProxyManage(props: { active?: boolean }) {
 
   const stopPolling = () => {
     if (pollTimer.value != null) {
-      window.clearInterval(pollTimer.value)
+      window.clearTimeout(pollTimer.value)
       pollTimer.value = null
     }
   }
 
-  const startPolling = () => {
+  const schedulePolling = (delay = 10000) => {
     stopPolling()
     if (!props.active) return
+    if (!hasLoaded.value || Boolean(loadError.value) || !overview.value.available) return
     if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
-    pollTimer.value = window.setInterval(() => {
-      void fetchOverview(true)
-    }, 4000)
+    pollTimer.value = window.setTimeout(async () => {
+      pollTimer.value = null
+      const msg = await fetchRuntime()
+      schedulePolling(msg?.success ? 10000 : 30000)
+    }, delay)
   }
 
+  const startPolling = () => schedulePolling()
+
   const handleVisibilityChange = () => {
-    if (document.visibilityState === 'visible') {
-      void fetchOverview(true)
-      startPolling()
+    if (document.visibilityState === 'visible' && props.active) {
+      void fetchOverview(hasLoaded.value).then(() => startPolling())
     } else {
       stopPolling()
     }
@@ -1164,19 +1647,36 @@ export function useReverseProxyManage(props: { active?: boolean }) {
 
   watch(() => props.active, (active) => {
     if (active) {
-      void fetchOverview(true)
-      startPolling()
+      void fetchOverview(hasLoaded.value).then(() => startPolling())
     } else {
       stopPolling()
     }
   })
 
-  watch(() => editingRule.value.listenProtocol, (value) => {
+  const defaultProtocolPort = (value: string) => {
+    const normalized = value.trim().toLowerCase()
+    if (normalized === 'http' || normalized === 'ws') return 80
+    if (normalized === 'dns_udp' || normalized === 'dns_tcp') return 53
+    if (normalized === 'dns_dot' || normalized === 'dns_doq') return 853
+    return 443
+  }
+
+  const changeListenProtocol = (nextValue: unknown) => {
+    if (typeof nextValue !== 'string') return
+    const value = nextValue.trim().toLowerCase()
+    const previous = editingRule.value.listenProtocol
+    if (!value || value === previous) return
+    const previousPort = defaultProtocolPort(previous)
+    const shouldApplyDefaultPort = !editingRule.value.listenPort || editingRule.value.listenPort === previousPort
+    editingRule.value.listenProtocol = value as ReverseProxyRuleForm['listenProtocol']
     editingRule.value.listenHttpVersionStrategy = mapListenProtocolToBackend(value).listenHttpVersionStrategy
     if (protocolIsDNS(value)) {
-      editingRule.value.hostsText = ''
       editingRule.value.pathPrefix = ''
       editingRule.value.apiPassthrough = true
+      editingRule.value.maxConcurrentConnections = 0
+      editingRule.value.maxConcurrentRequests = 0
+      editingRule.value.upstreamMaxConnections = 0
+      editingRule.value.upstreamMaxIdleConnections = 0
       if (dnsProtocolUsesPath(value) && !editingRule.value.listenDnsPath.trim()) {
         editingRule.value.listenDnsPath = '/dns-query'
       }
@@ -1184,18 +1684,14 @@ export function useReverseProxyManage(props: { active?: boolean }) {
         editingRule.value.listenDnsPath = ''
       }
       if (value === 'dns_udp' || value === 'dns_tcp') {
-        if (!editingRule.value.listenPort || editingRule.value.listenPort === 443 || editingRule.value.listenPort === 853) {
-          editingRule.value.listenPort = 53
-        }
+        editingRule.value.hostsText = ''
         editingRule.value.certificateRecordIds = []
-      } else if (value === 'dns_doh' || value === 'dns_doh3') {
-        if (!editingRule.value.listenPort || editingRule.value.listenPort === 53 || editingRule.value.listenPort === 853) {
-          editingRule.value.listenPort = 443
-        }
-      } else if (!editingRule.value.listenPort || editingRule.value.listenPort === 53 || editingRule.value.listenPort === 443) {
-        editingRule.value.listenPort = 853
       }
+      if (shouldApplyDefaultPort) editingRule.value.listenPort = defaultProtocolPort(value)
       return
+    }
+    if (value !== 'https') {
+      editingRule.value.advertiseHttp3 = false
     }
     editingRule.value.ednsEnabled = false
     editingRule.value.ednsMode = 'auto'
@@ -1206,13 +1702,9 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     editingRule.value.listenDnsPath = ''
     if (protocolIsHTTP(value)) {
       editingRule.value.certificateRecordIds = []
-      if (!editingRule.value.listenPort || editingRule.value.listenPort === 443) {
-        editingRule.value.listenPort = 80
-      }
-    } else if (!editingRule.value.listenPort || editingRule.value.listenPort === 80) {
-      editingRule.value.listenPort = 443
     }
-  })
+    if (shouldApplyDefaultPort) editingRule.value.listenPort = defaultProtocolPort(value)
+  }
 
   watch(
     () => [overview.value.certificates, editingRule.value.certificateRecordIds] as const,
@@ -1230,72 +1722,57 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     { deep: true },
   )
 
-  watch(() => editingRule.value.targetProtocol, (value) => {
+  const changeTargetProtocol = (nextValue: unknown) => {
+    if (typeof nextValue !== 'string') return
+    const value = nextValue.trim().toLowerCase()
+    const previous = editingRule.value.targetProtocol
+    if (!value || value === previous) return
+    const previousPort = defaultProtocolPort(previous)
+    const shouldApplyDefaultPort = !editingRule.value.targetPort || editingRule.value.targetPort === previousPort
+    editingRule.value.targetProtocol = value as ReverseProxyRuleForm['targetProtocol']
     if (protocolIsDNS(value)) {
       editingRule.value.httpVersionStrategy = ''
       editingRule.value.upstreamTlsVerify = protocolIsTLS(value)
       editingRule.value.targetPath = ''
+      editingRule.value.maxConcurrentRequests = 0
+      editingRule.value.upstreamMaxConnections = 0
+      editingRule.value.upstreamMaxIdleConnections = 0
       if (dnsProtocolUsesPath(value) && !editingRule.value.targetDnsPath.trim()) {
         editingRule.value.targetDnsPath = '/dns-query'
       }
       if (!dnsProtocolUsesPath(value)) {
         editingRule.value.targetDnsPath = ''
       }
-      if (value === 'dns_udp' || value === 'dns_tcp') {
-        if (!editingRule.value.targetPort || editingRule.value.targetPort === 443 || editingRule.value.targetPort === 853) {
-          editingRule.value.targetPort = 53
-        }
-      } else if (value === 'dns_doh' || value === 'dns_doh3') {
-        if (!editingRule.value.targetPort || editingRule.value.targetPort === 53 || editingRule.value.targetPort === 853) {
-          editingRule.value.targetPort = 443
-        }
-      } else if (!editingRule.value.targetPort || editingRule.value.targetPort === 53 || editingRule.value.targetPort === 443) {
-        editingRule.value.targetPort = 853
-      }
+      if (shouldApplyDefaultPort) editingRule.value.targetPort = defaultProtocolPort(value)
       return
     }
+    editingRule.value.fallbackDnsUpstreams = ''
+    editingRule.value.dnsCacheEnabled = false
     editingRule.value.targetDnsPath = ''
     if (value === 'http') {
       editingRule.value.httpVersionStrategy = ''
       editingRule.value.upstreamTlsVerify = false
-      if (!editingRule.value.targetPort || editingRule.value.targetPort === 443) {
-        editingRule.value.targetPort = 80
-      }
     } else if (value === 'ws') {
       editingRule.value.httpVersionStrategy = ''
       editingRule.value.upstreamTlsVerify = false
-      if (!editingRule.value.targetPort || editingRule.value.targetPort === 443) {
-        editingRule.value.targetPort = 80
-      }
     } else if (value === 'wss') {
       editingRule.value.httpVersionStrategy = ''
       editingRule.value.upstreamTlsVerify = true
-      if (!editingRule.value.targetPort || editingRule.value.targetPort === 80) {
-        editingRule.value.targetPort = 443
-      }
     } else if (value === 'h2') {
       editingRule.value.httpVersionStrategy = 'h2_only'
       editingRule.value.upstreamTlsVerify = true
-      if (!editingRule.value.targetPort || editingRule.value.targetPort === 80) {
-        editingRule.value.targetPort = 443
-      }
     } else if (value === 'h3') {
       editingRule.value.httpVersionStrategy = 'h3_only'
       editingRule.value.upstreamTlsVerify = true
-      if (!editingRule.value.targetPort || editingRule.value.targetPort === 80) {
-        editingRule.value.targetPort = 443
-      }
     } else {
       const normalized = normalizeTargetHTTPVersionStrategy(editingRule.value.httpVersionStrategy)
       if (!normalized || normalized === 'h2_only' || normalized === 'h3_only') {
         editingRule.value.httpVersionStrategy = 'prefer_h2'
       }
       editingRule.value.upstreamTlsVerify = true
-      if (!editingRule.value.targetPort || editingRule.value.targetPort === 80) {
-        editingRule.value.targetPort = 443
-      }
     }
-  })
+    if (shouldApplyDefaultPort) editingRule.value.targetPort = defaultProtocolPort(value)
+  }
 
   watch(() => editingRule.value.pathPrefix, (value) => {
     if (!value.trim()) return
@@ -1309,9 +1786,8 @@ export function useReverseProxyManage(props: { active?: boolean }) {
 
   onMounted(() => {
     if (props.active) {
-      void fetchOverview()
+      void fetchOverview().then(() => startPolling())
     }
-    startPolling()
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', handleVisibilityChange)
     }
@@ -1328,27 +1804,44 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     loading,
     refreshing,
     saving,
+    savingResources,
+    mutationBusy,
+    hasLoaded,
+    loadError,
+    actionsDisabled,
     dialogVisible,
+    resourceDialogVisible,
     rowBusyId,
     searchText,
     overview,
+    runtimeUsage,
+    editingResources,
+    configurationConflict,
     editingRule,
     filteredRules,
     lastSyncLabel,
     dialogTitle,
     selectedCertificates,
     currentCertificateHints,
+    ipCertificateRoutingHint,
     targetIsHTTPS,
     listenIsHTTPS,
     listenIsDNS,
+    listenIsPlainDNS,
     targetIsDNS,
     targetVersionConfigurable,
+    listenCanAdvertiseHTTP3,
     hasPreviewProtocol,
     listenProtocolBehavior,
     targetProtocolBehavior,
     fetchOverview,
+    fetchRuntime,
     refreshOverview,
+    openResourceDialog,
+    saveResources,
     openRuleDialog,
+    changeListenProtocol,
+    changeTargetProtocol,
     normalizeCustomEDNSInput,
     saveRule,
     removeRule,
@@ -1356,6 +1849,3 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     moveRule,
   }
 }
-
-
-

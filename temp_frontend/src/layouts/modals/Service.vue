@@ -107,9 +107,12 @@ export default {
 
       // save data
       this.loading = true
-      const success = await Data().save("services", this.$props.id == 0 ? "new" : "edit", this.srv)
-      if (success) this.closeModal()
-      this.loading = false
+      try {
+        const success = await Data().save("services", this.$props.id == 0 ? "new" : "edit", this.srv)
+        if (success) this.closeModal()
+      } finally {
+        this.loading = false
+      }
     },
   },
   watch: {

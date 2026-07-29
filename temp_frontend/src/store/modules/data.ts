@@ -4,12 +4,19 @@ import { push } from 'notivue'
 import { i18n } from '@/locales'
 import { Inbound } from '@/types/inbounds'
 import { Client } from '@/types/clients'
+import { normalizeSubscriptionURI, refreshSubscriptionURI } from '@/plugins/subscriptionUri'
+
+let defaultDataLoadPromise: Promise<void> | null = null
 
 const Data = defineStore('Data', {
   state: () => ({ 
+    isLoadingData: false,
     lastLoad: 0,
     reloadItems: localStorage.getItem("reloadItems")?.split(',')?? <string[]>[],
     subURI: "",
+    subscriptionUriVerified: false,
+    subscriptionUriRefreshing: false,
+    subscriptionUriError: '',
     enableTraffic: false,
     onlines: {inbound: <string[]>[], outbound: <string[]>[], user: <string[]>[]},
     config: <any>{},
@@ -24,21 +31,38 @@ const Data = defineStore('Data', {
     tlsConfigs: <any[]>[],
   }),
   actions: {
-    async loadData() {
-      const params = this.lastLoad > 0
-        ? { lu: this.lastLoad, light: 'true' }
-        : {}
-      const msg = await HttpUtils.get('api/load', params)
-      if(msg.success) {
-        this.onlines = msg.obj.onlines
-        if (msg.obj.config) {
-          this.setNewData(msg.obj)
+    loadData(): Promise<void> {
+      if (defaultDataLoadPromise) return defaultDataLoadPromise
+      this.isLoadingData = true
+      defaultDataLoadPromise = (async () => {
+        try {
+          const params = this.lastLoad > 0
+            ? { lu: this.lastLoad, light: 'true' }
+            : {}
+          const msg = await HttpUtils.get('api/load', params)
+          if(msg.success) {
+            this.onlines = msg.obj.onlines
+            if (msg.obj.config) {
+              this.setNewData(msg.obj)
+            }
+          }
+        } finally {
+          this.isLoadingData = false
+          defaultDataLoadPromise = null
         }
-      }
+      })()
+      return defaultDataLoadPromise
     },
     setNewData(data: any) {
       this.lastLoad = Math.floor((new Date()).getTime()/1000)
-      if (Object.hasOwn(data, 'subURI')) this.subURI = data.subURI ?? ""
+      if (Object.hasOwn(data, 'subURI')) {
+        const subURI = normalizeSubscriptionURI(data.subURI)
+        if (subURI) {
+          this.subURI = subURI
+          this.subscriptionUriVerified = true
+          this.subscriptionUriError = ''
+        }
+      }
       if (Object.hasOwn(data, 'enableTraffic')) this.enableTraffic = data.enableTraffic === true
       if (Object.hasOwn(data, 'config')) this.config = data.config ?? {}
       if (Object.hasOwn(data, 'clients')) this.clients = data.clients ?? []
@@ -50,6 +74,23 @@ const Data = defineStore('Data', {
       if (Object.hasOwn(data, 'services')) this.services = data.services ?? []
       if (Object.hasOwn(data, 'endpoints')) this.endpoints = data.endpoints ?? []
       if (Object.hasOwn(data, 'tls')) this.tlsConfigs = data.tls ?? []
+    },
+    async refreshSubscriptionURI(): Promise<boolean> {
+      this.subscriptionUriRefreshing = true
+      this.subscriptionUriError = ''
+      try {
+        const result = await refreshSubscriptionURI()
+        if (!result.success) {
+          this.subscriptionUriError = result.error
+          return false
+        }
+        this.subURI = result.subURI
+        this.subscriptionUriVerified = true
+        this.subscriptionUriError = ''
+        return true
+      } finally {
+        this.subscriptionUriRefreshing = false
+      }
     },
     async loadInbounds(ids: number[]): Promise<Inbound[]> {
       const options = ids.length > 0 ? {id: ids.join(",")} : {}

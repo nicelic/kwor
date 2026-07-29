@@ -2,7 +2,6 @@ package service
 
 import (
 	"encoding/json"
-	"os"
 	"strings"
 
 	"github.com/alireza0/s-ui/database"
@@ -203,8 +202,6 @@ func (s *OutboundService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 			return err
 		}
 		incomingRaw := normalizeOutboundRawPayload(data)
-		oldTag := ""
-		oldType := ""
 		if act == "edit" {
 			existing := &model.Outbound{}
 			query := tx.Model(model.Outbound{})
@@ -214,8 +211,6 @@ func (s *OutboundService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 				query = query.Where("tag = ?", outbound.Tag)
 			}
 			if err := query.First(existing).Error; err == nil {
-				oldTag = existing.Tag
-				oldType = existing.Type
 				if existing.Type == outbound.Type {
 					if baseRaw, resolveErr := resolveOutboundJSON(existing); resolveErr == nil {
 						outbound.RawOutbound = mergeEditableOutboundRawPayload(baseRaw, data, "default", outbound.Type)
@@ -237,33 +232,6 @@ func (s *OutboundService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 			outbound.RawOutbound = incomingRaw
 		}
 
-		if corePtr.IsRunning() {
-			configData, err := resolveOutboundJSON(&outbound)
-			if err != nil {
-				return err
-			}
-			runtimePayloads, err := buildRuntimeOutboundPayloads(configData, outbound.Type)
-			if err != nil {
-				return err
-			}
-
-			if act == "edit" {
-				if oldTag == "" {
-					return gorm.ErrRecordNotFound
-				}
-				if err := removeRuntimeOutboundFromCore(oldTag, oldType); err != nil {
-					return err
-				}
-			}
-
-			for _, payload := range runtimePayloads {
-				err = corePtr.AddOutbound(payload)
-				if err != nil {
-					return err
-				}
-			}
-		}
-
 		err = tx.Save(&outbound).Error
 		if err != nil {
 			return err
@@ -273,20 +241,6 @@ func (s *OutboundService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 		err = json.Unmarshal(data, &tag)
 		if err != nil {
 			return err
-		}
-		if corePtr.IsRunning() {
-			outboundType := ""
-			var old struct {
-				Type string
-			}
-			findErr := tx.Model(model.Outbound{}).Select("type").Where("tag = ?", tag).Take(&old).Error
-			if findErr == nil {
-				outboundType = old.Type
-			}
-			err = removeRuntimeOutboundFromCore(tag, outboundType)
-			if err != nil && err != os.ErrInvalid {
-				return err
-			}
 		}
 		err = tx.Where("tag = ?", tag).Delete(model.Outbound{}).Error
 		if err != nil {
@@ -335,55 +289,6 @@ func sanitizeShadowTLSOutboundJSON(raw []byte) ([]byte, error) {
 	}
 	stripShadowTLSInboundOnlyFields(outboundData)
 	return json.Marshal(outboundData)
-}
-
-func buildRuntimeOutboundPayloads(configData json.RawMessage, outboundType string) ([]json.RawMessage, error) {
-	sanitizePayloads := func(payloads []json.RawMessage) ([]json.RawMessage, error) {
-		if len(payloads) == 0 {
-			return payloads, nil
-		}
-		sanitized, _, err := normalizeSingboxRuntimeOutbounds(payloads)
-		if err != nil {
-			return nil, err
-		}
-		return sanitized, nil
-	}
-
-	if outboundType != "shadowtls" {
-		return sanitizePayloads([]json.RawMessage{configData})
-	}
-
-	var outboundSvc OutboundService
-	ssJson, stlsJson, err := outboundSvc.processShadowTLSOutbound(configData, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	payloads := make([]json.RawMessage, 0, 2)
-	if ssJson != nil {
-		payloads = append(payloads, ssJson)
-	}
-	if stlsJson != nil {
-		payloads = append(payloads, stlsJson)
-	}
-	return sanitizePayloads(payloads)
-}
-
-func removeRuntimeOutboundFromCore(tag string, outboundType string) error {
-	if tag == "" {
-		return nil
-	}
-	if err := corePtr.RemoveOutbound(tag); err != nil && err != os.ErrInvalid {
-		return err
-	}
-
-	if outboundType == "shadowtls" {
-		stlsTag := tag + "-out"
-		if err := corePtr.RemoveOutbound(stlsTag); err != nil && err != os.ErrInvalid {
-			return err
-		}
-	}
-	return nil
 }
 
 func normalizeCertificateStoreValue(raw interface{}) string {

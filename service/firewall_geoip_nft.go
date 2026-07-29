@@ -265,11 +265,14 @@ func buildManagedFirewallGeoPortOnlyArgs(group firewallGeoRenderGroup) ([]string
 	}
 	switch group.Protocol {
 	case firewallProtocolTCP:
-		args = append(args, "meta", "l4proto", "tcp", "th", "dport")
+		args = append(args, "meta", "l4proto", "tcp")
+		args = appendNftTransportPortMatch(args, "dport")
 	case firewallProtocolUDP:
-		args = append(args, "meta", "l4proto", "udp", "th", "dport")
+		args = append(args, "meta", "l4proto", "udp")
+		args = appendNftTransportPortMatch(args, "dport")
 	case firewallProtocolTCPUDP:
-		args = append(args, "meta", "l4proto", "{", "tcp", ",", "udp", "}", "th", "dport")
+		args = append(args, "meta", "l4proto", "{", "tcp", ",", "udp", "}")
+		args = appendNftTransportPortMatch(args, "dport")
 	default:
 		return nil, fmt.Errorf("unsupported geo protocol: %s", group.Protocol)
 	}

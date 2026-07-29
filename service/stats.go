@@ -2,13 +2,12 @@ package service
 
 import (
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/logger"
-
-	"gorm.io/gorm"
 )
 
 type onlines struct {
@@ -17,71 +16,30 @@ type onlines struct {
 	Outbound []string `json:"outbound,omitempty"`
 }
 
-var onlineResources = &onlines{}
-var mihomoOnlineResources = &onlines{}
+type onlineResourcesSnapshot struct {
+	mu    sync.RWMutex
+	value onlines
+}
+
+var onlineResources onlineResourcesSnapshot
+var mihomoOnlineResources onlineResourcesSnapshot
 
 func setOnlines(inboundTags []string, userTags []string, outboundTags []string) {
-	onlineResources.Inbound = normalizeOnlineTags(inboundTags)
-	onlineResources.Outbound = normalizeOnlineTags(outboundTags)
-	onlineResources.User = normalizeOnlineTags(userTags)
+	onlineResources.mu.Lock()
+	onlineResources.value = onlines{
+		Inbound:  normalizeOnlineTags(inboundTags),
+		Outbound: normalizeOnlineTags(outboundTags),
+		User:     normalizeOnlineTags(userTags),
+	}
+	onlineResources.mu.Unlock()
 }
 
 type StatsService struct {
 	NftTrafficService
 }
 
-func (s *StatsService) SaveStats(enableTraffic bool) error {
-	if !corePtr.IsRunning() {
-		setOnlines(nil, nil, nil)
-		return nil
-	}
-	if err := EnsureHistoryStorageReady(); err != nil {
-		return err
-	}
-	stats := corePtr.GetInstance().StatsTracker().GetStats()
-
-	if len(*stats) == 0 {
-		if !enableTraffic {
-			setOnlines(nil, nil, nil)
-		}
-		return nil
-	}
-
-	var err error
-	db := database.GetDB()
-	tx := db.Begin()
-	defer func() {
-		if err == nil {
-			tx.Commit()
-		} else {
-			tx.Rollback()
-		}
-	}()
-
-	if !enableTraffic {
-		for _, stat := range *stats {
-			if normalizeStatsResource(stat.Resource) != "client" {
-				continue
-			}
-			if stat.Direction {
-				err = tx.Model(model.Client{}).Where("name = ?", stat.Tag).
-					UpdateColumn("up", gorm.Expr("up + ?", stat.Traffic)).Error
-			} else {
-				err = tx.Model(model.Client{}).Where("name = ?", stat.Tag).
-					UpdateColumn("down", gorm.Expr("down + ?", stat.Traffic)).Error
-			}
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
-	err = upsertStatsTrafficBatch(tx, *stats)
-	if err != nil {
-		return err
-	}
-
+func (s *StatsService) SaveStats(_ bool) error {
+	setOnlines(nil, nil, nil)
 	return nil
 }
 
@@ -90,17 +48,31 @@ func (s *StatsService) GetStats(resource string, tag string, limit int) ([]model
 }
 
 func (s *StatsService) GetOnlines() (onlines, error) {
-	return *onlineResources, nil
+	return onlineResources.clone(), nil
 }
 
 func (s *StatsService) GetMihomoOnlines() (onlines, error) {
-	return *mihomoOnlineResources, nil
+	return mihomoOnlineResources.clone(), nil
 }
 
 func setMihomoOnlines(inboundTags []string, userTags []string) {
-	mihomoOnlineResources.Inbound = normalizeOnlineTags(inboundTags)
-	mihomoOnlineResources.Outbound = []string{}
-	mihomoOnlineResources.User = normalizeOnlineTags(userTags)
+	mihomoOnlineResources.mu.Lock()
+	mihomoOnlineResources.value = onlines{
+		Inbound:  normalizeOnlineTags(inboundTags),
+		Outbound: []string{},
+		User:     normalizeOnlineTags(userTags),
+	}
+	mihomoOnlineResources.mu.Unlock()
+}
+
+func (s *onlineResourcesSnapshot) clone() onlines {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return onlines{
+		Inbound:  append([]string(nil), s.value.Inbound...),
+		User:     append([]string(nil), s.value.User...),
+		Outbound: append([]string(nil), s.value.Outbound...),
+	}
 }
 
 func normalizeOnlineTags(tags []string) []string {

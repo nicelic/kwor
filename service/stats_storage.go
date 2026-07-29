@@ -25,9 +25,14 @@ const (
 )
 
 var (
-	historyStorageStateMu  sync.Mutex
-	historyStorageInitOnce sync.Once
-	historyStorageInitErr  error
+	historyStorageStateMu     sync.Mutex
+	historyStorageInitOnce    sync.Once
+	historyStorageInitErr     error
+	mainSQLiteCompactionMu    sync.Mutex
+	mainSQLiteCompactionQueue = struct {
+		sync.Mutex
+		queued bool
+	}{}
 )
 
 func init() {
@@ -492,6 +497,8 @@ func compactMainSQLiteDB(db *gorm.DB, force bool) error {
 	if db == nil {
 		return nil
 	}
+	mainSQLiteCompactionMu.Lock()
+	defer mainSQLiteCompactionMu.Unlock()
 
 	if !force {
 		pageCount, freelistCount, err := readSQLitePageStats(db)
@@ -510,6 +517,34 @@ func compactMainSQLiteDB(db *gorm.DB, force bool) error {
 		logger.Warning("main sqlite wal checkpoint failed: ", err)
 	}
 	return db.Exec("VACUUM").Error
+}
+
+// requestMainSQLiteCompaction deliberately keeps VACUUM out of API response
+// paths. SQLite owns the single project connection while vacuuming, so only
+// one background maintenance run may be queued at a time.
+func requestMainSQLiteCompaction(db *gorm.DB, force bool) bool {
+	if db == nil {
+		return false
+	}
+	mainSQLiteCompactionQueue.Lock()
+	if mainSQLiteCompactionQueue.queued {
+		mainSQLiteCompactionQueue.Unlock()
+		return true
+	}
+	mainSQLiteCompactionQueue.queued = true
+	mainSQLiteCompactionQueue.Unlock()
+
+	go func() {
+		defer func() {
+			mainSQLiteCompactionQueue.Lock()
+			mainSQLiteCompactionQueue.queued = false
+			mainSQLiteCompactionQueue.Unlock()
+		}()
+		if err := compactMainSQLiteDB(db, force); err != nil {
+			logger.Warning("background main sqlite compaction failed: ", err)
+		}
+	}()
+	return true
 }
 
 func readSQLitePageStats(db *gorm.DB) (int64, int64, error) {

@@ -404,28 +404,30 @@ const validateRulesetModalData = (data: ruleset): string[] => {
 
 const saveConfig = async () => {
   loading.value = true
-  normalizeRoute()
-  syncMihomoSnifferConfig()
-  syncMihomoNoResolveConfig()
-  if (props.namespace === 'mihomo') {
-    const errors = validateRouteForNamespace(appConfig.value.route, props.namespace, {
-      outboundTags: outboundTags.value,
-    })
-    if (errors.length > 0) {
-      loading.value = false
-      showValidationErrors(errors)
-      return
+  try {
+    normalizeRoute()
+    syncMihomoSnifferConfig()
+    syncMihomoNoResolveConfig()
+    if (props.namespace === 'mihomo') {
+      const errors = validateRouteForNamespace(appConfig.value.route, props.namespace, {
+        outboundTags: outboundTags.value,
+      })
+      if (errors.length > 0) {
+        showValidationErrors(errors)
+        return
+      }
     }
+    const success = await store.save('config', 'set', appConfig.value)
+    if (success) {
+      const nextConfig = normalizeEditableConfig(store.config)
+      appConfig.value = nextConfig
+      oldConfig.value = cloneConfig(nextConfig)
+      syncMihomoSniffUiFromConfig()
+      syncMihomoNoResolveUiFromConfig()
+    }
+  } finally {
+    loading.value = false
   }
-  const success = await store.save('config', 'set', appConfig.value)
-  if (success) {
-    const nextConfig = normalizeEditableConfig(store.config)
-    appConfig.value = nextConfig
-    oldConfig.value = cloneConfig(nextConfig)
-    syncMihomoSniffUiFromConfig()
-    syncMihomoNoResolveUiFromConfig()
-  }
-  loading.value = false
 }
 
 const clients = computed((): string[] => {

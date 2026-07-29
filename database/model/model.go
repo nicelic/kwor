@@ -8,6 +8,11 @@ type Setting struct {
 	Value string `json:"value" form:"value"`
 }
 
+type SettingsState struct {
+	Id       uint   `json:"id" gorm:"primaryKey;autoIncrement:false"`
+	Revision uint64 `json:"revision" gorm:"not null;default:1"`
+}
+
 type Tls struct {
 	Id                  uint            `json:"id" form:"id" gorm:"primaryKey;autoIncrement"`
 	Name                string          `json:"name" form:"name"`

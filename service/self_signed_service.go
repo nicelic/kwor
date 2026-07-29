@@ -80,7 +80,6 @@ type SelfSignedIssuePayload struct {
 	ApplyTarget        string
 	PushDir            string
 	PushExplicit       bool
-	TrackedPushFiles   string
 }
 
 type selfSignedBuiltinAuthority struct {
@@ -330,14 +329,18 @@ func (s *SelfSignedService) Issue(payload SelfSignedIssuePayload) (*AcmeActionRe
 		platformCode = "custom"
 	}
 
+	previousFingerprint := ""
 	sourceRef := makeSelfSignedSourceRef()
 	if strings.TrimSpace(payload.PreferredSourceRef) != "" {
 		sourceRef = strings.TrimSpace(payload.PreferredSourceRef)
 	}
 	if payload.ExistingRecordID > 0 {
 		existingRecord, err := certificateInventory.GetRecordByID(payload.ExistingRecordID)
-		if err == nil && existingRecord != nil && strings.TrimSpace(existingRecord.SourceRef) != "" {
-			sourceRef = strings.TrimSpace(existingRecord.SourceRef)
+		if err == nil && existingRecord != nil {
+			previousFingerprint = strings.TrimSpace(existingRecord.Fingerprint)
+			if strings.TrimSpace(existingRecord.SourceRef) != "" {
+				sourceRef = strings.TrimSpace(existingRecord.SourceRef)
+			}
 		}
 	}
 
@@ -361,8 +364,6 @@ func (s *SelfSignedService) Issue(payload SelfSignedIssuePayload) (*AcmeActionRe
 
 		AcmeAccountName: strings.TrimSpace(authority.Name),
 		ApplyTarget:     applyTarget,
-		PushDir:         strings.TrimSpace(payload.PushDir),
-		PushFiles:       strings.TrimSpace(payload.TrackedPushFiles),
 		Remark:          strings.TrimSpace(payload.Remark),
 		RenewConfig:     renewConfig,
 
@@ -392,54 +393,26 @@ func (s *SelfSignedService) Issue(payload SelfSignedIssuePayload) (*AcmeActionRe
 		return nil, common.NewError("issue self-signed certificate failed: empty inventory record")
 	}
 
-	if payload.PushExplicit && strings.TrimSpace(row.PushDir) != "" {
-		pushState, pushErr := syncCertificateDirectoryPushState(
-			row.PushDir,
-			row.PushDir,
-			row.PushFiles,
-			certPEM,
-			keyPEM,
-			fullchainPEM,
-			chainPEM,
-		)
-		if pushErr != nil {
-			return nil, pushErr
-		}
-		row.PushDir = pushState.PushDir
-		row.PushFiles = pushState.PushFiles
+	acmeSvc := &AcmeService{}
+	materialChanged := normalizeCertificateFingerprint(previousFingerprint) != normalizeCertificateFingerprint(row.Fingerprint)
+	warnings := acmeSvc.applyCertificateRecordPostActionsWithCoreRestart(row, applyTarget, payload.PushDir, payload.PushExplicit, materialChanged)
+	if err := acmeSvc.EnsureOverviewRuntimeConsistency(true); err != nil {
+		warnings = append(warnings, "刷新证书运行态一致性失败: "+strings.TrimSpace(err.Error()))
 	}
+	warnings = persistCertificatePostActionWarnings(row, warnings)
 
-	if applyTarget != "" {
-		target, _ := normalizeAcmeApplyTarget(applyTarget)
-		acmeSvc := &AcmeService{}
-		if err := acmeSvc.applyInventoryRecordToTarget(row, target); err != nil {
-			return nil, err
-		}
-		row.ApplyTarget = applyTarget
-	}
-
-	if err := database.GetDB().Save(row).Error; err != nil {
-		return nil, err
-	}
-	if err := ApplyPanelTLSRuntimeSettingsForRecord(row.Id); err != nil {
-		return nil, err
-	}
-	if _, err := ForceSyncTLSBindingsForCertificateRecord(row.Id, ""); err != nil {
-		return nil, err
-	}
-	if err := (&AcmeService{}).EnsureOverviewRuntimeConsistency(true); err != nil {
-		return nil, err
-	}
-
-	overview, err := (&AcmeService{}).GetOverview()
-	if err != nil {
-		return nil, err
+	var overview *AcmeOverview
+	if loadedOverview, overviewErr := acmeSvc.GetOverview(); overviewErr != nil {
+		warnings = persistCertificatePostActionWarnings(row, append(warnings, "刷新证书概览失败: "+strings.TrimSpace(overviewErr.Error())))
+	} else {
+		overview = loadedOverview
 	}
 	view := convertCertificateRecord(row)
 	return &AcmeActionResult{
 		Overview:    overview,
 		Certificate: &view,
 		Msg:         "self-signed certificate issued",
+		Warnings:    warnings,
 	}, nil
 }
 

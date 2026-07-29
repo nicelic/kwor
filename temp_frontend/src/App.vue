@@ -13,11 +13,13 @@
     {{ $t('loading') }}
   </v-overlay>
   <Message />
+  <ConfirmDialog />
   <router-view />
 </template>
 
 <script lang="ts" setup>
 import Message from '@/components/message.vue'
+import ConfirmDialog from '@/layouts/modals/ConfirmDialog.vue'
 import { inject, ref, Ref } from 'vue'
 
 const loading:Ref = inject('loading')?? ref(false)

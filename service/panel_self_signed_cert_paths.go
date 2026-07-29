@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -303,7 +302,7 @@ func isSelfSignedCertificatePair(certPath string, keyPath string) (bool, error) 
 func sameFilePath(pathA string, pathB string) bool {
 	cleanA := filepath.Clean(strings.TrimSpace(pathA))
 	cleanB := filepath.Clean(strings.TrimSpace(pathB))
-	if runtime.GOOS == "windows" {
+	if IsSystemPlatformWindows() {
 		return strings.EqualFold(cleanA, cleanB)
 	}
 	return cleanA == cleanB

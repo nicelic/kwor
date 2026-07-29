@@ -1,7 +1,7 @@
 ---
 services:
   kwor:
-    image: ghcr.io/nicelic/kwor:v1.5.19
+    image: ghcr.io/nicelic/kwor:v1.6.0
     container_name: kwor
     hostname: "kwor"
     cap_add:
@@ -18,6 +18,8 @@ services:
     #   ports you configure without re-declaring them here.
     # - cap_add: NET_ADMIN is required for nftables-based firewall / traffic /
     #   port-forward features inside the shared host network namespace.
+    # - Persistent MTU optimization requires a native systemd host install and
+    #   is intentionally unavailable inside this container.
     # If you prefer bridge networking, comment out network_mode above and use
     # the ports block below (remember to also expose every inbound port you
     # create in the panel, and nftables rules will stay inside the container

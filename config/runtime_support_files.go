@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 )
 
@@ -33,7 +32,12 @@ func GetLegacyRuntimeServiceFilePath() string {
 	return filepath.Join(GetBinDir(), runtimeServiceFileName)
 }
 
-func MigrateLegacyRuntimeSupportFiles() error {
+// MigrateLegacyRuntimeSupportFiles only moves Linux runtime support files when
+// the caller has already read the persisted platform snapshot.
+func MigrateLegacyRuntimeSupportFiles(platformLinux bool) error {
+	if !platformLinux {
+		return nil
+	}
 	binDir := GetBinDir()
 	if !shouldMigrateLegacyRuntimeSupportFilesForBinDir(binDir) {
 		return nil
@@ -42,9 +46,6 @@ func MigrateLegacyRuntimeSupportFiles() error {
 }
 
 func shouldMigrateLegacyRuntimeSupportFilesForBinDir(binDir string) bool {
-	if runtime.GOOS != "linux" {
-		return false
-	}
 	return !looksLikeRuntimeSupportSourceTree(binDir)
 }
 

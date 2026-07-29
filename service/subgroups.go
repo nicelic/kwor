@@ -6,12 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/alireza0/s-ui/config"
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/logger"
@@ -243,7 +241,7 @@ func (s *SubGroupService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 			return err
 		}
 
-		// Imported groups own their imported suboutbounds; delete their records and files on group delete.
+		// Imported groups own their imported suboutbound database records.
 		if strings.TrimSpace(group.SubscriptionUrl) != "" || strings.TrimSpace(group.SubscriptionUrlClash) != "" {
 			cleanupTags, cleanupErr := s.collectSubscriptionGroupCleanupTags(tx, &group)
 			if cleanupErr != nil {
@@ -287,18 +285,14 @@ func (s *SubGroupService) syncGroupConfig(db *gorm.DB, group *model.SubGroup) er
 		return nil
 	}
 	return QueueManagedRuntimeHook(db, func() error {
-		return s.saveGroupJson(snapshot)
+		return s.validateGroupJSON(snapshot)
 	})
 }
 
+// removeGroupConfig is retained for transactional call-site compatibility.
+// Historical copies are removed when the Runtime Store initializes.
 func (s *SubGroupService) removeGroupConfig(db *gorm.DB, name string) error {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return nil
-	}
-	return QueueManagedRuntimeHook(db, func() error {
-		return s.deleteGroupJson(name)
-	})
+	return nil
 }
 
 func (s *SubGroupService) syncSubscriptionGroupConfig(
@@ -320,12 +314,13 @@ func (s *SubGroupService) syncSubscriptionGroupConfig(
 	}
 
 	return QueueManagedRuntimeHook(db, func() error {
-		return s.saveSubGroupSubscriptionJson(groupName, jsonURL, clashURL, allowInsecure, snapshot)
+		return s.validateSubGroupSubscriptionJSON(groupName, jsonURL, clashURL, allowInsecure, snapshot)
 	})
 }
 
-// saveGroupJson writes merged outbounds of a group to Promanager_data/sub_json/<group>.json.
-func (s *SubGroupService) saveGroupJson(group *model.SubGroup) error {
+// validateGroupJSON preserves the former group-render validation without
+// persisting a sub_json copy.
+func (s *SubGroupService) validateGroupJSON(group *model.SubGroup) error {
 	if group == nil {
 		return nil
 	}
@@ -333,11 +328,6 @@ func (s *SubGroupService) saveGroupJson(group *model.SubGroup) error {
 		return err
 	}
 
-	subJsonDir, err := getSubJsonDir()
-	if err != nil {
-		logger.Errorf("[SubGroup] get sub_json dir failed: %v", err)
-		return err
-	}
 	outboundTags := parseSubGroupOutboundTags(group.Outbounds)
 	subOutboundsByTag := make(map[string]*model.SubOutbound, len(outboundTags))
 	if len(outboundTags) > 0 {
@@ -382,7 +372,7 @@ func (s *SubGroupService) saveGroupJson(group *model.SubGroup) error {
 
 	var settingService SettingService
 	othersStr, _ := settingService.GetSubJsonExt()
-	configData, err := renderManagedSingboxSubscriptionJSON(
+	_, err := renderManagedSingboxSubscriptionJSON(
 		rawOutbounds,
 		othersStr,
 		settingService.ResolveSubscriptionTLSStore,
@@ -392,31 +382,11 @@ func (s *SubGroupService) saveGroupJson(group *model.SubGroup) error {
 		return err
 	}
 
-	baseFilename := sanitizeGroupFilename(group.Name)
-	configFilePath := filepath.Join(subJsonDir, fmt.Sprintf("%s.json", baseFilename))
-	if err := ManagedRuntimeWriteFile(configFilePath, configData); err != nil {
-		logger.Errorf("[SubGroup] write group config failed: %v", err)
-		return err
-	}
 	return nil
 }
 
-func (s *SubGroupService) deleteGroupJson(name string) error {
-	subJsonDir, err := getSubJsonDir()
-	if err != nil {
-		logger.Errorf("[SubGroup] get sub_json dir failed: %v", err)
-		return err
-	}
-
-	baseFilename := sanitizeGroupFilename(name)
-	configFilePath := filepath.Join(subJsonDir, fmt.Sprintf("%s.json", baseFilename))
-	if err := ManagedRuntimeDeleteFile(configFilePath); err != nil {
-		logger.Errorf("[SubGroup] remove group config failed: %v", err)
-		return err
-	}
-	return nil
-}
-
+// RegenerateAllGroupConfigs is retained for API compatibility. It validates
+// every group render in memory without creating persistent copies.
 func (s *SubGroupService) RegenerateAllGroupConfigs() {
 	db := database.GetDB()
 
@@ -427,8 +397,8 @@ func (s *SubGroupService) RegenerateAllGroupConfigs() {
 	}
 
 	for _, group := range groups {
-		if err := s.saveGroupJson(group); err != nil {
-			logger.Errorf("[SubGroup] regenerate group config failed [%s]: %v", group.Name, err)
+		if err := s.validateGroupJSON(group); err != nil {
+			logger.Errorf("[SubGroup] validate group config failed [%s]: %v", group.Name, err)
 		}
 	}
 }
@@ -480,12 +450,21 @@ func isProxyOutbound(outbound map[string]interface{}) bool {
 	return !nonProxyTypes[typeVal]
 }
 
+const subscriptionImportMaxResponseBytes = 16 * 1024 * 1024
+
 // fetchSubscriptionJSON downloads content from subscription URL.
 func fetchSubscriptionJSON(url string, allowInsecure bool) ([]byte, error) {
 	return fetchSubscriptionJSONWithTimeout(url, allowInsecure, 30*time.Second)
 }
 
 func fetchSubscriptionJSONWithTimeout(url string, allowInsecure bool, timeout time.Duration) ([]byte, error) {
+	return fetchSubscriptionJSONWithTimeoutAndLimit(url, allowInsecure, timeout, subscriptionImportMaxResponseBytes)
+}
+
+func fetchSubscriptionJSONWithTimeoutAndLimit(url string, allowInsecure bool, timeout time.Duration, maxResponseBytes int) ([]byte, error) {
+	if maxResponseBytes <= 0 {
+		return nil, fmt.Errorf("subscription response size limit must be positive")
+	}
 	client := &http.Client{
 		Timeout: timeout,
 	}
@@ -506,9 +485,12 @@ func fetchSubscriptionJSONWithTimeout(url string, allowInsecure bool, timeout ti
 		return nil, fmt.Errorf("subscription returned status code: %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxResponseBytes)+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read subscription body: %v", err)
+	}
+	if len(body) > maxResponseBytes {
+		return nil, fmt.Errorf("subscription response exceeds %d MiB", maxResponseBytes/(1024*1024))
 	}
 
 	return body, nil
@@ -763,14 +745,6 @@ func normalizeImportedOutboundTLS(outbound map[string]interface{}, certStore str
 	}
 }
 
-func getSubJsonDir() (string, error) {
-	return filepath.Join(config.GetDataDir(), "sub_json"), nil
-}
-
-func getSubManagerDir() (string, error) {
-	return filepath.Join(config.GetDataDir(), "sub_manager"), nil
-}
-
 func (s *SubGroupService) replaceSubscriptionGroupNodesTx(
 	groupName string,
 	nodes []subscriptionImportNode,
@@ -814,7 +788,7 @@ func (s *SubGroupService) replaceSubscriptionGroupNodesTx(
 		return nil, err
 	}
 
-	LastUpdate = time.Now().Unix()
+	markLastUpdate(time.Now().Unix())
 	if err := RunManagedRuntimeHookScope(tx); err != nil {
 		return nil, err
 	}
@@ -1261,7 +1235,7 @@ func (s *SubGroupService) persistSubscriptionImportNodes(
 	return savedTags, jsonOutbounds, nil
 }
 
-func (s *SubGroupService) saveSubGroupSubscriptionJson(
+func (s *SubGroupService) validateSubGroupSubscriptionJSON(
 	groupName string,
 	jsonURL string,
 	clashURL string,
@@ -1283,25 +1257,15 @@ func (s *SubGroupService) saveSubGroupSubscriptionJson(
 		return err
 	}
 
-	subJsonDir, err := getSubJsonDir()
-	if err != nil {
-		return err
-	}
-	baseFilename := sanitizeGroupFilename(groupName)
-	filePath := filepath.Join(subJsonDir, fmt.Sprintf("%s.json", baseFilename))
-
 	var settingService SettingService
 	othersStr, _ := settingService.GetSubJsonExt()
-	content, err := renderManagedSingboxSubscriptionJSON(
+	_, err := renderManagedSingboxSubscriptionJSON(
 		jsonOutbounds,
 		othersStr,
 		settingService.ResolveSubscriptionTLSStore,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to render group config: %v", err)
-	}
-	if err := ManagedRuntimeWriteFile(filePath, content); err != nil {
-		return fmt.Errorf("failed to write group config file: %v", err)
 	}
 
 	return nil
@@ -1501,13 +1465,16 @@ func (s *SubGroupService) pruneMissingOutboundTags(db *gorm.DB) (int, error) {
 		return 0, nil
 	}
 
-	var existingTags []string
-	if err := db.Model(model.SubOutbound{}).Pluck("tag", &existingTags).Error; err != nil {
+	var existingOutbounds []model.SubOutbound
+	if err := db.Model(model.SubOutbound{}).Select("tag", "type", "raw_outbound", "source_type").Find(&existingOutbounds).Error; err != nil {
 		return 0, err
 	}
-	existingSet := make(map[string]struct{}, len(existingTags))
-	for _, tag := range existingTags {
-		tag = strings.TrimSpace(tag)
+	existingSet := make(map[string]struct{}, len(existingOutbounds))
+	for _, outbound := range existingOutbounds {
+		if isSubscriptionServerOnlySubOutbound(&outbound) {
+			continue
+		}
+		tag := strings.TrimSpace(outbound.Tag)
 		if tag == "" {
 			continue
 		}
@@ -1550,7 +1517,7 @@ func (s *SubGroupService) pruneMissingOutboundTags(db *gorm.DB) (int, error) {
 	}
 
 	if prunedCount > 0 {
-		LastUpdate = time.Now().Unix()
+		markLastUpdate(time.Now().Unix())
 	}
 
 	return prunedCount, nil
@@ -1696,7 +1663,7 @@ func (s *SubGroupService) ClearSubManagerData() (*SubManagerClearResult, error) 
 		return nil, err
 	}
 
-	LastUpdate = time.Now().Unix()
+	markLastUpdate(time.Now().Unix())
 	return &SubManagerClearResult{
 		ClearedNodes:  len(cleanedTags),
 		ClearedGroups: len(groups),

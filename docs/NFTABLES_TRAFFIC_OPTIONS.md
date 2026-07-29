@@ -9,7 +9,7 @@
 现状：
 - 前端 `Stats.vue` 调用：`GET /app/api/stats?resource=...&tag=...&limit=...`
 - 后端：`service/stats.go -> StatsService.GetStats()` 从 `Stats` 表读取（resource/tag/direction/traffic/dateTime）
-- `Stats` 表数据由定时任务每 10 秒写入（`StatsService.SaveStats`），来源是 sing-box 内核的 `core/StatsTracker`
+- 流量历史开启时，定时任务每 10 秒通过 `NftTrafficService.CollectAndSaveTraffic()` 读取 nftables 计数器并写入 `Stats` 表；`StatsService.SaveStats()` 只清理旧内嵌运行时遗留的在线状态。
 
 因此：如果完全不跑内核统计，`Stats` 表就必须由 **nftables 采集器**来写入，UI 才会继续有数据。
 
@@ -93,14 +93,14 @@
 
 ---
 
-### 方案 E：继续用 sing-box 统计，但只把“统计模块”替换/隔离（折中）
+### 方案 E：接入独立 Core 的外部统计接口（折中）
 
-如果你所谓“屏蔽内核”是指不想暴露/依赖 sing-box 内部 API 或某些行为，那么可以考虑：
+如果你希望不用端口级计数器，但仍需要应用层用户维度统计，可以考虑：
 - 仍让 sing-box 运行与监听端口（必须，否则服务不存在）
-- 统计仍用 StatsTracker，但把落库/对外接口做隔离（例如独立 service、可开关）
+- 为独立运行的 sing-box 部署并采集其外部统计接口，再由独立 service 落库或对外提供数据
 - 这样可以保持 `resource=user` 语义完全不变
 
-这不是 nftables 方案，但对现有 UI 兼容性最好。
+当前项目没有内嵌统计跟踪器；这不是 nftables 方案，且需要另行设计外部 Core 的统计接口与部署方式。
 
 ---
 
@@ -133,7 +133,7 @@
 **确保：入站删除后，不再保留端口统计规则。**
 
 > 注意：nftables 只负责统计，不负责“监听”。端口监听由 sing-box 入站决定。
-> 你要保证“没用的端口不监听”，仍需要 `corePtr.RemoveInbound(tag)` 生效（当前代码已做）。
+> 要保证“没用的端口不监听”，先让配置保存重建不含该入站的外部 Core 配置，再通过独立 Core Manager 的控制入口让运行内核加载该配置。
 
 ### 4.3 采集与对接 UI
 你项目 UI 统计图读的是 `Stats` 表，所以 nftables 采集器应当每 10 秒：

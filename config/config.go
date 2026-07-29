@@ -25,10 +25,8 @@ const (
 )
 
 var (
-	dbPathOnce        sync.Once
-	dbPath            string
-	monitorDBPathOnce sync.Once
-	monitorDBPath     string
+	dbPathOnce sync.Once
+	dbPath     string
 )
 
 func GetVersion() string {
@@ -106,13 +104,6 @@ func GetDBPath() string {
 		migrateLegacyDBArtifacts(dbPath)
 	})
 	return dbPath
-}
-
-func GetSystemMonitorDBPath() string {
-	monitorDBPathOnce.Do(func() {
-		monitorDBPath = filepath.Join(GetDBFolderPath(), "monitor.db")
-	})
-	return monitorDBPath
 }
 
 func isSubPath(path, parent string) bool {

@@ -115,24 +115,17 @@ const startReconnectPolling = () => {
 
   const poll = async () => {
     try {
-      const resp = await fetch('./api/session', {
-        method: 'GET',
-        credentials: 'include',
-        cache: 'no-store',
-        headers: {
-          'X-Requested-With': 'XMLHttpRequest',
-        },
+      const body = await HttpUtils.get('api/session', {}, {
+        timeout: 5000,
+        silentAuthCheck: true,
+        silentErrorToast: true,
       })
-      if (resp.ok) {
-        const body = await resp.json()
-        if (body?.success === true) {
-          window.location.reload()
-          return
-        }
-        if (typeof body?.msg === 'string' && body.msg === 'Invalid login') {
-          window.location.replace('./login')
-          return
-        }
+      if (body.success) {
+        window.location.reload()
+        return
+      }
+      if (body.msg === 'Invalid login') {
+        return
       }
     } catch {
       // 等待面板恢复连接

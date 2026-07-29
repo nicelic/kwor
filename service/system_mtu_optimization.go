@@ -6,20 +6,24 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/alireza0/s-ui/config"
+	"github.com/alireza0/s-ui/database"
+	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/util/common"
+	"gorm.io/gorm"
 )
 
 const (
 	systemMTUEnabledKey    = "systemMTUEnabled"
 	systemMTUValueKey      = "systemMTUValue"
 	systemMTUScriptPathKey = "systemMTUScriptPath"
+	systemMTUInterfaceKey  = "systemMTUInterface"
+	systemMTUOriginalKey   = "systemMTUOriginalValue"
 
 	defaultSystemMTUValue = 1500
 	minAllowedMTUValue    = 576
@@ -28,15 +32,32 @@ const (
 	managedMTUScriptFileName = "_set_mtu_.sh"
 	managedMTUServiceUnit    = "kwor-mtu-opt.service"
 	managedMTUServicePath    = "/etc/systemd/system/" + managedMTUServiceUnit
+	managedMTUScriptOwnerID  = "mtu-script"
+	managedMTUServiceOwnerID = "mtu-systemd"
 )
 
 var (
 	systemMTUOptimizationMu sync.Mutex
 	mtuPattern              = regexp.MustCompile(`\bmtu\s+(\d+)\b`)
+	mtuInterfaceNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,64}$`)
 )
 
 type SystemMTUOptimizationService struct {
 	SettingService
+}
+
+type systemMTUPersistedState struct {
+	Enabled     bool
+	MTU         int
+	OriginalMTU int
+	Interface   string
+	ScriptPath  string
+}
+
+type systemMTUFileSnapshot struct {
+	exists bool
+	data   []byte
+	mode   os.FileMode
 }
 
 type SystemMTUOptimizationOverview struct {
@@ -45,6 +66,7 @@ type SystemMTUOptimizationOverview struct {
 	Interface         string `json:"interface"`
 	CurrentMTU        int    `json:"currentMtu"`
 	MTU               int    `json:"mtu"`
+	OriginalMTU       int    `json:"originalMtu"`
 	ScriptPath        string `json:"scriptPath"`
 	ScriptExists      bool   `json:"scriptExists"`
 	ServiceName       string `json:"serviceName"`
@@ -65,12 +87,15 @@ func (s *SystemMTUOptimizationService) GetOverview() (*SystemMTUOptimizationOver
 	if mtuErr != nil {
 		storedMTU = defaultSystemMTUValue
 	}
+	originalMTU, originalErr := s.getStoredOriginalMTU()
+	storedInterface, interfaceErr := s.getStoredInterface()
 
 	scriptPath := s.resolveMTUScriptPath()
 	overview := &SystemMTUOptimizationOverview{
-		Supported:         runtime.GOOS == "linux",
+		Supported:         IsSystemPlatformLinux(),
 		Enabled:           enabled,
 		MTU:               storedMTU,
+		OriginalMTU:       originalMTU,
 		ScriptPath:        scriptPath,
 		ScriptExists:      pathEntryExists(scriptPath),
 		ServiceName:       managedMTUServiceUnit,
@@ -83,13 +108,33 @@ func (s *SystemMTUOptimizationService) GetOverview() (*SystemMTUOptimizationOver
 		return overview, nil
 	}
 
-	issues := make([]string, 0, 4)
+	issues := make([]string, 0, 6)
 	if mtuErr != nil {
 		issues = append(issues, strings.TrimSpace(mtuErr.Error()))
 	}
+	if originalErr != nil {
+		issues = append(issues, strings.TrimSpace(originalErr.Error()))
+	}
+	if interfaceErr != nil {
+		issues = append(issues, strings.TrimSpace(interfaceErr.Error()))
+	}
 
-	iface, detectErr := detectDefaultInterfaceName()
+	iface := ""
+	if enabled {
+		iface = sanitizeInterfaceName(storedInterface)
+		if iface != "" {
+			if _, lookupErr := net.InterfaceByName(iface); lookupErr != nil {
+				issues = append(issues, "保存的 MTU 网卡已不可用，将回退到当前默认网卡")
+				iface = ""
+			}
+		}
+	}
+	var detectErr error
+	if iface == "" {
+		iface, detectErr = detectDefaultInterfaceName()
+	}
 	if detectErr != nil {
+		overview.Supported = false
 		issues = append(issues, "默认网卡检测失败: "+strings.TrimSpace(detectErr.Error()))
 	} else {
 		overview.Interface = iface
@@ -101,33 +146,40 @@ func (s *SystemMTUOptimizationService) GetOverview() (*SystemMTUOptimizationOver
 		}
 	}
 
-	systemctlPath, systemctlErr := exec.LookPath("systemctl")
-	if systemctlErr == nil {
-		state, stateErr := readSystemdUnitFileState(systemctlPath, managedMTUServiceUnit)
-		if stateErr != nil {
-			issues = append(issues, "读取 systemd 注册状态失败: "+strings.TrimSpace(stateErr.Error()))
-		} else {
-			overview.ServiceEnabled = strings.EqualFold(state, "enabled")
-			if strings.TrimSpace(state) != "" {
-				overview.ServiceRegistered = overview.ServiceRegistered || !strings.EqualFold(state, "not-found")
-			}
+	if iface != "" {
+		if _, capabilityErr := resolveInterfaceMTUMutator(iface); capabilityErr != nil {
+			overview.Supported = false
+			issues = append(issues, strings.TrimSpace(capabilityErr.Error()))
 		}
+	}
 
-		activeState, activeErr := readSystemdUnitActiveState(systemctlPath, managedMTUServiceUnit)
-		if activeErr == nil {
+	systemctlPath, systemctlErr := resolveOperationalSystemctl()
+	if systemctlErr != nil {
+		overview.Supported = false
+		issues = append(issues, strings.TrimSpace(systemctlErr.Error()))
+	} else {
+		unitState, activeState, stateErr := readSystemdUnitStatus(systemctlPath, managedMTUServiceUnit)
+		if stateErr != nil {
+			issues = append(issues, "读取 systemd 状态失败: "+strings.TrimSpace(stateErr.Error()))
+		} else {
+			overview.ServiceEnabled = strings.EqualFold(unitState, "enabled")
+			overview.ServiceRegistered = overview.ServiceRegistered || (unitState != "" && !strings.EqualFold(unitState, "not-found"))
 			overview.ServiceActive = activeState
 		}
-	} else if enabled {
-		issues = append(issues, "未找到 systemctl，无法检测开机启动注册状态")
 	}
 
 	if enabled {
+		if overview.OriginalMTU <= 0 {
+			issues = append(issues, "旧版本未记录原始 MTU，关闭时将回退到 1500")
+		}
 		if !overview.ScriptExists {
 			issues = append(issues, "MTU 脚本不存在，请重新保存 MTU 或重新开启开关")
 		}
 		if !overview.ServiceRegistered || !overview.ServiceEnabled {
 			issues = append(issues, "systemd 开机自启未注册，将在下次保存或重新开启时自动补注册")
 		}
+	} else if overview.ServiceRegistered || overview.ServiceEnabled {
+		issues = append(issues, "检测到已关闭功能残留的 MTU systemd 服务，请重新切换开关完成清理")
 	}
 
 	if len(issues) > 0 {
@@ -140,7 +192,7 @@ func (s *SystemMTUOptimizationService) SetEnabled(enabled bool, requestedMTU *in
 	systemMTUOptimizationMu.Lock()
 	defer systemMTUOptimizationMu.Unlock()
 
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return common.NewError("MTU 优化仅支持 Linux")
 	}
 
@@ -167,7 +219,7 @@ func (s *SystemMTUOptimizationService) SaveMTU(mtu int) error {
 	systemMTUOptimizationMu.Lock()
 	defer systemMTUOptimizationMu.Unlock()
 
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return common.NewError("MTU 优化仅支持 Linux")
 	}
 	if err := validateMTUValue(mtu); err != nil {
@@ -189,57 +241,185 @@ func (s *SystemMTUOptimizationService) enableMTULocked(mtu int) error {
 	if err := validateMTUValue(mtu); err != nil {
 		return err
 	}
-
-	scriptPath, err := s.rebuildManagedMTUScriptLocked(mtu)
+	previous, err := s.loadMTUPersistedState()
 	if err != nil {
 		return err
 	}
-	if err := runManagedMTUScript(scriptPath, mtu); err != nil {
-		return common.NewError("执行 MTU 脚本失败: ", err)
+
+	iface := ""
+	previousInterface := sanitizeInterfaceName(previous.Interface)
+	if previous.Enabled {
+		iface = previousInterface
+		if iface != "" {
+			if _, lookupErr := net.InterfaceByName(iface); lookupErr != nil {
+				iface = ""
+			}
+		}
 	}
-	if err := ensureSystemdMTUService(scriptPath); err != nil {
+	if iface == "" {
+		iface, err = detectDefaultInterfaceName()
+		if err != nil {
+			return common.NewError("默认网卡检测失败: ", err)
+		}
+	}
+	currentMTU, err := detectInterfaceMTUValue(iface)
+	if err != nil {
+		return common.NewError("读取网卡原始 MTU 失败: ", err)
+	}
+	if _, err := resolveInterfaceMTUMutator(iface); err != nil {
+		return err
+	}
+	if _, err := resolveOperationalSystemctl(); err != nil {
 		return err
 	}
 
-	if err := s.setString(systemMTUValueKey, strconv.Itoa(mtu)); err != nil {
+	originalMTU := currentMTU
+	if previous.Enabled && previous.OriginalMTU > 0 && iface == previousInterface {
+		originalMTU = previous.OriginalMTU
+	}
+	scriptPath, err := s.rebuildManagedMTUScriptLocked(mtu, iface)
+	if err != nil {
 		return err
 	}
-	if err := s.setString(systemMTUEnabledKey, "true"); err != nil {
-		return err
+	rollback := func(cause error) error {
+		return s.rollbackMTUEnable(previous, iface, currentMTU, scriptPath, cause)
 	}
-	return s.setString(systemMTUScriptPathKey, scriptPath)
+	if err := ensureSystemdMTUService(scriptPath); err != nil {
+		return rollback(err)
+	}
+	if err := runManagedMTUScript(scriptPath, mtu); err != nil {
+		return rollback(common.NewError("执行 MTU 脚本失败: ", err))
+	}
+	verifiedMTU, err := detectInterfaceMTUValue(iface)
+	if err != nil || verifiedMTU != mtu {
+		if err == nil {
+			err = common.NewError("读取值为 ", verifiedMTU, "，期望值为 ", mtu)
+		}
+		return rollback(common.NewError("校验 MTU 生效结果失败: ", err))
+	}
+
+	next := systemMTUPersistedState{
+		Enabled:     true,
+		MTU:         mtu,
+		OriginalMTU: originalMTU,
+		Interface:   iface,
+		ScriptPath:  scriptPath,
+	}
+	if err := s.saveMTUPersistedState(next); err != nil {
+		return rollback(common.NewError("保存 MTU 状态失败: ", err))
+	}
+	return nil
 }
 
 func (s *SystemMTUOptimizationService) disableMTULocked() error {
-	errs := make([]error, 0, 4)
+	previous, err := s.loadMTUPersistedState()
+	if err != nil {
+		return err
+	}
+	previous.ScriptPath = strings.TrimSpace(previous.ScriptPath)
+	if previous.ScriptPath == "" {
+		previous.ScriptPath = s.resolveMTUScriptPath()
+	}
+	if !previous.Enabled {
+		errs := make([]error, 0, 2)
+		if err := removeSystemdMTUService(); err != nil {
+			errs = append(errs, err)
+		}
+		if err := removeManagedMTUScript(previous.ScriptPath); err != nil {
+			errs = append(errs, err)
+		}
+		if err := joinMTUErrors(errs); err != nil {
+			return err
+		}
 
-	iface, ifaceErr := detectDefaultInterfaceName()
-	if ifaceErr == nil {
-		if err := setInterfaceMTUValue(iface, defaultSystemMTUValue); err != nil {
-			errs = append(errs, common.NewError("回退 MTU=1500 失败: ", err))
+		previous.Interface = ""
+		previous.OriginalMTU = 0
+		return s.saveMTUPersistedState(previous)
+	}
+	previousInterface := sanitizeInterfaceName(previous.Interface)
+	iface := previousInterface
+	if iface != "" {
+		if _, lookupErr := net.InterfaceByName(iface); lookupErr != nil {
+			iface = ""
+		}
+	}
+	if iface == "" {
+		iface, err = detectDefaultInterfaceName()
+		if err != nil {
+			return common.NewError("默认网卡检测失败: ", err)
+		}
+	}
+	restoreMTU := previous.OriginalMTU
+	if restoreMTU <= 0 || iface != previousInterface {
+		restoreMTU = defaultSystemMTUValue
+	}
+	if _, err := resolveInterfaceMTUMutator(iface); err != nil {
+		return err
+	}
+	rollback := func(cause error) error {
+		return s.rollbackMTUDisable(previous, iface, cause)
+	}
+	if err := setInterfaceMTUValue(iface, restoreMTU); err != nil {
+		return rollback(common.NewError("恢复原始 MTU=", restoreMTU, " 失败: ", err))
+	}
+	if err := removeSystemdMTUService(); err != nil {
+		return rollback(err)
+	}
+	if err := removeManagedMTUScript(previous.ScriptPath); err != nil {
+		return rollback(err)
+	}
+	next := systemMTUPersistedState{
+		Enabled:    false,
+		MTU:        restoreMTU,
+		ScriptPath: previous.ScriptPath,
+	}
+	if err := s.saveMTUPersistedState(next); err != nil {
+		return rollback(common.NewError("保存 MTU 关闭状态失败: ", err))
+	}
+	return nil
+}
+
+func (s *SystemMTUOptimizationService) rollbackMTUDisable(previous systemMTUPersistedState, iface string, cause error) error {
+	errs := []error{cause}
+	restoredPath, rebuildErr := s.rebuildManagedMTUScriptLocked(previous.MTU, iface)
+	if rebuildErr != nil {
+		errs = append(errs, common.NewError("恢复原 MTU 脚本失败: ", rebuildErr))
+	} else if serviceErr := ensureSystemdMTUService(restoredPath); serviceErr != nil {
+		errs = append(errs, common.NewError("恢复原 MTU systemd 服务失败: ", serviceErr))
+	}
+	if restoreErr := setInterfaceMTUValue(iface, previous.MTU); restoreErr != nil {
+		errs = append(errs, common.NewError("恢复关闭前 MTU 失败: ", restoreErr))
+	}
+	return joinMTUErrors(errs)
+}
+
+func (s *SystemMTUOptimizationService) rollbackMTUEnable(previous systemMTUPersistedState, iface string, previousCurrentMTU int, scriptPath string, cause error) error {
+	errs := []error{cause}
+	if err := setInterfaceMTUValue(iface, previousCurrentMTU); err != nil {
+		errs = append(errs, common.NewError("恢复变更前 MTU 失败: ", err))
+	}
+	if previous.Enabled {
+		restoreInterface := sanitizeInterfaceName(previous.Interface)
+		if restoreInterface == "" {
+			restoreInterface = iface
+		}
+		restoredPath, rebuildErr := s.rebuildManagedMTUScriptLocked(previous.MTU, restoreInterface)
+		if rebuildErr != nil {
+			errs = append(errs, common.NewError("恢复原 MTU 脚本失败: ", rebuildErr))
+		} else if serviceErr := ensureSystemdMTUService(restoredPath); serviceErr != nil {
+			errs = append(errs, common.NewError("恢复原 MTU systemd 服务失败: ", serviceErr))
 		}
 	} else {
-		errs = append(errs, common.NewError("默认网卡检测失败: ", ifaceErr))
+		if err := removeSystemdMTUService(); err != nil {
+			errs = append(errs, err)
+		}
+		if err := removeManagedMTUScript(scriptPath); err != nil {
+			errs = append(errs, err)
+		}
 	}
-
-	if err := removeSystemdMTUService(); err != nil {
-		errs = append(errs, err)
+	if err := s.saveMTUPersistedState(previous); err != nil {
+		errs = append(errs, common.NewError("恢复原 MTU 数据状态失败: ", err))
 	}
-	scriptPath := s.resolveMTUScriptPath()
-	if err := removeManagedMTUScript(scriptPath); err != nil {
-		errs = append(errs, err)
-	}
-
-	if err := s.setString(systemMTUEnabledKey, "false"); err != nil {
-		errs = append(errs, err)
-	}
-	if err := s.setString(systemMTUValueKey, strconv.Itoa(defaultSystemMTUValue)); err != nil {
-		errs = append(errs, err)
-	}
-	if err := s.setString(systemMTUScriptPathKey, scriptPath); err != nil {
-		errs = append(errs, err)
-	}
-
 	return joinMTUErrors(errs)
 }
 
@@ -249,6 +429,105 @@ func (s *SystemMTUOptimizationService) getStoredMTU() (int, error) {
 		return 0, err
 	}
 	return parseAndValidateMTU(raw)
+}
+
+func (s *SystemMTUOptimizationService) getStoredOriginalMTU() (int, error) {
+	raw, err := s.getString(systemMTUOriginalKey)
+	if err != nil {
+		return 0, err
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "0" {
+		return 0, nil
+	}
+	value, err := strconv.Atoi(trimmed)
+	if err != nil {
+		return 0, common.NewError("保存的原始 MTU 不是整数")
+	}
+	if err := validateMTUValue(value); err != nil {
+		return 0, common.NewError("保存的原始 MTU 无效: ", err)
+	}
+	return value, nil
+}
+
+func (s *SystemMTUOptimizationService) getStoredInterface() (string, error) {
+	raw, err := s.getString(systemMTUInterfaceKey)
+	if err != nil {
+		return "", err
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", nil
+	}
+	normalized := sanitizeInterfaceName(trimmed)
+	if normalized == "" || normalized != trimmed {
+		return "", common.NewError("保存的 MTU 网卡名称无效")
+	}
+	return normalized, nil
+}
+
+func (s *SystemMTUOptimizationService) loadMTUPersistedState() (systemMTUPersistedState, error) {
+	enabled, err := s.getBool(systemMTUEnabledKey)
+	if err != nil {
+		return systemMTUPersistedState{}, err
+	}
+	mtu, err := s.getStoredMTU()
+	if err != nil {
+		return systemMTUPersistedState{}, err
+	}
+	originalMTU, err := s.getStoredOriginalMTU()
+	if err != nil {
+		return systemMTUPersistedState{}, err
+	}
+	iface, err := s.getStoredInterface()
+	if err != nil {
+		return systemMTUPersistedState{}, err
+	}
+	return systemMTUPersistedState{
+		Enabled:     enabled,
+		MTU:         mtu,
+		OriginalMTU: originalMTU,
+		Interface:   iface,
+		ScriptPath:  s.resolveMTUScriptPath(),
+	}, nil
+}
+
+func (s *SystemMTUOptimizationService) saveMTUPersistedState(state systemMTUPersistedState) error {
+	db := database.GetDB()
+	if db == nil {
+		return common.NewError("database is not ready")
+	}
+	iface := sanitizeInterfaceName(state.Interface)
+	if state.Enabled && iface == "" {
+		return common.NewError("MTU 网卡名称为空")
+	}
+	values := map[string]string{
+		systemMTUEnabledKey:    strconv.FormatBool(state.Enabled),
+		systemMTUValueKey:      strconv.Itoa(state.MTU),
+		systemMTUScriptPathKey: strings.TrimSpace(state.ScriptPath),
+		systemMTUInterfaceKey:  iface,
+		systemMTUOriginalKey:   strconv.Itoa(state.OriginalMTU),
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		for key, value := range values {
+			setting := &model.Setting{}
+			err := tx.Model(model.Setting{}).Where("key = ?", key).Order("id DESC").First(setting).Error
+			if database.IsNotFound(err) {
+				if err := tx.Create(&model.Setting{Key: key, Value: value}).Error; err != nil {
+					return err
+				}
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			setting.Value = value
+			if err := tx.Save(setting).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (s *SystemMTUOptimizationService) resolveMTUScriptPath() string {
@@ -262,31 +541,40 @@ func (s *SystemMTUOptimizationService) resolveMTUScriptPath() string {
 	return filepath.Join(config.GetDataDir(), "mtu", managedMTUScriptFileName)
 }
 
-func (s *SystemMTUOptimizationService) rebuildManagedMTUScriptLocked(mtu int) (string, error) {
+func (s *SystemMTUOptimizationService) rebuildManagedMTUScriptLocked(mtu int, iface string) (string, error) {
+	iface = sanitizeInterfaceName(iface)
+	if iface == "" {
+		return "", common.NewError("MTU 网卡名称为空")
+	}
 	scriptPath := s.resolveMTUScriptPath()
 	scriptPath = strings.TrimSpace(scriptPath)
 	if scriptPath == "" {
 		return "", common.NewError("MTU 脚本路径为空")
 	}
-
 	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
 		return "", common.NewError("创建 MTU 脚本目录失败: ", err)
 	}
-	if pathEntryExists(scriptPath) {
-		if err := os.Remove(scriptPath); err != nil && !os.IsNotExist(err) {
-			return "", common.NewError("删除旧 MTU 脚本失败: ", err)
-		}
+	previousFile, err := captureSystemMTUFile(scriptPath)
+	if err != nil {
+		return "", common.NewError("读取旧 MTU 脚本失败: ", err)
+	}
+	ownership, err := BeginHostFileOwnership(managedMTUScriptOwnerID, []string{scriptPath}, HostCleanupDelete)
+	if err != nil {
+		return "", common.NewError("记录待写入 MTU 脚本所有权失败: ", err)
 	}
 
-	content := buildManagedMTUScriptContent(mtu)
-	if err := os.WriteFile(scriptPath, []byte(content), 0o755); err != nil {
-		return "", common.NewError("写入 MTU 脚本失败: ", err)
+	content := buildManagedMTUScriptContent(mtu, iface)
+	if err := writeSystemMTUFileAtomic(scriptPath, []byte(content), 0o755); err != nil {
+		if restoreErr := rollbackSystemMTUFile(ownership.ID, scriptPath, previousFile); restoreErr != nil {
+			return "", common.NewError("原子替换 MTU 脚本失败: ", err, "；恢复旧脚本失败: ", restoreErr)
+		}
+		return "", common.NewError("原子替换 MTU 脚本失败: ", err)
 	}
-	if err := os.Chmod(scriptPath, 0o755); err != nil {
-		return "", common.NewError("设置 MTU 脚本执行权限失败: ", err)
-	}
-	if err := s.setString(systemMTUScriptPathKey, scriptPath); err != nil {
-		return "", err
+	if err := VerifyAndActivateHostResource(ownership.ID); err != nil {
+		if restoreErr := rollbackSystemMTUFile(ownership.ID, scriptPath, previousFile); restoreErr != nil {
+			return "", common.NewError("确认 MTU 脚本所有权失败: ", err, "；恢复旧脚本失败: ", restoreErr)
+		}
+		return "", common.NewError("确认 MTU 脚本所有权失败: ", err)
 	}
 	return scriptPath, nil
 }
@@ -302,6 +590,9 @@ func removeManagedMTUScript(scriptPath string) error {
 			return common.NewError("删除 MTU 脚本失败: ", err)
 		}
 	}
+	if err := RemoveHostResource(managedMTUScriptOwnerID); err != nil {
+		return common.NewError("删除 MTU 脚本所有权记录失败: ", err)
+	}
 
 	scriptDir := filepath.Dir(scriptPath)
 	entries, err := os.ReadDir(scriptDir)
@@ -311,12 +602,86 @@ func removeManagedMTUScript(scriptPath string) error {
 	return nil
 }
 
-func buildManagedMTUScriptContent(mtu int) string {
+func captureSystemMTUFile(path string) (systemMTUFileSnapshot, error) {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return systemMTUFileSnapshot{}, nil
+	}
+	if err != nil {
+		return systemMTUFileSnapshot{}, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return systemMTUFileSnapshot{}, err
+	}
+	return systemMTUFileSnapshot{exists: true, data: data, mode: info.Mode().Perm()}, nil
+}
+
+func restoreSystemMTUFile(path string, snapshot systemMTUFileSnapshot) error {
+	if !snapshot.exists {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	return writeSystemMTUFileAtomic(path, snapshot.data, snapshot.mode)
+}
+
+func restoreMTUFileOwnership(id string, snapshot systemMTUFileSnapshot) error {
+	if snapshot.exists {
+		return VerifyAndActivateHostResource(id)
+	}
+	return RemoveHostResource(id)
+}
+
+func rollbackSystemMTUFile(id string, path string, snapshot systemMTUFileSnapshot) error {
+	if err := restoreSystemMTUFile(path, snapshot); err != nil {
+		return err
+	}
+	return restoreMTUFileOwnership(id, snapshot)
+}
+
+func writeSystemMTUFileAtomic(path string, data []byte, mode os.FileMode) error {
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		return err
+	}
+	tempFile, err := os.CreateTemp(directory, ".kwor-mtu-*")
+	if err != nil {
+		return err
+	}
+	tempPath := tempFile.Name()
+	defer os.Remove(tempPath)
+	if _, err := tempFile.Write(data); err != nil {
+		_ = tempFile.Close()
+		return err
+	}
+	if err := tempFile.Sync(); err != nil {
+		_ = tempFile.Close()
+		return err
+	}
+	if err := tempFile.Chmod(mode); err != nil {
+		_ = tempFile.Close()
+		return err
+	}
+	if err := tempFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	return syncHostOwnershipDirectory(directory)
+}
+
+func buildManagedMTUScriptContent(mtu int, iface string) string {
+	iface = sanitizeInterfaceName(iface)
 	return strings.TrimSpace(
 		`#!/bin/sh
+# kwor-owner:v1 resource=mtu-script
 set -eu
 
 MTU_VALUE="`+strconv.Itoa(mtu)+`"
+PREFERRED_IFACE="`+iface+`"
 if [ "${1:-}" != "" ]; then
   MTU_VALUE="$1"
 fi
@@ -330,6 +695,11 @@ esac
 
 detect_default_iface() {
   iface=""
+  if [ -n "${PREFERRED_IFACE:-}" ] && [ "${PREFERRED_IFACE}" != "lo" ] && [ -e "/sys/class/net/${PREFERRED_IFACE}" ]; then
+    echo "${PREFERRED_IFACE}"
+    return 0
+  fi
+
   if command -v ip >/dev/null 2>&1; then
     iface="$(ip -o route show to default 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1); exit}}}')"
     iface="${iface%%@*}"
@@ -355,6 +725,24 @@ detect_default_iface() {
     fi
   fi
 
+  for iface_path in /sys/class/net/*; do
+    [ -e "$iface_path" ] || continue
+    iface="${iface_path##*/}"
+    [ "$iface" = "lo" ] && continue
+    if [ -r "$iface_path/operstate" ] && [ "$(cat "$iface_path/operstate" 2>/dev/null || true)" = "up" ]; then
+      echo "$iface"
+      return 0
+    fi
+  done
+
+  for iface_path in /sys/class/net/*; do
+    [ -e "$iface_path" ] || continue
+    iface="${iface_path##*/}"
+    [ "$iface" = "lo" ] && continue
+    echo "$iface"
+    return 0
+  done
+
   return 1
 }
 
@@ -368,8 +756,10 @@ if command -v ip >/dev/null 2>&1; then
   ip link set dev "$IFACE" mtu "$MTU_VALUE"
 elif command -v ifconfig >/dev/null 2>&1; then
   ifconfig "$IFACE" mtu "$MTU_VALUE" up
+elif [ -w "/sys/class/net/$IFACE/mtu" ]; then
+  printf '%s\n' "$MTU_VALUE" > "/sys/class/net/$IFACE/mtu"
 else
-  echo "missing network command: neither ip nor ifconfig was found" >&2
+  echo "missing MTU write capability: ip, ifconfig and writable sysfs are unavailable" >&2
   exit 1
 fi
 `,
@@ -401,24 +791,82 @@ func resolveManagedScriptShell() (string, error) {
 }
 
 func ensureSystemdMTUService(scriptPath string) error {
-	systemctlPath, err := exec.LookPath("systemctl")
+	systemctlPath, err := resolveOperationalSystemctl()
 	if err != nil {
-		return common.NewError("未找到 systemctl，无法注册 MTU 开机自启")
+		return err
 	}
 
 	serviceContent, err := buildManagedMTUServiceContent(scriptPath)
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(managedMTUServicePath, []byte(serviceContent), 0o644); err != nil {
-		return common.NewError("写入 MTU systemd 服务失败: ", err)
+	previousFile, err := captureSystemMTUFile(managedMTUServicePath)
+	if err != nil {
+		return common.NewError("读取旧 MTU systemd 服务失败: ", err)
+	}
+	previousUnitState, _, _ := readSystemdUnitStatus(systemctlPath, managedMTUServiceUnit)
+	previousUnitEnabled := strings.EqualFold(previousUnitState, "enabled")
+	ownership, err := BeginSystemdHostOwnership(managedMTUServiceOwnerID, managedMTUServiceUnit, []string{managedMTUServicePath}, map[string]string{
+		"script": scriptPath,
+	})
+	if err != nil {
+		return common.NewError("记录待写入 MTU systemd 所有权失败: ", err)
+	}
+	if err := writeSystemMTUFileAtomic(managedMTUServicePath, []byte(serviceContent), 0o644); err != nil {
+		if restoreErr := rollbackSystemMTUFile(ownership.ID, managedMTUServicePath, previousFile); restoreErr != nil {
+			return common.NewError("原子替换 MTU systemd 服务失败: ", err, "；恢复旧服务失败: ", restoreErr)
+		}
+		return common.NewError("原子替换 MTU systemd 服务失败: ", err)
+	}
+	restorePreviousFile := func() error {
+		errs := make([]error, 0, 4)
+		if err := runCommandWithTimeout(12*time.Second, systemctlPath, "disable", managedMTUServiceUnit); err != nil && !isMissingSystemdUnitError(err) {
+			errs = append(errs, err)
+		}
+		fileRestored := true
+		if err := restoreSystemMTUFile(managedMTUServicePath, previousFile); err != nil {
+			fileRestored = false
+			errs = append(errs, err)
+		}
+		if err := runCommandWithTimeout(12*time.Second, systemctlPath, "daemon-reload"); err != nil {
+			errs = append(errs, err)
+		}
+		if previousUnitEnabled {
+			if err := runCommandWithTimeout(12*time.Second, systemctlPath, "enable", managedMTUServiceUnit); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if fileRestored {
+			if err := restoreMTUFileOwnership(ownership.ID, previousFile); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		return joinMTUErrors(errs)
+	}
+	if err := verifySystemdUnitFile(managedMTUServicePath); err != nil {
+		if restoreErr := restorePreviousFile(); restoreErr != nil {
+			return common.NewError("校验 MTU systemd 服务失败: ", err, "；恢复旧服务失败: ", restoreErr)
+		}
+		return common.NewError("校验 MTU systemd 服务失败: ", err)
 	}
 
 	if err := runCommandWithTimeout(12*time.Second, systemctlPath, "daemon-reload"); err != nil {
+		if restoreErr := restorePreviousFile(); restoreErr != nil {
+			return common.NewError("重新加载 systemd 失败: ", err, "；恢复旧服务失败: ", restoreErr)
+		}
 		return common.NewError("重新加载 systemd 失败: ", err)
 	}
 	if err := runCommandWithTimeout(12*time.Second, systemctlPath, "enable", managedMTUServiceUnit); err != nil {
+		if restoreErr := restorePreviousFile(); restoreErr != nil {
+			return common.NewError("注册 MTU systemd 开机自启失败: ", err, "；恢复旧服务失败: ", restoreErr)
+		}
 		return common.NewError("注册 MTU systemd 开机自启失败: ", err)
+	}
+	if err := VerifyAndActivateHostResource(ownership.ID); err != nil {
+		if restoreErr := restorePreviousFile(); restoreErr != nil {
+			return common.NewError("确认 MTU systemd 所有权失败: ", err, "；恢复旧服务失败: ", restoreErr)
+		}
+		return common.NewError("确认 MTU systemd 所有权失败: ", err)
 	}
 	return nil
 }
@@ -428,7 +876,8 @@ func buildManagedMTUServiceContent(scriptPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return `[Unit]
+	return `# kwor-owner:v1 resource=mtu-systemd
+[Unit]
 Description=kwor managed default interface MTU
 Wants=network-online.target
 After=network-online.target
@@ -436,7 +885,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStartPre=/bin/sleep 10
-ExecStart=` + shellPath + ` "` + scriptPath + `"
+ExecStart=` + buildSystemdExecCommand(shellPath, scriptPath) + `
 RemainAfterExit=yes
 
 [Install]
@@ -445,48 +894,108 @@ WantedBy=multi-user.target
 }
 
 func removeSystemdMTUService() error {
-	systemctlPath, systemctlErr := exec.LookPath("systemctl")
+	systemctlPath, systemctlErr := resolveOperationalSystemctl()
+	errs := make([]error, 0, 4)
 	if systemctlErr == nil {
-		_ = runCommandWithTimeout(12*time.Second, systemctlPath, "disable", "--now", managedMTUServiceUnit)
+		unitState, _, stateErr := readSystemdUnitStatus(systemctlPath, managedMTUServiceUnit)
+		unitMissing := stateErr == nil && strings.EqualFold(unitState, "not-found") && !pathEntryExists(managedMTUServicePath)
+		if !unitMissing {
+			if err := runCommandWithTimeout(12*time.Second, systemctlPath, "disable", "--now", managedMTUServiceUnit); err != nil && !isMissingSystemdUnitError(err) {
+				return common.NewError("停用 MTU systemd 服务失败: ", err)
+			}
+		}
+	} else if pathEntryExists(managedMTUServicePath) {
+		return systemctlErr
 	}
 
 	if pathEntryExists(managedMTUServicePath) {
 		if err := os.Remove(managedMTUServicePath); err != nil && !os.IsNotExist(err) {
-			return common.NewError("删除 MTU systemd 服务文件失败: ", err)
+			errs = append(errs, common.NewError("删除 MTU systemd 服务文件失败: ", err))
 		}
 	}
 
 	if systemctlErr == nil {
 		if err := runCommandWithTimeout(12*time.Second, systemctlPath, "daemon-reload"); err != nil {
-			return common.NewError("删除 MTU 服务后重新加载 systemd 失败: ", err)
+			errs = append(errs, common.NewError("删除 MTU 服务后重新加载 systemd 失败: ", err))
 		}
 		_ = runCommandWithTimeout(8*time.Second, systemctlPath, "reset-failed", managedMTUServiceUnit)
 	}
-	return nil
+	if len(errs) == 0 {
+		if err := RemoveHostResource(managedMTUServiceOwnerID); err != nil {
+			errs = append(errs, common.NewError("删除 MTU systemd 所有权记录失败: ", err))
+		}
+	}
+	return joinMTUErrors(errs)
 }
 
-func readSystemdUnitFileState(systemctlPath string, unit string) (string, error) {
-	output, err := runCommandOutputWithTimeout(8*time.Second, systemctlPath, "show", "-p", "UnitFileState", "--value", unit)
-	if err != nil {
-		return "", err
+func isMissingSystemdUnitError(err error) bool {
+	if err == nil {
+		return false
 	}
-	state := strings.TrimSpace(output)
-	if state == "" {
-		state = "unknown"
+	lower := strings.ToLower(err.Error())
+	for _, fragment := range []string{"not found", "not loaded", "does not exist", "no such file"} {
+		if strings.Contains(lower, fragment) {
+			return true
+		}
 	}
-	return state, nil
+	return false
 }
 
-func readSystemdUnitActiveState(systemctlPath string, unit string) (string, error) {
-	output, err := runCommandOutputWithTimeout(8*time.Second, systemctlPath, "show", "-p", "ActiveState", "--value", unit)
+func resolveOperationalSystemctl() (string, error) {
+	if !pathEntryExists("/run/systemd/system") {
+		return "", common.NewError("当前环境没有运行中的 systemd 管理器，MTU 持久化不可用")
+	}
+	systemctlPath, err := exec.LookPath("systemctl")
 	if err != nil {
-		return "", err
+		return "", common.NewError("未找到 systemctl，MTU 持久化不可用")
 	}
-	state := strings.TrimSpace(output)
-	if state == "" {
-		state = "unknown"
+	output, err := runCommandOutputWithTimeout(5*time.Second, systemctlPath, "show", "--property=Version", "--value")
+	if err != nil {
+		return "", common.NewError("无法连接 systemd 管理器: ", err)
 	}
-	return state, nil
+	if strings.TrimSpace(output) == "" {
+		return "", common.NewError("systemd 管理器未返回版本信息")
+	}
+	return systemctlPath, nil
+}
+
+func readSystemdUnitStatus(systemctlPath string, unit string) (string, string, error) {
+	output, err := runCommandOutputWithTimeout(5*time.Second, systemctlPath, "show", "-p", "LoadState", "-p", "UnitFileState", "-p", "ActiveState", unit)
+	if err != nil {
+		return "", "", err
+	}
+	unitFileState, activeState := parseSystemdUnitStatus(output)
+	return unitFileState, activeState, nil
+}
+
+func parseSystemdUnitStatus(output string) (string, string) {
+	loadState := ""
+	unitFileState := ""
+	activeState := ""
+	for _, line := range strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n") {
+		key, value, found := strings.Cut(strings.TrimSpace(line), "=")
+		if !found {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "LoadState":
+			loadState = strings.TrimSpace(value)
+		case "UnitFileState":
+			unitFileState = strings.TrimSpace(value)
+		case "ActiveState":
+			activeState = strings.TrimSpace(value)
+		}
+	}
+	if strings.EqualFold(loadState, "not-found") {
+		unitFileState = "not-found"
+	}
+	if unitFileState == "" {
+		unitFileState = "unknown"
+	}
+	if activeState == "" {
+		activeState = "unknown"
+	}
+	return unitFileState, activeState
 }
 
 func detectDefaultInterfaceName() (string, error) {
@@ -585,7 +1094,11 @@ func sanitizeInterfaceName(name string) string {
 	if idx := strings.Index(name, "@"); idx > 0 {
 		name = name[:idx]
 	}
-	return strings.TrimSpace(name)
+	name = strings.TrimSpace(name)
+	if !mtuInterfaceNamePattern.MatchString(name) {
+		return ""
+	}
+	return name
 }
 
 func detectInterfaceMTUValue(iface string) (int, error) {
@@ -633,18 +1146,60 @@ func setInterfaceMTUValue(iface string, mtu int) error {
 	}
 
 	mtuStr := strconv.Itoa(mtu)
+	errs := make([]error, 0, 3)
 	if ipPath, err := exec.LookPath("ip"); err == nil {
 		if setErr := runCommandWithTimeout(12*time.Second, ipPath, "link", "set", "dev", iface, "mtu", mtuStr); setErr == nil {
 			return nil
+		} else {
+			errs = append(errs, setErr)
 		}
 	}
 	if ifconfigPath, err := exec.LookPath("ifconfig"); err == nil {
 		if setErr := runCommandWithTimeout(12*time.Second, ifconfigPath, iface, "mtu", mtuStr, "up"); setErr == nil {
 			return nil
+		} else {
+			errs = append(errs, setErr)
 		}
 	}
+	if setErr := writeInterfaceMTUValueSysfs(iface, mtuStr); setErr == nil {
+		return nil
+	} else {
+		errs = append(errs, setErr)
+	}
+	return common.NewError("设置网卡 MTU 失败: ", joinMTUErrors(errs))
+}
 
-	return common.NewError("未找到可用命令设置 MTU（ip/ifconfig）")
+func resolveInterfaceMTUMutator(iface string) (string, error) {
+	iface = sanitizeInterfaceName(iface)
+	if iface == "" {
+		return "", common.NewError("网卡名称为空")
+	}
+	if path, err := exec.LookPath("ip"); err == nil {
+		return path, nil
+	}
+	if path, err := exec.LookPath("ifconfig"); err == nil {
+		return path, nil
+	}
+	path := filepath.Join("/sys/class/net", iface, "mtu")
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err == nil {
+		_ = file.Close()
+		return path, nil
+	}
+	return "", common.NewError("缺少 MTU 写入能力：未找到 ip/ifconfig，且 sysfs 不可写")
+}
+
+func writeInterfaceMTUValueSysfs(iface string, mtu string) error {
+	path := filepath.Join("/sys/class/net", iface, "mtu")
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if _, err := file.WriteString(mtu + "\n"); err != nil {
+		return err
+	}
+	return nil
 }
 
 func parseAndValidateMTU(raw string) (int, error) {

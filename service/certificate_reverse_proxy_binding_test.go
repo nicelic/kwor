@@ -7,7 +7,7 @@ import (
 	"github.com/alireza0/s-ui/database/model"
 )
 
-func TestCertificateListBlocksDeleteWhenReverseProxyUsesCertificateList(t *testing.T) {
+func TestCertificateDeleteDetachesReverseProxyCertificateList(t *testing.T) {
 	db := setupMihomoSyncTestDB(t, "cert-reverse-proxy-list-usage.db")
 	record := upsertTestCertificateRecord(t, "reverse-proxy-list.example.com")
 
@@ -26,8 +26,8 @@ func TestCertificateListBlocksDeleteWhenReverseProxyUsesCertificateList(t *testi
 		t.Fatalf("list certificates failed: %v", err)
 	}
 	view := findCertificateRecordView(t, views, record.Id)
-	if !view.DeleteBlocked {
-		t.Fatalf("expected reverse proxy usage to block delete, got %#v", view)
+	if view.DeleteBlocked {
+		t.Fatalf("expected reverse proxy usage to be informational only, got %#v", view)
 	}
 	if !strings.Contains(view.UsageLabel, "反向代理使用中") || !strings.Contains(view.UsageLabel, "rp-listener-a") {
 		t.Fatalf("expected usage label to include reverse proxy rule name, got %q", view.UsageLabel)
@@ -36,14 +36,18 @@ func TestCertificateListBlocksDeleteWhenReverseProxyUsesCertificateList(t *testi
 		t.Fatalf("expected remark to include reverse proxy usage marker, got %q", view.Remark)
 	}
 
-	if _, err := (&AcmeService{}).Delete(AcmeDeletePayload{ID: record.Id}); err == nil {
-		t.Fatalf("expected delete to fail while certificate is used by reverse proxy")
-	} else if !strings.Contains(err.Error(), "反向代理使用中") {
-		t.Fatalf("expected reverse proxy delete error, got %v", err)
+	if _, err := (&AcmeService{}).Delete(AcmeDeletePayload{ID: record.Id}); err != nil {
+		t.Fatalf("delete while reverse proxy is bound failed: %v", err)
+	}
+	if err := db.Where("id = ?", rule.Id).First(rule).Error; err != nil {
+		t.Fatalf("reload reverse proxy rule failed: %v", err)
+	}
+	if rule.CertificateRecordID != 0 || rule.CertificateRecordList != "" {
+		t.Fatalf("expected reverse proxy binding cleared: %#v", rule)
 	}
 }
 
-func TestCertificateListBlocksDeleteWhenDisabledReverseProxyUsesLegacyCertificateField(t *testing.T) {
+func TestCertificateListReportsDisabledReverseProxyLegacyCertificateField(t *testing.T) {
 	db := setupMihomoSyncTestDB(t, "cert-reverse-proxy-legacy-usage.db")
 	record := upsertTestCertificateRecord(t, "reverse-proxy-legacy.example.com")
 
@@ -62,8 +66,8 @@ func TestCertificateListBlocksDeleteWhenDisabledReverseProxyUsesLegacyCertificat
 		t.Fatalf("list certificates failed: %v", err)
 	}
 	view := findCertificateRecordView(t, views, record.Id)
-	if !view.DeleteBlocked {
-		t.Fatalf("expected disabled reverse proxy rule to block delete, got %#v", view)
+	if view.DeleteBlocked {
+		t.Fatalf("expected disabled reverse proxy usage to be informational only, got %#v", view)
 	}
 	if !strings.Contains(view.UsageLabel, "rp-disabled-legacy") {
 		t.Fatalf("expected usage label to include disabled reverse proxy rule, got %q", view.UsageLabel)

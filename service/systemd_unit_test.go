@@ -14,6 +14,7 @@ func TestBuildSingboxSystemdServiceContent_UsesSystemdSafeExecSyntax(t *testing.
 	content := buildSingboxSystemdServiceContent(controlPath, binPath, configPath, workDir)
 
 	expectedLines := []string{
+		`# kwor-owner:v1 resource=core-singbox`,
 		`ExecStartPre=/opt/kwor/bin/kwor\x20ctl materialize-core-config singbox`,
 		`ExecStart=/opt/kwor/core/singbox/sing-box run -c /opt/kwor/Promanager\x20data/core/singbox/config.json`,
 		`ExecStopPost=/opt/kwor/bin/kwor\x20ctl cleanup-core-config singbox`,
@@ -48,6 +49,7 @@ func TestBuildMihomoSystemdServiceContent_UsesSystemdSafeExecSyntax(t *testing.T
 	content := buildMihomoSystemdServiceContent(controlPath, binPath, configPath, workDir)
 
 	expectedLines := []string{
+		`# kwor-owner:v1 resource=core-mihomo`,
 		`Environment=XDG_CONFIG_HOME=/opt/kwor/Promanager\x20data/core/mihomo/.config`,
 		`Environment=XDG_CACHE_HOME=/opt/kwor/Promanager\x20data/core/mihomo/.cache`,
 		`ExecStartPre=/opt/kwor/bin/kwor\x20ctl materialize-core-config mihomo`,

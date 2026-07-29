@@ -436,3 +436,23 @@ func TestLinkGenerator_HysteriaUsesClientOutJsonBandwidthParams(t *testing.T) {
 		t.Fatalf("expected client bandwidth params from out_json, got %q", links[0])
 	}
 }
+
+func TestLinkGenerator_MixedIsExcludedFromSubscriptions(t *testing.T) {
+	clientConfig := json.RawMessage(`{
+  "mixed": {"username": "mixed-user", "password": "mixed-secret"},
+  "socks": {"username": "wrong-socks", "password": "wrong-socks-pass"},
+  "http": {"username": "wrong-http", "password": "wrong-http-pass"}
+}`)
+	inbound := &model.Inbound{
+		Type: "mixed",
+		Tag:  "mixed-in",
+		Addrs: json.RawMessage(`[
+  {"server": "example.com", "server_port": 1080, "remark": " mixed"}
+]`),
+	}
+
+	links := LinkGenerator(clientConfig, inbound, "ignored.example.com")
+	if len(links) != 0 {
+		t.Fatalf("mixed listener must not generate subscription links, got %#v", links)
+	}
+}

@@ -1,7 +1,7 @@
 package service
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,7 +16,118 @@ import (
 	"time"
 
 	"github.com/alireza0/s-ui/logger"
+	"golang.org/x/sys/cpu"
 )
+
+type MihomoCoreDownloadTarget struct {
+	OS         string `json:"os"`
+	Arch       string `json:"arch"`
+	Amd64Level string `json:"amd64Level"`
+}
+
+type MihomoCoreInfo struct {
+	LocalVersion       string                       `json:"localVersion"`
+	Installed          bool                         `json:"installed"`
+	Compatible         bool                         `json:"compatible"`
+	Running            bool                         `json:"running"`
+	VersionInfo        string                       `json:"versionInfo"`
+	Platform           string                       `json:"platform"`
+	RuntimeMode        string                       `json:"runtimeMode,omitempty"`
+	InstalledTarget    MihomoCoreDownloadTarget     `json:"installedTarget,omitempty"`
+	DownloadPreference MihomoCoreDownloadPreference `json:"downloadPreference"`
+}
+
+type MihomoCoreUpdateInfo struct {
+	Enabled       bool   `json:"enabled"`
+	IntervalHours int    `json:"intervalHours"`
+	LastCheckedAt int64  `json:"lastCheckedAt"`
+	LatestStable  string `json:"latestStable"`
+	LatestAlpha   string `json:"latestAlpha"`
+	PendingStable string `json:"pendingStable"`
+	PendingAlpha  string `json:"pendingAlpha"`
+	HasUpdate     bool   `json:"hasUpdate"`
+	UpdateCount   int    `json:"updateCount"`
+}
+
+type MihomoCoreVersionItem struct {
+	TagName     string `json:"tag_name"`
+	Name        string `json:"name"`
+	Prerelease  bool   `json:"prerelease"`
+	PublishedAt string `json:"published_at"`
+	AssetName   string `json:"asset_name,omitempty"`
+	AssetSize   int64  `json:"asset_size,omitempty"`
+}
+
+type MihomoCoreVersionListResponse struct {
+	Versions []MihomoCoreVersionItem `json:"versions"`
+	Page     int                     `json:"page,omitempty"`
+	PerPage  int                     `json:"per_page,omitempty"`
+	Offset   int                     `json:"offset,omitempty"`
+	Limit    int                     `json:"limit,omitempty"`
+	HasMore  bool                    `json:"has_more"`
+}
+
+type mihomoCoreVersionCacheEntry struct {
+	expiresAt time.Time
+	response  MihomoCoreVersionListResponse
+}
+
+var mihomoCoreVersionCache = struct {
+	sync.Mutex
+	items map[string]mihomoCoreVersionCacheEntry
+}{
+	items: make(map[string]mihomoCoreVersionCacheEntry),
+}
+
+func cleanupMihomoCoreVersionCacheLocked(now time.Time) {
+	for key, entry := range mihomoCoreVersionCache.items {
+		if now.After(entry.expiresAt) {
+			delete(mihomoCoreVersionCache.items, key)
+		}
+	}
+}
+
+func cloneMihomoCoreVersionListResponse(response *MihomoCoreVersionListResponse) *MihomoCoreVersionListResponse {
+	if response == nil {
+		return nil
+	}
+	cloned := *response
+	if response.Versions != nil {
+		cloned.Versions = append([]MihomoCoreVersionItem(nil), response.Versions...)
+	}
+	return &cloned
+}
+
+func getMihomoCoreVersionCache(key string) (*MihomoCoreVersionListResponse, bool) {
+	now := time.Now()
+	mihomoCoreVersionCache.Lock()
+	defer mihomoCoreVersionCache.Unlock()
+	cleanupMihomoCoreVersionCacheLocked(now)
+
+	entry, ok := mihomoCoreVersionCache.items[key]
+	if !ok {
+		return nil, false
+	}
+	if now.After(entry.expiresAt) {
+		delete(mihomoCoreVersionCache.items, key)
+		return nil, false
+	}
+	return cloneMihomoCoreVersionListResponse(&entry.response), true
+}
+
+func setMihomoCoreVersionCache(key string, response *MihomoCoreVersionListResponse) {
+	if response == nil {
+		return
+	}
+	now := time.Now()
+	mihomoCoreVersionCache.Lock()
+	defer mihomoCoreVersionCache.Unlock()
+	cleanupMihomoCoreVersionCacheLocked(now)
+	mihomoCoreVersionCache.items[key] = mihomoCoreVersionCacheEntry{
+		expiresAt: now.Add(coreVersionCacheTTL),
+		response:  *cloneMihomoCoreVersionListResponse(response),
+	}
+}
 
 type MihomoCoreManagerService struct {
 	mu        sync.Mutex
@@ -54,6 +164,7 @@ type mihomoLocalVersionCacheEntry struct {
 	expiresAt   time.Time
 	binModTime  time.Time
 	binSize     int64
+	binMode     os.FileMode
 	version     string
 	versionInfo string
 }
@@ -65,7 +176,71 @@ var mihomoLocalVersionCache = struct {
 	items: make(map[string]mihomoLocalVersionCacheEntry),
 }
 
-func getMihomoLocalVersionCache(binPath string, binModTime time.Time, binSize int64) (string, string, bool) {
+func normalizeMihomoAMD64Level(level string) string {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "v1":
+		return "v1"
+	case "v2":
+		return "v2"
+	case "v3":
+		return "v3"
+	default:
+		return ""
+	}
+}
+
+func inferMihomoHostAMD64Level() string {
+	if GetSystemPlatformArchitecture() != "amd64" {
+		return ""
+	}
+	if !(cpu.X86.HasCX16 &&
+		cpu.X86.HasSSE3 &&
+		cpu.X86.HasSSSE3 &&
+		cpu.X86.HasSSE41 &&
+		cpu.X86.HasSSE42 &&
+		cpu.X86.HasPOPCNT) {
+		return "v1"
+	}
+	if cpu.X86.HasAVX &&
+		cpu.X86.HasAVX2 &&
+		cpu.X86.HasBMI1 &&
+		cpu.X86.HasBMI2 &&
+		cpu.X86.HasFMA {
+		return "v3"
+	}
+	return "v2"
+}
+
+func hasMihomoCoreDownloadTargetFilter(target MihomoCoreDownloadTarget) bool {
+	return strings.TrimSpace(target.OS) != "" ||
+		strings.TrimSpace(target.Arch) != "" ||
+		strings.TrimSpace(target.Amd64Level) != ""
+}
+
+func mihomoCoreVersionCacheKey(repo string, channel string, offset int, limit int, target MihomoCoreDownloadTarget, filterTarget bool) string {
+	if !filterTarget {
+		return fmt.Sprintf("%s|%s|%d|%d|all", repo, channel, offset, limit)
+	}
+	return fmt.Sprintf(
+		"%s|%s|%d|%d|%s|%s|%s",
+		repo,
+		channel,
+		offset,
+		limit,
+		target.OS,
+		target.Arch,
+		target.Amd64Level,
+	)
+}
+
+func describeMihomoCoreDownloadTarget(target MihomoCoreDownloadTarget) string {
+	if target.Arch == "amd64" && target.Amd64Level != "" {
+		return fmt.Sprintf("%s/%s (%s)", target.OS, target.Arch, target.Amd64Level)
+	}
+	return fmt.Sprintf("%s/%s", target.OS, target.Arch)
+}
+
+func getMihomoLocalVersionCache(binPath string, binModTime time.Time, binSize int64, binMode os.FileMode) (string, string, bool) {
 	now := time.Now()
 	mihomoLocalVersionCache.Lock()
 	defer mihomoLocalVersionCache.Unlock()
@@ -78,14 +253,14 @@ func getMihomoLocalVersionCache(binPath string, binModTime time.Time, binSize in
 		delete(mihomoLocalVersionCache.items, binPath)
 		return "", "", false
 	}
-	if !entry.binModTime.Equal(binModTime) || entry.binSize != binSize {
+	if !entry.binModTime.Equal(binModTime) || entry.binSize != binSize || entry.binMode != binMode {
 		delete(mihomoLocalVersionCache.items, binPath)
 		return "", "", false
 	}
 	return entry.version, entry.versionInfo, true
 }
 
-func setMihomoLocalVersionCache(binPath string, binModTime time.Time, binSize int64, version string, versionInfo string) {
+func setMihomoLocalVersionCache(binPath string, binModTime time.Time, binSize int64, binMode os.FileMode, version string, versionInfo string) {
 	mihomoLocalVersionCache.Lock()
 	defer mihomoLocalVersionCache.Unlock()
 
@@ -93,6 +268,7 @@ func setMihomoLocalVersionCache(binPath string, binModTime time.Time, binSize in
 		expiresAt:   time.Now().Add(coreLocalVersionCacheTTL),
 		binModTime:  binModTime,
 		binSize:     binSize,
+		binMode:     binMode,
 		version:     version,
 		versionInfo: versionInfo,
 	}
@@ -113,7 +289,7 @@ func (s *MihomoCoreManagerService) getCoreDir() string {
 }
 
 func (s *MihomoCoreManagerService) getCoreBinName() string {
-	if runtime.GOOS == "windows" {
+	if IsSystemPlatformWindows() {
 		return "mihomo.exe"
 	}
 	return "mihomo"
@@ -132,7 +308,7 @@ func (s *MihomoCoreManagerService) regenerateRuntimeConfig() error {
 }
 
 func (s *MihomoCoreManagerService) getPlatformInfo() string {
-	return fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH)
+	return fmt.Sprintf("%s/%s", GetSystemPlatformOS(), GetSystemPlatformArchitecture())
 }
 
 func getMihomoServiceFilePath() string {
@@ -145,9 +321,7 @@ func (s *MihomoCoreManagerService) getLocalVersion(binPath string) (string, stri
 		{"version"},
 	}
 	for _, args := range commands {
-		cmd := exec.Command(binPath, args...)
-		cmd.Dir = filepath.Dir(binPath)
-		output, err := cmd.CombinedOutput()
+		output, err := runCommandOutputInDirWithTimeout(coreVersionCommandTimeout, filepath.Dir(binPath), binPath, args...)
 		if err != nil {
 			continue
 		}
@@ -163,12 +337,36 @@ func (s *MihomoCoreManagerService) getLocalVersion(binPath string) (string, stri
 	return "", ""
 }
 
-func (s *MihomoCoreManagerService) GetCoreStatus() (*CoreInfo, error) {
+func (s *MihomoCoreManagerService) getCachedLocalVersion(binPath string, statInfo os.FileInfo, forceRefresh bool) (string, string) {
+	if forceRefresh {
+		clearMihomoLocalVersionCache(binPath)
+	}
+	binMode := statInfo.Mode().Perm()
+	if version, versionInfo, ok := getMihomoLocalVersionCache(binPath, statInfo.ModTime(), statInfo.Size(), binMode); ok {
+		return version, versionInfo
+	}
+	version, versionInfo := s.getLocalVersion(binPath)
+	setMihomoLocalVersionCache(binPath, statInfo.ModTime(), statInfo.Size(), binMode, version, versionInfo)
+	return version, versionInfo
+}
+
+func inferMihomoInstalledAMD64Level(binPath string, versionInfo string) string {
+	return inferMihomoAMD64Level(inferMihomoTargetFromGoBuildInfo(binPath).Amd64Level, versionInfo)
+}
+
+func inferMihomoAMD64Level(goBuildLevel string, versionInfo string) string {
+	if level := normalizeMihomoAMD64Level(goBuildLevel); level != "" {
+		return level
+	}
+	return inferMihomoAmd64LevelFromVersionInfo(versionInfo)
+}
+
+func (s *MihomoCoreManagerService) GetCoreStatus() (*MihomoCoreInfo, error) {
 	if err := EnsureManagedCoreLayout(); err != nil {
 		return nil, err
 	}
 
-	info := &CoreInfo{
+	info := &MihomoCoreInfo{
 		Platform: s.getPlatformInfo(),
 	}
 	info.RuntimeMode = string(getManagedCoreRuntimeMode())
@@ -179,26 +377,36 @@ func (s *MihomoCoreManagerService) GetCoreStatus() (*CoreInfo, error) {
 	}
 
 	binPath := s.getCoreBinPath()
-	if statInfo, err := os.Stat(binPath); err == nil {
-		if version, versionInfo, ok := getMihomoLocalVersionCache(binPath, statInfo.ModTime(), statInfo.Size()); ok {
-			info.LocalVersion = version
-			info.VersionInfo = versionInfo
-		} else {
-			version, versionInfo := s.getLocalVersion(binPath)
-			setMihomoLocalVersionCache(binPath, statInfo.ModTime(), statInfo.Size(), version, versionInfo)
-			info.LocalVersion = version
-			info.VersionInfo = versionInfo
+	if !IsSystemPlatformWindows() {
+		inspection := inspectManagedLinuxCoreBinary(binPath, "mihomo", func(statInfo os.FileInfo, forceRefresh bool) (string, string) {
+			return s.getCachedLocalVersion(binPath, statInfo, forceRefresh)
+		})
+		info.Installed = inspection.Installed
+		info.Compatible = inspection.Compatible
+		info.LocalVersion = inspection.Version
+		info.VersionInfo = inspection.VersionInfo
+		if inspection.Architecture != "" {
+			installedTarget := MihomoCoreDownloadTarget{OS: "linux", Arch: inspection.Architecture}
+			if installedTarget.Arch == "amd64" {
+				installedTarget.Amd64Level = inferMihomoInstalledAMD64Level(binPath, inspection.VersionInfo)
+			}
+			info.InstalledTarget = installedTarget
 		}
-		installedTarget := inferTargetFromGoBuildInfo(binPath)
+		if !inspection.Installed {
+			clearMihomoLocalVersionCache(binPath)
+		}
+	} else if statInfo, err := os.Stat(binPath); err == nil {
+		info.Installed = true
+		info.LocalVersion, info.VersionInfo = s.getCachedLocalVersion(binPath, statInfo, false)
+		info.Compatible = info.LocalVersion != "" && managedCoreVersionOutputMatches(info.VersionInfo, "mihomo")
+		installedTarget := inferMihomoTargetFromGoBuildInfo(binPath)
 		if installedTarget.OS == "" && installedTarget.Arch == "" {
-			installedTarget = inferTargetFromPlatform(info.Platform)
+			installedTarget = inferMihomoTargetFromPlatform(info.Platform)
 		}
 		if installedTarget.Arch == "amd64" {
-			if level := inferMihomoAmd64LevelFromVersionInfo(info.VersionInfo); level != "" {
-				installedTarget.Amd64Level = level
-			}
+			installedTarget.Amd64Level = inferMihomoInstalledAMD64Level(binPath, info.VersionInfo)
 		}
-		info.InstalledTarget = mergeInstalledTargetWithPreference(installedTarget, info.DownloadPreference.Target)
+		info.InstalledTarget = mergeMihomoInstalledTargetWithPreference(installedTarget, info.DownloadPreference.Target)
 	} else {
 		clearMihomoLocalVersionCache(binPath)
 	}
@@ -208,10 +416,10 @@ func (s *MihomoCoreManagerService) GetCoreStatus() (*CoreInfo, error) {
 }
 
 func (s *MihomoCoreManagerService) fetchGitHubReleasePage(client *http.Client, apiPage int, perPage int) ([]GitHubRelease, error) {
-	return fetchGitHubReleasePageForRepo("MetaCubeX/mihomo", client, apiPage, perPage)
+	return fetchGitHubReleasePageForRepo("MetaCubeX/mihomo", client, apiPage, perPage, coreGitHubReleaseListMaxBytes)
 }
 
-func (s *MihomoCoreManagerService) GetRemoteVersionsPage(channel string, page int, perPage int) (*VersionListResponse, error) {
+func (s *MihomoCoreManagerService) GetRemoteVersionsPage(channel string, page int, perPage int) (*MihomoCoreVersionListResponse, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -219,10 +427,10 @@ func (s *MihomoCoreManagerService) GetRemoteVersionsPage(channel string, page in
 		perPage = 5
 	}
 	offset := (page - 1) * perPage
-	return s.GetRemoteVersionsWindow(channel, offset, perPage, CoreDownloadTarget{})
+	return s.GetRemoteVersionsWindow(channel, offset, perPage, MihomoCoreDownloadTarget{})
 }
 
-func pickMihomoAssetFromAssets(assets []GitHubAsset, target CoreDownloadTarget) (GitHubAsset, bool) {
+func pickMihomoAssetFromAssets(assets []GitHubAsset, target MihomoCoreDownloadTarget) (GitHubAsset, bool) {
 	normalizedTarget := (&MihomoCoreManagerService{}).normalizeDownloadTarget(target)
 	preferredExts := []string{".gz", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".zip"}
 	if normalizedTarget.OS == "windows" {
@@ -255,23 +463,23 @@ func pickMihomoAssetFromAssets(assets []GitHubAsset, target CoreDownloadTarget) 
 	return candidates[0].asset, true
 }
 
-func (s *MihomoCoreManagerService) GetRemoteVersionsWindow(channel string, offset int, limit int, target CoreDownloadTarget) (*VersionListResponse, error) {
+func (s *MihomoCoreManagerService) GetRemoteVersionsWindow(channel string, offset int, limit int, target MihomoCoreDownloadTarget) (*MihomoCoreVersionListResponse, error) {
 	channel = "stable"
 	offset, limit = normalizeCoreVersionWindow(offset, limit)
-	filterTarget := hasCoreDownloadTargetFilter(target)
+	filterTarget := hasMihomoCoreDownloadTargetFilter(target)
 	if filterTarget {
 		target = s.normalizeDownloadTarget(target)
 	}
 
-	cacheKey := coreVersionCacheKey("MetaCubeX/mihomo", channel, offset, limit, target, filterTarget)
-	if cached, ok := getCoreVersionCache(cacheKey); ok {
+	cacheKey := mihomoCoreVersionCacheKey("MetaCubeX/mihomo", channel, offset, limit, target, filterTarget)
+	if cached, ok := getMihomoCoreVersionCache(cacheKey); ok {
 		return cached, nil
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	seenTags := make(map[string]struct{})
-	result := &VersionListResponse{
-		Versions: make([]VersionItem, 0, limit+1),
+	result := &MihomoCoreVersionListResponse{
+		Versions: make([]MihomoCoreVersionItem, 0, limit+1),
 		Offset:   offset,
 		Limit:    limit,
 		PerPage:  limit,
@@ -315,7 +523,7 @@ func (s *MihomoCoreManagerService) GetRemoteVersionsWindow(channel string, offse
 			}
 			matchedCount++
 
-			result.Versions = append(result.Versions, VersionItem{
+			result.Versions = append(result.Versions, MihomoCoreVersionItem{
 				TagName:     r.TagName,
 				Name:        r.Name,
 				Prerelease:  r.Prerelease,
@@ -337,12 +545,12 @@ func (s *MihomoCoreManagerService) GetRemoteVersionsWindow(channel string, offse
 		result.HasMore = true
 		result.Versions = result.Versions[:limit]
 	}
-	setCoreVersionCache(cacheKey, result)
-	return cloneVersionListResponse(result), nil
+	setMihomoCoreVersionCache(cacheKey, result)
+	return cloneMihomoCoreVersionListResponse(result), nil
 }
 
 func (s *MihomoCoreManagerService) getArchName() string {
-	switch runtime.GOARCH {
+	switch GetSystemPlatformArchitecture() {
 	case "amd64":
 		return "amd64"
 	case "386":
@@ -352,7 +560,7 @@ func (s *MihomoCoreManagerService) getArchName() string {
 	case "arm":
 		return "armv7"
 	default:
-		return runtime.GOARCH
+		return GetSystemPlatformArchitecture()
 	}
 }
 
@@ -453,7 +661,7 @@ func inferMihomoAmd64LevelFromVersionInfo(versionInfo string) string {
 	return ""
 }
 
-func (s *MihomoCoreManagerService) scoreAssetName(name string, preferredExts []string, target CoreDownloadTarget) int {
+func (s *MihomoCoreManagerService) scoreAssetName(name string, preferredExts []string, target MihomoCoreDownloadTarget) int {
 	lower := strings.ToLower(name)
 	tokens := splitMihomoAssetTokens(lower)
 
@@ -485,7 +693,7 @@ func (s *MihomoCoreManagerService) scoreAssetName(name string, preferredExts []s
 	}
 
 	if target.Arch == "amd64" {
-		level := normalizeAmd64Level(target.Amd64Level)
+		level := normalizeMihomoAMD64Level(target.Amd64Level)
 		if level == "" {
 			level = "v3"
 		}
@@ -532,21 +740,21 @@ func (s *MihomoCoreManagerService) scoreAssetName(name string, preferredExts []s
 	return score
 }
 
-func (s *MihomoCoreManagerService) normalizeDownloadTarget(target CoreDownloadTarget) CoreDownloadTarget {
-	normalized := CoreDownloadTarget{
+func (s *MihomoCoreManagerService) normalizeDownloadTarget(target MihomoCoreDownloadTarget) MihomoCoreDownloadTarget {
+	normalized := MihomoCoreDownloadTarget{
 		OS:         strings.ToLower(strings.TrimSpace(target.OS)),
 		Arch:       strings.ToLower(strings.TrimSpace(target.Arch)),
-		Amd64Level: normalizeAmd64Level(target.Amd64Level),
+		Amd64Level: normalizeMihomoAMD64Level(target.Amd64Level),
 	}
 	if normalized.OS == "" {
-		normalized.OS = runtime.GOOS
+		normalized.OS = GetSystemPlatformOS()
 	}
 	if normalized.Arch == "" {
 		normalized.Arch = s.getArchName()
 	}
 	if normalized.Arch == "amd64" {
 		if normalized.Amd64Level == "" {
-			normalized.Amd64Level = inferHostAMD64Level()
+			normalized.Amd64Level = inferMihomoHostAMD64Level()
 		}
 	} else {
 		normalized.Amd64Level = ""
@@ -554,7 +762,7 @@ func (s *MihomoCoreManagerService) normalizeDownloadTarget(target CoreDownloadTa
 	return normalized
 }
 
-func (s *MihomoCoreManagerService) pickDownloadAsset(release *GitHubRelease, target CoreDownloadTarget) (string, error) {
+func (s *MihomoCoreManagerService) pickDownloadAsset(release *GitHubRelease, target MihomoCoreDownloadTarget) (string, error) {
 	if release == nil {
 		return "", fmt.Errorf("release is nil")
 	}
@@ -562,14 +770,18 @@ func (s *MihomoCoreManagerService) pickDownloadAsset(release *GitHubRelease, tar
 	if asset, ok := pickMihomoAssetFromAssets(release.Assets, target); ok {
 		return asset.BrowserDownloadURL, nil
 	}
-	return "", fmt.Errorf("no suitable mihomo asset found for %s", describeCoreDownloadTarget(target))
+	return "", fmt.Errorf("no suitable mihomo asset found for %s", describeMihomoCoreDownloadTarget(target))
 }
 
-func (s *MihomoCoreManagerService) getDownloadAsset(version string, target CoreDownloadTarget) (string, error) {
+func (s *MihomoCoreManagerService) getDownloadAsset(version string, target MihomoCoreDownloadTarget) (string, error) {
+	return s.getDownloadAssetContext(context.Background(), version, target)
+}
+
+func (s *MihomoCoreManagerService) getDownloadAssetContext(ctx context.Context, version string, target MihomoCoreDownloadTarget) (string, error) {
 	apiURL := fmt.Sprintf("https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/%s", version)
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequest("GET", apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -586,7 +798,7 @@ func (s *MihomoCoreManagerService) getDownloadAsset(version string, target CoreD
 	}
 
 	var release GitHubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	if err := unmarshalBoundedHTTPResponseJSON(resp.Body, coreGitHubResponseMaxBytes, &release); err != nil {
 		return "", fmt.Errorf("failed to parse GitHub release: %v", err)
 	}
 
@@ -612,7 +824,7 @@ func (s *MihomoCoreManagerService) installCoreFromArchiveFile(archivePath, coreD
 		err = extractCoreGzipBinary(archivePath, coreDir, binName)
 	default:
 		if copyErr := copyCoreFile(archivePath, binPath); copyErr == nil {
-			if runtime.GOOS != "windows" {
+			if !IsSystemPlatformWindows() {
 				_ = os.Chmod(binPath, 0o755)
 			}
 			if s.validateCoreBinary(binPath) {
@@ -626,7 +838,7 @@ func (s *MihomoCoreManagerService) installCoreFromArchiveFile(archivePath, coreD
 	if err != nil {
 		return err
 	}
-	if runtime.GOOS != "windows" {
+	if !IsSystemPlatformWindows() {
 		_ = os.Chmod(binPath, 0o755)
 	}
 	if _, statErr := os.Stat(binPath); statErr != nil {
@@ -635,7 +847,18 @@ func (s *MihomoCoreManagerService) installCoreFromArchiveFile(archivePath, coreD
 	return nil
 }
 
-func (s *MihomoCoreManagerService) DownloadCore(version string, target CoreDownloadTarget, requestedSessionID string) (string, error) {
+func (s *MihomoCoreManagerService) DownloadCore(version string, target MihomoCoreDownloadTarget, requestedSessionID string) (string, error) {
+	operationContext, operation, err := BeginKworManagedOperation("mihomo-core-download")
+	if err != nil {
+		return "", err
+	}
+	defer operation.Done()
+	lifecycleLock, err := AcquireKworLifecycleLock()
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = lifecycleLock.Release() }()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -676,18 +899,22 @@ func (s *MihomoCoreManagerService) DownloadCore(version string, target CoreDownl
 	}
 
 	normalizedTarget := s.normalizeDownloadTarget(target)
-	if strings.TrimSpace(target.OS) != "" && normalizedTarget.OS != runtime.GOOS {
-		err := fmt.Errorf("requested mihomo target %s cannot be installed on runtime %s/%s", describeCoreDownloadTarget(normalizedTarget), runtime.GOOS, runtime.GOARCH)
+	if strings.TrimSpace(target.OS) != "" && normalizedTarget.OS != GetSystemPlatformOS() {
+		err := fmt.Errorf("requested mihomo target %s cannot be installed on runtime %s/%s", describeMihomoCoreDownloadTarget(normalizedTarget), GetSystemPlatformOS(), GetSystemPlatformArchitecture())
 		failProgress(coreDownloadStageDownloading, err)
 		return "", err
 	}
 	if strings.TrimSpace(target.Arch) != "" && normalizedTarget.Arch != s.getArchName() {
-		err := fmt.Errorf("requested mihomo target %s does not match runtime architecture %s", describeCoreDownloadTarget(normalizedTarget), s.getArchName())
+		err := fmt.Errorf("requested mihomo target %s does not match runtime architecture %s", describeMihomoCoreDownloadTarget(normalizedTarget), s.getArchName())
 		failProgress(coreDownloadStageDownloading, err)
 		return "", err
 	}
 
-	downloadURL, err := s.getDownloadAsset(version, normalizedTarget)
+	if err := operationContext.Err(); err != nil {
+		failProgress(coreDownloadStageDownloading, err)
+		return "", err
+	}
+	downloadURL, err := s.getDownloadAssetContext(operationContext, version, normalizedTarget)
 	if err != nil {
 		failProgress(coreDownloadStageDownloading, err)
 		return "", err
@@ -695,7 +922,13 @@ func (s *MihomoCoreManagerService) DownloadCore(version string, target CoreDownl
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageDownloading)
 
 	client := &http.Client{Timeout: 600 * time.Second}
-	resp, err := client.Get(downloadURL)
+	req, err := http.NewRequestWithContext(operationContext, http.MethodGet, downloadURL, nil)
+	if err != nil {
+		err = fmt.Errorf("create download request failed: %v", err)
+		failProgress(coreDownloadStageDownloading, err)
+		return "", err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		err = fmt.Errorf("download failed: %v", err)
 		failProgress(coreDownloadStageDownloading, err)
@@ -758,7 +991,7 @@ func (s *MihomoCoreManagerService) DownloadCore(version string, target CoreDownl
 	stagedBinPath := filepath.Join(stageDir, binName)
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageValidating)
 	if !s.validateCoreBinary(stagedBinPath) {
-		err = fmt.Errorf("downloaded mihomo binary is not executable on current runtime %s/%s", runtime.GOOS, runtime.GOARCH)
+		err = fmt.Errorf("downloaded mihomo binary is not executable on current runtime %s/%s", GetSystemPlatformOS(), GetSystemPlatformArchitecture())
 		failProgress(coreDownloadStageValidating, err)
 		return "", err
 	}
@@ -829,6 +1062,17 @@ func (s *MihomoCoreManagerService) DownloadCore(version string, target CoreDownl
 }
 
 func (s *MihomoCoreManagerService) DownloadCoreFromURL(downloadURL string, requestedSessionID string) (string, error) {
+	operationContext, operation, err := BeginKworManagedOperation("mihomo-core-download")
+	if err != nil {
+		return "", err
+	}
+	defer operation.Done()
+	lifecycleLock, err := AcquireKworLifecycleLock()
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = lifecycleLock.Release() }()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -877,7 +1121,7 @@ func (s *MihomoCoreManagerService) DownloadCoreFromURL(downloadURL string, reque
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageDownloading)
 
 	client := &http.Client{Timeout: 600 * time.Second}
-	req, err := http.NewRequest("GET", downloadURL, nil)
+	req, err := http.NewRequestWithContext(operationContext, "GET", downloadURL, nil)
 	if err != nil {
 		err = fmt.Errorf("create request failed: %v", err)
 		failProgress(coreDownloadStageDownloading, err)
@@ -948,7 +1192,7 @@ func (s *MihomoCoreManagerService) DownloadCoreFromURL(downloadURL string, reque
 	stagedBinPath := filepath.Join(stageDir, binName)
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageValidating)
 	if !s.validateCoreBinary(stagedBinPath) {
-		err = fmt.Errorf("downloaded mihomo binary is not executable on current runtime %s/%s", runtime.GOOS, runtime.GOARCH)
+		err = fmt.Errorf("downloaded mihomo binary is not executable on current runtime %s/%s", GetSystemPlatformOS(), GetSystemPlatformArchitecture())
 		failProgress(coreDownloadStageValidating, err)
 		return "", err
 	}
@@ -1029,12 +1273,31 @@ func (s *MihomoCoreManagerService) extractCoreByExternalTool(archivePath, destDi
 }
 
 func (s *MihomoCoreManagerService) validateCoreBinary(binPath string) bool {
-	_, output := s.getLocalVersion(binPath)
-	return strings.Contains(strings.ToLower(output), "mihomo")
+	if !IsSystemPlatformWindows() {
+		inspection := inspectManagedLinuxCoreBinary(binPath, "mihomo", func(statInfo os.FileInfo, forceRefresh bool) (string, string) {
+			return s.getCachedLocalVersion(binPath, statInfo, forceRefresh)
+		})
+		return inspection.Compatible
+	}
+
+	version, output := s.getLocalVersion(binPath)
+	return version != "" && managedCoreVersionOutputMatches(output, "mihomo")
 }
 
-func (s *MihomoCoreManagerService) StartCore() error {
+func (s *MihomoCoreManagerService) StartCore() (err error) {
+	lifecycleLock, lockErr := AcquireKworLifecycleLock()
+	if lockErr != nil {
+		return lockErr
+	}
+	defer func() { _ = lifecycleLock.Release() }()
+
 	s.mu.Lock()
+	defer func() {
+		if err == nil {
+			SyncPortForwardNftablesAfterCoreRuntimeReady()
+			notifyCertificateCoreLoadedLatestConfig(certificateCoreKindMihomo)
+		}
+	}()
 	defer s.mu.Unlock()
 
 	if err := EnsureManagedCoreLayout(); err != nil {
@@ -1050,7 +1313,7 @@ func (s *MihomoCoreManagerService) StartCore() error {
 		return fmt.Errorf("core file does not exist: %s", binPath)
 	}
 	if !s.validateCoreBinary(binPath) {
-		return fmt.Errorf("core binary is not compatible with current runtime %s/%s", runtime.GOOS, runtime.GOARCH)
+		return fmt.Errorf("core binary is not compatible with current runtime %s/%s", GetSystemPlatformOS(), GetSystemPlatformArchitecture())
 	}
 
 	if err := s.regenerateRuntimeConfig(); err != nil {
@@ -1071,7 +1334,11 @@ func (s *MihomoCoreManagerService) StartCore() error {
 
 	coreDir := s.getCoreDir()
 	absCoreDir, _ := filepath.Abs(coreDir)
-	if runtime.GOOS == "windows" {
+	if err := RegisterManagedCoreHostOwnership("mihomo", binPath, mihomoSystemdName); err != nil {
+		DiscardMaterializedManagedRuntimeCoreFile(configPath)
+		return fmt.Errorf("record mihomo ownership before start: %w", err)
+	}
+	if IsSystemPlatformWindows() {
 		err = s.startCoreWindows(absCoreDir)
 	} else {
 		err = s.startCoreLinux(absCoreDir)
@@ -1080,7 +1347,7 @@ func (s *MihomoCoreManagerService) StartCore() error {
 		DiscardMaterializedManagedRuntimeCoreFile(configPath)
 		return err
 	}
-	if runtime.GOOS == "linux" {
+	if IsSystemPlatformLinux() {
 		if markerErr := markManagedCoreShouldRun("mihomo"); markerErr != nil {
 			logger.Warning("failed to persist mihomo runtime marker: ", markerErr)
 		}
@@ -1098,7 +1365,7 @@ func (s *MihomoCoreManagerService) startCoreLocked() error {
 		return fmt.Errorf("core file does not exist: %s", binPath)
 	}
 	if !s.validateCoreBinary(binPath) {
-		return fmt.Errorf("core binary is not compatible with current runtime %s/%s", runtime.GOOS, runtime.GOARCH)
+		return fmt.Errorf("core binary is not compatible with current runtime %s/%s", GetSystemPlatformOS(), GetSystemPlatformArchitecture())
 	}
 
 	if err := s.regenerateRuntimeConfig(); err != nil {
@@ -1119,7 +1386,11 @@ func (s *MihomoCoreManagerService) startCoreLocked() error {
 
 	coreDir := s.getCoreDir()
 	absCoreDir, _ := filepath.Abs(coreDir)
-	if runtime.GOOS == "windows" {
+	if err := RegisterManagedCoreHostOwnership("mihomo", binPath, mihomoSystemdName); err != nil {
+		DiscardMaterializedManagedRuntimeCoreFile(configPath)
+		return fmt.Errorf("record mihomo ownership before start: %w", err)
+	}
+	if IsSystemPlatformWindows() {
 		err = s.startCoreWindows(absCoreDir)
 	} else {
 		err = s.startCoreLinux(absCoreDir)
@@ -1128,7 +1399,7 @@ func (s *MihomoCoreManagerService) startCoreLocked() error {
 		DiscardMaterializedManagedRuntimeCoreFile(configPath)
 		return err
 	}
-	if runtime.GOOS == "linux" {
+	if IsSystemPlatformLinux() {
 		if markerErr := markManagedCoreShouldRun("mihomo"); markerErr != nil {
 			logger.Warning("failed to persist mihomo runtime marker: ", markerErr)
 		}
@@ -1137,10 +1408,16 @@ func (s *MihomoCoreManagerService) startCoreLocked() error {
 }
 
 func (s *MihomoCoreManagerService) StopCore() error {
+	lifecycleLock, err := AcquireKworLifecycleLock()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lifecycleLock.Release() }()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if runtime.GOOS == "linux" {
+	if IsSystemPlatformLinux() {
 		err := s.stopCoreLinuxFull()
 		if err == nil {
 			clearManagedCoreShouldRun("mihomo")
@@ -1151,6 +1428,12 @@ func (s *MihomoCoreManagerService) StopCore() error {
 }
 
 func (s *MihomoCoreManagerService) DeleteCore() error {
+	lifecycleLock, err := AcquireKworLifecycleLock()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lifecycleLock.Release() }()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1158,7 +1441,7 @@ func (s *MihomoCoreManagerService) DeleteCore() error {
 		return err
 	}
 
-	if runtime.GOOS == "linux" {
+	if IsSystemPlatformLinux() {
 		if err := s.stopCoreLinuxFull(); err != nil {
 			return err
 		}
@@ -1184,15 +1467,30 @@ func (s *MihomoCoreManagerService) DeleteCore() error {
 	return nil
 }
 
-func (s *MihomoCoreManagerService) RestartCore() error {
+func (s *MihomoCoreManagerService) RestartCore() (err error) {
+	lifecycleLock, lockErr := AcquireKworLifecycleLock()
+	if lockErr != nil {
+		return lockErr
+	}
+	defer func() { _ = lifecycleLock.Release() }()
+
 	s.mu.Lock()
+	defer func() {
+		if err == nil {
+			SyncPortForwardNftablesAfterCoreRuntimeReady()
+			notifyCertificateCoreLoadedLatestConfig(certificateCoreKindMihomo)
+		}
+	}()
 	defer s.mu.Unlock()
 
 	if err := EnsureManagedCoreLayout(); err != nil {
 		return err
 	}
+	if !s.validateCoreBinary(s.getCoreBinPath()) {
+		return fmt.Errorf("core binary is not compatible with current runtime %s/%s", GetSystemPlatformOS(), GetSystemPlatformArchitecture())
+	}
 
-	if runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime() && s.isMihomoSystemdActive() {
+	if IsSystemPlatformLinux() && !shouldUseDirectManagedCoreRuntime() && s.isMihomoSystemdActive() {
 		if err := s.regenerateRuntimeConfig(); err != nil {
 			return err
 		}
@@ -1214,8 +1512,7 @@ func (s *MihomoCoreManagerService) RestartCore() error {
 			DiscardMaterializedManagedRuntimeCoreFile(configPath)
 			return fmt.Errorf("refresh systemd service for mihomo failed: %v", err)
 		}
-		cmd := exec.Command("systemctl", "restart", mihomoSystemdName)
-		if err := cmd.Run(); err != nil {
+		if err := runSystemctlCommand("restart", mihomoSystemdName); err != nil {
 			DiscardMaterializedManagedRuntimeCoreFile(configPath)
 			return fmt.Errorf("systemd restart mihomo failed: %v", err)
 		}
@@ -1231,7 +1528,7 @@ func (s *MihomoCoreManagerService) RestartCore() error {
 	if err := s.startCoreLocked(); err != nil {
 		return err
 	}
-	if runtime.GOOS == "linux" {
+	if IsSystemPlatformLinux() {
 		if markerErr := markManagedCoreShouldRun("mihomo"); markerErr != nil {
 			logger.Warning("failed to persist mihomo runtime marker: ", markerErr)
 		}
@@ -1246,7 +1543,7 @@ func (s *MihomoCoreManagerService) IsRunning() bool {
 }
 
 func (s *MihomoCoreManagerService) isRunning() bool {
-	if runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime() {
+	if IsSystemPlatformLinux() && !shouldUseDirectManagedCoreRuntime() {
 		if s.isMihomoSystemdActive() {
 			s.isStarted = true
 			return true
@@ -1260,7 +1557,7 @@ func (s *MihomoCoreManagerService) isRunning() bool {
 		s.isStarted = false
 		s.coreCmd = nil
 	}
-	if runtime.GOOS == "linux" && shouldUseDirectManagedCoreRuntime() && isManagedCoreProcessRunningByBinaryPath(s.getCoreBinPath()) {
+	if IsSystemPlatformLinux() && shouldUseDirectManagedCoreRuntime() && isManagedCoreProcessRunningByBinaryPath(s.getCoreBinPath()) {
 		s.isStarted = true
 		return true
 	}
@@ -1268,8 +1565,7 @@ func (s *MihomoCoreManagerService) isRunning() bool {
 }
 
 func (s *MihomoCoreManagerService) isMihomoSystemdActive() bool {
-	cmd := exec.Command("systemctl", "is-active", "--quiet", mihomoSystemdName)
-	return cmd.Run() == nil
+	return systemctlUnitIsActive(mihomoSystemdName)
 }
 
 func (s *MihomoCoreManagerService) startCoreWindows(coreDir string) error {
@@ -1352,9 +1648,8 @@ func (s *MihomoCoreManagerService) startCoreLinux(coreDir string) error {
 		return err
 	}
 
-	_ = exec.Command("systemctl", "reset-failed", mihomoSystemdName).Run()
-	startCmd := exec.Command("systemctl", "start", mihomoSystemdName)
-	startOutput, startErr := startCmd.CombinedOutput()
+	_ = runSystemctlCommand("reset-failed", mihomoSystemdName)
+	startOutput, startErr := runSystemctlOutput("start", mihomoSystemdName)
 	if startErr != nil {
 		diagnostics := collectSystemdStartupDiagnostics(mihomoSystemdName, systemdCoreJournalTailLines)
 		message := buildSystemdActivationErrorMessage(
@@ -1413,9 +1708,8 @@ func (s *MihomoCoreManagerService) stopCoreLinuxFull() error {
 }
 
 func (s *MihomoCoreManagerService) stopCoreInternal() error {
-	if runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime() && s.isMihomoSystemdActive() {
-		cmd := exec.Command("systemctl", "stop", mihomoSystemdName)
-		if err := cmd.Run(); err == nil {
+	if IsSystemPlatformLinux() && !shouldUseDirectManagedCoreRuntime() && s.isMihomoSystemdActive() {
+		if err := runSystemctlCommand("stop", mihomoSystemdName); err == nil {
 			time.Sleep(300 * time.Millisecond)
 			if s.isMihomoSystemdActive() {
 				return fmt.Errorf("mihomo systemd service is still active after stop request")
@@ -1431,7 +1725,7 @@ func (s *MihomoCoreManagerService) stopCoreInternal() error {
 		}
 	}
 
-	if runtime.GOOS == "linux" && shouldUseDirectManagedCoreRuntime() {
+	if IsSystemPlatformLinux() && shouldUseDirectManagedCoreRuntime() {
 		if err := terminateManagedCoreProcessesByBinaryPath(s.getCoreBinPath(), 5*time.Second); err != nil {
 			return fmt.Errorf("failed to stop mihomo direct runtime process: %v", err)
 		}
@@ -1445,8 +1739,8 @@ func (s *MihomoCoreManagerService) stopCoreInternal() error {
 
 	if s.coreCmd != nil && s.coreCmd.Process != nil {
 		pid := s.coreCmd.Process.Pid
-		if runtime.GOOS == "windows" {
-			if err := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", pid)).Run(); err != nil {
+		if IsSystemPlatformWindows() {
+			if err := runCommandWithTimeout(systemCommandTimeout, "taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", pid)); err != nil {
 				return fmt.Errorf("failed to stop mihomo process %d: %v", pid, err)
 			}
 		} else {
@@ -1492,10 +1786,10 @@ func (s *MihomoCoreManagerService) removeSystemdServiceByName(serviceName string
 	if serviceName == "" {
 		return
 	}
-	useSystemctl := runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime()
+	useSystemctl := IsSystemPlatformLinux() && !shouldUseDirectManagedCoreRuntime()
 	if useSystemctl {
-		_ = exec.Command("systemctl", "stop", serviceName).Run()
-		_ = exec.Command("systemctl", "disable", serviceName).Run()
+		_ = runSystemctlCommand("stop", serviceName)
+		_ = runSystemctlCommand("disable", serviceName)
 	}
 
 	removed := false
@@ -1511,8 +1805,8 @@ func (s *MihomoCoreManagerService) removeSystemdServiceByName(serviceName string
 	}
 	if removed {
 		if useSystemctl {
-			_ = exec.Command("systemctl", "daemon-reload").Run()
-			_ = exec.Command("systemctl", "reset-failed").Run()
+			_ = runSystemctlCommand("daemon-reload")
+			_ = runSystemctlCommand("reset-failed")
 		}
 	}
 }
@@ -1522,20 +1816,34 @@ func (s *MihomoCoreManagerService) createMihomoSystemdService(binPath, configPat
 	serviceContent := buildMihomoSystemdServiceContent(controlPath, binPath, configPath, workDir)
 
 	servicePath := getMihomoServiceFilePath()
+	ownership, err := BeginSystemdHostOwnership("core-mihomo-systemd", mihomoSystemdName, []string{servicePath}, map[string]string{
+		"binary": binPath,
+		"config": configPath,
+	})
+	if err != nil {
+		return fmt.Errorf("record pending mihomo systemd ownership failed: %w", err)
+	}
 	if err := os.WriteFile(servicePath, []byte(serviceContent), 0o644); err != nil {
 		return fmt.Errorf("unable to write systemd service file %s: %v", servicePath, err)
 	}
 	if err := verifySystemdUnitFile(servicePath); err != nil {
 		return err
 	}
-	if err := exec.Command("systemctl", "daemon-reload").Run(); err != nil {
+	if err := runSystemctlCommand("daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload failed: %v", err)
+	}
+	if err := VerifyAndActivateHostResource(ownership.ID); err != nil {
+		return fmt.Errorf("activate mihomo systemd ownership failed: %w", err)
+	}
+	if err := RegisterManagedCoreHostOwnership("mihomo", binPath, mihomoSystemdName); err != nil {
+		return fmt.Errorf("record mihomo ownership failed: %w", err)
 	}
 	return nil
 }
 
 func buildMihomoSystemdServiceContent(controlPath, binPath, configPath, workDir string) string {
-	return fmt.Sprintf(`[Unit]
+	return fmt.Sprintf(`# kwor-owner:v1 resource=core-mihomo
+[Unit]
 Description=kwor mihomo service
 Documentation=https://wiki.metacubex.one
 After=network.target nss-lookup.target
@@ -1575,17 +1883,17 @@ func (s *MihomoCoreManagerService) removeMihomoSystemdService() {
 	if _, err := os.Stat(servicePath); os.IsNotExist(err) {
 		return
 	}
-	useSystemctl := runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime()
+	useSystemctl := IsSystemPlatformLinux() && !shouldUseDirectManagedCoreRuntime()
 	if useSystemctl {
-		_ = exec.Command("systemctl", "disable", mihomoSystemdName).Run()
+		_ = runSystemctlCommand("disable", mihomoSystemdName)
 	}
 	if err := os.Remove(servicePath); err != nil {
 		logger.Warning("unable to remove systemd service file: ", err)
 		return
 	}
 	if useSystemctl {
-		_ = exec.Command("systemctl", "daemon-reload").Run()
-		_ = exec.Command("systemctl", "reset-failed").Run()
+		_ = runSystemctlCommand("daemon-reload")
+		_ = runSystemctlCommand("reset-failed")
 	}
 }
 
@@ -1619,7 +1927,7 @@ func (s *MihomoCoreManagerService) getCoreAutoCheckSettings() (enabled bool, int
 	return enabled, intervalHours, lastCheckedAt, nil
 }
 
-func (s *MihomoCoreManagerService) buildCoreUpdateInfo() (*CoreUpdateInfo, error) {
+func (s *MihomoCoreManagerService) buildMihomoCoreUpdateInfo() (*MihomoCoreUpdateInfo, error) {
 	enabled, intervalHours, lastCheckedAt, err := s.getCoreAutoCheckSettings()
 	if err != nil {
 		return nil, err
@@ -1635,7 +1943,7 @@ func (s *MihomoCoreManagerService) buildCoreUpdateInfo() (*CoreUpdateInfo, error
 		return nil, err
 	}
 
-	info := &CoreUpdateInfo{
+	info := &MihomoCoreUpdateInfo{
 		Enabled:       enabled,
 		IntervalHours: intervalHours,
 		LastCheckedAt: lastCheckedAt,
@@ -1697,13 +2005,13 @@ func (s *MihomoCoreManagerService) ClearCoreUpdatePending() error {
 	return nil
 }
 
-func (s *MihomoCoreManagerService) GetCoreUpdateInfo(forceCheck bool) (*CoreUpdateInfo, error) {
+func (s *MihomoCoreManagerService) GetMihomoCoreUpdateInfo(forceCheck bool) (*MihomoCoreUpdateInfo, error) {
 	if forceCheck {
 		if err := s.CheckAndMarkCoreUpdates(true); err != nil {
 			logger.Warning("check mihomo core updates failed: ", err)
 		}
 	}
-	return s.buildCoreUpdateInfo()
+	return s.buildMihomoCoreUpdateInfo()
 }
 
 func (s *MihomoCoreManagerService) fetchLatestStableTag(client *http.Client) (string, error) {
@@ -1724,7 +2032,7 @@ func (s *MihomoCoreManagerService) fetchLatestStableTag(client *http.Client) (st
 	}
 
 	var release GitHubRelease
-	if err = json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	if err = unmarshalBoundedHTTPResponseJSON(resp.Body, coreGitHubResponseMaxBytes, &release); err != nil {
 		return "", fmt.Errorf("failed to parse latest stable release: %v", err)
 	}
 	return strings.TrimSpace(release.TagName), nil

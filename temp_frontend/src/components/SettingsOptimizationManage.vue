@@ -251,7 +251,7 @@
             <v-switch
               :model-value="mtuOverview.enabled"
               :loading="switchingMtu"
-              :disabled="loadingMtu || switchingMtu || !mtuOverview.supported"
+              :disabled="loadingMtu || switchingMtu || (!mtuOverview.supported && !mtuOverview.enabled)"
               color="success"
               inset
               hide-details
@@ -295,6 +295,7 @@
             </div>
             <div class="text-caption text-medium-emphasis mt-2">
               默认网卡：{{ mtuOverview.interface || '-' }} · 当前 MTU：{{ formatMtuValue(mtuOverview.currentMtu) }} ·
+              原始 MTU：{{ formatMtuValue(mtuOverview.originalMtu) }} ·
               systemd：{{ mtuOverview.serviceEnabled ? '已注册' : '未注册' }} · 状态：{{ mtuOverview.serviceActive || '-' }}
             </div>
           </v-card-text>
@@ -454,6 +455,7 @@ type MTUOptimizationOverview = {
   interface: string
   currentMtu: number
   mtu: number
+  originalMtu: number
   scriptPath: string
   scriptExists: boolean
   serviceName: string
@@ -512,6 +514,7 @@ const mtuOverview = ref<MTUOptimizationOverview>({
   interface: '',
   currentMtu: 0,
   mtu: 1500,
+  originalMtu: 0,
   scriptPath: '',
   scriptExists: false,
   serviceName: '',
@@ -624,6 +627,7 @@ const normalizeMtuOverview = (raw: unknown): MTUOptimizationOverview => {
     interface: readString(data, 'interface', ''),
     currentMtu: readInt(data, 'currentMtu', 0),
     mtu: readInt(data, 'mtu', 1500),
+    originalMtu: readInt(data, 'originalMtu', 0),
     scriptPath: readString(data, 'scriptPath', ''),
     scriptExists: readBool(data, 'scriptExists', false),
     serviceName: readString(data, 'serviceName', ''),

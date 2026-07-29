@@ -115,6 +115,144 @@ func TestMihomoInboundServiceGetAllIncludesSelectableClientAssignments(t *testin
 	assertSelectableUsers("stls-40443", "stls-user")
 }
 
+func TestMihomoUserManagedProtocolsAreSelectable(t *testing.T) {
+	tests := []struct {
+		inboundType      string
+		shadowTLSVersion int
+	}{
+		{inboundType: "mixed"},
+		{inboundType: "socks"},
+		{inboundType: "http"},
+		{inboundType: "shadowsocks"},
+		{inboundType: "shadowtls", shadowTLSVersion: 1},
+		{inboundType: "shadowtls", shadowTLSVersion: 3},
+		{inboundType: "vmess"},
+		{inboundType: "vless"},
+		{inboundType: "trojan"},
+		{inboundType: "tuic"},
+		{inboundType: "hysteria2"},
+		{inboundType: "anytls"},
+		{inboundType: "mieru"},
+		{inboundType: "sudoku"},
+		{inboundType: "trusttunnel"},
+		{inboundType: "shadowquic"},
+		{inboundType: "snell"},
+		{inboundType: "ssh"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.inboundType, func(t *testing.T) {
+			management := buildMihomoInboundUserManagement(test.inboundType, test.shadowTLSVersion)
+			if !management.Selectable {
+				t.Fatalf("%s must be selectable in Mihomo client management: %#v", test.inboundType, management)
+			}
+		})
+	}
+
+	for _, inboundType := range []string{"direct", "redirect", "tproxy", "tun", "unknown"} {
+		management := buildMihomoInboundUserManagement(inboundType, 0)
+		if management.Selectable {
+			t.Fatalf("%s must not be selectable in Mihomo client management: %#v", inboundType, management)
+		}
+	}
+}
+
+func TestMihomoProxyAuthUsersAreSelectableAndWhitelisted(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "mihomo-proxy-auth-users.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("InitDB failed: %v", err)
+	}
+
+	db := database.GetDB()
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("db.DB failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
+
+	svc := &MihomoInboundService{}
+	for index, inboundType := range []string{"mixed", "socks", "http"} {
+		inbound := model.MihomoInbound{
+			Type: inboundType,
+			Tag:  fmt.Sprintf("%s-%d", inboundType, 18080+index),
+			Options: json.RawMessage(fmt.Sprintf(`{
+				"listen": "::",
+				"listen_port": %d,
+				"users": [{"username": "legacy", "password": "legacy", "unexpected": "drop"}]
+			}`, 18080+index)),
+		}
+		if err := db.Create(&inbound).Error; err != nil {
+			t.Fatalf("create %s inbound failed: %v", inboundType, err)
+		}
+
+		username := inboundType + "-user"
+		password := inboundType + "-secret"
+		client := model.MihomoClient{
+			Enable: true,
+			Name:   username,
+			Config: json.RawMessage(fmt.Sprintf(`{
+				"%s": {
+					"name": %q,
+					"password": %q,
+					"unexpected": "drop",
+					"user_management": {"selectable": true}
+				}
+			}`, inboundType, username, password)),
+			Inbounds: json.RawMessage(fmt.Sprintf("[%d]", inbound.Id)),
+			Links:    json.RawMessage(`[]`),
+		}
+		if err := db.Create(&client).Error; err != nil {
+			t.Fatalf("create %s client failed: %v", inboundType, err)
+		}
+
+		rawInbound, err := inbound.MarshalJSON()
+		if err != nil {
+			t.Fatalf("marshal %s inbound failed: %v", inboundType, err)
+		}
+		rendered, err := svc.addUsers(db, rawInbound, inbound.Id, inboundType)
+		if err != nil {
+			t.Fatalf("render %s users failed: %v", inboundType, err)
+		}
+
+		payload := map[string]interface{}{}
+		if err := json.Unmarshal(rendered, &payload); err != nil {
+			t.Fatalf("decode %s runtime payload failed: %v", inboundType, err)
+		}
+		users, ok := payload["users"].([]interface{})
+		if !ok || len(users) != 1 {
+			t.Fatalf("%s runtime users = %#v", inboundType, payload["users"])
+		}
+		user, ok := users[0].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s runtime user = %#v", inboundType, users[0])
+		}
+		if len(user) != 2 || user["username"] != username || user["password"] != password {
+			t.Fatalf("%s runtime user was not whitelisted: %#v", inboundType, user)
+		}
+	}
+
+	data, err := svc.GetAll()
+	if err != nil {
+		t.Fatalf("GetAll failed: %v", err)
+	}
+	for _, item := range *data {
+		inboundType, _ := item["type"].(string)
+		if inboundType != "mixed" && inboundType != "socks" && inboundType != "http" {
+			continue
+		}
+		userManagement, ok := item["user_management"].(MihomoInboundUserManagement)
+		if !ok || !userManagement.Selectable {
+			t.Fatalf("%s user management = %#v, want selectable", inboundType, item["user_management"])
+		}
+		users, ok := item["users"].([]string)
+		if !ok || len(users) != 1 || users[0] != inboundType+"-user" {
+			t.Fatalf("%s assigned users = %#v", inboundType, item["users"])
+		}
+	}
+}
+
 func TestResolveSnellSharedPSK(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "mihomo-snell-psk.db")
 	if err := database.InitDB(dbPath); err != nil {

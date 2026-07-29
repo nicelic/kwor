@@ -25,7 +25,8 @@ const (
 	firewallGeoUpdateIntervalMinutesKey = "firewallGeoUpdateIntervalMinutes"
 	firewallGeoLastRefreshAtKey         = "firewallGeoLastRefreshAt"
 
-	firewallGeoHTTPTimeout = 45 * time.Second
+	firewallGeoHTTPTimeout          = 45 * time.Second
+	firewallGeoMaxSourceBytes int64 = 32 * 1024 * 1024
 )
 
 var firewallGeoState = struct {
@@ -285,9 +286,12 @@ func downloadFirewallGeoSource(sourceURL string, cache map[string]firewallGeoDow
 		return firewallGeoDownloadedSource{}, fmt.Errorf("http status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, firewallGeoMaxSourceBytes+1))
 	if err != nil {
 		return firewallGeoDownloadedSource{}, err
+	}
+	if int64(len(body)) > firewallGeoMaxSourceBytes {
+		return firewallGeoDownloadedSource{}, fmt.Errorf("geo source exceeds %d MiB", firewallGeoMaxSourceBytes/(1024*1024))
 	}
 	parsed, err := parseFirewallGeoRuleBytes(sourceURL, body)
 	if err != nil {

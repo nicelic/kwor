@@ -13,9 +13,12 @@ import (
 
 	"github.com/alireza0/s-ui/config"
 	"github.com/alireza0/s-ui/database"
+	"github.com/alireza0/s-ui/logger"
 )
 
 const managedRuntimeFileTable = "managed_runtime_files"
+
+var obsoleteManagedRuntimeJSONRoots = []string{"Inbound", "outbound", "sub_manager", "sub_json"}
 
 type managedRuntimeFileEntry struct {
 	Path      string
@@ -532,11 +535,8 @@ func (s *managedRuntimeFileStore) hasActiveCleanup(canonical string) bool {
 }
 
 func (s *managedRuntimeFileStore) migrateLegacyFiles() error {
-	managedDirs := []string{"Inbound", "outbound", "sub_json", "sub_manager"}
-	for _, dirName := range managedDirs {
-		if err := s.migrateLegacyDir(dirName); err != nil {
-			return err
-		}
+	if err := s.pruneObsoleteManagedRuntimeJSONArtifacts(); err != nil {
+		logger.Warningf("managed runtime obsolete JSON cleanup incomplete; will retry on next initialization: %v", err)
 	}
 
 	managedCoreFiles := []string{
@@ -557,6 +557,126 @@ func (s *managedRuntimeFileStore) migrateLegacyFiles() error {
 	}
 
 	return nil
+}
+
+func (s *managedRuntimeFileStore) pruneObsoleteManagedRuntimeJSONArtifacts() error {
+	db := database.GetDB()
+	if db == nil {
+		return fmt.Errorf("database is not initialized")
+	}
+
+	var cleanupErrors []error
+	for _, root := range obsoleteManagedRuntimeJSONRoots {
+		prefix := root + "/"
+		statement := fmt.Sprintf(
+			`DELETE FROM %s WHERE lower(ext) = '.json' AND (path = ? OR substr(path, 1, ?) = ?)`,
+			managedRuntimeFileTable,
+		)
+		if err := db.Exec(statement, root, len(prefix), prefix).Error; err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("remove %s records: %w", root, err))
+		}
+	}
+
+	s.cacheMu.Lock()
+	for canonical := range s.cache {
+		if isObsoleteManagedRuntimeJSONPath(canonical) {
+			delete(s.cache, canonical)
+		}
+	}
+	s.cacheMu.Unlock()
+
+	s.timerMu.Lock()
+	for canonical, timer := range s.timers {
+		if !isObsoleteManagedRuntimeJSONPath(canonical) {
+			continue
+		}
+		if timer != nil {
+			timer.Stop()
+		}
+		delete(s.timers, canonical)
+	}
+	s.timerMu.Unlock()
+
+	for _, root := range obsoleteManagedRuntimeJSONRoots {
+		if err := removeObsoleteManagedRuntimeJSONFiles(root); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("clean %s directory: %w", root, err))
+		}
+	}
+
+	return errors.Join(cleanupErrors...)
+}
+
+func isObsoleteManagedRuntimeJSONPath(canonical string) bool {
+	if !strings.EqualFold(path.Ext(canonical), ".json") {
+		return false
+	}
+	for _, root := range obsoleteManagedRuntimeJSONRoots {
+		if canonical == root || strings.HasPrefix(canonical, root+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func removeObsoleteManagedRuntimeJSONFiles(root string) error {
+	dirPath := filepath.Join(config.GetDataDir(), root)
+	info, err := os.Lstat(dirPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return nil
+	}
+
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return err
+	}
+
+	var cleanupErrors []error
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !strings.EqualFold(filepath.Ext(entry.Name()), ".json") {
+			continue
+		}
+
+		filePath := filepath.Join(dirPath, entry.Name())
+		fileInfo, statErr := os.Lstat(filePath)
+		if statErr != nil {
+			if !errors.Is(statErr, os.ErrNotExist) {
+				cleanupErrors = append(cleanupErrors, statErr)
+			}
+			continue
+		}
+		if fileInfo.Mode()&os.ModeSymlink != 0 || !fileInfo.Mode().IsRegular() {
+			continue
+		}
+		if removeErr := os.Remove(filePath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			cleanupErrors = append(cleanupErrors, removeErr)
+		}
+	}
+
+	remaining, readErr := os.ReadDir(dirPath)
+	if readErr != nil {
+		if !errors.Is(readErr, os.ErrNotExist) {
+			cleanupErrors = append(cleanupErrors, readErr)
+		}
+		return errors.Join(cleanupErrors...)
+	}
+	if len(remaining) == 0 {
+		currentInfo, statErr := os.Lstat(dirPath)
+		if statErr == nil && currentInfo.Mode()&os.ModeSymlink == 0 && currentInfo.IsDir() {
+			if removeErr := os.Remove(dirPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				cleanupErrors = append(cleanupErrors, removeErr)
+			}
+		} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			cleanupErrors = append(cleanupErrors, statErr)
+		}
+	}
+
+	return errors.Join(cleanupErrors...)
 }
 
 func (s *managedRuntimeFileStore) migrateLegacyCoreCanonicalAlias(sourceCanonical, targetCanonical string) error {
@@ -617,34 +737,6 @@ func (s *managedRuntimeFileStore) migrateLegacyCoreCanonicalAlias(sourceCanonica
 		}
 	}
 
-	return nil
-}
-
-func (s *managedRuntimeFileStore) migrateLegacyDir(dirName string) error {
-	dirPath := filepath.Join(config.GetDataDir(), dirName)
-	entries, err := os.ReadDir(dirPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		fullPath := filepath.Join(dirPath, entry.Name())
-		canonical, managed := canonicalManagedRuntimePath(fullPath)
-		if !managed {
-			continue
-		}
-		if err := s.migrateLegacyFile(canonical); err != nil {
-			return err
-		}
-	}
-
-	_ = os.Remove(dirPath)
 	return nil
 }
 

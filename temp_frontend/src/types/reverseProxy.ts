@@ -15,8 +15,6 @@ export type ReverseProxyRule = {
   enabled: boolean
   listenProtocol: 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
   listenProtocolAlias?: 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp' | ''
-  listenIP: string
-  listenIPs: string[]
   listenPort: number
   hosts: string[]
   pathPrefix: string
@@ -27,6 +25,15 @@ export type ReverseProxyRule = {
   targetPort: number
   targetPath: string
   targetDnsPath?: string
+  fallbackDnsUpstreams: string
+  dnsUpstreamTimeoutSeconds: number
+  dnsCacheEnabled: boolean
+  dnsCacheSizeBytes: number
+  dnsCacheMinTtl: number
+  dnsCacheMaxTtl: number
+  dnsAllowedCidrs: string[]
+  dnsRateLimitQps: number
+  dnsMaxConcurrentQueries: number
   ednsEnabled: boolean
   ednsMode: 'auto' | 'custom'
   ednsCustomIp: string
@@ -41,7 +48,13 @@ export type ReverseProxyRule = {
   ipStrategy: 'ipv4_only' | 'ipv6_only' | 'prefer_ipv4' | 'prefer_ipv6'
   httpVersionStrategy: '' | 'h2_only' | 'h3_only' | 'prefer_h2' | 'prefer_h3' | 'dual_required_prefer_h3'
   upstreamTlsVerify: boolean
+  maxConcurrentConnections: number
+  maxConcurrentRequests: number
+  upstreamMaxConnections: number
+  upstreamMaxIdleConnections: number
+  memoryLimitBytes: number
   apiPassthrough: boolean
+  advertiseHttp3: boolean
   remark: string
   lastError: string
   runtimeStatus: string
@@ -58,7 +71,6 @@ export type ReverseProxyRuleForm = {
   name: string
   enabled: boolean
   listenProtocol: 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
-  listenIPsText: string
   listenPort: number
   hostsText: string
   pathPrefix: string
@@ -68,6 +80,15 @@ export type ReverseProxyRuleForm = {
   targetPort: number
   targetPath: string
   targetDnsPath: string
+  fallbackDnsUpstreams: string
+  dnsUpstreamTimeoutSeconds: number
+  dnsCacheEnabled: boolean
+  dnsCacheSizeBytes: number
+  dnsCacheMinTtl: number
+  dnsCacheMaxTtl: number
+  dnsAllowedCidrsText: string
+  dnsRateLimitQps: number
+  dnsMaxConcurrentQueries: number
   ednsEnabled: boolean
   ednsMode: 'auto' | 'custom'
   ednsCustomIp: string
@@ -79,11 +100,19 @@ export type ReverseProxyRuleForm = {
   ipStrategy: 'ipv4_only' | 'ipv6_only' | 'prefer_ipv4' | 'prefer_ipv6'
   httpVersionStrategy: '' | 'h2_only' | 'h3_only' | 'prefer_h2' | 'prefer_h3' | 'dual_required_prefer_h3'
   upstreamTlsVerify: boolean
+  maxConcurrentConnections: number
+  maxConcurrentRequests: number
+  upstreamMaxConnections: number
+  upstreamMaxIdleConnections: number
+  memoryLimitBytes: number
   apiPassthrough: boolean
+  advertiseHttp3: boolean
   remark: string
 }
 
 export type ReverseProxyOverview = {
+	revision: number
+	resourceSettings: ReverseProxyResourceSettings
   available: boolean
   started: boolean
   listenerCount: number
@@ -93,6 +122,46 @@ export type ReverseProxyOverview = {
   lastSyncAt: number
   certificates: ReverseProxyCertificateOption[]
   rules: ReverseProxyRule[]
+  warnings?: string[]
+  error?: string
+}
+
+export type ReverseProxyResourceSettings = {
+  listenerConnectionLimit: number
+  globalHttpMaxConcurrent: number
+  globalDnsMaxConcurrent: number
+  http2MaxConcurrentStreams: number
+  quicMaxIncomingStreams: number
+  defaultUpstreamMaxIdleConnections: number
+  memoryPoolBytes: number
+  defaultRuleMemoryLimitBytes: number
+  responseRewriteInputBytes: number
+  responseRewriteOutputBytes: number
+  responseRewriteMaxConcurrent: number
+}
+
+export type ReverseProxyRuntimeRuleState = {
+  id: number
+  runtimeStatus: string
+  lastError: string
+  localConnectionCount: number
+  upstreamConnectionCount: number
+}
+
+export type ReverseProxyRuntimeOverview = {
+  revision: number
+  available: boolean
+  started: boolean
+  listenerCount: number
+  lastSyncAt: number
+  rules: ReverseProxyRuntimeRuleState[]
+  resources: {
+    activeHttpRequests: number
+    activeDnsQueries: number
+    memoryUsedBytes: number
+    cacheUsedBytes: number
+    rewriteUsedBytes: number
+  }
   warnings?: string[]
   error?: string
 }

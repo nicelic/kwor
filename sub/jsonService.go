@@ -11,32 +11,6 @@ import (
 	"github.com/alireza0/s-ui/util"
 )
 
-const defaultJson = `
-{
-  "inbounds": [
-    {
-      "type": "tun",
-      "address": [
-        "172.19.0.1/30",
-        "fdfe:dcba:9876::1/126"
-      ],
-      "mtu": 1500,
-      "auto_route": true,
-      "strict_route": true,
-      "endpoint_independent_nat": false,
-      "stack": "mixed",
-      "exclude_package": []
-    },
-    {
-      "type": "mixed",
-      "listen": "127.0.0.1",
-      "listen_port": 2080,
-      "users": []
-    }
-  ]
-}
-`
-
 type JsonService struct {
 	service.SettingService
 	LinkService
@@ -107,8 +81,6 @@ func (j *JsonService) GetMihomoJson(subId string, format string) (*string, []str
 }
 
 func (j *JsonService) buildJSONSubscription(client *model.Client, inDatas []*model.Inbound) (*string, []string, error) {
-	var jsonConfig map[string]interface{}
-
 	outbounds, outTags, err := j.getOutbounds(client.Name, client.Config, inDatas)
 	if err != nil {
 		return nil, nil, err
@@ -136,42 +108,7 @@ func (j *JsonService) buildJSONSubscription(client *model.Client, inDatas []*mod
 	}
 
 	// Comment cleaned to avoid mojibake.
-	latencyUrl := "http://www.gstatic.com/generate_204"
-	latencyInterval := "10m"
-	latencyTolerance := 50
-	var extJson map[string]interface{}
-	othersStr2, _ := j.SettingService.GetSubJsonExt()
-	if len(othersStr2) > 0 {
-		if err := json.Unmarshal([]byte(othersStr2), &extJson); err == nil {
-			if u, ok := extJson["latency_test_url"].(string); ok && u != "" {
-				latencyUrl = u
-			}
-			if i, ok := extJson["latency_test_interval"].(string); ok && i != "" {
-				if normalized, ok := normalizeSingboxLatencyInterval(i); ok {
-					latencyInterval = normalized
-				}
-			}
-			if t, ok := extJson["latency_tolerance"].(float64); ok && t > 0 {
-				latencyTolerance = int(t)
-			}
-		}
-	}
-	selectorGroups := parseSelectorGroupsFromExt(extJson)
-
-	// Comment cleaned to avoid mojibake.
-	stripMihomoFields(outbounds)
-
-	j.addDefaultOutbounds(outbounds, outTags, latencyUrl, latencyInterval, latencyTolerance, selectorGroups)
-
-	// Comment cleaned to avoid mojibake.
 	j.overrideServerIP(outbounds, client.ServerIp)
-
-	err = json.Unmarshal([]byte(defaultJson), &jsonConfig)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	jsonConfig["outbounds"] = outbounds
 
 	// Extract certificate store configured in TLS.
 	tlsStore := j.extractTlsStore(inDatas)
@@ -181,17 +118,75 @@ func (j *JsonService) buildJSONSubscription(client *model.Client, inDatas []*mod
 	}
 	tlsStore = j.SettingService.ResolveSubscriptionTLSStore(tlsStore)
 
-	// Add other objects from settings
-	j.addOthers(&jsonConfig)
-	applyCertificateStore(&jsonConfig, tlsStore)
-
-	result, _ := json.MarshalIndent(jsonConfig, "", "  ")
-	resultStr := string(result)
+	resultStr, err := j.renderJSONSubscription(outbounds, outTags, tlsStore)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	updateInterval, _ := j.SettingService.GetSubUpdates()
 	headers := util.GetHeaders(client, updateInterval)
 
 	return &resultStr, headers, nil
+}
+
+func (j *JsonService) loadSubJSONExtension() (map[string]interface{}, error) {
+	raw, err := j.SettingService.GetSubJsonExt()
+	if err != nil {
+		return nil, err
+	}
+	extension, err := service.ParseSubJSONExtension(raw)
+	if err != nil {
+		return nil, err
+	}
+	if err := service.ValidateSubJSONExtension(extension); err != nil {
+		return nil, err
+	}
+	return extension, nil
+}
+
+func subJSONRenderSettings(ext map[string]interface{}) (string, string, int, []selectorGroupConfig) {
+	latencyURL := "http://www.gstatic.com/generate_204"
+	latencyInterval := "10m"
+	latencyTolerance := 50
+	if value, ok := ext["latency_test_url"].(string); ok && strings.TrimSpace(value) != "" {
+		latencyURL = strings.TrimSpace(value)
+	}
+	if value, ok := ext["latency_test_interval"].(string); ok {
+		if normalized, valid := normalizeSingboxLatencyInterval(value); valid {
+			latencyInterval = normalized
+		}
+	}
+	if value, ok := toInt(ext["latency_tolerance"]); ok && value > 0 {
+		latencyTolerance = value
+	}
+	return latencyURL, latencyInterval, latencyTolerance, parseSelectorGroupsFromExt(ext)
+}
+
+func (j *JsonService) renderJSONSubscription(outbounds *[]map[string]interface{}, outTags *[]string, tlsStore string) (string, error) {
+	ext, err := j.loadSubJSONExtension()
+	if err != nil {
+		return "", err
+	}
+	latencyURL, latencyInterval, latencyTolerance, selectorGroups := subJSONRenderSettings(ext)
+
+	stripMihomoFields(outbounds)
+	j.addDefaultOutbounds(outbounds, outTags, latencyURL, latencyInterval, latencyTolerance, selectorGroups)
+
+	jsonConfig := map[string]interface{}{}
+	if err := json.Unmarshal([]byte(service.SubscriptionJSONBaseConfig), &jsonConfig); err != nil {
+		return "", fmt.Errorf("parse canonical JSON subscription base: %w", err)
+	}
+	jsonConfig["outbounds"] = *outbounds
+	if err := j.addOthersFromExtension(&jsonConfig, ext); err != nil {
+		return "", err
+	}
+	applyCertificateStore(&jsonConfig, tlsStore)
+
+	result, err := json.MarshalIndent(jsonConfig, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("serialize JSON subscription: %w", err)
+	}
+	return string(result), nil
 }
 
 func normalizeSingboxLatencyInterval(raw string) (string, bool) {
@@ -328,6 +323,9 @@ func (j *JsonService) getOutboundsForNamespace(clientName string, clientConfig j
 		return nil, nil, err
 	}
 	for _, inData := range inbounds {
+		if inData == nil || util.IsSubscriptionServerOnlyInboundType(inData.Type) {
+			continue
+		}
 		if len(inData.OutJson) < 5 {
 			continue
 		}
@@ -336,8 +334,18 @@ func (j *JsonService) getOutboundsForNamespace(clientName string, clientConfig j
 		if err != nil {
 			return nil, nil, err
 		}
+		util.StripSubscriptionOutboundPanelFields(outbound)
 		refreshSubscriptionOutboundTLS(outbound, inData.Tls)
 		protocol, _ := outbound["type"].(string)
+		if util.IsSubscriptionServerOnlyInboundType(protocol) {
+			continue
+		}
+		if strings.EqualFold(protocol, "shadowquic") || strings.EqualFold(inData.Type, "shadowquic") {
+			// A legacy inbound may still carry a TLS relation. ShadowQUIC has
+			// native SNI/ALPN fields, so do not let that relation re-add tls.
+			util.SanitizeMihomoShadowQUICInboundTemplate(outbound)
+			protocol = "shadowquic"
+		}
 		if protocol == "trusttunnel" {
 			util.SanitizeTrustTunnelOutbound(outbound)
 		}
@@ -422,12 +430,10 @@ func (j *JsonService) getOutboundsForNamespace(clientName string, clientConfig j
 				}
 				outbound[key] = value
 			}
-			if namespace == "mihomo" && !util.ShouldSkipMihomoOutboundClientConfigKey(protocol, "username", inData.TlsId != 0) {
+			if !shouldSkipSubscriptionClientConfigKey(namespace, protocol, "username", inData.TlsId != 0) {
 				if strings.TrimSpace(firstString(outbound["username"])) == "" {
-					if username := strings.TrimSpace(firstString(config["username"])); username != "" {
+					if username := util.SubscriptionClientConfigUsername(config); username != "" {
 						outbound["username"] = username
-					} else if legacyName := strings.TrimSpace(firstString(config["name"])); legacyName != "" {
-						outbound["username"] = legacyName
 					}
 				}
 			}
@@ -457,11 +463,6 @@ func (j *JsonService) getOutboundsForNamespace(clientName string, clientConfig j
 		if len(addrs) == 0 {
 			for _, variant := range outboundVariants {
 				variantTag, _ := variant["tag"].(string)
-				if protocol == "mixed" {
-					variant["tag"] = variantTag
-					j.pushMixed(&outbounds, &outTags, variant)
-					continue
-				}
 				outTags = append(outTags, variantTag)
 				outbounds = append(outbounds, variant)
 			}
@@ -496,12 +497,8 @@ func (j *JsonService) getOutboundsForNamespace(clientName string, clientConfig j
 					}
 					newTag := fmt.Sprintf("%d.%s%s", index+1, variantTag, remark)
 					newOut["tag"] = newTag
-					if protocol == "mixed" {
-						j.pushMixed(&outbounds, &outTags, newOut)
-					} else {
-						outTags = append(outTags, newTag)
-						outbounds = append(outbounds, newOut)
-					}
+					outTags = append(outTags, newTag)
+					outbounds = append(outbounds, newOut)
 				}
 			}
 		}
@@ -512,6 +509,9 @@ func (j *JsonService) getOutboundsForNamespace(clientName string, clientConfig j
 func shouldSkipSubscriptionClientConfigKey(namespace string, protocol string, key string, hasTLS bool) bool {
 	if namespace == "mihomo" {
 		return util.ShouldSkipMihomoOutboundClientConfigKey(protocol, key, hasTLS)
+	}
+	if namespace == "clash" {
+		return util.ShouldSkipClashSubscriptionClientConfigKey(protocol, key, hasTLS)
 	}
 	return util.ShouldSkipSingboxOutboundClientConfigKey(protocol, key, hasTLS)
 }
@@ -596,6 +596,14 @@ func (j *JsonService) addDefaultOutbounds(outbounds *[]map[string]interface{}, o
 }
 
 func (j *JsonService) addOthers(jsonConfig *map[string]interface{}) error {
+	ext, err := j.loadSubJSONExtension()
+	if err != nil {
+		return err
+	}
+	return j.addOthersFromExtension(jsonConfig, ext)
+}
+
+func (j *JsonService) addOthersFromExtension(jsonConfig *map[string]interface{}, othersJson map[string]interface{}) error {
 	route := map[string]interface{}{
 		"auto_detect_interface":   true,
 		"default_domain_resolver": "proxy-dns",
@@ -603,19 +611,6 @@ func (j *JsonService) addOthers(jsonConfig *map[string]interface{}) error {
 		"rules":                   []interface{}{},
 	}
 
-	othersStr, err := j.SettingService.GetSubJsonExt()
-	if err != nil {
-		return err
-	}
-	if len(othersStr) == 0 {
-		(*jsonConfig)["route"] = route
-		return nil
-	}
-	var othersJson map[string]interface{}
-	err = json.Unmarshal([]byte(othersStr), &othersJson)
-	if err != nil {
-		return err
-	}
 	if _, ok := othersJson["log"]; ok {
 		(*jsonConfig)["log"] = othersJson["log"]
 	}
@@ -641,8 +636,6 @@ func (j *JsonService) addOthers(jsonConfig *map[string]interface{}) error {
 	if settingRules, ok := othersJson["rules"].([]interface{}); ok {
 		route["rules"] = normalizeRouteRules(settingRules)
 	}
-	// Remove front-end-only UI state from generated config.
-	delete(othersJson, "_uiConfig")
 	if routeFinal, ok := othersJson["route_final"].(string); ok {
 		route["final"] = normalizeRouteFinalOutbound(routeFinal)
 	}
@@ -1167,23 +1160,6 @@ func normalizeRouteRuleMap(rule map[string]interface{}) map[string]interface{} {
 	}
 
 	return rule
-}
-
-func (j *JsonService) pushMixed(outbounds *[]map[string]interface{}, outTags *[]string, out map[string]interface{}) {
-	socksOut := make(map[string]interface{}, 1)
-	httpOut := make(map[string]interface{}, 1)
-	for key, value := range out {
-		socksOut[key] = value
-		httpOut[key] = value
-	}
-	socksTag := fmt.Sprintf("%s-socks", out["tag"])
-	httpTag := fmt.Sprintf("%s-http", out["tag"])
-	socksOut["type"] = "socks"
-	httpOut["type"] = "http"
-	socksOut["tag"] = socksTag
-	httpOut["tag"] = httpTag
-	*outbounds = append(*outbounds, socksOut, httpOut)
-	*outTags = append(*outTags, socksTag, httpTag)
 }
 
 func expandMieruSubscriptionOutbounds(outbound map[string]interface{}) []map[string]interface{} {

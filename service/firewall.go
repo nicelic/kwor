@@ -4,11 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -64,7 +64,12 @@ var (
 		lastRenderHash  string
 		lastRuntimeHash string
 		lastReconcile   time.Time
+		lastError       string
 	}{}
+	firewallOverviewRuntimeMu sync.RWMutex
+	firewallOverviewRuntime   struct {
+		lastError string
+	}
 )
 
 type FirewallService struct {
@@ -202,8 +207,8 @@ func firewallTableExists() bool {
 	if !firewallSupported() {
 		return false
 	}
-	_, err := runNft("list", "table", nftFamily, firewallNftTable)
-	return err == nil
+	exists, err := inspectOwnedNftTableForMutation(nftFamily, firewallNftTable)
+	return err == nil && exists
 }
 
 func firewallRuleComment(ruleID uint, family string) string {
@@ -215,27 +220,15 @@ func firewallStaticComment(name string) string {
 }
 
 func (s *FirewallService) GetOverview() (*FirewallOverview, error) {
-	firewallStateMu.Lock()
-	defer firewallStateMu.Unlock()
-
 	enabled, err := s.getFirewallEnabledLocked()
 	if err != nil {
 		return nil, err
 	}
-	available := firewallSupportedFn()
-	nftStatus := buildFirewallNftablesStatus(available)
-	if enabled && available {
-		if syncErr := s.reconcileLocked(2 * time.Second); syncErr != nil {
-			return nil, syncErr
-		}
-	}
+	hostAvailable := firewallSupportedFn()
+	nftStatus := buildFirewallNftablesStatus(hostAvailable)
+	available := hostAvailable && nftStatus.RendererSupported
 
 	defaults := resolveFirewallDefaultPorts()
-	if !enabled || !available {
-		if syncErr := upsertFirewallSystemRulesLocked(database.GetDB(), defaults); syncErr != nil {
-			return nil, syncErr
-		}
-	}
 	lastSyncAt, _ := s.getFirewallLastSyncAtLocked()
 	rows, err := loadFirewallRulesLocked()
 	if err != nil {
@@ -310,8 +303,36 @@ func (s *FirewallService) GetOverview() (*FirewallOverview, error) {
 		GeoLastRefreshAt:         geoLastRefreshAt,
 		GeoRules:                 geoViews,
 	}
-	overview.Error = buildFirewallNftablesOverviewError(nftStatus)
+	overview.Error = joinFirewallOverviewErrors(
+		buildFirewallNftablesOverviewError(nftStatus),
+		firewallReconcileErrorSnapshot(),
+	)
 	return overview, nil
+}
+
+func joinFirewallOverviewErrors(parts ...string) string {
+	filtered := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			filtered = append(filtered, value)
+		}
+	}
+	return strings.Join(filtered, " | ")
+}
+
+func firewallReconcileErrorSnapshot() string {
+	if firewallStateMu.TryLock() {
+		value := strings.TrimSpace(firewallState.lastError)
+		firewallStateMu.Unlock()
+		firewallOverviewRuntimeMu.Lock()
+		firewallOverviewRuntime.lastError = value
+		firewallOverviewRuntimeMu.Unlock()
+		return value
+	}
+	firewallOverviewRuntimeMu.RLock()
+	value := firewallOverviewRuntime.lastError
+	firewallOverviewRuntimeMu.RUnlock()
+	return value
 }
 
 func (s *FirewallService) SetEnabled(enabled bool) error {
@@ -321,6 +342,9 @@ func (s *FirewallService) SetEnabled(enabled bool) error {
 	if enabled {
 		if !firewallSupportedFn() {
 			return common.NewError("nftables firewall is unavailable on this host")
+		}
+		if err := ensureNftRendererSupported(); err != nil {
+			return common.NewError(err.Error())
 		}
 		return s.enableLocked()
 	}
@@ -520,7 +544,13 @@ func (s *FirewallService) SetSystemRuleReserved(systemKey string, enabled bool) 
 func (s *FirewallService) SyncIfNeeded(minGap time.Duration) error {
 	firewallStateMu.Lock()
 	defer firewallStateMu.Unlock()
-	return s.reconcileLocked(minGap)
+	err := s.reconcileLocked(minGap)
+	if err != nil {
+		firewallState.lastError = strings.TrimSpace(err.Error())
+	} else {
+		firewallState.lastError = ""
+	}
+	return err
 }
 
 func (s *FirewallService) CleanupTemporaryRulesOnStartup() error {
@@ -533,7 +563,7 @@ func (s *FirewallService) CleanupOnShutdown() {
 	firewallStateMu.Lock()
 	defer firewallStateMu.Unlock()
 
-	if runtime.GOOS == "linux" && firewallSupportedFn() {
+	if IsSystemPlatformLinux() && nftSupported() {
 		if err := cleanupManagedFirewallTable(); err != nil && !firewallNftObjectMissing(err) {
 			logger.Warning("failed to cleanup managed firewall nft table on shutdown: ", err)
 		}
@@ -542,6 +572,7 @@ func (s *FirewallService) CleanupOnShutdown() {
 	firewallState.lastRenderHash = ""
 	firewallState.lastRuntimeHash = ""
 	firewallState.lastReconcile = time.Time{}
+	firewallState.lastError = ""
 	firewallGeoState.loaded = make(map[uint]firewallGeoResolvedPrefixes)
 }
 
@@ -622,6 +653,9 @@ func (s *FirewallService) reconcileLocked(minGap time.Duration) error {
 	if !firewallSupportedFn() {
 		return common.NewError("nftables firewall is unavailable on this host")
 	}
+	if err := ensureNftRendererSupported(); err != nil {
+		return err
+	}
 
 	now := time.Now()
 	if minGap > 0 && !firewallState.lastReconcile.IsZero() && now.Sub(firewallState.lastReconcile) < minGap {
@@ -646,6 +680,9 @@ func (s *FirewallService) reconcileLocked(minGap time.Duration) error {
 }
 
 func (s *FirewallService) renderLocked(force bool) error {
+	if err := ensureNftRendererSupported(); err != nil {
+		return err
+	}
 	rows, err := loadFirewallRulesLocked()
 	if err != nil {
 		return err
@@ -656,7 +693,10 @@ func (s *FirewallService) renderLocked(force bool) error {
 	}
 	managedRows := filterFirewallRulesForRender(rows)
 	hash := computeFirewallRenderHash(managedRows, geoRows)
-	tableExists := firewallTableExists()
+	tableExists, ownershipErr := inspectOwnedNftTableForMutation(nftFamily, firewallNftTable)
+	if ownershipErr != nil {
+		return ownershipErr
+	}
 	runtimeHashBeforeApply := ""
 	if tableExists {
 		currentRuntimeHash, hashErr := computeManagedFirewallRuntimeHash()
@@ -670,14 +710,41 @@ func (s *FirewallService) renderLocked(force bool) error {
 		return nil
 	}
 
-		// Apply the whole managed table in a single nft batch so external-rule
-		// observation and rule refreshes do not open a transient allow window.
-		script, err := buildManagedFirewallScript(managedRows, geoRows, tableExists)
+	// Apply the whole managed table in a single nft batch so external-rule
+	// observation and rule refreshes do not open a transient allow window.
+	script, err := buildManagedFirewallScript(managedRows, geoRows, tableExists)
 	if err != nil {
 		return err
 	}
+	var ownership HostResource
+	if !tableExists {
+		ownership, err = BeginNftHostOwnership("nft-firewall-"+nftFamily, []HostNftTable{{Family: nftFamily, Name: firewallNftTable}})
+		if err != nil {
+			return fmt.Errorf("record firewall nft ownership before creation: %w", err)
+		}
+	}
 	if _, err := runNftScript(script); err != nil {
+		if ownership.ID != "" {
+			return finishUnconfirmedNftCreationFailure(ownership, nftFamily, firewallNftTable, err)
+		}
 		return err
+	}
+	if output, verifyErr := runNft("list", "table", nftFamily, firewallNftTable); verifyErr != nil || !nftTableHasOwnershipMarker(output) {
+		if verifyErr != nil {
+			if ownership.ID != "" {
+				return rollbackConfirmedNftCreation(ownership, nftFamily, firewallNftTable, fmt.Errorf("verify firewall nft ownership marker: %w", verifyErr))
+			}
+			return fmt.Errorf("verify firewall nft ownership marker: %w", verifyErr)
+		}
+		if ownership.ID != "" {
+			return rollbackConfirmedNftCreation(ownership, nftFamily, firewallNftTable, errors.New("firewall nft ownership marker is missing after render"))
+		}
+		return fmt.Errorf("firewall nft ownership marker is missing after render")
+	}
+	if ownership.ID != "" {
+		if err := ActivateHostResource(ownership.ID); err != nil {
+			return rollbackConfirmedNftCreation(ownership, nftFamily, firewallNftTable, fmt.Errorf("activate firewall nft ownership: %w", err))
+		}
 	}
 	firewallState.lastRenderHash = hash
 
@@ -689,8 +756,8 @@ func (s *FirewallService) renderLocked(force bool) error {
 		firewallState.lastRuntimeHash = runtimeHashAfterApply
 	}
 
-		return nil
-	}
+	return nil
+}
 
 func loadFirewallRulesLocked() ([]model.FirewallRule, error) {
 	db := database.GetDB()
@@ -781,7 +848,7 @@ func buildManagedFirewallScript(rows []model.FirewallRule, geoRows []model.Firew
 	if tableExists {
 		script.WriteString(fmt.Sprintf("delete table %s %s\n", nftFamily, firewallNftTable))
 	}
-	script.WriteString(fmt.Sprintf("add table %s %s\n", nftFamily, firewallNftTable))
+	appendOwnedNftTableCreationScript(script, nftFamily, firewallNftTable)
 	script.WriteString(fmt.Sprintf(
 		"add chain %s %s %s { type filter hook input priority -50; policy drop; }\n",
 		nftFamily,
@@ -824,10 +891,21 @@ func ensureManagedFirewallBase() error {
 	if !firewallSupported() {
 		return nil
 	}
-	if _, err := runNft("add", "table", nftFamily, firewallNftTable); err != nil {
+	exists, err := inspectOwnedNftTableForMutation(nftFamily, firewallNftTable)
+	if err != nil {
 		return err
 	}
-	_, err := runNft(
+	if !exists {
+		if err := createOwnedNftTable("nft-firewall-"+nftFamily, nftFamily, firewallNftTable); err != nil {
+			return err
+		}
+	}
+	if _, err := runNft("list", "chain", nftFamily, firewallNftTable, firewallInputChain); err == nil {
+		return nil
+	} else if !firewallNftObjectMissing(err) {
+		return err
+	}
+	_, err = runNft(
 		"add", "chain", nftFamily, firewallNftTable, firewallInputChain,
 		"{", "type", "filter", "hook", "input", "priority", "-50", ";", "policy", "drop", ";", "}",
 	)
@@ -835,11 +913,10 @@ func ensureManagedFirewallBase() error {
 }
 
 func cleanupManagedFirewallTable() error {
-	if !firewallSupported() || !firewallTableExists() {
+	if !nftSupported() {
 		return nil
 	}
-	_, err := runNft("delete", "table", nftFamily, firewallNftTable)
-	return err
+	return deleteOwnedNftTableForRuntime(nftFamily, firewallNftTable)
 }
 
 func addManagedFirewallStaticRules() error {
@@ -926,13 +1003,16 @@ func buildManagedFirewallRuleArgs(row model.FirewallRule, target firewallRenderT
 	}
 	switch row.Protocol {
 	case firewallProtocolTCP:
-		args = append(args, "meta", "l4proto", "tcp", "th", "dport")
+		args = append(args, "meta", "l4proto", "tcp")
+		args = appendNftTransportPortMatch(args, "dport")
 		args = append(args, buildNftPortSetArgs(row.PortSpec)...)
 	case firewallProtocolUDP:
-		args = append(args, "meta", "l4proto", "udp", "th", "dport")
+		args = append(args, "meta", "l4proto", "udp")
+		args = appendNftTransportPortMatch(args, "dport")
 		args = append(args, buildNftPortSetArgs(row.PortSpec)...)
 	case firewallProtocolTCPUDP:
-		args = append(args, "meta", "l4proto", "{", "tcp", ",", "udp", "}", "th", "dport")
+		args = append(args, "meta", "l4proto", "{", "tcp", ",", "udp", "}")
+		args = appendNftTransportPortMatch(args, "dport")
 		args = append(args, buildNftPortSetArgs(row.PortSpec)...)
 	case firewallProtocolAny:
 		return nil, common.NewError("ANY protocol is not supported for managed firewall rules")
@@ -1010,11 +1090,13 @@ func mapFirewallTargetFamily(family string) string {
 
 func computeFirewallRenderHash(rows []model.FirewallRule, geoRows []model.FirewallGeoRule) string {
 	raw, _ := json.Marshal(struct {
-		Rules    []model.FirewallRule    `json:"rules"`
-		GeoRules []model.FirewallGeoRule `json:"geoRules"`
+		Rules            []model.FirewallRule    `json:"rules"`
+		GeoRules         []model.FirewallGeoRule `json:"geoRules"`
+		CapabilityLayout string                  `json:"capabilityLayout"`
 	}{
-		Rules:    rows,
-		GeoRules: geoRows,
+		Rules:            rows,
+		GeoRules:         geoRows,
+		CapabilityLayout: nftCapabilityLayoutSignature(),
 	})
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])

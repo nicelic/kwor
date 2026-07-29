@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,18 +33,30 @@ import (
 // - output: meta l4proto {tcp,udp} th sport <port> counter comment "..."
 
 const (
-	nftFamily          = "inet"
-	nftChainIn         = "input"
-	nftChainOut        = "output"
-	nftChainForward    = "forward"
-	nftChainPrerouting = "prerouting"
+	nftTableOwnershipMarker = "kwor-owner:v1"
+	nftOwnershipChain       = "kwor_owner"
+
+	nftFamily           = "inet"
+	nftChainIn          = "input"
+	nftChainOut         = "output"
+	nftChainForward     = "forward"
+	nftChainPrerouting  = "prerouting"
+	nftChainPostrouting = "postrouting"
+	nftNatFamilyIPv4    = "ip"
+	nftNatFamilyIPv6    = "ip6"
+	// Keep NAT hook priorities numeric. nftables 0.7 and 0.9.0 do not
+	// parse the newer dstnat/srcnat aliases, while -100/100 are their exact
+	// netfilter priorities and remain valid on current nftables releases.
+	nftNatPreroutingPriority  = "-100"
+	nftNatPostroutingPriority = "100"
 )
 
 var (
-	nftTable      = loadNftTableName()
-	nftHandleRe   = regexp.MustCompile(`handle\s+(\d+)`)
-	nftCommentRe  = regexp.MustCompile(`comment\s+"((?:[^"\\]|\\.)*)"`)
-	nftCandidates = []string{
+	nftTable          = loadNftTableName()
+	nftHandleRe       = regexp.MustCompile(`handle\s+(\d+)`)
+	nftCommentRe      = regexp.MustCompile(`comment\s+"((?:[^"\\]|\\.)*)"`)
+	nftCounterBytesRe = regexp.MustCompile(`\bcounter\s+packets\s+\d+\s+bytes\s+(\d+)\b`)
+	nftCandidates     = []string{
 		"/usr/sbin/nft",
 		"/sbin/nft",
 		"/usr/bin/nft",
@@ -53,12 +64,12 @@ var (
 	}
 )
 
-var nftRuntimeGOOS = runtime.GOOS
+var nftIsLinuxHost = IsSystemPlatformLinux
 var nftLookPathFn = exec.LookPath
 var nftStatFn = os.Stat
 
 func resolveNftBinaryPath() (string, error) {
-	if nftRuntimeGOOS != "linux" {
+	if !nftIsLinuxHost() {
 		return "", fmt.Errorf("nft is supported on linux only")
 	}
 	if path, err := nftLookPathFn("nft"); err == nil && strings.TrimSpace(path) != "" {
@@ -120,6 +131,10 @@ func ruleLineHasExactComment(line string, comment string) bool {
 }
 
 func runNft(args ...string) ([]byte, error) {
+	return runNftFn(args...)
+}
+
+var runNftFn = func(args ...string) ([]byte, error) {
 	binaryPath, err := resolveNftBinaryPath()
 	if err != nil {
 		return nil, err
@@ -140,6 +155,10 @@ func runNft(args ...string) ([]byte, error) {
 }
 
 func runNftScript(script string) ([]byte, error) {
+	return runNftScriptFn(script)
+}
+
+var runNftScriptFn = func(script string) ([]byte, error) {
 	binaryPath, err := resolveNftBinaryPath()
 	if err != nil {
 		return nil, err
@@ -160,15 +179,286 @@ func runNftScript(script string) ([]byte, error) {
 	return stdout.Bytes(), nil
 }
 
+func nftTableHasOwnershipMarker(output []byte) bool {
+	tokens := tokenizeNftOwnershipOutput(string(output))
+	depth := 0
+	seenTable := false
+	ownerChainDepth := 0
+	pendingOwnerChain := false
+	statementHasCounter := false
+	statementHasMarker := false
+	resetStatement := func() {
+		statementHasCounter = false
+		statementHasMarker = false
+	}
+	for index, token := range tokens {
+		switch token.value {
+		case "table":
+			if depth == 0 {
+				seenTable = true
+			}
+		case "chain":
+			pendingOwnerChain = seenTable && depth == 1 && index+1 < len(tokens) &&
+				strings.EqualFold(strings.TrimSpace(tokens[index+1].value), nftOwnershipChain)
+		case "{":
+			if seenTable {
+				depth++
+				if pendingOwnerChain {
+					ownerChainDepth = depth
+					pendingOwnerChain = false
+					resetStatement()
+				}
+			}
+		case "}":
+			if ownerChainDepth > 0 && depth == ownerChainDepth {
+				if statementHasCounter && statementHasMarker {
+					return true
+				}
+				ownerChainDepth = 0
+				resetStatement()
+			}
+			if seenTable && depth > 0 {
+				depth--
+			}
+		case ";", "\n":
+			if ownerChainDepth > 0 && depth == ownerChainDepth {
+				if statementHasCounter && statementHasMarker {
+					return true
+				}
+				resetStatement()
+			}
+		default:
+			if seenTable && depth == 1 && strings.EqualFold(token.value, "comment") && index+1 < len(tokens) {
+				next := tokens[index+1]
+				if next.quoted && strings.EqualFold(strings.TrimSpace(next.value), nftTableOwnershipMarker) {
+					return true
+				}
+			}
+			if ownerChainDepth > 0 && depth == ownerChainDepth {
+				if strings.EqualFold(token.value, "counter") {
+					statementHasCounter = true
+				}
+				if strings.EqualFold(token.value, "comment") && index+1 < len(tokens) {
+					next := tokens[index+1]
+					statementHasMarker = next.quoted && strings.EqualFold(strings.TrimSpace(next.value), nftTableOwnershipMarker)
+				}
+			}
+		}
+	}
+	return false
+}
+
+type nftOwnershipToken struct {
+	value  string
+	quoted bool
+}
+
+func tokenizeNftOwnershipOutput(value string) []nftOwnershipToken {
+	tokens := make([]nftOwnershipToken, 0, 32)
+	for index := 0; index < len(value); {
+		switch value[index] {
+		case ' ', '\t', '\r':
+			index++
+			continue
+		case '\n', ';':
+			tokens = append(tokens, nftOwnershipToken{value: string(value[index])})
+			index++
+			continue
+		case '{', '}':
+			tokens = append(tokens, nftOwnershipToken{value: string(value[index])})
+			index++
+			continue
+		case '"':
+			start := index
+			index++
+			for index < len(value) {
+				if value[index] == '\\' && index+1 < len(value) {
+					index += 2
+					continue
+				}
+				if value[index] == '"' {
+					index++
+					break
+				}
+				index++
+			}
+			raw := value[start:index]
+			unquoted, err := strconv.Unquote(raw)
+			if err != nil {
+				continue
+			}
+			tokens = append(tokens, nftOwnershipToken{value: unquoted, quoted: true})
+			continue
+		}
+		start := index
+		for index < len(value) && !strings.ContainsRune(" \t\r\n;{}\"", rune(value[index])) {
+			index++
+		}
+		if index > start {
+			tokens = append(tokens, nftOwnershipToken{value: value[start:index]})
+		}
+	}
+	return tokens
+}
+
+func nftTableHasTrustedKworRuleEvidence(tableName string, output []byte) bool {
+	knownPrefixes := []string{}
+	knownChains := []string{}
+	switch tableName {
+	case nftTable:
+		knownPrefixes = []string{
+			"kwor_inbound_",
+			"kwor_client_limit_",
+			"kwor_client_block_",
+			"kwor_mihomo_inbound_",
+			"kwor_mihomo_client_limit_",
+			"kwor_mihomo_client_block_",
+			"kwor_traffic_cap_",
+		}
+		knownChains = []string{nftChainIn, nftChainOut, nftChainForward, nftChainPrerouting, nftChainPostrouting}
+	case firewallNftTable:
+		knownPrefixes = []string{"kwor_firewall_static_", "kwor_firewall_rule_", "kwor_firewall_geo_"}
+		knownChains = []string{firewallInputChain}
+	case portForwardNftTable:
+		knownPrefixes = []string{"kwor_pf_rule_", "kwor_pf_counter_", "kwor_pf_meter_"}
+		knownChains = []string{
+			portForwardPreroutingChain,
+			portForwardPostroutingChain,
+			portForwardForwardChain,
+			portForwardInputChain,
+			portForwardOutputChain,
+		}
+	default:
+		return false
+	}
+	seenComment := false
+	for _, line := range strings.Split(string(output), "\n") {
+		comment, ok := extractRuleComment(line)
+		if !ok {
+			continue
+		}
+		comment = strings.ToLower(strings.TrimSpace(comment))
+		for _, prefix := range knownPrefixes {
+			if strings.HasPrefix(comment, prefix) {
+				seenComment = true
+				break
+			}
+		}
+		if seenComment {
+			break
+		}
+	}
+	if !seenComment {
+		return false
+	}
+	lower := strings.ToLower(string(output))
+	for _, chain := range knownChains {
+		if strings.Contains(lower, "chain "+strings.ToLower(chain)) {
+			return true
+		}
+	}
+	return false
+}
+
+func nftManifestOwnsActiveTable(tableFamily string, tableName string) (bool, error) {
+	manifest, found, err := LoadHostOwnershipManifest()
+	if err != nil || !found || manifest == nil {
+		return false, err
+	}
+	if hostID := strings.TrimSpace(manifest.HostID); hostID != "" && hostID != hostOwnershipHostID() {
+		return false, nil
+	}
+	for _, resource := range manifest.Resources {
+		if resource.Kind != HostResourceNftTable || resource.State != hostResourceStateActive {
+			continue
+		}
+		for _, table := range resource.NftTables {
+			if table.Family == tableFamily && table.Name == tableName {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func inspectOwnedNftTableForMutation(tableFamily string, tableName string) (bool, error) {
+	output, err := runNft("list", "table", tableFamily, tableName)
+	if err != nil {
+		if nftObjectMissing(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if nftTableHasOwnershipMarker(output) {
+		return true, nil
+	}
+	if strings.TrimSpace(string(output)) == "" {
+		return false, fmt.Errorf("refuse to modify nft table with empty ownership evidence: %s %s", tableFamily, tableName)
+	}
+	manifestOwned, manifestErr := nftManifestOwnsActiveTable(tableFamily, tableName)
+	if manifestErr != nil {
+		return false, manifestErr
+	}
+	if manifestOwned && nftTableHasTrustedKworRuleEvidence(tableName, output) {
+		return true, nil
+	}
+	return false, fmt.Errorf("refuse to modify nft table without kwor ownership proof: %s %s", tableFamily, tableName)
+}
+
+func nftTableIsSafeToDelete(tableFamily string, tableName string, output []byte) (bool, error) {
+	if nftTableHasOwnershipMarker(output) {
+		return true, nil
+	}
+	if strings.TrimSpace(string(output)) == "" {
+		return false, nil
+	}
+	manifestOwned, err := nftManifestOwnsActiveTable(tableFamily, tableName)
+	if err != nil {
+		return false, err
+	}
+	if manifestOwned && nftTableHasTrustedKworRuleEvidence(tableName, output) {
+		return true, nil
+	}
+	// A manifest may already have been removed by an older release. Only the
+	// exact project comments and matching project chains are strong enough to
+	// adopt and delete that historic table.
+	return nftTableHasTrustedKworRuleEvidence(tableName, output), nil
+}
+
+func deleteOwnedNftTableForRuntime(tableFamily string, tableName string) error {
+	output, err := runNft("list", "table", tableFamily, tableName)
+	if err != nil {
+		if nftObjectMissing(err) {
+			return nil
+		}
+		return err
+	}
+	owned, err := nftTableIsSafeToDelete(tableFamily, tableName, output)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return fmt.Errorf("refuse to delete nft table without kwor ownership proof: %s %s", tableFamily, tableName)
+	}
+	_, err = runNft("delete", "table", tableFamily, tableName)
+	return err
+}
+
 func ensureNftBase() error {
 	if !nftSupported() {
 		return nil
 	}
+	if err := ensureNftRendererSupported(); err != nil {
+		return err
+	}
 
 	// Ensure table
-	_, err := runNft("list", "table", nftFamily, nftTable)
+	exists, err := inspectOwnedNftTableForMutation(nftFamily, nftTable)
 	if err != nil {
-		if _, addErr := runNft("add", "table", nftFamily, nftTable); addErr != nil {
+		return err
+	}
+	if !exists {
+		if addErr := createOwnedNftTable("nft-default-"+nftFamily, nftFamily, nftTable); addErr != nil {
 			return addErr
 		}
 	}
@@ -210,7 +500,10 @@ func ensureNftBase() error {
 	return nil
 }
 
-// ensureNftNatChain ensures the nat/prerouting chain exists for port hopping REDIRECT rules.
+// ensureNftNatChain ensures the NAT chains for port hopping REDIRECT rules.
+// nftables before Linux 5.2 cannot attach NAT base chains to inet tables, so
+// the compatibility layout keeps filter rules in inet and creates dedicated
+// ip/ip6 NAT tables with the same managed table name.
 func ensureNftNatChain() error {
 	if !nftSupported() {
 		return nil
@@ -218,18 +511,272 @@ func ensureNftNatChain() error {
 	if err := ensureNftBase(); err != nil {
 		return err
 	}
+	if nftUsesCompatibilityLayout() {
+		if err := removeNativeNftNatChain(); err != nil {
+			return err
+		}
+		return ensureNftCompatibilityNatChains()
+	}
+	if err := cleanupNftCompatibilityNatTables(); err != nil {
+		return err
+	}
 
-	_, err := runNft("list", "chain", nftFamily, nftTable, nftChainPrerouting)
-	if err != nil {
-		_, addErr := runNft(
-			"add", "chain", nftFamily, nftTable, nftChainPrerouting,
-			"{", "type", "nat", "hook", "prerouting", "priority", "dstnat", ";", "policy", "accept", ";", "}",
+	_, err := ensureManagedNftNatChain(
+		nftFamily,
+		nftChainPrerouting,
+		nftPreroutingNatChainSpec(),
+	)
+	return err
+}
+
+func nftCompatibilityNatFamilies() []string {
+	return []string{nftNatFamilyIPv4, nftNatFamilyIPv6}
+}
+
+func nftNatTableExists(tableFamily string, table string) bool {
+	if !nftSupported() {
+		return false
+	}
+	exists, err := inspectOwnedNftTableForMutation(tableFamily, table)
+	return err == nil && exists
+}
+
+func nftPreroutingNatChainSpec() []string {
+	return []string{"type", "nat", "hook", "prerouting", "priority", nftNatPreroutingPriority, ";", "policy", "accept", ";"}
+}
+
+func nftPostroutingNatChainSpec() []string {
+	return []string{"type", "nat", "hook", "postrouting", "priority", nftNatPostroutingPriority, ";", "policy", "accept", ";"}
+}
+
+func ensureNftCompatibilityNatChains() error {
+	createdTables := make(map[string]struct{})
+	createdChains := make([]nftManagedNatChain, 0, len(nftCompatibilityNatFamilies())*2)
+	rollback := func() {
+		// A table created by this call owns all of its just-created chains, so
+		// deleting the table is both safer and more complete. Chains added to a
+		// pre-existing panel table must be removed individually.
+		for i := len(createdChains) - 1; i >= 0; i-- {
+			chain := createdChains[i]
+			if _, createdTable := createdTables[chain.tableFamily]; createdTable {
+				continue
+			}
+			_, _ = runNft("flush", "chain", chain.tableFamily, nftTable, chain.name)
+			_, _ = runNft("delete", "chain", chain.tableFamily, nftTable, chain.name)
+		}
+		for _, tableFamily := range nftCompatibilityNatFamilies() {
+			if _, createdTable := createdTables[tableFamily]; !createdTable {
+				continue
+			}
+			_, _ = runNft("delete", "table", tableFamily, nftTable)
+		}
+	}
+
+	for _, tableFamily := range nftCompatibilityNatFamilies() {
+		createdTable, err := ensureManagedNftNatTable(tableFamily)
+		if err != nil {
+			rollback()
+			return err
+		}
+		if createdTable {
+			createdTables[tableFamily] = struct{}{}
+		}
+		createdChain, err := ensureManagedNftNatChain(
+			tableFamily,
+			nftChainPrerouting,
+			nftPreroutingNatChainSpec(),
 		)
-		if addErr != nil {
-			return addErr
+		if err != nil {
+			rollback()
+			return err
+		}
+		if createdChain {
+			createdChains = append(createdChains, nftManagedNatChain{tableFamily: tableFamily, name: nftChainPrerouting})
+		}
+		// Linux kernels before 4.18 require both NAT base hooks to be present
+		// for reply-path NAT. Keeping postrouting in every compatibility table
+		// is harmless on newer kernels and makes the layout deterministic.
+		createdChain, err = ensureManagedNftNatChain(
+			tableFamily,
+			nftChainPostrouting,
+			nftPostroutingNatChainSpec(),
+		)
+		if err != nil {
+			rollback()
+			return err
+		}
+		if createdChain {
+			createdChains = append(createdChains, nftManagedNatChain{tableFamily: tableFamily, name: nftChainPostrouting})
 		}
 	}
 	return nil
+}
+
+type nftManagedNatChain struct {
+	tableFamily string
+	name        string
+}
+
+func ensureManagedNftNatTable(tableFamily string) (bool, error) {
+	if exists, err := inspectOwnedNftTableForMutation(tableFamily, nftTable); err != nil {
+		return false, err
+	} else if exists {
+		return false, nil
+	}
+	if err := createOwnedNftTable("nft-default-"+tableFamily, tableFamily, nftTable); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func createOwnedNftTable(id string, tableFamily string, tableName string) error {
+	if err := ensureNftRendererSupported(); err != nil {
+		return err
+	}
+	if exists, err := inspectOwnedNftTableForMutation(tableFamily, tableName); err != nil {
+		return err
+	} else if exists {
+		return nil
+	}
+	ownership, err := BeginNftHostOwnership(id, []HostNftTable{{Family: tableFamily, Name: tableName}})
+	if err != nil {
+		return fmt.Errorf("record nft table ownership before creation: %w", err)
+	}
+	script := &strings.Builder{}
+	appendOwnedNftTableCreationScript(script, tableFamily, tableName)
+	if _, err := runNftScript(script.String()); err != nil {
+		return finishUnconfirmedNftCreationFailure(ownership, tableFamily, tableName, err)
+	}
+	if output, verifyErr := runNft("list", "table", tableFamily, tableName); verifyErr != nil || !nftTableHasOwnershipMarker(output) {
+		if verifyErr != nil {
+			return rollbackConfirmedNftCreation(ownership, tableFamily, tableName, fmt.Errorf("verify nft table ownership marker: %w", verifyErr))
+		}
+		return rollbackConfirmedNftCreation(ownership, tableFamily, tableName, fmt.Errorf("nft table ownership marker is missing after creation: %s %s", tableFamily, tableName))
+	}
+	if ownership.ID != "" {
+		if err := ActivateHostResource(ownership.ID); err != nil {
+			return rollbackConfirmedNftCreation(ownership, tableFamily, tableName, fmt.Errorf("activate nft table ownership: %w", err))
+		}
+	}
+	return nil
+}
+
+func appendOwnedNftTableCreationScript(script *strings.Builder, tableFamily string, tableName string) {
+	if GetNftablesCapabilities().SupportsTableComments {
+		script.WriteString(fmt.Sprintf("add table %s %s { comment %q; }\n", tableFamily, tableName, nftTableOwnershipMarker))
+	} else {
+		script.WriteString(fmt.Sprintf("add table %s %s\n", tableFamily, tableName))
+	}
+	script.WriteString(fmt.Sprintf("add chain %s %s %s\n", tableFamily, tableName, nftOwnershipChain))
+	script.WriteString(fmt.Sprintf(
+		"add rule %s %s %s counter comment %q\n",
+		tableFamily,
+		tableName,
+		nftOwnershipChain,
+		nftTableOwnershipMarker,
+	))
+}
+
+func finishUnconfirmedNftCreationFailure(ownership HostResource, tableFamily string, tableName string, cause error) error {
+	output, err := runNft("list", "table", tableFamily, tableName)
+	if err != nil && nftObjectMissing(err) {
+		if ownership.ID != "" {
+			if removeErr := RemoveHostResource(ownership.ID); removeErr != nil {
+				return fmt.Errorf("%w; clear absent nft ownership record: %v", cause, removeErr)
+			}
+		}
+		return cause
+	}
+	if err != nil {
+		return fmt.Errorf("%w; inspect failed nft creation result: %v", cause, err)
+	}
+	if !nftTableHasOwnershipMarker(output) {
+		return fmt.Errorf("%w; a same-name nft table appeared without kwor ownership proof", cause)
+	}
+	return rollbackConfirmedNftCreation(ownership, tableFamily, tableName, cause)
+}
+
+func rollbackConfirmedNftCreation(ownership HostResource, tableFamily string, tableName string, cause error) error {
+	if _, err := runNft("delete", "table", tableFamily, tableName); err != nil && !nftObjectMissing(err) {
+		return fmt.Errorf("%w; rollback nft table %s %s failed: %v", cause, tableFamily, tableName, err)
+	}
+	if _, err := runNft("list", "table", tableFamily, tableName); err == nil {
+		return fmt.Errorf("%w; rollback nft table %s %s did not remove the table", cause, tableFamily, tableName)
+	} else if !nftObjectMissing(err) {
+		return fmt.Errorf("%w; verify nft table rollback failed: %v", cause, err)
+	}
+	if ownership.ID != "" {
+		if err := RemoveHostResource(ownership.ID); err != nil {
+			return fmt.Errorf("%w; clear rolled-back nft ownership record: %v", cause, err)
+		}
+	}
+	return cause
+}
+
+func ensureManagedNftNatChain(tableFamily string, chainName string, spec []string) (bool, error) {
+	if _, err := runNft("list", "chain", tableFamily, nftTable, chainName); err == nil {
+		return false, nil
+	} else if !nftObjectMissing(err) {
+		return false, err
+	}
+	args := []string{"add", "chain", tableFamily, nftTable, chainName, "{"}
+	args = append(args, spec...)
+	args = append(args, "}")
+	if _, err := runNft(args...); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func removeNativeNftNatChain() error {
+	if exists, err := inspectOwnedNftTableForMutation(nftFamily, nftTable); err != nil {
+		return err
+	} else if !exists {
+		return nil
+	}
+	var firstErr error
+	for _, chain := range []string{nftChainPrerouting, nftChainPostrouting} {
+		if _, err := runNft("list", "chain", nftFamily, nftTable, chain); err != nil {
+			if !nftObjectMissing(err) && firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if _, err := runNft("flush", "chain", nftFamily, nftTable, chain); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if _, err := runNft("delete", "chain", nftFamily, nftTable, chain); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func cleanupNftCompatibilityNatTables() error {
+	var firstErr error
+	for _, tableFamily := range nftCompatibilityNatFamilies() {
+		if err := deleteOwnedNftTableForRuntime(tableFamily, nftTable); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func nftTransportPortMatchArgs(direction string) []string {
+	if GetNftablesCapabilities().SupportsTransportHeader {
+		return []string{"th", direction}
+	}
+	if direction == "sport" {
+		return []string{"@th,0,16"}
+	}
+	return []string{"@th,16,16"}
+}
+
+func appendNftTransportPortMatch(args []string, direction string) []string {
+	return append(args, nftTransportPortMatchArgs(direction)...)
 }
 
 func addPortCounterRule(chain string, port int, direction string, comment string) (int, error) {
@@ -246,10 +793,9 @@ func addPortCounterRule(chain string, port int, direction string, comment string
 		"add", "rule",
 		nftFamily, nftTable, chain,
 		"meta", "l4proto", "{", "tcp", ",", "udp", "}",
-		"th", direction, fmt.Sprint(port),
-		"counter",
-		"comment", comment,
 	}
+	args = appendNftTransportPortMatch(args, direction)
+	args = append(args, fmt.Sprint(port), "counter", "comment", comment)
 	_, err := runNft(args...)
 	if err != nil {
 		return 0, err
@@ -303,12 +849,13 @@ func addPortRateLimitRule(chain string, port int, direction string, bytesPerSeco
 		"add", "rule",
 		nftFamily, nftTable, chain,
 		"meta", "l4proto", "{", "tcp", ",", "udp", "}",
-		"th", direction, fmt.Sprint(port),
-		"limit", "rate", "over", fmt.Sprint(bytesPerSecond), "bytes/second",
-		"counter",
-		"drop",
-		"comment", comment,
 	}
+	args = appendNftTransportPortMatch(args, direction)
+	args = append(args,
+		fmt.Sprint(port),
+		"limit", "rate", "over", fmt.Sprint(bytesPerSecond), "bytes/second",
+		"counter", "drop", "comment", comment,
+	)
 	if _, err := runNft(args...); err != nil {
 		return 0, err
 	}
@@ -337,11 +884,9 @@ func addPortDropRule(chain string, port int, direction string, comment string) (
 		"add", "rule",
 		nftFamily, nftTable, chain,
 		"meta", "l4proto", "{", "tcp", ",", "udp", "}",
-		"th", direction, fmt.Sprint(port),
-		"counter",
-		"drop",
-		"comment", comment,
 	}
+	args = appendNftTransportPortMatch(args, direction)
+	args = append(args, fmt.Sprint(port), "counter", "drop", "comment", comment)
 	if _, err := runNft(args...); err != nil {
 		return 0, err
 	}
@@ -373,8 +918,8 @@ func addPortRangeDropRule(chain string, direction string, ranges []portRange, co
 		"add", "rule",
 		nftFamily, nftTable, chain,
 		"meta", "l4proto", "{", "tcp", ",", "udp", "}",
-		"th", direction,
 	}
+	args = appendNftTransportPortMatch(args, direction)
 	args = append(args, portSetArgs...)
 	args = append(args, "counter", "drop", "comment", comment)
 
@@ -537,8 +1082,9 @@ func addDropExceptPortsRule(chain string, direction string, allowedPorts []int, 
 		"add", "rule",
 		nftFamily, nftTable, chain,
 		"meta", "l4proto", "{", "tcp", ",", "udp", "}",
-		"th", direction, "!=",
 	}
+	args = appendNftTransportPortMatch(args, direction)
+	args = append(args, "!=")
 	args = append(args, portSetArgs...)
 	args = append(args, "counter", "drop", "comment", comment)
 
@@ -600,6 +1146,13 @@ func addRedirectRuleWithProtocols(hopPortsNft string, listenPort int, comment st
 	if err := ensureNftNatChain(); err != nil {
 		return 0, err
 	}
+	if nftUsesCompatibilityLayout() {
+		return addCompatibilityRedirectRule(hopPortsNft, listenPort, comment, includeTCP)
+	}
+	return addNativeRedirectRule(hopPortsNft, listenPort, comment, includeTCP)
+}
+
+func addNativeRedirectRule(hopPortsNft string, listenPort int, comment string, includeTCP bool) (int, error) {
 
 	// Build port set args: { 899-999 , 5000-6000 }
 	portSetArgs := buildNftPortSetArgs(hopPortsNft)
@@ -617,7 +1170,7 @@ func addRedirectRuleWithProtocols(hopPortsNft string, listenPort int, comment st
 	} else {
 		args = append(args, "meta", "l4proto", "udp")
 	}
-	args = append(args, "th", "dport")
+	args = appendNftTransportPortMatch(args, "dport")
 	args = append(args, portSetArgs...)
 	args = append(args, "redirect", "to", fmt.Sprintf(":%d", listenPort))
 	args = append(args, "comment", comment)
@@ -652,6 +1205,43 @@ func addRedirectRuleWithProtocols(hopPortsNft string, listenPort int, comment st
 	}
 
 	logger.Warning("nftables REDIRECT rule created but handle not found for comment: ", comment)
+	return 0, nil
+}
+
+func addCompatibilityRedirectRule(hopPortsNft string, listenPort int, comment string, includeTCP bool) (int, error) {
+	portSetArgs := buildNftPortSetArgs(hopPortsNft)
+	if len(portSetArgs) == 0 {
+		return 0, nil
+	}
+
+	addedFamilies := make([]string, 0, len(nftCompatibilityNatFamilies()))
+	for _, tableFamily := range nftCompatibilityNatFamilies() {
+		args := []string{"add", "rule", tableFamily, nftTable, nftChainPrerouting}
+		if includeTCP {
+			args = append(args, "meta", "l4proto", "{", "tcp", ",", "udp", "}")
+		} else {
+			args = append(args, "meta", "l4proto", "udp")
+		}
+		args = appendNftTransportPortMatch(args, "dport")
+		args = append(args, portSetArgs...)
+		args = append(args, "redirect", "to", fmt.Sprintf(":%d", listenPort), "comment", comment)
+		if _, err := runNft(args...); err != nil {
+			var rollbackErr error
+			for _, addedFamily := range addedFamilies {
+				if cleanupErr := deleteNftRulesByExactComment(addedFamily, nftTable, nftChainPrerouting, comment); cleanupErr != nil && rollbackErr == nil {
+					rollbackErr = cleanupErr
+				}
+			}
+			if rollbackErr != nil {
+				return 0, fmt.Errorf("add compatibility REDIRECT for %s failed: %w; rollback failed: %v", tableFamily, err, rollbackErr)
+			}
+			return 0, err
+		}
+		addedFamilies = append(addedFamilies, tableFamily)
+	}
+
+	// A single database handle cannot represent the two managed NAT rules.
+	// Compatibility callers use the stable comment for lifecycle operations.
 	return 0, nil
 }
 
@@ -924,6 +1514,165 @@ var deleteRuleByHandleFn = func(chain string, handle int) error {
 	return err
 }
 
+func findNftRuleHandlesByExactComment(tableFamily string, table string, chain string, comment string) ([]int, error) {
+	if !nftSupported() || comment == "" {
+		return nil, nil
+	}
+	out, err := runNft("--handle", "--numeric", "list", "chain", tableFamily, table, chain)
+	if err != nil {
+		if nftObjectMissing(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	handles := make([]int, 0)
+	for _, line := range strings.Split(string(out), "\n") {
+		if !ruleLineHasExactComment(line, comment) {
+			continue
+		}
+		match := nftHandleRe.FindStringSubmatch(line)
+		if len(match) != 2 {
+			continue
+		}
+		handle, convErr := strconv.Atoi(match[1])
+		if convErr == nil && handle > 0 {
+			handles = append(handles, handle)
+		}
+	}
+	return handles, nil
+}
+
+func deleteNftRulesByExactComment(tableFamily string, table string, chain string, comment string) error {
+	handles, err := findNftRuleHandlesByExactComment(tableFamily, table, chain, comment)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, handle := range handles {
+		if _, deleteErr := runNft("delete", "rule", tableFamily, table, chain, "handle", strconv.Itoa(handle)); deleteErr != nil && firstErr == nil {
+			firstErr = deleteErr
+		}
+	}
+	return firstErr
+}
+
+type nftRuleLocation struct {
+	tableFamily string
+	table       string
+	chain       string
+}
+
+func nftRedirectRuleLocations() []nftRuleLocation {
+	locations := make([]nftRuleLocation, 0, 1+len(nftCompatibilityNatFamilies()))
+	locations = append(locations, nftRuleLocation{tableFamily: nftFamily, table: nftTable, chain: nftChainPrerouting})
+	for _, tableFamily := range nftCompatibilityNatFamilies() {
+		locations = append(locations, nftRuleLocation{tableFamily: tableFamily, table: nftTable, chain: nftChainPrerouting})
+	}
+	return locations
+}
+
+func nftRedirectLocationIsCurrent(location nftRuleLocation) bool {
+	if nftUsesCompatibilityLayout() {
+		return location.tableFamily == nftNatFamilyIPv4 || location.tableFamily == nftNatFamilyIPv6
+	}
+	return location.tableFamily == nftFamily
+}
+
+// nftRedirectRuleExistsByComment is an integrity check, not merely a lookup.
+// A managed REDIRECT is valid only when every current-layout table has exactly
+// one matching rule and every other layout has none. This makes duplicate and
+// stale cross-layout rules self-heal through the existing caller lifecycle.
+func nftRedirectRuleExistsByComment(comment string) bool {
+	if !nftSupported() || comment == "" {
+		return false
+	}
+	for _, location := range nftRedirectRuleLocations() {
+		handles, err := findNftRuleHandlesByExactComment(location.tableFamily, location.table, location.chain, comment)
+		if err != nil {
+			return false
+		}
+		if nftRedirectLocationIsCurrent(location) {
+			if len(handles) != 1 {
+				return false
+			}
+			continue
+		}
+		if len(handles) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// nftRedirectRuleExistsInAnyLayout is used by cleanup paths. Unlike the
+// strict integrity predicate above, it deliberately reports stale and
+// duplicate rules so a disabled port-hop configuration can remove them.
+func nftRedirectRuleExistsInAnyLayout(comment string) bool {
+	if !nftSupported() || comment == "" {
+		return false
+	}
+	for _, location := range nftRedirectRuleLocations() {
+		handles, err := findNftRuleHandlesByExactComment(location.tableFamily, location.table, location.chain, comment)
+		if err == nil && len(handles) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func findNftRedirectHandleByComment(comment string) int {
+	if nftUsesCompatibilityLayout() {
+		return 0
+	}
+	return findHandleByComment(nftChainPrerouting, comment)
+}
+
+// deleteNftRedirectRulesByComment removes both current and previous managed
+// layouts. This is required when a host capability profile changes at runtime.
+func deleteNftRedirectRulesByComment(comment string) error {
+	if !nftSupported() || comment == "" {
+		return nil
+	}
+	var firstErr error
+	for _, location := range nftRedirectRuleLocations() {
+		if err := deleteNftRulesByExactComment(location.tableFamily, location.table, location.chain, comment); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func listNftRedirectCommentsByPrefix(prefix string) ([]string, error) {
+	if !nftSupported() || prefix == "" {
+		return nil, nil
+	}
+	seen := make(map[string]struct{})
+	comments := make([]string, 0)
+	var firstErr error
+	for _, tableFamily := range append([]string{nftFamily}, nftCompatibilityNatFamilies()...) {
+		out, err := runNft("--handle", "--numeric", "list", "chain", tableFamily, nftTable, nftChainPrerouting)
+		if err != nil {
+			if !nftObjectMissing(err) && firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			comment, ok := extractRuleComment(line)
+			if !ok || !strings.HasPrefix(comment, prefix) {
+				continue
+			}
+			if _, exists := seen[comment]; exists {
+				continue
+			}
+			seen[comment] = struct{}{}
+			comments = append(comments, comment)
+		}
+	}
+	return comments, firstErr
+}
+
 // deleteRuleByComment deletes all rules in the given chain that contain the specified comment.
 // Used as fallback when handle is unknown (0).
 func deleteRuleByComment(chain string, comment string) error {
@@ -988,25 +1737,23 @@ func findHandleByComment(chain string, comment string) int {
 	return 0
 }
 
-// cleanupNftTable deletes the entire kwor nftables table and all its rules.
+// cleanupNftTable deletes every managed default-core table, including the
+// compatibility ip/ip6 NAT tables used on kernels without inet NAT support.
 // Called on program shutdown to avoid leaving stale rules.
 func cleanupNftTable() {
 	if !nftSupported() {
 		return
 	}
 
-	// Check if table exists first
-	_, err := runNft("list", "table", nftFamily, nftTable)
-	if err != nil {
-		return // table doesn't exist, nothing to clean
-	}
-
-	// Delete the entire table (this removes all chains and rules inside it)
-	_, err = runNft("delete", "table", nftFamily, nftTable)
-	if err != nil {
-		logger.Warning("failed to delete nftables table ", nftTable, ": ", err)
-	} else {
-		logger.Info("nftables table ", nftFamily, " ", nftTable, " cleaned up")
+	for _, tableFamily := range append([]string{nftFamily}, nftCompatibilityNatFamilies()...) {
+		if err := deleteOwnedNftTableForRuntime(tableFamily, nftTable); err != nil {
+			if nftObjectMissing(err) {
+				continue
+			}
+			logger.Warning("failed to delete nftables table ", tableFamily, " ", nftTable, ": ", err)
+		} else {
+			logger.Info("nftables table ", tableFamily, " ", nftTable, " cleaned up")
+		}
 	}
 }
 
@@ -1017,8 +1764,14 @@ func CleanupAllNftRulesForCommand() {
 	if err := cleanupManagedFirewallTable(); err != nil && !firewallNftObjectMissing(err) {
 		logger.Warning("failed to cleanup managed firewall nft table: ", err)
 	}
-	if err := cleanupManagedPortForwardTable(); err != nil && !portForwardNftObjectMissing(err) {
-		logger.Warning("failed to cleanup managed port-forward nft table: ", err)
+	if portForwardSupported() {
+		if err := cleanupManagedPortForwardTable(); err != nil && !portForwardNftObjectMissing(err) {
+			logger.Warning("failed to cleanup managed port-forward nft table: ", err)
+		} else if err := restorePortForwardKernelForwarding(); err != nil {
+			// Restore only after every owned table was removed successfully. The
+			// stored baseline remains for the next safe cleanup attempt on error.
+			logger.Warning("failed to restore managed forwarding sysctl state: ", err)
+		}
 	}
 }
 
@@ -1030,8 +1783,8 @@ var nftTableExistsFn = func() bool {
 	if !nftSupported() {
 		return false
 	}
-	_, err := runNft("list", "table", nftFamily, nftTable)
-	return err == nil
+	exists, err := inspectOwnedNftTableForMutation(nftFamily, nftTable)
+	return err == nil && exists
 }
 
 func nftObjectMissing(err error) bool {
@@ -1068,11 +1821,32 @@ func getChainRuleBytesByHandle(chain string, handle int) (int64, error) {
 		return 0, err
 	}
 
-	out, err := runNft("-j", "list", "chain", nftFamily, nftTable, chain)
-	if err != nil {
-		return 0, err
-	}
+	if GetNftablesCapabilities().SupportsJSON {
+		out, err := runNft("-j", "list", "chain", nftFamily, nftTable, chain)
+		if err == nil {
+			bytes, parseErr := getChainRuleBytesByHandleFromJSON(out, chain, handle)
+			if parseErr == nil {
+				return bytes, nil
+			}
+			err = parseErr
+		}
 
+		// A runtime can report a newer version while a restricted nft binary
+		// rejects JSON. Fall back to the text parser before treating the
+		// counter as unavailable.
+		textBytes, textErr := getChainRuleBytesByHandleFromTextNft(chain, handle)
+		if textErr == nil {
+			return textBytes, nil
+		}
+		if err != nil {
+			return 0, fmt.Errorf("read nft counter by json failed: %w; text fallback failed: %v", err, textErr)
+		}
+		return 0, textErr
+	}
+	return getChainRuleBytesByHandleFromTextNft(chain, handle)
+}
+
+func getChainRuleBytesByHandleFromJSON(out []byte, chain string, handle int) (int64, error) {
 	var parsed nftList
 	if err := json.Unmarshal(out, &parsed); err != nil {
 		return 0, fmt.Errorf("parse nft json failed: %w", err)
@@ -1102,5 +1876,36 @@ func getChainRuleBytesByHandle(chain string, handle int) (int64, error) {
 		return 0, nil
 	}
 
+	return 0, fmt.Errorf("nft rule handle %d not found in %s", handle, chain)
+}
+
+func getChainRuleBytesByHandleFromTextNft(chain string, handle int) (int64, error) {
+	out, err := runNft("--handle", "--numeric", "list", "chain", nftFamily, nftTable, chain)
+	if err != nil {
+		return 0, err
+	}
+	return getChainRuleBytesByHandleFromText(out, chain, handle)
+}
+
+func getChainRuleBytesByHandleFromText(out []byte, chain string, handle int) (int64, error) {
+	for _, line := range strings.Split(string(out), "\n") {
+		match := nftHandleRe.FindStringSubmatch(line)
+		if len(match) != 2 {
+			continue
+		}
+		currentHandle, convErr := strconv.Atoi(match[1])
+		if convErr != nil || currentHandle != handle {
+			continue
+		}
+		counterMatch := nftCounterBytesRe.FindStringSubmatch(line)
+		if len(counterMatch) != 2 {
+			return 0, nil
+		}
+		bytes, bytesErr := strconv.ParseInt(counterMatch[1], 10, 64)
+		if bytesErr != nil {
+			return 0, fmt.Errorf("parse nft counter bytes for handle %d: %w", handle, bytesErr)
+		}
+		return bytes, nil
+	}
 	return 0, fmt.Errorf("nft rule handle %d not found in %s", handle, chain)
 }

@@ -32,16 +32,10 @@ func getManagedCoreRuntimeMode() managedCoreRuntimeMode {
 }
 
 func detectManagedCoreRuntimeMode() managedCoreRuntimeMode {
-	if runtime.GOOS != "linux" {
-		return managedCoreRuntimeModeDirect
+	if isKworSystemdHost() {
+		return managedCoreRuntimeModeSystemd
 	}
-	if runningInsideContainer() {
-		return managedCoreRuntimeModeDirect
-	}
-	if _, err := exec.LookPath("systemctl"); err != nil {
-		return managedCoreRuntimeModeDirect
-	}
-	return managedCoreRuntimeModeSystemd
+	return managedCoreRuntimeModeDirect
 }
 
 func runningInsideContainer() bool {
@@ -82,12 +76,42 @@ func RunningInsideContainer() bool {
 	return runningInsideContainer()
 }
 
+// RunningInsideDocker is narrower than generic container detection. Only the
+// packaged Docker image has the documented /app/Promanager_data mount layout.
+func RunningInsideDocker() bool {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("KWOR_RUNTIME_MODE")))
+	if mode != "" {
+		return mode == "docker"
+	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("KWOR_IN_DOCKER")), "true") {
+		return true
+	}
+	_, err := os.Stat("/.dockerenv")
+	return err == nil
+}
+
+// isKworSystemdHost verifies that a reachable system manager exists. Some
+// non-systemd Linux distributions ship a systemctl compatibility binary.
+func isKworSystemdHost() bool {
+	if runtime.GOOS != "linux" || runningInsideContainer() {
+		return false
+	}
+	if _, err := os.Stat("/run/systemd/system"); err != nil {
+		return false
+	}
+	systemctl, err := exec.LookPath("systemctl")
+	if err != nil {
+		return false
+	}
+	return runCommandWithTimeout(shortSystemCommandTimeout, systemctl, "show-environment") == nil
+}
+
 func shouldUseDirectManagedCoreRuntime() bool {
 	return getManagedCoreRuntimeMode() == managedCoreRuntimeModeDirect
 }
 
 func ShouldAutoRecoverManagedCoreRuntime(coreName string) bool {
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return false
 	}
 	if !shouldUseDirectManagedCoreRuntime() {

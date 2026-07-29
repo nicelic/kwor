@@ -21,7 +21,13 @@ func initTimeLocationSettingTestDB(t *testing.T) *SettingService {
 		})
 	}
 
-	return &SettingService{}
+	settingService := &SettingService{}
+	// 这些既有规范化测试不验证首次启动远端逻辑，预置 UTC 以避免测试
+	// 因真实网络状态而等待。
+	if err := settingService.SaveSetting("timeLocation", "UTC"); err != nil {
+		t.Fatalf("seed panel timezone failed: %v", err)
+	}
+	return settingService
 }
 
 func TestExtractTimeLocationFromZoneinfoPathSupportsPosixAndRight(t *testing.T) {

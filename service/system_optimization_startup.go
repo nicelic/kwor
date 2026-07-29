@@ -1,7 +1,6 @@
 package service
 
 import (
-	"runtime"
 	"strings"
 
 	"github.com/alireza0/s-ui/util/common"
@@ -10,7 +9,7 @@ import (
 // ReconcileSystemOptimizationOnStartup enforces startup lock policy for managed
 // sysctl and journald files based on their switches.
 func ReconcileSystemOptimizationOnStartup() error {
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return nil
 	}
 

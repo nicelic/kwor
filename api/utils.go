@@ -17,24 +17,29 @@ type Msg struct {
 }
 
 func getRemoteIp(c *gin.Context) string {
-	value := c.GetHeader("X-Forwarded-For")
-	if value != "" {
-		ips := strings.Split(value, ",")
-		return ips[0]
-	} else {
-		addr := c.Request.RemoteAddr
-		ip, _, _ := net.SplitHostPort(addr)
-		return ip
+	if c == nil || c.Request == nil {
+		return ""
 	}
+	addr := strings.TrimSpace(c.Request.RemoteAddr)
+	ip, _, err := net.SplitHostPort(addr)
+	if err == nil {
+		return strings.TrimSpace(ip)
+	}
+	return addr
 }
 
 func getHostname(c *gin.Context) string {
-	host := c.Request.Host
-	if strings.Contains(host, ":") {
-		host, _, _ = net.SplitHostPort(c.Request.Host)
-		if strings.Contains(host, ":") {
-			host = "[" + host + "]"
-		}
+	if c == nil || c.Request == nil {
+		return ""
+	}
+	host := strings.TrimSpace(c.Request.Host)
+	if splitHost, _, err := net.SplitHostPort(host); err == nil {
+		host = splitHost
+	} else if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	}
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
 	}
 	return host
 }

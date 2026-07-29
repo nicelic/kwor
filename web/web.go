@@ -28,8 +28,8 @@ import (
 
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-contrib/sessions"
-	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
+	gorillaSessions "github.com/gorilla/sessions"
 )
 
 //go:embed *
@@ -42,6 +42,8 @@ type Server struct {
 	cancel         context.CancelFunc
 	settingService service.SettingService
 	balanceService service.PanelCertificateBalanceService
+	coreManager    *service.CoreManagerService
+	mihomoManager  *service.MihomoCoreManagerService
 	tlsMu          sync.RWMutex
 	tlsMaterials   []*tlsRuntimeCertificate
 	tlsDefaultFP   string
@@ -60,6 +62,23 @@ type tlsRuntimeCertificate struct {
 	notAfter     time.Time
 }
 
+// gin-contrib's cookie.Store hides Gorilla CookieStore.MaxAge. Keep the
+// adapter local so securecookie decoding is bounded on the server as well as
+// by the per-login session registry in api/session.go.
+type sessionCookieStore struct {
+	*gorillaSessions.CookieStore
+}
+
+func (s *sessionCookieStore) Options(options sessions.Options) {
+	s.CookieStore.Options = options.ToGorillaOptions()
+}
+
+func newSessionCookieStore(secret []byte) *sessionCookieStore {
+	store := &sessionCookieStore{CookieStore: gorillaSessions.NewCookieStore(secret)}
+	store.MaxAge(api.SessionCookieCodecMaxAgeSeconds())
+	return store
+}
+
 func NewServer() *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
@@ -68,6 +87,14 @@ func NewServer() *Server {
 		tlsConns:      make(map[*network.ManagedTLSConn]struct{}),
 		tlsSelections: make(map[*network.ManagedTLSConn]service.PanelCertificateBalanceSelection),
 	}
+}
+
+func (s *Server) SetCoreManagers(coreManager *service.CoreManagerService, mihomoManager *service.MihomoCoreManagerService) {
+	if s == nil {
+		return
+	}
+	s.coreManager = coreManager
+	s.mihomoManager = mihomoManager
 }
 
 func (s *Server) initRouter() (*gin.Engine, error) {
@@ -111,14 +138,17 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	engine.Use(gzip.Gzip(gzip.DefaultCompression))
 	assetsBasePath := base_url + "assets/"
 
-	store := cookie.NewStore(secret)
-	engine.Use(sessions.Sessions("kwor", store))
+	store := newSessionCookieStore(secret)
+	engine.Use(sessions.Sessions(sessionCookieName(secret), store))
 
 	engine.Use(func(c *gin.Context) {
-		uri := c.Request.RequestURI
+		uri := c.Request.URL.Path
 		if strings.HasPrefix(uri, assetsBasePath) {
 			c.Header("Cache-Control", "max-age=31536000")
+		} else {
+			api.SetNoStoreResponseHeaders(c)
 		}
+		c.Next()
 	})
 
 	// Serve the assets folder
@@ -130,10 +160,10 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	engine.StaticFS(assetsBasePath, http.FS(assetsFS))
 
 	group_apiv2 := engine.Group(base_url + "apiv2")
-	apiv2 := api.NewAPIv2Handler(group_apiv2)
+	apiv2 := api.NewAPIv2HandlerWithCoreManagers(group_apiv2, s.coreManager, s.mihomoManager)
 
 	group_api := engine.Group(base_url + "api")
-	api.NewAPIHandler(group_api, apiv2)
+	api.NewAPIHandlerWithCoreManagers(group_api, apiv2, s.coreManager, s.mihomoManager)
 
 	// Serve index.html as the entry point
 	// Handle all other routes by serving index.html
@@ -190,6 +220,11 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	return engine, nil
 }
 
+func sessionCookieName(secret []byte) string {
+	sum := sha256.Sum256(secret)
+	return "kwor_" + hex.EncodeToString(sum[:6])
+}
+
 func (s *Server) Start() (err error) {
 	//This is an anonymous function, no function name
 	defer func() {
@@ -216,6 +251,7 @@ func (s *Server) Start() (err error) {
 	if err != nil {
 		return err
 	}
+	var serverTLSConfig *tls.Config
 	s.setTLSListenerKey(service.PanelCertificateBalanceListenerKey(service.PanelSelfSignedTargetPanel, port))
 
 	materials, _, materialErr := service.EnsurePanelTLSMaterials(&s.settingService, service.PanelSelfSignedTargetPanel, time.Now())
@@ -230,9 +266,8 @@ func (s *Server) Start() (err error) {
 			logger.Info("web server run http on", listener.Addr())
 		} else {
 			s.setTLSState(certs)
-			c := &tls.Config{
-				GetCertificate: s.getTLSCertificate,
-			}
+			c := network.NewHTTPServerTLSConfig(s.getTLSCertificate)
+			serverTLSConfig = c.Clone()
 			listener = network.NewManagedTLSListener(listener)
 			listener = network.NewAutoHttpsListener(listener)
 			listener = tls.NewListener(listener, c)
@@ -249,8 +284,14 @@ func (s *Server) Start() (err error) {
 	s.listener = listener
 
 	s.httpServer = &http.Server{
-		Handler:   engine,
-		ConnState: s.trackTLSConn,
+		Handler:           engine,
+		TLSConfig:         serverTLSConfig,
+		ReadTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 15 * time.Second,
+		WriteTimeout:      20 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+		ConnState:         s.trackTLSConn,
 	}
 
 	go func() {
@@ -270,6 +311,9 @@ func (s *Server) Stop() error {
 		err = s.httpServer.Shutdown(shutdownCtx)
 		if err != nil {
 			logger.Warning("web server shutdown error:", err)
+			if closeErr := s.httpServer.Close(); closeErr != nil {
+				logger.Warning("force close web server failed:", closeErr)
+			}
 		}
 	}
 	if s.listener != nil {
@@ -278,7 +322,7 @@ func (s *Server) Stop() error {
 	}
 	s.releaseAllTLSSelections()
 	s.cancel()
-	return nil
+	return err
 }
 
 func (s *Server) Restart() error {
@@ -338,8 +382,8 @@ func (s *Server) clearTLSState() {
 }
 
 func (s *Server) trackTLSConn(conn net.Conn, state http.ConnState) {
-	managedConn, ok := conn.(*network.ManagedTLSConn)
-	if !ok || managedConn == nil {
+	managedConn := network.ManagedTLSConnFromNetConn(conn)
+	if managedConn == nil {
 		return
 	}
 	switch state {
@@ -551,7 +595,7 @@ func (s *Server) selectBalancedTLSRuntimeCertificate(candidates []*tlsRuntimeCer
 	if len(filtered) == 0 {
 		return nil, service.PanelCertificateBalanceSelection{}
 	}
-	if len(ids) == 0 || strings.TrimSpace(listenerKey) == "" {
+	if len(ids) < 2 || strings.TrimSpace(listenerKey) == "" {
 		return filtered[0], service.PanelCertificateBalanceSelection{}
 	}
 	selectedID, selection, err := s.balanceService.Reserve(listenerKey, sniBucket, ids)

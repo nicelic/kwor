@@ -81,8 +81,14 @@ func FillOutJson(i *model.Inbound, hostname string) error {
 	if outJson == nil {
 		outJson = make(map[string]interface{})
 	}
+	// Older panel builds could leave list-view metadata in the reusable
+	// outbound template. It must not survive into subscriptions.
+	StripSubscriptionOutboundPanelFields(outJson)
 
-	if i.TlsId > 0 {
+	if i.Type == "shadowquic" {
+		// ShadowQUIC has native sni/alpn fields and must never inherit mihomo_TLS.
+		delete(outJson, "tls")
+	} else if i.TlsId > 0 {
 		addTls(&outJson, i.Tls)
 	} else {
 		// ShadowTLS 的客户端配置使用 out_json.tls（包含 utls/fingerprint），
@@ -116,6 +122,8 @@ func FillOutJson(i *model.Inbound, hostname string) error {
 		shadowsocksOut(&outJson, *inbound)
 	case "shadowtls":
 		shadowTlsOut(&outJson, *inbound)
+	case "shadowquic":
+		shadowQUICOut(&outJson, *inbound)
 	case "hysteria":
 		hysteriaOut(&outJson, *inbound)
 	case "hysteria2":
@@ -341,10 +349,114 @@ func shadowTlsOut(out *map[string]interface{}, inbound map[string]interface{}) {
 	}
 }
 
+func shadowQUICOut(out *map[string]interface{}, inbound map[string]interface{}) {
+	if out == nil || *out == nil {
+		return
+	}
+
+	// The listener owns these protocol fields. Remove a previously generated
+	// client value before copying the current server-side configuration.
+	for _, key := range []string{
+		"sni",
+		"alpn",
+		"quic_versions",
+		"quic-versions",
+		"zero_rtt",
+		"zero-rtt",
+		"congestion_controller",
+		"congestion-controller",
+		"up",
+		"down",
+		"cwnd",
+		"bbr_profile",
+		"bbr-profile",
+		"max_datagram_frame_size",
+		"max-datagram-frame-size",
+		"recv_window_conn",
+		"recv-window-conn",
+		"recv_window",
+		"recv-window",
+		"disable_mtu_discovery",
+		"disable-mtu-discovery",
+	} {
+		delete(*out, key)
+	}
+	delete(*out, "tls")
+	delete(*out, "jls_upstream")
+	delete(*out, "jls-upstream")
+	delete(*out, "routing_mark")
+	delete(*out, "routing-mark")
+	delete(*out, "rule")
+	delete(*out, "proxy")
+	delete(*out, "detour")
+
+	if upstream := shadowQUICInboundUpstream(inbound); upstream != nil {
+		if sni := strings.TrimSpace(shadowQUICString(upstream["sni"])); sni != "" {
+			(*out)["sni"] = sni
+		}
+	}
+	if alpn := NormalizeMihomoShadowQUICALPN(inbound["alpn"]); len(alpn) > 0 {
+		(*out)["alpn"] = alpn
+	}
+	if versions := NormalizeMihomoShadowQUICVersions(firstShadowQUICValue(inbound, "quic_versions", "quic-versions")); len(versions) > 0 {
+		(*out)["quic_versions"] = versions
+	}
+	if zeroRTT, ok := firstShadowQUICValue(inbound, "zero_rtt", "zero-rtt").(bool); ok {
+		(*out)["zero_rtt"] = zeroRTT
+	}
+	if controller, ok := NormalizeMihomoShadowQUICCongestionController(firstShadowQUICValue(inbound, "congestion_controller", "congestion-controller")); ok {
+		(*out)["congestion_controller"] = controller
+	}
+	copyShadowQUICBandwidth(inbound, *out, "up", "up")
+	copyShadowQUICBandwidth(inbound, *out, "down", "down")
+	copyShadowQUICNonNegativeInt(inbound, *out, "cwnd", "cwnd")
+	if profile, ok := NormalizeMihomoBBRProfile(firstShadowQUICValue(inbound, "bbr_profile", "bbr-profile")); ok {
+		(*out)["bbr_profile"] = profile
+	}
+	copyShadowQUICNonNegativeInt(inbound, *out, "max_datagram_frame_size", "max_datagram_frame_size", "max-datagram-frame-size")
+	copyShadowQUICNonNegativeInt(inbound, *out, "recv_window_conn", "recv_window_conn", "recv-window-conn")
+	copyShadowQUICNonNegativeInt(inbound, *out, "recv_window", "recv_window")
+	if disableMTUDiscovery, ok := firstShadowQUICValue(inbound, "disable_mtu_discovery", "disable-mtu-discovery").(bool); ok {
+		(*out)["disable_mtu_discovery"] = disableMTUDiscovery
+	}
+
+	SanitizeMihomoShadowQUICInboundTemplate(*out)
+	if _, exists := (*out)["udp_over_stream"]; !exists {
+		(*out)["udp_over_stream"] = false
+	}
+	if _, exists := (*out)["keep_alive_interval"]; !exists {
+		(*out)["keep_alive_interval"] = 10000
+	}
+	if _, exists := (*out)["max_open_streams"]; !exists {
+		(*out)["max_open_streams"] = 1024
+	}
+}
+
+func shadowQUICInboundUpstream(inbound map[string]interface{}) map[string]interface{} {
+	if inbound == nil {
+		return nil
+	}
+	upstream, _ := inbound["jls-upstream"].(map[string]interface{})
+	if canonical, ok := inbound["jls_upstream"].(map[string]interface{}); ok && canonical != nil {
+		if upstream == nil {
+			upstream = map[string]interface{}{}
+		}
+		for key, value := range canonical {
+			upstream[key] = value
+		}
+	}
+	return upstream
+}
+
 func hysteriaOut(out *map[string]interface{}, inbound map[string]interface{}) {
 	clientUpMbps, hasClientUpMbps := positiveIntFromAny((*out)["up_mbps"])
 	clientDownMbps, hasClientDownMbps := positiveIntFromAny((*out)["down_mbps"])
 
+	delete(*out, "server_up_mbps")
+	delete(*out, "server_down_mbps")
+	delete(*out, "port_hop_range")
+	delete(*out, "port_hop_interval")
+	delete(*out, "port_hop_interval_max")
 	delete(*out, "down_mbps")
 	delete(*out, "up_mbps")
 	delete(*out, "obfs")
@@ -394,6 +506,11 @@ func hysteria2Out(out *map[string]interface{}, inbound map[string]interface{}) {
 	clientUpMbps, hasClientUpMbps := positiveIntFromAny((*out)["up_mbps"])
 	clientDownMbps, hasClientDownMbps := positiveIntFromAny((*out)["down_mbps"])
 
+	delete(*out, "server_up_mbps")
+	delete(*out, "server_down_mbps")
+	delete(*out, "port_hop_range")
+	delete(*out, "port_hop_interval")
+	delete(*out, "port_hop_interval_max")
 	delete(*out, "down_mbps")
 	delete(*out, "up_mbps")
 	delete(*out, "obfs")
@@ -462,7 +579,7 @@ func NormalizeMihomoBBRProfile(raw interface{}) (string, bool) {
 
 func SupportsMihomoBBRProfileProtocol(protocol string) bool {
 	switch strings.ToLower(strings.TrimSpace(protocol)) {
-	case "hysteria2", "tuic", "trusttunnel", "masque":
+	case "hysteria2", "tuic", "trusttunnel", "shadowquic", "masque":
 		return true
 	default:
 		return false
@@ -859,6 +976,7 @@ func trojanOut(out *map[string]interface{}, inbound map[string]interface{}) {
 }
 
 func vmessOut(out *map[string]interface{}, inbound map[string]interface{}) {
+	delete(*out, "alterId")
 	(*out)["alter_id"] = 0
 	delete(*out, "transport")
 	if transport, ok := inbound["transport"]; ok {

@@ -83,6 +83,7 @@
 <script lang="ts">
 import { i18n } from '@/locales'
 import HttpUtils from '@/plugins/httputil'
+import { formatPanelDateTime } from '@/plugins/panelTime'
 
 export default {
   props: ['admins', 'actor', 'visible'],
@@ -106,15 +107,17 @@ export default {
   methods: {
     async loadData() {
       this.loading = true
-      const data = await HttpUtils.get('api/changes',{ a: this.user, k: this.key, c: this.chngCount })
-      if (data.success) {
-        this.changes = data.obj?? []
+      try {
+        const data = await HttpUtils.get('api/changes',{ a: this.user, k: this.key, c: this.chngCount })
+        if (data.success) {
+          this.changes = data.obj?? []
+        }
+      } finally {
         this.loading = false
       }
     },
     dateFormatted(dt: number): string {
-      const date = new Date(dt*1000)
-      return date.toLocaleString(this.locale)
+      return formatPanelDateTime(dt * 1000, this.locale)
     },
   },
   computed: {

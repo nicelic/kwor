@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -70,7 +69,7 @@ type portSpan struct {
 
 func (s *PortCheckService) Check(req PortCheckRequest) (*PortCheckResponse, error) {
 	resp := &PortCheckResponse{
-		Supported: runtime.GOOS == "linux",
+		Supported: IsSystemPlatformLinux(),
 		CheckedAt: time.Now().Unix(),
 		Single:    make([]SinglePortStatus, 0, len(req.SinglePorts)),
 		UDPRanges: make([]UDPRangeStatus, 0, len(req.UDPRanges)),

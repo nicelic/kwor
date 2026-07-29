@@ -145,38 +145,31 @@ func TestConvertCertificateRecordIncludesIssuedAlgorithms(t *testing.T) {
 	}
 }
 
-func TestApplyIssuePostActionsOnlyUsesExplicitPushDir(t *testing.T) {
+func TestApplyCertificateRecordPostActionsOnlyUsesExplicitPushDir(t *testing.T) {
 	setupAcmeIPBehaviorTestDB(t, "acme-ip-behavior-pushdir.db")
 	svc := &AcmeService{}
 
-	entry := &model.AcmeCertificate{
-		Id:              11,
+	record, err := certificateInventory.Upsert(CertificateUpsertPayload{
+		SourceType:      CertificateSourceACME,
+		SourceRef:       "post-action-push",
 		MainDomain:      "test.example.com",
-		DomainSet:       `["test.example.com"]`,
+		Domains:         []string{"test.example.com"},
+		CertificateType: acmeCertificateTypeDomain,
 		Challenge:       "standalone",
 		KeyLength:       "ec-384",
 		CAServer:        acmeLEProductionDirectory,
-		CertificateType: acmeCertificateTypeDomain,
 		CertPEM:         []byte("test-cert"),
 		KeyPEM:          []byte("test-key"),
 		FullchainPEM:    []byte("test-fullchain"),
 		ChainPEM:        []byte("test-chain"),
-	}
-	if err := database.GetDB().Create(entry).Error; err != nil {
-		t.Fatalf("create acme certificate failed: %v", err)
-	}
-	record, err := upsertInventoryFromAcme(entry)
+	})
 	if err != nil {
-		t.Fatalf("upsert inventory failed: %v", err)
+		t.Fatalf("create certificate record failed: %v", err)
 	}
 
 	targetDir := filepath.Join(t.TempDir(), "bundle")
-	if err := svc.applyIssuePostActions(entry, "", targetDir, true); err != nil {
-		t.Fatalf("applyIssuePostActions failed: %v", err)
-	}
-
-	if got := strings.TrimSpace(entry.PushDir); got != targetDir {
-		t.Fatalf("expected entry push dir updated: got=%q want=%q", got, targetDir)
+	if warnings := svc.applyCertificateRecordPostActions(record, "", targetDir, true); len(warnings) > 0 {
+		t.Fatalf("applyCertificateRecordPostActions returned warnings: %v", warnings)
 	}
 
 	record, err = certificateInventory.GetRecordByID(record.Id)
@@ -186,53 +179,54 @@ func TestApplyIssuePostActionsOnlyUsesExplicitPushDir(t *testing.T) {
 	if got := strings.TrimSpace(record.PushDir); got != targetDir {
 		t.Fatalf("expected inventory push dir updated: got=%q want=%q", got, targetDir)
 	}
-	if got := strings.TrimSpace(record.PushFiles); got == "" {
-		t.Fatal("expected inventory push files to be recorded")
+	if !record.PushEnabled {
+		t.Fatal("expected inventory push state to be marked verified")
+	}
+	if got := strings.TrimSpace(record.PushFilePaths); got == "" {
+		t.Fatal("expected inventory full push file paths to be recorded")
 	}
 }
 
-func TestApplyIssuePostActionsSkipsStoredPushDirWhenPushNotExplicit(t *testing.T) {
-	setupAcmeIPBehaviorTestDB(t, "acme-ip-behavior-pushdir-skip.db")
+func TestApplyCertificateRecordPostActionsRewritesVerifiedPushWhenNotExplicit(t *testing.T) {
+	setupAcmeIPBehaviorTestDB(t, "acme-ip-behavior-pushdir-rewrite.db")
 	svc := &AcmeService{}
 
 	oldDir := filepath.Join(t.TempDir(), "old-push")
-	if err := os.MkdirAll(oldDir, 0o755); err != nil {
-		t.Fatalf("create old push dir failed: %v", err)
-	}
 
-	entry := &model.AcmeCertificate{
-		Id:              12,
-		MainDomain:      "test-skip.example.com",
-		DomainSet:       `["test-skip.example.com"]`,
+	record, err := certificateInventory.Upsert(CertificateUpsertPayload{
+		SourceType:      CertificateSourceACME,
+		SourceRef:       "post-action-rewrite",
+		MainDomain:      "test-rewrite.example.com",
+		Domains:         []string{"test-rewrite.example.com"},
+		CertificateType: acmeCertificateTypeDomain,
 		Challenge:       "standalone",
 		KeyLength:       "ec-384",
 		CAServer:        acmeLEProductionDirectory,
-		CertificateType: acmeCertificateTypeDomain,
-		PushDir:         oldDir,
-		CertPEM:         []byte("test-cert"),
-		KeyPEM:          []byte("test-key"),
-		FullchainPEM:    []byte("test-fullchain"),
-		ChainPEM:        []byte("test-chain"),
-	}
-	if err := database.GetDB().Create(entry).Error; err != nil {
-		t.Fatalf("create acme certificate failed: %v", err)
-	}
-	record, err := upsertInventoryFromAcme(entry)
+		CertPEM:         []byte("first-cert"),
+		KeyPEM:          []byte("first-key"),
+		FullchainPEM:    []byte("first-fullchain"),
+		ChainPEM:        []byte("first-chain"),
+	})
 	if err != nil {
-		t.Fatalf("upsert inventory failed: %v", err)
+		t.Fatalf("create certificate record failed: %v", err)
 	}
-	record.PushDir = oldDir
-	record.PushFiles = `["cert.pem","key.pem","fullchain.pem"]`
+	if _, err := svc.Push(AcmePushPayload{ID: record.Id, TargetDir: oldDir}); err != nil {
+		t.Fatalf("seed verified directory push failed: %v", err)
+	}
+	record, err = certificateInventory.GetRecordByID(record.Id)
+	if err != nil {
+		t.Fatalf("reload verified inventory record failed: %v", err)
+	}
+	record.CertPEM = []byte("renewed-cert")
+	record.KeyPEM = []byte("renewed-key")
+	record.FullchainPEM = []byte("renewed-fullchain")
+	record.ChainPEM = nil
 	if err := database.GetDB().Save(record).Error; err != nil {
-		t.Fatalf("save inventory push state failed: %v", err)
+		t.Fatalf("save renewed certificate material failed: %v", err)
 	}
 
-	if err := svc.applyIssuePostActions(entry, "", "", false); err != nil {
-		t.Fatalf("applyIssuePostActions failed: %v", err)
-	}
-
-	if got := strings.TrimSpace(entry.PushDir); got != oldDir {
-		t.Fatalf("expected entry push dir unchanged: got=%q want=%q", got, oldDir)
+	if warnings := svc.applyCertificateRecordPostActions(record, "", "", false); len(warnings) > 0 {
+		t.Fatalf("applyCertificateRecordPostActions returned warnings: %v", warnings)
 	}
 	reloadedRecord, err := certificateInventory.GetRecordByID(record.Id)
 	if err != nil {
@@ -241,56 +235,90 @@ func TestApplyIssuePostActionsSkipsStoredPushDirWhenPushNotExplicit(t *testing.T
 	if got := strings.TrimSpace(reloadedRecord.PushDir); got != oldDir {
 		t.Fatalf("expected inventory push dir unchanged: got=%q want=%q", got, oldDir)
 	}
-	if _, statErr := os.Stat(filepath.Join(oldDir, "cert.pem")); !os.IsNotExist(statErr) {
-		t.Fatalf("expected cert.pem not created when push is not explicit, stat err=%v", statErr)
+	if !reloadedRecord.PushEnabled {
+		t.Fatal("expected verified directory push state to remain enabled")
+	}
+	if actual, readErr := os.ReadFile(filepath.Join(oldDir, "cert.pem")); readErr != nil || string(actual) != "renewed-cert" {
+		t.Fatalf("expected cert.pem rewritten for verified push, content=%q err=%v", string(actual), readErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(oldDir, "chain.pem")); !os.IsNotExist(statErr) {
+		t.Fatalf("expected obsolete chain.pem removed during verified push rewrite, stat err=%v", statErr)
 	}
 }
 
-func TestPushSyncsAcmeSourceRecordAndPreservesTrackedFiles(t *testing.T) {
+func TestPostActionWarningsPersistWithoutChangingCertificateStatus(t *testing.T) {
+	setupAcmeIPBehaviorTestDB(t, "acme-post-action-warning.db")
+	record, err := certificateInventory.Upsert(CertificateUpsertPayload{
+		SourceType:      CertificateSourceACME,
+		SourceRef:       "post-action-warning",
+		MainDomain:      "warning.example.com",
+		Domains:         []string{"warning.example.com"},
+		CertificateType: acmeCertificateTypeDomain,
+		Challenge:       "standalone",
+		NotAfter:        time.Now().Add(24 * time.Hour).Unix(),
+		CertPEM:         []byte("test-cert"),
+		KeyPEM:          []byte("test-key"),
+		FullchainPEM:    []byte("test-fullchain"),
+	})
+	if err != nil {
+		t.Fatalf("create certificate record failed: %v", err)
+	}
+
+	warnings := persistCertificatePostActionWarnings(record, []string{"推送证书目录失败: permission denied"})
+	if len(warnings) != 1 {
+		t.Fatalf("unexpected persisted warnings: %v", warnings)
+	}
+	reloaded, err := certificateInventory.GetRecordByID(record.Id)
+	if err != nil {
+		t.Fatalf("reload certificate record failed: %v", err)
+	}
+	view := convertCertificateRecord(reloaded)
+	if view.Status != "normal" {
+		t.Fatalf("post-action warning must not change certificate validity status: %q", view.Status)
+	}
+	if !strings.Contains(view.PostActionError, "permission denied") {
+		t.Fatalf("expected post-action warning in inventory view: %q", view.PostActionError)
+	}
+
+	if err := clearCertificatePostActionError(reloaded); err != nil {
+		t.Fatalf("clear post-action warning failed: %v", err)
+	}
+	reloaded, err = certificateInventory.GetRecordByID(record.Id)
+	if err != nil {
+		t.Fatalf("reload cleared certificate record failed: %v", err)
+	}
+	if strings.TrimSpace(reloaded.PostActionError) != "" {
+		t.Fatalf("expected post-action warning to be cleared: %q", reloaded.PostActionError)
+	}
+}
+
+func TestPushUpdatesCertificateRecordAndPreservesTrackedFiles(t *testing.T) {
 	setupAcmeIPBehaviorTestDB(t, "acme-push-sync-source.db")
 	svc := &AcmeService{}
 
-	sourceEntry := &model.AcmeCertificate{
-		Id:              21,
+	record, err := certificateInventory.Upsert(CertificateUpsertPayload{
+		SourceType:      CertificateSourceACME,
+		SourceRef:       "push-record",
 		MainDomain:      "push.example.com",
-		DomainSet:       `["push.example.com"]`,
+		Domains:         []string{"push.example.com"},
+		CertificateType: acmeCertificateTypeDomain,
 		Challenge:       "standalone",
 		KeyLength:       "ec-256",
 		CAServer:        acmeLEProductionDirectory,
-		CertificateType: acmeCertificateTypeDomain,
-		PushDir:         "",
-		PushFiles:       "",
 		CertPEM:         []byte("cert-a"),
 		KeyPEM:          []byte("key-a"),
 		FullchainPEM:    []byte("fullchain-a"),
-		ChainPEM:        nil,
-	}
-	if err := database.GetDB().Create(sourceEntry).Error; err != nil {
-		t.Fatalf("create acme source entry failed: %v", err)
-	}
-
-	record, err := upsertInventoryFromAcme(sourceEntry)
+	})
 	if err != nil {
-		t.Fatalf("upsert inventory failed: %v", err)
+		t.Fatalf("create certificate record failed: %v", err)
 	}
 
 	oldDir := filepath.Join(t.TempDir(), "old-push")
-	if _, err := replaceCertificateInDirectoryWithTrackedFiles(oldDir, nil, sourceEntry.CertPEM, sourceEntry.KeyPEM, sourceEntry.FullchainPEM, sourceEntry.ChainPEM); err != nil {
-		t.Fatalf("seed old push dir failed: %v", err)
+	if _, err := svc.Push(AcmePushPayload{ID: record.Id, TargetDir: oldDir}); err != nil {
+		t.Fatalf("seed verified old push dir failed: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(oldDir, "keep.txt"), []byte("keep"), 0o644); err != nil {
 		t.Fatalf("write keep.txt failed: %v", err)
-	}
-
-	sourceEntry.PushDir = oldDir
-	sourceEntry.PushFiles = `["cert.pem","fullchain.pem","key.pem"]`
-	if err := database.GetDB().Save(sourceEntry).Error; err != nil {
-		t.Fatalf("save acme source entry failed: %v", err)
-	}
-	record.PushDir = oldDir
-	record.PushFiles = sourceEntry.PushFiles
-	if err := database.GetDB().Save(record).Error; err != nil {
-		t.Fatalf("save inventory record failed: %v", err)
 	}
 
 	newDir := filepath.Join(t.TempDir(), "new-push")
@@ -302,23 +330,18 @@ func TestPushSyncsAcmeSourceRecordAndPreservesTrackedFiles(t *testing.T) {
 		t.Fatal("expected push result certificate")
 	}
 
-	reloadedSource := &model.AcmeCertificate{}
-	if err := database.GetDB().Where("id = ?", sourceEntry.Id).First(reloadedSource).Error; err != nil {
-		t.Fatalf("reload source entry failed: %v", err)
-	}
-	if got := strings.TrimSpace(reloadedSource.PushDir); got != newDir {
-		t.Fatalf("expected source push dir synced: got=%q want=%q", got, newDir)
-	}
-	if got := strings.TrimSpace(reloadedSource.PushFiles); got == "" {
-		t.Fatal("expected source push files recorded")
-	}
-
 	reloadedRecord, err := certificateInventory.GetRecordByID(record.Id)
 	if err != nil {
 		t.Fatalf("reload inventory record failed: %v", err)
 	}
 	if got := strings.TrimSpace(reloadedRecord.PushDir); got != newDir {
 		t.Fatalf("expected inventory push dir synced: got=%q want=%q", got, newDir)
+	}
+	if !reloadedRecord.PushEnabled {
+		t.Fatal("expected certificate record push state marked verified")
+	}
+	if got := strings.TrimSpace(reloadedRecord.PushFilePaths); got == "" {
+		t.Fatal("expected certificate record full push file paths recorded")
 	}
 
 	for _, name := range []string{"cert.pem", "key.pem", "fullchain.pem"} {
@@ -331,6 +354,129 @@ func TestPushSyncsAcmeSourceRecordAndPreservesTrackedFiles(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(oldDir, "keep.txt")); statErr != nil {
 		t.Fatalf("expected keep.txt preserved, stat err=%v", statErr)
+	}
+}
+
+func TestPushWithoutChainRecordsOnlyWrittenPaths(t *testing.T) {
+	setupAcmeIPBehaviorTestDB(t, "acme-push-without-chain.db")
+	svc := &AcmeService{}
+	record, err := certificateInventory.Upsert(CertificateUpsertPayload{
+		SourceType:      CertificateSourceACME,
+		SourceRef:       "push-no-chain",
+		MainDomain:      "no-chain.example.com",
+		Domains:         []string{"no-chain.example.com"},
+		CertificateType: acmeCertificateTypeDomain,
+		Challenge:       "standalone",
+		KeyLength:       "ec-256",
+		CAServer:        acmeLEProductionDirectory,
+		CertPEM:         []byte("cert"),
+		KeyPEM:          []byte("key"),
+		FullchainPEM:    []byte("fullchain"),
+	})
+	if err != nil {
+		t.Fatalf("create certificate record failed: %v", err)
+	}
+
+	targetDir := filepath.Join(t.TempDir(), "bundle")
+	if _, err := svc.Push(AcmePushPayload{ID: record.Id, TargetDir: targetDir}); err != nil {
+		t.Fatalf("push failed: %v", err)
+	}
+	reloaded, err := certificateInventory.GetRecordByID(record.Id)
+	if err != nil {
+		t.Fatalf("reload pushed record failed: %v", err)
+	}
+	paths := decodeCertificatePushFilePaths(reloaded.PushFilePaths)
+	if len(paths) != 3 || paths["chain.pem"] != "" {
+		t.Fatalf("expected only three pushed file paths, got=%#v", paths)
+	}
+	if _, statErr := os.Stat(filepath.Join(targetDir, "chain.pem")); !os.IsNotExist(statErr) {
+		t.Fatalf("expected chain.pem absent when bundle has no chain, stat err=%v", statErr)
+	}
+}
+
+func TestPushFailureDoesNotMarkUnverifiedDirectoryState(t *testing.T) {
+	setupAcmeIPBehaviorTestDB(t, "acme-push-failure-state.db")
+	svc := &AcmeService{}
+	record, err := certificateInventory.Upsert(CertificateUpsertPayload{
+		SourceType:      CertificateSourceACME,
+		SourceRef:       "push-failure",
+		MainDomain:      "failure.example.com",
+		Domains:         []string{"failure.example.com"},
+		CertificateType: acmeCertificateTypeDomain,
+		Challenge:       "standalone",
+		KeyLength:       "ec-256",
+		CAServer:        acmeLEProductionDirectory,
+		CertPEM:         []byte("cert"),
+		KeyPEM:          []byte("key"),
+		FullchainPEM:    []byte("fullchain"),
+	})
+	if err != nil {
+		t.Fatalf("create certificate record failed: %v", err)
+	}
+
+	targetDir := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(targetDir, []byte("file"), 0o644); err != nil {
+		t.Fatalf("prepare invalid target path failed: %v", err)
+	}
+	if _, err := svc.Push(AcmePushPayload{ID: record.Id, TargetDir: targetDir}); err == nil {
+		t.Fatal("expected directory push failure")
+	}
+	reloaded, err := certificateInventory.GetRecordByID(record.Id)
+	if err != nil {
+		t.Fatalf("reload failed push record failed: %v", err)
+	}
+	if reloaded.PushEnabled || strings.TrimSpace(reloaded.PushDir) != "" || strings.TrimSpace(reloaded.PushFilePaths) != "" {
+		t.Fatalf("failed push must not mark an unverified directory state: %#v", reloaded)
+	}
+}
+
+func TestClearPushDeletesOnlyVerifiedCertificateFiles(t *testing.T) {
+	setupAcmeIPBehaviorTestDB(t, "acme-push-clear.db")
+	svc := &AcmeService{}
+	record, err := certificateInventory.Upsert(CertificateUpsertPayload{
+		SourceType:      CertificateSourceACME,
+		SourceRef:       "push-clear",
+		MainDomain:      "clear.example.com",
+		Domains:         []string{"clear.example.com"},
+		CertificateType: acmeCertificateTypeDomain,
+		Challenge:       "standalone",
+		KeyLength:       "ec-256",
+		CAServer:        acmeLEProductionDirectory,
+		CertPEM:         []byte("cert"),
+		KeyPEM:          []byte("key"),
+		FullchainPEM:    []byte("fullchain"),
+	})
+	if err != nil {
+		t.Fatalf("create certificate record failed: %v", err)
+	}
+
+	targetDir := filepath.Join(t.TempDir(), "bundle")
+	if _, err := svc.Push(AcmePushPayload{ID: record.Id, TargetDir: targetDir}); err != nil {
+		t.Fatalf("seed push failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "keep.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatalf("write unrelated file failed: %v", err)
+	}
+	if _, err := svc.Push(AcmePushPayload{ID: record.Id, Clear: true}); err != nil {
+		t.Fatalf("clear push failed: %v", err)
+	}
+	reloaded, err := certificateInventory.GetRecordByID(record.Id)
+	if err != nil {
+		t.Fatalf("reload cleared record failed: %v", err)
+	}
+	if reloaded.PushEnabled || strings.TrimSpace(reloaded.PushDir) != "" || strings.TrimSpace(reloaded.PushFilePaths) != "" {
+		t.Fatalf("expected push state cleared, got %#v", reloaded)
+	}
+	for _, name := range []string{"cert.pem", "key.pem", "fullchain.pem"} {
+		if _, statErr := os.Stat(filepath.Join(targetDir, name)); !os.IsNotExist(statErr) {
+			t.Fatalf("expected %s deleted, stat err=%v", name, statErr)
+		}
+	}
+	if _, statErr := os.Stat(targetDir); statErr != nil {
+		t.Fatalf("expected target directory preserved, stat err=%v", statErr)
+	}
+	if content, readErr := os.ReadFile(filepath.Join(targetDir, "keep.txt")); readErr != nil || string(content) != "keep" {
+		t.Fatalf("expected unrelated file preserved, content=%q err=%v", string(content), readErr)
 	}
 }
 
@@ -584,7 +730,7 @@ func TestCertificateInventoryDisplayIDReusesSmallestGap(t *testing.T) {
 	}
 }
 
-func TestUpsertCertificateFromPathsCreatesNewRowsForSameIP(t *testing.T) {
+func TestUpsertCertificateRecordFromPathsCreatesNewRowsForSameIP(t *testing.T) {
 	setupAcmeIPBehaviorTestDB(t, "acme-same-ip-new-rows.db")
 
 	now := time.Now()
@@ -596,34 +742,72 @@ func TestUpsertCertificateFromPathsCreatesNewRowsForSameIP(t *testing.T) {
 	paths2 := writeManagedBundleForTest(t, "149.104.4.229-b", certPEM, keyPEM, fullchainPEM, chainPEM)
 
 	svc := &AcmeService{}
-	first, err := svc.upsertCertificateFromPaths(0, []string{"149.104.4.229"}, acmeCertificateTypeIP, acmeCertProfileForType(acmeCertificateTypeIP), "standalone", "ec-384", acmeLEProductionDirectory, true, "/tmp/acme-a", "", "", "", "", paths1, 111)
+	first, err := svc.upsertAcmeCertificateRecordFromPaths(
+		0,
+		[]string{"149.104.4.229"},
+		acmeCertificateTypeIP,
+		"standalone",
+		"ec-384",
+		acmeLEProductionDirectory,
+		true,
+		"",
+		"",
+		"",
+		nil,
+		nil,
+		paths1,
+		true,
+		"",
+		"",
+		"",
+	)
 	if err != nil {
 		t.Fatalf("upsert first failed: %v", err)
 	}
-	second, err := svc.upsertCertificateFromPaths(0, []string{"149.104.4.229"}, acmeCertificateTypeIP, acmeCertProfileForType(acmeCertificateTypeIP), "standalone", "ec-384", acmeLEProductionDirectory, true, "/tmp/acme-b", "", "", "", "", paths2, 222)
+	second, err := svc.upsertAcmeCertificateRecordFromPaths(
+		0,
+		[]string{"149.104.4.229"},
+		acmeCertificateTypeIP,
+		"standalone",
+		"ec-384",
+		acmeLEProductionDirectory,
+		true,
+		"",
+		"",
+		"",
+		nil,
+		nil,
+		paths2,
+		true,
+		"",
+		"",
+		"",
+	)
 	if err != nil {
 		t.Fatalf("upsert second failed: %v", err)
 	}
 
 	if first.Id == 0 || second.Id == 0 || first.Id == second.Id {
-		t.Fatalf("expected distinct acme rows, got first=%d second=%d", first.Id, second.Id)
+		t.Fatalf("expected distinct certificate records, got first=%d second=%d", first.Id, second.Id)
 	}
 
 	var count int64
-	if err := database.GetDB().Model(&model.AcmeCertificate{}).Where("main_domain = ?", "149.104.4.229").Count(&count).Error; err != nil {
+	if err := database.GetDB().Model(&model.CertificateRecord{}).Where("source_type = ? AND main_domain = ?", CertificateSourceACME, "149.104.4.229").Count(&count).Error; err != nil {
 		t.Fatalf("count same ip rows failed: %v", err)
 	}
 	if count != 2 {
-		t.Fatalf("expected 2 acme rows for same ip, got=%d", count)
+		t.Fatalf("expected 2 certificate records for same ip, got=%d", count)
 	}
 }
 
-func TestSyncInventoryFromAcmeDBRepairsMissingInventoryAndDisplayID(t *testing.T) {
+func TestCertificateInventoryRepairsDisplayIDAndListOrder(t *testing.T) {
 	setupAcmeIPBehaviorTestDB(t, "acme-sync-repair.db")
 
-	entry := &model.AcmeCertificate{
+	row, err := certificateInventory.Upsert(CertificateUpsertPayload{
+		SourceType:      CertificateSourceACME,
+		SourceRef:       "repair-display-id",
 		MainDomain:      "repair.example.com",
-		DomainSet:       `["repair.example.com"]`,
+		Domains:         []string{"repair.example.com"},
 		CertificateType: acmeCertificateTypeDomain,
 		Challenge:       "standalone",
 		KeyLength:       "ec-256",
@@ -638,25 +822,13 @@ func TestSyncInventoryFromAcmeDBRepairsMissingInventoryAndDisplayID(t *testing.T
 		NotAfter:        2000,
 		LastIssuedAt:    1000,
 		LastRenewedAt:   1000,
-		AcmeAccountName: "default",
-		DNSAccountName:  "",
 		AutoRenew:       true,
-	}
-	if err := database.GetDB().Create(entry).Error; err != nil {
-		t.Fatalf("create acme entry failed: %v", err)
-	}
-
-	svc := &AcmeService{}
-	if err := svc.syncInventoryFromAcmeDB(); err != nil {
-		t.Fatalf("syncInventoryFromAcmeDB failed: %v", err)
-	}
-
-	row := &model.CertificateRecord{}
-	if err := database.GetDB().Where("source_type = ? AND source_ref = ?", CertificateSourceACME, "1").First(row).Error; err != nil {
-		t.Fatalf("expected inventory row synced: %v", err)
+	})
+	if err != nil {
+		t.Fatalf("create certificate record failed: %v", err)
 	}
 	if row.DisplayID != 1 {
-		t.Fatalf("expected display id repaired to 1, got=%d", row.DisplayID)
+		t.Fatalf("expected display id allocated as 1, got=%d", row.DisplayID)
 	}
 	if row.ListOrderAt <= 0 {
 		t.Fatalf("expected positive listOrderAt, got=%d", row.ListOrderAt)
@@ -669,8 +841,8 @@ func TestSyncInventoryFromAcmeDBRepairsMissingInventoryAndDisplayID(t *testing.T
 		t.Fatalf("reset display id/list order failed: %v", err)
 	}
 
-	if err := svc.syncInventoryFromAcmeDB(); err != nil {
-		t.Fatalf("second syncInventoryFromAcmeDB failed: %v", err)
+	if err := certificateInventory.RepairDisplayIDs(); err != nil {
+		t.Fatalf("RepairDisplayIDs failed: %v", err)
 	}
 
 	if err := database.GetDB().Where("id = ?", row.Id).First(row).Error; err != nil {
@@ -699,15 +871,17 @@ func TestDeleteRemovesTrackedPushedFilesForNonAcmeRecord(t *testing.T) {
 	}
 
 	record, err := certificateInventory.Upsert(CertificateUpsertPayload{
-		SourceType:   CertificateSourceSelfSigned,
-		SourceRef:    "self-delete-1",
-		MainDomain:   "self.example.com",
-		Domains:      []string{"self.example.com"},
-		PushDir:      pushDir,
-		PushFiles:    `["cert.pem","key.pem"]`,
-		CertPEM:      []byte("cert"),
-		KeyPEM:       []byte("key"),
-		LastIssuedAt: 100,
+		SourceType:        CertificateSourceSelfSigned,
+		SourceRef:         "self-delete-1",
+		MainDomain:        "self.example.com",
+		Domains:           []string{"self.example.com"},
+		PushStateProvided: true,
+		PushEnabled:       true,
+		PushDir:           pushDir,
+		PushFilePaths:     encodeCertificatePushFilePaths(map[string]string{"cert.pem": filepath.Join(pushDir, "cert.pem"), "key.pem": filepath.Join(pushDir, "key.pem")}),
+		CertPEM:           []byte("cert"),
+		KeyPEM:            []byte("key"),
+		LastIssuedAt:      100,
 	})
 	if err != nil {
 		t.Fatalf("upsert self-signed record failed: %v", err)
@@ -744,18 +918,20 @@ func TestDeleteRemovesTrackedPushedFilesAndRemovesOrphanAcmeInventoryRecord(t *t
 	}
 
 	record, err := certificateInventory.Upsert(CertificateUpsertPayload{
-		SourceType:   CertificateSourceACME,
-		SourceRef:    "999",
-		MainDomain:   "orphan.example.com",
-		Domains:      []string{"orphan.example.com"},
-		Challenge:    "standalone",
-		KeyLength:    "ec-256",
-		CAServer:     acmeLEProductionDirectory,
-		PushDir:      pushDir,
-		PushFiles:    `["fullchain.pem","key.pem"]`,
-		CertPEM:      []byte("cert"),
-		KeyPEM:       []byte("key"),
-		LastIssuedAt: 100,
+		SourceType:        CertificateSourceACME,
+		SourceRef:         "999",
+		MainDomain:        "orphan.example.com",
+		Domains:           []string{"orphan.example.com"},
+		Challenge:         "standalone",
+		KeyLength:         "ec-256",
+		CAServer:          acmeLEProductionDirectory,
+		PushStateProvided: true,
+		PushEnabled:       true,
+		PushDir:           pushDir,
+		PushFilePaths:     encodeCertificatePushFilePaths(map[string]string{"fullchain.pem": filepath.Join(pushDir, "fullchain.pem"), "key.pem": filepath.Join(pushDir, "key.pem")}),
+		CertPEM:           []byte("cert"),
+		KeyPEM:            []byte("key"),
+		LastIssuedAt:      100,
 	})
 	if err != nil {
 		t.Fatalf("upsert orphan acme inventory failed: %v", err)
@@ -816,36 +992,14 @@ func TestRemoveTrackedCertificateFilesFromDirectoryOnlyTouchesTrackedFiles(t *te
 	}
 }
 
-func TestSyncInventoryFromAcmeDBRemovesOrphanAcmeInventoryRows(t *testing.T) {
+func TestOverviewMaintenanceKeepsACMEInventoryRecordWithoutMirror(t *testing.T) {
 	setupAcmeIPBehaviorTestDB(t, "acme-sync-remove-orphan.db")
 
-	validEntry := &model.AcmeCertificate{
-		MainDomain:      "valid.example.com",
-		DomainSet:       `["valid.example.com"]`,
-		CertificateType: acmeCertificateTypeDomain,
-		Challenge:       "standalone",
-		KeyLength:       "ec-256",
-		CAServer:        acmeLEProductionDirectory,
-		UseECC:          true,
-		CertPEM:         []byte("cert-valid"),
-		KeyPEM:          []byte("key-valid"),
-		FullchainPEM:    []byte("fullchain-valid"),
-		ChainPEM:        []byte("chain-valid"),
-		Fingerprint:     "fp-valid",
-		NotBefore:       1000,
-		NotAfter:        2000,
-		LastIssuedAt:    1000,
-		LastRenewedAt:   1000,
-	}
-	if err := database.GetDB().Create(validEntry).Error; err != nil {
-		t.Fatalf("create valid acme entry failed: %v", err)
-	}
-
-	orphan, err := certificateInventory.Upsert(CertificateUpsertPayload{
+	record, err := certificateInventory.Upsert(CertificateUpsertPayload{
 		SourceType:   CertificateSourceACME,
-		SourceRef:    "999",
-		MainDomain:   "orphan.example.com",
-		Domains:      []string{"orphan.example.com"},
+		SourceRef:    "inventory-only",
+		MainDomain:   "inventory-only.example.com",
+		Domains:      []string{"inventory-only.example.com"},
 		Challenge:    "standalone",
 		KeyLength:    "ec-256",
 		CAServer:     acmeLEProductionDirectory,
@@ -854,24 +1008,16 @@ func TestSyncInventoryFromAcmeDBRemovesOrphanAcmeInventoryRows(t *testing.T) {
 		LastIssuedAt: 100,
 	})
 	if err != nil {
-		t.Fatalf("create orphan inventory row failed: %v", err)
+		t.Fatalf("create certificate record failed: %v", err)
 	}
 
 	svc := &AcmeService{}
-	if err := svc.syncInventoryFromAcmeDB(); err != nil {
-		t.Fatalf("syncInventoryFromAcmeDB failed: %v", err)
+	if err := svc.EnsureOverviewRuntimeConsistency(true); err != nil {
+		t.Fatalf("EnsureOverviewRuntimeConsistency failed: %v", err)
 	}
 
-	if err := database.GetDB().Where("id = ?", orphan.Id).First(&model.CertificateRecord{}).Error; !database.IsNotFound(err) {
-		t.Fatalf("expected orphan inventory removed, got err=%v", err)
-	}
-
-	validRow := &model.CertificateRecord{}
-	if err := database.GetDB().Where("source_type = ? AND source_ref = ?", CertificateSourceACME, "1").First(validRow).Error; err != nil {
-		t.Fatalf("expected valid inventory row kept: %v", err)
-	}
-	if strings.TrimSpace(validRow.MainDomain) != "valid.example.com" {
-		t.Fatalf("unexpected valid inventory main domain: %q", validRow.MainDomain)
+	if err := database.GetDB().Where("id = ?", record.Id).First(&model.CertificateRecord{}).Error; err != nil {
+		t.Fatalf("ACME certificate record should not require a mirror row: %v", err)
 	}
 }
 

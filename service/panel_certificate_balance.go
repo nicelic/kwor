@@ -1,6 +1,9 @@
 package service
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,11 +31,50 @@ type PanelCertificateBalanceSelection struct {
 
 type PanelCertificateBalanceService struct{}
 
+type panelCertificateBalanceRuntimeKey struct {
+	listenerKey         string
+	sniBucket           string
+	certificateRecordID uint
+}
+
+type panelCertificateBalanceRuntimeState struct {
+	activeConn      int64
+	pendingSelected int64
+	lastSelectedAt  int64
+	updatedAtUnix   int64
+}
+
+type panelCertificateBalancePersistRow struct {
+	key             panelCertificateBalanceRuntimeKey
+	activeConn      int64
+	pendingSelected int64
+	lastSelectedAt  int64
+	updatedAtUnix   int64
+}
+
 var (
+	panelCertificateBalanceRuntimeMu sync.Mutex
+	panelCertificateBalanceRuntime   = make(map[panelCertificateBalanceRuntimeKey]*panelCertificateBalanceRuntimeState)
+
 	panelCertificateBalanceMaintenanceMu   sync.Mutex
 	panelCertificateBalanceLastCleanupUnix int64 = panelCertificateBalanceMinUpdatedUnix
 	panelCertificateBalanceLastDecayUnix   int64 = panelCertificateBalanceMinUpdatedUnix
 )
+
+func init() {
+	database.RegisterDBResetHook(resetPanelCertificateBalanceRuntime)
+}
+
+func resetPanelCertificateBalanceRuntime() {
+	panelCertificateBalanceRuntimeMu.Lock()
+	panelCertificateBalanceRuntime = make(map[panelCertificateBalanceRuntimeKey]*panelCertificateBalanceRuntimeState)
+	panelCertificateBalanceRuntimeMu.Unlock()
+
+	panelCertificateBalanceMaintenanceMu.Lock()
+	panelCertificateBalanceLastCleanupUnix = panelCertificateBalanceMinUpdatedUnix
+	panelCertificateBalanceLastDecayUnix = panelCertificateBalanceMinUpdatedUnix
+	panelCertificateBalanceMaintenanceMu.Unlock()
+}
 
 func PanelCertificateBalanceListenerKey(target PanelSelfSignedTarget, port int) string {
 	name := "panel"
@@ -53,125 +95,176 @@ func NormalizePanelCertificateBalanceSNIBucket(raw string) string {
 	return value
 }
 
-func (s *PanelCertificateBalanceService) Reserve(listenerKey string, sniBucket string, candidateRecordIDs []uint) (uint, PanelCertificateBalanceSelection, error) {
-	if err := s.Maintain(false); err != nil {
-		return 0, PanelCertificateBalanceSelection{}, err
+func panelCertificateBalanceCandidateBucket(ids []uint) string {
+	sorted := append([]uint(nil), ids...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	parts := make([]string, 0, len(sorted))
+	for _, id := range sorted {
+		parts = append(parts, strconv.FormatUint(uint64(id), 10))
 	}
-	db := database.GetDB()
-	if db == nil {
-		return 0, PanelCertificateBalanceSelection{}, nil
-	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, ",")))
+	return "certset:" + hex.EncodeToString(sum[:12])
+}
 
+// Reserve selects a certificate entirely in memory. TLS handshakes must never
+// wait for the single SQLite connection; the low-frequency maintenance job
+// persists diagnostic counters independently.
+func (s *PanelCertificateBalanceService) Reserve(listenerKey string, _ string, candidateRecordIDs []uint) (uint, PanelCertificateBalanceSelection, error) {
 	listenerKey = strings.TrimSpace(listenerKey)
-	sniBucket = NormalizePanelCertificateBalanceSNIBucket(sniBucket)
-	if listenerKey == "" {
-		return 0, PanelCertificateBalanceSelection{}, nil
-	}
-
 	ids := normalizePanelCertificateBalanceRecordIDs(candidateRecordIDs)
-	if len(ids) == 0 {
+	if listenerKey == "" || len(ids) == 0 {
 		return 0, PanelCertificateBalanceSelection{}, nil
 	}
 
+	bucket := panelCertificateBalanceCandidateBucket(ids)
+	nowUnix := time.Now().Unix()
 	selectedID := uint(0)
-	nowUnix := int64(0)
-	if err := db.Transaction(func(tx *gorm.DB) error {
-		rows := make([]model.PanelCertificateBalanceState, 0, len(ids))
-		if err := tx.
-			Select("certificate_record_id", "active_conn", "last_selected_at").
-			Where("listener_key = ? AND sni_bucket = ? AND certificate_record_id IN ?", listenerKey, sniBucket, ids).
-			Find(&rows).Error; err != nil {
-			return err
-		}
+	selectedActive := int64(0)
+	selectedLast := int64(0)
 
-		stats := make(map[uint]model.PanelCertificateBalanceState, len(rows))
-		for i := range rows {
-			stats[rows[i].CertificateRecordID] = rows[i]
+	panelCertificateBalanceRuntimeMu.Lock()
+	for i, id := range ids {
+		key := panelCertificateBalanceRuntimeKey{
+			listenerKey:         listenerKey,
+			sniBucket:           bucket,
+			certificateRecordID: id,
 		}
-
-		selectedActive := int64(0)
-		selectedLast := int64(0)
-		for i, id := range ids {
-			row := stats[id]
-			if i == 0 || panelBalanceCandidateLess(row.ActiveConn, row.LastSelectedAt, id, selectedActive, selectedLast, selectedID) {
-				selectedID = id
-				selectedActive = row.ActiveConn
-				selectedLast = row.LastSelectedAt
-			}
+		state := panelCertificateBalanceRuntime[key]
+		activeConn := int64(0)
+		lastSelectedAt := int64(0)
+		if state != nil {
+			activeConn = state.activeConn
+			lastSelectedAt = state.lastSelectedAt
 		}
-		if selectedID == 0 {
-			return nil
+		if i == 0 || panelBalanceCandidateLess(activeConn, lastSelectedAt, id, selectedActive, selectedLast, selectedID) {
+			selectedID = id
+			selectedActive = activeConn
+			selectedLast = lastSelectedAt
 		}
-
-		nowUnix = time.Now().Unix()
-		insertRow := &model.PanelCertificateBalanceState{
-			ListenerKey:         listenerKey,
-			SNIBucket:           sniBucket,
-			CertificateRecordID: selectedID,
-			ActiveConn:          1,
-			SelectedTotal:       1,
-			LastSelectedAt:      nowUnix,
-			UpdatedAtUnix:       nowUnix,
-		}
-		return tx.Clauses(clause.OnConflict{
-			Columns: []clause.Column{
-				{Name: "listener_key"},
-				{Name: "sni_bucket"},
-				{Name: "certificate_record_id"},
-			},
-			DoUpdates: clause.Assignments(map[string]interface{}{
-				"active_conn":      gormExpr("active_conn + 1"),
-				"selected_total":   gormExpr("selected_total + 1"),
-				"last_selected_at": nowUnix,
-				"updated_at_unix":  nowUnix,
-			}),
-		}).Create(insertRow).Error
-	}); err != nil {
-		return 0, PanelCertificateBalanceSelection{}, err
 	}
-
-	if selectedID == 0 {
-		return 0, PanelCertificateBalanceSelection{}, nil
+	selectedKey := panelCertificateBalanceRuntimeKey{
+		listenerKey:         listenerKey,
+		sniBucket:           bucket,
+		certificateRecordID: selectedID,
 	}
+	state := panelCertificateBalanceRuntime[selectedKey]
+	if state == nil {
+		state = &panelCertificateBalanceRuntimeState{}
+		panelCertificateBalanceRuntime[selectedKey] = state
+	}
+	state.activeConn++
+	state.pendingSelected++
+	state.lastSelectedAt = nowUnix
+	state.updatedAtUnix = nowUnix
+	panelCertificateBalanceRuntimeMu.Unlock()
+
 	return selectedID, PanelCertificateBalanceSelection{
 		ListenerKey:         listenerKey,
-		SNIBucket:           sniBucket,
+		SNIBucket:           bucket,
 		CertificateRecordID: selectedID,
 	}, nil
 }
 
 func (s *PanelCertificateBalanceService) Release(selection PanelCertificateBalanceSelection) error {
-	db := database.GetDB()
-	if db == nil {
+	listenerKey := strings.TrimSpace(selection.ListenerKey)
+	bucket := strings.TrimSpace(selection.SNIBucket)
+	if listenerKey == "" || bucket == "" || selection.CertificateRecordID == 0 {
 		return nil
 	}
-	listenerKey := strings.TrimSpace(selection.ListenerKey)
-	sniBucket := NormalizePanelCertificateBalanceSNIBucket(selection.SNIBucket)
-	if listenerKey == "" || selection.CertificateRecordID == 0 {
-		return nil
+
+	key := panelCertificateBalanceRuntimeKey{
+		listenerKey:         listenerKey,
+		sniBucket:           bucket,
+		certificateRecordID: selection.CertificateRecordID,
 	}
 	nowUnix := time.Now().Unix()
-	return db.Exec(
-		"UPDATE panel_certificate_balance_states SET active_conn = CASE WHEN active_conn > 0 THEN active_conn - 1 ELSE 0 END, updated_at_unix = ? WHERE listener_key = ? AND sni_bucket = ? AND certificate_record_id = ?",
-		nowUnix,
-		listenerKey,
-		sniBucket,
-		selection.CertificateRecordID,
-	).Error
+	panelCertificateBalanceRuntimeMu.Lock()
+	if state := panelCertificateBalanceRuntime[key]; state != nil {
+		if state.activeConn > 0 {
+			state.activeConn--
+		}
+		state.updatedAtUnix = nowUnix
+	}
+	panelCertificateBalanceRuntimeMu.Unlock()
+	return nil
+}
+
+func snapshotPanelCertificateBalanceRuntime() []panelCertificateBalancePersistRow {
+	panelCertificateBalanceRuntimeMu.Lock()
+	defer panelCertificateBalanceRuntimeMu.Unlock()
+
+	rows := make([]panelCertificateBalancePersistRow, 0, len(panelCertificateBalanceRuntime))
+	for key, state := range panelCertificateBalanceRuntime {
+		if state == nil {
+			continue
+		}
+		rows = append(rows, panelCertificateBalancePersistRow{
+			key:             key,
+			activeConn:      state.activeConn,
+			pendingSelected: state.pendingSelected,
+			lastSelectedAt:  state.lastSelectedAt,
+			updatedAtUnix:   state.updatedAtUnix,
+		})
+	}
+	return rows
+}
+
+func acknowledgePanelCertificateBalancePersist(rows []panelCertificateBalancePersistRow, nowUnix int64) {
+	panelCertificateBalanceRuntimeMu.Lock()
+	defer panelCertificateBalanceRuntimeMu.Unlock()
+
+	staleBefore := nowUnix - int64(panelCertificateBalanceStaleTTL/time.Second)
+	for _, row := range rows {
+		state := panelCertificateBalanceRuntime[row.key]
+		if state == nil {
+			continue
+		}
+		state.pendingSelected -= row.pendingSelected
+		if state.pendingSelected < 0 {
+			state.pendingSelected = 0
+		}
+	}
+	for key, state := range panelCertificateBalanceRuntime {
+		if state != nil && state.activeConn == 0 && state.pendingSelected == 0 && state.updatedAtUnix < staleBefore {
+			delete(panelCertificateBalanceRuntime, key)
+		}
+	}
+}
+
+func assignedPanelCertificateBalanceRecordIDs() ([]uint, error) {
+	settingService := &SettingService{}
+	panelIDs, err := GetAssignedCertificateRecordIDs(settingService, PanelSelfSignedTargetPanel)
+	if err != nil {
+		return nil, err
+	}
+	subIDs, err := GetAssignedCertificateRecordIDs(settingService, PanelSelfSignedTargetSub)
+	if err != nil {
+		return nil, err
+	}
+	return normalizePanelCertificateBalanceRecordIDs(append(panelIDs, subIDs...)), nil
+}
+
+func discardUnassignedPanelCertificateBalanceRuntime(boundIDs []uint) {
+	bound := make(map[uint]struct{}, len(boundIDs))
+	for _, id := range boundIDs {
+		bound[id] = struct{}{}
+	}
+	panelCertificateBalanceRuntimeMu.Lock()
+	for key := range panelCertificateBalanceRuntime {
+		if _, exists := bound[key.certificateRecordID]; !exists {
+			delete(panelCertificateBalanceRuntime, key)
+		}
+	}
+	panelCertificateBalanceRuntimeMu.Unlock()
 }
 
 func (s *PanelCertificateBalanceService) Maintain(force bool) error {
-	nowUnix := time.Now().Unix()
 	panelCertificateBalanceMaintenanceMu.Lock()
-	needCleanup := force
-	needDecay := force
-	if !needCleanup {
-		needCleanup = nowUnix-panelCertificateBalanceLastCleanupUnix >= int64(panelCertificateBalanceCleanupGap/time.Second)
-	}
-	if !needDecay {
-		needDecay = nowUnix-panelCertificateBalanceLastDecayUnix >= int64(panelCertificateBalanceDecayGap/time.Second)
-	}
-	panelCertificateBalanceMaintenanceMu.Unlock()
+	defer panelCertificateBalanceMaintenanceMu.Unlock()
+
+	nowUnix := time.Now().Unix()
+	needCleanup := force || nowUnix-panelCertificateBalanceLastCleanupUnix >= int64(panelCertificateBalanceCleanupGap/time.Second)
+	needDecay := force || nowUnix-panelCertificateBalanceLastDecayUnix >= int64(panelCertificateBalanceDecayGap/time.Second)
 	if !needCleanup && !needDecay {
 		return nil
 	}
@@ -180,85 +273,92 @@ func (s *PanelCertificateBalanceService) Maintain(force bool) error {
 	if db == nil {
 		return nil
 	}
+	boundIDs, err := assignedPanelCertificateBalanceRecordIDs()
+	if err != nil {
+		return err
+	}
+	discardUnassignedPanelCertificateBalanceRuntime(boundIDs)
+	runtimeRows := snapshotPanelCertificateBalanceRuntime()
 
-	if err := db.Model(&model.PanelCertificateBalanceState{}).
-		Where("active_conn < 0 OR selected_total < 0 OR last_selected_at < 0 OR updated_at_unix < 0").
-		Updates(map[string]interface{}{
-			"active_conn":      gormExpr("CASE WHEN active_conn < 0 THEN 0 ELSE active_conn END"),
-			"selected_total":   gormExpr("CASE WHEN selected_total < 0 THEN 0 ELSE selected_total END"),
-			"last_selected_at": gormExpr("CASE WHEN last_selected_at < 0 THEN 0 ELSE last_selected_at END"),
-			"updated_at_unix":  gormExpr("CASE WHEN updated_at_unix < 0 THEN 0 ELSE updated_at_unix END"),
-		}).Error; err != nil {
-		return err
-	}
-	if err := db.Exec(
-		"DELETE FROM panel_certificate_balance_states WHERE certificate_record_id NOT IN (SELECT id FROM certificate_records)",
-	).Error; err != nil {
-		return err
-	}
-	if err := s.cleanupUnassignedRows(); err != nil {
-		return err
-	}
-	if needCleanup {
-		staleBefore := nowUnix - int64(panelCertificateBalanceStaleTTL/time.Second)
-		if err := db.Where("active_conn = 0 AND (updated_at_unix <= 0 OR updated_at_unix < ?)", staleBefore).
-			Delete(&model.PanelCertificateBalanceState{}).Error; err != nil {
+	err = db.Transaction(func(tx *gorm.DB) error {
+		// The runtime map is authoritative. Reset leaked counts left by older
+		// versions before publishing the current process snapshot.
+		if err := tx.Model(&model.PanelCertificateBalanceState{}).
+			Where("active_conn <> 0").
+			Update("active_conn", 0).Error; err != nil {
 			return err
 		}
-	}
-	if needDecay {
-		if err := db.Model(&model.PanelCertificateBalanceState{}).
-			Where("selected_total > 0").
-			Update("selected_total", gormExpr("selected_total / 2")).Error; err != nil {
+		if err := tx.Exec(
+			"DELETE FROM panel_certificate_balance_states WHERE certificate_record_id NOT IN (SELECT id FROM certificate_records)",
+		).Error; err != nil {
 			return err
 		}
+		if err := tx.Where("sni_bucket NOT LIKE ?", "certset:%").Delete(&model.PanelCertificateBalanceState{}).Error; err != nil {
+			return err
+		}
+		if len(boundIDs) == 0 {
+			if err := tx.Session(&gormSessionAllowAll).Delete(&model.PanelCertificateBalanceState{}).Error; err != nil {
+				return err
+			}
+		} else if err := tx.Where("certificate_record_id NOT IN ?", boundIDs).Delete(&model.PanelCertificateBalanceState{}).Error; err != nil {
+			return err
+		}
+
+		for _, runtimeRow := range runtimeRows {
+			row := &model.PanelCertificateBalanceState{
+				ListenerKey:         runtimeRow.key.listenerKey,
+				SNIBucket:           runtimeRow.key.sniBucket,
+				CertificateRecordID: runtimeRow.key.certificateRecordID,
+				ActiveConn:          runtimeRow.activeConn,
+				SelectedTotal:       runtimeRow.pendingSelected,
+				LastSelectedAt:      runtimeRow.lastSelectedAt,
+				UpdatedAtUnix:       runtimeRow.updatedAtUnix,
+			}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns: []clause.Column{
+					{Name: "listener_key"},
+					{Name: "sni_bucket"},
+					{Name: "certificate_record_id"},
+				},
+				DoUpdates: clause.Assignments(map[string]interface{}{
+					"active_conn":      runtimeRow.activeConn,
+					"selected_total":   clause.Expr{SQL: "selected_total + ?", Vars: []interface{}{runtimeRow.pendingSelected}},
+					"last_selected_at": runtimeRow.lastSelectedAt,
+					"updated_at_unix":  runtimeRow.updatedAtUnix,
+				}),
+			}).Create(row).Error; err != nil {
+				return err
+			}
+		}
+
+		if needCleanup {
+			staleBefore := nowUnix - int64(panelCertificateBalanceStaleTTL/time.Second)
+			if err := tx.Where("active_conn = 0 AND (updated_at_unix <= 0 OR updated_at_unix < ?)", staleBefore).
+				Delete(&model.PanelCertificateBalanceState{}).Error; err != nil {
+				return err
+			}
+		}
+		if needDecay {
+			if err := tx.Model(&model.PanelCertificateBalanceState{}).
+				Where("selected_total > 0").
+				Update("selected_total", gormExpr("selected_total / 2")).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
-	panelCertificateBalanceMaintenanceMu.Lock()
+	acknowledgePanelCertificateBalancePersist(runtimeRows, nowUnix)
 	if needCleanup {
 		panelCertificateBalanceLastCleanupUnix = nowUnix
 	}
 	if needDecay {
 		panelCertificateBalanceLastDecayUnix = nowUnix
 	}
-	panelCertificateBalanceMaintenanceMu.Unlock()
 	return nil
-}
-
-func (s *PanelCertificateBalanceService) cleanupUnassignedRows() error {
-	db := database.GetDB()
-	if db == nil {
-		return nil
-	}
-	settingService := &SettingService{}
-	panelIDs, err := GetAssignedCertificateRecordIDs(settingService, PanelSelfSignedTargetPanel)
-	if err != nil {
-		return err
-	}
-	subIDs, err := GetAssignedCertificateRecordIDs(settingService, PanelSelfSignedTargetSub)
-	if err != nil {
-		return err
-	}
-
-	bound := make(map[uint]struct{}, len(panelIDs)+len(subIDs))
-	for _, id := range panelIDs {
-		if id > 0 {
-			bound[id] = struct{}{}
-		}
-	}
-	for _, id := range subIDs {
-		if id > 0 {
-			bound[id] = struct{}{}
-		}
-	}
-	if len(bound) == 0 {
-		return db.Session(&gormSessionAllowAll).Delete(&model.PanelCertificateBalanceState{}).Error
-	}
-	ids := make([]uint, 0, len(bound))
-	for id := range bound {
-		ids = append(ids, id)
-	}
-	return db.Where("certificate_record_id NOT IN ?", ids).Delete(&model.PanelCertificateBalanceState{}).Error
 }
 
 func panelBalanceCandidateLess(activeA int64, lastA int64, idA uint, activeB int64, lastB int64, idB uint) bool {

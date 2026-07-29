@@ -3,7 +3,6 @@ package service
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/alireza0/s-ui/database"
@@ -109,8 +108,7 @@ func (s *InboundService) GetAll() (*[]map[string]interface{}, error) {
 	}
 	var data []map[string]interface{}
 	for _, inbound := range inbounds {
-		var shadowtls_version uint
-		ss_managed := false
+		var shadowtlsVersion uint
 		routeTag := deriveEffectiveInboundRouteTagFromRaw(inbound.Tag, inbound.Type, inbound.Options)
 		inbData := map[string]interface{}{
 			"id":        inbound.Id,
@@ -127,26 +125,17 @@ func (s *InboundService) GetAll() (*[]map[string]interface{}, error) {
 			inbData["listen"] = restFields["listen"]
 			inbData["listen_port"] = restFields["listen_port"]
 			if inbound.Type == "shadowtls" {
-				json.Unmarshal(restFields["version"], &shadowtls_version)
-			}
-			if inbound.Type == "shadowsocks" {
-				// 开发者要求隐藏并默认关闭 SS API 专用能力，读取列表时统一按 managed=false 处理。
-				// Developer requirement: hide and default-disable SS API-only capability; always treat managed as false in list view.
-				ss_managed = false
-			}
-		}
-		if inbound.Type == "ssh" {
-			inbData["user_management"] = map[string]interface{}{
-				"selectable":       true,
-				"uses_users_field": false,
-				"mode":             "shared_credentials",
-				"identity_type":    "type_tag",
-				"reason":           "ssh_subscription_outbound_only",
+				var rawVersion interface{}
+				if json.Unmarshal(restFields["version"], &rawVersion) == nil {
+					if version := util.ShadowTLSVersion(rawVersion); version > 0 {
+						shadowtlsVersion = uint(version)
+					}
+				}
 			}
 		}
-		if s.hasUser(inbound.Type) &&
-			!(inbound.Type == "shadowtls" && shadowtls_version < 3) &&
-			!(inbound.Type == "shadowsocks" && ss_managed) {
+		userManagement := buildSingboxInboundUserManagement(inbound.Type, shadowtlsVersion)
+		inbData["user_management"] = userManagement
+		if userManagement.Selectable {
 			users := []string{}
 			err = db.Raw("SELECT clients.name FROM clients, json_each(clients.inbounds) as je WHERE je.value = ?", inbound.Id).Scan(&users).Error
 			if err != nil {
@@ -195,34 +184,6 @@ func (s *InboundService) Save(tx *gorm.DB, act string, data json.RawMessage, ini
 			}
 		}
 
-		if corePtr.IsRunning() {
-			if act == "edit" {
-				err = corePtr.RemoveInbound(oldTag)
-				if err != nil && err != os.ErrInvalid {
-					return nil, err
-				}
-			}
-
-			inboundConfig, err := inbound.MarshalJSON()
-			if err != nil {
-				return nil, err
-			}
-
-			if act == "edit" {
-				inboundConfig, err = s.addUsers(tx, inboundConfig, inbound.Id, inbound.Type)
-			} else {
-				inboundConfig, err = s.initUsers(tx, inboundConfig, initUserIds, inbound.Type)
-			}
-			if err != nil {
-				return nil, err
-			}
-
-			err = corePtr.AddInbound(inboundConfig)
-			if err != nil {
-				return nil, err
-			}
-		}
-
 		err = util.FillOutJson(&inbound, hostname)
 		if err != nil {
 			return nil, err
@@ -254,12 +215,6 @@ func (s *InboundService) Save(tx *gorm.DB, act string, data json.RawMessage, ini
 		err = json.Unmarshal(data, &tag)
 		if err != nil {
 			return nil, err
-		}
-		if corePtr.IsRunning() {
-			err = corePtr.RemoveInbound(tag)
-			if err != nil && err != os.ErrInvalid {
-				return nil, err
-			}
 		}
 		var id uint
 		err = tx.Model(model.Inbound{}).Select("id").Where("tag = ?", tag).Scan(&id).Error
@@ -606,37 +561,4 @@ func (s *InboundService) initUsers(db *gorm.DB, inboundJson []byte, clientIds st
 	}
 
 	return json.Marshal(inbound)
-}
-
-func (s *InboundService) RestartInbounds(tx *gorm.DB, ids []uint) error {
-	if !corePtr.IsRunning() {
-		return nil
-	}
-	var inbounds []*model.Inbound
-	err := tx.Model(model.Inbound{}).Preload("Tls").Where("id in ?", ids).Find(&inbounds).Error
-	if err != nil {
-		return err
-	}
-	for _, inbound := range inbounds {
-		err = corePtr.RemoveInbound(inbound.Tag)
-		if err != nil && err != os.ErrInvalid {
-			return err
-		}
-		// Close all existing connections
-		corePtr.GetInstance().ConnTracker().CloseConnByInbound(inbound.Tag)
-
-		inboundConfig, err := inbound.MarshalJSON()
-		if err != nil {
-			return err
-		}
-		inboundConfig, err = s.addUsers(tx, inboundConfig, inbound.Id, inbound.Type)
-		if err != nil {
-			return err
-		}
-		err = corePtr.AddInbound(inboundConfig)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }

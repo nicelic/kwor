@@ -157,6 +157,129 @@ func TestMihomoClientSubscriptions(t *testing.T) {
 	}
 }
 
+func TestMihomoSubscriptionsExcludePanelAndUnknownClientFields(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "mihomo-subscription-client-fields.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("InitDB failed: %v", err)
+	}
+
+	db := database.GetDB()
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("db.DB failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
+
+	inbound := model.MihomoInbound{
+		Type:  "trojan",
+		Tag:   "trojan-clean-443",
+		Addrs: mustRawJSON(t, []interface{}{}),
+		OutJson: mustRawJSON(t, map[string]interface{}{
+			"type":            "trojan",
+			"tag":             "trojan-clean-443",
+			"server":          "panel.example.com",
+			"server_port":     443,
+			"id":              99,
+			"route_tag":       "trojan-clean-443",
+			"user_management": map[string]interface{}{"selectable": true},
+			"metadata":        map[string]interface{}{"source": "legacy-panel"},
+			"users":           []interface{}{map[string]interface{}{"username": "legacy"}},
+		}),
+		Options: mustRawJSON(t, map[string]interface{}{
+			"listen_port": 443,
+		}),
+	}
+	if err := db.Create(&inbound).Error; err != nil {
+		t.Fatalf("create mihomo inbound failed: %v", err)
+	}
+
+	client := model.MihomoClient{
+		Enable: true,
+		Name:   "field-cleanup-user",
+		Config: mustRawJSON(t, map[string]interface{}{
+			"trojan": map[string]interface{}{
+				"username":        "alice",
+				"password":        "client-secret",
+				"route_tag":       "client-route",
+				"user_management": map[string]interface{}{"selectable": true},
+				"metadata":        map[string]interface{}{"source": "client"},
+				"server_port":     1,
+				"unexpected":      "must-not-leak",
+			},
+		}),
+		Inbounds: mustRawJSON(t, []uint{inbound.Id}),
+		Links:    mustRawJSON(t, []map[string]string{}),
+	}
+	if err := db.Create(&client).Error; err != nil {
+		t.Fatalf("create mihomo client failed: %v", err)
+	}
+
+	baseInbound := inbound.ToBase()
+	rawOutbounds, _, err := (&JsonService{}).getOutboundsForNamespace(client.Name, client.Config, []*model.Inbound{&baseInbound}, "mihomo")
+	if err != nil {
+		t.Fatalf("build Mihomo raw outbounds failed: %v", err)
+	}
+	if rawOutbounds == nil || len(*rawOutbounds) != 1 {
+		t.Fatalf("unexpected Mihomo raw outbounds: %#v", rawOutbounds)
+	}
+	rawOutbound := (*rawOutbounds)[0]
+	for _, key := range []string{"id", "route_tag", "user_management", "metadata", "users", "unexpected"} {
+		if _, exists := rawOutbound[key]; exists {
+			t.Fatalf("Mihomo raw outbound leaked %q: %#v", key, rawOutbound)
+		}
+	}
+	if got, _ := rawOutbound["server_port"].(float64); got != 443 {
+		t.Fatalf("client config must not override server_port, got %#v", rawOutbound["server_port"])
+	}
+	if got, _ := rawOutbound["username"].(string); got != "alice" {
+		t.Fatalf("expected allowed Mihomo username, got %#v", rawOutbound["username"])
+	}
+	if got, _ := rawOutbound["password"].(string); got != "client-secret" {
+		t.Fatalf("expected allowed password, got %#v", rawOutbound["password"])
+	}
+
+	jsonSub, _, err := (&JsonService{}).GetMihomoJson(client.Name, "json")
+	if err != nil {
+		t.Fatalf("GetMihomoJson failed: %v", err)
+	}
+	jsonDoc := map[string]interface{}{}
+	if err := json.Unmarshal([]byte(*jsonSub), &jsonDoc); err != nil {
+		t.Fatalf("decode JSON subscription failed: %v", err)
+	}
+	jsonOutbound := findTaggedOutbound(t, jsonDoc["outbounds"], inbound.Tag)
+	for _, key := range []string{"id", "route_tag", "user_management", "metadata", "users", "unexpected", "username"} {
+		if _, exists := jsonOutbound[key]; exists {
+			t.Fatalf("sing-box JSON outbound leaked %q: %#v", key, jsonOutbound)
+		}
+	}
+	if got, _ := jsonOutbound["server_port"].(float64); got != 443 {
+		t.Fatalf("JSON client config must not override server_port, got %#v", jsonOutbound["server_port"])
+	}
+	if got, _ := jsonOutbound["password"].(string); got != "client-secret" {
+		t.Fatalf("expected JSON password to remain, got %#v", jsonOutbound["password"])
+	}
+
+	clashSub, _, err := (&ClashService{}).GetMihomoClash(client.Name)
+	if err != nil {
+		t.Fatalf("GetMihomoClash failed: %v", err)
+	}
+	clashDoc := map[string]interface{}{}
+	if err := yaml.Unmarshal([]byte(*clashSub), &clashDoc); err != nil {
+		t.Fatalf("decode Clash subscription failed: %v", err)
+	}
+	clashProxy := findNamedProxy(t, clashDoc["proxies"], inbound.Tag)
+	for _, key := range []string{"id", "route_tag", "user_management", "metadata", "users", "unexpected"} {
+		if _, exists := clashProxy[key]; exists {
+			t.Fatalf("Clash proxy leaked %q: %#v", key, clashProxy)
+		}
+	}
+	if got, _ := clashProxy["password"].(string); got != "client-secret" {
+		t.Fatalf("expected Clash password to remain, got %#v", clashProxy["password"])
+	}
+}
+
 func TestMihomoClashSubscriptions_Snell(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "mihomo-snell-subscriptions.db")
 	if err := database.InitDB(dbPath); err != nil {
@@ -971,6 +1094,128 @@ func TestMihomoMieruSubscriptions(t *testing.T) {
 	}
 	if got, _ := clashProxyB["username"].(string); got != "alice" {
 		t.Fatalf("expected second mieru username=alice, got %v", clashProxyB["username"])
+	}
+}
+
+func TestMihomoShadowQUICSubscriptions(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "mihomo-shadowquic.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("InitDB failed: %v", err)
+	}
+
+	db := database.GetDB()
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("db.DB failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
+
+	inbound := model.MihomoInbound{
+		Type:  "shadowquic",
+		Tag:   "sq-10443",
+		Addrs: mustRawJSON(t, []interface{}{}),
+		OutJson: mustRawJSON(t, map[string]interface{}{
+			"sni":                   "cdn.example.com",
+			"alpn":                  []interface{}{"h3"},
+			"quic_versions":         []interface{}{"v2", "v1"},
+			"zero_rtt":              false,
+			"disable_mtu_discovery": false,
+			"tls":                   map[string]interface{}{"enabled": true},
+		}),
+		Options: mustRawJSON(t, map[string]interface{}{
+			"listen":                "0.0.0.0",
+			"listen_port":           10443,
+			"alpn":                  []interface{}{"h3"},
+			"quic_versions":         []interface{}{"v2", "v1"},
+			"zero_rtt":              false,
+			"disable_mtu_discovery": false,
+			"jls_upstream": map[string]interface{}{
+				"addr":  "www.example.com:443",
+				"sni":   "cdn.example.com",
+				"proxy": "upstream-group",
+			},
+		}),
+	}
+
+	baseInbound := inbound.ToBase()
+	if err := util.FillOutJson(&baseInbound, "panel.example.com"); err != nil {
+		t.Fatalf("FillOutJson failed: %v", err)
+	}
+	inbound.OutJson = baseInbound.OutJson
+	if err := db.Create(&inbound).Error; err != nil {
+		t.Fatalf("create mihomo ShadowQUIC inbound failed: %v", err)
+	}
+
+	client := model.MihomoClient{
+		Enable: true,
+		Name:   "shadowquic-user",
+		Config: mustRawJSON(t, map[string]interface{}{
+			"shadowquic": map[string]interface{}{
+				"username": "alice",
+				"password": "secret",
+			},
+		}),
+		Inbounds: mustRawJSON(t, []uint{inbound.Id}),
+		Links:    mustRawJSON(t, []map[string]string{}),
+	}
+	if err := db.Create(&client).Error; err != nil {
+		t.Fatalf("create mihomo ShadowQUIC client failed: %v", err)
+	}
+
+	plainSub, _, err := (&SubService{}).GetMihomoSubs(client.Name)
+	if err != nil {
+		t.Fatalf("GetMihomoSubs failed: %v", err)
+	}
+	plainText := *plainSub
+	if decoded, decodeErr := base64.StdEncoding.DecodeString(plainText); decodeErr == nil {
+		plainText = string(decoded)
+	}
+	if strings.Contains(strings.ToLower(plainText), "shadowquic://") {
+		t.Fatalf("ordinary subscription must not invent a ShadowQUIC URI: %s", plainText)
+	}
+
+	jsonSub, _, err := (&JsonService{}).GetMihomoJson(client.Name, "json")
+	if err != nil {
+		t.Fatalf("GetMihomoJson failed: %v", err)
+	}
+	var jsonDoc map[string]interface{}
+	if err := json.Unmarshal([]byte(*jsonSub), &jsonDoc); err != nil {
+		t.Fatalf("decode JSON subscription failed: %v", err)
+	}
+	if hasTaggedOutbound(jsonDoc["outbounds"], inbound.Tag) {
+		t.Fatalf("sing-box JSON subscription must filter ShadowQUIC: %#v", jsonDoc["outbounds"])
+	}
+
+	clashSub, _, err := (&ClashService{}).GetMihomoClash(client.Name)
+	if err != nil {
+		t.Fatalf("GetMihomoClash failed: %v", err)
+	}
+	var clashDoc map[string]interface{}
+	if err := yaml.Unmarshal([]byte(*clashSub), &clashDoc); err != nil {
+		t.Fatalf("decode Clash subscription failed: %v", err)
+	}
+	proxy := findNamedProxy(t, clashDoc["proxies"], inbound.Tag)
+	if proxy["type"] != "shadowquic" || proxy["username"] != "alice" || proxy["password"] != "secret" {
+		t.Fatalf("unexpected ShadowQUIC Clash proxy: %#v", proxy)
+	}
+	if proxy["sni"] != "cdn.example.com" {
+		t.Fatalf("expected native ShadowQUIC sni, got %#v", proxy["sni"])
+	}
+	versions, ok := proxy["quic-versions"].([]interface{})
+	if !ok || len(versions) != 2 || versions[0] != "v2" || versions[1] != "v1" {
+		t.Fatalf("expected ordered ShadowQUIC QUIC versions in Clash subscription, got %#v", proxy["quic-versions"])
+	}
+	for _, key := range []string{"zero-rtt", "disable-mtu-discovery"} {
+		if _, exists := proxy[key]; !exists {
+			t.Fatalf("expected explicit optional field %s in Clash proxy: %#v", key, proxy)
+		}
+	}
+	for _, key := range []string{"tls", "routing-mark", "rule", "proxy"} {
+		if _, exists := proxy[key]; exists {
+			t.Fatalf("unexpected field %s in ShadowQUIC Clash proxy: %#v", key, proxy)
+		}
 	}
 }
 

@@ -1,5 +1,6 @@
 ﻿<template>
   <Editor
+	v-if="enableEditor"
     v-model="enableEditor"
     :data="editorData"
     :visible="enableEditor"
@@ -7,11 +8,14 @@
     @close="enableEditor = false"
     @save="saveEditor"
     />
-  <v-card>
+	<v-card @input.capture="markUserDirty" @change.capture="markUserDirty">
+	  <v-alert v-if="parseError" type="error" variant="tonal" density="compact" class="mb-4">
+	    {{ parseError }}
+	  </v-alert>
     <!-- Server tls_store settings -->
     <v-row>
       <v-col cols="12" sm="4" md="2" lg="2">
-        <v-switch v-model="enableServerTlsStore" color="primary" label="服务端证书库 tls_store" hide-details />
+		<v-switch v-model="enableServerTlsStore" color="primary" :label="$t('subscriptionEditor.serverTlsStore')" hide-details />
       </v-col>
       <v-col cols="12" sm="4" md="2" lg="2" v-if="enableServerTlsStore">
         <v-select hide-details label="store" :items="tlsStoreOptions" v-model="serverTlsStore"></v-select>
@@ -19,7 +23,7 @@
     </v-row>
     <v-row>
       <v-col cols="12" sm="4" md="2" lg="2">
-        <v-switch v-model="enableClientTlsStore" color="primary" label="客户端证书库 tls_store" hide-details />
+		<v-switch v-model="enableClientTlsStore" color="primary" :label="$t('subscriptionEditor.clientTlsStore')" hide-details />
       </v-col>
       <v-col cols="12" sm="4" md="2" lg="2" v-if="enableClientTlsStore">
         <v-select hide-details label="store" :items="tlsStoreOptions" v-model="clientTlsStore"></v-select>
@@ -58,7 +62,7 @@
       <v-row>
         <v-col cols="12" sm="6" md="4" lg="4">
           <v-row no-gutters>
-            <v-col cols="12" class="v-card-subtitle" style="margin-top: -5px;">代理流量 DNS</v-col>
+            <v-col cols="12" class="v-card-subtitle" style="margin-top: -5px;">{{ $t('subscriptionEditor.proxyTrafficDns') }}</v-col>
             <v-col cols="4">
               <v-select hide-details :label="$t('type')" :items="dnsTypeOptions" density="compact" class="noGutters" v-model="proxyDnsType" @update:model-value="onProxyDnsTypeChange"></v-select>
             </v-col>
@@ -72,7 +76,7 @@
         </v-col>
         <v-col cols="12" sm="6" md="4" lg="4">
           <v-row no-gutters>
-            <v-col cols="12" class="v-card-subtitle" style="margin-top: -5px;">直连流量 DNS</v-col>
+            <v-col cols="12" class="v-card-subtitle" style="margin-top: -5px;">{{ $t('subscriptionEditor.directTrafficDns') }}</v-col>
             <v-col cols="4">
               <v-select hide-details :label="$t('type')" :items="dnsTypeOptions" density="compact" class="noGutters" v-model="directDnsType" @update:model-value="onDirectDnsTypeChange"></v-select>
             </v-col>
@@ -89,7 +93,7 @@
       <v-row>
         <v-col cols="12" sm="6" md="4" lg="4">
           <v-row no-gutters>
-            <v-col cols="12" class="v-card-subtitle" style="margin-top: -5px;">代理流量 bootstrap DNS</v-col>
+            <v-col cols="12" class="v-card-subtitle" style="margin-top: -5px;">{{ $t('subscriptionEditor.proxyBootstrapDns') }}</v-col>
             <v-col cols="4">
               <v-select hide-details :label="$t('type')" :items="dnsTypeOptions" density="compact" class="noGutters" v-model="proxyBootstrapDnsType" @update:model-value="onProxyBootstrapDnsTypeChange"></v-select>
             </v-col>
@@ -103,7 +107,7 @@
         </v-col>
         <v-col cols="12" sm="6" md="4" lg="4">
           <v-row no-gutters>
-            <v-col cols="12" class="v-card-subtitle" style="margin-top: -5px;">直连流量 bootstrap DNS</v-col>
+            <v-col cols="12" class="v-card-subtitle" style="margin-top: -5px;">{{ $t('subscriptionEditor.directBootstrapDns') }}</v-col>
             <v-col cols="4">
               <v-select hide-details :label="$t('type')" :items="dnsTypeOptions" density="compact" class="noGutters" v-model="directBootstrapDnsType" @update:model-value="onDirectBootstrapDnsTypeChange"></v-select>
             </v-col>
@@ -146,7 +150,7 @@
       <!-- DNS row 5: sortable route rows -->
       <v-row
         v-for="(dnsRouteRow, dnsRowIdx) in dnsRouteRows"
-        :key="`dns-route-row-${dnsRowIdx}`"
+		:key="dnsRouteRow.id"
         align="center"
       >
         <v-col cols="12" sm="6" md="3">
@@ -176,35 +180,47 @@
             hide-details
           ></v-select>
         </v-col>
-        <v-col cols="12" sm="12" md="2">
+		<v-col cols="12" class="subscription-row-actions">
           <div class="d-flex align-center justify-end ga-1">
             <v-btn
               icon="mdi-arrow-up"
+			  class="subscription-row-action"
+			  :title="$t('subscriptionEditor.moveUp')"
+			  :aria-label="$t('subscriptionEditor.moveUp')"
               size="small"
               variant="text"
               :disabled="dnsRowIdx === 0"
-              @click="moveDnsRouteRow(dnsRowIdx, -1)"
+			  @click="markUserDirty(); moveDnsRouteRow(dnsRowIdx, -1)"
             ></v-btn>
             <v-btn
               icon="mdi-arrow-down"
+			  class="subscription-row-action"
+			  :title="$t('subscriptionEditor.moveDown')"
+			  :aria-label="$t('subscriptionEditor.moveDown')"
               size="small"
               variant="text"
               :disabled="dnsRowIdx >= dnsRouteRows.length - 1"
-              @click="moveDnsRouteRow(dnsRowIdx, 1)"
+			  @click="markUserDirty(); moveDnsRouteRow(dnsRowIdx, 1)"
             ></v-btn>
             <v-btn
               v-if="dnsRouteRow.kind === 'rule-set'"
               icon="mdi-plus"
+			  class="subscription-row-action"
+			  :title="$t('subscriptionEditor.add')"
+			  :aria-label="$t('subscriptionEditor.add')"
               size="small"
               variant="text"
-              @click="insertDnsRouteRow(dnsRowIdx)"
+			  @click="markUserDirty(); insertDnsRouteRow(dnsRowIdx)"
             ></v-btn>
             <v-btn
               v-if="dnsRouteRow.kind === 'rule-set' && canDeleteDnsRouteRow(dnsRowIdx)"
               icon="mdi-delete"
+			  class="subscription-row-action"
+			  :title="$t('subscriptionEditor.remove')"
+			  :aria-label="$t('subscriptionEditor.remove')"
               size="small"
               variant="text"
-              @click="removeDnsRouteRow(dnsRowIdx)"
+			  @click="markUserDirty(); removeDnsRouteRow(dnsRowIdx)"
             ></v-btn>
           </div>
         </v-col>
@@ -212,7 +228,7 @@
       <!-- DNS row 6: resolver strategy -->
       <v-row>
         <v-col cols="12" sm="6" md="3" lg="2">
-          <v-select v-model="dnsStrategy" :items="dnsStrategyOptions" label="域名解析策略" hide-details></v-select>
+		  <v-select v-model="dnsStrategy" :items="dnsStrategyOptions" :label="$t('subscriptionEditor.dnsStrategy')" hide-details></v-select>
         </v-col>
         <v-col cols="12" sm="6" md="3" lg="2">
           <v-select
@@ -238,10 +254,10 @@
           <v-switch v-model="enableTun" color="primary" label="tun" hide-details />
         </v-col>
         <v-col cols="12" sm="4" md="2" lg="2" v-if="enableTun">
-          <v-switch v-model="autoRoute" color="primary" label="自动路由" hide-details />
+		  <v-switch v-model="autoRoute" color="primary" :label="$t('subscriptionEditor.autoRoute')" hide-details />
         </v-col>
         <v-col cols="12" sm="4" md="2" lg="2" v-if="enableTun && autoRoute">
-          <v-switch v-model="strictRoute" color="primary" label="严格路由" hide-details />
+		  <v-switch v-model="strictRoute" color="primary" :label="$t('subscriptionEditor.strictRoute')" hide-details />
         </v-col>
         <v-col cols="12" sm="4" md="3" lg="3" v-if="enableTun">
           <v-switch v-model="endpointIndependentNat" color="primary" label="endpoint_independent_nat" hide-details />
@@ -250,7 +266,7 @@
       <!-- TUN address and MTU -->
       <v-row v-if="enableTun">
         <v-col cols="12" sm="6" md="3">
-          <v-combobox v-model="tunAddress" :items="defaultTunAddress" chips multiple hide-details label="TUN网卡IP"></v-combobox>
+		  <v-combobox v-model="tunAddress" :items="defaultTunAddress" chips multiple hide-details :label="$t('subscriptionEditor.tunAddress')"></v-combobox>
         </v-col>
         <v-col cols="12" sm="6" md="3" lg="2">
           <v-text-field type="number" v-model.number="tunMtu" hide-details label="MTU"></v-text-field>
@@ -258,16 +274,16 @@
       </v-row>
       <v-row v-if="enableTun">
         <v-col cols="12" sm="6" md="3" lg="2">
-          <v-select v-model="tunMode" :items="['system', 'mixed', 'gvisor']" label="TUN 模式" hide-details></v-select>
+		  <v-select v-model="tunMode" :items="['system', 'mixed', 'gvisor']" :label="$t('subscriptionEditor.tunMode')" hide-details></v-select>
         </v-col>
       </v-row>
       <!-- Mixed inbound listen settings -->
       <v-row>
         <v-col cols="12" sm="4" md="3" lg="2">
-          <v-text-field v-model="mixedListen" label="默认监听地址" hide-details placeholder="127.0.0.1"></v-text-field>
+		  <v-text-field v-model="mixedListen" :label="$t('subscriptionEditor.defaultListen')" hide-details placeholder="127.0.0.1"></v-text-field>
         </v-col>
         <v-col cols="12" sm="2" md="2" lg="1">
-          <v-text-field type="number" v-model.number="mixedListenPort" label="端口" hide-details placeholder="2080"></v-text-field>
+		  <v-text-field type="number" v-model.number="mixedListenPort" :label="$t('setting.port')" hide-details placeholder="2080"></v-text-field>
         </v-col>
       </v-row>
       <!-- TUN package exclusion and platform proxy -->
@@ -276,7 +292,7 @@
           <v-combobox v-model="tunExcludePackage" :items="['ir.mci.ecareapp','com.myirancell']" chips multiple hide-details :label="$t('setting.excludePkg')"></v-combobox>
         </v-col>
         <v-col cols="12" sm="6" md="3" lg="2">
-          <v-switch v-model="platformProxy" hide-details color="primary" label="平台 HTTP 代理"></v-switch>
+		  <v-switch v-model="platformProxy" hide-details color="primary" :label="$t('subscriptionEditor.platformHttpProxy')"></v-switch>
         </v-col>
       </v-row>
     </template>
@@ -284,30 +300,30 @@
     <!-- Rule set source -->
     <v-row>
       <v-col cols="12" sm="6" md="3">
-        <v-select v-model="ruleSetSource" :items="ruleSetSourceOptions" label="全局规则集来源" hide-details></v-select>
+		<v-select v-model="ruleSetSource" :items="ruleSetSourceOptions" :label="$t('subscriptionEditor.globalRuleSetSource')" hide-details></v-select>
       </v-col>
     </v-row>
         <!-- Match/ruleset unified list -->
     <v-row
       v-for="(row, idx) in ruleRows"
-      :key="`rule-row-${idx}`"
+	  :key="row.id"
       align="center"
     >
       <v-col cols="12" sm="3" md="2">
         <v-text-field
           v-model="row.name"
-          :label="idx === 0 ? '名称（可选）' : '名称'"
-          :hint="idx === 0 ? '提示：规则集可同名合并；自定义同名需同匹配类型，且不能与规则集重名。' : ''"
+		  :label="idx === 0 ? $t('subscriptionEditor.optionalName') : $t('subscriptionEditor.name')"
+		  :hint="idx === 0 ? $t('subscriptionEditor.ruleNameHelp') : ''"
           :persistent-hint="idx === 0"
           hide-details="auto"
-          placeholder="例如：CN"
+          :placeholder="$t('subscriptionEditor.exampleCN')"
         ></v-text-field>
       </v-col>
       <v-col cols="12" sm="3" md="2">
         <v-select
           v-model="row.kind"
           :items="ruleKindOptions"
-          label="规则类型"
+		  :label="$t('subscriptionEditor.ruleKind')"
           hide-details
         ></v-select>
       </v-col>
@@ -316,22 +332,22 @@
           v-if="row.kind === 'custom'"
           v-model="row.customType"
           :items="domainIpTypes"
-          :label="idx === 0 ? '自定义匹配类型' : '匹配类型'"
+		  :label="idx === 0 ? $t('subscriptionEditor.customMatchType') : $t('subscriptionEditor.matchType')"
           hide-details
         ></v-select>
         <v-select
           v-else
           v-model="row.ruleSetScope"
           :items="ruleSetScopeOptions"
-          label="规则集类型"
+		  :label="$t('subscriptionEditor.ruleSetScope')"
           hide-details
         ></v-select>
       </v-col>
       <v-col cols="12" sm="3" md="2" v-if="row.kind === 'ruleset'">
         <v-select
           v-model="row.ruleSetSourceOverride"
-          :items="ruleSetSourceOverrideOptions"
-          label="规则集来源"
+		  :items="getRuleSetSourceOverrideOptions(row.ruleSetScope)"
+		  :label="$t('subscriptionEditor.ruleSetSource')"
           hide-details
         ></v-select>
       </v-col>
@@ -350,96 +366,108 @@
         <v-select
           v-model="row.route"
           :items="customRouteOptions"
-          :label="row.name && row.name.trim() ? '路由（设置名称后禁用）' : '路由'"
+		  :label="row.name && row.name.trim() ? $t('subscriptionEditor.routeDisabledByName') : $t('subscriptionEditor.route')"
           :disabled="Boolean(row.name && row.name.trim())"
           hide-details
         ></v-select>
       </v-col>
-      <v-col cols="12" sm="12" md="2">
+	  <v-col cols="12" class="subscription-row-actions">
         <div class="d-flex align-center justify-end ga-1">
           <v-btn
             icon="mdi-arrow-up"
+			class="subscription-row-action"
+			:title="$t('subscriptionEditor.moveUp')"
+			:aria-label="$t('subscriptionEditor.moveUp')"
             size="small"
             variant="text"
             :disabled="idx === 0"
-            @click="moveRuleRow(idx, -1)"
+			@click="markUserDirty(); moveRuleRow(idx, -1)"
           ></v-btn>
           <v-btn
             icon="mdi-arrow-down"
+			class="subscription-row-action"
+			:title="$t('subscriptionEditor.moveDown')"
+			:aria-label="$t('subscriptionEditor.moveDown')"
             size="small"
             variant="text"
             :disabled="idx >= ruleRows.length - 1"
-            @click="moveRuleRow(idx, 1)"
+			@click="markUserDirty(); moveRuleRow(idx, 1)"
           ></v-btn>
           <v-btn
             icon="mdi-plus"
+			class="subscription-row-action"
+			:title="$t('subscriptionEditor.add')"
+			:aria-label="$t('subscriptionEditor.add')"
             size="small"
             variant="text"
-            @click="insertRuleRow(idx)"
+			@click="markUserDirty(); insertRuleRow(idx)"
           ></v-btn>
           <v-btn
             v-if="canDeleteRuleRow(idx)"
             icon="mdi-delete"
+			class="subscription-row-action"
+			:title="$t('subscriptionEditor.remove')"
+			:aria-label="$t('subscriptionEditor.remove')"
             size="small"
             variant="text"
-            @click="removeRuleRow(idx)"
+			@click="markUserDirty(); removeRuleRow(idx)"
           ></v-btn>
         </div>
       </v-col>
     </v-row>
     <v-row>
       <v-col cols="12" sm="3" md="2">
-        <v-select v-model="updateMethod" :items="updateMethodOptions" label="更新方式" hide-details></v-select>
+		<v-select v-model="updateMethod" :items="updateMethodOptions" :label="$t('subscriptionEditor.updateMethod')" hide-details></v-select>
       </v-col>
       <v-col cols="12" sm="3" md="2">
-        <v-text-field v-model="updateInterval" label="更新时间，例如 1m 1h 1d" hide-details placeholder="1d"></v-text-field>
+		<v-text-field v-model="updateInterval" :label="$t('subscriptionEditor.updateInterval')" hide-details placeholder="1d"></v-text-field>
       </v-col>
     </v-row>
     <v-row>
       <v-col cols="12" sm="3" md="2">
-        <v-select v-model="routeFinal" :items="routeFinalOptions" label="路由最终出口（都不匹配时）" hide-details></v-select>
+		<v-select v-model="routeFinal" :items="routeFinalOptions" :label="$t('subscriptionEditor.routeFinal')" hide-details></v-select>
       </v-col>
     </v-row>
     <v-row>
       <v-col cols="12" sm="6" md="6">
-        <v-combobox v-model="latencyTestUrl" :items="latencyTestUrlOptions" label="真实延迟测试链接" hide-details></v-combobox>
+		<v-combobox v-model="latencyTestUrl" :items="latencyTestUrlOptions" :label="$t('subscriptionEditor.latencyUrl')" hide-details></v-combobox>
       </v-col>
     </v-row>
     <v-row>
       <v-col cols="12" sm="6" md="3">
         <v-text-field
           v-model="latencyTestInterval"
-          label="测试延迟间隔（自动切换代理相关）"
+		  :label="$t('subscriptionEditor.latencyInterval')"
           hide-details="auto"
-          hint="Sing-box：必须带单位（s/m/h/d，不支持 ms）"
+          :hint="$t('subscriptionEditor.singboxIntervalHint')"
           persistent-hint
           :error-messages="latencyTestIntervalError ? [latencyTestIntervalError] : []"
-          placeholder="例如 3m 或 30s"
+          :placeholder="$t('subscriptionEditor.singboxIntervalPlaceholder')"
         ></v-text-field>
       </v-col>
       <v-col cols="12" sm="6" md="3">
         <v-text-field
           v-model="latencyTolerance"
-          label="延迟容差"
+		  :label="$t('subscriptionEditor.latencyTolerance')"
           hide-details="auto"
-          hint="单位为 ms，可留空；填写时仅输入数字"
+          :hint="$t('subscriptionEditor.toleranceHint')"
           persistent-hint
           :error-messages="latencyToleranceError ? [latencyToleranceError] : []"
-          placeholder="例如 50（不要写 ms）"
+          :placeholder="$t('subscriptionEditor.tolerancePlaceholder')"
         ></v-text-field>
       </v-col>
     </v-row>
     <v-row>
       <v-col cols="12" sm="6" md="3" lg="2">
-        <v-switch v-model="enableRejectQuic" color="primary" label="拒绝quic" hide-details />
+		<v-switch v-model="enableRejectQuic" color="primary" :label="$t('subscriptionEditor.rejectQuic')" hide-details />
       </v-col>
       <v-col cols="12" sm="6" md="3" lg="2">
-        <v-switch v-model="enableReject443Udp" color="primary" label="拒绝_443_udp" hide-details />
+		<v-switch v-model="enableReject443Udp" color="primary" :label="$t('subscriptionEditor.reject443Udp')" hide-details />
       </v-col>
     </v-row>
     <v-row>
       <v-col cols="12" sm="6" md="3" lg="2">
-        <v-switch v-model="enableExp" color="primary" label="本地缓存（缓存删除数据困难）" hide-details />
+		<v-switch v-model="enableExp" color="primary" :label="$t('subscriptionEditor.localCache')" hide-details />
       </v-col>
       <v-col cols="12" sm="6" md="3" lg="2">
         <v-switch v-model="enableSubClashApi" color="primary" label="clash_api" hide-details />
@@ -532,15 +560,11 @@ import {
   tunIpOptions,
   dnsStrategyOptions,
   tlsStoreOptions,
-  ruleSetSourceOptions,
-  domainIpTypes,
   ruleSetOptions,
   geositeNameOptions,
   geoipNameOptions,
-  updateMethodOptions,
   latencyTestUrlOptions,
   clashApiModeOptions,
-  subSelectorTagOptions,
   geositeList,
   geoList,
   geo,
@@ -548,10 +572,21 @@ import {
 } from './SubJsonExtConstants'
 
 export default {
-  props: ['settings'],
+	props: ['settings', 'canonicalDefault', 'initialDirty', 'initialReset', 'ruleSetSources'],
+	emits: ['dirty-change'],
   components: { Editor },
   mixins: [SubJsonExtMixin],
   data() {
+	const backendRuleSetSourceOptions = (Array.isArray(this.ruleSetSources) ? this.ruleSetSources : [])
+	  .filter((item: any) => item?.domainTemplate && item?.ipTemplate)
+	  .map((item: any) => ({ title: item.title || item.id, value: item.id }))
+	const selectorOptions = [
+	  { title: this.$t('subscriptionEditor.nodeSelector'), value: '节点选择' },
+	  { title: this.$t('subscriptionEditor.autoSelector'), value: '自动选择' },
+	  { title: this.$t('subscriptionEditor.globalDirectSelector'), value: '全球直连' },
+	  { title: this.$t('subscriptionEditor.globalBlockSelector'), value: '全球拦截' },
+	  { title: this.$t('subscriptionEditor.finalSelector'), value: '漏网之鱼' },
+	]
     return {
       // Reactive state
       subJsonExt: {} as any,
@@ -561,36 +596,30 @@ export default {
       autoMatchedRuleSetUrls: {} as Record<string, { url: string; source: string }>,
       autoMatchRunToken: 0,
       dnsRouteRows: [
-        { kind: "rule-set", server: "proxy-dns", ruleSet: [] as string[] },
-      ] as Array<{ kind: string; server: string; ruleSet: string[] }>,
+		{ id: "json-dns-initial", kind: "rule-set", server: "proxy-dns", ruleSet: [] as string[] },
+	  ] as Array<{ id: string; kind: string; server: string; ruleSet: string[] }>,
       ruleRows: [
-        { kind: "custom", name: "", customType: "domain", ruleSetScope: "domain", ruleSetSourceOverride: null as string | null, route: "reject", values: [] as string[] },
-      ] as Array<{ kind: string; name: string; customType: string; ruleSetScope: string; ruleSetSourceOverride: string | null; route: string; values: string[] }>,
+		{ id: "json-rule-initial", kind: "custom", name: "", customType: "domain_keyword", ruleSetScope: "domain", ruleSetSourceOverride: null as string | null, route: "reject", values: [] as string[] },
+	  ] as Array<{ id: string; kind: string; name: string; customType: string; ruleSetScope: string; ruleSetSourceOverride: string | null; route: string; values: string[] }>,
       ruleKindOptions: [
-        { title: "自定义匹配", value: "custom" },
-        { title: "规则集", value: "ruleset" },
+		{ title: this.$t('subscriptionEditor.customMatch'), value: "custom" },
+		{ title: this.$t('subscriptionEditor.ruleSet'), value: "ruleset" },
       ],
       ruleSetScopeOptions: [
-        { title: "域名", value: "domain" },
+		{ title: this.$t('subscriptionEditor.domain'), value: "domain" },
         { title: "IP", value: "ip" },
       ],
       customRouteOptions: [
-        { title: "屏蔽 (reject)", value: "reject" },
-        { title: "直连 (direct)", value: "direct" },
-        { title: "代理 (proxy)", value: "proxy" },
+		{ title: this.$t('subscriptionEditor.blockRoute'), value: "reject" },
+		{ title: this.$t('subscriptionEditor.directRoute'), value: "direct" },
+		{ title: this.$t('subscriptionEditor.proxyRoute'), value: "proxy" },
       ],
       updateMethod: "全球直连" as string,
       updateInterval: "1d" as string,
       routeFinal: "漏网之鱼" as string,
-      routeFinalOptions: [
-        { title: "节点选择", value: "节点选择" },
-        { title: "自动选择", value: "自动选择" },
-        { title: "全球直连", value: "全球直连" },
-        { title: "全球拦截", value: "全球拦截" },
-        { title: "漏网之鱼", value: "漏网之鱼" },
-      ],
+      routeFinalOptions: selectorOptions,
       clashApiModeOptions,
-      subSelectorTagOptions,
+      subSelectorTagOptions: selectorOptions,
       latencyTestUrl: "https://cp.cloudflare.com/generate_204" as string,
       latencyTestInterval: "3m" as string,
       latencyTolerance: "50" as string,
@@ -600,6 +629,11 @@ export default {
       enableReject443Udp: false,
       _uiConfigLoaded: false,
       _suspendRuleRegeneration: false,
+	  _dirty: this.initialDirty === true,
+	  _resetRequested: this.initialReset === true,
+	  _parseError: '',
+	  _rawSource: '',
+	  _editorSourcePending: false,
 
       // DNS server type options.
       dnsTypeOptions: ['udp', 'tcp', 'local', 'dhcp', 'tls', 'quic', 'h3', 'https'],
@@ -611,16 +645,23 @@ export default {
       tunIpOptions,
       dnsStrategyOptions,
       tlsStoreOptions,
-      ruleSetSourceOptions,
+	  ruleSetSourceOptions: backendRuleSetSourceOptions,
       ruleSetSourceOverrideOptions: [
-        { title: "使用全局规则集来源", value: null as string | null },
-        ...ruleSetSourceOptions,
+		{ title: this.$t('subscriptionEditor.useGlobalRuleSetSource'), value: null as string | null },
+		...backendRuleSetSourceOptions,
       ],
-      domainIpTypes,
+      domainIpTypes: [
+		{ title: this.$t('subscriptionEditor.domainExact'), value: 'domain' },
+		{ title: this.$t('subscriptionEditor.domainSuffix'), value: 'domain_suffix' },
+		{ title: this.$t('subscriptionEditor.domainKeyword'), value: 'domain_keyword' },
+		{ title: this.$t('subscriptionEditor.domainRegex'), value: 'domain_regex' },
+		{ title: this.$t('subscriptionEditor.ipCidr'), value: 'ip_cidr' },
+		{ title: this.$t('subscriptionEditor.privateIp'), value: 'ip_is_private' },
+	  ],
       ruleSetOptions,
       geositeNameOptions: geositeNameOptions.filter((item: string) => item.trim().length > 0),
       geoipNameOptions: geoipNameOptions.filter((item: string) => item.trim().length > 0),
-      updateMethodOptions,
+      updateMethodOptions: selectorOptions,
       latencyTestUrlOptions,
       geositeList,
       geoList,
@@ -724,8 +765,8 @@ export default {
   },
   methods: {
     defaultPortForDnsType(t: string): number {
-      if (t === 'https') return 443
-      if (['tls', 'quic', 'h3'].includes(t)) return 853
+	  if (['https', 'h3'].includes(t)) return 443
+	  if (['tls', 'quic'].includes(t)) return 853
       return 53
     },
     onProxyDnsTypeChange(t: string) {
@@ -735,10 +776,8 @@ export default {
       if (this.noServerTypes.includes(t)) {
         delete dns.server; delete dns.server_port; delete dns.tls; delete dns.domain_resolver
       } else {
-        if (!dns.server) {
-          dns.server = ''
-          dns.server_port = this.defaultPortForDnsType(t)
-        }
+		if (!dns.server) dns.server = ''
+		dns.server_port = this.defaultPortForDnsType(t)
         if (tlsTypes.includes(t)) {
           if (!dns.tls) dns.tls = { enabled: true, insecure: false, min_version: '1.3', server_name: dns.server || '' }
         } else {
@@ -755,10 +794,8 @@ export default {
       if (this.noServerTypes.includes(t)) {
         delete dns.server; delete dns.server_port; delete dns.tls; delete dns.domain_resolver
       } else {
-        if (!dns.server) {
-          dns.server = ''
-          dns.server_port = this.defaultPortForDnsType(t)
-        }
+		if (!dns.server) dns.server = ''
+		dns.server_port = this.defaultPortForDnsType(t)
         if (tlsTypes.includes(t)) {
           if (!dns.tls) dns.tls = { enabled: true, insecure: false, min_version: '1.3', server_name: dns.server || '' }
         } else {
@@ -775,10 +812,8 @@ export default {
       if (this.noServerTypes.includes(t)) {
         delete dns.server; delete dns.server_port; delete dns.tls; delete dns.domain_resolver
       } else {
-        if (!dns.server) {
-          dns.server = ''
-          dns.server_port = this.defaultPortForDnsType(t)
-        }
+		if (!dns.server) dns.server = ''
+		dns.server_port = this.defaultPortForDnsType(t)
         if (tlsTypes.includes(t)) {
           if (!dns.tls) dns.tls = { enabled: true, insecure: false, min_version: '1.3', server_name: dns.server || '' }
         } else {
@@ -794,10 +829,8 @@ export default {
       if (this.noServerTypes.includes(t)) {
         delete dns.server; delete dns.server_port; delete dns.tls; delete dns.domain_resolver
       } else {
-        if (!dns.server) {
-          dns.server = ''
-          dns.server_port = this.defaultPortForDnsType(t)
-        }
+		if (!dns.server) dns.server = ''
+		dns.server_port = this.defaultPortForDnsType(t)
         if (tlsTypes.includes(t)) {
           if (!dns.tls) dns.tls = { enabled: true, insecure: false, min_version: '1.3', server_name: dns.server || '' }
         } else {
@@ -810,6 +843,16 @@ export default {
 }
 </script>
 
+<style scoped>
+.subscription-row-action {
+	width: 36px;
+	height: 36px;
+	min-width: 36px;
+	flex: 0 0 36px;
+}
 
-
-
+.subscription-row-actions {
+	flex-basis: 100%;
+	max-width: 100%;
+}
+</style>

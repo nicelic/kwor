@@ -160,7 +160,7 @@ func TestKernelManagerTraversalAndPackageFilter(t *testing.T) {
 		}
 	}
 
-	bbrPkgs, err := svc.GetPackages("bbrplus", "", "6.7.9-bbrplus", "")
+	bbrPkgs, err := svc.GetPackages("bbrplus", "", "6.7.9-bbrplus", runtime.GOARCH)
 	if err != nil {
 		t.Fatalf("GetPackages bbrplus failed: %v", err)
 	}
@@ -370,6 +370,58 @@ func TestNormalizeKernelPurgeTargetsAndCommand(t *testing.T) {
 	}
 }
 
+func TestValidateKernelPurgeTargetsFromScanRejectsUnscannedPackage(t *testing.T) {
+	entries := []kernelSelectionEntry{
+		{Name: "linux-image-6.18.27-x64v3-xanmod1", Status: "install"},
+		{Name: "linux-headers-6.18.27-x64v3-xanmod1", Status: "install"},
+	}
+	if err := validateKernelPurgeTargetsFromScan(entries, []string{"linux-image-6.18.27-x64v3-xanmod1"}); err != nil {
+		t.Fatalf("expected scanned package to be accepted, got %v", err)
+	}
+	if err := validateKernelPurgeTargetsFromScan(entries, []string{"bash"}); err == nil || !strings.Contains(err.Error(), "not present in the latest scan") {
+		t.Fatalf("expected unscanned package rejection, got %v", err)
+	}
+}
+
+func TestValidateKernelManualPurgeKeepsBootPairAllowsCurrentKernelWhenPairRemains(t *testing.T) {
+	entries := []kernelSelectionEntry{
+		{Name: "linux-image-6.18.27-x64v3-xanmod1", Status: "install"},
+		{Name: "linux-headers-6.18.27-x64v3-xanmod1", Status: "install"},
+		{Name: "linux-image-6.18.29-x64v3-xanmod1", Status: "install"},
+		{Name: "linux-headers-6.18.29-x64v3-xanmod1", Status: "install"},
+	}
+	if err := validateKernelManualPurgeKeepsBootPair(entries, []string{
+		"linux-image-6.18.27-x64v3-xanmod1",
+		"linux-headers-6.18.27-x64v3-xanmod1",
+	}); err != nil {
+		t.Fatalf("expected current kernel purge to be allowed while another pair remains, got %v", err)
+	}
+}
+
+func TestValidateKernelManualPurgeKeepsBootPairRejectsLastImageOrHeaders(t *testing.T) {
+	entries := []kernelSelectionEntry{
+		{Name: "linux-image-6.18.27-x64v3-xanmod1", Status: "install"},
+		{Name: "linux-headers-6.18.27-x64v3-xanmod1", Status: "hold"},
+	}
+	if err := validateKernelManualPurgeKeepsBootPair(entries, []string{"linux-image-6.18.27-x64v3-xanmod1"}); err == nil || !strings.Contains(err.Error(), "no installed linux-image") {
+		t.Fatalf("expected last image purge to be rejected, got %v", err)
+	}
+	if err := validateKernelManualPurgeKeepsBootPair(entries, []string{"linux-headers-6.18.27-x64v3-xanmod1"}); err == nil || !strings.Contains(err.Error(), "no installed linux-headers") {
+		t.Fatalf("expected last headers purge to be rejected, got %v", err)
+	}
+}
+
+func TestValidateKernelManualPurgeKeepsBootPairRejectsKernelDeleteWhenOtherClassIsAlreadyMissing(t *testing.T) {
+	entries := []kernelSelectionEntry{
+		{Name: "linux-image-6.18.27-x64v3-xanmod1", Status: "install"},
+		{Name: "linux-image-6.18.29-x64v3-xanmod1", Status: "install"},
+	}
+	err := validateKernelManualPurgeKeepsBootPair(entries, []string{"linux-image-6.18.27-x64v3-xanmod1"})
+	if err == nil || !strings.Contains(err.Error(), "no installed linux-headers") {
+		t.Fatalf("expected deletion to be rejected while no headers package remains, got %v", err)
+	}
+}
+
 func TestExtractKernelIDFromPackage(t *testing.T) {
 	if got := extractKernelIDFromPackage("linux-image-6.18.27-x64v3-xanmod1"); got != "6.18.27-x64v3-xanmod1" {
 		t.Fatalf("unexpected image kernel id: %q", got)
@@ -527,20 +579,33 @@ func TestAutoCleanupPackagesNoTargetsStillRunsSystemCleanup(t *testing.T) {
 }
 
 func TestPurgePackagesFailureStillRunsSystemCleanup(t *testing.T) {
-	oldEnsure := kernelEnsureRuntimeSupported
+	oldEnsure := kernelEnsureCleanupRuntime
 	oldResolveApt := kernelResolveAptCommand
 	oldRunPrivileged := kernelRunPrivilegedCommand
 	oldRunCleanup := kernelRunSystemCleanup
+	oldRunCommandOutput := kernelRunCommandOutput
 	defer func() {
-		kernelEnsureRuntimeSupported = oldEnsure
+		kernelEnsureCleanupRuntime = oldEnsure
 		kernelResolveAptCommand = oldResolveApt
 		kernelRunPrivilegedCommand = oldRunPrivileged
 		kernelRunSystemCleanup = oldRunCleanup
+		kernelRunCommandOutput = oldRunCommandOutput
 	}()
 
-	kernelEnsureRuntimeSupported = func() error { return nil }
+	kernelEnsureCleanupRuntime = func() error { return nil }
 	kernelResolveAptCommand = func() (string, error) {
 		return "/usr/bin/apt-get", nil
+	}
+	kernelRunCommandOutput = func(timeout time.Duration, command string, args ...string) (string, error) {
+		if command == "dpkg" {
+			return `
+linux-image-6.18.27-x64v3-xanmod1              install
+linux-headers-6.18.27-x64v3-xanmod1            install
+linux-image-6.18.29-x64v3-xanmod1              install
+linux-headers-6.18.29-x64v3-xanmod1            install
+`, nil
+		}
+		return "", fmt.Errorf("unexpected command: %s", command)
 	}
 	kernelRunPrivilegedCommand = func(timeout time.Duration, command string, args ...string) error {
 		if command == "/usr/bin/apt-get" && len(args) > 0 && args[0] == "purge" {
@@ -574,6 +639,45 @@ func TestPurgePackagesFailureStillRunsSystemCleanup(t *testing.T) {
 	}
 	if result.SystemCleanupSummary != "system cleanup completed" {
 		t.Fatalf("unexpected cleanup summary: %q", result.SystemCleanupSummary)
+	}
+}
+
+func TestPurgePackagesRejectsLastKernelPairBeforeRunningAptCleanup(t *testing.T) {
+	oldEnsure := kernelEnsureCleanupRuntime
+	oldRunOutput := kernelRunCommandOutput
+	oldRunPrivileged := kernelRunPrivilegedCommand
+	oldRunCleanup := kernelRunSystemCleanup
+	defer func() {
+		kernelEnsureCleanupRuntime = oldEnsure
+		kernelRunCommandOutput = oldRunOutput
+		kernelRunPrivilegedCommand = oldRunPrivileged
+		kernelRunSystemCleanup = oldRunCleanup
+	}()
+
+	kernelEnsureCleanupRuntime = func() error { return nil }
+	kernelRunCommandOutput = func(_ time.Duration, command string, _ ...string) (string, error) {
+		if command != "dpkg" {
+			return "", fmt.Errorf("unexpected command: %s", command)
+		}
+		return "linux-image-6.18.27-x64v3-xanmod1 install\nlinux-headers-6.18.27-x64v3-xanmod1 install\n", nil
+	}
+	aptCalled := false
+	kernelRunPrivilegedCommand = func(_ time.Duration, _ string, _ ...string) error {
+		aptCalled = true
+		return nil
+	}
+	cleanupCalled := false
+	kernelRunSystemCleanup = func() *kernelSystemCleanupReport {
+		cleanupCalled = true
+		return &kernelSystemCleanupReport{Done: true}
+	}
+
+	_, err := (&KernelManagerService{}).PurgePackages([]string{"linux-image-6.18.27-x64v3-xanmod1"})
+	if err == nil || !strings.Contains(err.Error(), "no installed linux-image") {
+		t.Fatalf("expected final image protection error, got %v", err)
+	}
+	if aptCalled || cleanupCalled {
+		t.Fatalf("rejected deletion must not execute apt or cleanup, apt=%v cleanup=%v", aptCalled, cleanupCalled)
 	}
 }
 
@@ -780,6 +884,135 @@ func TestClearDownloadedKernelRemovesMarkerAndLegacyArtifacts(t *testing.T) {
 	}
 	if strings.TrimSpace(stored) != "" {
 		t.Fatalf("expected marker cleared, got %q", stored)
+	}
+}
+
+func TestInstallDownloadedKernelRequiresCompletedDownloadMarker(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "kernel-install-marker.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("init db failed: %v", err)
+	}
+	if sqlDB, err := database.GetDB().DB(); err == nil && sqlDB != nil {
+		t.Cleanup(func() {
+			_ = sqlDB.Close()
+		})
+	}
+
+	kernelRoot := filepath.Join(config.GetDataDir(), "kernel")
+	_ = os.RemoveAll(kernelRoot)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(kernelRoot)
+	})
+
+	_, err := (&KernelManagerService{}).InstallDownloadedKernel()
+	if err == nil || !strings.Contains(err.Error(), "no completed kernel download") {
+		t.Fatalf("expected missing completed-download marker error, got %v", err)
+	}
+}
+
+func TestGetDownloadedKernelStatusRejectsMarkerOutsideKernelDownloadRoot(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "kernel-outside-marker.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("init db failed: %v", err)
+	}
+	if sqlDB, err := database.GetDB().DB(); err == nil && sqlDB != nil {
+		t.Cleanup(func() {
+			_ = sqlDB.Close()
+		})
+	}
+
+	kernelRoot := filepath.Join(config.GetDataDir(), "kernel")
+	_ = os.RemoveAll(kernelRoot)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(kernelRoot)
+	})
+
+	externalDir := filepath.Join(t.TempDir(), "external-kernel")
+	if err := os.MkdirAll(externalDir, 0o755); err != nil {
+		t.Fatalf("create external marker directory failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(externalDir, "linux-headers-6.18.36-x64v3-xanmod1_1_amd64.deb"), []byte("h"), 0o644); err != nil {
+		t.Fatalf("write external headers package failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(externalDir, "linux-image-6.18.36-x64v3-xanmod1_1_amd64.deb"), []byte("i"), 0o644); err != nil {
+		t.Fatalf("write external image package failed: %v", err)
+	}
+
+	marker := kernelDownloadedMarker{
+		Provider:  kernelProviderXanMod,
+		Line:      "lts",
+		Version:   "6.18.36-xanmod1",
+		Arch:      "x64v3",
+		Directory: externalDir,
+	}
+	raw, err := json.Marshal(marker)
+	if err != nil {
+		t.Fatalf("marshal external marker failed: %v", err)
+	}
+	settingSvc := &SettingService{}
+	if err := settingSvc.SaveSetting(kernelDownloadedMarkerSettingKey, string(raw)); err != nil {
+		t.Fatalf("save external marker failed: %v", err)
+	}
+
+	status, err := (&KernelManagerService{}).GetDownloadedKernelStatus()
+	if err != nil {
+		t.Fatalf("get downloaded kernel status failed: %v", err)
+	}
+	if status == nil || status.Exists {
+		t.Fatalf("external marker must not be installable, got %#v", status)
+	}
+	stored, err := settingSvc.getString(kernelDownloadedMarkerSettingKey)
+	if err != nil {
+		t.Fatalf("load cleared marker failed: %v", err)
+	}
+	if strings.TrimSpace(stored) != "" {
+		t.Fatalf("expected external marker to be cleared, got %q", stored)
+	}
+}
+
+func TestGetDownloadedKernelStatusAcceptsCompletedMarkerUnderKernelDownloadRoot(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "kernel-valid-marker.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("init db failed: %v", err)
+	}
+	if sqlDB, err := database.GetDB().DB(); err == nil && sqlDB != nil {
+		t.Cleanup(func() {
+			_ = sqlDB.Close()
+		})
+	}
+
+	kernelRoot := filepath.Join(config.GetDataDir(), "kernel")
+	_ = os.RemoveAll(kernelRoot)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(kernelRoot)
+	})
+	downloadDir := filepath.Join(kernelRoot, "lts", "6.18.36-xanmod1", "x64v3")
+	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
+		t.Fatalf("create download directory failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloadDir, "linux-headers-6.18.36-x64v3-xanmod1_1_amd64.deb"), []byte("h"), 0o644); err != nil {
+		t.Fatalf("write headers package failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(downloadDir, "linux-image-6.18.36-x64v3-xanmod1_1_amd64.deb"), []byte("i"), 0o644); err != nil {
+		t.Fatalf("write image package failed: %v", err)
+	}
+
+	svc := &KernelManagerService{}
+	if err := svc.saveDownloadedMarker(kernelDownloadedMarker{
+		Provider:  kernelProviderXanMod,
+		Line:      "lts",
+		Version:   "6.18.36-xanmod1",
+		Arch:      "x64v3",
+		Directory: downloadDir,
+	}); err != nil {
+		t.Fatalf("save valid completed-download marker failed: %v", err)
+	}
+	status, err := svc.GetDownloadedKernelStatus()
+	if err != nil {
+		t.Fatalf("get downloaded kernel status failed: %v", err)
+	}
+	if status == nil || !status.Exists || filepath.Clean(status.Directory) != filepath.Clean(downloadDir) {
+		t.Fatalf("expected valid marker status, got %#v", status)
 	}
 }
 

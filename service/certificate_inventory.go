@@ -22,8 +22,9 @@ const (
 )
 
 type CertificateRecordView struct {
-	Id        uint   `json:"id"`
-	DisplayID uint64 `json:"displayId"`
+	Id         uint   `json:"id"`
+	DisplayID  uint64 `json:"displayId"`
+	ResourceID string `json:"resourceId"`
 
 	SourceType string `json:"sourceType"`
 	SourceRef  string `json:"sourceRef"`
@@ -40,16 +41,22 @@ type CertificateRecordView struct {
 	CAServer                 string `json:"caServer"`
 	UseECC                   bool   `json:"useEcc"`
 	AutoRenew                bool   `json:"autoRenew"`
+	AutoRenewRetryPhase      string `json:"autoRenewRetryPhase"`
+	AutoRenewRetryCount      int    `json:"autoRenewRetryCount"`
+	AutoRenewNextRetryAt     int64  `json:"autoRenewNextRetryAt"`
+	AutoRenewLastAttemptAt   int64  `json:"autoRenewLastAttemptAt"`
 
-	AcmeAccountID   uint   `json:"acmeAccountId"`
-	AcmeAccountName string `json:"acmeAccountName"`
-	DNSAccountID    uint   `json:"dnsAccountId"`
-	DNSAccountName  string `json:"dnsAccountName"`
-	ApplyTarget     string `json:"applyTarget"`
-	PushDir         string `json:"pushDir"`
-	PushFiles       string `json:"pushFiles"`
-	Remark          string `json:"remark"`
-	RenewConfig     string `json:"renewConfig"`
+	AcmeAccountID   uint              `json:"acmeAccountId"`
+	AcmeAccountName string            `json:"acmeAccountName"`
+	DNSAccountID    uint              `json:"dnsAccountId"`
+	DNSAccountName  string            `json:"dnsAccountName"`
+	ApplyTarget     string            `json:"applyTarget"`
+	PushEnabled     bool              `json:"pushEnabled"`
+	PushDir         string            `json:"pushDir"`
+	PushFilePaths   map[string]string `json:"pushFilePaths"`
+	PushFiles       string            `json:"pushFiles"`
+	Remark          string            `json:"remark"`
+	RenewConfig     string            `json:"renewConfig"`
 
 	AcmeHome    string `json:"acmeHome"`
 	Webroot     string `json:"webroot"`
@@ -66,20 +73,24 @@ type CertificateRecordView struct {
 	NotBefore   int64  `json:"notBefore"`
 	NotAfter    int64  `json:"notAfter"`
 
-	LastIssuedAt  int64  `json:"lastIssuedAt"`
-	LastRenewedAt int64  `json:"lastRenewedAt"`
-	ListOrderAt   int64  `json:"listOrderAt"`
-	UpdatedAt     int64  `json:"updatedAt"`
-	CreatedAt     int64  `json:"createdAt"`
-	LastError     string `json:"lastError"`
-	LastOutput    string `json:"lastOutput"`
-	Status        string `json:"status"`
-	InUseByPanel  bool   `json:"inUseByPanel"`
-	InUseBySub    bool   `json:"inUseBySub"`
-	InUseByTLS    bool   `json:"inUseByTls"`
-	InUseByMihomo bool   `json:"inUseByMihomo"`
-	UsageLabel    string `json:"usageLabel"`
-	DeleteBlocked bool   `json:"deleteBlocked"`
+	LastIssuedAt    int64  `json:"lastIssuedAt"`
+	LastRenewedAt   int64  `json:"lastRenewedAt"`
+	ListOrderAt     int64  `json:"listOrderAt"`
+	UpdatedAt       int64  `json:"updatedAt"`
+	CreatedAt       int64  `json:"createdAt"`
+	LastError       string `json:"lastError"`
+	PostActionError string `json:"postActionError"`
+	LastOutput      string `json:"lastOutput"`
+	Status          string `json:"status"`
+	InUseByPanel    bool   `json:"inUseByPanel"`
+	InUseBySub      bool   `json:"inUseBySub"`
+	InUseByTLS      bool   `json:"inUseByTls"`
+	InUseByMihomo   bool   `json:"inUseByMihomo"`
+	UsageLabel      string `json:"usageLabel"`
+	// DeleteBlocked is kept for API compatibility. Certificate deletion now
+	// detaches active consumers atomically, so a usage reference is informative
+	// rather than a hard delete block.
+	DeleteBlocked bool `json:"deleteBlocked"`
 }
 
 type CertificateMaterialView struct {
@@ -94,8 +105,10 @@ type CertificateMaterialView struct {
 	FullchainPath string `json:"fullchainPath"`
 	ChainPath     string `json:"chainPath"`
 
-	FullchainPEM             string `json:"fullchainPem"`
+	CertPEM                  string `json:"certPem"`
 	KeyPEM                   string `json:"keyPem"`
+	FullchainPEM             string `json:"fullchainPem"`
+	ChainPEM                 string `json:"chainPem"`
 	Fingerprint              string `json:"fingerprint"`
 	IssuedKeyAlgorithm       string `json:"issuedKeyAlgorithm"`
 	IssuedSignatureAlgorithm string `json:"issuedSignatureAlgorithm"`
@@ -118,15 +131,21 @@ type CertificateUpsertPayload struct {
 	UseECC          bool
 	AutoRenew       bool
 
-	AcmeAccountID   uint
-	AcmeAccountName string
-	DNSAccountID    uint
-	DNSAccountName  string
-	ApplyTarget     string
-	PushDir         string
-	PushFiles       string
-	Remark          string
-	RenewConfig     string
+	AcmeAccountID      uint
+	AcmeAccountName    string
+	DNSAccountID       uint
+	DNSAccountName     string
+	AcmeRuntimeProfile string
+	ApplyTarget        string
+	PushEnabled        bool
+	PushDir            string
+	PushFilePaths      string
+	PushFiles          string
+	// PushStateProvided avoids overwriting a verified directory-push state while
+	// an issuance or renewal updates the certificate material.
+	PushStateProvided bool
+	Remark            string
+	RenewConfig       string
 
 	AcmeHome    string
 	Webroot     string
@@ -148,16 +167,23 @@ type CertificateUpsertPayload struct {
 	NotBefore   int64
 	NotAfter    int64
 
-	LastIssuedAt  int64
-	LastRenewedAt int64
-	LastError     string
-	LastOutput    string
-	ListOrderAt   int64
+	LastIssuedAt    int64
+	LastRenewedAt   int64
+	LastError       string
+	PostActionError string
+	LastOutput      string
+	ListOrderAt     int64
 }
 
 func (s *CertificateInventoryService) List() ([]CertificateRecordView, error) {
 	rows := make([]model.CertificateRecord, 0)
-	if err := database.GetDB().Order("list_order_at DESC, id DESC").Find(&rows).Error; err != nil {
+	if err := database.GetDB().
+		Select(certificateRecordListProjectionColumns()).
+		Order("list_order_at DESC, id DESC").
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	if err := hydrateCertificateAccountNames(rows); err != nil {
 		return nil, err
 	}
 	usageSnapshot, err := collectCertificateUsageSnapshot(rows)
@@ -171,6 +197,77 @@ func (s *CertificateInventoryService) List() ([]CertificateRecordView, error) {
 	return result, nil
 }
 
+func certificateRecordListProjectionColumns() []string {
+	return []string{
+		"id", "display_id", "list_order_at",
+		"source_type", "source_ref", "main_domain", "domain_set",
+		"certificate_type", "cert_profile", "challenge", "key_length",
+		"issued_key_algorithm", "issued_signature_algorithm", "ca_server", "use_ecc", "auto_renew",
+		"auto_renew_retry_phase", "auto_renew_retry_count", "auto_renew_next_retry_at", "auto_renew_last_attempt_at",
+		"acme_account_id", "acme_account_name", "dns_account_id", "dns_account_name",
+		"apply_target", "push_enabled", "push_dir", "push_file_paths", "push_files", "remark", "renew_config",
+		"webroot", "dns_provider", "custom_args",
+		"fingerprint", "not_before", "not_after",
+		"last_issued_at", "last_renewed_at", "last_error", "post_action_error", "last_output",
+		"created_at", "updated_at",
+	}
+}
+
+// hydrateCertificateAccountNames keeps the UI label in sync with an account
+// rename while the permanent account IDs remain the only relation source.
+func hydrateCertificateAccountNames(rows []model.CertificateRecord) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	acmeIDs := make([]uint, 0)
+	dnsIDs := make([]uint, 0)
+	seenAcme := map[uint]struct{}{}
+	seenDNS := map[uint]struct{}{}
+	for i := range rows {
+		if rows[i].AcmeAccountID > 0 {
+			if _, exists := seenAcme[rows[i].AcmeAccountID]; !exists {
+				seenAcme[rows[i].AcmeAccountID] = struct{}{}
+				acmeIDs = append(acmeIDs, rows[i].AcmeAccountID)
+			}
+		}
+		if rows[i].DNSAccountID > 0 {
+			if _, exists := seenDNS[rows[i].DNSAccountID]; !exists {
+				seenDNS[rows[i].DNSAccountID] = struct{}{}
+				dnsIDs = append(dnsIDs, rows[i].DNSAccountID)
+			}
+		}
+	}
+	acmeNames := map[uint]string{}
+	if len(acmeIDs) > 0 {
+		accounts := make([]model.AcmeAccount, 0)
+		if err := database.GetDB().Select("id", "name").Where("id IN ? AND system = ?", acmeIDs, false).Find(&accounts).Error; err != nil {
+			return err
+		}
+		for i := range accounts {
+			acmeNames[accounts[i].Id] = strings.TrimSpace(accounts[i].Name)
+		}
+	}
+	dnsNames := map[uint]string{}
+	if len(dnsIDs) > 0 {
+		accounts := make([]model.AcmeDNSAccount, 0)
+		if err := database.GetDB().Select("id", "name").Where("id IN ?", dnsIDs).Find(&accounts).Error; err != nil {
+			return err
+		}
+		for i := range accounts {
+			dnsNames[accounts[i].Id] = strings.TrimSpace(accounts[i].Name)
+		}
+	}
+	for i := range rows {
+		if name, exists := acmeNames[rows[i].AcmeAccountID]; exists {
+			rows[i].AcmeAccountName = name
+		}
+		if name, exists := dnsNames[rows[i].DNSAccountID]; exists {
+			rows[i].DNSAccountName = name
+		}
+	}
+	return nil
+}
+
 func (s *CertificateInventoryService) GetMaterial(id uint) (*CertificateMaterialView, error) {
 	if id == 0 {
 		return nil, common.NewError("certificate id is required")
@@ -179,7 +276,7 @@ func (s *CertificateInventoryService) GetMaterial(id uint) (*CertificateMaterial
 	if err := database.GetDB().Where("id = ?", id).First(row).Error; err != nil {
 		return nil, err
 	}
-	issuedKeyAlgorithm, issuedSignatureAlgorithm := inspectIssuedCertificateAlgorithms(row.FullchainPEM)
+	issuedKeyAlgorithm, issuedSignatureAlgorithm := certificateIssuedAlgorithms(row)
 	return &CertificateMaterialView{
 		Id:                       row.Id,
 		MainDomain:               strings.TrimSpace(row.MainDomain),
@@ -189,8 +286,10 @@ func (s *CertificateInventoryService) GetMaterial(id uint) (*CertificateMaterial
 		KeyPath:                  strings.TrimSpace(row.KeyPath),
 		FullchainPath:            strings.TrimSpace(row.FullchainPath),
 		ChainPath:                strings.TrimSpace(row.ChainPath),
-		FullchainPEM:             strings.TrimSpace(string(row.FullchainPEM)),
+		CertPEM:                  strings.TrimSpace(string(row.CertPEM)),
 		KeyPEM:                   strings.TrimSpace(string(row.KeyPEM)),
+		FullchainPEM:             strings.TrimSpace(string(row.FullchainPEM)),
+		ChainPEM:                 strings.TrimSpace(string(row.ChainPEM)),
 		Fingerprint:              strings.TrimSpace(row.Fingerprint),
 		IssuedKeyAlgorithm:       issuedKeyAlgorithm,
 		IssuedSignatureAlgorithm: issuedSignatureAlgorithm,
@@ -212,7 +311,14 @@ func (s *CertificateInventoryService) DeleteByID(id uint) error {
 	if id == 0 {
 		return common.NewError("certificate id is required")
 	}
-	return database.GetDB().Where("id = ?", id).Delete(&model.CertificateRecord{}).Error
+	result := database.GetDB().Where("id = ?", id).Delete(&model.CertificateRecord{})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected > 0 {
+		noteReverseProxyCertificateInventoryChanged()
+	}
+	return nil
 }
 
 func (s *CertificateInventoryService) DeleteBySource(sourceType string, sourceRef string) error {
@@ -221,9 +327,16 @@ func (s *CertificateInventoryService) DeleteBySource(sourceType string, sourceRe
 	if sourceType == "" || sourceRef == "" {
 		return nil
 	}
-	return database.GetDB().
+	result := database.GetDB().
 		Where("source_type = ? AND source_ref = ?", sourceType, sourceRef).
-		Delete(&model.CertificateRecord{}).Error
+		Delete(&model.CertificateRecord{})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected > 0 {
+		noteReverseProxyCertificateInventoryChanged()
+	}
+	return nil
 }
 
 func (s *CertificateInventoryService) Upsert(payload CertificateUpsertPayload) (*model.CertificateRecord, error) {
@@ -281,14 +394,22 @@ func (s *CertificateInventoryService) Upsert(payload CertificateUpsertPayload) (
 	entry.CAServer = strings.TrimSpace(payload.CAServer)
 	entry.UseECC = payload.UseECC
 	entry.AutoRenew = payload.AutoRenew
+	entry.AutoRenewRetryPhase = ""
+	entry.AutoRenewRetryCount = 0
+	entry.AutoRenewNextRetryAt = 0
 
 	entry.AcmeAccountID = payload.AcmeAccountID
 	entry.AcmeAccountName = strings.TrimSpace(payload.AcmeAccountName)
 	entry.DNSAccountID = payload.DNSAccountID
 	entry.DNSAccountName = strings.TrimSpace(payload.DNSAccountName)
+	entry.AcmeRuntimeProfile = strings.TrimSpace(payload.AcmeRuntimeProfile)
 	entry.ApplyTarget = strings.TrimSpace(payload.ApplyTarget)
-	entry.PushDir = strings.TrimSpace(payload.PushDir)
-	entry.PushFiles = strings.TrimSpace(payload.PushFiles)
+	if payload.PushStateProvided {
+		entry.PushEnabled = payload.PushEnabled
+		entry.PushDir = strings.TrimSpace(payload.PushDir)
+		entry.PushFilePaths = strings.TrimSpace(payload.PushFilePaths)
+		entry.PushFiles = strings.TrimSpace(payload.PushFiles)
+	}
 	entry.Remark = strings.TrimSpace(payload.Remark)
 	entry.RenewConfig = strings.TrimSpace(payload.RenewConfig)
 
@@ -307,6 +428,7 @@ func (s *CertificateInventoryService) Upsert(payload CertificateUpsertPayload) (
 	entry.KeyPEM = append([]byte(nil), payload.KeyPEM...)
 	entry.FullchainPEM = append([]byte(nil), payload.FullchainPEM...)
 	entry.ChainPEM = append([]byte(nil), payload.ChainPEM...)
+	entry.IssuedKeyAlgorithm, entry.IssuedSignatureAlgorithm = inspectIssuedCertificateAlgorithms(entry.FullchainPEM)
 
 	entry.Fingerprint = strings.TrimSpace(payload.Fingerprint)
 	entry.NotBefore = payload.NotBefore
@@ -324,6 +446,7 @@ func (s *CertificateInventoryService) Upsert(payload CertificateUpsertPayload) (
 	}
 
 	entry.LastError = strings.TrimSpace(payload.LastError)
+	entry.PostActionError = strings.TrimSpace(payload.PostActionError)
 	entry.LastOutput = strings.TrimSpace(payload.LastOutput)
 	if entry.ListOrderAt <= 0 {
 		entry.ListOrderAt = payload.ListOrderAt
@@ -345,6 +468,7 @@ func (s *CertificateInventoryService) Upsert(payload CertificateUpsertPayload) (
 	if err := db.Save(entry).Error; err != nil {
 		return nil, err
 	}
+	noteReverseProxyCertificateInventoryChanged()
 	return entry, nil
 }
 
@@ -578,10 +702,17 @@ func convertCertificateRecordWithUsage(entry *model.CertificateRecord, snapshot 
 	if len(domains) == 0 && strings.TrimSpace(entry.MainDomain) != "" {
 		domains = []string{strings.TrimSpace(entry.MainDomain)}
 	}
-	issuedKeyAlgorithm, issuedSignatureAlgorithm := inspectIssuedCertificateAlgorithms(entry.FullchainPEM)
+	issuedKeyAlgorithm, issuedSignatureAlgorithm := certificateIssuedAlgorithms(entry)
+	pushDir := ""
+	pushFilePaths := map[string]string{}
+	if entry.PushEnabled {
+		pushDir = strings.TrimSpace(entry.PushDir)
+		pushFilePaths = decodeCertificatePushFilePaths(entry.PushFilePaths)
+	}
 	return CertificateRecordView{
-		Id:        entry.Id,
-		DisplayID: entry.DisplayID,
+		Id:         entry.Id,
+		DisplayID:  entry.DisplayID,
+		ResourceID: certificateResourceID(entry.DisplayID),
 
 		SourceType: strings.TrimSpace(entry.SourceType),
 		SourceRef:  strings.TrimSpace(entry.SourceRef),
@@ -598,46 +729,56 @@ func convertCertificateRecordWithUsage(entry *model.CertificateRecord, snapshot 
 		CAServer:                 strings.TrimSpace(entry.CAServer),
 		UseECC:                   entry.UseECC,
 		AutoRenew:                entry.AutoRenew,
+		AutoRenewRetryPhase:      strings.TrimSpace(entry.AutoRenewRetryPhase),
+		AutoRenewRetryCount:      entry.AutoRenewRetryCount,
+		AutoRenewNextRetryAt:     entry.AutoRenewNextRetryAt,
+		AutoRenewLastAttemptAt:   entry.AutoRenewLastAttemptAt,
 
 		AcmeAccountID:   entry.AcmeAccountID,
 		AcmeAccountName: strings.TrimSpace(entry.AcmeAccountName),
 		DNSAccountID:    entry.DNSAccountID,
 		DNSAccountName:  strings.TrimSpace(entry.DNSAccountName),
 		ApplyTarget:     applyTarget,
-		PushDir:         strings.TrimSpace(entry.PushDir),
+		PushEnabled:     entry.PushEnabled,
+		PushDir:         pushDir,
+		PushFilePaths:   pushFilePaths,
 		PushFiles:       strings.TrimSpace(entry.PushFiles),
 		Remark:          mergeCertificateRemark(strings.TrimSpace(entry.Remark), inUseByPanel, inUseBySub, tlsUsage, reverseProxyUsage),
 		RenewConfig:     strings.TrimSpace(entry.RenewConfig),
 
-		AcmeHome:    strings.TrimSpace(entry.AcmeHome),
+		// Runtime paths and ad-hoc DNS variables are implementation details and
+		// may contain legacy sensitive data. Certificate records retain only the
+		// challenge metadata needed for an explicit reissue.
+		AcmeHome:    "",
 		Webroot:     strings.TrimSpace(entry.Webroot),
 		DNSProvider: strings.TrimSpace(entry.DNSProvider),
-		DNSEnvText:  strings.TrimSpace(entry.DNSEnvText),
+		DNSEnvText:  "",
 		CustomArgs:  strings.TrimSpace(entry.CustomArgs),
 
-		CertPath:      strings.TrimSpace(entry.CertPath),
-		KeyPath:       strings.TrimSpace(entry.KeyPath),
-		FullchainPath: strings.TrimSpace(entry.FullchainPath),
-		ChainPath:     strings.TrimSpace(entry.ChainPath),
+		CertPath:      "",
+		KeyPath:       "",
+		FullchainPath: "",
+		ChainPath:     "",
 
 		Fingerprint: strings.TrimSpace(entry.Fingerprint),
 		NotBefore:   entry.NotBefore,
 		NotAfter:    entry.NotAfter,
 
-		LastIssuedAt:  entry.LastIssuedAt,
-		LastRenewedAt: entry.LastRenewedAt,
-		ListOrderAt:   entry.ListOrderAt,
-		UpdatedAt:     entry.UpdatedAt.Unix(),
-		CreatedAt:     entry.CreatedAt.Unix(),
-		LastError:     strings.TrimSpace(entry.LastError),
-		LastOutput:    strings.TrimSpace(entry.LastOutput),
-		Status:        certificateStatus(entry),
-		InUseByPanel:  inUseByPanel,
-		InUseBySub:    inUseBySub,
-		InUseByTLS:    inUseByTLS,
-		InUseByMihomo: inUseByMihomo,
-		UsageLabel:    usageLabel,
-		DeleteBlocked: inUseByPanel || inUseBySub || inUseByTLS || inUseByMihomo || reverseProxyUsage.inUse(),
+		LastIssuedAt:    entry.LastIssuedAt,
+		LastRenewedAt:   entry.LastRenewedAt,
+		ListOrderAt:     entry.ListOrderAt,
+		UpdatedAt:       entry.UpdatedAt.Unix(),
+		CreatedAt:       entry.CreatedAt.Unix(),
+		LastError:       strings.TrimSpace(entry.LastError),
+		PostActionError: strings.TrimSpace(entry.PostActionError),
+		LastOutput:      strings.TrimSpace(entry.LastOutput),
+		Status:          certificateStatus(entry),
+		InUseByPanel:    inUseByPanel,
+		InUseBySub:      inUseBySub,
+		InUseByTLS:      inUseByTLS,
+		InUseByMihomo:   inUseByMihomo,
+		UsageLabel:      usageLabel,
+		DeleteBlocked:   false,
 	}
 }
 
@@ -650,6 +791,57 @@ func inspectIssuedCertificateAlgorithms(fullchainPEM []byte) (string, string) {
 		return "", ""
 	}
 	return strings.TrimSpace(algorithmInfo["key_algorithm"]), strings.TrimSpace(algorithmInfo["signature_algorithm"])
+}
+
+func certificateIssuedAlgorithms(entry *model.CertificateRecord) (string, string) {
+	if entry == nil {
+		return "", ""
+	}
+	keyAlgorithm := strings.TrimSpace(entry.IssuedKeyAlgorithm)
+	signatureAlgorithm := strings.TrimSpace(entry.IssuedSignatureAlgorithm)
+	if (keyAlgorithm == "" || signatureAlgorithm == "") && len(entry.FullchainPEM) > 0 {
+		parsedKey, parsedSignature := inspectIssuedCertificateAlgorithms(entry.FullchainPEM)
+		if keyAlgorithm == "" {
+			keyAlgorithm = parsedKey
+		}
+		if signatureAlgorithm == "" {
+			signatureAlgorithm = parsedSignature
+		}
+	}
+	return keyAlgorithm, signatureAlgorithm
+}
+
+// BackfillIssuedAlgorithms updates one bounded startup batch of legacy records.
+// It intentionally loads PEM only here, never in list or selector queries.
+func (s *CertificateInventoryService) BackfillIssuedAlgorithms(limit int) error {
+	if limit <= 0 {
+		limit = 100
+	}
+	db := database.GetDB()
+	if db == nil {
+		return nil
+	}
+	rows := make([]model.CertificateRecord, 0, limit)
+	if err := db.Select("id", "fullchain_pem", "issued_key_algorithm", "issued_signature_algorithm").
+		Where("(issued_key_algorithm = '' OR issued_signature_algorithm = '') AND length(fullchain_pem) > 0").
+		Order("id ASC").
+		Limit(limit).
+		Find(&rows).Error; err != nil {
+		return err
+	}
+	for i := range rows {
+		keyAlgorithm, signatureAlgorithm := certificateIssuedAlgorithms(&rows[i])
+		if keyAlgorithm == "" && signatureAlgorithm == "" {
+			continue
+		}
+		if err := db.Model(&model.CertificateRecord{}).Where("id = ?", rows[i].Id).Updates(map[string]interface{}{
+			"issued_key_algorithm":       keyAlgorithm,
+			"issued_signature_algorithm": signatureAlgorithm,
+		}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func BuildImportedSourceRef(target PanelSelfSignedTarget) string {

@@ -4,12 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
-	"github.com/alireza0/s-ui/config"
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/logger"
@@ -21,28 +18,6 @@ import (
 
 // SubOutboundService handles subscription outbounds.
 type SubOutboundService struct{}
-
-// subJsonDefaultConfig is the default template used for subscription JSON generation.
-const subJsonDefaultConfig = `{
-  "inbounds": [
-    {
-      "type": "tun",
-      "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
-      "mtu": 1500,
-      "auto_route": true,
-      "strict_route": true,
-      "endpoint_independent_nat": false,
-      "stack": "mixed",
-      "exclude_package": []
-    },
-    {
-      "type": "mixed",
-      "listen": "127.0.0.1",
-      "listen_port": 2080,
-      "users": []
-    }
-  ]
-}`
 
 const (
 	nodeSelectorTag         = "节点选择"
@@ -261,6 +236,9 @@ func (s *SubOutboundService) GetAll() (*[]map[string]interface{}, error) {
 	}
 	var data []map[string]interface{}
 	for _, subOutbound := range subOutbounds {
+		if isSubscriptionServerOnlySubOutbound(subOutbound) {
+			continue
+		}
 		outboundJSON, err := resolveSubOutboundJSON(subOutbound)
 		if err != nil {
 			return nil, err
@@ -275,6 +253,44 @@ func (s *SubOutboundService) GetAll() (*[]map[string]interface{}, error) {
 	return &data, nil
 }
 
+func isSubscriptionServerOnlySubOutbound(subOutbound *model.SubOutbound) bool {
+	if subOutbound == nil {
+		return false
+	}
+	if !isInboundSyncedSubOutboundSource(subOutbound.SourceType) {
+		return false
+	}
+	return hasMixedSubscriptionOutboundType(subOutbound)
+}
+
+func hasMixedSubscriptionOutboundType(subOutbound *model.SubOutbound) bool {
+	if subOutbound == nil {
+		return false
+	}
+	if util.IsSubscriptionServerOnlyInboundType(subOutbound.Type) {
+		return true
+	}
+	if len(subOutbound.RawOutbound) == 0 {
+		return false
+	}
+
+	payload := map[string]interface{}{}
+	if err := json.Unmarshal(subOutbound.RawOutbound, &payload); err != nil {
+		return false
+	}
+	payloadType, _ := payload["type"].(string)
+	return util.IsSubscriptionServerOnlyInboundType(payloadType)
+}
+
+func isInboundSyncedSubOutboundSource(sourceType string) bool {
+	switch strings.TrimSpace(sourceType) {
+	case subOutboundSourceClient, subOutboundSourceMihomoClient:
+		return true
+	default:
+		return false
+	}
+}
+
 // GetAllConfig returns all subscription outbounds for sing-box config generation.
 func (s *SubOutboundService) GetAllConfig(db *gorm.DB) ([]json.RawMessage, error) {
 	var subOutboundsJson []json.RawMessage
@@ -284,9 +300,33 @@ func (s *SubOutboundService) GetAllConfig(db *gorm.DB) ([]json.RawMessage, error
 		return nil, err
 	}
 	for _, subOutbound := range subOutbounds {
+		if isSubscriptionServerOnlySubOutbound(subOutbound) {
+			continue
+		}
 		subOutboundJson, err := resolveSubOutboundJSON(subOutbound)
 		if err != nil {
 			return nil, err
+		}
+		if hasMixedSubscriptionOutboundType(subOutbound) {
+			outbound := map[string]interface{}{}
+			if err := json.Unmarshal(subOutboundJson, &outbound); err != nil {
+				return nil, err
+			}
+			socksOutbound, httpOutbound := util.BuildMixedSubscriptionOutboundPair(outbound)
+			for _, expanded := range []map[string]interface{}{socksOutbound, httpOutbound} {
+				if expanded == nil {
+					continue
+				}
+				expandedJSON, err := json.Marshal(expanded)
+				if err != nil {
+					return nil, err
+				}
+				subOutboundsJson = append(subOutboundsJson, expandedJSON)
+			}
+			continue
+		}
+		if !util.SupportsSingboxSubscriptionOutboundType(subOutbound.Type) {
+			continue
 		}
 
 		// Comment cleaned to avoid mojibake.
@@ -323,6 +363,9 @@ func normalizeSubOutboundRawPayload(data json.RawMessage) json.RawMessage {
 	}
 
 	delete(payload, "id")
+	if outboundType, _ := payload["type"].(string); strings.EqualFold(strings.TrimSpace(outboundType), "shadowquic") {
+		util.SanitizeMihomoShadowQUICOutbound(payload)
+	}
 	normalized, err := json.Marshal(payload)
 	if err != nil {
 		return append(json.RawMessage(nil), data...)
@@ -415,7 +458,7 @@ func (s *SubOutboundService) processShadowTLSOutboundLegacy(outboundJson []byte,
 	return ssOutboundJson, shadowtlsJson, nil
 }
 
-// Save persists a sub outbound and regenerates related files.
+// Save persists a sub outbound and validates its dynamic subscription render.
 func (s *SubOutboundService) Save(tx *gorm.DB, act string, data json.RawMessage) error {
 	var err error
 
@@ -449,7 +492,7 @@ func (s *SubOutboundService) Save(tx *gorm.DB, act string, data json.RawMessage)
 			if subOutbound.SourceInboundId == 0 {
 				subOutbound.SourceInboundId = existing.SourceInboundId
 			}
-			if existing.Type == subOutbound.Type {
+			if existing.Type == subOutbound.Type && !strings.EqualFold(strings.TrimSpace(subOutbound.Type), "shadowquic") {
 				if baseRaw, resolveErr := resolveSubOutboundJSON(existing); resolveErr == nil {
 					subOutbound.RawOutbound = mergeEditableOutboundRawPayload(baseRaw, data, "default", subOutbound.Type)
 				}
@@ -466,6 +509,21 @@ func (s *SubOutboundService) Save(tx *gorm.DB, act string, data json.RawMessage)
 		}
 		if len(subOutbound.RawOutbound) == 0 {
 			subOutbound.RawOutbound = incomingRaw
+		}
+		subOutbound.RawOutbound = sanitizeMihomoShadowQUICOutboundRaw(subOutbound.RawOutbound, subOutbound.Type)
+		if strings.EqualFold(strings.TrimSpace(subOutbound.Type), "shadowquic") {
+			shadowQUICRaw := map[string]interface{}{}
+			if err := json.Unmarshal(subOutbound.RawOutbound, &shadowQUICRaw); err != nil {
+				return err
+			}
+			if err := util.ValidateMihomoShadowQUICOutbound(shadowQUICRaw, subOutbound.Tag); err != nil {
+				return err
+			}
+			clashOptions, err := buildMihomoClashOptions(shadowQUICRaw, subOutbound.Tag)
+			if err != nil {
+				return err
+			}
+			subOutbound.ClashOptions = clashOptions
 		}
 		subOutbound.RawClashYAML = nil
 		subOutbound.ClashOptions = normalizeClashProxyOptionsTag(subOutbound.ClashOptions, subOutbound.Tag)
@@ -526,14 +584,6 @@ func (s *SubOutboundService) Save(tx *gorm.DB, act string, data json.RawMessage)
 	return nil
 }
 
-// SubOutboundMetadata describes the metadata sidecar for a saved sub outbound.
-type SubOutboundMetadata struct {
-	Id        uint   `json:"id"`
-	Tag       string `json:"tag"`
-	Type      string `json:"type"`
-	UpdatedAt int64  `json:"updated_at"`
-}
-
 func cloneSubOutboundForArtifacts(src *model.SubOutbound) *model.SubOutbound {
 	if src == nil {
 		return nil
@@ -547,6 +597,15 @@ func cloneSubOutboundForArtifacts(src *model.SubOutbound) *model.SubOutbound {
 	return &cloned
 }
 
+// SubOutboundMetadata is retained for source compatibility.
+// Deprecated: sub_manager metadata sidecars are no longer persisted.
+type SubOutboundMetadata struct {
+	Id        uint   `json:"id"`
+	Tag       string `json:"tag"`
+	Type      string `json:"type"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
 func (s *SubOutboundService) syncManagedArtifacts(db *gorm.DB, subOutbound *model.SubOutbound) error {
 	snapshot := cloneSubOutboundForArtifacts(subOutbound)
 	if snapshot == nil {
@@ -554,101 +613,42 @@ func (s *SubOutboundService) syncManagedArtifacts(db *gorm.DB, subOutbound *mode
 	}
 
 	return QueueManagedRuntimeHook(db, func() error {
-		if err := s.saveSubOutboundJson(snapshot); err != nil {
+		if err := s.validateSubOutboundProjection(snapshot); err != nil {
 			return err
 		}
-		return s.generateSubJsonFile(snapshot)
+		return s.validateSubJsonRender(snapshot)
 	})
 }
 
+// removeManagedArtifacts is retained for the transaction call sites. Historical
+// copies are removed centrally when the Runtime Store initializes.
 func (s *SubOutboundService) removeManagedArtifacts(db *gorm.DB, tag string) error {
-	tag = strings.TrimSpace(tag)
-	if tag == "" {
-		return nil
-	}
-
-	return QueueManagedRuntimeHook(db, func() error {
-		if err := s.deleteSubOutboundJson(tag); err != nil {
-			return err
-		}
-		return s.deleteSubJsonFile(tag)
-	})
+	return nil
 }
 
-// saveSubOutboundJson writes outbound config and metadata into Promanager_data/sub_manager.
-func (s *SubOutboundService) saveSubOutboundJson(subOutbound *model.SubOutbound) error {
-	subManagerDir := filepath.Join(config.GetDataDir(), "sub_manager")
-
+// validateSubOutboundProjection preserves the former serialization validation
+// without persisting a sub_manager copy.
+func (s *SubOutboundService) validateSubOutboundProjection(subOutbound *model.SubOutbound) error {
 	outboundJson, err := resolveSubOutboundJSON(subOutbound)
 	if err != nil {
 		logger.Errorf("[SubOutbound] failed to marshal outbound: %v", err)
 		return err
 	}
 
-	baseFilename := sanitizeSubFilename(subOutbound.Tag)
-	configFilePath := filepath.Join(subManagerDir, fmt.Sprintf("%s.json", baseFilename))
-	metaFilePath := filepath.Join(subManagerDir, fmt.Sprintf("%s_meta.json", baseFilename))
-
 	var prettyJson interface{}
 	if err := json.Unmarshal(outboundJson, &prettyJson); err != nil {
 		logger.Errorf("[SubOutbound] failed to parse outbound JSON: %v", err)
 		return err
 	}
-	configData, err := json.MarshalIndent(prettyJson, "", "  ")
-	if err != nil {
+	if _, err := json.MarshalIndent(prettyJson, "", "  "); err != nil {
 		logger.Errorf("[SubOutbound] failed to pretty-print outbound JSON: %v", err)
 		return err
 	}
-	if err := ManagedRuntimeWriteFile(configFilePath, configData); err != nil {
-		logger.Errorf("[SubOutbound] failed to write outbound file: %v", err)
-		return err
-	}
-
-	metadata := &SubOutboundMetadata{
-		Id:        subOutbound.Id,
-		Tag:       subOutbound.Tag,
-		Type:      subOutbound.Type,
-		UpdatedAt: time.Now().Unix(),
-	}
-	metaData, err := json.MarshalIndent(metadata, "", "  ")
-	if err != nil {
-		logger.Errorf("[SubOutbound] failed to marshal outbound metadata: %v", err)
-		return err
-	}
-	if err := ManagedRuntimeWriteFile(metaFilePath, metaData); err != nil {
-		logger.Errorf("[SubOutbound] failed to write metadata file: %v", err)
-		return err
-	}
-
-	logger.Infof("[SubOutbound] saved config: %s (with metadata)", configFilePath)
 	return nil
 }
 
-// deleteSubOutboundJson removes outbound config and metadata files by tag.
-func (s *SubOutboundService) deleteSubOutboundJson(tag string) error {
-	subManagerDir := filepath.Join(config.GetDataDir(), "sub_manager")
-
-	baseFilename := sanitizeSubFilename(tag)
-	configFilePath := filepath.Join(subManagerDir, fmt.Sprintf("%s.json", baseFilename))
-	metaFilePath := filepath.Join(subManagerDir, fmt.Sprintf("%s_meta.json", baseFilename))
-
-	if err := ManagedRuntimeDeleteFile(configFilePath); err != nil {
-		logger.Errorf("[SubOutbound] failed to remove config file: %v", err)
-		return err
-	}
-
-	if err := ManagedRuntimeDeleteFile(metaFilePath); err != nil {
-		logger.Errorf("[SubOutbound] failed to remove metadata file: %v", err)
-		return err
-	}
-
-	logger.Infof("[SubOutbound] deleted config and metadata: %s", configFilePath)
-	return nil
-}
-
-// generateSubJsonFile generates a full sing-box subscription JSON file for one outbound.
-func (s *SubOutboundService) generateSubJsonFile(subOutbound *model.SubOutbound) error {
-	subJsonDir := filepath.Join(config.GetDataDir(), "sub_json")
+// validateSubJsonRender renders a subscription in memory and discards it.
+func (s *SubOutboundService) validateSubJsonRender(subOutbound *model.SubOutbound) error {
 	if err := validateSubOutboundSubJSONFileName(nil, subOutbound); err != nil {
 		return err
 	}
@@ -675,7 +675,7 @@ func (s *SubOutboundService) generateSubJsonFile(subOutbound *model.SubOutbound)
 	othersStr, _ := settingService.GetSubJsonExt()
 	refreshManagedSubOutboundTLS(outboundMap, subOutbound)
 
-	result, err := renderManagedSingboxSubscriptionJSON(
+	_, err = renderManagedSingboxSubscriptionJSON(
 		[]map[string]interface{}{outboundMap},
 		othersStr,
 		settingService.ResolveSubscriptionTLSStore,
@@ -685,14 +685,6 @@ func (s *SubOutboundService) generateSubJsonFile(subOutbound *model.SubOutbound)
 		return err
 	}
 
-	baseFilename := sanitizeSubFilename(subOutbound.Tag)
-	filePath := filepath.Join(subJsonDir, fmt.Sprintf("%s.json", baseFilename))
-	if err := ManagedRuntimeWriteFile(filePath, result); err != nil {
-		logger.Errorf("[SubOutbound] failed to write subscription JSON file: %v", err)
-		return err
-	}
-
-	logger.Infof("[SubOutbound] generated subscription JSON file: %s (size: %d bytes)", filePath, len(result))
 	return nil
 }
 
@@ -732,6 +724,19 @@ func expandSubOutboundsForSubscription(raw []map[string]interface{}) ([]map[stri
 		outType, _ := outbound["type"].(string)
 		tag, _ := outbound["tag"].(string)
 		if tag == "" {
+			continue
+		}
+
+		if strings.EqualFold(strings.TrimSpace(outType), "mixed") {
+			socksOutbound, httpOutbound := util.BuildMixedSubscriptionOutboundPair(outbound)
+			for _, expanded := range []map[string]interface{}{socksOutbound, httpOutbound} {
+				if expanded == nil {
+					continue
+				}
+				expandedTag, _ := expanded["tag"].(string)
+				outbounds = append(outbounds, expanded)
+				outTags = append(outTags, expandedTag)
+			}
 			continue
 		}
 
@@ -1304,7 +1309,7 @@ func buildNamedSelectorOptions(defaultOutbound string, nodeTags []string) []stri
 func buildSubJsonFullConfig(outbounds []map[string]interface{}, othersStr string) map[string]interface{} {
 	// Use default subscription JSON template.
 	var jsonConfig map[string]interface{}
-	if err := json.Unmarshal([]byte(subJsonDefaultConfig), &jsonConfig); err != nil {
+	if err := json.Unmarshal([]byte(SubscriptionJSONBaseConfig), &jsonConfig); err != nil {
 		// Fallback.
 		jsonConfig = map[string]interface{}{}
 	}
@@ -1364,22 +1369,8 @@ func buildSubJsonFullConfig(outbounds []map[string]interface{}, othersStr string
 	return jsonConfig
 }
 
-// deleteSubJsonFile removes one generated subscription JSON file by tag.
-func (s *SubOutboundService) deleteSubJsonFile(tag string) error {
-	subJsonDir := filepath.Join(config.GetDataDir(), "sub_json")
-
-	baseFilename := sanitizeSubFilename(tag)
-	filePath := filepath.Join(subJsonDir, fmt.Sprintf("%s.json", baseFilename))
-
-	if err := ManagedRuntimeDeleteFile(filePath); err != nil {
-		logger.Errorf("[SubOutbound] failed to delete subscription file: %v", err)
-		return err
-	}
-	logger.Infof("[SubOutbound] deleted subscription JSON file: %s", filePath)
-	return nil
-}
-
-// RegenerateAllSubOutboundConfigs rewrites all sub_manager outbound config files.
+// RegenerateAllSubOutboundConfigs is retained for API compatibility. It now
+// validates all outbound projections in memory without creating copies.
 func (s *SubOutboundService) RegenerateAllSubOutboundConfigs() {
 	db := database.GetDB()
 
@@ -1389,20 +1380,17 @@ func (s *SubOutboundService) RegenerateAllSubOutboundConfigs() {
 		return
 	}
 
-	subManagerDir := filepath.Join(config.GetDataDir(), "sub_manager")
-
-	clearSubJsonFilesInDir(subManagerDir)
-
 	for _, subOutbound := range subOutbounds {
-		if err := s.saveSubOutboundJson(subOutbound); err != nil {
-			logger.Errorf("[SubOutbound] failed to regenerate sub_manager config [%s]: %v", subOutbound.Tag, err)
+		if err := s.validateSubOutboundProjection(subOutbound); err != nil {
+			logger.Errorf("[SubOutbound] failed to validate outbound projection [%s]: %v", subOutbound.Tag, err)
 		}
 	}
 
-	logger.Infof("[SubOutbound] regenerated %d sub outbound configs (sub_manager)", len(subOutbounds))
+	logger.Infof("[SubOutbound] validated %d outbound projections", len(subOutbounds))
 }
 
-// RegenerateAllSubJsonFiles rewrites all generated subscription JSON files.
+// RegenerateAllSubJsonFiles is retained for API compatibility. It validates
+// subscription rendering in memory without writing sub_json files.
 func (s *SubOutboundService) RegenerateAllSubJsonFiles() {
 	db := database.GetDB()
 	if err := validateManagedSubJSONFileNames(db); err != nil {
@@ -1417,12 +1405,12 @@ func (s *SubOutboundService) RegenerateAllSubJsonFiles() {
 	}
 
 	for _, subOutbound := range subOutbounds {
-		if err := s.generateSubJsonFile(subOutbound); err != nil {
-			logger.Errorf("[SubOutbound] failed to regenerate sub_json file [%s]: %v", subOutbound.Tag, err)
+		if err := s.validateSubJsonRender(subOutbound); err != nil {
+			logger.Errorf("[SubOutbound] failed to validate subscription render [%s]: %v", subOutbound.Tag, err)
 		}
 	}
 
-	logger.Infof("[SubOutbound] regenerated %d subscription JSON files (sub_json)", len(subOutbounds))
+	logger.Infof("[SubOutbound] validated %d subscription renders", len(subOutbounds))
 }
 
 // sanitizeSubFilename replaces invalid path chars with underscore.
@@ -1452,11 +1440,6 @@ func indexSubOf(s, substr string) int {
 		}
 	}
 	return -1
-}
-
-// clearSubJsonFilesInDir removes all *.json files under a directory.
-func clearSubJsonFilesInDir(dir string) {
-	_ = ManagedRuntimeClearDirJSONFiles(dir)
 }
 
 func normalizeClashProxyOptionsTag(raw json.RawMessage, tag string) json.RawMessage {

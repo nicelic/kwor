@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"strings"
 
 	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/util"
@@ -110,7 +111,8 @@ func renderMihomoProxySection(entries []mihomoProxyRenderEntry) ([]byte, error) 
 	buffer.WriteString("proxies:\n")
 	for _, entry := range entries {
 		itemYAML := cloneRawYAMLBytes(entry.RawYAML)
-		if len(itemYAML) == 0 {
+		proxyType := strings.ToLower(strings.TrimSpace(firstString(entry.Proxy["type"])))
+		if len(itemYAML) == 0 || proxyType == "shadowquic" {
 			var err error
 			itemYAML, err = marshalSingleMihomoProxyItemYAML(entry.Proxy)
 			if err != nil {

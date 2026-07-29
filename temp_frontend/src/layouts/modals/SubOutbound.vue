@@ -94,6 +94,7 @@
               <Trojan v-if="outbound.type == outTypes.Trojan" :data="outbound" />
               <Hysteria v-if="outbound.type == outTypes.Hysteria" direction="out" :data="outbound" />
               <ShadowTls v-if="outbound.type == outTypes.ShadowTLS" :data="outbound" />
+              <ShadowQuic v-if="outbound.type == outTypes.ShadowQUIC" direction="out" :data="outbound" />
               <Vless v-if="outbound.type == outTypes.VLESS" :data="outbound" />
               <Tuic v-if="outbound.type == outTypes.TUIC" direction="out" :data="outbound" />
               <Hysteria2 v-if="outbound.type == outTypes.Hysteria2" direction="out" :data="outbound" :hide-port-hop-editors="true" />
@@ -161,6 +162,7 @@ import Trojan from '@/components/protocols/Trojan.vue'
 import Wireguard from '@/components/protocols/Wireguard.vue'
 import Hysteria from '@/components/protocols/Hysteria.vue'
 import ShadowTls from '@/components/protocols/OutShadowTls.vue'
+import ShadowQuic from '@/components/protocols/ShadowQuic.vue'
 import Vless from '@/components/protocols/Vless.vue'
 import Tuic from '@/components/protocols/Tuic.vue'
 import Hysteria2 from '@/components/protocols/Hysteria2.vue'
@@ -174,6 +176,8 @@ import TrustTunnel from '@/components/protocols/TrustTunnel.vue'
 import Data from '@/store/modules/data'
 import { applyHopIntervalInput, formatHopIntervalInput, parseHopIntervalInput, parseHopIntervalSeconds } from '@/plugins/hopInterval'
 import { normalizePortRangeInput, parseServerPortInput, pickPrimaryPort } from '@/plugins/portRange'
+import { validateShadowQuicOutbound } from '@/plugins/shadowQuic'
+import { push } from 'notivue'
 export default {
   props: ['visible', 'data', 'id', 'tags'],
   emits: ['close'],
@@ -186,7 +190,7 @@ export default {
       loading: false,
       hy2HopIntervalInput: '',
       outTypes: OutTypes,
-      NoDial: [OutTypes.Selector, OutTypes.URLTest],
+      NoDial: [OutTypes.Selector, OutTypes.URLTest, OutTypes.ShadowQUIC],
       NoServer: [OutTypes.Direct, OutTypes.Selector, OutTypes.URLTest, OutTypes.Tor],
     }
   },
@@ -235,23 +239,36 @@ export default {
       // check duplicate tag
       const isDuplicatedTag = Data().checkTag("suboutbound",this.outbound.id, this.outbound.tag)
       if (isDuplicatedTag) return
+      if (this.outbound.type === this.outTypes.ShadowQUIC) {
+        const validationError = validateShadowQuicOutbound(this.outbound)
+        if (validationError) {
+          push.warning({ title: 'ShadowQUIC 参数错误', message: validationError })
+          return
+        }
+      }
 
       // save data
       this.loading = true
-      const success = await Data().save("suboutbounds", this.$props.id == 0 ? "new" : "edit", this.outbound)
-      if (success) this.closeModal()
-      this.loading = false
+      try {
+        const success = await Data().save("suboutbounds", this.$props.id == 0 ? "new" : "edit", this.outbound)
+        if (success) this.closeModal()
+      } finally {
+        this.loading = false
+      }
     },
     async linkConvert() {
       if (this.link.length>0){
         this.loading = true
-        const msg = await HttpUtils.post('api/linkConvert', { link: this.link })
-        this.loading = false
-        if (msg.success) {
-          this.outbound = msg.obj
-          this.syncHy2HopIntervalInput()
-          this.tab = "t1"
-          this.link = ""
+        try {
+          const msg = await HttpUtils.post('api/linkConvert', { link: this.link })
+          if (msg.success) {
+            this.outbound = msg.obj
+            this.syncHy2HopIntervalInput()
+            this.tab = "t1"
+            this.link = ""
+          }
+        } finally {
+          this.loading = false
         }
       }
     }
@@ -345,7 +362,7 @@ export default {
   },
   components: { Dial, Multiplex, Transport, OutTLS,
     Direct, Socks, Http, Snell, Shadowsocks, Vmess, Trojan,
-    Wireguard, Hysteria, ShadowTls, Vless, Tuic,
+    Wireguard, Hysteria, ShadowTls, ShadowQuic, Vless, Tuic,
     Hysteria2, AnyTls, TrustTunnel, Tor, Ssh, Selector, UrlTest }
 }
 </script>

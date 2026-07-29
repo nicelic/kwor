@@ -2,7 +2,6 @@ package service
 
 import (
 	"encoding/json"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -23,7 +22,7 @@ func (s *MihomoClientPortBlockService) IsNftTableReady() bool {
 }
 
 func (s *MihomoClientPortBlockService) InitOnStartup() {
-	if runtime.GOOS != "linux" || !nftSupported() {
+	if !IsSystemPlatformLinux() || !nftSupported() {
 		return
 	}
 	if err := s.Reconcile(true); err != nil {
@@ -32,7 +31,7 @@ func (s *MihomoClientPortBlockService) InitOnStartup() {
 }
 
 func (s *MihomoClientPortBlockService) EnsureRuleIntegrity() error {
-	if runtime.GOOS != "linux" || !nftSupported() {
+	if !IsSystemPlatformLinux() || !nftSupported() {
 		return nil
 	}
 	if !(&MihomoCoreManagerService{}).IsRunning() {
@@ -43,29 +42,18 @@ func (s *MihomoClientPortBlockService) EnsureRuleIntegrity() error {
 
 func (s *MihomoClientPortBlockService) Reconcile(applyRules bool) error {
 	db := database.GetDB()
-	tx := db.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
-
-	desired, err := s.collectDesiredBlockedPorts(tx)
+	desired, err := s.collectDesiredBlockedPorts(db)
 	if err != nil {
-		tx.Rollback()
 		return err
 	}
 
 	if applyRules {
-		err = s.reconcileWithRules(tx, desired)
+		err = s.reconcileWithRules(db, desired)
 	} else {
-		err = s.reconcileStateOnly(tx, desired)
+		err = s.reconcileStateOnly(db, desired)
 	}
 	if err != nil {
-		tx.Rollback()
 		return err
-	}
-	if commitErr := tx.Commit().Error; commitErr != nil {
-		tx.Rollback()
-		return commitErr
 	}
 
 	if applyRules && len(desired) > 0 {
@@ -77,7 +65,7 @@ func (s *MihomoClientPortBlockService) Reconcile(applyRules bool) error {
 }
 
 func (s *MihomoClientPortBlockService) CleanupOnShutdown() {
-	if runtime.GOOS == "linux" && nftSupported() {
+	if IsSystemPlatformLinux() && nftSupported() {
 		if err := deleteRulesByCommentPrefix(mihomoBlockNftRuleComments.prefix); err != nil {
 			logger.Warning("failed to cleanup mihomo client block nft rules by prefix: ", err)
 		}

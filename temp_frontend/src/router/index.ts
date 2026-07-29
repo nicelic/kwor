@@ -3,6 +3,11 @@ import Login from '@/views/Login.vue'
 import Data from '@/store/modules/data'
 import MihomoData from '@/store/modules/mihomoData'
 import HttpUtils from '@/plugins/httputil'
+import { panelBaseURL } from '@/plugins/api'
+import { cancelConfirm } from '@/plugins/confirm'
+import { clearPanelTimeContext, ensurePanelTimeContext } from '@/plugins/panelTime'
+import { i18n } from '@/locales'
+import { push } from 'notivue'
 
 const routes = [
   {
@@ -111,17 +116,20 @@ const routes = [
         path: '/settings',
         name: 'pages.settings',
         component: () => import('@/views/Settings.vue'),
+        meta: { skipGlobalDataPolling: true },
       },
     ],
   },
 ]
 
 const router = createRouter({
-  history: createWebHistory((window as any).BASE_URL),
+  history: createWebHistory(panelBaseURL),
   routes,
 })
 
 let intervalId: any
+let dataPollingEnabled = false
+let globalDataRefreshPromise: Promise<void> | null = null
 
 const stopDataInterval = () => {
   if (!intervalId) return
@@ -129,25 +137,91 @@ const stopDataInterval = () => {
   intervalId = undefined
 }
 
-const probeSession = async () => {
-  const msg = await HttpUtils.get('api/session', {}, { silentAuthCheck: true })
-  return msg.success
+const refreshGlobalData = async () => {
+  if (globalDataRefreshPromise) return globalDataRefreshPromise
+
+  globalDataRefreshPromise = (async () => {
+    await Data().loadData()
+    await MihomoData().loadData()
+  })().finally(() => {
+    globalDataRefreshPromise = null
+  })
+  return globalDataRefreshPromise
+}
+
+const syncDataInterval = () => {
+  const pageVisible = typeof document === 'undefined' || document.visibilityState === 'visible'
+  if (!dataPollingEnabled || !pageVisible) {
+    stopDataInterval()
+    return
+  }
+  if (intervalId) return
+  void refreshGlobalData()
+  intervalId = setInterval(() => {
+    void refreshGlobalData()
+  }, 10000)
+}
+
+const handleVisibilityChange = () => {
+  syncDataInterval()
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', handleVisibilityChange)
+}
+
+type SessionProbeState = 'authenticated' | 'unauthenticated' | 'unreachable'
+
+let lastSessionConnectionWarningAt = 0
+
+const delaySessionRetry = () => new Promise<void>(resolve => window.setTimeout(resolve, 400))
+
+const probeSession = async (): Promise<SessionProbeState> => {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const msg = await HttpUtils.get('api/session', {}, { silentAuthCheck: true, timeout: 10000 })
+    if (msg.success) return 'authenticated'
+    if (msg.failureKind === 'api') return 'unauthenticated'
+    if (attempt === 0) await delaySessionRetry()
+  }
+  return 'unreachable'
+}
+
+const notifySessionConnectionFailure = () => {
+  const now = Date.now()
+  if (now - lastSessionConnectionWarningAt < 15000) return
+  lastSessionConnectionWarningAt = now
+  push.warning({
+    title: i18n.global.t('sessionConnectionErrorTitle'),
+    duration: 6000,
+    message: i18n.global.t('sessionConnectionErrorMessage'),
+  })
 }
 
 router.beforeEach(async (to) => {
-  const isAuthenticated = await probeSession()
+  const sessionState = await probeSession()
+  const isAuthenticated = sessionState === 'authenticated'
   const requiresAuth = to.matched.some(record => record.meta.requiresAuth)
+
+  if (sessionState === 'unreachable') {
+    notifySessionConnectionFailure()
+    return true
+  }
 
   if (to.path === '/login') {
     if (isAuthenticated) {
+		  void ensurePanelTimeContext()
       return '/'
     }
+    dataPollingEnabled = false
     stopDataInterval()
+		clearPanelTimeContext()
     return true
   }
 
   if (requiresAuth && !isAuthenticated) {
+    dataPollingEnabled = false
     stopDataInterval()
+		clearPanelTimeContext()
     return '/login'
   }
 
@@ -157,20 +231,18 @@ router.beforeEach(async (to) => {
   }
 
   if (requiresAuth && isAuthenticated) {
-    loadDataInterval()
+		await ensurePanelTimeContext()
+    dataPollingEnabled = !to.matched.some(record => record.meta.skipGlobalDataPolling)
+    syncDataInterval()
   }
 
   return true
 })
 
-const loadDataInterval = () => {
-  if (intervalId) return
-  Data().loadData()
-  MihomoData().loadData()
-  intervalId = setInterval(() => {
-    Data().loadData()
-    MihomoData().loadData()
-  }, 10000)
-}
+router.afterEach((_to, _from, failure) => {
+  if (!failure) {
+    cancelConfirm()
+  }
+})
 
 export default router

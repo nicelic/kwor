@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -26,11 +25,40 @@ const (
 	defaultPanelPath = "/app/"
 )
 
-var kworProcessNames = []string{"kwor", "kwor_amd64", "kwor_arm64"}
-
 // getServiceFilePath returns the systemd service file path for kwor.
 func getServiceFilePath() string {
 	return "/etc/systemd/system/" + kworServiceName + ".service"
+}
+
+func panelServiceFileCandidates() []string {
+	return []string{
+		getServiceFilePath(),
+		"/run/systemd/system/" + kworServiceName + ".service",
+		"/usr/local/lib/systemd/system/" + kworServiceName + ".service",
+		"/usr/lib/systemd/system/" + kworServiceName + ".service",
+		"/lib/systemd/system/" + kworServiceName + ".service",
+	}
+}
+
+func findExistingPanelServiceFile() string {
+	for _, candidate := range panelServiceFileCandidates() {
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func findManagedPanelServiceFile(binaryPath string) string {
+	candidate := findExistingPanelServiceFile()
+	if candidate != "" && service.PanelSystemdUnitIsManaged(candidate, binaryPath) {
+		return candidate
+	}
+	return ""
+}
+
+func isManagedPanelSystemdServiceActive() bool {
+	return findManagedPanelServiceFile(getBinPath()) != "" && isSystemdServiceActive()
 }
 
 // getBinDir returns the directory of the currently running binary.
@@ -62,91 +90,25 @@ func getBinPath() string {
 
 // isProcessRunning checks whether a kwor process is running (excluding self).
 func isProcessRunning() bool {
-	selfPid := strconv.Itoa(os.Getpid())
-	for _, processName := range kworProcessNames {
-		out, err := exec.Command("pgrep", "-x", processName).Output()
-		if err != nil {
-			continue
-		}
-		for _, pid := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			pid = strings.TrimSpace(pid)
-			if pid != "" && pid != selfPid {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func isSystemdServiceExists() bool {
-	_, err := os.Stat(getServiceFilePath())
-	return err == nil
+	return service.ManagedProcessesRunningByBinaryPath(getBinPath(), []int{os.Getpid()})
 }
 
 func isSystemdServiceActive() bool {
 	return exec.Command("systemctl", "is-active", "--quiet", kworServiceName).Run() == nil
 }
 
-func isSingboxServiceActive() bool {
-	singboxName := service.GetSingboxSystemdName()
-	return exec.Command("systemctl", "is-active", "--quiet", singboxName).Run() == nil
-}
-
-func isSingboxServiceExists() bool {
-	singboxName := service.GetSingboxSystemdName()
-	_, err := os.Stat("/etc/systemd/system/" + singboxName + ".service")
-	return err == nil
-}
-
-func isMihomoServiceActive() bool {
-	mihomoName := service.GetMihomoSystemdName()
-	return exec.Command("systemctl", "is-active", "--quiet", mihomoName).Run() == nil
-}
-
-func isMihomoServiceExists() bool {
-	mihomoName := service.GetMihomoSystemdName()
-	_, err := os.Stat("/etc/systemd/system/" + mihomoName + ".service")
-	return err == nil
-}
-
-func isNamedProcessRunning(processName string) bool {
-	out, err := exec.Command("pgrep", "-x", processName).Output()
-	if err != nil {
-		return false
-	}
-	return len(strings.TrimSpace(string(out))) > 0
-}
-
-func stopManagedChildService(serviceName string, processName string, label string) bool {
-	stoppedSomething := false
-
-	if exec.Command("systemctl", "is-active", "--quiet", serviceName).Run() == nil {
-		fmt.Printf("[kwor] stopping %s child service via systemd...\n", label)
-		if err := exec.Command("systemctl", "stop", serviceName).Run(); err != nil {
-			fmt.Printf("[kwor] failed to stop %s with systemd: %v, fallback to kill\n", label, err)
-			exec.Command("pkill", "-TERM", "-x", processName).Run()
-			time.Sleep(2 * time.Second)
-			exec.Command("pkill", "-KILL", "-x", processName).Run()
-		}
-		fmt.Printf("[kwor] %s stopped\n", label)
-		stoppedSomething = true
-	} else if isNamedProcessRunning(processName) {
-		fmt.Printf("[kwor] force stopping %s process...\n", label)
-		exec.Command("pkill", "-TERM", "-x", processName).Run()
-		time.Sleep(2 * time.Second)
-		if isNamedProcessRunning(processName) {
-			exec.Command("pkill", "-KILL", "-x", processName).Run()
-		}
-		fmt.Printf("[kwor] %s process stopped\n", label)
-		stoppedSomething = true
-	}
-
-	return stoppedSomething
-}
-
 func createSystemdService() error {
 	binPath := getBinPath()
+	if existingServicePath := findExistingPanelServiceFile(); existingServicePath != "" && !service.PanelSystemdUnitIsManaged(existingServicePath, binPath) {
+		return fmt.Errorf("refuse to overwrite unverified systemd service: %s", existingServicePath)
+	}
 	serviceContent := service.BuildPanelSystemdServiceContent(binPath)
+	ownership, err := service.BeginSystemdHostOwnership("panel-systemd", kworServiceName, []string{getServiceFilePath()}, map[string]string{
+		"binary": binPath,
+	})
+	if err != nil {
+		return fmt.Errorf("record pending panel systemd ownership failed: %v", err)
+	}
 
 	if err := os.WriteFile(getServiceFilePath(), []byte(serviceContent), 0o644); err != nil {
 		return fmt.Errorf("failed to create systemd service file: %v", err)
@@ -158,6 +120,9 @@ func createSystemdService() error {
 
 	if err := exec.Command("systemctl", "daemon-reload").Run(); err != nil {
 		return fmt.Errorf("failed to reload systemd daemon: %v", err)
+	}
+	if err := service.VerifyAndActivateHostResource(ownership.ID); err != nil {
+		return fmt.Errorf("activate panel systemd ownership failed: %v", err)
 	}
 
 	return nil
@@ -603,13 +568,24 @@ func handleStart() error {
 		printContainerLifecycleHint("start")
 		return fmt.Errorf("container deployment does not support kwor start")
 	}
+	uninstallOptions := buildKworUninstallOptions()
+	if err := service.ReconcileIncompleteKworUninstall(uninstallOptions); err != nil {
+		return fmt.Errorf("recover incomplete uninstall before start: %w", err)
+	}
+	if err := service.MigrateLegacyKworHostOwnership(uninstallOptions); err != nil {
+		return fmt.Errorf("migrate host ownership before start: %w", err)
+	}
+	if err := service.RegisterPanelHostOwnershipWithPaths(getBinPath(), config.GetDataDir(), kworServiceName, uninstallOptions.RuntimePaths); err != nil {
+		return fmt.Errorf("record panel ownership before start: %w", err)
+	}
 
 	firstRunInitialized := false
 
 	if isProcessRunning() {
-		if isSystemdServiceExists() && isSystemdServiceActive() {
+		managedServicePath := findManagedPanelServiceFile(getBinPath())
+		if managedServicePath != "" && isSystemdServiceActive() {
 			fmt.Println("[kwor] program already running, systemd service is active")
-		} else if isSystemdServiceExists() && !isSystemdServiceActive() {
+		} else if managedServicePath != "" && !isSystemdServiceActive() {
 			fmt.Println("[kwor] program running but systemd service is inactive, starting service...")
 			if err := exec.Command("systemctl", "start", kworServiceName).Run(); err != nil {
 				fmt.Printf("[kwor] activate systemd service failed: %v\n", err)
@@ -670,7 +646,10 @@ func handleStop() {
 
 	stoppedSomething := false
 
-	panelRunning := isSystemdServiceActive() || isProcessRunning()
+	managedServicePath := findManagedPanelServiceFile(getBinPath())
+	panelServiceActive := managedServicePath != "" && isSystemdServiceActive()
+	panelProcessRunning := isProcessRunning()
+	panelRunning := panelServiceActive || panelProcessRunning
 	if panelRunning {
 		if err := service.MarkPanelStopOnly(); err != nil {
 			fmt.Printf("[kwor] prepare panel-only stop failed: %v\n", err)
@@ -678,7 +657,7 @@ func handleStop() {
 		}
 	}
 
-	if isSystemdServiceActive() {
+	if panelServiceActive {
 		fmt.Println("[kwor] stopping kwor service...")
 		if err := exec.Command("systemctl", "stop", kworServiceName).Run(); err != nil {
 			fmt.Printf("[kwor] stop kwor failed: %v\n", err)
@@ -686,19 +665,28 @@ func handleStop() {
 			fmt.Println("[kwor] kwor stopped")
 			stoppedSomething = true
 		}
-	} else if isProcessRunning() {
-		fmt.Println("[kwor] force stopping kwor process...")
-		for _, processName := range kworProcessNames {
-			killProcessesByNameExceptSelf(processName)
-		}
-		fmt.Println("[kwor] kwor process stopped")
-		stoppedSomething = true
 	}
 
-	if isSystemdServiceExists() {
+	if panelProcessRunning || isProcessRunning() {
+		fmt.Println("[kwor] stopping remaining kwor process by executable path...")
+		if err := service.TerminateManagedProcessesByBinaryPathExceptPIDs(getBinPath(), 2*time.Second, []int{os.Getpid()}); err != nil {
+			fmt.Printf("[kwor] stop kwor process failed: %v\n", err)
+		} else {
+			fmt.Println("[kwor] kwor process stopped")
+			stoppedSomething = true
+		}
+	}
+
+	if panelServiceActive && isSystemdServiceActive() {
+		fmt.Println("[kwor] kwor systemd service remains active; service files were kept")
+		service.ClearPanelStopOnlyMarker()
+		return
+	}
+
+	if managedServicePath != "" {
 		fmt.Println("[kwor] removing kwor systemd service...")
 		exec.Command("systemctl", "disable", kworServiceName).Run()
-		os.Remove(getServiceFilePath())
+		os.Remove(managedServicePath)
 		exec.Command("systemctl", "daemon-reload").Run()
 		exec.Command("systemctl", "reset-failed").Run()
 		fmt.Println("[kwor] kwor systemd service removed")
@@ -735,6 +723,9 @@ func materializeCoreConfigForSystemd(coreName string) error {
 	if err = database.InitDB(config.GetDBPath()); err != nil {
 		return fmt.Errorf("init database failed: %v", err)
 	}
+	if _, err = service.RefreshSystemPlatform(); err != nil {
+		return fmt.Errorf("refresh system platform failed: %v", err)
+	}
 	if err = service.InitManagedRuntimeFileStore(); err != nil {
 		return fmt.Errorf("init managed runtime file store failed: %v", err)
 	}
@@ -747,7 +738,7 @@ func materializeCoreConfigForSystemd(coreName string) error {
 	var regenerateErr error
 	switch normalizedCore {
 	case "singbox", "sing-box", "default":
-		cfgSvc := service.NewConfigService(nil)
+		cfgSvc := service.NewConfigService()
 		func() {
 			defer func() {
 				if recoverErr := recover(); recoverErr != nil {
@@ -778,7 +769,7 @@ func materializeCoreConfigForSystemd(coreName string) error {
 	}
 	if normalizedCore == "singbox" || normalizedCore == "sing-box" || normalizedCore == "default" {
 		binName := "sing-box"
-		if runtime.GOOS == "windows" {
+		if service.IsSystemPlatformWindows() {
 			binName = "sing-box.exe"
 		}
 		binPath := filepath.Join(service.GetSingboxCoreDir(), binName)
@@ -850,10 +841,6 @@ func handleAdminSubcommand(args []string) {
 }
 
 func ParseCmd() {
-	if err := config.MigrateLegacyRuntimeSupportFiles(); err != nil {
-		fmt.Printf("[kwor] migrate legacy runtime support files failed: %v\n", err)
-	}
-
 	var showVersion bool
 	flag.BoolVar(&showVersion, "v", false, "show version")
 
@@ -886,6 +873,28 @@ func ParseCmd() {
 	switch os.Args[1] {
 	case "version":
 		fmt.Println(config.GetName(), "\t", config.GetVersion())
+	case "lifecycle-guard":
+		if !isInternalSystemdCommandAllowed() {
+			printUnsupportedSubcommand(os.Args[1])
+			os.Exit(2)
+		}
+		if err := service.KworServiceStartAllowed(); err != nil {
+			fmt.Printf("[kwor] %v\n", err)
+			os.Exit(1)
+		}
+	case "lifecycle-operation-finish":
+		if !isInternalSystemdCommandAllowed() {
+			printUnsupportedSubcommand(os.Args[1])
+			os.Exit(2)
+		}
+		if len(os.Args) != 3 {
+			fmt.Println("usage: kwor lifecycle-operation-finish <operation-id>")
+			os.Exit(2)
+		}
+		if err := service.FinishKworManagedOperation(os.Args[2]); err != nil {
+			fmt.Printf("[kwor] %v\n", err)
+			os.Exit(1)
+		}
 	case "materialize-core-config":
 		if !isInternalSystemdCommandAllowed() {
 			printUnsupportedSubcommand(os.Args[1])
@@ -923,7 +932,10 @@ func ParseCmd() {
 	case "resetadmin":
 		handleResetAdminCommand()
 	case "uninstall":
-		handleUninstallCommand()
+		if err := handleUninstallCommand(os.Args[2:]); err != nil {
+			fmt.Println("[kwor]", err)
+			os.Exit(2)
+		}
 	case "migrate":
 		migration.MigrateDb()
 	case "uri":

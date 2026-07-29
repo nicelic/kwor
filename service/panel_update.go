@@ -2,16 +2,17 @@ package service
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -23,40 +24,111 @@ import (
 const (
 	panelUpdateRepo              = "nicelic/kwor"
 	panelUpdateInstallScriptURL  = "https://raw.githubusercontent.com/nicelic/kwor/main/install.sh"
+	panelUpdateMinimumVersion    = "v1.6.0"
 	panelUpdatePerPage           = 20
 	panelUpdateMaxPages          = 30
 	panelUpdateVersionMaxLimit   = 20
+	panelUpdateVersionMaxOffset  = panelUpdateMaxPages * panelUpdatePerPage
+	panelUpdateVersionCacheMax   = 64
 	panelUpdateVersionCacheTTL   = 10 * time.Minute
 	panelUpdateSupportFileMaxLen = 512 * 1024
 	panelUpdateServiceName       = "kwor"
 	panelUpdateDefaultInstallDir = "/opt/kwor"
 )
 
+var (
+	panelUpdateScriptPathPattern      = regexp.MustCompile(`(?:^|[\s"'=;{])((?:/[^/\s"'=;{}]+)+/apply-update\.sh)(?:$|[\s"';}])`)
+	panelUpdateSystemdUnitNamePattern = regexp.MustCompile(`^kwor-panel-update-[0-9]+(?:\.service)?$`)
+)
+
+const (
+	panelUpdateWorkspaceMarkerFileName = ".kwor-owner-v1"
+	panelUpdateWorkspaceMarkerContent  = "kwor-owner:v1 resource=panel-update-workspace\n"
+)
+
+type panelUpdateSystemdLaunchResult struct {
+	Started bool
+	Output  string
+	Err     error
+}
+
+type panelUpdateWorkerRollbackIncompleteError struct {
+	cause error
+}
+
+func (e *panelUpdateWorkerRollbackIncompleteError) Error() string {
+	if e == nil || e.cause == nil {
+		return "panel update worker rollback is incomplete"
+	}
+	return e.cause.Error()
+}
+
+func (e *panelUpdateWorkerRollbackIncompleteError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+var panelUpdateSystemdRunLookPathFn = exec.LookPath
+var panelUpdateSystemdLauncherFn = launchPanelUpdateSystemdWorker
+var panelUpdateSetSystemdUnitFn = func(operation *KworManagedOperationHandle, unit string) error {
+	if operation == nil {
+		return nil
+	}
+	return operation.SetSystemdUnit(unit)
+}
+var panelUpdateSystemdWorkerRollbackFn = stopStartedPanelUpdateSystemdWorker
+var panelUpdateSystemdActiveFn = isPanelSystemdServiceActive
+var panelUpdateDirectWorkerRollbackFn = stopStartedKworDetachedWorker
+var panelUpdateNowFn = time.Now
+
 type PanelUpdateService struct{}
 
 type PanelUpdateStatus struct {
-	LocalVersion      string `json:"localVersion"`
-	BinaryPath        string `json:"binaryPath"`
-	BinaryName        string `json:"binaryName"`
-	InstallDir        string `json:"installDir"`
-	ServiceFilePath   string `json:"serviceFilePath"`
-	ServiceBinaryPath string `json:"serviceBinaryPath"`
-	RunningBinaryPath string `json:"runningBinaryPath"`
-	InstallSource     string `json:"installSource"`
-	Platform          string `json:"platform"`
-	CanInstall        bool   `json:"canInstall"`
-	InstallHint       string `json:"installHint,omitempty"`
-	LastUpdateLogPath string `json:"lastUpdateLogPath,omitempty"`
-	LastUpdateError   string `json:"lastUpdateError,omitempty"`
+	LocalVersion            string                        `json:"localVersion"`
+	BinaryPath              string                        `json:"binaryPath"`
+	BinaryName              string                        `json:"binaryName"`
+	InstallDir              string                        `json:"installDir"`
+	ServiceFilePath         string                        `json:"serviceFilePath"`
+	ServiceBinaryPath       string                        `json:"serviceBinaryPath"`
+	RunningBinaryPath       string                        `json:"runningBinaryPath"`
+	InstallSource           string                        `json:"installSource"`
+	Platform                string                        `json:"platform"`
+	CanRestart              bool                          `json:"canRestart"`
+	RestartHint             string                        `json:"restartHint,omitempty"`
+	CanInstall              bool                          `json:"canInstall"`
+	InstallHint             string                        `json:"installHint,omitempty"`
+	CanUninstall            bool                          `json:"canUninstall"`
+	UninstallHint           string                        `json:"uninstallHint,omitempty"`
+	UninstallMode           PanelUninstallMode            `json:"uninstallMode"`
+	UninstallState          string                        `json:"uninstallState"`
+	UninstallPhase          string                        `json:"uninstallPhase,omitempty"`
+	UninstallError          string                        `json:"uninstallError,omitempty"`
+	UninstallFailures       []string                      `json:"uninstallFailures,omitempty"`
+	UninstallWarnings       []string                      `json:"uninstallWarnings,omitempty"`
+	UninstallCanRetry       bool                          `json:"uninstallCanRetry"`
+	DockerUninstallCommands []PanelDockerUninstallCommand `json:"dockerUninstallCommands,omitempty"`
+	LastUpdateLogPath       string                        `json:"lastUpdateLogPath,omitempty"`
+	LastUpdateError         string                        `json:"lastUpdateError,omitempty"`
+}
+
+type PanelVersionItem struct {
+	TagName     string `json:"tag_name"`
+	Name        string `json:"name"`
+	Prerelease  bool   `json:"prerelease"`
+	PublishedAt string `json:"published_at"`
+	AssetName   string `json:"asset_name,omitempty"`
+	AssetSize   int64  `json:"asset_size,omitempty"`
 }
 
 type PanelVersionListResponse struct {
-	Versions []VersionItem `json:"versions"`
-	Offset   int           `json:"offset"`
-	Limit    int           `json:"limit"`
-	Page     int           `json:"page"`
-	PerPage  int           `json:"per_page"`
-	HasMore  bool          `json:"has_more"`
+	Versions []PanelVersionItem `json:"versions"`
+	Offset   int                `json:"offset"`
+	Limit    int                `json:"limit"`
+	Page     int                `json:"page"`
+	PerPage  int                `json:"per_page"`
+	HasMore  bool               `json:"has_more"`
 }
 
 type PanelInstallResult struct {
@@ -75,6 +147,7 @@ type PanelUpdateLogView struct {
 }
 
 type panelUpdateVersionCacheEntry struct {
+	createdAt time.Time
 	expiresAt time.Time
 	response  PanelVersionListResponse
 }
@@ -95,27 +168,45 @@ func (s *PanelUpdateService) GetStatus() (*PanelUpdateStatus, error) {
 	binaryPath, runningPath, servicePath, serviceBinPath, source := resolvePanelUpdateBinaryPath()
 	installDir := filepath.Dir(binaryPath)
 	canInstall, installHint := panelUpdateInstallSupport()
+	canRestart, restartHint := PanelRestartSupport()
+	uninstallStatus := GetPanelUninstallStatus()
 	lastUpdateLogPath := filepath.Join(config.GetRuntimeSupportDir(), "panel-update-last.log")
 	lastUpdateError := readPanelUpdateLastError(lastUpdateLogPath)
 
 	return &PanelUpdateStatus{
-		LocalVersion:      config.GetVersion(),
-		BinaryPath:        binaryPath,
-		BinaryName:        filepath.Base(binaryPath),
-		InstallDir:        installDir,
-		ServiceFilePath:   servicePath,
-		ServiceBinaryPath: serviceBinPath,
-		RunningBinaryPath: runningPath,
-		InstallSource:     source,
-		Platform:          fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
-		CanInstall:        canInstall,
-		InstallHint:       installHint,
-		LastUpdateLogPath: lastUpdateLogPath,
-		LastUpdateError:   lastUpdateError,
+		LocalVersion:            config.GetVersion(),
+		BinaryPath:              binaryPath,
+		BinaryName:              filepath.Base(binaryPath),
+		InstallDir:              installDir,
+		ServiceFilePath:         servicePath,
+		ServiceBinaryPath:       serviceBinPath,
+		RunningBinaryPath:       runningPath,
+		InstallSource:           source,
+		Platform:                fmt.Sprintf("%s/%s", GetSystemPlatformOS(), GetSystemPlatformArchitecture()),
+		CanRestart:              canRestart,
+		RestartHint:             restartHint,
+		CanInstall:              canInstall,
+		InstallHint:             installHint,
+		CanUninstall:            uninstallStatus.Mode == PanelUninstallModeNative && uninstallStatus.CanSchedule,
+		UninstallHint:           uninstallStatus.Hint,
+		UninstallMode:           uninstallStatus.Mode,
+		UninstallState:          uninstallStatus.State,
+		UninstallPhase:          uninstallStatus.Phase,
+		UninstallError:          uninstallStatus.Error,
+		UninstallFailures:       uninstallStatus.Failures,
+		UninstallWarnings:       uninstallStatus.Warnings,
+		UninstallCanRetry:       uninstallStatus.CanRetry,
+		DockerUninstallCommands: uninstallStatus.DockerCommands,
+		LastUpdateLogPath:       lastUpdateLogPath,
+		LastUpdateError:         lastUpdateError,
 	}, nil
 }
 
 func (s *PanelUpdateService) GetRemoteVersions(offset int, limit int) (*PanelVersionListResponse, error) {
+	return s.GetRemoteVersionsContext(context.Background(), offset, limit)
+}
+
+func (s *PanelUpdateService) GetRemoteVersionsContext(ctx context.Context, offset int, limit int) (*PanelVersionListResponse, error) {
 	offset, limit = normalizePanelVersionWindow(offset, limit)
 	cacheKey := fmt.Sprintf("%s|%d|%d", panelUpdateRepo, offset, limit)
 	if cached, ok := getPanelVersionCache(cacheKey); ok {
@@ -124,7 +215,7 @@ func (s *PanelUpdateService) GetRemoteVersions(offset int, limit int) (*PanelVer
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	result := &PanelVersionListResponse{
-		Versions: make([]VersionItem, 0, limit+1),
+		Versions: make([]PanelVersionItem, 0, limit+1),
 		Offset:   offset,
 		Limit:    limit,
 		PerPage:  limit,
@@ -134,7 +225,10 @@ func (s *PanelUpdateService) GetRemoteVersions(offset int, limit int) (*PanelVer
 	seenTags := make(map[string]struct{})
 	matchedCount := 0
 	for apiPage := 1; apiPage <= panelUpdateMaxPages && len(result.Versions) < limit+1; apiPage++ {
-		releases, err := fetchGitHubReleasePageForRepo(panelUpdateRepo, client, apiPage, panelUpdatePerPage)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		releases, err := fetchGitHubReleasePageForRepoContext(ctx, panelUpdateRepo, client, apiPage, panelUpdatePerPage, coreGitHubResponseMaxBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -147,6 +241,9 @@ func (s *PanelUpdateService) GetRemoteVersions(offset int, limit int) (*PanelVer
 				continue
 			}
 			seenTags[release.TagName] = struct{}{}
+			if !isPanelUpdateVersionSelectable(release.TagName) {
+				continue
+			}
 
 			asset, ok := pickPanelReleaseAsset(release.Assets)
 			if !ok {
@@ -158,7 +255,7 @@ func (s *PanelUpdateService) GetRemoteVersions(offset int, limit int) (*PanelVer
 			}
 			matchedCount++
 
-			result.Versions = append(result.Versions, VersionItem{
+			result.Versions = append(result.Versions, PanelVersionItem{
 				TagName:     release.TagName,
 				Name:        release.Name,
 				Prerelease:  release.Prerelease,
@@ -191,10 +288,28 @@ func (s *PanelUpdateService) Install(version string) (*PanelInstallResult, error
 	if supported, reason := panelUpdateInstallSupport(); !supported {
 		return nil, fmt.Errorf("%s", reason)
 	}
+	lifecycleLock, err := AcquireKworLifecycleLock()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = lifecycleLock.Release() }()
+	operationContext, operation, err := BeginKworManagedOperation("panel-update")
+	if err != nil {
+		return nil, err
+	}
+	operationDetached := false
+	defer func() {
+		if !operationDetached {
+			operation.Done()
+		}
+	}()
 
 	version = normalizePanelVersionTag(version)
 	if version == "" {
 		return nil, fmt.Errorf("version is required")
+	}
+	if !isPanelUpdateVersionSelectable(version) {
+		return nil, fmt.Errorf("only %s and later panel versions can be installed", panelUpdateMinimumVersion)
 	}
 
 	status, err := s.GetStatus()
@@ -204,8 +319,13 @@ func (s *PanelUpdateService) Install(version string) (*PanelInstallResult, error
 	if strings.TrimSpace(status.BinaryPath) == "" {
 		return nil, fmt.Errorf("failed to resolve current panel binary path")
 	}
+	if _, statErr := os.Lstat(status.BinaryPath + ".bak"); statErr == nil {
+		return nil, fmt.Errorf("refuse to overwrite an existing panel backup: %s", status.BinaryPath+".bak")
+	} else if !os.IsNotExist(statErr) {
+		return nil, fmt.Errorf("inspect panel backup path failed: %v", statErr)
+	}
 
-	downloadURL, err := getPanelReleaseAssetURL(version)
+	downloadURL, err := getPanelReleaseAssetURLContext(operationContext, version)
 	if err != nil {
 		return nil, err
 	}
@@ -213,6 +333,12 @@ func (s *PanelUpdateService) Install(version string) (*PanelInstallResult, error
 	workDir, err := os.MkdirTemp("", "kwor-panel-update-")
 	if err != nil {
 		return nil, fmt.Errorf("create update work dir failed: %v", err)
+	}
+	workspaceID := "panel-update-workspace-" + filepath.Base(workDir)
+	workspaceOwnership, err := BeginUpdateWorkspaceOwnership(workspaceID, workDir, status.BinaryPath)
+	if err != nil {
+		cleanupPanelUpdateWorkDir(workDir)
+		return nil, fmt.Errorf("record update workspace ownership failed: %v", err)
 	}
 	archivePath := filepath.Join(workDir, filepath.Base(downloadURL))
 	stagedBinPath := filepath.Join(workDir, "kwor")
@@ -222,17 +348,23 @@ func (s *PanelUpdateService) Install(version string) (*PanelInstallResult, error
 	defer func() {
 		if cleanupWorkDir {
 			cleanupPanelUpdateWorkDir(workDir)
+			if workspaceOwnership.ID != "" && !pathExists(workDir) {
+				_ = RemoveHostResource(workspaceOwnership.ID)
+			}
 		}
 	}()
+	if err := os.WriteFile(filepath.Join(workDir, panelUpdateWorkspaceMarkerFileName), []byte(panelUpdateWorkspaceMarkerContent), 0o600); err != nil {
+		return nil, fmt.Errorf("write update workspace ownership marker failed: %v", err)
+	}
 
-	if err := downloadPanelReleaseArchive(downloadURL, archivePath); err != nil {
+	if err := downloadPanelReleaseArchiveContext(operationContext, downloadURL, archivePath); err != nil {
 		return nil, err
 	}
 	if err := extractPanelReleasePayload(archivePath, stagedBinPath, stagedInstallScriptPath); err != nil {
 		return nil, err
 	}
 	_ = os.Remove(archivePath)
-	if err := downloadPanelLatestInstallScript(stagedInstallScriptPath); err != nil {
+	if err := downloadPanelLatestInstallScriptContext(operationContext, stagedInstallScriptPath); err != nil {
 		logger.Warning("download latest panel install.sh failed, fallback to release packaged script: ", err)
 	}
 	if _, err := os.Stat(stagedInstallScriptPath); err != nil {
@@ -246,21 +378,38 @@ func (s *PanelUpdateService) Install(version string) (*PanelInstallResult, error
 	if err := os.Chmod(stagedBinPath, 0o755); err != nil {
 		return nil, fmt.Errorf("chmod staged binary failed: %v", err)
 	}
-	if err := validatePanelBinary(stagedBinPath); err != nil {
+	if err := validatePanelBinaryContext(operationContext, stagedBinPath); err != nil {
 		return nil, err
 	}
 
-	installScriptPath, err := writePanelUpdateScript(workDir, status.BinaryPath, stagedBinPath, stagedInstallScriptPath, stagedServiceFilePath, status.BinaryName)
+	installScriptPath, err := writePanelUpdateScriptWithOperation(workDir, status.BinaryPath, stagedBinPath, stagedInstallScriptPath, stagedServiceFilePath, status.BinaryName, operation.ID())
 	if err != nil {
 		return nil, err
+	}
+	if workspaceOwnership.ID != "" {
+		if err := ActivateHostResource(workspaceOwnership.ID); err != nil {
+			return nil, fmt.Errorf("activate update workspace ownership failed: %v", err)
+		}
 	}
 	cleanupWorkDir = false
 	clearPanelUpdateLastError(status.LastUpdateLogPath)
 
-	if err := startPanelUpdateWorker(installScriptPath); err != nil {
+	if err := operation.SetBlockNewWork(true); err != nil {
 		cleanupWorkDir = true
+		return nil, fmt.Errorf("block new work while handing off panel update: %w", err)
+	}
+	if err := startPanelUpdateWorker(operationContext, operation, installScriptPath); err != nil {
+		if panelUpdateWorkerRollbackIncomplete(err) {
+			cleanupWorkDir = false
+			operation.Detach()
+			operationDetached = true
+		} else {
+			cleanupWorkDir = true
+		}
 		return nil, err
 	}
+	operation.Detach()
+	operationDetached = true
 
 	return &PanelInstallResult{
 		Version:    version,
@@ -288,11 +437,14 @@ func normalizePanelVersionWindow(offset int, limit int) (int, int) {
 	if limit > panelUpdateVersionMaxLimit {
 		limit = panelUpdateVersionMaxLimit
 	}
+	if offset > panelUpdateVersionMaxOffset {
+		offset = panelUpdateVersionMaxOffset
+	}
 	return offset, limit
 }
 
 func panelUpdateInstallSupport() (bool, string) {
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return false, "面板内升级仅支持 Linux 宿主机部署"
 	}
 	if runningInsideContainer() {
@@ -315,6 +467,10 @@ func normalizePanelVersionTag(raw string) string {
 	return "v" + raw
 }
 
+func isPanelUpdateVersionSelectable(version string) bool {
+	return compareSemverLikeTags(version, panelUpdateMinimumVersion) >= 0
+}
+
 func pickPanelReleaseAsset(assets []GitHubAsset) (GitHubAsset, bool) {
 	targetName := fmt.Sprintf("kwor-linux-%s.tar.gz", panelUpdateArchName())
 	for _, asset := range assets {
@@ -326,20 +482,24 @@ func pickPanelReleaseAsset(assets []GitHubAsset) (GitHubAsset, bool) {
 }
 
 func panelUpdateArchName() string {
-	switch runtime.GOARCH {
+	switch GetSystemPlatformArchitecture() {
 	case "amd64":
 		return "amd64"
 	case "arm64":
 		return "arm64"
 	default:
-		return runtime.GOARCH
+		return GetSystemPlatformArchitecture()
 	}
 }
 
 func getPanelReleaseAssetURL(version string) (string, error) {
+	return getPanelReleaseAssetURLContext(context.Background(), version)
+}
+
+func getPanelReleaseAssetURLContext(ctx context.Context, version string) (string, error) {
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", panelUpdateRepo, version)
 	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequest("GET", apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -356,7 +516,7 @@ func getPanelReleaseAssetURL(version string) (string, error) {
 	}
 
 	var release GitHubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	if err := unmarshalBoundedHTTPResponseJSON(resp.Body, coreGitHubResponseMaxBytes, &release); err != nil {
 		return "", fmt.Errorf("failed to parse GitHub release: %v", err)
 	}
 	asset, ok := pickPanelReleaseAsset(release.Assets)
@@ -367,8 +527,16 @@ func getPanelReleaseAssetURL(version string) (string, error) {
 }
 
 func downloadPanelReleaseArchive(downloadURL string, archivePath string) error {
+	return downloadPanelReleaseArchiveContext(context.Background(), downloadURL, archivePath)
+}
+
+func downloadPanelReleaseArchiveContext(ctx context.Context, downloadURL string, archivePath string) error {
 	client := &http.Client{Timeout: 600 * time.Second}
-	resp, err := client.Get(downloadURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return fmt.Errorf("create release archive request failed: %v", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("download release archive failed: %v", err)
 	}
@@ -399,6 +567,7 @@ func cleanupPanelUpdateWorkDir(workDir string) {
 		return
 	}
 	for _, name := range []string{
+		panelUpdateWorkspaceMarkerFileName,
 		"kwor",
 		"install.sh",
 		"install.sh.download",
@@ -415,6 +584,58 @@ func cleanupPanelUpdateWorkDir(workDir string) {
 	_ = os.Remove(filepath.Join(workDir, "kwor", "kwor.service"))
 	_ = os.Remove(filepath.Join(workDir, "kwor"))
 	_ = os.Remove(workDir)
+}
+
+func panelUpdateScriptPathFromCommandText(command string) string {
+	matches := panelUpdateScriptPathPattern.FindStringSubmatch(command)
+	if len(matches) != 2 {
+		return ""
+	}
+	path := filepath.Clean(strings.TrimSpace(matches[1]))
+	if !panelUpdateWorkspacePathStrict(filepath.Dir(path)) || filepath.Base(path) != "apply-update.sh" {
+		return ""
+	}
+	return path
+}
+
+func panelUpdateWorkspacePathStrict(path string) bool {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if path == "" || path == "." || path == string(os.PathSeparator) {
+		return false
+	}
+	base := filepath.Base(path)
+	if !strings.HasPrefix(base, "kwor-panel-update-") || len(base) == len("kwor-panel-update-") {
+		return false
+	}
+	parent := filepath.Clean(filepath.Dir(path))
+	return parent == filepath.Clean(os.TempDir()) || parent == filepath.Clean("/tmp")
+}
+
+func panelUpdateWorkspaceScriptOwned(scriptPath string) bool {
+	scriptPath = filepath.Clean(strings.TrimSpace(scriptPath))
+	if filepath.Base(scriptPath) != "apply-update.sh" || !panelUpdateWorkspacePathStrict(filepath.Dir(scriptPath)) {
+		return false
+	}
+	info, err := os.Lstat(scriptPath)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	raw, err := os.ReadFile(scriptPath)
+	return err == nil && strings.Contains(string(raw), "# "+strings.TrimSpace(panelUpdateWorkspaceMarkerContent))
+}
+
+func panelUpdateWorkspaceDirectoryOwned(workDir string) bool {
+	workDir = filepath.Clean(strings.TrimSpace(workDir))
+	if !panelUpdateWorkspacePathStrict(workDir) {
+		return false
+	}
+	markerPath := filepath.Join(workDir, panelUpdateWorkspaceMarkerFileName)
+	if info, err := os.Lstat(markerPath); err == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
+		if raw, readErr := os.ReadFile(markerPath); readErr == nil && string(raw) == panelUpdateWorkspaceMarkerContent {
+			return true
+		}
+	}
+	return panelUpdateWorkspaceScriptOwned(filepath.Join(workDir, "apply-update.sh"))
 }
 
 func readPanelUpdateLastError(logPath string) string {
@@ -587,12 +808,16 @@ func writePanelTarFile(reader io.Reader, targetPath string) error {
 }
 
 func downloadPanelLatestInstallScript(targetPath string) error {
+	return downloadPanelLatestInstallScriptContext(context.Background(), targetPath)
+}
+
+func downloadPanelLatestInstallScriptContext(ctx context.Context, targetPath string) error {
 	targetPath = strings.TrimSpace(targetPath)
 	if targetPath == "" {
 		return fmt.Errorf("target install script path is empty")
 	}
 	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequest("GET", panelUpdateInstallScriptURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", panelUpdateInstallScriptURL, nil)
 	if err != nil {
 		return err
 	}
@@ -643,61 +868,109 @@ func downloadPanelLatestInstallScript(targetPath string) error {
 }
 
 func validatePanelBinary(binPath string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	return validatePanelBinaryContext(context.Background(), binPath)
+}
+
+func validatePanelBinaryContext(parent context.Context, binPath string) error {
+	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, binPath, "-v")
 	cmd.Dir = filepath.Dir(binPath)
-	output, err := cmd.CombinedOutput()
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	PrepareKworManagedCommandContext(parent, cmd)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("downloaded kwor binary is not executable: %v", err)
+	}
+	if err := TrackKworManagedCommandContext(parent, cmd); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("record downloaded kwor binary validation process: %w", err)
+	}
+	err := cmd.Wait()
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Errorf("downloaded kwor binary validation timed out")
 	}
 	if err != nil {
-		return fmt.Errorf("downloaded kwor binary is not executable: %v: %s", err, strings.TrimSpace(string(output)))
+		return fmt.Errorf("downloaded kwor binary is not executable: %v: %s", err, strings.TrimSpace(output.String()))
 	}
 	return nil
 }
 
-func startPanelUpdateWorker(scriptPath string) error {
-	if _, err := exec.LookPath("systemd-run"); err == nil {
-		unitName := fmt.Sprintf("kwor-panel-update-%d", time.Now().UnixNano())
-		cmd := exec.Command(
-			"systemd-run",
+func startPanelUpdateWorker(ctx context.Context, operation *KworManagedOperationHandle, scriptPath string) error {
+	if _, err := panelUpdateSystemdRunLookPathFn("systemd-run"); err == nil {
+		unitName := fmt.Sprintf("kwor-panel-update-%d", panelUpdateNowFn().UnixNano())
+		operationID := ""
+		if operation != nil {
+			operationID = operation.ID()
+			if setErr := panelUpdateSetSystemdUnitFn(operation, unitName); setErr != nil {
+				return fmt.Errorf("record panel update worker unit: %w", setErr)
+			}
+		}
+		systemdArgs := []string{
 			"--unit", unitName,
 			"--collect",
 			"--description", "kwor panel update",
-			"bash", scriptPath,
-		)
-		output, runErr := cmd.CombinedOutput()
-		if runErr == nil {
+			"--working-directory=" + filepath.Dir(scriptPath),
+		}
+		if operationID != "" {
+			systemdArgs = append(systemdArgs, "--setenv="+kworLifecycleOperationIDEnv+"="+operationID)
+		}
+		systemdArgs = append(systemdArgs, "bash", scriptPath)
+		result := panelUpdateSystemdLauncherFn(ctx, systemdArgs)
+		if result.Err == nil {
 			return nil
 		}
-		message := strings.TrimSpace(string(output))
-		if isPanelSystemdServiceActive() {
-			if message != "" {
-				return fmt.Errorf("start panel update worker with systemd-run failed: %v: %s", runErr, message)
+		if result.Started {
+			if rollbackErr := panelUpdateSystemdWorkerRollbackFn(unitName, operationID); rollbackErr != nil {
+				return &panelUpdateWorkerRollbackIncompleteError{cause: fmt.Errorf(
+					"start panel update worker with systemd-run failed: %v; stop started unit failed: %w",
+					result.Err,
+					rollbackErr,
+				)}
 			}
-			return fmt.Errorf("start panel update worker with systemd-run failed: %v", runErr)
 		}
-		logger.Warning("systemd-run panel update worker failed, fallback to detached process: ", runErr, " ", message)
+		if clearErr := panelUpdateSetSystemdUnitFn(operation, ""); clearErr != nil {
+			return fmt.Errorf("clear panel update worker unit after launch failure: %w", clearErr)
+		}
+		message := strings.TrimSpace(result.Output)
+		if panelUpdateSystemdActiveFn() {
+			if message != "" {
+				return fmt.Errorf("start panel update worker with systemd-run failed: %v: %s", result.Err, message)
+			}
+			return fmt.Errorf("start panel update worker with systemd-run failed: %v", result.Err)
+		}
+		logger.Warning("systemd-run panel update worker failed, fallback to detached process: ", result.Err, " ", message)
 	}
 
-	commandName := "bash"
-	args := []string{scriptPath}
-	if _, err := exec.LookPath("setsid"); err == nil {
-		commandName = "setsid"
-		args = []string{"bash", scriptPath}
-	} else if _, err := exec.LookPath("nohup"); err == nil {
-		commandName = "nohup"
-		args = []string{"bash", scriptPath}
-	}
-
-	cmd := exec.Command(commandName, args...)
+	cmd := exec.CommandContext(ctx, "bash", scriptPath)
 	cmd.Dir = filepath.Dir(scriptPath)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
+	PrepareKworManagedCommandContext(ctx, cmd)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start panel update worker failed: %v", err)
+	}
+	startTime, identityErr := kworLifecycleProcessStartTime(cmd.Process.Pid)
+	if identityErr != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("read panel update worker identity: %w", identityErr)
+	}
+	pgid := kworManagedOperationProcessGroup(cmd.Process.Pid)
+	if err := TrackKworManagedCommandContext(ctx, cmd); err != nil {
+		if rollbackErr := panelUpdateDirectWorkerRollbackFn(cmd.Process.Pid, pgid, startTime); rollbackErr != nil {
+			_ = cmd.Process.Release()
+			return &panelUpdateWorkerRollbackIncompleteError{cause: fmt.Errorf(
+				"record panel update worker process: %v; stop started process failed: %w",
+				err,
+				rollbackErr,
+			)}
+		}
+		_ = cmd.Wait()
+		return fmt.Errorf("record panel update worker process: %w", err)
 	}
 	if err := cmd.Process.Release(); err != nil {
 		logger.Warning("release panel update worker process failed: ", err)
@@ -705,22 +978,63 @@ func startPanelUpdateWorker(scriptPath string) error {
 	return nil
 }
 
+func launchPanelUpdateSystemdWorker(ctx context.Context, systemdArgs []string) panelUpdateSystemdLaunchResult {
+	cmd := exec.CommandContext(ctx, "systemd-run", systemdArgs...)
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	PrepareKworManagedCommandContext(ctx, cmd)
+	if err := cmd.Start(); err != nil {
+		return panelUpdateSystemdLaunchResult{Output: output.String(), Err: err}
+	}
+	if err := TrackKworManagedCommandContext(ctx, cmd); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return panelUpdateSystemdLaunchResult{Started: true, Output: output.String(), Err: fmt.Errorf("record panel update launcher process: %w", err)}
+	}
+	runErr := cmd.Wait()
+	return panelUpdateSystemdLaunchResult{Started: true, Output: output.String(), Err: runErr}
+}
+
+func stopStartedPanelUpdateSystemdWorker(unit string, operationID string) error {
+	systemctlPath, err := exec.LookPath("systemctl")
+	if err != nil {
+		return fmt.Errorf("find systemctl while rolling back panel update worker: %w", err)
+	}
+	owned, err := verifyKworPanelUpdateSystemdUnit(systemctlPath, unit, operationID, strings.TrimSpace(operationID) != "")
+	if err != nil {
+		return fmt.Errorf("verify panel update worker unit before rollback: %w", err)
+	}
+	if !owned {
+		return fmt.Errorf("refuse to stop unverified panel update worker unit: %s", unit)
+	}
+	return stopSystemdUnitForUninstall(unit, false)
+}
+
+func panelUpdateWorkerRollbackIncomplete(err error) bool {
+	var target *panelUpdateWorkerRollbackIncompleteError
+	return errors.As(err, &target)
+}
+
 func isPanelSystemdServiceActive() bool {
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		return false
 	}
-	return exec.Command("systemctl", "is-active", "--quiet", panelUpdateServiceName).Run() == nil
+	return runCommandWithTimeout(shortSystemCommandTimeout, "systemctl", "is-active", "--quiet", panelUpdateServiceName) == nil
 }
 
 func BuildPanelSystemdServiceContent(binPath string) string {
 	binPath = strings.TrimSpace(binPath)
 	binDir := filepath.Dir(binPath)
-	return fmt.Sprintf(`[Unit]
+	return fmt.Sprintf(`# kwor-owner:v1 resource=panel-systemd
+[Unit]
 Description=kwor Service
 After=network.target nss-lookup.target
 
 [Service]
 Type=simple
+Environment=%s
+ExecCondition=%s
 WorkingDirectory=%s
 ExecStart=%s
 Restart=on-failure
@@ -729,10 +1043,19 @@ LimitNOFILE=infinity
 
 [Install]
 WantedBy=multi-user.target
-`, escapeSystemdUnitValue(binDir), buildSystemdExecCommand(binPath))
+`,
+		quoteSystemdEnvironmentAssignment(InternalSystemdCommandEnv, "1"),
+		buildSystemdExecCommand(binPath, "lifecycle-guard"),
+		escapeSystemdUnitValue(binDir),
+		buildSystemdExecCommand(binPath),
+	)
 }
 
 func writePanelUpdateScript(workDir string, targetBinPath string, stagedBinPath string, stagedInstallScriptPath string, stagedServiceFilePath string, binaryName string) (string, error) {
+	return writePanelUpdateScriptWithOperation(workDir, targetBinPath, stagedBinPath, stagedInstallScriptPath, stagedServiceFilePath, binaryName, "")
+}
+
+func writePanelUpdateScriptWithOperation(workDir string, targetBinPath string, stagedBinPath string, stagedInstallScriptPath string, stagedServiceFilePath string, binaryName string, operationID string) (string, error) {
 	scriptPath := filepath.Join(workDir, "apply-update.sh")
 	backupPath := targetBinPath + ".bak"
 	logPath := filepath.Join(workDir, "apply-update.log")
@@ -741,6 +1064,7 @@ func writePanelUpdateScript(workDir string, targetBinPath string, stagedBinPath 
 	serviceSupportPath := config.GetRuntimeServiceFilePath()
 
 	script := fmt.Sprintf(`#!/usr/bin/env bash
+# kwor-owner:v1 resource=panel-update-workspace
 set -u
 
 TARGET_BIN=%s
@@ -753,11 +1077,18 @@ LOG_PATH=%s
 LAST_LOG_PATH=%s
 SERVICE_NAME=%s
 BINARY_NAME=%s
+OPERATION_ID=%s
 INSTALL_DIR="$(dirname "$TARGET_BIN")"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 UPDATE_SUCCESS=0
+CLEANUP_DONE=0
+OWNER_MARKER="$WORK_DIR/.kwor-owner-v1"
 
 cleanup() {
+	if [[ "$CLEANUP_DONE" -eq 1 ]]; then
+		return
+	fi
+	CLEANUP_DONE=1
   if [[ "$UPDATE_SUCCESS" -eq 0 && -f "$LOG_PATH" ]]; then
     cp -f "$LOG_PATH" "$LAST_LOG_PATH" 2>/dev/null || true
     chmod 600 "$LAST_LOG_PATH" 2>/dev/null || true
@@ -769,12 +1100,16 @@ cleanup() {
     rm -f "$STAGED_INSTALL_SH"
   fi
   rm -f "$STAGED_SERVICE_FILE"
+  if [[ -n "$OPERATION_ID" && -x "$TARGET_BIN" ]]; then
+    %s=1 "$TARGET_BIN" lifecycle-operation-finish "$OPERATION_ID" >> "$LOG_PATH" 2>&1 || true
+  fi
   rm -f "$0"
   rm -f "$LOG_PATH"
+  rm -f "$OWNER_MARKER"
   rmdir "$WORK_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
-trap 'cleanup; exit 143' HUP INT TERM
+trap 'exit 143' HUP INT TERM
 
 log() {
   printf '%%s\n' "$*" >> "$LOG_PATH"
@@ -783,23 +1118,140 @@ log() {
 sleep 1
 log "starting kwor panel update"
 
-if [[ -x "$TARGET_BIN" ]]; then
-  "$TARGET_BIN" stop >> "$LOG_PATH" 2>&1 || true
-fi
+process_matches_target() {
+  local pid="$1"
+  local exe=""
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$pid" != "$$" ]] || return 1
+  exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+  exe="${exe%% (deleted)}"
+  [[ -n "$exe" && "$exe" == "$TARGET_BIN" ]]
+}
 
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl stop "$SERVICE_NAME" >> "$LOG_PATH" 2>&1 || true
-fi
+process_start_time() {
+  local pid="$1"
+  local stat_content=""
+  local suffix=""
+  local fields=()
+  [[ -r "/proc/$pid/stat" ]] || return 1
+  stat_content="$(<"/proc/$pid/stat")"
+  [[ "$stat_content" == *") "* ]] || return 1
+  suffix="${stat_content##*) }"
+  read -r -a fields <<< "$suffix"
+  [[ "${#fields[@]}" -gt 19 && -n "${fields[19]}" ]] || return 1
+  printf '%%s\n' "${fields[19]}"
+}
 
-for name in kwor kwor_amd64 kwor_arm64; do
-  pkill -TERM -x "$name" >> "$LOG_PATH" 2>&1 || true
-done
-sleep 2
-for name in kwor kwor_amd64 kwor_arm64; do
-  if pgrep -x "$name" >/dev/null 2>&1; then
-    pkill -KILL -x "$name" >> "$LOG_PATH" 2>&1 || true
+process_identity_matches_target() {
+  local pid="$1"
+  local expected_start="$2"
+  local current_start=""
+  current_start="$(process_start_time "$pid" 2>/dev/null || true)"
+  [[ -n "$current_start" && "$current_start" == "$expected_start" ]] || return 1
+  process_matches_target "$pid"
+}
+
+target_process_pids() {
+  local proc_path
+  local pid
+  for proc_path in /proc/[0-9]*; do
+    pid="${proc_path##*/}"
+    if process_matches_target "$pid"; then
+      echo "$pid"
+    fi
+  done
+}
+
+target_process_identities() {
+  local pid=""
+  local start_time=""
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    start_time="$(process_start_time "$pid" 2>/dev/null || true)"
+    if [[ -z "$start_time" ]]; then
+      if process_matches_target "$pid"; then
+        printf '! %%s\n' "$pid"
+      fi
+      continue
+    fi
+    printf '%%s %%s\n' "$pid" "$start_time"
+  done < <(target_process_pids)
+}
+
+stop_target_systemd_service() {
+  local main_pid=""
+  if ! command -v systemctl >/dev/null 2>&1 || ! systemctl is-active --quiet "$SERVICE_NAME"; then
+    return 0
   fi
-done
+  main_pid="$(systemctl show "$SERVICE_NAME" --property=MainPID --value 2>/dev/null || true)"
+  if ! process_matches_target "$main_pid"; then
+    log "refusing to stop an unverified $SERVICE_NAME systemd service"
+    return 1
+  fi
+  systemctl stop "$SERVICE_NAME" >> "$LOG_PATH" 2>&1 || true
+  ! systemctl is-active --quiet "$SERVICE_NAME"
+}
+
+stop_target_processes() {
+  local identity=""
+  local pid=""
+  local start_time=""
+  local attempt=0
+  local live=0
+  local identities=()
+  mapfile -t identities < <(target_process_identities)
+  for identity in "${identities[@]}"; do
+    if [[ "$identity" == "! "* ]]; then
+      log "failed to capture panel process identity: ${identity#! }"
+      return 1
+    fi
+    read -r pid start_time <<< "$identity"
+    if process_identity_matches_target "$pid" "$start_time"; then
+      kill -TERM "$pid" >> "$LOG_PATH" 2>&1 || true
+    fi
+  done
+  for attempt in $(seq 1 20); do
+    live=0
+    for identity in "${identities[@]}"; do
+      read -r pid start_time <<< "$identity"
+      if process_identity_matches_target "$pid" "$start_time"; then
+        live=1
+        break
+      fi
+    done
+    [[ "$live" -eq 0 ]] && return 0
+    sleep 0.1
+  done
+  for identity in "${identities[@]}"; do
+    read -r pid start_time <<< "$identity"
+    if process_identity_matches_target "$pid" "$start_time"; then
+      kill -KILL "$pid" >> "$LOG_PATH" 2>&1 || true
+    fi
+  done
+  for attempt in $(seq 1 20); do
+    live=0
+    for identity in "${identities[@]}"; do
+      read -r pid start_time <<< "$identity"
+      if process_identity_matches_target "$pid" "$start_time"; then
+        live=1
+        break
+      fi
+    done
+    [[ "$live" -eq 0 ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+if ! stop_target_systemd_service; then
+  log "failed to stop the verified panel systemd service"
+  exit 1
+fi
+
+if ! stop_target_processes; then
+  log "failed to stop the exact panel binary process"
+  exit 1
+fi
 
 sleep 1
 
@@ -847,13 +1299,7 @@ start_with_repaired_systemd() {
   systemctl reset-failed "$SERVICE_NAME" >> "$LOG_PATH" 2>&1 || true
   systemctl enable "$SERVICE_NAME" >> "$LOG_PATH" 2>&1 || return 1
   systemctl restart "$SERVICE_NAME" >> "$LOG_PATH" 2>&1 || return 1
-  for _ in $(seq 1 40); do
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-      return 0
-    fi
-    sleep 0.3
-  done
-  return 1
+  wait_for_target_runtime
 }
 
 repair_systemd_file() {
@@ -869,15 +1315,18 @@ repair_systemd_file() {
 }
 
 wait_for_target_runtime() {
-  local process_name
-  process_name="$(basename "$TARGET_BIN")"
+  local main_pid=""
+  local pid=""
   for _ in $(seq 1 40); do
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SERVICE_NAME"; then
-      return 0
+      main_pid="$(systemctl show "$SERVICE_NAME" --property=MainPID --value 2>/dev/null || true)"
+      if process_matches_target "$main_pid"; then
+        return 0
+      fi
     fi
-    if pgrep -x "$process_name" >/dev/null 2>&1; then
-      return 0
-    fi
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] && return 0
+    done < <(target_process_pids)
     sleep 0.3
   done
   return 1
@@ -926,6 +1375,8 @@ exit 1
 		shellQuote(lastLogPath),
 		shellQuote(panelUpdateServiceName),
 		shellQuote(binaryName),
+		shellQuote(operationID),
+		InternalSystemdCommandEnv,
 		shellQuote(filepath.Dir(installSupportPath)),
 		shellQuote(installSupportPath),
 		shellQuote(installSupportPath),
@@ -947,9 +1398,14 @@ func shellQuote(value string) string {
 }
 
 func resolvePanelUpdateBinaryPath() (binaryPath string, runningPath string, servicePath string, serviceBinPath string, source string) {
-	runningPath = resolvePanelRunningBinaryPath()
-	if runningPath != "" {
-		return runningPath, runningPath, "", "", "running process"
+	if execPath, err := os.Executable(); err == nil && strings.TrimSpace(execPath) != "" {
+		if realPath, realErr := filepath.EvalSymlinks(execPath); realErr == nil {
+			execPath = realPath
+		}
+		execPath = filepath.Clean(execPath)
+		if info, statErr := os.Stat(execPath); statErr == nil && info.Mode().IsRegular() {
+			return execPath, execPath, "", "", "current process"
+		}
 	}
 
 	servicePath, serviceBinPath = resolvePanelServiceBinaryPath()
@@ -957,35 +1413,7 @@ func resolvePanelUpdateBinaryPath() (binaryPath string, runningPath string, serv
 		return serviceBinPath, "", servicePath, serviceBinPath, "systemd service"
 	}
 
-	execPath, err := os.Executable()
-	if err == nil && strings.TrimSpace(execPath) != "" {
-		if realPath, realErr := filepath.EvalSymlinks(execPath); realErr == nil {
-			execPath = realPath
-		}
-		return execPath, "", "", "", "current process"
-	}
-
 	return filepath.Join(panelUpdateDefaultInstallDir, "kwor"), "", "", "", "default"
-}
-
-func resolvePanelRunningBinaryPath() string {
-	for _, processName := range []string{"kwor", "kwor_amd64", "kwor_arm64"} {
-		out, err := exec.Command("pgrep", "-x", processName).Output()
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			pid := strings.TrimSpace(line)
-			if pid == "" || pid == fmt.Sprintf("%d", os.Getpid()) {
-				continue
-			}
-			exePath := filepath.Join("/proc", pid, "exe")
-			if resolved, err := filepath.EvalSymlinks(exePath); err == nil && resolved != "" {
-				return resolved
-			}
-		}
-	}
-	return ""
 }
 
 func resolvePanelServiceBinaryPath() (string, string) {
@@ -1097,7 +1525,26 @@ func setPanelVersionCache(key string, response *PanelVersionListResponse) {
 	now := time.Now()
 	panelUpdateVersionCache.Lock()
 	defer panelUpdateVersionCache.Unlock()
+	for cacheKey, entry := range panelUpdateVersionCache.items {
+		if now.After(entry.expiresAt) {
+			delete(panelUpdateVersionCache.items, cacheKey)
+		}
+	}
+	if _, exists := panelUpdateVersionCache.items[key]; !exists && len(panelUpdateVersionCache.items) >= panelUpdateVersionCacheMax {
+		oldestKey := ""
+		var oldest time.Time
+		for cacheKey, entry := range panelUpdateVersionCache.items {
+			if oldestKey == "" || entry.createdAt.Before(oldest) {
+				oldestKey = cacheKey
+				oldest = entry.createdAt
+			}
+		}
+		if oldestKey != "" {
+			delete(panelUpdateVersionCache.items, oldestKey)
+		}
+	}
 	panelUpdateVersionCache.items[key] = panelUpdateVersionCacheEntry{
+		createdAt: now,
 		expiresAt: now.Add(panelUpdateVersionCacheTTL),
 		response:  *clonePanelVersionListResponse(response),
 	}
@@ -1109,7 +1556,7 @@ func clonePanelVersionListResponse(response *PanelVersionListResponse) *PanelVer
 	}
 	cloned := *response
 	if response.Versions != nil {
-		cloned.Versions = append([]VersionItem(nil), response.Versions...)
+		cloned.Versions = append([]PanelVersionItem(nil), response.Versions...)
 	}
 	return &cloned
 }

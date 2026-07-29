@@ -144,7 +144,7 @@ func (s *SubGroupService) markSubGroupAutoUpdateResult(
 	if err := db.Model(&model.SubGroup{}).Where("id = ?", groupID).Updates(updates).Error; err != nil {
 		return err
 	}
-	LastUpdate = time.Now().Unix()
+	markLastUpdate(time.Now().Unix())
 	return nil
 }
 

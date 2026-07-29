@@ -1,15 +1,15 @@
 package app
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"time"
 
 	"github.com/alireza0/s-ui/config"
-	// "github.com/alireza0/s-ui/core"
 	"github.com/alireza0/s-ui/cronjob"
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/logger"
@@ -26,9 +26,10 @@ type APP struct {
 	webServer     *web.Server
 	subServer     *sub.Server
 	reverseProxy  *service.ReverseProxyService
+	coreManager   *service.CoreManagerService
+	mihomoManager *service.MihomoCoreManagerService
 	cronJob       *cronjob.CronJob
 	logger        *logging.Logger
-	core          interface{} // *core.Core
 }
 
 func NewApp() *APP {
@@ -37,6 +38,9 @@ func NewApp() *APP {
 
 func (a *APP) Init() error {
 	log.Printf("%v %v", config.GetName(), config.GetVersion())
+	if err := service.KworServiceStartAllowed(); err != nil {
+		return err
+	}
 
 	a.initLog()
 
@@ -49,44 +53,78 @@ func (a *APP) Init() error {
 			return err
 		}
 	}
+	if _, err := service.RefreshSystemPlatform(); err != nil {
+		return err
+	}
+	service.RefreshNftablesCapabilities()
+	// Initialize the panel-owned timezone before generic settings defaults can
+	// seed it. This performs the documented one-shot remote validation only at
+	// process startup and keeps the resulting IANA name in SQLite.
+	if err := a.SettingService.InitializePanelTimeOnStartup(); err != nil {
+		return err
+	}
 	if err := a.prepareStartupData(); err != nil {
 		return err
 	}
-
-	// a.core = core.NewCore()
+	if err := refreshPanelRuntimeOwnershipOnStartup(); err != nil {
+		return err
+	}
 
 	a.cronJob = cronjob.NewCronJob()
-	a.webServer = web.NewServer()
+	a.coreManager = &service.CoreManagerService{}
+	a.mihomoManager = &service.MihomoCoreManagerService{}
+	a.webServer = a.newWebServer()
 	a.subServer = sub.NewServer()
 	a.reverseProxy = &service.ReverseProxyService{}
 	service.RegisterPanelTLSRuntimeApplier(a)
 	service.RegisterFirewallRuntimePortProvider(a)
+	service.RegisterPanelTimeScheduleReloader(a)
 
-	a.configService = service.NewConfigService(a.core)
+	a.configService = service.NewConfigService()
 
 	a.regenerateManagedRuntimeConfigs()
 
 	return nil
 }
 
+// refreshPanelRuntimeOwnershipOnStartup 在每次服务实际启动后刷新二进制和
+// 运行时附属文件的指纹。升级 worker 替换文件后会重启服务，因此无需依赖
+// 已经可能消失的旧进程内存状态。
+func refreshPanelRuntimeOwnershipOnStartup() error {
+	binaryPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve panel executable for ownership refresh: %w", err)
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(binaryPath); resolveErr == nil {
+		binaryPath = resolved
+	}
+	binaryPath = filepath.Clean(binaryPath)
+	runtimePaths := []string{
+		filepath.Join(filepath.Dir(binaryPath), "install.sh"),
+		filepath.Join(filepath.Dir(binaryPath), "kwor.service"),
+		config.GetRuntimeInstallScriptPath(),
+		config.GetRuntimeServiceFilePath(),
+		filepath.Join(config.GetRuntimeSupportDir(), "panel-update-last.log"),
+	}
+	if err := service.RefreshPanelHostOwnership(binaryPath, config.GetDataDir(), "kwor", runtimePaths); err != nil {
+		return fmt.Errorf("refresh panel runtime ownership: %w", err)
+	}
+	unitPath := "/etc/systemd/system/kwor.service"
+	if _, err := service.RefreshPanelSystemdHostOwnershipIfVerified("kwor", unitPath, binaryPath); err != nil {
+		return fmt.Errorf("refresh panel systemd ownership: %w", err)
+	}
+	return nil
+}
+
 func (a *APP) Start() error {
 	service.RegisterPanelTLSRuntimeApplier(a)
+	if err := service.StartKworLifecycleControlServer(); err != nil {
+		return err
+	}
 
 	service.SyncManagedNftablesOnStartup()
 
-	loc, err := a.SettingService.GetTimeLocation()
-	if err != nil {
-		logger.Warning("get time location failed, fallback to Local:", err)
-		loc = time.Local
-	}
-
-	trafficAge, err := a.SettingService.GetTrafficAge()
-	if err != nil {
-		logger.Warning("get trafficAge failed, fallback to 30:", err)
-		trafficAge = 30
-	}
-
-	err = a.cronJob.Start(loc, trafficAge)
+	err := a.ReloadPanelTimeSchedule()
 	if err != nil {
 		return err
 	}
@@ -108,8 +146,9 @@ func (a *APP) Start() error {
 		}
 	}
 
+	service.SyncPortForwardNftablesAfterListenersOnStartup()
+
 	a.startTrafficOverviewRuntimeProbe()
-	a.startSystemMonitorRuntimeProbe()
 	a.startManagedCoreOnLinuxStartup()
 	if database.HasPendingDBRestoreToFinalize() {
 		if err := database.FinalizePendingDBRestore(); err != nil {
@@ -117,46 +156,46 @@ func (a *APP) Start() error {
 		}
 	}
 
-	// err = a.configService.StartCore("")
-	// if err != nil {
-	// 	logger.Error(err)
-	// }
-
 	return nil
 }
 
 func (a *APP) startManagedCoreOnLinuxStartup() {
-	if runtime.GOOS != "linux" {
+	if !service.IsSystemPlatformLinux() {
 		return
 	}
 
 	go func() {
+		operation, err := service.BeginKworInProcessOperation("startup-managed-core-reconcile")
+		if err != nil {
+			logger.Warning("managed core startup reconcile skipped by lifecycle state:", err)
+			return
+		}
+		defer operation.Done()
 		time.Sleep(1200 * time.Millisecond)
 		a.reconcileManagedCoreOnStartup(
 			service.GetSingboxSystemdName(),
-			&service.CoreManagerService{},
+			a.coreManager,
 			"sing-box",
 		)
 		a.reconcileManagedCoreOnStartup(
 			service.GetMihomoSystemdName(),
-			&service.MihomoCoreManagerService{},
+			a.mihomoManager,
 			"mihomo",
 		)
+		service.SyncPortForwardNftablesAfterCoreRuntimeReady()
 	}()
 }
 
 func (a *APP) startTrafficOverviewRuntimeProbe() {
 	go func() {
+		operation, err := service.BeginKworInProcessOperation("startup-traffic-overview-probe")
+		if err != nil {
+			logger.Warning("traffic overview runtime probe skipped by lifecycle state:", err)
+			return
+		}
+		defer operation.Done()
 		if err := (&service.TrafficOverviewService{}).EnsureRuntimeReady(); err != nil {
 			logger.Warning("traffic overview runtime prepare failed:", err)
-		}
-	}()
-}
-
-func (a *APP) startSystemMonitorRuntimeProbe() {
-	go func() {
-		if err := (&service.SystemMonitorService{}).EnsureRuntimeReady(); err != nil {
-			logger.Warning("system monitor runtime prepare failed:", err)
 		}
 	}()
 }
@@ -172,7 +211,7 @@ func (a *APP) reconcileManagedCoreOnStartup(serviceName string, starter managedC
 		if starter.IsRunning() {
 			return
 		}
-		if err := starter.StartCore(); err != nil {
+		if err := service.WithCertificateCoreConfigGate(starter.StartCore); err != nil {
 			logger.Warningf("%s startup auto-recover failed: %v", label, err)
 		}
 		return
@@ -194,29 +233,34 @@ func (a *APP) reconcileManagedCoreOnStartup(serviceName string, starter managedC
 		// If service was previously enabled, it might have started before panel startup.
 		// Restart once so the startup path always uses freshly generated runtime config.
 		if wasEnabled {
-			if err := starter.RestartCore(); err != nil {
+			if err := service.WithCertificateCoreConfigGate(starter.RestartCore); err != nil {
 				logger.Warningf("%s startup auto-reconcile restart failed: %v", label, err)
 			}
 		}
 		return
 	}
-	if err := starter.StartCore(); err != nil {
+	if err := service.WithCertificateCoreConfigGate(starter.StartCore); err != nil {
 		logger.Warningf("%s startup auto-recover failed: %v", label, err)
 	}
 }
 
 func isSystemdServiceEnabled(serviceName string) bool {
-	cmd := exec.Command("systemctl", "is-enabled", "--quiet", serviceName)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemctl", "is-enabled", "--quiet", serviceName)
 	return cmd.Run() == nil
 }
 
 func disableSystemdServiceAutostart(serviceName string) error {
-	cmd := exec.Command("systemctl", "disable", serviceName)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemctl", "disable", serviceName)
 	return cmd.Run()
 }
 
 func (a *APP) Stop() {
 	service.RegisterPanelTLSRuntimeApplier(nil)
+	service.RegisterPanelTimeScheduleReloader(nil)
 
 	a.cronJob.Stop()
 
@@ -244,10 +288,29 @@ func (a *APP) Stop() {
 			logger.Warning("stop reverse proxy runtime err:", rpErr)
 		}
 	}
-	// err = a.configService.StopCore()
-	// if err != nil {
-	// 	logger.Warning("stop Core err:", err)
-	// }
+	service.StopKworLifecycleControlServer()
+}
+
+// ReloadPanelTimeSchedule is called after a successful panel timezone save.
+// CronJob.Start swaps and stops the prior scheduler under its own mutex, so no
+// schedule goroutine is retained after a timezone change.
+func (a *APP) ReloadPanelTimeSchedule() error {
+	if a == nil || a.cronJob == nil {
+		return nil
+	}
+
+	loc, err := a.SettingService.GetPanelTimeLocation()
+	if err != nil {
+		logger.Warning("get panel timezone failed, fallback to UTC:", err)
+		loc = time.UTC
+	}
+
+	trafficAge, err := a.SettingService.GetTrafficAge()
+	if err != nil {
+		logger.Warning("get trafficAge failed, fallback to 30:", err)
+		trafficAge = 30
+	}
+	return a.cronJob.Start(loc, trafficAge)
 }
 
 func (a *APP) initLog() {
@@ -276,7 +339,12 @@ func (a *APP) RestartApp() {
 	if database.HasPendingDBRestoreToApply() {
 		if err := database.ApplyPendingDBRestore(); err != nil {
 			logger.Error("apply pending db restore failed:", err)
-			a.webServer = web.NewServer()
+			if _, platformErr := service.RefreshSystemPlatform(); platformErr != nil {
+				logger.Error("refresh system platform after database restore failure failed:", platformErr)
+			} else {
+				service.RefreshNftablesCapabilities()
+			}
+			a.webServer = a.newWebServer()
 			a.subServer = sub.NewServer()
 			if startErr := a.Start(); startErr != nil {
 				logger.Error("restart app after restore failure failed:", startErr)
@@ -287,9 +355,14 @@ func (a *APP) RestartApp() {
 	}
 
 	if restoreApplied {
+		if _, err := service.RefreshSystemPlatform(); err != nil {
+			logger.Error("refresh system platform after database restore failed:", err)
+		} else {
+			service.RefreshNftablesCapabilities()
+		}
 		if err := a.prepareStartupData(); err != nil {
 			logger.Error("prepare startup data after db restore failed:", err)
-			a.webServer = web.NewServer()
+			a.webServer = a.newWebServer()
 			a.subServer = sub.NewServer()
 			if startErr := a.Start(); startErr != nil {
 				logger.Error("restart app after startup data reload failure failed:", startErr)
@@ -297,10 +370,13 @@ func (a *APP) RestartApp() {
 			return
 		}
 		a.regenerateManagedRuntimeConfigs()
+	} else if _, err := service.RefreshSystemPlatform(); err != nil {
+		logger.Error("refresh system platform before panel restart failed:", err)
+	} else {
+		service.RefreshNftablesCapabilities()
 	}
-
 	// Recreate servers with fresh contexts so Start() works properly
-	a.webServer = web.NewServer()
+	a.webServer = a.newWebServer()
 	a.subServer = sub.NewServer()
 
 	err := a.Start()
@@ -309,21 +385,30 @@ func (a *APP) RestartApp() {
 	}
 }
 
+func (a *APP) newWebServer() *web.Server {
+	server := web.NewServer()
+	server.SetCoreManagers(a.coreManager, a.mihomoManager)
+	service.RegisterCertificateCoreRestartManagers(a.coreManager, a.mihomoManager)
+	return server
+}
+
 func (a *APP) prepareStartupData() error {
-	if err := config.MigrateLegacyRuntimeSupportFiles(); err != nil {
+	if err := config.MigrateLegacyRuntimeSupportFiles(service.IsSystemPlatformLinux()); err != nil {
 		logger.Warning("migrate legacy runtime support files failed:", err)
 	}
 	if err := service.InitManagedRuntimeFileStore(); err != nil {
 		return err
-	}
-	if err := service.InitSystemMonitorStore(); err != nil {
-		logger.Warning("init system monitor store failed:", err)
 	}
 	if err := service.EnsureManagedCoreLayout(); err != nil {
 		return err
 	}
 	if _, err := a.SettingService.GetAllSetting(); err != nil {
 		return err
+	}
+	if migrated, migrateErr := service.MigrateLegacySingboxCoreDownloadPreference(); migrateErr != nil {
+		logger.Warning("migrate legacy sing-box core download preference failed:", migrateErr)
+	} else if migrated {
+		logger.Info("removed legacy AMD64 level from sing-box core download preference")
 	}
 	if reconcileErr := service.ReconcileSystemOptimizationOnStartup(); reconcileErr != nil {
 		logger.Warning("reconcile managed system optimization on startup failed:", reconcileErr)
@@ -345,8 +430,8 @@ func (a *APP) prepareStartupData() error {
 	if syncErr := service.SyncPanelTLSAssignments(&a.SettingService); syncErr != nil {
 		logger.Warning("sync panel tls assignments failed:", syncErr)
 	}
-	if syncErr := (&service.AcmeService{}).MigrateLegacyDNSSecretsOnStartup(); syncErr != nil {
-		logger.Warning("migrate legacy acme dns secrets failed:", syncErr)
+	if syncErr := (&service.AcmeService{}).MigrateLegacyAcmeRuntimeOnStartup(); syncErr != nil {
+		logger.Warning("migrate legacy acme runtime failed:", syncErr)
 	}
 	if syncErr := (&service.AcmeService{}).EnsureOverviewRuntimeConsistency(true); syncErr != nil {
 		logger.Warning("prepare acme overview runtime consistency failed:", syncErr)
@@ -367,10 +452,6 @@ func (a *APP) regenerateManagedRuntimeConfigs() {
 	if err := service.NewMihomoManagerService().RegenerateServerConfig(); err != nil {
 		logger.Warning("generate mihomo server config failed:", err)
 	}
-}
-
-func (a *APP) GetCore() interface{} {
-	return a.core
 }
 
 func (a *APP) GetActivePanelPort() int {

@@ -108,6 +108,11 @@ func (s *MihomoManagerService) GenerateServerDocument() (map[string]interface{},
 	listeners := make([]interface{}, 0, len(inbounds))
 
 	for _, inbound := range inbounds {
+		if strings.EqualFold(strings.TrimSpace(inbound.Type), "shadowquic") {
+			if err := repairMihomoShadowQUICInboundClientCredentials(db, inbound.Id); err != nil {
+				return nil, fmt.Errorf("repair mihomo shadowquic client credentials for %s failed: %w", inbound.Tag, err)
+			}
+		}
 		rawJSON, err := inbound.MarshalJSON()
 		if err != nil {
 			return nil, fmt.Errorf("marshal mihomo inbound %s failed: %w", inbound.Tag, err)

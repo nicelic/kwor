@@ -6,9 +6,15 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/util"
+)
+
+const (
+	externalSubscriptionTimeout          = 15 * time.Second
+	externalSubscriptionMaxResponseBytes = 8 * 1024 * 1024
 )
 
 type Link struct {
@@ -21,6 +27,9 @@ type LinkService struct {
 }
 
 func (s *LinkService) GetLinks(linkJson *json.RawMessage, types string, clientInfo string) []string {
+	if linkJson == nil || len(*linkJson) == 0 {
+		return nil
+	}
 	links := []Link{}
 	var result []string
 	err := json.Unmarshal(*linkJson, &links)
@@ -63,7 +72,12 @@ func (s *LinkService) addClientInfo(uri string, clientInfo string) string {
 			logger.Warning("sub: Error decoding vmess content:", err)
 			return uri
 		}
-		vmessJson["ps"] = vmessJson["ps"].(string) + clientInfo
+		remark, ok := vmessJson["ps"].(string)
+		if !ok {
+			logger.Warning("sub: vmess link has no string ps field")
+			return uri
+		}
+		vmessJson["ps"] = remark + clientInfo
 		result, err := json.MarshalIndent(vmessJson, "", "  ")
 		if err != nil {
 			logger.Warning("sub: Error decoding vmess + clientInfo content:", err)
@@ -80,7 +94,11 @@ func (s *LinkService) getExternalSub(url string) []string {
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 
-	client := &http.Client{Transport: tr}
+	client := &http.Client{
+		Transport: tr,
+		Timeout:   externalSubscriptionTimeout,
+	}
+	defer client.CloseIdleConnections()
 
 	// Make the HTTP request
 	response, err := client.Get(url)
@@ -89,11 +107,19 @@ func (s *LinkService) getExternalSub(url string) []string {
 		return nil
 	}
 	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		logger.Warning("sub: external subscription returned HTTP status ", response.StatusCode)
+		return nil
+	}
 
 	// Read the response body
-	body, err := io.ReadAll(response.Body)
+	body, err := io.ReadAll(io.LimitReader(response.Body, externalSubscriptionMaxResponseBytes+1))
 	if err != nil {
 		logger.Warning("sub: Error reading response body:", err)
+		return nil
+	}
+	if len(body) > externalSubscriptionMaxResponseBytes {
+		logger.Warning("sub: external subscription response exceeds size limit")
 		return nil
 	}
 

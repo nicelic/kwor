@@ -11,16 +11,33 @@ func withMockedPortForwardSocketSnapshot(t *testing.T, snapshot *socketSnapshot,
 	t.Helper()
 
 	originalGOOS := portForwardRuntimeGOOS
-	originalSnapshotReader := portForwardReadSocketSnapshot
+	originalSocketReader := portForwardReadSocketConflictSockets
+	originalBindV6Only := portForwardReadSocketConflictBindV6Only
 
 	portForwardRuntimeGOOS = func() string { return "linux" }
-	portForwardReadSocketSnapshot = func() (*socketSnapshot, error) {
-		return snapshot, snapshotErr
+	portForwardReadSocketConflictSockets = func(filter firewallListenerFilter) ([]procListenerSocket, error) {
+		if snapshotErr != nil {
+			return nil, snapshotErr
+		}
+		result := make([]procListenerSocket, 0)
+		for port := range snapshot.tcp {
+			if filter.matches(firewallProtocolTCP, port) {
+				result = append(result, procListenerSocket{protocol: firewallProtocolTCP, family: firewallFamilyIPv4, port: port})
+			}
+		}
+		for port := range snapshot.udp {
+			if filter.matches(firewallProtocolUDP, port) {
+				result = append(result, procListenerSocket{protocol: firewallProtocolUDP, family: firewallFamilyIPv4, port: port})
+			}
+		}
+		return result, nil
 	}
+	portForwardReadSocketConflictBindV6Only = func() (bool, bool) { return true, true }
 
 	t.Cleanup(func() {
 		portForwardRuntimeGOOS = originalGOOS
-		portForwardReadSocketSnapshot = originalSnapshotReader
+		portForwardReadSocketConflictSockets = originalSocketReader
+		portForwardReadSocketConflictBindV6Only = originalBindV6Only
 	})
 }
 
@@ -82,16 +99,16 @@ func TestFindPortForwardSocketConflicts_ProtocolSpecific(t *testing.T) {
 
 func TestFindPortForwardSocketConflicts_NonLinuxNoCheck(t *testing.T) {
 	originalGOOS := portForwardRuntimeGOOS
-	originalSnapshotReader := portForwardReadSocketSnapshot
+	originalSocketReader := portForwardReadSocketConflictSockets
 
 	portForwardRuntimeGOOS = func() string { return "windows" }
-	portForwardReadSocketSnapshot = func() (*socketSnapshot, error) {
-		t.Fatal("snapshot reader should not be called on non-linux")
+	portForwardReadSocketConflictSockets = func(filter firewallListenerFilter) ([]procListenerSocket, error) {
+		t.Fatal("socket reader should not be called on non-linux")
 		return nil, nil
 	}
 	t.Cleanup(func() {
 		portForwardRuntimeGOOS = originalGOOS
-		portForwardReadSocketSnapshot = originalSnapshotReader
+		portForwardReadSocketConflictSockets = originalSocketReader
 	})
 
 	row := normalizedPortForwardRule{
@@ -148,4 +165,3 @@ func TestValidatePortForwardRuleAvailability_MultiAndRangePorts(t *testing.T) {
 		t.Fatalf("expected udp occupied ports in error, got: %s", got)
 	}
 }
-

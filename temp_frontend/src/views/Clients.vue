@@ -158,7 +158,7 @@
           <div class="text-start">
             <v-chip
               size="small"
-              :color="item.expiry > 0 && item.expiry <= Date.now() / 1000 ? 'error' : ''"
+              :color="item.expiry > 0 && item.expiry <= panelNowUnix() ? 'error' : ''"
               label>
               {{ HumanReadable.remainedDays(item.expiry) }}
             </v-chip>
@@ -240,6 +240,7 @@ import Stats from '@/layouts/modals/Stats.vue'
 import { Client } from '@/types/clients'
 import { computed, reactive, ref } from 'vue'
 import { HumanReadable } from '@/plugins/utils'
+import { panelNowUnix } from '@/plugins/panelTime'
 import { i18n } from '@/locales'
 import { push } from 'notivue'
 import { useDisplay } from 'vuetify'
@@ -384,7 +385,7 @@ const doFilter = () => {
       filteredClients = filteredClients.filter(c => c.enable == false)
       break
     case 'expired':
-      filteredClients = filteredClients.filter(c => c.expiry > 0 && c.expiry <= (Date.now() / 1000))
+      filteredClients = filteredClients.filter(c => c.expiry > 0 && c.expiry <= panelNowUnix())
       break
     case 'online':
       filteredClients = filteredClients.filter(c => store.onlines?.user?.includes(c.name))
@@ -421,15 +422,18 @@ const syncLoading = reactive<Record<string, boolean>>({})
 
 const syncToSubManager = async (clientName: string) => {
   syncLoading[clientName] = true
-  const msg = await HttpUtils.post(namespaceApi.syncEndpoint, { name: clientName })
-  syncLoading[clientName] = false
-  if (msg.success) {
-    const result = msg.obj
-    push.success({
-      message: clientName + (result.action === 'updated' ? ' updated' : ' synced'),
-      duration: 3000,
-    })
-    await store.loadData()
+  try {
+    const msg = await HttpUtils.post(namespaceApi.syncEndpoint, { name: clientName })
+    if (msg.success) {
+      const result = msg.obj
+      push.success({
+        message: clientName + (result.action === 'updated' ? ' updated' : ' synced'),
+        duration: 3000,
+      })
+      await store.loadData()
+    }
+  } finally {
+    syncLoading[clientName] = false
   }
 }
 

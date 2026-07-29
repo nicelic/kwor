@@ -541,7 +541,7 @@
             </v-menu>
           </v-card-actions>
         </v-card>
-        <AcmeVue :tls="inTls" />
+        <AcmeVue v-if="showEmbeddedAcme" :tls="inTls" />
         <EchVue :iTls="inTls" :oTls="outTls" />
       </v-card-text>
       <v-card-actions>
@@ -618,6 +618,7 @@ export default {
   data() {
     return {
       tls: <tls>{ id: 0, name: '', server: <iTls>{ enabled: true }, client: <oTls>{} },
+      showEmbeddedAcme: false,
       title: "add",
       loading: false,
       menu: false,
@@ -1070,132 +1071,134 @@ export default {
         return
       }
       this.loading = true
-      const serverName = this.inTls.server_name ?? "''"
-      const options = serverName + "," + this.certDuration + "," + this.certDurationUnit + "," + this.certKeyAlg + "," + this.certSigAlg
-      const query: Record<string, string> = { k: "tls", o: options }
-      if (templateCode) {
-        query.template = templateCode
-      }
-      const msg = await HttpUtils.get('api/keypairs', query)
-      this.loading = false
-      if (msg.success) {
+      try {
+        const serverName = this.inTls.server_name ?? "''"
+        const options = serverName + "," + this.certDuration + "," + this.certDurationUnit + "," + this.certKeyAlg + "," + this.certSigAlg
+        const query: Record<string, string> = { k: "tls", o: options }
+        if (templateCode) {
+          query.template = templateCode
+        }
+        const msg = await HttpUtils.get('api/keypairs', query)
+        if (!msg.success || !Array.isArray(msg.obj) || msg.obj.length === 0) {
+          push.error({
+            message: msg.msg || i18n.global.t('error')
+          })
+          return
+        }
+
         this.inTls.key_path=undefined
         this.inTls.certificate_path=undefined
         this.usePath = 1
-        if (msg.obj.length>0){
-          let privateKey = <string[]>[]
-          let publicKey = <string[]>[]
-          let isPrivateKey = false
-          let isPublicKey = false
+        let privateKey = <string[]>[]
+        let publicKey = <string[]>[]
+        let isPrivateKey = false
+        let isPublicKey = false
 
-          msg.obj.forEach((line:string) => {
-              if (line === "-----BEGIN PRIVATE KEY-----") {
-                  isPrivateKey = true
-                  isPublicKey = false
-                  privateKey.push(line)
-              } else if (line === "-----END PRIVATE KEY-----") {
-                  isPrivateKey = false
-                  privateKey.push(line)
-              } else if (line === "-----BEGIN CERTIFICATE-----") {
-                  isPublicKey = true
-                  isPrivateKey = false
-                  publicKey.push(line)
-              } else if (line === "-----END CERTIFICATE-----") {
-                  isPublicKey = false
-                  publicKey.push(line)
-              } else if (isPrivateKey) {
-                  privateKey.push(line)
-              } else if (isPublicKey) {
-                  publicKey.push(line)
-              }
-          })
-          this.clearServerCertDerivedValues()
-          this.inTls.key = privateKey?? undefined
-          this.inTls.certificate = publicKey?? undefined
-          await this.refreshServerCertDerivedFields()
-
-        } else {
-          push.error({
-            message: i18n.global.t('error') + ": " + msg.obj
-          })
-        }
-      } else {
-        push.error({
-          message: msg.msg || i18n.global.t('error')
+        msg.obj.forEach((line:string) => {
+            if (line === "-----BEGIN PRIVATE KEY-----") {
+                isPrivateKey = true
+                isPublicKey = false
+                privateKey.push(line)
+            } else if (line === "-----END PRIVATE KEY-----") {
+                isPrivateKey = false
+                privateKey.push(line)
+            } else if (line === "-----BEGIN CERTIFICATE-----") {
+                isPublicKey = true
+                isPrivateKey = false
+                publicKey.push(line)
+            } else if (line === "-----END CERTIFICATE-----") {
+                isPublicKey = false
+                publicKey.push(line)
+            } else if (isPrivateKey) {
+                privateKey.push(line)
+            } else if (isPublicKey) {
+                publicKey.push(line)
+            }
         })
+        this.clearServerCertDerivedValues()
+        this.inTls.key = privateKey?? undefined
+        this.inTls.certificate = publicKey?? undefined
+        await this.refreshServerCertDerivedFields()
+      } finally {
+        this.loading = false
       }
     },
     async genRealityKey(){
       this.loading = true
-      const msg = await HttpUtils.get('api/keypairs', { k: "reality" })
-      this.loading = false
-      if (msg.success) {
-        msg.obj.forEach((line:string) => {
-          if (this.inTls.reality && this.outTls.reality){
-            if (line.startsWith("PrivateKey")){
-              this.inTls.reality.private_key = line.substring(12)
-            }
-            if (line.startsWith("PublicKey")){
-              this.outTls.reality.public_key = line.substring(11)
-            }
-          }
-        })
-      } else {
-        push.error({
-          message: i18n.global.t('error') + ": " + msg.obj
-        })
-      }
-    },
-    async genClientCert(){
-      this.loading = true
-      const serverName = this.inTls.server_name ?? "client"
-      const options = serverName + "," + this.certDuration + "," + this.certDurationUnit + "," + this.certKeyAlg + "," + this.certSigAlg + ",client"
-      const msg = await HttpUtils.get('api/keypairs', { k: "tls", o: options })
-      this.loading = false
-      if (msg.success) {
-        this.clientCertUsePath = 1
-        if (msg.obj.length > 0){
-          let privateKey = <string[]>[]
-          let publicKey = <string[]>[]
-          let isPrivateKey = false
-          let isPublicKey = false
-
+      try {
+        const msg = await HttpUtils.get('api/keypairs', { k: "reality" })
+        if (msg.success && Array.isArray(msg.obj)) {
           msg.obj.forEach((line:string) => {
-              if (line === "-----BEGIN PRIVATE KEY-----") {
-                  isPrivateKey = true
-                  isPublicKey = false
-                  privateKey.push(line)
-              } else if (line === "-----END PRIVATE KEY-----") {
-                  isPrivateKey = false
-                  privateKey.push(line)
-              } else if (line === "-----BEGIN CERTIFICATE-----") {
-                  isPublicKey = true
-                  isPrivateKey = false
-                  publicKey.push(line)
-              } else if (line === "-----END CERTIFICATE-----") {
-                  isPublicKey = false
-                  publicKey.push(line)
-              } else if (isPrivateKey) {
-                  privateKey.push(line)
-              } else if (isPublicKey) {
-                  publicKey.push(line)
+            if (this.inTls.reality && this.outTls.reality){
+              if (line.startsWith("PrivateKey")){
+                this.inTls.reality.private_key = line.substring(12)
               }
+              if (line.startsWith("PublicKey")){
+                this.outTls.reality.public_key = line.substring(11)
+              }
+            }
           })
-          this.clearClientCertDerivedValues()
-          // 客户端证书和私钥 -> tls.client
-          this.tls.client.client_certificate = publicKey.length > 0 ? publicKey : undefined
-          this.tls.client.client_certificate_path = undefined
-          this.tls.client.client_key = privateKey.length > 0 ? privateKey : undefined
-          this.tls.client.client_key_path = undefined
-          // 同时将客户端证书（CA）放到服务端 inTls.client_certificate，用于验证客户端
-          this.inTls.client_certificate = publicKey.length > 0 ? [...publicKey] : undefined
-          this.inTls.client_certificate_path = undefined
-          this.clientCaUsePath = 1
         } else {
           push.error({
             message: i18n.global.t('error') + ": " + msg.obj
           })
         }
+      } finally {
+        this.loading = false
+      }
+    },
+    async genClientCert(){
+      this.loading = true
+      try {
+        const serverName = this.inTls.server_name ?? "client"
+        const options = serverName + "," + this.certDuration + "," + this.certDurationUnit + "," + this.certKeyAlg + "," + this.certSigAlg + ",client"
+        const msg = await HttpUtils.get('api/keypairs', { k: "tls", o: options })
+        if (!msg.success || !Array.isArray(msg.obj) || msg.obj.length === 0) {
+          push.error({
+            message: i18n.global.t('error') + ": " + msg.obj
+          })
+          return
+        }
+
+        this.clientCertUsePath = 1
+        let privateKey = <string[]>[]
+        let publicKey = <string[]>[]
+        let isPrivateKey = false
+        let isPublicKey = false
+
+        msg.obj.forEach((line:string) => {
+            if (line === "-----BEGIN PRIVATE KEY-----") {
+                isPrivateKey = true
+                isPublicKey = false
+                privateKey.push(line)
+            } else if (line === "-----END PRIVATE KEY-----") {
+                isPrivateKey = false
+                privateKey.push(line)
+            } else if (line === "-----BEGIN CERTIFICATE-----") {
+                isPublicKey = true
+                isPrivateKey = false
+                publicKey.push(line)
+            } else if (line === "-----END CERTIFICATE-----") {
+                isPublicKey = false
+                publicKey.push(line)
+            } else if (isPrivateKey) {
+                privateKey.push(line)
+            } else if (isPublicKey) {
+                publicKey.push(line)
+            }
+        })
+        this.clearClientCertDerivedValues()
+        // 客户端证书和私钥 -> tls.client
+        this.tls.client.client_certificate = publicKey.length > 0 ? publicKey : undefined
+        this.tls.client.client_certificate_path = undefined
+        this.tls.client.client_key = privateKey.length > 0 ? privateKey : undefined
+        this.tls.client.client_key_path = undefined
+        // 同时将客户端证书（CA）放到服务端 inTls.client_certificate，用于验证客户端
+        this.inTls.client_certificate = publicKey.length > 0 ? [...publicKey] : undefined
+        this.inTls.client_certificate_path = undefined
+        this.clientCaUsePath = 1
+      } finally {
+        this.loading = false
       }
     },
     splitToLines(v: string): string[] | undefined {

@@ -2,9 +2,9 @@ package model
 
 import "time"
 
-// AcmeCertificate keeps issued certificate materials and metadata.
-// Certificates are persisted in SQLite by default so they can still be
-// exported/applied even if original acme.sh paths change.
+// AcmeCertificate is the retired ACME mirror schema. It is deliberately not
+// AutoMigrated for new installations and is referenced only by the one-time
+// upgrade importer that moves legacy rows into CertificateRecord.
 type AcmeCertificate struct {
 	Id uint `json:"id" gorm:"primaryKey;autoIncrement"`
 

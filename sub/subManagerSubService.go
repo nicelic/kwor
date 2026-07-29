@@ -3,13 +3,10 @@ package sub
 import (
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"strings"
 
-	"github.com/alireza0/s-ui/config"
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
-	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/service"
 	"github.com/alireza0/s-ui/util"
 	"gopkg.in/yaml.v3"
@@ -59,61 +56,12 @@ func (s *SubManagerSubService) GetSubManagerJson(tag string) (*string, error) {
 		util.SanitizeSingboxSubscriptionOutbound(outbounds[i])
 	}
 
-	// Read latency test settings.
-	latencyUrl := "http://www.gstatic.com/generate_204"
-	latencyInterval := "10m"
-	latencyTolerance := 50
-	var extJson map[string]interface{}
-	othersStr, _ := s.SettingService.GetSubJsonExt()
-	if len(othersStr) > 0 {
-		if err := json.Unmarshal([]byte(othersStr), &extJson); err == nil {
-			if u, ok := extJson["latency_test_url"].(string); ok && u != "" {
-				latencyUrl = u
-			}
-			if i, ok := extJson["latency_test_interval"].(string); ok && i != "" {
-				if normalized, ok := normalizeSingboxLatencyInterval(i); ok {
-					latencyInterval = normalized
-				}
-			}
-			if t, ok := extJson["latency_tolerance"].(float64); ok && t > 0 {
-				latencyTolerance = int(t)
-			}
-		}
-	}
-	selectorGroups := parseSelectorGroupsFromExt(extJson)
-
-	// Remove mihomo-only fields from sing-box JSON output.
-	stripMihomoFields(&outbounds)
-
-	// Reuse JsonService defaults for selector/urltest/direct/block/final groups.
-	s.JsonService.addDefaultOutbounds(&outbounds, &outTags, latencyUrl, latencyInterval, latencyTolerance, selectorGroups)
-
-	var jsonConfig map[string]interface{}
-	if err := json.Unmarshal([]byte(defaultJson), &jsonConfig); err != nil {
-		return nil, err
-	}
-	jsonConfig["outbounds"] = outbounds
-
-	// Move tls_store from outbound.tls blocks into root certificate.store.
 	tlsStore := extractTlsStoreFromOutbounds(outbounds)
 	tlsStore = s.SettingService.ResolveSubscriptionTLSStore(tlsStore)
-
-	// Reuse JsonService extra fields merge.
-	s.JsonService.addOthers(&jsonConfig)
-	applyCertificateStore(&jsonConfig, tlsStore)
-
-	result, err := json.MarshalIndent(jsonConfig, "", "  ")
+	resultStr, err := s.JsonService.renderJSONSubscription(&outbounds, &outTags, tlsStore)
 	if err != nil {
 		return nil, err
 	}
-	resultStr := string(result)
-
-	// Save a copy into sub_json directory.
-	if err := SaveSubJsonToFile(tag, resultStr); err != nil {
-		logger.Errorf("[SubManagerSub] failed to save subscription JSON file: %v", err)
-		// Do not return error here because HTTP response payload is already generated.
-	}
-
 	return &resultStr, nil
 }
 
@@ -129,36 +77,45 @@ func (s *SubManagerSubService) GetSubManagerClash(tag string) (*string, error) {
 		return nil, err
 	}
 
-	clashConfig, latencyUrl, latencyInterval, latencyTolerance, selectorGroups, err := s.ClashService.getClashConfigClean()
-	if err != nil || len(clashConfig) == 0 {
-		clashConfig = basicClashConfig
-		latencyUrl = "http://www.gstatic.com/generate_204"
-		latencyInterval = 300
-		latencyTolerance = 50
-		selectorGroups = nil
+	extension, err := s.ClashService.loadClashExtension()
+	if err != nil {
+		return nil, err
 	}
 
 	proxies := make([]map[string]interface{}, 0, 1)
 	renderEntries := make([]clashProxyRenderEntry, 0, 1)
 	if s.shouldUseStoredClashProxy(subOutbound) {
 		if proxy, ok := parseSubOutboundClashProxy(subOutbound); ok {
-			s.refreshSubOutboundClashProxyTLS(proxy, subOutbound)
-			proxies = append(proxies, proxy)
-			name, _ := proxy["name"].(string)
-			renderEntries = append(renderEntries, clashProxyRenderEntry{
-				Name:    strings.TrimSpace(name),
-				Proxy:   proxy,
-				RawYAML: s.storedSubOutboundRawClashYAML(subOutbound),
-			})
+			if strings.EqualFold(strings.TrimSpace(subOutbound.Type), "shadowquic") {
+				// Keep ClashOptions as the preferred source, but normalize it through
+				// the strict ShadowQUIC schema so old TLS/generic fields cannot leak.
+				name := strings.TrimSpace(firstString(proxy["name"]))
+				if normalized, valid := util.BuildMihomoShadowQUICClashProxy(proxy, name); valid {
+					proxy = normalized
+				} else {
+					proxy = nil
+				}
+			}
+			if proxy != nil {
+				s.refreshSubOutboundClashProxyTLS(proxy, subOutbound)
+				proxies = append(proxies, proxy)
+				name, _ := proxy["name"].(string)
+				renderEntries = append(renderEntries, clashProxyRenderEntry{
+					Name:    strings.TrimSpace(name),
+					Proxy:   proxy,
+					RawYAML: s.storedSubOutboundRawClashYAML(subOutbound),
+				})
+			}
 		}
 	}
+
 	if len(proxies) == 0 {
 		fallbackEntries, convErr := s.buildRuntimeClashRenderEntries(
 			[]map[string]interface{}{runtimeOutbound},
-			latencyUrl,
-			latencyInterval,
-			latencyTolerance,
-			selectorGroups,
+			extension.LatencyURL,
+			extension.LatencyInterval,
+			extension.LatencyTolerance,
+			extension.SelectorGroups,
 		)
 		if convErr != nil {
 			return nil, convErr
@@ -172,17 +129,25 @@ func (s *SubManagerSubService) GetSubManagerClash(tag string) (*string, error) {
 		}
 	}
 
-	rendered, err := renderClashSubscriptionFromEntries(renderEntries, latencyUrl, latencyInterval, latencyTolerance, selectorGroups)
+	generated := buildClashSubscriptionMapFromEntries(
+		renderEntries,
+		extension.LatencyURL,
+		extension.LatencyInterval,
+		extension.LatencyTolerance,
+		extension.SelectorGroups,
+	)
+	resultStr, err := renderMergedClashSubscription(extension.Config, generated)
 	if err != nil {
 		return nil, err
 	}
-
-	resultStr := clashConfig + "\n" + string(rendered)
 	return &resultStr, nil
 }
 
 func (s *SubManagerSubService) shouldUseStoredClashProxy(subOutbound *model.SubOutbound) bool {
 	if subOutbound == nil {
+		return false
+	}
+	if isServerOnlySubscriptionSubOutbound(subOutbound) {
 		return false
 	}
 	if len(subOutbound.ClashOptions) == 0 {
@@ -253,6 +218,10 @@ func (s *SubManagerSubService) buildRuntimeOutboundMap(subOutbound *model.SubOut
 	if err != nil {
 		return nil, err
 	}
+	if strings.EqualFold(strings.TrimSpace(firstString(outboundMap["type"])), "shadowquic") {
+		util.SanitizeMihomoShadowQUICOutbound(outboundMap)
+		return outboundMap, nil
+	}
 	s.refreshSubOutboundTLS(outboundMap, subOutbound)
 	return outboundMap, nil
 }
@@ -291,6 +260,10 @@ func shouldFallbackRefreshSubOutboundTLS(subOutbound *model.SubOutbound) bool {
 
 func (s *SubManagerSubService) refreshSubOutboundClashProxyTLS(proxy map[string]interface{}, subOutbound *model.SubOutbound) {
 	if proxy == nil || subOutbound == nil {
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(firstString(proxy["type"])), "shadowquic") ||
+		strings.EqualFold(strings.TrimSpace(subOutbound.Type), "shadowquic") {
 		return
 	}
 
@@ -404,7 +377,33 @@ func (s *SubManagerSubService) getSubOutboundRecord(tag string) (*model.SubOutbo
 	if err != nil {
 		return nil, err
 	}
+	if isServerOnlySubscriptionSubOutbound(subOutbound) {
+		return nil, fmt.Errorf("suboutbound %s uses server-only mixed listener type", tag)
+	}
 	return subOutbound, nil
+}
+
+func isServerOnlySubscriptionSubOutbound(subOutbound *model.SubOutbound) bool {
+	if subOutbound == nil {
+		return false
+	}
+	sourceType := strings.TrimSpace(subOutbound.SourceType)
+	if sourceType != subManagerSourceClient && sourceType != subManagerSourceMihomoClient {
+		return false
+	}
+	if util.IsSubscriptionServerOnlyInboundType(subOutbound.Type) {
+		return true
+	}
+	if len(subOutbound.RawOutbound) == 0 {
+		return false
+	}
+
+	payload := map[string]interface{}{}
+	if err := json.Unmarshal(subOutbound.RawOutbound, &payload); err != nil {
+		return false
+	}
+	payloadType, _ := payload["type"].(string)
+	return util.IsSubscriptionServerOnlyInboundType(payloadType)
 }
 
 func (s *SubManagerSubService) decodeSubOutboundMap(subOutbound *model.SubOutbound) (map[string]interface{}, error) {
@@ -446,6 +445,9 @@ func parseSubOutboundClashProxy(subOutbound *model.SubOutbound) (map[string]inte
 	}
 	proxy = normalizeProxyForYAML(proxy)
 	proxy, _ = sanitizeMihomoClashProxy(proxy)
+	if proxy == nil {
+		return nil, false
+	}
 
 	name, _ := proxy["name"].(string)
 	name = strings.TrimSpace(name)
@@ -590,43 +592,14 @@ func extractTlsStoreFromOutbounds(outbounds []map[string]interface{}) string {
 	return tlsStore
 }
 
-// SaveSubJsonToFile writes generated subscription JSON into sub_json directory.
+// SaveSubJsonToFile is retained for compatibility. Subscription JSON is now
+// served dynamically, so this wrapper only preserves filename validation.
 func SaveSubJsonToFile(tag string, jsonContent string) error {
-	logger.Infof("[SubManagerSub] start saving subscription JSON, tag: %s", tag)
+	_ = jsonContent
 	if err := service.ValidateManagedSubOutboundTagForSubJSON(tag); err != nil {
 		return err
 	}
-
-	subJsonDir := filepath.Join(config.GetDataDir(), "sub_json")
-	logger.Infof("[SubManagerSub] target directory: %s", subJsonDir)
-
-	// Sanitize filename.
-	baseFilename := sanitizeFilename(tag)
-	filePath := filepath.Join(subJsonDir, fmt.Sprintf("%s.json", baseFilename))
-	logger.Infof("[SubManagerSub] file path: %s", filePath)
-
-	// Write file content.
-	if err := service.ManagedRuntimeWriteFile(filePath, []byte(jsonContent)); err != nil {
-		logger.Errorf("[SubManagerSub] failed to write subscription file: %v", err)
-		return fmt.Errorf("failed to write subscription file: %w", err)
-	}
-
-	logger.Infof("[SubManagerSub] subscription JSON saved: %s (size=%d bytes)", filePath, len(jsonContent))
 	return nil
-}
-
-// sanitizeFilename removes unsafe path characters.
-func sanitizeFilename(name string) string {
-	unsafe := []string{"/", "\\", ":", "*", "?", "\"", "<", ">", "|"}
-	result := name
-	for _, char := range unsafe {
-		for i := 0; i < len(result); i++ {
-			if i+len(char) <= len(result) && result[i:i+len(char)] == char {
-				result = result[:i] + "_" + result[i+len(char):]
-			}
-		}
-	}
-	return result
 }
 
 // GetSubGroupJson renders sing-box JSON subscription for a group.
@@ -687,54 +660,12 @@ func (s *SubManagerSubService) GetSubGroupJson(groupName string) (*string, error
 		util.SanitizeSingboxSubscriptionOutbound(outbounds[i])
 	}
 
-	// Read latency test settings.
-	latencyUrl := "http://www.gstatic.com/generate_204"
-	latencyInterval := "10m"
-	latencyTolerance := 50
-	var extJson map[string]interface{}
-	othersStr, _ := s.SettingService.GetSubJsonExt()
-	if len(othersStr) > 0 {
-		if err := json.Unmarshal([]byte(othersStr), &extJson); err == nil {
-			if u, ok := extJson["latency_test_url"].(string); ok && u != "" {
-				latencyUrl = u
-			}
-			if i, ok := extJson["latency_test_interval"].(string); ok && i != "" {
-				if normalized, ok := normalizeSingboxLatencyInterval(i); ok {
-					latencyInterval = normalized
-				}
-			}
-			if t, ok := extJson["latency_tolerance"].(float64); ok && t > 0 {
-				latencyTolerance = int(t)
-			}
-		}
-	}
-	selectorGroups := parseSelectorGroupsFromExt(extJson)
-
-	// Remove mihomo-only fields from sing-box JSON output.
-	stripMihomoFields(&outbounds)
-
-	// Reuse JsonService defaults for selector/urltest/direct/block/final groups.
-	s.JsonService.addDefaultOutbounds(&outbounds, &outTags, latencyUrl, latencyInterval, latencyTolerance, selectorGroups)
-
-	var jsonConfig map[string]interface{}
-	if err := json.Unmarshal([]byte(defaultJson), &jsonConfig); err != nil {
-		return nil, err
-	}
-	jsonConfig["outbounds"] = outbounds
-
-	// Move tls_store from outbound.tls blocks into root certificate.store.
 	tlsStore := extractTlsStoreFromOutbounds(outbounds)
 	tlsStore = s.SettingService.ResolveSubscriptionTLSStore(tlsStore)
-
-	// Reuse JsonService extra fields merge.
-	s.JsonService.addOthers(&jsonConfig)
-	applyCertificateStore(&jsonConfig, tlsStore)
-
-	result, err := json.MarshalIndent(jsonConfig, "", "  ")
+	resultStr, err := s.JsonService.renderJSONSubscription(&outbounds, &outTags, tlsStore)
 	if err != nil {
 		return nil, err
 	}
-	resultStr := string(result)
 	return &resultStr, nil
 }
 
@@ -758,13 +689,9 @@ func (s *SubManagerSubService) GetSubGroupClash(groupName string) (*string, erro
 		outboundTags = []string{}
 	}
 
-	clashConfig, latencyUrl, latencyInterval, latencyTolerance, selectorGroups, err := s.ClashService.getClashConfigClean()
-	if err != nil || len(clashConfig) == 0 {
-		clashConfig = basicClashConfig
-		latencyUrl = "http://www.gstatic.com/generate_204"
-		latencyInterval = 300
-		latencyTolerance = 50
-		selectorGroups = nil
+	extension, err := s.ClashService.loadClashExtension()
+	if err != nil {
+		return nil, err
 	}
 
 	renderEntries := make([]clashProxyRenderEntry, 0, len(outboundTags))
@@ -790,10 +717,10 @@ func (s *SubManagerSubService) GetSubGroupClash(groupName string) (*string, erro
 		if mapErr == nil {
 			fallbackEntries, convErr := s.buildRuntimeClashRenderEntries(
 				[]map[string]interface{}{outboundMap},
-				latencyUrl,
-				latencyInterval,
-				latencyTolerance,
-				selectorGroups,
+				extension.LatencyURL,
+				extension.LatencyInterval,
+				extension.LatencyTolerance,
+				extension.SelectorGroups,
 			)
 			if convErr != nil {
 				return nil, convErr
@@ -802,17 +729,22 @@ func (s *SubManagerSubService) GetSubGroupClash(groupName string) (*string, erro
 		}
 	}
 
-	rendered, err := renderClashSubscriptionFromEntries(renderEntries, latencyUrl, latencyInterval, latencyTolerance, selectorGroups)
+	generated := buildClashSubscriptionMapFromEntries(
+		renderEntries,
+		extension.LatencyURL,
+		extension.LatencyInterval,
+		extension.LatencyTolerance,
+		extension.SelectorGroups,
+	)
+	resultStr, err := renderMergedClashSubscription(extension.Config, generated)
 	if err != nil {
 		return nil, err
 	}
-
-	resultStr := clashConfig + "\n" + string(rendered)
 	return &resultStr, nil
 }
 
-// buildSubManagerRuntimeOutbounds expands runtime outbounds used by SubManager subscriptions.
-// ShadowTLS with ss_config is split into a shadowsocks detour and a shadowtls outbound.
+// buildSubManagerRuntimeOutbounds expands manually configured Mixed endpoints and
+// ShadowTLS with ss_config into client-compatible subscription outbounds.
 func buildSubManagerRuntimeOutbounds(raw []map[string]interface{}) ([]map[string]interface{}, []string) {
 	outbounds := make([]map[string]interface{}, 0, len(raw))
 	outTags := make([]string, 0, len(raw))
@@ -825,6 +757,19 @@ func buildSubManagerRuntimeOutbounds(raw []map[string]interface{}) ([]map[string
 		outType, _ := outbound["type"].(string)
 		tag, _ := outbound["tag"].(string)
 		if tag == "" {
+			continue
+		}
+
+		if strings.EqualFold(strings.TrimSpace(outType), "mixed") {
+			socksOutbound, httpOutbound := util.BuildMixedSubscriptionOutboundPair(outbound)
+			for _, expanded := range []map[string]interface{}{socksOutbound, httpOutbound} {
+				if expanded == nil {
+					continue
+				}
+				expandedTag, _ := expanded["tag"].(string)
+				outbounds = append(outbounds, expanded)
+				outTags = append(outTags, expandedTag)
+			}
 			continue
 		}
 

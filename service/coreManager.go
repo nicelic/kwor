@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,29 +56,32 @@ var legacySingboxSystemdNames = []string{
 var coreAutoCheckMu sync.Mutex
 
 const (
-	coreReleaseGitHubPerPage = 20
-	coreReleaseMaxPages      = 30
-	coreVersionCacheTTL      = 10 * time.Minute
-	coreVersionMaxLimit      = 20
-	coreLocalVersionCacheTTL = 45 * time.Second
+	coreReleaseGitHubPerPage            = 20
+	coreReleaseMaxPages                 = 30
+	coreVersionCacheTTL                 = 10 * time.Minute
+	coreVersionMaxLimit                 = 20
+	coreLocalVersionCacheTTL            = 45 * time.Second
+	coreGitHubResponseMaxBytes    int64 = 4 * 1024 * 1024
+	coreGitHubReleaseListMaxBytes int64 = 100 * 1024 * 1024
 )
 
-type coreVersionCacheEntry struct {
+type singboxCoreVersionCacheEntry struct {
 	expiresAt time.Time
-	response  VersionListResponse
+	response  SingboxCoreVersionListResponse
 }
 
-var coreVersionCache = struct {
+var singboxCoreVersionCache = struct {
 	sync.Mutex
-	items map[string]coreVersionCacheEntry
+	items map[string]singboxCoreVersionCacheEntry
 }{
-	items: make(map[string]coreVersionCacheEntry),
+	items: make(map[string]singboxCoreVersionCacheEntry),
 }
 
 type coreLocalVersionCacheEntry struct {
 	expiresAt   time.Time
 	binModTime  time.Time
 	binSize     int64
+	binMode     os.FileMode
 	version     string
 	versionInfo string
 }
@@ -91,15 +93,15 @@ var coreLocalVersionCache = struct {
 	items: make(map[string]coreLocalVersionCacheEntry),
 }
 
-func cleanupCoreVersionCacheLocked(now time.Time) {
-	for key, entry := range coreVersionCache.items {
+func cleanupSingboxCoreVersionCacheLocked(now time.Time) {
+	for key, entry := range singboxCoreVersionCache.items {
 		if now.After(entry.expiresAt) {
-			delete(coreVersionCache.items, key)
+			delete(singboxCoreVersionCache.items, key)
 		}
 	}
 }
 
-func getCoreLocalVersionCache(binPath string, binModTime time.Time, binSize int64) (string, string, bool) {
+func getCoreLocalVersionCache(binPath string, binModTime time.Time, binSize int64, binMode os.FileMode) (string, string, bool) {
 	now := time.Now()
 	coreLocalVersionCache.Lock()
 	defer coreLocalVersionCache.Unlock()
@@ -112,14 +114,14 @@ func getCoreLocalVersionCache(binPath string, binModTime time.Time, binSize int6
 		delete(coreLocalVersionCache.items, binPath)
 		return "", "", false
 	}
-	if !entry.binModTime.Equal(binModTime) || entry.binSize != binSize {
+	if !entry.binModTime.Equal(binModTime) || entry.binSize != binSize || entry.binMode != binMode {
 		delete(coreLocalVersionCache.items, binPath)
 		return "", "", false
 	}
 	return entry.version, entry.versionInfo, true
 }
 
-func setCoreLocalVersionCache(binPath string, binModTime time.Time, binSize int64, version string, versionInfo string) {
+func setCoreLocalVersionCache(binPath string, binModTime time.Time, binSize int64, binMode os.FileMode, version string, versionInfo string) {
 	coreLocalVersionCache.Lock()
 	defer coreLocalVersionCache.Unlock()
 
@@ -127,6 +129,7 @@ func setCoreLocalVersionCache(binPath string, binModTime time.Time, binSize int6
 		expiresAt:   time.Now().Add(coreLocalVersionCacheTTL),
 		binModTime:  binModTime,
 		binSize:     binSize,
+		binMode:     binMode,
 		version:     version,
 		versionInfo: versionInfo,
 	}
@@ -155,29 +158,31 @@ type GitHubAsset struct {
 	Size               int64  `json:"size"`
 }
 
-// CoreInfo 内核状态信息
-type CoreInfo struct {
-	LocalVersion       string                 `json:"localVersion"`
-	Running            bool                   `json:"running"`
-	VersionInfo        string                 `json:"versionInfo"`
-	Platform           string                 `json:"platform"`
-	RuntimeMode        string                 `json:"runtimeMode,omitempty"`
-	InstalledTarget    CoreDownloadTarget     `json:"installedTarget,omitempty"`
-	DownloadPreference CoreDownloadPreference `json:"downloadPreference"`
+// SingboxCoreInfo 内核状态信息
+type SingboxCoreInfo struct {
+	LocalVersion       string                        `json:"localVersion"`
+	Installed          bool                          `json:"installed"`
+	Compatible         bool                          `json:"compatible"`
+	Running            bool                          `json:"running"`
+	VersionInfo        string                        `json:"versionInfo"`
+	Platform           string                        `json:"platform"`
+	RuntimeMode        string                        `json:"runtimeMode,omitempty"`
+	InstalledTarget    SingboxCoreDownloadTarget     `json:"installedTarget,omitempty"`
+	DownloadPreference SingboxCoreDownloadPreference `json:"downloadPreference"`
 }
 
-// VersionListResponse 版本列表响应
-type VersionListResponse struct {
-	Versions []VersionItem `json:"versions"`
-	Page     int           `json:"page,omitempty"`
-	PerPage  int           `json:"per_page,omitempty"`
-	Offset   int           `json:"offset,omitempty"`
-	Limit    int           `json:"limit,omitempty"`
-	HasMore  bool          `json:"has_more"`
+// SingboxCoreVersionListResponse 版本列表响应
+type SingboxCoreVersionListResponse struct {
+	Versions []SingboxCoreVersionItem `json:"versions"`
+	Page     int                      `json:"page,omitempty"`
+	PerPage  int                      `json:"per_page,omitempty"`
+	Offset   int                      `json:"offset,omitempty"`
+	Limit    int                      `json:"limit,omitempty"`
+	HasMore  bool                     `json:"has_more"`
 }
 
-// VersionItem 版本项
-type VersionItem struct {
+// SingboxCoreVersionItem 版本项
+type SingboxCoreVersionItem struct {
 	TagName     string `json:"tag_name"`
 	Name        string `json:"name"`
 	Prerelease  bool   `json:"prerelease"`
@@ -186,15 +191,14 @@ type VersionItem struct {
 	AssetSize   int64  `json:"asset_size,omitempty"`
 }
 
-// CoreUpdateInfo 内核更新检测信息
-type CoreDownloadTarget struct {
-	OS         string `json:"os"`
-	Arch       string `json:"arch"`
-	Libc       string `json:"libc"`
-	Amd64Level string `json:"amd64Level"`
+// SingboxCoreUpdateInfo 内核更新检测信息
+type SingboxCoreDownloadTarget struct {
+	OS   string `json:"os"`
+	Arch string `json:"arch"`
+	Libc string `json:"libc"`
 }
 
-type CoreUpdateInfo struct {
+type SingboxCoreUpdateInfo struct {
 	Enabled       bool   `json:"enabled"`
 	IntervalHours int    `json:"intervalHours"`
 	LastCheckedAt int64  `json:"lastCheckedAt"`
@@ -211,7 +215,7 @@ func (s *CoreManagerService) getCoreDir() string {
 }
 
 func (s *CoreManagerService) getCoreBinName() string {
-	if runtime.GOOS == "windows" {
+	if IsSystemPlatformWindows() {
 		return "sing-box.exe"
 	}
 	return "sing-box"
@@ -226,12 +230,12 @@ func (s *CoreManagerService) getConfigPath() string {
 }
 
 func (s *CoreManagerService) regenerateRuntimeConfig() {
-	configService := NewConfigService(nil)
+	configService := NewConfigService()
 	NewProManagerService(configService).SaveInboundJson()
 }
 
 func (s *CoreManagerService) getPlatformInfo() string {
-	return fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH)
+	return fmt.Sprintf("%s/%s", GetSystemPlatformOS(), GetSystemPlatformArchitecture())
 }
 
 // GetSingboxSystemdName 返回 sing-box systemd 服务名（供外部调用，例如 cmd.go）
@@ -316,7 +320,7 @@ func buildSystemdExecCommand(args ...string) string {
 }
 
 func verifySystemdUnitFile(servicePath string) error {
-	out, err := exec.Command("systemd-analyze", "verify", servicePath).CombinedOutput()
+	out, err := runCommandOutputWithTimeout(systemCommandTimeout, "systemd-analyze", "verify", servicePath)
 	if err == nil {
 		return nil
 	}
@@ -332,7 +336,8 @@ func verifySystemdUnitFile(servicePath string) error {
 }
 
 func buildSingboxSystemdServiceContent(controlPath, binPath, configPath, workDir string) string {
-	return fmt.Sprintf(`[Unit]
+	return fmt.Sprintf(`# kwor-owner:v1 resource=core-singbox
+[Unit]
 Description=kwor sing-box service
 Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target
@@ -362,12 +367,12 @@ WantedBy=multi-user.target
 }
 
 // GetCoreStatus 获取内核状态
-func (s *CoreManagerService) GetCoreStatus() (*CoreInfo, error) {
+func (s *CoreManagerService) GetCoreStatus() (*SingboxCoreInfo, error) {
 	if err := EnsureManagedCoreLayout(); err != nil {
 		return nil, err
 	}
 
-	info := &CoreInfo{
+	info := &SingboxCoreInfo{
 		Platform: s.getPlatformInfo(),
 	}
 	info.RuntimeMode = string(getManagedCoreRuntimeMode())
@@ -378,21 +383,29 @@ func (s *CoreManagerService) GetCoreStatus() (*CoreInfo, error) {
 	}
 
 	binPath := s.getCoreBinPath()
-	if statInfo, err := os.Stat(binPath); err == nil {
-		if version, versionInfo, ok := getCoreLocalVersionCache(binPath, statInfo.ModTime(), statInfo.Size()); ok {
-			info.LocalVersion = version
-			info.VersionInfo = versionInfo
-		} else {
-			version, versionInfo := s.getLocalVersion(binPath)
-			setCoreLocalVersionCache(binPath, statInfo.ModTime(), statInfo.Size(), version, versionInfo)
-			info.LocalVersion = version
-			info.VersionInfo = versionInfo
+	if !IsSystemPlatformWindows() {
+		inspection := inspectManagedLinuxCoreBinary(binPath, "sing-box", func(statInfo os.FileInfo, forceRefresh bool) (string, string) {
+			return s.getCachedLocalVersion(binPath, statInfo, forceRefresh)
+		})
+		info.Installed = inspection.Installed
+		info.Compatible = inspection.Compatible
+		info.LocalVersion = inspection.Version
+		info.VersionInfo = inspection.VersionInfo
+		if inspection.Architecture != "" {
+			info.InstalledTarget = SingboxCoreDownloadTarget{OS: "linux", Arch: inspection.Architecture}
 		}
-		installedTarget := inferTargetFromGoBuildInfo(binPath)
+		if !inspection.Installed {
+			clearCoreLocalVersionCache(binPath)
+		}
+	} else if statInfo, err := os.Stat(binPath); err == nil {
+		info.Installed = true
+		info.LocalVersion, info.VersionInfo = s.getCachedLocalVersion(binPath, statInfo, false)
+		info.Compatible = info.LocalVersion != "" && managedCoreVersionOutputMatches(info.VersionInfo, "sing-box")
+		installedTarget := inferSingboxTargetFromGoBuildInfo(binPath)
 		if installedTarget.OS == "" && installedTarget.Arch == "" {
-			installedTarget = inferTargetFromPlatform(info.Platform)
+			installedTarget = inferSingboxTargetFromPlatform(info.Platform)
 		}
-		info.InstalledTarget = mergeInstalledTargetWithPreference(installedTarget, info.DownloadPreference.Target)
+		info.InstalledTarget = mergeSingboxInstalledTargetWithPreference(installedTarget, info.DownloadPreference.Target)
 	} else {
 		clearCoreLocalVersionCache(binPath)
 	}
@@ -402,9 +415,7 @@ func (s *CoreManagerService) GetCoreStatus() (*CoreInfo, error) {
 }
 
 func (s *CoreManagerService) getLocalVersion(binPath string) (string, string) {
-	cmd := exec.Command(binPath, "version")
-	cmd.Dir = filepath.Dir(binPath)
-	output, err := cmd.CombinedOutput()
+	output, err := runCommandOutputInDirWithTimeout(coreVersionCommandTimeout, filepath.Dir(binPath), binPath, "version")
 	if err != nil {
 		logger.Warning("Failed to get sing-box version: ", err)
 		return "", ""
@@ -418,27 +429,40 @@ func (s *CoreManagerService) getLocalVersion(binPath string) (string, string) {
 	return version, outputStr
 }
 
-// GetRemoteVersions 从 GitHub 获取远程版本列表
-func (s *CoreManagerService) GetRemoteVersions(channel string) (*VersionListResponse, error) {
-	return s.GetRemoteVersionsWindow(channel, 0, 20, CoreDownloadTarget{})
+func (s *CoreManagerService) getCachedLocalVersion(binPath string, statInfo os.FileInfo, forceRefresh bool) (string, string) {
+	if forceRefresh {
+		clearCoreLocalVersionCache(binPath)
+	}
+	binMode := statInfo.Mode().Perm()
+	if version, versionInfo, ok := getCoreLocalVersionCache(binPath, statInfo.ModTime(), statInfo.Size(), binMode); ok {
+		return version, versionInfo
+	}
+	version, versionInfo := s.getLocalVersion(binPath)
+	setCoreLocalVersionCache(binPath, statInfo.ModTime(), statInfo.Size(), binMode, version, versionInfo)
+	return version, versionInfo
 }
 
-func (s *CoreManagerService) GetRemoteVersionsWindow(channel string, offset int, limit int, target CoreDownloadTarget) (*VersionListResponse, error) {
+// GetRemoteVersions 从 GitHub 获取远程版本列表
+func (s *CoreManagerService) GetRemoteVersions(channel string) (*SingboxCoreVersionListResponse, error) {
+	return s.GetRemoteVersionsWindow(channel, 0, 20, SingboxCoreDownloadTarget{})
+}
+
+func (s *CoreManagerService) GetRemoteVersionsWindow(channel string, offset int, limit int, target SingboxCoreDownloadTarget) (*SingboxCoreVersionListResponse, error) {
 	offset, limit = normalizeCoreVersionWindow(offset, limit)
-	filterTarget := hasCoreDownloadTargetFilter(target)
+	filterTarget := hasSingboxCoreDownloadTargetFilter(target)
 	if filterTarget {
 		target = s.normalizeDownloadTarget(target)
 	}
 
-	cacheKey := coreVersionCacheKey("SagerNet/sing-box", channel, offset, limit, target, filterTarget)
-	if cached, ok := getCoreVersionCache(cacheKey); ok {
+	cacheKey := singboxCoreVersionCacheKey("SagerNet/sing-box", channel, offset, limit, target, filterTarget)
+	if cached, ok := getSingboxCoreVersionCache(cacheKey); ok {
 		return cached, nil
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	seenTags := make(map[string]struct{})
-	result := &VersionListResponse{
-		Versions: make([]VersionItem, 0, limit+1),
+	result := &SingboxCoreVersionListResponse{
+		Versions: make([]SingboxCoreVersionItem, 0, limit+1),
 		Offset:   offset,
 		Limit:    limit,
 		PerPage:  limit,
@@ -481,7 +505,7 @@ func (s *CoreManagerService) GetRemoteVersionsWindow(channel string, offset int,
 			}
 			matchedCount++
 
-			result.Versions = append(result.Versions, VersionItem{
+			result.Versions = append(result.Versions, SingboxCoreVersionItem{
 				TagName:     r.TagName,
 				Name:        r.Name,
 				Prerelease:  r.Prerelease,
@@ -503,8 +527,8 @@ func (s *CoreManagerService) GetRemoteVersionsWindow(channel string, offset int,
 		result.HasMore = true
 		result.Versions = result.Versions[:limit]
 	}
-	setCoreVersionCache(cacheKey, result)
-	return cloneVersionListResponse(result), nil
+	setSingboxCoreVersionCache(cacheKey, result)
+	return cloneSingboxCoreVersionListResponse(result), nil
 }
 
 func shouldIncludeRelease(channel string, prerelease bool) bool {
@@ -530,61 +554,60 @@ func normalizeCoreVersionWindow(offset int, limit int) (int, int) {
 	return offset, limit
 }
 
-func hasCoreDownloadTargetFilter(target CoreDownloadTarget) bool {
+func hasSingboxCoreDownloadTargetFilter(target SingboxCoreDownloadTarget) bool {
 	return strings.TrimSpace(target.OS) != "" ||
 		strings.TrimSpace(target.Arch) != "" ||
-		strings.TrimSpace(target.Libc) != "" ||
-		strings.TrimSpace(target.Amd64Level) != ""
+		strings.TrimSpace(target.Libc) != ""
 }
 
-func cloneVersionListResponse(response *VersionListResponse) *VersionListResponse {
+func cloneSingboxCoreVersionListResponse(response *SingboxCoreVersionListResponse) *SingboxCoreVersionListResponse {
 	if response == nil {
 		return nil
 	}
 	cloned := *response
 	if response.Versions != nil {
-		cloned.Versions = append([]VersionItem(nil), response.Versions...)
+		cloned.Versions = append([]SingboxCoreVersionItem(nil), response.Versions...)
 	}
 	return &cloned
 }
 
-func getCoreVersionCache(key string) (*VersionListResponse, bool) {
+func getSingboxCoreVersionCache(key string) (*SingboxCoreVersionListResponse, bool) {
 	now := time.Now()
-	coreVersionCache.Lock()
-	defer coreVersionCache.Unlock()
-	cleanupCoreVersionCacheLocked(now)
+	singboxCoreVersionCache.Lock()
+	defer singboxCoreVersionCache.Unlock()
+	cleanupSingboxCoreVersionCacheLocked(now)
 
-	entry, ok := coreVersionCache.items[key]
+	entry, ok := singboxCoreVersionCache.items[key]
 	if !ok {
 		return nil, false
 	}
 	if now.After(entry.expiresAt) {
-		delete(coreVersionCache.items, key)
+		delete(singboxCoreVersionCache.items, key)
 		return nil, false
 	}
-	return cloneVersionListResponse(&entry.response), true
+	return cloneSingboxCoreVersionListResponse(&entry.response), true
 }
 
-func setCoreVersionCache(key string, response *VersionListResponse) {
+func setSingboxCoreVersionCache(key string, response *SingboxCoreVersionListResponse) {
 	if response == nil {
 		return
 	}
 	now := time.Now()
-	coreVersionCache.Lock()
-	defer coreVersionCache.Unlock()
-	cleanupCoreVersionCacheLocked(now)
-	coreVersionCache.items[key] = coreVersionCacheEntry{
+	singboxCoreVersionCache.Lock()
+	defer singboxCoreVersionCache.Unlock()
+	cleanupSingboxCoreVersionCacheLocked(now)
+	singboxCoreVersionCache.items[key] = singboxCoreVersionCacheEntry{
 		expiresAt: now.Add(coreVersionCacheTTL),
-		response:  *cloneVersionListResponse(response),
+		response:  *cloneSingboxCoreVersionListResponse(response),
 	}
 }
 
-func coreVersionCacheKey(repo string, channel string, offset int, limit int, target CoreDownloadTarget, filterTarget bool) string {
+func singboxCoreVersionCacheKey(repo string, channel string, offset int, limit int, target SingboxCoreDownloadTarget, filterTarget bool) string {
 	if !filterTarget {
 		return fmt.Sprintf("%s|%s|%d|%d|all", repo, channel, offset, limit)
 	}
 	return fmt.Sprintf(
-		"%s|%s|%d|%d|%s|%s|%s|%s",
+		"%s|%s|%d|%d|%s|%s|%s",
 		repo,
 		channel,
 		offset,
@@ -592,18 +615,21 @@ func coreVersionCacheKey(repo string, channel string, offset int, limit int, tar
 		target.OS,
 		target.Arch,
 		target.Libc,
-		target.Amd64Level,
 	)
 }
 
-func fetchGitHubReleasePageForRepo(repo string, client *http.Client, apiPage int, perPage int) ([]GitHubRelease, error) {
+func fetchGitHubReleasePageForRepo(repo string, client *http.Client, apiPage int, perPage int, responseMaxBytes int64) ([]GitHubRelease, error) {
+	return fetchGitHubReleasePageForRepoContext(context.Background(), repo, client, apiPage, perPage, responseMaxBytes)
+}
+
+func fetchGitHubReleasePageForRepoContext(ctx context.Context, repo string, client *http.Client, apiPage int, perPage int, responseMaxBytes int64) ([]GitHubRelease, error) {
 	apiURL := fmt.Sprintf(
 		"https://api.github.com/repos/%s/releases?per_page=%d&page=%d",
 		repo,
 		perPage,
 		apiPage,
 	)
-	req, err := http.NewRequest("GET", apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -620,18 +646,18 @@ func fetchGitHubReleasePageForRepo(repo string, client *http.Client, apiPage int
 	}
 
 	var releases []GitHubRelease
-	if err = json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+	if err = unmarshalBoundedHTTPResponseJSON(resp.Body, responseMaxBytes, &releases); err != nil {
 		return nil, fmt.Errorf("failed to parse GitHub releases: %v", err)
 	}
 	return releases, nil
 }
 
 func (s *CoreManagerService) fetchGitHubReleasePage(client *http.Client, apiPage int, perPage int) ([]GitHubRelease, error) {
-	return fetchGitHubReleasePageForRepo("SagerNet/sing-box", client, apiPage, perPage)
+	return fetchGitHubReleasePageForRepo("SagerNet/sing-box", client, apiPage, perPage, coreGitHubReleaseListMaxBytes)
 }
 
 // GetRemoteVersionsPage keeps the old page/per_page contract while using the new window loader.
-func (s *CoreManagerService) GetRemoteVersionsPage(channel string, page int, perPage int) (*VersionListResponse, error) {
+func (s *CoreManagerService) GetRemoteVersionsPage(channel string, page int, perPage int) (*SingboxCoreVersionListResponse, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -639,16 +665,17 @@ func (s *CoreManagerService) GetRemoteVersionsPage(channel string, page int, per
 		perPage = 5
 	}
 	offset := (page - 1) * perPage
-	return s.GetRemoteVersionsWindow(channel, offset, perPage, CoreDownloadTarget{})
+	return s.GetRemoteVersionsWindow(channel, offset, perPage, SingboxCoreDownloadTarget{})
 }
 
-func pickSingboxAssetFromAssets(version string, assets []GitHubAsset, target CoreDownloadTarget) (GitHubAsset, bool) {
+func pickSingboxAssetFromAssets(version string, assets []GitHubAsset, target SingboxCoreDownloadTarget) (GitHubAsset, bool) {
+	version = strings.TrimPrefix(strings.TrimSpace(version), "v")
 	normalizedTarget := target
 	if normalizedTarget.OS == "" {
-		normalizedTarget.OS = runtime.GOOS
+		normalizedTarget.OS = GetSystemPlatformOS()
 	}
 	if normalizedTarget.Arch == "" {
-		normalizedTarget.Arch = runtime.GOARCH
+		normalizedTarget.Arch = GetSystemPlatformArchitecture()
 	}
 	normalizedTarget = (&CoreManagerService{}).normalizeDownloadTarget(normalizedTarget)
 	ext := coreArchiveExtForOS(normalizedTarget.OS)
@@ -670,11 +697,15 @@ func pickSingboxAssetFromAssets(version string, assets []GitHubAsset, target Cor
 	return GitHubAsset{}, false
 }
 
-func (s *CoreManagerService) getDownloadAsset(version string, target CoreDownloadTarget) (string, error) {
+func (s *CoreManagerService) getDownloadAsset(version string, target SingboxCoreDownloadTarget) (string, error) {
+	return s.getDownloadAssetContext(context.Background(), version, target)
+}
+
+func (s *CoreManagerService) getDownloadAssetContext(ctx context.Context, version string, target SingboxCoreDownloadTarget) (string, error) {
 	apiURL := fmt.Sprintf("https://api.github.com/repos/SagerNet/sing-box/releases/tags/%s", version)
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequest("GET", apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -690,7 +721,7 @@ func (s *CoreManagerService) getDownloadAsset(version string, target CoreDownloa
 		return "", fmt.Errorf("GitHub API 返回 %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readBoundedHTTPResponseBody(resp.Body, coreGitHubResponseMaxBytes)
 	if err != nil {
 		return "", err
 	}
@@ -718,28 +749,20 @@ func (s *CoreManagerService) getDownloadAsset(version string, target CoreDownloa
 		}
 	}
 
-	return "", fmt.Errorf("no sing-box asset found for %s, version: %s", describeCoreDownloadTarget(normalizedTarget), ver)
+	return "", fmt.Errorf("no sing-box asset found for %s, version: %s", describeSingboxCoreDownloadTarget(normalizedTarget), ver)
 }
 
-func (s *CoreManagerService) normalizeDownloadTarget(target CoreDownloadTarget) CoreDownloadTarget {
-	normalized := CoreDownloadTarget{
-		OS:         strings.ToLower(strings.TrimSpace(target.OS)),
-		Arch:       strings.ToLower(strings.TrimSpace(target.Arch)),
-		Libc:       strings.ToLower(strings.TrimSpace(target.Libc)),
-		Amd64Level: normalizeAmd64Level(target.Amd64Level),
+func (s *CoreManagerService) normalizeDownloadTarget(target SingboxCoreDownloadTarget) SingboxCoreDownloadTarget {
+	normalized := SingboxCoreDownloadTarget{
+		OS:   strings.ToLower(strings.TrimSpace(target.OS)),
+		Arch: strings.ToLower(strings.TrimSpace(target.Arch)),
+		Libc: strings.ToLower(strings.TrimSpace(target.Libc)),
 	}
 	if normalized.OS == "" {
-		normalized.OS = runtime.GOOS
+		normalized.OS = GetSystemPlatformOS()
 	}
 	if normalized.Arch == "" {
 		normalized.Arch = s.getArchName()
-	}
-	if normalized.Arch == "amd64" {
-		if normalized.Amd64Level == "" {
-			normalized.Amd64Level = inferHostAMD64Level()
-		}
-	} else {
-		normalized.Amd64Level = ""
 	}
 	if normalized.OS != "linux" {
 		normalized.Libc = ""
@@ -765,7 +788,7 @@ func coreArchiveExtForOS(goos string) string {
 	return ".tar.gz"
 }
 
-func buildCoreAssetCandidates(version string, target CoreDownloadTarget) []string {
+func buildCoreAssetCandidates(version string, target SingboxCoreDownloadTarget) []string {
 	ext := coreArchiveExtForOS(target.OS)
 	candidates := make([]string, 0, 3)
 	appendUnique := func(name string) {
@@ -799,7 +822,7 @@ func buildCoreAssetCandidates(version string, target CoreDownloadTarget) []strin
 	return candidates
 }
 
-func assetMatchesDownloadTarget(asset GitHubAsset, target CoreDownloadTarget, ext string) bool {
+func assetMatchesDownloadTarget(asset GitHubAsset, target SingboxCoreDownloadTarget, ext string) bool {
 	lowerName := strings.ToLower(asset.Name)
 	if !strings.Contains(lowerName, target.OS) || !strings.Contains(lowerName, target.Arch) || !strings.HasSuffix(lowerName, ext) {
 		return false
@@ -825,59 +848,22 @@ func isUniversalLinuxAssetName(name string) bool {
 		!strings.Contains(name, "-musl")
 }
 
-func describeCoreDownloadTarget(target CoreDownloadTarget) string {
-	if target.OS == "linux" && target.Arch == "amd64" && target.Amd64Level != "" {
-		if target.Libc != "" {
-			return fmt.Sprintf("%s/%s/%s (%s)", target.OS, target.Arch, target.Amd64Level, target.Libc)
-		}
-		return fmt.Sprintf("%s/%s/%s", target.OS, target.Arch, target.Amd64Level)
-	}
+func describeSingboxCoreDownloadTarget(target SingboxCoreDownloadTarget) string {
 	if target.OS == "linux" && target.Libc != "" {
 		return fmt.Sprintf("%s/%s (%s)", target.OS, target.Arch, target.Libc)
 	}
 	return fmt.Sprintf("%s/%s", target.OS, target.Arch)
 }
 
-func normalizeAmd64Level(raw string) string {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "v1", "1":
-		return "v1"
-	case "v2", "2":
-		return "v2"
-	case "v3", "3":
-		return "v3"
-	default:
-		return ""
-	}
-}
-
 func detectHostLinuxLibc() string {
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return ""
 	}
-	if _, err := os.Stat("/etc/alpine-release"); err == nil {
-		return "musl"
-	}
-	if matches, _ := filepath.Glob("/lib/ld-musl-*.so.1"); len(matches) > 0 {
-		return "musl"
-	}
-	cmd := exec.Command("ldd", "--version")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return ""
-	}
-	lower := strings.ToLower(string(output))
-	if strings.Contains(lower, "musl") {
-		return "musl"
-	}
-	if strings.Contains(lower, "glibc") || strings.Contains(lower, "gnu libc") {
-		return "glibc"
-	}
-	return ""
+	return GetSystemPlatformLibc()
 }
 
 func (s *CoreManagerService) getArchName() string {
-	switch runtime.GOARCH {
+	switch GetSystemPlatformArchitecture() {
 	case "amd64":
 		return "amd64"
 	case "386":
@@ -887,12 +873,23 @@ func (s *CoreManagerService) getArchName() string {
 	case "arm":
 		return "armv7"
 	default:
-		return runtime.GOARCH
+		return GetSystemPlatformArchitecture()
 	}
 }
 
 // DownloadCore 下载 sing-box 内核
-func (s *CoreManagerService) DownloadCore(version string, target CoreDownloadTarget, requestedSessionID string) (string, error) {
+func (s *CoreManagerService) DownloadCore(version string, target SingboxCoreDownloadTarget, requestedSessionID string) (string, error) {
+	operationContext, operation, err := BeginKworManagedOperation("singbox-core-download")
+	if err != nil {
+		return "", err
+	}
+	defer operation.Done()
+	lifecycleLock, err := AcquireKworLifecycleLock()
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = lifecycleLock.Release() }()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -933,26 +930,30 @@ func (s *CoreManagerService) DownloadCore(version string, target CoreDownloadTar
 	}
 
 	normalizedTarget := s.normalizeDownloadTarget(target)
-	if strings.TrimSpace(target.OS) != "" && normalizedTarget.OS != runtime.GOOS {
-		err := fmt.Errorf("requested core target %s cannot be installed on runtime %s/%s", describeCoreDownloadTarget(normalizedTarget), runtime.GOOS, runtime.GOARCH)
+	if strings.TrimSpace(target.OS) != "" && normalizedTarget.OS != GetSystemPlatformOS() {
+		err := fmt.Errorf("requested core target %s cannot be installed on runtime %s/%s", describeSingboxCoreDownloadTarget(normalizedTarget), GetSystemPlatformOS(), GetSystemPlatformArchitecture())
 		failProgress(coreDownloadStageDownloading, err)
 		return "", err
 	}
 	if strings.TrimSpace(target.Arch) != "" && normalizedTarget.Arch != s.getArchName() {
-		err := fmt.Errorf("requested core target %s does not match runtime architecture %s", describeCoreDownloadTarget(normalizedTarget), s.getArchName())
+		err := fmt.Errorf("requested core target %s does not match runtime architecture %s", describeSingboxCoreDownloadTarget(normalizedTarget), s.getArchName())
 		failProgress(coreDownloadStageDownloading, err)
 		return "", err
 	}
 	if normalizedTarget.OS == "linux" && (normalizedTarget.Libc == "glibc" || normalizedTarget.Libc == "musl") {
 		hostLibc := detectHostLinuxLibc()
 		if hostLibc != "" && hostLibc != normalizedTarget.Libc {
-			err := fmt.Errorf("requested core target %s does not match host libc %s", describeCoreDownloadTarget(normalizedTarget), hostLibc)
+			err := fmt.Errorf("requested core target %s does not match host libc %s", describeSingboxCoreDownloadTarget(normalizedTarget), hostLibc)
 			failProgress(coreDownloadStageDownloading, err)
 			return "", err
 		}
 	}
 
-	downloadURL, err := s.getDownloadAsset(version, normalizedTarget)
+	if err := operationContext.Err(); err != nil {
+		failProgress(coreDownloadStageDownloading, err)
+		return "", err
+	}
+	downloadURL, err := s.getDownloadAssetContext(operationContext, version, normalizedTarget)
 	if err != nil {
 		failProgress(coreDownloadStageDownloading, err)
 		return "", err
@@ -962,7 +963,13 @@ func (s *CoreManagerService) DownloadCore(version string, target CoreDownloadTar
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageDownloading)
 
 	client := &http.Client{Timeout: 600 * time.Second}
-	resp, err := client.Get(downloadURL)
+	req, err := http.NewRequestWithContext(operationContext, http.MethodGet, downloadURL, nil)
+	if err != nil {
+		err = fmt.Errorf("创建下载请求失败: %v", err)
+		failProgress(coreDownloadStageDownloading, err)
+		return "", err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		err = fmt.Errorf("下载失败: %v", err)
 		failProgress(coreDownloadStageDownloading, err)
@@ -1029,7 +1036,7 @@ func (s *CoreManagerService) DownloadCore(version string, target CoreDownloadTar
 
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageValidating)
 	if !s.validateCoreBinary(stagedBinPath) {
-		err = fmt.Errorf("downloaded sing-box binary is not executable on current runtime %s/%s", runtime.GOOS, runtime.GOARCH)
+		err = fmt.Errorf("downloaded sing-box binary is not executable on current runtime %s/%s", GetSystemPlatformOS(), GetSystemPlatformArchitecture())
 		failProgress(coreDownloadStageValidating, err)
 		return "", err
 	}
@@ -1178,8 +1185,20 @@ func (s *CoreManagerService) extractTarGz(tarGzPath, destDir, binName string) er
 // StartCore 启动内核
 // Linux: 创建 systemd 服务文件 → daemon-reload → systemctl start
 // Windows: 直接启动进程
-func (s *CoreManagerService) StartCore() error {
+func (s *CoreManagerService) StartCore() (err error) {
+	lifecycleLock, lockErr := AcquireKworLifecycleLock()
+	if lockErr != nil {
+		return lockErr
+	}
+	defer func() { _ = lifecycleLock.Release() }()
+
 	s.mu.Lock()
+	defer func() {
+		if err == nil {
+			SyncPortForwardNftablesAfterCoreRuntimeReady()
+			notifyCertificateCoreLoadedLatestConfig(certificateCoreKindSingbox)
+		}
+	}()
 	defer s.mu.Unlock()
 
 	if err := EnsureManagedCoreLayout(); err != nil {
@@ -1195,7 +1214,7 @@ func (s *CoreManagerService) StartCore() error {
 		return fmt.Errorf("内核文件不存在: %s", binPath)
 	}
 	if !s.validateCoreBinary(binPath) {
-		return fmt.Errorf("内核文件无法在当前系统执行，请确认下载的架构与系统匹配（当前 %s/%s）", runtime.GOOS, runtime.GOARCH)
+		return fmt.Errorf("内核文件无法在当前系统执行，请确认下载的架构与系统匹配（当前 %s/%s）", GetSystemPlatformOS(), GetSystemPlatformArchitecture())
 	}
 
 	s.regenerateRuntimeConfig()
@@ -1217,8 +1236,12 @@ func (s *CoreManagerService) StartCore() error {
 		DiscardMaterializedManagedRuntimeCoreFile(configPath)
 		return err
 	}
+	if err := RegisterManagedCoreHostOwnership("singbox", binPath, singboxSystemdName); err != nil {
+		DiscardMaterializedManagedRuntimeCoreFile(configPath)
+		return fmt.Errorf("record sing-box ownership before start: %w", err)
+	}
 
-	if runtime.GOOS == "windows" {
+	if IsSystemPlatformWindows() {
 		err = s.startCoreWindows(absCoreDir)
 	} else {
 		err = s.startCoreLinux(absCoreDir)
@@ -1227,7 +1250,7 @@ func (s *CoreManagerService) StartCore() error {
 		DiscardMaterializedManagedRuntimeCoreFile(configPath)
 		return err
 	}
-	if runtime.GOOS == "linux" {
+	if IsSystemPlatformLinux() {
 		if markerErr := markManagedCoreShouldRun("singbox"); markerErr != nil {
 			logger.Warning("failed to persist sing-box runtime marker: ", markerErr)
 		}
@@ -1246,7 +1269,7 @@ func (s *CoreManagerService) startCoreLocked() error {
 		return fmt.Errorf("内核文件不存在: %s", binPath)
 	}
 	if !s.validateCoreBinary(binPath) {
-		return fmt.Errorf("内核文件无法在当前系统执行，请确认下载的架构与系统匹配（当前 %s/%s）", runtime.GOOS, runtime.GOARCH)
+		return fmt.Errorf("内核文件无法在当前系统执行，请确认下载的架构与系统匹配（当前 %s/%s）", GetSystemPlatformOS(), GetSystemPlatformArchitecture())
 	}
 
 	s.regenerateRuntimeConfig()
@@ -1268,8 +1291,12 @@ func (s *CoreManagerService) startCoreLocked() error {
 		DiscardMaterializedManagedRuntimeCoreFile(configPath)
 		return err
 	}
+	if err := RegisterManagedCoreHostOwnership("singbox", binPath, singboxSystemdName); err != nil {
+		DiscardMaterializedManagedRuntimeCoreFile(configPath)
+		return fmt.Errorf("record sing-box ownership before start: %w", err)
+	}
 
-	if runtime.GOOS == "windows" {
+	if IsSystemPlatformWindows() {
 		err = s.startCoreWindows(absCoreDir)
 	} else {
 		err = s.startCoreLinux(absCoreDir)
@@ -1278,7 +1305,7 @@ func (s *CoreManagerService) startCoreLocked() error {
 		DiscardMaterializedManagedRuntimeCoreFile(configPath)
 		return err
 	}
-	if runtime.GOOS == "linux" {
+	if IsSystemPlatformLinux() {
 		if markerErr := markManagedCoreShouldRun("singbox"); markerErr != nil {
 			logger.Warning("failed to persist sing-box runtime marker: ", markerErr)
 		}
@@ -1290,10 +1317,16 @@ func (s *CoreManagerService) startCoreLocked() error {
 // Linux: systemctl stop → disable → 删除 service 文件 → daemon-reload
 // Windows: 直接终止进程
 func (s *CoreManagerService) StopCore() error {
+	lifecycleLock, err := AcquireKworLifecycleLock()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lifecycleLock.Release() }()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if runtime.GOOS == "linux" {
+	if IsSystemPlatformLinux() {
 		err := s.stopCoreLinuxFull()
 		if err == nil {
 			clearManagedCoreShouldRun("singbox")
@@ -1305,6 +1338,12 @@ func (s *CoreManagerService) StopCore() error {
 
 // DeleteCore stops running core/service and removes the core binary.
 func (s *CoreManagerService) DeleteCore() error {
+	lifecycleLock, err := AcquireKworLifecycleLock()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lifecycleLock.Release() }()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1312,7 +1351,7 @@ func (s *CoreManagerService) DeleteCore() error {
 		return err
 	}
 
-	if runtime.GOOS == "linux" {
+	if IsSystemPlatformLinux() {
 		if err := s.stopCoreLinuxFull(); err != nil {
 			return err
 		}
@@ -1345,15 +1384,31 @@ func (s *CoreManagerService) DeleteCore() error {
 }
 
 // RestartCore 重启内核
-func (s *CoreManagerService) RestartCore() error {
+func (s *CoreManagerService) RestartCore() (err error) {
+	lifecycleLock, lockErr := AcquireKworLifecycleLock()
+	if lockErr != nil {
+		return lockErr
+	}
+	defer func() { _ = lifecycleLock.Release() }()
+
 	s.mu.Lock()
+	defer func() {
+		if err == nil {
+			SyncPortForwardNftablesAfterCoreRuntimeReady()
+			notifyCertificateCoreLoadedLatestConfig(certificateCoreKindSingbox)
+		}
+	}()
 	defer s.mu.Unlock()
 
 	if err := EnsureManagedCoreLayout(); err != nil {
 		return err
 	}
+	binPath := s.getCoreBinPath()
+	if !s.validateCoreBinary(binPath) {
+		return fmt.Errorf("内核文件无法在当前系统执行，请确认下载的架构与系统匹配（当前 %s/%s）", GetSystemPlatformOS(), GetSystemPlatformArchitecture())
+	}
 
-	if runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime() && s.isSingboxSystemdActive() {
+	if IsSystemPlatformLinux() && !shouldUseDirectManagedCoreRuntime() && s.isSingboxSystemdActive() {
 		s.regenerateRuntimeConfig()
 		configPath := s.getConfigPath()
 		configExists, err := ManagedRuntimeFileExists(configPath)
@@ -1376,8 +1431,7 @@ func (s *CoreManagerService) RestartCore() error {
 			DiscardMaterializedManagedRuntimeCoreFile(configPath)
 			return fmt.Errorf("refresh systemd service for sing-box failed: %v", err)
 		}
-		cmd := exec.Command("systemctl", "restart", singboxSystemdName)
-		output, err := cmd.CombinedOutput()
+		output, err := runSystemctlOutput("restart", singboxSystemdName)
 		if err != nil {
 			DiscardMaterializedManagedRuntimeCoreFile(configPath)
 			diagnostics := collectSystemdStartupDiagnostics(singboxSystemdName, systemdCoreJournalTailLines)
@@ -1424,7 +1478,6 @@ func (s *CoreManagerService) RestartCore() error {
 	time.Sleep(1 * time.Second)
 	s.regenerateRuntimeConfig()
 
-	binPath := s.getCoreBinPath()
 	if _, err := os.Stat(binPath); os.IsNotExist(err) {
 		return fmt.Errorf("内核文件不存在")
 	}
@@ -1447,7 +1500,7 @@ func (s *CoreManagerService) RestartCore() error {
 		return err
 	}
 
-	if runtime.GOOS == "windows" {
+	if IsSystemPlatformWindows() {
 		err = s.startCoreWindows(absCoreDir)
 	} else {
 		err = s.startCoreLinux(absCoreDir)
@@ -1456,7 +1509,7 @@ func (s *CoreManagerService) RestartCore() error {
 		DiscardMaterializedManagedRuntimeCoreFile(configPath)
 		return err
 	}
-	if runtime.GOOS == "linux" {
+	if IsSystemPlatformLinux() {
 		if markerErr := markManagedCoreShouldRun("singbox"); markerErr != nil {
 			logger.Warning("failed to persist sing-box runtime marker: ", markerErr)
 		}
@@ -1480,7 +1533,7 @@ func (s *CoreManagerService) IsRunning() bool {
 // isRunning 检查内核是否在运行
 func (s *CoreManagerService) isRunning() bool {
 	// Linux 宿主机模式优先检查 systemd 状态
-	if runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime() {
+	if IsSystemPlatformLinux() && !shouldUseDirectManagedCoreRuntime() {
 		if s.isSingboxSystemdActive() {
 			s.isStarted = true
 			return true
@@ -1497,7 +1550,7 @@ func (s *CoreManagerService) isRunning() bool {
 		s.coreCmd = nil
 	}
 
-	if runtime.GOOS == "linux" && shouldUseDirectManagedCoreRuntime() && isManagedCoreProcessRunningByBinaryPath(s.getCoreBinPath()) {
+	if IsSystemPlatformLinux() && shouldUseDirectManagedCoreRuntime() && isManagedCoreProcessRunningByBinaryPath(s.getCoreBinPath()) {
 		s.isStarted = true
 		return true
 	}
@@ -1507,9 +1560,7 @@ func (s *CoreManagerService) isRunning() bool {
 
 // isSingboxSystemdActive 检查 sing-box systemd 服务是否 active
 func (s *CoreManagerService) isSingboxSystemdActive() bool {
-	cmd := exec.Command("systemctl", "is-active", "--quiet", singboxSystemdName)
-	err := cmd.Run()
-	return err == nil
+	return systemctlUnitIsActive(singboxSystemdName)
 }
 
 // isSingboxSystemdExists 检查 sing-box systemd 服务文件是否存在
@@ -1587,9 +1638,8 @@ func (s *CoreManagerService) startCoreLinux(coreDir string) error {
 	}
 
 	// 2. systemctl start
-	_ = exec.Command("systemctl", "reset-failed", singboxSystemdName).Run()
-	startCmd := exec.Command("systemctl", "start", singboxSystemdName)
-	startOutput, startErr := startCmd.CombinedOutput()
+	_ = runSystemctlCommand("reset-failed", singboxSystemdName)
+	startOutput, startErr := runSystemctlOutput("start", singboxSystemdName)
 	if startErr != nil {
 		diagnostics := collectSystemdStartupDiagnostics(singboxSystemdName, systemdCoreJournalTailLines)
 		message := buildSystemdActivationErrorMessage(
@@ -1693,8 +1743,7 @@ func (s *CoreManagerService) stopCoreLinuxFull() error {
 	s.cleanupLegacySingboxSystemdServices()
 	// 先通过 systemd 停止
 	if s.isSingboxSystemdActive() {
-		cmd := exec.Command("systemctl", "stop", singboxSystemdName)
-		if err := cmd.Run(); err != nil {
+		if err := runSystemctlCommand("stop", singboxSystemdName); err != nil {
 			logger.Warning("systemctl stop ", singboxSystemdName, " 失败: ", err)
 		} else {
 			logger.Info("sing-box 已通过 systemd 停止")
@@ -1733,9 +1782,8 @@ func (s *CoreManagerService) stopCoreLinuxFull() error {
 // stopCoreInternal 内部停止方法（Windows 或非 systemd 场景）
 func (s *CoreManagerService) stopCoreInternal() error {
 	// Linux 宿主机模式：先尝试 systemd stop
-	if runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime() && s.isSingboxSystemdActive() {
-		cmd := exec.Command("systemctl", "stop", singboxSystemdName)
-		if err := cmd.Run(); err == nil {
+	if IsSystemPlatformLinux() && !shouldUseDirectManagedCoreRuntime() && s.isSingboxSystemdActive() {
+		if err := runSystemctlCommand("stop", singboxSystemdName); err == nil {
 			time.Sleep(300 * time.Millisecond)
 			if s.isSingboxSystemdActive() {
 				return fmt.Errorf("sing-box systemd service is still active after stop request")
@@ -1753,7 +1801,7 @@ func (s *CoreManagerService) stopCoreInternal() error {
 	}
 
 	// 直接停止进程
-	if runtime.GOOS == "linux" && shouldUseDirectManagedCoreRuntime() {
+	if IsSystemPlatformLinux() && shouldUseDirectManagedCoreRuntime() {
 		if err := terminateManagedCoreProcessesByBinaryPath(s.getCoreBinPath(), 5*time.Second); err != nil {
 			return fmt.Errorf("failed to stop sing-box direct runtime process: %v", err)
 		}
@@ -1770,9 +1818,8 @@ func (s *CoreManagerService) stopCoreInternal() error {
 		pid := s.coreCmd.Process.Pid
 		logger.Info("正在停止 sing-box 内核, PID: ", pid)
 
-		if runtime.GOOS == "windows" {
-			killCmd := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", pid))
-			if err := killCmd.Run(); err != nil {
+		if IsSystemPlatformWindows() {
+			if err := runCommandWithTimeout(systemCommandTimeout, "taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", pid)); err != nil {
 				return fmt.Errorf("failed to stop sing-box process %d: %v", pid, err)
 			}
 		} else {
@@ -1831,10 +1878,10 @@ func (s *CoreManagerService) removeSystemdServiceByName(serviceName string) {
 		return
 	}
 
-	useSystemctl := runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime()
+	useSystemctl := IsSystemPlatformLinux() && !shouldUseDirectManagedCoreRuntime()
 	if useSystemctl {
-		exec.Command("systemctl", "stop", serviceName).Run()
-		exec.Command("systemctl", "disable", serviceName).Run()
+		_ = runSystemctlCommand("stop", serviceName)
+		_ = runSystemctlCommand("disable", serviceName)
 	}
 
 	removed := false
@@ -1851,8 +1898,8 @@ func (s *CoreManagerService) removeSystemdServiceByName(serviceName string) {
 
 	if removed {
 		if useSystemctl {
-			exec.Command("systemctl", "daemon-reload").Run()
-			exec.Command("systemctl", "reset-failed").Run()
+			_ = runSystemctlCommand("daemon-reload")
+			_ = runSystemctlCommand("reset-failed")
 		}
 		logger.Info("removed systemd service: ", serviceName)
 	}
@@ -1863,7 +1910,14 @@ func (s *CoreManagerService) createSingboxSystemdService(binPath, configPath, wo
 	serviceContent := buildSingboxSystemdServiceContent(controlPath, binPath, configPath, workDir)
 
 	servicePath := getSingboxServiceFilePath()
-	err := os.WriteFile(servicePath, []byte(serviceContent), 0644)
+	ownership, err := BeginSystemdHostOwnership("core-singbox-systemd", singboxSystemdName, []string{servicePath}, map[string]string{
+		"binary": binPath,
+		"config": configPath,
+	})
+	if err != nil {
+		return fmt.Errorf("record pending sing-box systemd ownership failed: %w", err)
+	}
+	err = os.WriteFile(servicePath, []byte(serviceContent), 0644)
 	if err != nil {
 		return fmt.Errorf("无法写入 systemd 服务文件 %s: %v", servicePath, err)
 	}
@@ -1872,8 +1926,14 @@ func (s *CoreManagerService) createSingboxSystemdService(binPath, configPath, wo
 	}
 
 	// daemon-reload 使 systemd 加载新文件
-	if err := exec.Command("systemctl", "daemon-reload").Run(); err != nil {
+	if err := runSystemctlCommand("daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload 失败: %v", err)
+	}
+	if err := VerifyAndActivateHostResource(ownership.ID); err != nil {
+		return fmt.Errorf("activate sing-box systemd ownership failed: %w", err)
+	}
+	if err := RegisterManagedCoreHostOwnership("singbox", binPath, singboxSystemdName); err != nil {
+		return fmt.Errorf("record sing-box ownership failed: %w", err)
 	}
 
 	logger.Info("已创建 systemd 服务文件: ", servicePath)
@@ -1890,9 +1950,9 @@ func (s *CoreManagerService) removeSingboxSystemdService() {
 		return // 文件不存在，无需删除
 	}
 
-	useSystemctl := runtime.GOOS == "linux" && !shouldUseDirectManagedCoreRuntime()
+	useSystemctl := IsSystemPlatformLinux() && !shouldUseDirectManagedCoreRuntime()
 	if useSystemctl {
-		exec.Command("systemctl", "disable", singboxSystemdName).Run()
+		_ = runSystemctlCommand("disable", singboxSystemdName)
 	}
 
 	// 删除服务文件
@@ -1903,8 +1963,8 @@ func (s *CoreManagerService) removeSingboxSystemdService() {
 	}
 
 	if useSystemctl {
-		exec.Command("systemctl", "daemon-reload").Run()
-		exec.Command("systemctl", "reset-failed").Run()
+		_ = runSystemctlCommand("daemon-reload")
+		_ = runSystemctlCommand("reset-failed")
 	}
 
 	logger.Info("已删除 ", singboxSystemdName, " systemd 服务")
@@ -1953,7 +2013,7 @@ func (s *CoreManagerService) getCoreAutoCheckSettings() (enabled bool, intervalH
 	return enabled, intervalHours, lastCheckedAt, nil
 }
 
-func (s *CoreManagerService) buildCoreUpdateInfo() (*CoreUpdateInfo, error) {
+func (s *CoreManagerService) buildSingboxCoreUpdateInfo() (*SingboxCoreUpdateInfo, error) {
 	enabled, intervalHours, lastCheckedAt, err := s.getCoreAutoCheckSettings()
 	if err != nil {
 		return nil, err
@@ -1977,7 +2037,7 @@ func (s *CoreManagerService) buildCoreUpdateInfo() (*CoreUpdateInfo, error) {
 		return nil, err
 	}
 
-	info := &CoreUpdateInfo{
+	info := &SingboxCoreUpdateInfo{
 		Enabled:       enabled,
 		IntervalHours: intervalHours,
 		LastCheckedAt: lastCheckedAt,
@@ -2040,15 +2100,15 @@ func (s *CoreManagerService) ClearCoreUpdatePending() error {
 	return nil
 }
 
-// GetCoreUpdateInfo returns current auto-check settings and update markers.
+// GetSingboxCoreUpdateInfo returns current auto-check settings and update markers.
 // If forceCheck is true, an immediate remote check will be attempted.
-func (s *CoreManagerService) GetCoreUpdateInfo(forceCheck bool) (*CoreUpdateInfo, error) {
+func (s *CoreManagerService) GetSingboxCoreUpdateInfo(forceCheck bool) (*SingboxCoreUpdateInfo, error) {
 	if forceCheck {
 		if err := s.CheckAndMarkCoreUpdates(true); err != nil {
 			logger.Warning("check core updates failed: ", err)
 		}
 	}
-	return s.buildCoreUpdateInfo()
+	return s.buildSingboxCoreUpdateInfo()
 }
 
 func (s *CoreManagerService) fetchLatestStableTag(client *http.Client) (string, error) {
@@ -2068,7 +2128,7 @@ func (s *CoreManagerService) fetchLatestStableTag(client *http.Client) (string, 
 		return "", fmt.Errorf("GitHub latest release API returned %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readBoundedHTTPResponseBody(resp.Body, coreGitHubResponseMaxBytes)
 	if err != nil {
 		return "", err
 	}
@@ -2175,15 +2235,15 @@ func (s *CoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
 
 // GetRemoteVersionsAll fetches release versions across multiple pages.
 // This keeps old versions (e.g. 1.11.x) available instead of only the latest page.
-func (s *CoreManagerService) GetRemoteVersionsAll(channel string) (*VersionListResponse, error) {
+func (s *CoreManagerService) GetRemoteVersionsAll(channel string) (*SingboxCoreVersionListResponse, error) {
 	const (
 		perPage  = 100
 		maxPages = 20
 	)
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	result := &VersionListResponse{
-		Versions: make([]VersionItem, 0),
+	result := &SingboxCoreVersionListResponse{
+		Versions: make([]SingboxCoreVersionItem, 0),
 	}
 	seenTags := make(map[string]struct{})
 
@@ -2204,7 +2264,7 @@ func (s *CoreManagerService) GetRemoteVersionsAll(channel string) (*VersionListR
 				continue
 			}
 			seenTags[r.TagName] = struct{}{}
-			result.Versions = append(result.Versions, VersionItem{
+			result.Versions = append(result.Versions, SingboxCoreVersionItem{
 				TagName:     r.TagName,
 				Name:        r.Name,
 				Prerelease:  r.Prerelease,
@@ -2222,6 +2282,17 @@ func (s *CoreManagerService) GetRemoteVersionsAll(channel string) (*VersionListR
 
 // DownloadCoreFromURL downloads and installs core using a custom link.
 func (s *CoreManagerService) DownloadCoreFromURL(downloadURL string, requestedSessionID string) (string, error) {
+	operationContext, operation, err := BeginKworManagedOperation("singbox-core-download")
+	if err != nil {
+		return "", err
+	}
+	defer operation.Done()
+	lifecycleLock, err := AcquireKworLifecycleLock()
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = lifecycleLock.Release() }()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2272,7 +2343,7 @@ func (s *CoreManagerService) DownloadCoreFromURL(downloadURL string, requestedSe
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageDownloading)
 
 	client := &http.Client{Timeout: 600 * time.Second}
-	req, err := http.NewRequest("GET", downloadURL, nil)
+	req, err := http.NewRequestWithContext(operationContext, "GET", downloadURL, nil)
 	if err != nil {
 		err = fmt.Errorf("create request failed: %v", err)
 		failProgress(coreDownloadStageDownloading, err)
@@ -2344,7 +2415,7 @@ func (s *CoreManagerService) DownloadCoreFromURL(downloadURL string, requestedSe
 	stagedBinPath := filepath.Join(stageDir, binName)
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageValidating)
 	if !s.validateCoreBinary(stagedBinPath) {
-		err = fmt.Errorf("downloaded sing-box binary is not executable on current runtime %s/%s", runtime.GOOS, runtime.GOARCH)
+		err = fmt.Errorf("downloaded sing-box binary is not executable on current runtime %s/%s", GetSystemPlatformOS(), GetSystemPlatformArchitecture())
 		failProgress(coreDownloadStageValidating, err)
 		return "", err
 	}
@@ -2460,7 +2531,7 @@ func (s *CoreManagerService) installCoreFromArchiveFile(archivePath, coreDir str
 		err = s.extractCoreByExternalTool(archivePath, coreDir, binName)
 	default:
 		if copyErr := copyCoreFile(archivePath, binPath); copyErr == nil {
-			if runtime.GOOS != "windows" {
+			if !IsSystemPlatformWindows() {
 				_ = os.Chmod(binPath, 0o755)
 			}
 			if s.validateCoreBinary(binPath) {
@@ -2478,7 +2549,7 @@ func (s *CoreManagerService) installCoreFromArchiveFile(archivePath, coreDir str
 		}
 	}
 
-	if runtime.GOOS != "windows" {
+	if !IsSystemPlatformWindows() {
 		_ = os.Chmod(binPath, 0o755)
 	}
 	if _, statErr := os.Stat(binPath); statErr != nil {
@@ -2488,13 +2559,18 @@ func (s *CoreManagerService) installCoreFromArchiveFile(archivePath, coreDir str
 }
 
 func (s *CoreManagerService) validateCoreBinary(binPath string) bool {
-	cmd := exec.Command(binPath, "version")
-	cmd.Dir = filepath.Dir(binPath)
-	output, err := cmd.CombinedOutput()
+	if !IsSystemPlatformWindows() {
+		inspection := inspectManagedLinuxCoreBinary(binPath, "sing-box", func(statInfo os.FileInfo, forceRefresh bool) (string, string) {
+			return s.getCachedLocalVersion(binPath, statInfo, forceRefresh)
+		})
+		return inspection.Compatible
+	}
+
+	output, err := runCommandOutputInDirWithTimeout(coreVersionCommandTimeout, filepath.Dir(binPath), binPath, "version")
 	if err != nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(string(output)), "sing-box")
+	return managedCoreVersionOutputMatches(string(output), "sing-box")
 }
 
 func CheckSingboxRuntimeConfig(binPath, configPath, workDir string) error {
@@ -2623,8 +2699,7 @@ func (s *CoreManagerService) extractCoreByExternalTool(archivePath, destDir, bin
 	defer os.RemoveAll(tmpDir)
 
 	runAndCopy := func(name string, args ...string) error {
-		cmd := exec.Command(name, args...)
-		output, err := cmd.CombinedOutput()
+		output, err := runCommandOutputInDirWithTimeout(2*time.Minute, tmpDir, name, args...)
 		if err != nil {
 			msg := strings.TrimSpace(string(output))
 			if msg == "" {

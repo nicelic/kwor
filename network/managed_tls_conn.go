@@ -10,13 +10,17 @@ import (
 
 type ManagedTLSConn struct {
 	net.Conn
-	generation atomic.Uint64
-	mu         sync.RWMutex
+	generation  atomic.Uint64
+	mu          sync.RWMutex
 	fingerprint string
 }
 
 type unwrapConn interface {
 	Unwrap() net.Conn
+}
+
+type netConnProvider interface {
+	NetConn() net.Conn
 }
 
 func NewManagedTLSConn(conn net.Conn) *ManagedTLSConn {
@@ -44,15 +48,22 @@ func (c *ManagedTLSConn) Fingerprint() string {
 }
 
 func ManagedTLSConnFromNetConn(conn net.Conn) *ManagedTLSConn {
-	for conn != nil {
+	// Listener wrappers expose Unwrap, while crypto/tls exposes NetConn.
+	// Keep the walk bounded so an unexpected self-referencing wrapper cannot
+	// trap connection lifecycle callbacks.
+	for depth := 0; conn != nil && depth < 16; depth++ {
 		if managed, ok := conn.(*ManagedTLSConn); ok {
 			return managed
 		}
-		unwrapper, ok := conn.(unwrapConn)
-		if !ok {
-			return nil
+		if unwrapper, ok := conn.(unwrapConn); ok {
+			conn = unwrapper.Unwrap()
+			continue
 		}
-		conn = unwrapper.Unwrap()
+		if provider, ok := conn.(netConnProvider); ok {
+			conn = provider.NetConn()
+			continue
+		}
+		return nil
 	}
 	return nil
 }

@@ -134,6 +134,12 @@ func (s *MihomoInboundService) Save(tx *gorm.DB, act string, data json.RawMessag
 			return nil, err
 		}
 		sanitizeMihomoShadowTLSInboundOptions(&inbound)
+		if err := sanitizeMihomoShadowQUICInboundOptions(&inbound); err != nil {
+			return nil, err
+		}
+		if err := validateMihomoShadowQUICJLSUpstreamProxy(tx, &inbound); err != nil {
+			return nil, err
+		}
 		if err := validateMihomoSnellInitBindings(tx, &inbound, parseIDList(initUserIDs)); err != nil {
 			return nil, err
 		}
@@ -274,24 +280,24 @@ func (s *MihomoInboundService) GetAllConfig(db *gorm.DB) ([]json.RawMessage, err
 			return nil, err
 		}
 
-	if inbound.Type == "shadowtls" {
-		shadowtlsJSON, ssJSON, err := s.processShadowTLSInbound(db, inboundJSON, inbound)
-		if err != nil {
-			return nil, err
+		if inbound.Type == "shadowtls" {
+			shadowtlsJSON, ssJSON, err := s.processShadowTLSInbound(db, inboundJSON, inbound)
+			if err != nil {
+				return nil, err
+			}
+			inboundsJSON = append(inboundsJSON, shadowtlsJSON)
+			if ssJSON != nil {
+				inboundsJSON = append(inboundsJSON, ssJSON)
+			}
+		} else if inbound.Type == "snell" {
+			snellJSON, err := s.processSnellInbound(db, inboundJSON, inbound)
+			if err != nil {
+				return nil, err
+			}
+			inboundsJSON = append(inboundsJSON, snellJSON)
+		} else {
+			inboundsJSON = append(inboundsJSON, inboundJSON)
 		}
-		inboundsJSON = append(inboundsJSON, shadowtlsJSON)
-		if ssJSON != nil {
-			inboundsJSON = append(inboundsJSON, ssJSON)
-		}
-	} else if inbound.Type == "snell" {
-		snellJSON, err := s.processSnellInbound(db, inboundJSON, inbound)
-		if err != nil {
-			return nil, err
-		}
-		inboundsJSON = append(inboundsJSON, snellJSON)
-	} else {
-		inboundsJSON = append(inboundsJSON, inboundJSON)
-	}
 	}
 
 	return inboundsJSON, nil
@@ -495,7 +501,7 @@ func (s *MihomoInboundService) resolveSnellSharedPSK(db *gorm.DB, inboundID uint
 
 func (s *MihomoInboundService) hasUser(inboundType string) bool {
 	switch inboundType {
-	case "mixed", "socks", "http", "snell", "vmess", "trojan", "naive", "hysteria", "shadowtls", "tuic", "hysteria2", "vless", "anytls", "mieru", "sudoku", "trusttunnel":
+	case "mixed", "socks", "http", "snell", "vmess", "trojan", "naive", "hysteria", "shadowtls", "shadowquic", "tuic", "hysteria2", "vless", "anytls", "mieru", "sudoku", "trusttunnel":
 		return true
 	}
 	return false
@@ -545,6 +551,9 @@ func (s *MihomoInboundService) addUsers(db *gorm.DB, inboundJSON []byte, inbound
 	if err := json.Unmarshal(inboundJSON, &inbound); err != nil {
 		return nil, err
 	}
+	// Runtime users are derived exclusively from bound Mihomo clients. This
+	// also prevents legacy Options or view metadata from reaching server.yaml.
+	delete(inbound, "users")
 
 	condition := fmt.Sprintf("%d IN (SELECT json_each.value FROM json_each(mihomo_clients.inbounds))", inboundID)
 	users, err := s.fetchUsers(db, inboundType, condition, inbound)
@@ -571,6 +580,7 @@ func (s *MihomoInboundService) initUsers(db *gorm.DB, inboundJSON []byte, client
 	if err := json.Unmarshal(inboundJSON, &inbound); err != nil {
 		return nil, err
 	}
+	delete(inbound, "users")
 
 	condition := fmt.Sprintf("id IN (%s)", strings.Join(clientIDList, ","))
 	users, err := s.fetchUsers(db, inboundType, condition, inbound)
@@ -598,22 +608,103 @@ func normalizeMihomoUsersForList(inboundType string, users []string, inbound map
 		}
 
 		switch inboundType {
-		case "vmess", "vless", "trojan":
-			if username := strings.TrimSpace(firstString(user["username"])); username == "" {
-				if legacyName := strings.TrimSpace(firstString(user["name"])); legacyName != "" {
-					user["username"] = legacyName
-				}
+		case "mixed", "socks", "http":
+			username := strings.TrimSpace(firstString(user["username"]))
+			if username == "" {
+				username = strings.TrimSpace(firstString(user["name"]))
 			}
-			delete(user, "name")
+			password := strings.TrimSpace(firstString(user["password"]))
+			if username == "" || password == "" {
+				return nil, fmt.Errorf("mihomo %s user missing username/password", inboundType)
+			}
+			// Proxy-auth listeners accept only this credential pair. Rebuild the
+			// entry so client-side metadata or legacy aliases cannot leak into YAML.
+			user = map[string]interface{}{
+				"username": username,
+				"password": password,
+			}
+		case "vmess", "vless", "trojan":
+			username := strings.TrimSpace(firstString(user["username"]))
+			if username == "" {
+				username = strings.TrimSpace(firstString(user["name"]))
+			}
+
+			switch inboundType {
+			case "vmess":
+				uuid := strings.TrimSpace(firstString(user["uuid"]))
+				if uuid == "" {
+					return nil, fmt.Errorf("mihomo vmess user missing uuid")
+				}
+				normalizedUser := map[string]interface{}{"uuid": uuid}
+				if username != "" {
+					normalizedUser["username"] = username
+				}
+				if alterID, ok := toInt(firstNonNil(user["alterId"], user["alter_id"])); ok && alterID >= 0 {
+					normalizedUser["alterId"] = alterID
+				}
+				user = normalizedUser
+			case "vless":
+				uuid := strings.TrimSpace(firstString(user["uuid"]))
+				if uuid == "" {
+					return nil, fmt.Errorf("mihomo vless user missing uuid")
+				}
+				normalizedUser := map[string]interface{}{"uuid": uuid}
+				if username != "" {
+					normalizedUser["username"] = username
+				}
+				if flow := strings.TrimSpace(firstString(user["flow"])); flow != "" && inbound["tls"] != nil {
+					normalizedUser["flow"] = flow
+				}
+				user = normalizedUser
+			case "trojan":
+				password := strings.TrimSpace(firstString(user["password"]))
+				if password == "" {
+					return nil, fmt.Errorf("mihomo trojan user missing password")
+				}
+				normalizedUser := map[string]interface{}{"password": password}
+				if username != "" {
+					normalizedUser["username"] = username
+				}
+				user = normalizedUser
+			}
+		case "shadowquic":
+			username := strings.TrimSpace(firstString(user["username"]))
+			if username == "" {
+				username = strings.TrimSpace(firstString(user["name"]))
+			}
+			password := strings.TrimSpace(firstString(user["password"]))
+			if username == "" || password == "" {
+				return nil, fmt.Errorf("mihomo %s user missing username/password", inboundType)
+			}
+			// The Mihomo listener schema only accepts these two user fields.
+			// Rebuild instead of deleting selected legacy keys so a future UI
+			// addition cannot accidentally reach the runtime users list.
+			user = map[string]interface{}{
+				"username": username,
+				"password": password,
+			}
+		case "shadowtls":
+			name := strings.TrimSpace(firstString(user["name"]))
+			if name == "" {
+				name = strings.TrimSpace(firstString(user["username"]))
+			}
+			password := strings.TrimSpace(firstString(user["password"]))
+			if name == "" || password == "" {
+				return nil, fmt.Errorf("mihomo shadowtls user missing name/password")
+			}
+			user = map[string]interface{}{
+				"name":     name,
+				"password": password,
+			}
 		case "trusttunnel":
 			username, password := util.ResolveTrustTunnelCredentials(user)
 			if username == "" || password == "" {
 				return nil, fmt.Errorf("mihomo %s user missing username/password", inboundType)
 			}
-			user["username"] = username
-			user["password"] = password
-			delete(user, "name")
-			delete(user, "uuid")
+			user = map[string]interface{}{
+				"username": username,
+				"password": password,
+			}
 		}
 
 		if inboundType == "vless" && inbound["tls"] == nil {

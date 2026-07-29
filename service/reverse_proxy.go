@@ -2,17 +2,20 @@ package service
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -20,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alireza0/s-ui/database"
@@ -63,21 +67,30 @@ const (
 	reverseProxyHTTPVersionPreferH3             = "prefer_h3"
 	reverseProxyHTTPVersionDualRequiredPreferH3 = "dual_required_prefer_h3"
 
-	reverseProxyMismatchFreeLimit            = 5
-	reverseProxyMismatchDelay                = 30 * time.Second
-	reverseProxyMismatchCooldown             = 24 * time.Hour
-	reverseProxyDialFallbackGap              = 20 * time.Millisecond
-	reverseProxyReadHeaderTimeout            = 15 * time.Second
-	reverseProxyServerIdleTimeout            = 10 * time.Minute
-	reverseProxyRequestTimeout               = 120 * time.Second
-	reverseProxyShutdownTimeout              = 5 * time.Second
-	reverseProxyAltSvcMaxAgeSeconds          = 2592000
-	reverseProxyUpstreamIdleTimeout          = 10 * time.Minute
-	reverseProxyUpstreamTCPKeepAlive         = 30 * time.Second
-	reverseProxyUpstreamHTTP2ReadIdleTimeout = 30 * time.Second
-	reverseProxyUpstreamHTTP2PingTimeout     = 15 * time.Second
-	reverseProxyUpstreamQUICKeepAlivePeriod  = 30 * time.Second
-	reverseProxyDelayReasonMismatch          = "url_mismatch_penalty"
+	reverseProxyMismatchFreeLimit             = 5
+	reverseProxyMismatchDelay                 = 30 * time.Second
+	reverseProxyMismatchCooldown              = 5 * time.Minute
+	reverseProxyMismatchMaxEntries            = 16384
+	reverseProxyRuntimeTableTTL               = 5 * time.Minute
+	reverseProxyRuntimeTableMaxEntries        = 16384
+	reverseProxyDialFallbackGap               = 20 * time.Millisecond
+	reverseProxyReadHeaderTimeout             = 15 * time.Second
+	reverseProxyServerIdleTimeout             = 10 * time.Minute
+	reverseProxyRequestTimeout                = 120 * time.Second
+	reverseProxyShutdownTimeout               = 5 * time.Second
+	reverseProxyRuntimeRetryBaseDelay         = time.Second
+	reverseProxyRuntimeRetryMaxDelay          = time.Minute
+	reverseProxyAltSvcMaxAgeSeconds           = 300
+	reverseProxyUpstreamResolveCacheTTL       = time.Minute
+	reverseProxyUpstreamIdleTimeout           = 10 * time.Minute
+	reverseProxyUpstreamTCPKeepAlive          = 30 * time.Second
+	reverseProxyUpstreamHTTP2ReadIdleTimeout  = 30 * time.Second
+	reverseProxyUpstreamHTTP2PingTimeout      = 15 * time.Second
+	reverseProxyUpstreamQUICKeepAlivePeriod   = 30 * time.Second
+	reverseProxyServerReadTimeout             = 120 * time.Second
+	reverseProxyUpstreamResponseHeaderTimeout = 30 * time.Second
+	reverseProxyMaxHeaderBytes                = 1 * 1024 * 1024
+	reverseProxyDelayReasonMismatch           = "url_mismatch_penalty"
 
 	reverseProxyUpstreamModeHTTP    = "http"
 	reverseProxyUpstreamModeHTTPS   = "https"
@@ -89,6 +102,17 @@ const (
 
 	reverseProxyEDNSClientSubnetPolicyClientIP            = "client_ip"
 	reverseProxyEDNSClientSubnetPolicyPreferRequestPublic = "prefer_request_public"
+
+	reverseProxyDNSDefaultUpstreamTimeoutSeconds = 12
+	reverseProxyDNSMaxUpstreamTimeoutSeconds     = 120
+	reverseProxyDNSDefaultCacheSizeBytes         = 4 * 1024 * 1024
+	reverseProxyDNSMaxCacheTTLSeconds            = 4294967295
+	reverseProxyDNSDefaultRateLimitQPS           = 50
+	reverseProxyDNSDefaultMaxConcurrentQueries   = 128
+	reverseProxyDNSMaxRateLimitQPS               = 10000
+	reverseProxyDNSMaxConcurrentQueryLimit       = 4096
+	reverseProxyDefaultMaxConcurrentRequests     = 128
+	reverseProxyMaxConcurrentRequestLimit        = 10000
 )
 
 var reverseProxyHostTokenRe = regexp.MustCompile(`^[A-Za-z0-9\.\-:\[\]]+$`)
@@ -98,45 +122,110 @@ type ReverseProxyService struct {
 }
 
 type ReverseProxyRulePayload struct {
-	ID                        uint   `json:"id"`
-	Name                      string `json:"name"`
-	Enabled                   bool   `json:"enabled"`
-	ListenProtocol            string `json:"listenProtocol"`
-	ListenProtocolAlias       string `json:"listenProtocolAlias"`
-	ListenIP                  string `json:"listenIP"`
-	ListenIPs                 string `json:"listenIPs"`
-	ListenPort                int    `json:"listenPort"`
-	Hosts                     string `json:"hosts"`
-	PathPrefix                string `json:"pathPrefix"`
-	ListenDNSPath             string `json:"listenDnsPath"`
-	TargetProtocol            string `json:"targetProtocol"`
-	TargetProtocolAlias       string `json:"targetProtocolAlias"`
-	TargetAddresses           string `json:"targetAddresses"`
-	TargetPort                int    `json:"targetPort"`
-	TargetPath                string `json:"targetPath"`
-	TargetDNSPath             string `json:"targetDnsPath"`
-	EDNSEnabled               bool   `json:"ednsEnabled"`
-	EDNSMode                  string `json:"ednsMode"`
-	EDNSCustomIP              string `json:"ednsCustomIp"`
-	EDNSClientSubnetPolicy    string `json:"ednsClientSubnetPolicy"`
-	DisableIPv4Answer         bool   `json:"disableIpv4Answer"`
-	DisableIPv6Answer         bool   `json:"disableIpv6Answer"`
-	CertificateRecordIDs      []uint `json:"certificateRecordIds"`
-	CertificateRecordID       uint   `json:"certificateRecordId"`
-	ListenHTTPVersionStrategy string `json:"listenHttpVersionStrategy"`
-	IPStrategy                string `json:"ipStrategy"`
-	HTTPVersionStrategy       string `json:"httpVersionStrategy"`
-	UpstreamTLSVerify         bool   `json:"upstreamTlsVerify"`
-	ApiPassthrough            bool   `json:"apiPassthrough"`
-	Remark                    string `json:"remark"`
+	ExpectedRevision           *uint64 `json:"expectedRevision"`
+	ID                         uint    `json:"id"`
+	Name                       string  `json:"name"`
+	Enabled                    bool    `json:"enabled"`
+	ListenProtocol             string  `json:"listenProtocol"`
+	ListenProtocolAlias        string  `json:"listenProtocolAlias"`
+	ListenPort                 int     `json:"listenPort"`
+	Hosts                      string  `json:"hosts"`
+	PathPrefix                 string  `json:"pathPrefix"`
+	ListenDNSPath              string  `json:"listenDnsPath"`
+	TargetProtocol             string  `json:"targetProtocol"`
+	TargetProtocolAlias        string  `json:"targetProtocolAlias"`
+	TargetAddresses            string  `json:"targetAddresses"`
+	TargetPort                 int     `json:"targetPort"`
+	TargetPath                 string  `json:"targetPath"`
+	TargetDNSPath              string  `json:"targetDnsPath"`
+	FallbackDNSUpstreams       string  `json:"fallbackDnsUpstreams"`
+	DNSUpstreamTimeoutSeconds  *int    `json:"dnsUpstreamTimeoutSeconds"`
+	DNSCacheEnabled            bool    `json:"dnsCacheEnabled"`
+	DNSCacheSizeBytes          *int    `json:"dnsCacheSizeBytes"`
+	DNSCacheMinTTL             int     `json:"dnsCacheMinTtl"`
+	DNSCacheMaxTTL             int     `json:"dnsCacheMaxTtl"`
+	EDNSEnabled                bool    `json:"ednsEnabled"`
+	EDNSMode                   string  `json:"ednsMode"`
+	EDNSCustomIP               string  `json:"ednsCustomIp"`
+	EDNSClientSubnetPolicy     string  `json:"ednsClientSubnetPolicy"`
+	DisableIPv4Answer          bool    `json:"disableIpv4Answer"`
+	DisableIPv6Answer          bool    `json:"disableIpv6Answer"`
+	CertificateRecordIDs       []uint  `json:"certificateRecordIds"`
+	CertificateRecordID        uint    `json:"certificateRecordId"`
+	ListenHTTPVersionStrategy  string  `json:"listenHttpVersionStrategy"`
+	IPStrategy                 string  `json:"ipStrategy"`
+	HTTPVersionStrategy        string  `json:"httpVersionStrategy"`
+	UpstreamTLSVerify          bool    `json:"upstreamTlsVerify"`
+	DNSAllowedCIDRs            string  `json:"dnsAllowedCidrs"`
+	DNSRateLimitQPS            *int    `json:"dnsRateLimitQps"`
+	DNSMaxConcurrentQueries    *int    `json:"dnsMaxConcurrentQueries"`
+	MaxConcurrentConnections   *int    `json:"maxConcurrentConnections"`
+	MaxConcurrentRequests      *int    `json:"maxConcurrentRequests"`
+	UpstreamMaxConnections     *int    `json:"upstreamMaxConnections"`
+	UpstreamMaxIdleConnections *int    `json:"upstreamMaxIdleConnections"`
+	MemoryLimitBytes           *int64  `json:"memoryLimitBytes"`
+	ApiPassthrough             bool    `json:"apiPassthrough"`
+	AdvertiseHTTP3             bool    `json:"advertiseHttp3"`
+	Remark                     string  `json:"remark"`
+
+	// These flags preserve JSON omission semantics while keeping direct Go
+	// callers compatible with the established bool payload field.
+	upstreamTLSVerifySet     bool
+	upstreamTLSVerifyDecoded bool
+}
+
+type reverseProxyRulePayloadAlias ReverseProxyRulePayload
+
+func (p *ReverseProxyRulePayload) UnmarshalJSON(data []byte) error {
+	if p == nil {
+		return errors.New("reverse proxy payload is nil")
+	}
+	var decoded reverseProxyRulePayloadAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*p = ReverseProxyRulePayload(decoded)
+	fields := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	p.upstreamTLSVerifyDecoded = true
+	_, p.upstreamTLSVerifySet = fields["upstreamTlsVerify"]
+	return nil
 }
 
 type ReverseProxyRuleReorderPayload struct {
-	IDs []uint `json:"ids"`
+	ExpectedRevision *uint64 `json:"expectedRevision"`
+	IDs              []uint  `json:"ids"`
+}
+
+type ReverseProxyRuleStatusPayload struct {
+	ExpectedRevision *uint64 `json:"expectedRevision"`
+	ID               uint    `json:"id"`
+	Enabled          bool    `json:"enabled"`
+}
+
+type ReverseProxyRuleMovePayload struct {
+	ExpectedRevision *uint64 `json:"expectedRevision"`
+	ID               uint    `json:"id"`
+	Direction        int     `json:"direction"`
+}
+
+type ReverseProxyRuleStatusResult struct {
+	Revision uint64 `json:"revision"`
+	ID       uint   `json:"id"`
+	Enabled  bool   `json:"enabled"`
+}
+
+type ReverseProxyRuleMoveResult struct {
+	Revision   uint64 `json:"revision"`
+	ID         uint   `json:"id"`
+	AdjacentID uint   `json:"adjacentId"`
 }
 
 type ReverseProxyRuleDeletePayload struct {
-	ID uint `json:"id"`
+	ExpectedRevision *uint64 `json:"expectedRevision"`
+	ID               uint    `json:"id"`
 }
 
 type ReverseProxyCertificateOption struct {
@@ -149,52 +238,67 @@ type ReverseProxyCertificateOption struct {
 }
 
 type ReverseProxyRuleView struct {
-	ID                        uint                                       `json:"id"`
-	DisplayID                 uint64                                     `json:"displayId"`
-	ListOrder                 int64                                      `json:"listOrder"`
-	Name                      string                                     `json:"name"`
-	Enabled                   bool                                       `json:"enabled"`
-	ListenProtocol            string                                     `json:"listenProtocol"`
-	ListenProtocolAlias       string                                     `json:"listenProtocolAlias"`
-	ListenIP                  string                                     `json:"listenIP"`
-	ListenIPs                 []string                                   `json:"listenIPs"`
-	ListenPort                int                                        `json:"listenPort"`
-	Hosts                     []string                                   `json:"hosts"`
-	PathPrefix                string                                     `json:"pathPrefix"`
-	ListenDNSPath             string                                     `json:"listenDnsPath"`
-	TargetProtocol            string                                     `json:"targetProtocol"`
-	TargetProtocolAlias       string                                     `json:"targetProtocolAlias"`
-	TargetAddresses           []string                                   `json:"targetAddresses"`
-	TargetPort                int                                        `json:"targetPort"`
-	TargetPath                string                                     `json:"targetPath"`
-	TargetDNSPath             string                                     `json:"targetDnsPath"`
-	EDNSEnabled               bool                                       `json:"ednsEnabled"`
-	EDNSMode                  string                                     `json:"ednsMode"`
-	EDNSCustomIP              string                                     `json:"ednsCustomIp"`
-	EDNSClientSubnetPolicy    string                                     `json:"ednsClientSubnetPolicy"`
-	DisableIPv4Answer         bool                                       `json:"disableIpv4Answer"`
-	DisableIPv6Answer         bool                                       `json:"disableIpv6Answer"`
-	CertificateRecordIDs      []uint                                     `json:"certificateRecordIds"`
-	CertificateRecordID       uint                                       `json:"certificateRecordId"`
-	CertificateLabel          string                                     `json:"certificateLabel"`
-	CertificateLabels         []string                                   `json:"certificateLabels"`
-	ListenHTTPVersionStrategy string                                     `json:"listenHttpVersionStrategy"`
-	IPStrategy                string                                     `json:"ipStrategy"`
-	HTTPVersionStrategy       string                                     `json:"httpVersionStrategy"`
-	UpstreamTLSVerify         bool                                       `json:"upstreamTlsVerify"`
-	ApiPassthrough            bool                                       `json:"apiPassthrough"`
-	Remark                    string                                     `json:"remark"`
-	LastError                 string                                     `json:"lastError"`
-	RuntimeStatus             string                                     `json:"runtimeStatus"`
-	LocalConnectionCount      int                                        `json:"localConnectionCount"`
-	UpstreamConnectionCount   int                                        `json:"upstreamConnectionCount"`
-	CertificateHints          []string                                   `json:"certificateHints,omitempty"`
-	CertificateBalance        []ReverseProxyCertificateBalanceDiagnostic `json:"certificateBalance,omitempty"`
-	UpdatedAt                 int64                                      `json:"updatedAt"`
-	CreatedAt                 int64                                      `json:"createdAt"`
+	ID                         uint                                       `json:"id"`
+	DisplayID                  uint64                                     `json:"displayId"`
+	ListOrder                  int64                                      `json:"listOrder"`
+	Name                       string                                     `json:"name"`
+	Enabled                    bool                                       `json:"enabled"`
+	ListenProtocol             string                                     `json:"listenProtocol"`
+	ListenProtocolAlias        string                                     `json:"listenProtocolAlias"`
+	ListenPort                 int                                        `json:"listenPort"`
+	Hosts                      []string                                   `json:"hosts"`
+	PathPrefix                 string                                     `json:"pathPrefix"`
+	ListenDNSPath              string                                     `json:"listenDnsPath"`
+	TargetProtocol             string                                     `json:"targetProtocol"`
+	TargetProtocolAlias        string                                     `json:"targetProtocolAlias"`
+	TargetAddresses            []string                                   `json:"targetAddresses"`
+	TargetPort                 int                                        `json:"targetPort"`
+	TargetPath                 string                                     `json:"targetPath"`
+	TargetDNSPath              string                                     `json:"targetDnsPath"`
+	FallbackDNSUpstreams       string                                     `json:"fallbackDnsUpstreams"`
+	DNSUpstreamTimeoutSeconds  int                                        `json:"dnsUpstreamTimeoutSeconds"`
+	DNSCacheEnabled            bool                                       `json:"dnsCacheEnabled"`
+	DNSCacheSizeBytes          int                                        `json:"dnsCacheSizeBytes"`
+	DNSCacheMinTTL             int                                        `json:"dnsCacheMinTtl"`
+	DNSCacheMaxTTL             int                                        `json:"dnsCacheMaxTtl"`
+	DNSAllowedCIDRs            []string                                   `json:"dnsAllowedCidrs"`
+	DNSRateLimitQPS            int                                        `json:"dnsRateLimitQps"`
+	DNSMaxConcurrentQueries    int                                        `json:"dnsMaxConcurrentQueries"`
+	EDNSEnabled                bool                                       `json:"ednsEnabled"`
+	EDNSMode                   string                                     `json:"ednsMode"`
+	EDNSCustomIP               string                                     `json:"ednsCustomIp"`
+	EDNSClientSubnetPolicy     string                                     `json:"ednsClientSubnetPolicy"`
+	DisableIPv4Answer          bool                                       `json:"disableIpv4Answer"`
+	DisableIPv6Answer          bool                                       `json:"disableIpv6Answer"`
+	CertificateRecordIDs       []uint                                     `json:"certificateRecordIds"`
+	CertificateRecordID        uint                                       `json:"certificateRecordId"`
+	CertificateLabel           string                                     `json:"certificateLabel"`
+	CertificateLabels          []string                                   `json:"certificateLabels"`
+	ListenHTTPVersionStrategy  string                                     `json:"listenHttpVersionStrategy"`
+	IPStrategy                 string                                     `json:"ipStrategy"`
+	HTTPVersionStrategy        string                                     `json:"httpVersionStrategy"`
+	UpstreamTLSVerify          bool                                       `json:"upstreamTlsVerify"`
+	MaxConcurrentConnections   int                                        `json:"maxConcurrentConnections"`
+	MaxConcurrentRequests      int                                        `json:"maxConcurrentRequests"`
+	UpstreamMaxConnections     int                                        `json:"upstreamMaxConnections"`
+	UpstreamMaxIdleConnections int                                        `json:"upstreamMaxIdleConnections"`
+	MemoryLimitBytes           int64                                      `json:"memoryLimitBytes"`
+	ApiPassthrough             bool                                       `json:"apiPassthrough"`
+	AdvertiseHTTP3             bool                                       `json:"advertiseHttp3"`
+	Remark                     string                                     `json:"remark"`
+	LastError                  string                                     `json:"lastError"`
+	RuntimeStatus              string                                     `json:"runtimeStatus"`
+	LocalConnectionCount       int                                        `json:"localConnectionCount"`
+	UpstreamConnectionCount    int                                        `json:"upstreamConnectionCount"`
+	CertificateHints           []string                                   `json:"certificateHints,omitempty"`
+	CertificateBalance         []ReverseProxyCertificateBalanceDiagnostic `json:"certificateBalance,omitempty"`
+	UpdatedAt                  int64                                      `json:"updatedAt"`
+	CreatedAt                  int64                                      `json:"createdAt"`
 }
 
 type ReverseProxyOverview struct {
+	Revision         uint64                          `json:"revision"`
+	ResourceSettings ReverseProxyResourceSettings    `json:"resourceSettings"`
 	Available        bool                            `json:"available"`
 	Started          bool                            `json:"started"`
 	ListenerCount    int                             `json:"listenerCount"`
@@ -208,37 +312,56 @@ type ReverseProxyOverview struct {
 	Error            string                          `json:"error,omitempty"`
 }
 
+type reverseProxyLoadedConfiguration struct {
+	Settings model.ReverseProxySettings
+	Rules    []model.ReverseProxyRule
+}
+
 type reverseProxyNormalizedRule struct {
-	id                        uint
-	name                      string
-	enabled                   bool
-	listenProtocol            string
-	listenProtocolAlias       string
-	listenIPs                 []string
-	listenPort                int
-	hosts                     []string
-	pathPrefix                string
-	listenDNSPath             string
-	targetProtocol            string
-	targetProtocolAlias       string
-	targetAddresses           []string
-	targetPort                int
-	targetPath                string
-	targetDNSPath             string
-	ednsEnabled               bool
-	ednsMode                  string
-	ednsCustomIP              string
-	ednsClientSubnetPolicy    string
-	disableIPv4Answer         bool
-	disableIPv6Answer         bool
-	certificateRecordIDs      []uint
-	certificateRecordID       uint
-	listenHTTPVersionStrategy string
-	ipStrategy                string
-	httpVersionStrategy       string
-	upstreamTLSVerify         bool
-	apiPassthrough            bool
-	remark                    string
+	id                         uint
+	name                       string
+	enabled                    bool
+	listenProtocol             string
+	listenProtocolAlias        string
+	listenPort                 int
+	hosts                      []string
+	pathPrefix                 string
+	listenDNSPath              string
+	targetProtocol             string
+	targetProtocolAlias        string
+	targetAddresses            []string
+	targetPort                 int
+	targetPath                 string
+	targetDNSPath              string
+	fallbackDNSUpstreams       string
+	dnsUpstreamTimeoutSeconds  int
+	dnsCacheEnabled            bool
+	dnsCacheSizeBytes          int
+	dnsCacheMinTTL             int
+	dnsCacheMaxTTL             int
+	dnsAllowedCIDRs            []string
+	dnsRateLimitQPS            int
+	dnsMaxConcurrentQueries    int
+	ednsEnabled                bool
+	ednsMode                   string
+	ednsCustomIP               string
+	ednsClientSubnetPolicy     string
+	disableIPv4Answer          bool
+	disableIPv6Answer          bool
+	certificateRecordIDs       []uint
+	certificateRecordID        uint
+	listenHTTPVersionStrategy  string
+	ipStrategy                 string
+	httpVersionStrategy        string
+	upstreamTLSVerify          bool
+	maxConcurrentConnections   int
+	maxConcurrentRequests      int
+	upstreamMaxConnections     int
+	upstreamMaxIdleConnections int
+	memoryLimitBytes           int64
+	apiPassthrough             bool
+	advertiseHTTP3             bool
+	remark                     string
 }
 
 type reverseProxyMismatchEntry struct {
@@ -246,6 +369,21 @@ type reverseProxyMismatchEntry struct {
 	LastAttempt  time.Time
 	DelayedUntil time.Time
 	LastReason   string
+	element      *list.Element
+}
+
+const reverseProxyRuntimeTableShardCount = 16
+
+const (
+	reverseProxyTLSClientDomain = "domain"
+	reverseProxyTLSClientIP     = "ip_sni"
+	reverseProxyTLSClientNoSNI  = "no_sni"
+)
+
+type reverseProxyMismatchShard struct {
+	mu      sync.Mutex
+	entries map[string]*reverseProxyMismatchEntry
+	lru     *list.List
 }
 
 type reverseProxyTargetCandidate struct {
@@ -262,6 +400,25 @@ func reverseProxyIsWebSocketAlias(alias string) bool {
 	default:
 		return false
 	}
+}
+
+func reverseProxyIsHTTP3WebSocketRequest(r *http.Request) bool {
+	return r != nil &&
+		r.ProtoMajor == 3 &&
+		r.Method == http.MethodConnect &&
+		strings.EqualFold(strings.TrimSpace(r.Proto), "websocket")
+}
+
+func reverseProxyIsWebSocketUpgradeRequest(r *http.Request) bool {
+	if r == nil || r.ProtoMajor != 1 || !strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket") {
+		return false
+	}
+	for _, value := range strings.Split(r.Header.Get("Connection"), ",") {
+		if strings.EqualFold(strings.TrimSpace(value), "upgrade") {
+			return true
+		}
+	}
+	return false
 }
 
 type reverseProxyListenBind struct {
@@ -286,39 +443,60 @@ func normalizeReverseProxyEDNSCustomIPv4(raw string) (string, bool) {
 }
 
 type reverseProxyRuntimeState struct {
-	lastSyncAt    time.Time
-	lastRenderKey string
-	warnings      []string
+	lastSyncAt            time.Time
+	lastRenderKey         string
+	warnings              []string
+	revision              uint64
+	certificateGeneration uint64
+	nextRetryAt           time.Time
+	retryDelay            time.Duration
+}
+
+type reverseProxyRuleRuntimeState struct {
+	status    string
+	lastError string
+	updatedAt time.Time
 }
 
 type reverseProxyRenderRule struct {
-	ID                        uint                                 `json:"id"`
-	ListOrder                 int64                                `json:"listOrder"`
-	Enabled                   bool                                 `json:"enabled"`
-	ListenProtocol            string                               `json:"listenProtocol"`
-	ListenHTTPVersionStrategy string                               `json:"listenHttpVersionStrategy"`
-	ListenIPs                 []string                             `json:"listenIPs"`
-	ListenPort                int                                  `json:"listenPort"`
-	Hosts                     []string                             `json:"hosts"`
-	PathPrefix                string                               `json:"pathPrefix"`
-	ListenDNSPath             string                               `json:"listenDnsPath"`
-	TargetProtocol            string                               `json:"targetProtocol"`
-	TargetAddresses           []string                             `json:"targetAddresses"`
-	TargetPort                int                                  `json:"targetPort"`
-	TargetPath                string                               `json:"targetPath"`
-	TargetDNSPath             string                               `json:"targetDnsPath"`
-	EDNSEnabled               bool                                 `json:"ednsEnabled"`
-	EDNSMode                  string                               `json:"ednsMode"`
-	EDNSCustomIP              string                               `json:"ednsCustomIp"`
-	EDNSClientSubnetPolicy    string                               `json:"ednsClientSubnetPolicy"`
-	DisableIPv4Answer         bool                                 `json:"disableIpv4Answer"`
-	DisableIPv6Answer         bool                                 `json:"disableIpv6Answer"`
-	CertificateRecordIDs      []uint                               `json:"certificateRecordIds,omitempty"`
-	CertificateStates         []reverseProxyRenderCertificateState `json:"certificateStates,omitempty"`
-	IPStrategy                string                               `json:"ipStrategy"`
-	HTTPVersionStrategy       string                               `json:"httpVersionStrategy"`
-	UpstreamTLSVerify         bool                                 `json:"upstreamTlsVerify"`
-	ApiPassthrough            bool                                 `json:"apiPassthrough"`
+	ID                         uint                                 `json:"id"`
+	ListOrder                  int64                                `json:"listOrder"`
+	Enabled                    bool                                 `json:"enabled"`
+	ListenProtocol             string                               `json:"listenProtocol"`
+	ListenProtocolAlias        string                               `json:"listenProtocolAlias"`
+	ListenHTTPVersionStrategy  string                               `json:"listenHttpVersionStrategy"`
+	ListenPort                 int                                  `json:"listenPort"`
+	Hosts                      []string                             `json:"hosts"`
+	PathPrefix                 string                               `json:"pathPrefix"`
+	ListenDNSPath              string                               `json:"listenDnsPath"`
+	TargetProtocol             string                               `json:"targetProtocol"`
+	TargetProtocolAlias        string                               `json:"targetProtocolAlias"`
+	TargetAddresses            []string                             `json:"targetAddresses"`
+	TargetPort                 int                                  `json:"targetPort"`
+	TargetPath                 string                               `json:"targetPath"`
+	TargetDNSPath              string                               `json:"targetDnsPath"`
+	AdvertiseHTTP3             bool                                 `json:"advertiseHttp3"`
+	EDNSEnabled                bool                                 `json:"ednsEnabled"`
+	EDNSMode                   string                               `json:"ednsMode"`
+	EDNSCustomIP               string                               `json:"ednsCustomIp"`
+	EDNSClientSubnetPolicy     string                               `json:"ednsClientSubnetPolicy"`
+	DisableIPv4Answer          bool                                 `json:"disableIpv4Answer"`
+	DisableIPv6Answer          bool                                 `json:"disableIpv6Answer"`
+	DNSAllowedCIDRs            []string                             `json:"dnsAllowedCidrs"`
+	DNSRateLimitQPS            int                                  `json:"dnsRateLimitQps"`
+	DNSMaxConcurrentQueries    int                                  `json:"dnsMaxConcurrentQueries"`
+	DNSRuntimeState            string                               `json:"dnsRuntimeState,omitempty"`
+	CertificateRecordIDs       []uint                               `json:"certificateRecordIds,omitempty"`
+	CertificateStates          []reverseProxyRenderCertificateState `json:"certificateStates,omitempty"`
+	IPStrategy                 string                               `json:"ipStrategy"`
+	HTTPVersionStrategy        string                               `json:"httpVersionStrategy"`
+	UpstreamTLSVerify          bool                                 `json:"upstreamTlsVerify"`
+	MaxConcurrentConnections   int                                  `json:"maxConcurrentConnections"`
+	MaxConcurrentRequests      int                                  `json:"maxConcurrentRequests"`
+	UpstreamMaxConnections     int                                  `json:"upstreamMaxConnections"`
+	UpstreamMaxIdleConnections int                                  `json:"upstreamMaxIdleConnections"`
+	MemoryLimitBytes           int64                                `json:"memoryLimitBytes"`
+	ApiPassthrough             bool                                 `json:"apiPassthrough"`
 }
 
 type reverseProxyRenderCertificateState struct {
@@ -334,49 +512,111 @@ type reverseProxyRuleCertificateBinding struct {
 	Leaf                *x509LeafState
 }
 
+type reverseProxyParsedCertificateMaterial struct {
+	Certificate *tls.Certificate
+	Leaf        *x509LeafState
+	Err         error
+}
+
+var reverseProxyParsedCertificateMaterials = struct {
+	sync.RWMutex
+	databaseGeneration uint64
+	generation         uint64
+	items              map[uint]reverseProxyParsedCertificateMaterial
+}{items: make(map[uint]reverseProxyParsedCertificateMaterial)}
+
+var reverseProxyDatabaseGeneration atomic.Uint64
+
+func init() {
+	database.RegisterDBResetHook(func() {
+		databaseGeneration := reverseProxyDatabaseGeneration.Add(1)
+		reverseProxyParsedCertificateMaterials.Lock()
+		reverseProxyParsedCertificateMaterials.databaseGeneration = databaseGeneration
+		reverseProxyParsedCertificateMaterials.generation = 0
+		reverseProxyParsedCertificateMaterials.items = make(map[uint]reverseProxyParsedCertificateMaterial)
+		reverseProxyParsedCertificateMaterials.Unlock()
+		noteReverseProxyCertificateInventoryChanged()
+	})
+}
+
 type reverseProxyCertificateSelection struct {
 	ListenerKey         string
 	SNIBucket           string
 	CertificateRecordID uint
+	ClientKind          string
+	RequestedIP         string
 }
 
 type reverseProxyLocalConnectionState struct {
-	RuleID       uint
-	Selection    reverseProxyCertificateSelection
-	HasSelection bool
+	RuleConnectionLimiters map[uint]*reverseProxyAdjustableLimiter
+	HijackedRuleID         uint
+	Selection              reverseProxyCertificateSelection
+	HasSelection           bool
 }
 
+type reverseProxyPendingCertificateSelection struct {
+	Selection reverseProxyCertificateSelection
+	CreatedAt time.Time
+	element   *list.Element
+}
+
+// Pending TLS selections bridge the short interval between certificate choice
+// and connection registration.  They are partitioned by connection address
+// so a burst of unrelated handshakes cannot turn expiry or eviction into one
+// listener-wide LRU scan.
+type reverseProxyPendingCertificateShard struct {
+	selections map[string]*reverseProxyPendingCertificateSelection
+	lru        *list.List
+}
+
+const reverseProxyPendingCertificateShardLimit = reverseProxyRuntimeTableMaxEntries / reverseProxyRuntimeTableShardCount
+
 type reverseProxyListenerGroup struct {
-	mu                        sync.RWMutex
-	statsMu                   sync.Mutex
-	key                       string
-	listenIP                  string
-	listenPort                int
-	protocol                  string
-	listenHTTPVersionStrategy string
-	server                    *http.Server
-	listener                  net.Listener
-	h3Server                  *http3.Server
-	packetConn                net.PacketConn
-	servers                   []*http.Server
-	listeners                 []net.Listener
-	h3Servers                 []*http3.Server
-	packetConns               []net.PacketConn
-	rules                     []*model.ReverseProxyRule
-	service                   *ReverseProxyService
-	certBindingsByRule        map[uint][]*reverseProxyRuleCertificateBinding
-	orderedCertBindings       []*reverseProxyRuleCertificateBinding
-	warnings                  []string
-	upstreamByRule            map[uint]*reverseProxyCachedUpstream
-	defaultCert               *tls.Certificate
-	defaultLeaf               *x509LeafState
-	connectionCounts          map[uint]reverseProxyConnectionCounts
-	localConnIDs              map[net.Conn]string
-	localConnStates           map[string]reverseProxyLocalConnectionState
-	localConnAddrToID         map[string]string
-	localConnAddrByID         map[string]string
-	pendingConnSelections     map[string]reverseProxyCertificateSelection
-	nextConnID                uint64
+	mu                         sync.RWMutex
+	statsMu                    sync.Mutex
+	closed                     bool
+	key                        string
+	renderKey                  string
+	listenIP                   string
+	listenIPs                  []string
+	listenPort                 int
+	protocol                   string
+	socketKind                 string
+	listenHTTPVersionStrategy  string
+	server                     *http.Server
+	listener                   net.Listener
+	h3Server                   *http3.Server
+	packetConn                 net.PacketConn
+	servers                    []*http.Server
+	listeners                  []net.Listener
+	h3Servers                  []*http3.Server
+	packetConns                []net.PacketConn
+	rules                      []*model.ReverseProxyRule
+	service                    *ReverseProxyService
+	certBindingsByRule         map[uint][]*reverseProxyRuleCertificateBinding
+	orderedCertBindings        []*reverseProxyRuleCertificateBinding
+	ipCertBindings             map[string][]*reverseProxyRuleCertificateBinding
+	ipCertificateUniverse      map[string]struct{}
+	natFallbackCertBindings    map[string][]*reverseProxyRuleCertificateBinding
+	dnsHandler                 *reverseProxyDNSRuleHandler
+	warnings                   []string
+	upstreamByRule             map[uint]*reverseProxyCachedUpstream
+	connectionCounts           map[uint]reverseProxyConnectionCounts
+	localConnIDs               map[net.Conn]string
+	localConnByID              map[string]net.Conn
+	localConnStates            map[string]reverseProxyLocalConnectionState
+	localConnAddrToID          map[string]string
+	localConnAddrByID          map[string]string
+	hijackedConnections        map[string]net.Conn
+	pendingConnSelectionShards [reverseProxyRuntimeTableShardCount]reverseProxyPendingCertificateShard
+	connectionSlotIDs          map[string]struct{}
+	certificateBalanceShards   [reverseProxyRuntimeTableShardCount]reverseProxyCertificateBalanceShard
+	resources                  ReverseProxyResourceSettings
+	listenerConnectionLimiter  *reverseProxyAdjustableLimiter
+	ruleConnectionLimiters     map[uint]*reverseProxyAdjustableLimiter
+	requestLimiters            map[uint]*reverseProxyAdjustableLimiter
+	upstreamLimiters           map[uint]*reverseProxyAdjustableLimiter
+	nextConnID                 uint64
 }
 
 type reverseProxyCertificateHint struct {
@@ -385,12 +625,16 @@ type reverseProxyCertificateHint struct {
 }
 
 type reverseProxyRuntimeManager struct {
-	mu             sync.Mutex
-	groups         map[string]*reverseProxyListenerGroup
-	mismatchMu     sync.Mutex
-	mismatchByIP   map[string]*reverseProxyMismatchEntry
-	state          reverseProxyRuntimeState
-	reconcileError string
+	mu                  sync.Mutex
+	groups              map[string]*reverseProxyListenerGroup
+	mismatchShards      [reverseProxyRuntimeTableShardCount]reverseProxyMismatchShard
+	ruleStateMu         sync.RWMutex
+	ruleStates          map[uint]reverseProxyRuleRuntimeState
+	state               reverseProxyRuntimeState
+	reconcileError      string
+	overviewMu          sync.RWMutex
+	configuration       *ReverseProxyOverview
+	loadedConfiguration *reverseProxyLoadedConfiguration
 }
 
 type x509LeafState struct {
@@ -411,6 +655,7 @@ type reverseProxyCachedUpstream struct {
 	ServerName      string
 	HostHeader      string
 	TransportMode   string
+	ResolvedAt      time.Time
 	RoundTripper    http.RoundTripper
 	Cleanup         func()
 	refs            int
@@ -420,14 +665,95 @@ type reverseProxyCachedUpstream struct {
 type reverseProxyCleanupReadCloser struct {
 	io.ReadCloser
 	onClose func()
+	once    sync.Once
 }
 
 func (c *reverseProxyCleanupReadCloser) Close() error {
 	err := c.ReadCloser.Close()
-	if c.onClose != nil {
-		c.onClose()
-	}
+	c.once.Do(func() {
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
 	return err
+}
+
+type reverseProxyCleanupReadWriteCloser struct {
+	io.ReadWriteCloser
+	onClose func()
+	once    sync.Once
+}
+
+func (c *reverseProxyCleanupReadWriteCloser) Close() error {
+	err := c.ReadWriteCloser.Close()
+	c.once.Do(func() {
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
+	return err
+}
+
+type reverseProxyResponseHeaderTimeoutTransport struct {
+	base    http.RoundTripper
+	timeout time.Duration
+}
+
+func (t reverseProxyResponseHeaderTimeoutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.base == nil {
+		return nil, errors.New("upstream transport is nil")
+	}
+	if req == nil || t.timeout <= 0 {
+		return t.base.RoundTrip(req)
+	}
+	ctx, cancel := context.WithCancel(req.Context())
+	var stateMu sync.Mutex
+	timedOut := false
+	timer := time.AfterFunc(t.timeout, func() {
+		stateMu.Lock()
+		timedOut = true
+		stateMu.Unlock()
+		cancel()
+	})
+	response, err := t.base.RoundTrip(req.WithContext(ctx))
+	timer.Stop()
+	if err != nil {
+		cancel()
+		stateMu.Lock()
+		didTimeout := timedOut
+		stateMu.Unlock()
+		if didTimeout {
+			return nil, fmt.Errorf("upstream response header timeout: %w", context.DeadlineExceeded)
+		}
+		return nil, err
+	}
+	stateMu.Lock()
+	didTimeout := timedOut
+	stateMu.Unlock()
+	if didTimeout {
+		cancel()
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		return nil, fmt.Errorf("upstream response header timeout: %w", context.DeadlineExceeded)
+	}
+	if response == nil || response.Body == nil {
+		cancel()
+		return response, nil
+	}
+	if responseBody, ok := response.Body.(io.ReadWriteCloser); ok {
+		response.Body = &reverseProxyCleanupReadWriteCloser{ReadWriteCloser: responseBody, onClose: cancel}
+	} else {
+		response.Body = &reverseProxyCleanupReadCloser{ReadCloser: response.Body, onClose: cancel}
+	}
+	return response, nil
+}
+
+func reverseProxyWithResponseHeaderTimeout(base http.RoundTripper) http.RoundTripper {
+	return reverseProxyResponseHeaderTimeoutTransport{
+		base:    base,
+		timeout: reverseProxyUpstreamResponseHeaderTimeout,
+	}
 }
 
 type reverseProxyConnectionCounts struct {
@@ -441,6 +767,72 @@ type reverseProxyCountedConn struct {
 	net.Conn
 	onClose func()
 	once    sync.Once
+}
+
+// reverseProxyTrackedClientConn keeps the connection lifecycle visible after
+// net/http marks a WebSocket connection as StateHijacked.  The standard
+// ConnState callback does not receive StateClosed for a hijacked tunnel, so
+// relying on it alone leaked connection counters and TLS balance leases.
+type reverseProxyTrackedClientConn struct {
+	net.Conn
+	onClose func()
+	once    sync.Once
+}
+
+type reverseProxyClientHelloLocalHintConn struct {
+	local net.Addr
+}
+
+func (c *reverseProxyClientHelloLocalHintConn) Read([]byte) (int, error)         { return 0, net.ErrClosed }
+func (c *reverseProxyClientHelloLocalHintConn) Write([]byte) (int, error)        { return 0, net.ErrClosed }
+func (c *reverseProxyClientHelloLocalHintConn) Close() error                     { return nil }
+func (c *reverseProxyClientHelloLocalHintConn) LocalAddr() net.Addr              { return c.local }
+func (c *reverseProxyClientHelloLocalHintConn) RemoteAddr() net.Addr             { return &net.UDPAddr{} }
+func (c *reverseProxyClientHelloLocalHintConn) SetDeadline(time.Time) error      { return nil }
+func (c *reverseProxyClientHelloLocalHintConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *reverseProxyClientHelloLocalHintConn) SetWriteDeadline(time.Time) error { return nil }
+
+func reverseProxyClientHelloWithLocalIPHint(hello *tls.ClientHelloInfo, listenIP string) *tls.ClientHelloInfo {
+	if hello == nil || hello.Conn != nil {
+		return hello
+	}
+	ip := net.ParseIP(strings.Trim(strings.TrimSpace(listenIP), "[]"))
+	if ip == nil {
+		return hello
+	}
+	copyHello := *hello
+	copyHello.Conn = &reverseProxyClientHelloLocalHintConn{local: &net.UDPAddr{IP: ip}}
+	return &copyHello
+}
+
+func (c *reverseProxyTrackedClientConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() {
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
+	return err
+}
+
+type reverseProxyTrackedClientListener struct {
+	net.Listener
+	onClose func(net.Conn)
+}
+
+func (l *reverseProxyTrackedClientListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil || conn == nil {
+		return conn, err
+	}
+	return &reverseProxyTrackedClientConn{
+		Conn: conn,
+		onClose: func() {
+			if l.onClose != nil {
+				l.onClose(conn)
+			}
+		},
+	}, nil
 }
 
 func (c *reverseProxyCountedConn) Close() error {
@@ -463,12 +855,107 @@ type reverseProxyResponseRewritePlan struct {
 	Replacements         []reverseProxyStringReplacement
 	UpstreamCookieDomain string
 	ExternalCookieDomain string
+	UpstreamPathPrefix   string
 	ExternalPathPrefix   string
 }
 
 var reverseProxyRuntime = &reverseProxyRuntimeManager{
-	groups:       make(map[string]*reverseProxyListenerGroup),
-	mismatchByIP: make(map[string]*reverseProxyMismatchEntry),
+	groups:     make(map[string]*reverseProxyListenerGroup),
+	ruleStates: make(map[uint]reverseProxyRuleRuntimeState),
+}
+
+var reverseProxyCertificateGeneration atomic.Uint64
+
+func currentReverseProxyCertificateGeneration() uint64 {
+	return reverseProxyCertificateGeneration.Load()
+}
+
+func noteReverseProxyCertificateInventoryChanged() uint64 {
+	generation := reverseProxyCertificateGeneration.Add(1)
+	reverseProxyRuntime.overviewMu.Lock()
+	reverseProxyRuntime.configuration = nil
+	reverseProxyRuntime.overviewMu.Unlock()
+	return generation
+}
+
+func (r *reverseProxyRuntimeManager) reportRuleState(ruleID uint, status string, lastError string) {
+	if r == nil || ruleID == 0 {
+		return
+	}
+	status = strings.TrimSpace(status)
+	lastError = strings.TrimSpace(lastError)
+	if status == "running" {
+		lastError = ""
+	}
+	r.ruleStateMu.Lock()
+	if r.ruleStates == nil {
+		r.ruleStates = make(map[uint]reverseProxyRuleRuntimeState)
+	}
+	r.ruleStates[ruleID] = reverseProxyRuleRuntimeState{status: status, lastError: lastError, updatedAt: time.Now()}
+	r.ruleStateMu.Unlock()
+}
+
+func (r *reverseProxyRuntimeManager) clearRuleState(ruleID uint) {
+	if r == nil || ruleID == 0 {
+		return
+	}
+	r.ruleStateMu.Lock()
+	delete(r.ruleStates, ruleID)
+	r.ruleStateMu.Unlock()
+}
+
+func (r *reverseProxyRuntimeManager) resetRuleStates() {
+	if r == nil {
+		return
+	}
+	r.ruleStateMu.Lock()
+	r.ruleStates = make(map[uint]reverseProxyRuleRuntimeState)
+	r.ruleStateMu.Unlock()
+}
+
+func (r *reverseProxyRuntimeManager) reconcileRuleStates(rows []model.ReverseProxyRule) {
+	if r == nil {
+		return
+	}
+	valid := make(map[uint]bool, len(rows))
+	for i := range rows {
+		if rows[i].Id != 0 {
+			valid[rows[i].Id] = rows[i].Enabled
+		}
+	}
+	now := time.Now()
+	r.ruleStateMu.Lock()
+	if r.ruleStates == nil {
+		r.ruleStates = make(map[uint]reverseProxyRuleRuntimeState)
+	}
+	for ruleID := range r.ruleStates {
+		if _, exists := valid[ruleID]; !exists {
+			delete(r.ruleStates, ruleID)
+		}
+	}
+	for ruleID, enabled := range valid {
+		if !enabled {
+			r.ruleStates[ruleID] = reverseProxyRuleRuntimeState{status: "disabled", updatedAt: now}
+			continue
+		}
+		if _, exists := r.ruleStates[ruleID]; !exists {
+			r.ruleStates[ruleID] = reverseProxyRuleRuntimeState{status: "pending", updatedAt: now}
+		}
+	}
+	r.ruleStateMu.Unlock()
+}
+
+func (r *reverseProxyRuntimeManager) snapshotRuleStates() map[uint]reverseProxyRuleRuntimeState {
+	result := make(map[uint]reverseProxyRuleRuntimeState)
+	if r == nil {
+		return result
+	}
+	r.ruleStateMu.RLock()
+	for ruleID, state := range r.ruleStates {
+		result[ruleID] = state
+	}
+	r.ruleStateMu.RUnlock()
+	return result
 }
 
 func reverseProxySupported() bool {
@@ -517,62 +1004,300 @@ func reverseProxySnapshotConnectionCounts(groups map[string]*reverseProxyListene
 }
 
 func (s *ReverseProxyService) GetOverview() (*ReverseProxyOverview, error) {
-	reverseProxyRuntime.mu.Lock()
-	defer reverseProxyRuntime.mu.Unlock()
-
-	if reverseProxySupported() {
-		if err := reverseProxyRuntime.reconcileLocked(s, 2*time.Second); err != nil {
-			reverseProxyRuntime.reconcileError = strings.TrimSpace(err.Error())
+	configuration, err := s.reverseProxyConfigurationSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	runtime := s.reverseProxyRuntimeSnapshot(configuration.Revision)
+	overview := cloneReverseProxyOverview(configuration)
+	overview.Available = runtime.Available
+	overview.Started = runtime.Started
+	overview.ListenerCount = runtime.ListenerCount
+	overview.LastSyncAt = runtime.LastSyncAt
+	overview.Warnings = append([]string(nil), runtime.Warnings...)
+	overview.Error = runtime.Error
+	runtimeByRule := make(map[uint]ReverseProxyRuntimeRuleStateView, len(runtime.Rules))
+	for _, state := range runtime.Rules {
+		runtimeByRule[state.ID] = state
+	}
+	for index := range overview.Rules {
+		if state, exists := runtimeByRule[overview.Rules[index].ID]; exists {
+			overview.Rules[index].RuntimeStatus = state.RuntimeStatus
+			overview.Rules[index].LastError = state.LastError
+			overview.Rules[index].LocalConnectionCount = state.LocalConnectionCount
+			overview.Rules[index].UpstreamConnectionCount = state.UpstreamConnectionCount
 		}
 	}
+	return overview, nil
+}
 
+// GetRuntimeOverview never reads rules, certificate material, or the complete
+// SQLite configuration.  It is the endpoint used by the four-second UI poll.
+func (s *ReverseProxyService) GetRuntimeOverview() (*ReverseProxyRuntimeOverview, error) {
+	revision := uint64(0)
+	reverseProxyRuntime.overviewMu.RLock()
+	if reverseProxyRuntime.configuration != nil {
+		revision = reverseProxyRuntime.configuration.Revision
+	}
+	reverseProxyRuntime.overviewMu.RUnlock()
+	if revision == 0 {
+		reverseProxyRuntime.mu.Lock()
+		revision = reverseProxyRuntime.state.revision
+		reverseProxyRuntime.mu.Unlock()
+	}
+	runtime := s.reverseProxyRuntimeSnapshot(revision)
+	return &runtime, nil
+}
+
+func reverseProxyRulePayloadFromModel(row *model.ReverseProxyRule, enabled bool) ReverseProxyRulePayload {
+	if row == nil {
+		return ReverseProxyRulePayload{}
+	}
+	dnsTimeout := row.DNSUpstreamTimeoutSeconds
+	dnsCacheSize := row.DNSCacheSizeBytes
+	dnsRateLimit := row.DNSRateLimitQPS
+	dnsConcurrent := row.DNSMaxConcurrentQueries
+	maxConnections := row.MaxConcurrentConnections
+	maxRequests := row.MaxConcurrentRequests
+	upstreamConnections := row.UpstreamMaxConnections
+	upstreamIdleConnections := row.UpstreamMaxIdleConnections
+	memoryLimit := row.MemoryLimitBytes
+	payload := ReverseProxyRulePayload{
+		ID:                         row.Id,
+		Name:                       row.Name,
+		Enabled:                    enabled,
+		ListenProtocol:             row.ListenProtocol,
+		ListenProtocolAlias:        row.ListenProtocolAlias,
+		ListenPort:                 row.ListenPort,
+		Hosts:                      strings.Join(reverseProxyRuleServerNames(row), ", "),
+		PathPrefix:                 row.PathPrefix,
+		ListenDNSPath:              row.ListenDNSPath,
+		TargetProtocol:             row.TargetProtocol,
+		TargetProtocolAlias:        row.TargetProtocolAlias,
+		TargetAddresses:            strings.Join(decodeReverseProxyList(row.TargetAddresses), ", "),
+		TargetPort:                 row.TargetPort,
+		TargetPath:                 row.TargetPath,
+		TargetDNSPath:              row.TargetDNSPath,
+		FallbackDNSUpstreams:       row.FallbackDNSUpstreams,
+		DNSUpstreamTimeoutSeconds:  &dnsTimeout,
+		DNSCacheEnabled:            row.DNSCacheEnabled,
+		DNSCacheSizeBytes:          &dnsCacheSize,
+		DNSCacheMinTTL:             row.DNSCacheMinTTL,
+		DNSCacheMaxTTL:             row.DNSCacheMaxTTL,
+		EDNSEnabled:                row.EDNSEnabled,
+		EDNSMode:                   row.EDNSMode,
+		EDNSCustomIP:               row.EDNSCustomIP,
+		EDNSClientSubnetPolicy:     row.EDNSClientSubnetPolicy,
+		DisableIPv4Answer:          row.DisableIPv4Answer,
+		DisableIPv6Answer:          row.DisableIPv6Answer,
+		CertificateRecordIDs:       reverseProxyRuleCertificateIDs(row),
+		CertificateRecordID:        row.CertificateRecordID,
+		ListenHTTPVersionStrategy:  row.ListenHTTPVersionStrategy,
+		IPStrategy:                 row.IPStrategy,
+		HTTPVersionStrategy:        row.HTTPVersionStrategy,
+		UpstreamTLSVerify:          row.UpstreamTLSVerify,
+		DNSAllowedCIDRs:            strings.Join(decodeReverseProxyList(row.DNSAllowedCIDRs), ", "),
+		DNSRateLimitQPS:            &dnsRateLimit,
+		DNSMaxConcurrentQueries:    &dnsConcurrent,
+		MaxConcurrentConnections:   &maxConnections,
+		MaxConcurrentRequests:      &maxRequests,
+		UpstreamMaxConnections:     &upstreamConnections,
+		UpstreamMaxIdleConnections: &upstreamIdleConnections,
+		MemoryLimitBytes:           &memoryLimit,
+		ApiPassthrough:             row.ApiPassthrough,
+		AdvertiseHTTP3:             row.AdvertiseHTTP3,
+		Remark:                     row.Remark,
+		upstreamTLSVerifySet:       true,
+		upstreamTLSVerifyDecoded:   true,
+	}
+	return payload
+}
+
+func (s *ReverseProxyService) reverseProxyConfigurationSnapshot() (*ReverseProxyOverview, error) {
+	reverseProxyRuntime.overviewMu.RLock()
+	existing := reverseProxyRuntime.configuration
+	reverseProxyRuntime.overviewMu.RUnlock()
+	if existing != nil {
+		return cloneReverseProxyOverview(existing), nil
+	}
+	if err := s.refreshReverseProxyConfigurationSnapshot(); err != nil {
+		return nil, err
+	}
+	reverseProxyRuntime.overviewMu.RLock()
+	current := reverseProxyRuntime.configuration
+	reverseProxyRuntime.overviewMu.RUnlock()
+	if current == nil {
+		return nil, common.NewError("reverse proxy configuration snapshot is unavailable")
+	}
+	return cloneReverseProxyOverview(current), nil
+}
+
+func (s *ReverseProxyService) refreshReverseProxyConfigurationSnapshot() error {
+	settings, err := s.loadReverseProxySettings()
+	if err != nil {
+		return err
+	}
+	rules, err := s.loadRulesLocked(database.GetDB())
+	if err != nil {
+		return err
+	}
+	reverseProxyRuntime.mu.Lock()
+	reverseProxyRuntime.loadedConfiguration = &reverseProxyLoadedConfiguration{
+		Settings: *settings,
+		Rules:    append([]model.ReverseProxyRule(nil), rules...),
+	}
+	reverseProxyRuntime.mu.Unlock()
+	return s.publishReverseProxyConfigurationSnapshot(settings, rules)
+}
+
+func (s *ReverseProxyService) publishReverseProxyConfigurationSnapshot(settings *model.ReverseProxySettings, rules []model.ReverseProxyRule) error {
+	if settings == nil {
+		return common.NewError("reverse proxy settings are unavailable")
+	}
+	certOptions, certMap, err := s.listCertificateOptions()
+	if err != nil {
+		return err
+	}
+	views := make([]ReverseProxyRuleView, 0, len(rules))
+	enabledCount := 0
+	for index := range rules {
+		if rules[index].Enabled {
+			enabledCount++
+		}
+		views = append(views, buildReverseProxyRuleView(&rules[index], certMap, reverseProxyConnectionCounts{}, nil))
+	}
+	resources := reverseProxySettingsView(settings)
+	snapshot := &ReverseProxyOverview{
+		Revision:         settings.Revision,
+		ResourceSettings: resources,
+		Available:        reverseProxySupported(),
+		EnabledCount:     enabledCount,
+		RuleCount:        len(rules),
+		CertificateCount: len(certOptions),
+		Certificates:     certOptions,
+		Rules:            views,
+	}
+	reverseProxyRuntime.overviewMu.Lock()
+	reverseProxyRuntime.configuration = snapshot
+	reverseProxyRuntime.overviewMu.Unlock()
+	return nil
+}
+
+func cloneReverseProxyOverview(source *ReverseProxyOverview) *ReverseProxyOverview {
+	if source == nil {
+		return nil
+	}
+	copyOverview := *source
+	copyOverview.Warnings = append([]string(nil), source.Warnings...)
+	copyOverview.Certificates = make([]ReverseProxyCertificateOption, len(source.Certificates))
+	for index := range source.Certificates {
+		copyOverview.Certificates[index] = source.Certificates[index]
+		copyOverview.Certificates[index].Domains = append([]string(nil), source.Certificates[index].Domains...)
+	}
+	copyOverview.Rules = make([]ReverseProxyRuleView, len(source.Rules))
+	for index := range source.Rules {
+		copyOverview.Rules[index] = source.Rules[index]
+		copyOverview.Rules[index].Hosts = append([]string(nil), source.Rules[index].Hosts...)
+		copyOverview.Rules[index].TargetAddresses = append([]string(nil), source.Rules[index].TargetAddresses...)
+		copyOverview.Rules[index].DNSAllowedCIDRs = append([]string(nil), source.Rules[index].DNSAllowedCIDRs...)
+		copyOverview.Rules[index].CertificateRecordIDs = append([]uint(nil), source.Rules[index].CertificateRecordIDs...)
+		copyOverview.Rules[index].CertificateLabels = append([]string(nil), source.Rules[index].CertificateLabels...)
+		copyOverview.Rules[index].CertificateHints = append([]string(nil), source.Rules[index].CertificateHints...)
+		copyOverview.Rules[index].CertificateBalance = append([]ReverseProxyCertificateBalanceDiagnostic(nil), source.Rules[index].CertificateBalance...)
+	}
+	return &copyOverview
+}
+
+func cloneReverseProxyLoadedConfiguration(source *reverseProxyLoadedConfiguration) *reverseProxyLoadedConfiguration {
+	if source == nil {
+		return nil
+	}
+	clone := &reverseProxyLoadedConfiguration{Settings: source.Settings}
+	clone.Rules = append([]model.ReverseProxyRule(nil), source.Rules...)
+	return clone
+}
+
+func (r *reverseProxyRuntimeManager) loadedConfigurationSnapshot() *reverseProxyLoadedConfiguration {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	loaded := cloneReverseProxyLoadedConfiguration(r.loadedConfiguration)
+	r.mu.Unlock()
+	return loaded
+}
+
+func (s *ReverseProxyService) loadReverseProxyLoadedConfiguration() (*reverseProxyLoadedConfiguration, error) {
+	settings, err := s.loadReverseProxySettings()
+	if err != nil {
+		return nil, err
+	}
 	rules, err := s.loadRulesLocked(database.GetDB())
 	if err != nil {
 		return nil, err
 	}
-	certOptions, certMap, err := s.listCertificateOptions()
-	if err != nil {
+	if err := prepareReverseProxyParsedCertificateMaterials(rules); err != nil {
 		return nil, err
 	}
+	return &reverseProxyLoadedConfiguration{
+		Settings: *settings,
+		Rules:    rules,
+	}, nil
+}
+
+func (s *ReverseProxyService) reverseProxyRuntimeSnapshot(revision uint64) ReverseProxyRuntimeOverview {
+	reverseProxyRuntime.mu.Lock()
+	groups := make(map[string]*reverseProxyListenerGroup, len(reverseProxyRuntime.groups))
+	for key, group := range reverseProxyRuntime.groups {
+		groups[key] = group
+	}
 	warnings := append([]string(nil), reverseProxyRuntime.state.warnings...)
-	balanceDiagnosticsByRule, err := s.loadRuleCertificateBalanceDiagnostics(rules)
-	if err != nil {
-		warnings = append(warnings, "reverse proxy certificate balance diagnostics unavailable: "+strings.TrimSpace(err.Error()))
-		balanceDiagnosticsByRule = make(map[uint][]ReverseProxyCertificateBalanceDiagnostic)
-	}
-	connectionCounts := reverseProxySnapshotConnectionCounts(reverseProxyRuntime.groups)
-	views := make([]ReverseProxyRuleView, 0, len(rules))
-	enabledCount := 0
-	for i := range rules {
-		if rules[i].Enabled {
-			enabledCount++
-		}
-		views = append(views, buildReverseProxyRuleView(&rules[i], certMap, connectionCounts[rules[i].Id], balanceDiagnosticsByRule[rules[i].Id]))
-	}
+	runtimeError := reverseProxyRuntime.reconcileError
 	lastSyncAt := int64(0)
 	if !reverseProxyRuntime.state.lastSyncAt.IsZero() {
 		lastSyncAt = reverseProxyRuntime.state.lastSyncAt.Unix()
 	}
-	listenerCount := reverseProxyListenerCount(reverseProxyRuntime.groups) + reverseProxyDNSRuntime.listenerCount()
-	overview := &ReverseProxyOverview{
-		Available:        reverseProxySupported(),
-		Started:          listenerCount > 0,
-		ListenerCount:    listenerCount,
-		EnabledCount:     enabledCount,
-		RuleCount:        len(rules),
-		CertificateCount: len(certOptions),
-		LastSyncAt:       lastSyncAt,
-		Certificates:     certOptions,
-		Rules:            views,
-		Warnings:         warnings,
+	reverseProxyRuntime.mu.Unlock()
+	connectionCounts := reverseProxySnapshotConnectionCounts(groups)
+	runtimeStates := reverseProxyRuntime.snapshotRuleStates()
+	views := make([]ReverseProxyRuntimeRuleStateView, 0, len(runtimeStates)+len(connectionCounts))
+	ids := make(map[uint]struct{}, len(runtimeStates)+len(connectionCounts))
+	for ruleID := range runtimeStates {
+		ids[ruleID] = struct{}{}
 	}
-	if reverseProxyRuntime.reconcileError != "" {
-		overview.Error = reverseProxyRuntime.reconcileError
+	for ruleID := range connectionCounts {
+		ids[ruleID] = struct{}{}
+	}
+	for ruleID := range ids {
+		state := runtimeStates[ruleID]
+		counts := connectionCounts[ruleID]
+		views = append(views, ReverseProxyRuntimeRuleStateView{
+			ID:                      ruleID,
+			RuntimeStatus:           state.status,
+			LastError:               state.lastError,
+			LocalConnectionCount:    counts.LocalOpen,
+			UpstreamConnectionCount: counts.UpstreamOpen,
+		})
+	}
+	sort.Slice(views, func(i, j int) bool { return views[i].ID < views[j].ID })
+	listenerCount := reverseProxyListenerCount(groups) + reverseProxyDNSRuntime.listenerCount()
+	overview := ReverseProxyRuntimeOverview{
+		Revision:      revision,
+		Available:     reverseProxySupported(),
+		Started:       listenerCount > 0,
+		ListenerCount: listenerCount,
+		LastSyncAt:    lastSyncAt,
+		Rules:         views,
+		Resources:     reverseProxyResources.runtimeUsage(),
+		Warnings:      warnings,
+	}
+	if runtimeError != "" {
+		overview.Error = runtimeError
 	}
 	if !overview.Available {
 		overview.Error = "reverse proxy runtime is unavailable on this system"
 	}
-	return overview, nil
+	return overview
 }
 
 func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error {
@@ -585,19 +1310,24 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 	if err != nil {
 		return err
 	}
+	// Resolution can take seconds and must never hold the single SQLite
+	// connection inside a transaction.  Runtime resolution remains a second
+	// safety net for targets whose DNS answer changes after this preflight.
+	if err := s.preflightNormalizedRule(normalized); err != nil {
+		return err
+	}
 
-	savedRow := model.ReverseProxyRule{}
-	previousRow := model.ReverseProxyRule{}
-	hadPrevious := false
 	err = db.Transaction(func(tx *gorm.DB) error {
+		settings, err := reverseProxyExpectedRevision(tx, payload.ExpectedRevision)
+		if err != nil {
+			return err
+		}
 		existing := &model.ReverseProxyRule{}
 		isNew := normalized.id == 0
 		if !isNew {
 			if err := tx.Where("id = ?", normalized.id).First(existing).Error; err != nil {
 				return err
 			}
-			previousRow = *existing
-			hadPrevious = true
 		}
 		if err := s.validateNormalizedRule(tx, normalized); err != nil {
 			return err
@@ -622,8 +1352,6 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 		row.Enabled = normalized.enabled
 		row.ListenProtocol = normalized.listenProtocol
 		row.ListenProtocolAlias = normalized.listenProtocolAlias
-		row.ListenIP = ""
-		row.ListenIPList = encodeReverseProxyList(normalized.listenIPs)
 		row.ListenPort = normalized.listenPort
 		row.HostList = encodeReverseProxyList(normalized.hosts)
 		row.PathPrefix = normalized.pathPrefix
@@ -634,6 +1362,15 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 		row.TargetPort = normalized.targetPort
 		row.TargetPath = normalized.targetPath
 		row.TargetDNSPath = normalized.targetDNSPath
+		row.FallbackDNSUpstreams = normalized.fallbackDNSUpstreams
+		row.DNSUpstreamTimeoutSeconds = normalized.dnsUpstreamTimeoutSeconds
+		row.DNSCacheEnabled = normalized.dnsCacheEnabled
+		row.DNSCacheSizeBytes = normalized.dnsCacheSizeBytes
+		row.DNSCacheMinTTL = normalized.dnsCacheMinTTL
+		row.DNSCacheMaxTTL = normalized.dnsCacheMaxTTL
+		row.DNSAllowedCIDRs = encodeReverseProxyList(normalized.dnsAllowedCIDRs)
+		row.DNSRateLimitQPS = normalized.dnsRateLimitQPS
+		row.DNSMaxConcurrentQueries = normalized.dnsMaxConcurrentQueries
 		row.EDNSEnabled = normalized.ednsEnabled
 		row.EDNSMode = normalized.ednsMode
 		row.EDNSCustomIP = normalized.ednsCustomIP
@@ -646,10 +1383,20 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 		row.IPStrategy = normalized.ipStrategy
 		row.HTTPVersionStrategy = normalized.httpVersionStrategy
 		row.UpstreamTLSVerify = normalized.upstreamTLSVerify
+		row.MaxConcurrentConnections = normalized.maxConcurrentConnections
+		row.MaxConcurrentRequests = normalized.maxConcurrentRequests
+		row.UpstreamMaxConnections = normalized.upstreamMaxConnections
+		row.UpstreamMaxIdleConnections = normalized.upstreamMaxIdleConnections
+		row.MemoryLimitBytes = normalized.memoryLimitBytes
 		row.ApiPassthrough = normalized.apiPassthrough
+		row.AdvertiseHTTP3 = normalized.advertiseHTTP3
 		row.Remark = normalized.remark
-		if row.RuntimeStatus == "" {
+		if row.Enabled {
 			row.RuntimeStatus = "pending"
+			row.LastError = ""
+		} else {
+			row.RuntimeStatus = "disabled"
+			row.LastError = ""
 		}
 		if isNew {
 			createValues := reverseProxyRulePersistenceMap(row)
@@ -666,33 +1413,111 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 				return err
 			}
 		}
-		savedRow = *row
-		return nil
+		if err := validatePortForwardListenerClaimsAgainstActiveRules(tx); err != nil {
+			return err
+		}
+		return reverseProxyBumpRevisionTx(tx, settings)
 	})
 	if err != nil {
 		return err
 	}
 	if err := s.syncAllRuntimeNow(); err != nil {
-		if hadPrevious {
-			restoreErr := db.Model(&model.ReverseProxyRule{}).
-				Where("id = ?", previousRow.Id).
-				Updates(reverseProxyRulePersistenceMap(&previousRow)).Error
-			if restoreErr != nil {
-				logger.Warning("reverse proxy rule rollback failed: ", restoreErr)
-			}
-		} else {
-			restoreErr := db.Where("id = ?", savedRow.Id).Delete(&model.ReverseProxyRule{}).Error
-			if restoreErr != nil {
-				logger.Warning("reverse proxy rule create rollback failed: ", restoreErr)
-			}
-		}
-		_ = s.syncAllRuntimeNow()
-		return err
+		logger.Warning("reverse proxy runtime apply after rule save failed: ", err)
 	}
 	return nil
 }
 
+func (s *ReverseProxyService) SetRuleEnabled(payload ReverseProxyRuleStatusPayload) (*ReverseProxyRuleStatusResult, error) {
+	if payload.ID == 0 {
+		return nil, common.NewError("id is required")
+	}
+	if payload.ExpectedRevision == nil {
+		return nil, common.NewError("expectedRevision is required")
+	}
+	db := database.GetDB()
+	if db == nil {
+		return nil, common.NewError("database is not ready")
+	}
+
+	var normalized reverseProxyNormalizedRule
+	if payload.Enabled {
+		row := &model.ReverseProxyRule{}
+		if err := db.Where("id = ?", payload.ID).First(row).Error; err != nil {
+			return nil, err
+		}
+		var err error
+		normalized, err = s.normalizeRulePayload(reverseProxyRulePayloadFromModel(row, true))
+		if err != nil {
+			return nil, err
+		}
+		if err := s.preflightNormalizedRule(normalized); err != nil {
+			return nil, err
+		}
+	}
+
+	result := &ReverseProxyRuleStatusResult{ID: payload.ID, Enabled: payload.Enabled}
+	changed := false
+	err := db.Transaction(func(tx *gorm.DB) error {
+		settings, err := reverseProxyExpectedRevision(tx, payload.ExpectedRevision)
+		if err != nil {
+			return err
+		}
+		row := &model.ReverseProxyRule{}
+		if err := tx.Where("id = ?", payload.ID).First(row).Error; err != nil {
+			return err
+		}
+		if row.Enabled == payload.Enabled {
+			result.Revision = settings.Revision
+			return nil
+		}
+		if payload.Enabled {
+			if err := s.validateNormalizedRule(tx, normalized); err != nil {
+				return err
+			}
+		}
+		status := "disabled"
+		if payload.Enabled {
+			status = "pending"
+		}
+		if err := tx.Model(&model.ReverseProxyRule{}).Where("id = ?", payload.ID).Updates(map[string]interface{}{
+			"enabled":        payload.Enabled,
+			"runtime_status": status,
+			"last_error":     "",
+		}).Error; err != nil {
+			return err
+		}
+		if payload.Enabled {
+			if err := validatePortForwardListenerClaimsAgainstActiveRules(tx); err != nil {
+				return err
+			}
+		}
+		if err := reverseProxyBumpRevisionTx(tx, settings); err != nil {
+			return err
+		}
+		changed = true
+		result.Revision = settings.Revision
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if changed {
+		if err := s.syncAllRuntimeNow(); err != nil {
+			logger.Warning("reverse proxy runtime apply after rule status change failed: ", err)
+		}
+	}
+	return result, nil
+}
+
 func (s *ReverseProxyService) DeleteRule(id uint) error {
+	return s.deleteRule(id, nil)
+}
+
+func (s *ReverseProxyService) DeleteRuleWithRevision(payload ReverseProxyRuleDeletePayload) error {
+	return s.deleteRule(payload.ID, payload.ExpectedRevision)
+}
+
+func (s *ReverseProxyService) deleteRule(id uint, expectedRevision *uint64) error {
 	if id == 0 {
 		return common.NewError("id is required")
 	}
@@ -700,30 +1525,161 @@ func (s *ReverseProxyService) DeleteRule(id uint) error {
 	if db == nil {
 		return common.NewError("database is not ready")
 	}
-	deletedRow := model.ReverseProxyRule{}
 	err := db.Transaction(func(tx *gorm.DB) error {
+		settings, err := reverseProxyExpectedRevision(tx, expectedRevision)
+		if err != nil {
+			return err
+		}
 		row := &model.ReverseProxyRule{}
 		if err := tx.Where("id = ?", id).First(row).Error; err != nil {
 			return err
 		}
-		deletedRow = *row
 		if err := tx.Delete(row).Error; err != nil {
 			return err
 		}
-		return nil
+		return reverseProxyBumpRevisionTx(tx, settings)
 	})
 	if err != nil {
 		return err
 	}
 	if err := s.syncAllRuntimeNow(); err != nil {
-		restoreErr := db.Create(&deletedRow).Error
-		if restoreErr != nil {
-			logger.Warning("reverse proxy rule delete rollback failed: ", restoreErr)
+		logger.Warning("reverse proxy runtime apply after rule delete failed: ", err)
+	}
+	reverseProxyRuntime.clearRuleState(id)
+	return nil
+}
+
+func updateReverseProxyListOrdersTx(tx *gorm.DB, orders map[uint]int64) error {
+	if tx == nil || len(orders) == 0 {
+		return nil
+	}
+	ids := make([]uint, 0, len(orders))
+	for id := range orders {
+		if id != 0 {
+			ids = append(ids, id)
 		}
-		_ = s.syncAllRuntimeNow()
-		return err
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	const chunkSize = 300
+	for start := 0; start < len(ids); start += chunkSize {
+		end := start + chunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		query := "CASE id"
+		args := make([]interface{}, 0, len(chunk)*2)
+		for _, id := range chunk {
+			query += " WHEN ? THEN ?"
+			args = append(args, id, orders[id])
+		}
+		query += " ELSE list_order END"
+		result := tx.Model(&model.ReverseProxyRule{}).
+			Where("id IN ?", chunk).
+			UpdateColumn("list_order", gorm.Expr(query, args...))
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != int64(len(chunk)) {
+			return common.NewError("reorder ids mismatch current rules")
+		}
 	}
 	return nil
+}
+
+func (s *ReverseProxyService) MoveRule(payload ReverseProxyRuleMovePayload) (*ReverseProxyRuleMoveResult, error) {
+	if payload.ID == 0 {
+		return nil, common.NewError("id is required")
+	}
+	if payload.Direction != -1 && payload.Direction != 1 {
+		return nil, common.NewError("direction must be -1 or 1")
+	}
+	if payload.ExpectedRevision == nil {
+		return nil, common.NewError("expectedRevision is required")
+	}
+	db := database.GetDB()
+	if db == nil {
+		return nil, common.NewError("database is not ready")
+	}
+	result := &ReverseProxyRuleMoveResult{ID: payload.ID}
+	changed := false
+	err := db.Transaction(func(tx *gorm.DB) error {
+		settings, err := reverseProxyExpectedRevision(tx, payload.ExpectedRevision)
+		if err != nil {
+			return err
+		}
+		current := &model.ReverseProxyRule{}
+		if err := tx.Where("id = ?", payload.ID).First(current).Error; err != nil {
+			return err
+		}
+		neighbor := &model.ReverseProxyRule{}
+		query := tx.Model(&model.ReverseProxyRule{})
+		if payload.Direction < 0 {
+			query = query.Where("list_order < ? OR (list_order = ? AND id < ?)", current.ListOrder, current.ListOrder, current.Id).
+				Order("list_order DESC, id DESC")
+		} else {
+			query = query.Where("list_order > ? OR (list_order = ? AND id > ?)", current.ListOrder, current.ListOrder, current.Id).
+				Order("list_order ASC, id ASC")
+		}
+		findErr := query.First(neighbor).Error
+		if database.IsNotFound(findErr) {
+			result.Revision = settings.Revision
+			return nil
+		}
+		if findErr != nil {
+			return findErr
+		}
+		orders := map[uint]int64{
+			current.Id:  neighbor.ListOrder,
+			neighbor.Id: current.ListOrder,
+		}
+		if current.ListOrder == neighbor.ListOrder {
+			rules := make([]model.ReverseProxyRule, 0)
+			if err := tx.Order("list_order ASC, id ASC").Find(&rules).Error; err != nil {
+				return err
+			}
+			index := -1
+			for i := range rules {
+				if rules[i].Id == current.Id {
+					index = i
+					break
+				}
+			}
+			nextIndex := index + payload.Direction
+			if index < 0 || nextIndex < 0 || nextIndex >= len(rules) {
+				result.Revision = settings.Revision
+				return nil
+			}
+			rules[index], rules[nextIndex] = rules[nextIndex], rules[index]
+			orders = make(map[uint]int64, len(rules))
+			for i := range rules {
+				nextOrder := int64(i + 1)
+				if rules[i].ListOrder != nextOrder {
+					orders[rules[i].Id] = nextOrder
+				}
+			}
+			neighbor = &rules[index]
+		}
+		if err := updateReverseProxyListOrdersTx(tx, orders); err != nil {
+			return err
+		}
+		if err := reverseProxyBumpRevisionTx(tx, settings); err != nil {
+			return err
+		}
+		changed = true
+		result.Revision = settings.Revision
+		result.AdjacentID = neighbor.Id
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if changed {
+		if err := s.syncAllRuntimeNow(); err != nil {
+			logger.Warning("reverse proxy runtime apply after rule move failed: ", err)
+		}
+	}
+	return result, nil
 }
 
 func (s *ReverseProxyService) ReorderRules(payload ReverseProxyRuleReorderPayload) error {
@@ -735,6 +1691,10 @@ func (s *ReverseProxyService) ReorderRules(payload ReverseProxyRuleReorderPayloa
 		return common.NewError("database is not ready")
 	}
 	err := db.Transaction(func(tx *gorm.DB) error {
+		settings, err := reverseProxyExpectedRevision(tx, payload.ExpectedRevision)
+		if err != nil {
+			return err
+		}
 		rules, err := s.loadRulesLocked(tx)
 		if err != nil {
 			return err
@@ -752,39 +1712,92 @@ func (s *ReverseProxyService) ReorderRules(payload ReverseProxyRuleReorderPayloa
 			}
 			orderMap[id] = int64(idx + 1)
 		}
+		changedOrders := make(map[uint]int64)
 		for i := range rules {
 			nextOrder, ok := orderMap[rules[i].Id]
 			if !ok {
 				return common.NewError("reorder ids mismatch current rules")
 			}
-			if err := tx.Model(&model.ReverseProxyRule{}).Where("id = ?", rules[i].Id).Update("list_order", nextOrder).Error; err != nil {
-				return err
+			if rules[i].ListOrder != nextOrder {
+				changedOrders[rules[i].Id] = nextOrder
 			}
 		}
-		return nil
+		if err := updateReverseProxyListOrdersTx(tx, changedOrders); err != nil {
+			return err
+		}
+		return reverseProxyBumpRevisionTx(tx, settings)
 	})
 	if err != nil {
 		return err
 	}
-	return s.syncAllRuntimeNow()
+	if err := s.syncAllRuntimeNow(); err != nil {
+		logger.Warning("reverse proxy runtime apply after reorder failed: ", err)
+	}
+	return nil
 }
 
-func (s *ReverseProxyService) SyncIfNeeded(minGap time.Duration) error {
-	if err := s.MaintainCertificateBalance(false); err != nil {
-		return err
-	}
+func (s *ReverseProxyService) SyncIfNeeded(minGap time.Duration) (syncErr error) {
+	// A cron reconciliation can observe a revision written outside this API
+	// process (for example during a controlled database restore).  Refresh the
+	// heavyweight configuration snapshot only when its in-memory revision is
+	// behind the reconciled runtime; normal cron ticks remain SQLite-free after
+	// the tiny revision probe.
+	defer func() {
+		if snapshotErr := s.refreshReverseProxyConfigurationSnapshotIfStale(); snapshotErr != nil && syncErr == nil {
+			syncErr = snapshotErr
+		}
+	}()
 	if err := reverseProxyRuntime.SyncIfNeeded(s, minGap); err != nil {
 		return err
 	}
-	rows, err := s.loadRulesLocked(database.GetDB())
-	if err != nil {
-		return err
+	if minGap > 0 {
+		revision, err := s.peekReverseProxyRevision()
+		if err != nil {
+			return err
+		}
+		if !reverseProxyDNSRuntime.needsSync(revision, time.Now()) {
+			return nil
+		}
 	}
-	return syncReverseProxyDNSRuntime(s, rows)
+	loaded := reverseProxyRuntime.loadedConfigurationSnapshot()
+	if loaded == nil {
+		var err error
+		loaded, err = s.loadReverseProxyLoadedConfiguration()
+		if err != nil {
+			return err
+		}
+	}
+	return syncReverseProxyDNSRuntime(s, loaded.Rules)
+}
+
+func (s *ReverseProxyService) refreshReverseProxyConfigurationSnapshotIfStale() error {
+	if s == nil {
+		return nil
+	}
+	reverseProxyRuntime.mu.Lock()
+	runtimeRevision := reverseProxyRuntime.state.revision
+	reverseProxyRuntime.mu.Unlock()
+	if runtimeRevision == 0 {
+		return nil
+	}
+	reverseProxyRuntime.overviewMu.RLock()
+	snapshotRevision := uint64(0)
+	if reverseProxyRuntime.configuration != nil {
+		snapshotRevision = reverseProxyRuntime.configuration.Revision
+	}
+	reverseProxyRuntime.overviewMu.RUnlock()
+	if snapshotRevision == runtimeRevision {
+		return nil
+	}
+	loaded := reverseProxyRuntime.loadedConfigurationSnapshot()
+	if loaded == nil || loaded.Settings.Revision != runtimeRevision {
+		return s.refreshReverseProxyConfigurationSnapshot()
+	}
+	return s.publishReverseProxyConfigurationSnapshot(&loaded.Settings, loaded.Rules)
 }
 
 func (s *ReverseProxyService) StartRuntime() error {
-	if err := s.MaintainCertificateBalance(true); err != nil {
+	if err := s.CertificateInventoryService.BackfillIssuedAlgorithms(100); err != nil {
 		return err
 	}
 	if err := s.resetRuntimeStateForStartup(); err != nil {
@@ -793,16 +1806,27 @@ func (s *ReverseProxyService) StartRuntime() error {
 	if err := reverseProxyRuntime.SyncNow(s); err != nil {
 		return err
 	}
-	rows, err := s.loadRulesLocked(database.GetDB())
-	if err != nil {
+	loaded := reverseProxyRuntime.loadedConfigurationSnapshot()
+	if loaded == nil {
+		var err error
+		loaded, err = s.loadReverseProxyLoadedConfiguration()
+		if err != nil {
+			return err
+		}
+	}
+	if err := syncReverseProxyDNSRuntime(s, loaded.Rules); err != nil {
 		return err
 	}
-	return syncReverseProxyDNSRuntime(s, rows)
+	return s.publishReverseProxyConfigurationSnapshot(&loaded.Settings, loaded.Rules)
 }
 
 func (s *ReverseProxyService) StopRuntime() error {
 	httpErr := reverseProxyRuntime.Stop()
 	dnsErr := stopReverseProxyDNSRuntime()
+	reverseProxyRuntime.resetRuleStates()
+	reverseProxyRuntime.overviewMu.Lock()
+	reverseProxyRuntime.configuration = nil
+	reverseProxyRuntime.overviewMu.Unlock()
 	if httpErr != nil {
 		return httpErr
 	}
@@ -810,22 +1834,41 @@ func (s *ReverseProxyService) StopRuntime() error {
 }
 
 func (s *ReverseProxyService) syncAllRuntimeNow() error {
-	if err := reverseProxyRuntime.SyncNow(s); err != nil {
-		return err
+	httpErr := reverseProxyRuntime.SyncNow(s)
+	loaded := reverseProxyRuntime.loadedConfigurationSnapshot()
+	if loaded == nil || httpErr != nil {
+		var loadErr error
+		loaded, loadErr = s.loadReverseProxyLoadedConfiguration()
+		if loadErr != nil {
+			return errors.Join(httpErr, loadErr)
+		}
 	}
-	rows, err := s.loadRulesLocked(database.GetDB())
-	if err != nil {
-		return err
+	dnsErr := syncReverseProxyDNSRuntime(s, loaded.Rules)
+	var retryHTTPErr error
+	// HTTP reconciliation runs first so HTTP -> DNS changes can release their
+	// TCP socket before DNS binds it. The inverse transition releases the old
+	// DNS listener during the DNS pass, so retry a failed HTTP bind once now
+	// instead of leaving a saved protocol switch pending until the cron retry.
+	if httpErr == nil && reverseProxyRuntime.hasPendingReconcile() {
+		retryHTTPErr = reverseProxyRuntime.SyncNow(s)
 	}
-	return syncReverseProxyDNSRuntime(s, rows)
+	snapshotErr := s.publishReverseProxyConfigurationSnapshot(&loaded.Settings, loaded.Rules)
+	return errors.Join(httpErr, dnsErr, retryHTTPErr, snapshotErr)
+}
+
+func (s *ReverseProxyService) SyncCertificateInventoryNow() error {
+	if s == nil {
+		s = &ReverseProxyService{}
+	}
+	return s.syncAllRuntimeNow()
 }
 
 func (s *ReverseProxyService) resetRuntimeStateForStartup() error {
+	reverseProxyRuntime.resetRuleStates()
 	db := database.GetDB()
 	if db == nil {
 		return nil
 	}
-
 	if err := db.Session(&gormSessionAllowAll).Model(&model.ReverseProxyRule{}).Updates(map[string]interface{}{
 		"last_error":     "",
 		"runtime_status": "",
@@ -840,18 +1883,27 @@ func (s *ReverseProxyService) loadRulesLocked(db *gorm.DB) ([]model.ReverseProxy
 	if db == nil {
 		return rows, nil
 	}
-	if err := s.repairDisplayIDsTx(db); err != nil {
+	if err := db.Order("id asc").Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	if err := db.Order("list_order asc, id asc").Find(&rows).Error; err != nil {
+	if err := repairReverseProxyRowsTx(db, rows); err != nil {
 		return nil, err
 	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].ListOrder == rows[j].ListOrder {
+			return rows[i].Id < rows[j].Id
+		}
+		return rows[i].ListOrder < rows[j].ListOrder
+	})
 	return rows, nil
 }
 
 func (s *ReverseProxyService) listCertificateOptions() ([]ReverseProxyCertificateOption, map[uint]ReverseProxyCertificateOption, error) {
-	rows, err := s.CertificateInventoryService.List()
-	if err != nil {
+	rows := make([]model.CertificateRecord, 0)
+	if err := database.GetDB().
+		Select("id", "display_id", "main_domain", "domain_set", "not_after", "last_error", "list_order_at").
+		Order("list_order_at DESC, id DESC").
+		Find(&rows).Error; err != nil {
 		return nil, nil, err
 	}
 	options := make([]ReverseProxyCertificateOption, 0, len(rows))
@@ -863,10 +1915,10 @@ func (s *ReverseProxyService) listCertificateOptions() ([]ReverseProxyCertificat
 		option := ReverseProxyCertificateOption{
 			ID:         rows[i].Id,
 			DisplayID:  rows[i].DisplayID,
-			MainDomain: rows[i].MainDomain,
-			Domains:    append([]string(nil), rows[i].Domains...),
+			MainDomain: strings.TrimSpace(rows[i].MainDomain),
+			Domains:    decodeCertificateDomains(rows[i].DomainSet),
 			NotAfter:   rows[i].NotAfter,
-			Status:     rows[i].Status,
+			Status:     certificateStatus(&rows[i]),
 		}
 		options = append(options, option)
 		byID[option.ID] = option
@@ -879,49 +1931,69 @@ func buildReverseProxyRuleView(row *model.ReverseProxyRule, certMap map[uint]Rev
 	if row == nil {
 		return view
 	}
-	listenIPs := decodeReverseProxyListenIPs(row)
 	hosts := reverseProxyRuleServerNames(row)
 	certIDs := reverseProxyRuleCertificateIDs(row)
 	view = ReverseProxyRuleView{
-		ID:                        row.Id,
-		DisplayID:                 row.DisplayID,
-		ListOrder:                 row.ListOrder,
-		Name:                      strings.TrimSpace(row.Name),
-		Enabled:                   row.Enabled,
-		ListenProtocol:            strings.TrimSpace(row.ListenProtocol),
-		ListenProtocolAlias:       strings.TrimSpace(row.ListenProtocolAlias),
-		ListenIP:                  strings.TrimSpace(row.ListenIP),
-		ListenIPs:                 listenIPs,
-		ListenPort:                row.ListenPort,
-		Hosts:                     hosts,
-		PathPrefix:                strings.TrimSpace(row.PathPrefix),
-		ListenDNSPath:             strings.TrimSpace(row.ListenDNSPath),
-		TargetProtocol:            strings.TrimSpace(row.TargetProtocol),
-		TargetProtocolAlias:       strings.TrimSpace(row.TargetProtocolAlias),
-		TargetAddresses:           decodeReverseProxyList(row.TargetAddresses),
-		TargetPort:                row.TargetPort,
-		TargetPath:                strings.TrimSpace(row.TargetPath),
-		TargetDNSPath:             strings.TrimSpace(row.TargetDNSPath),
-		EDNSEnabled:               row.EDNSEnabled,
-		EDNSMode:                  strings.TrimSpace(row.EDNSMode),
-		EDNSCustomIP:              strings.TrimSpace(row.EDNSCustomIP),
-		EDNSClientSubnetPolicy:    strings.TrimSpace(row.EDNSClientSubnetPolicy),
-		DisableIPv4Answer:         row.DisableIPv4Answer,
-		DisableIPv6Answer:         row.DisableIPv6Answer,
-		CertificateRecordIDs:      append([]uint(nil), certIDs...),
-		ListenHTTPVersionStrategy: strings.TrimSpace(row.ListenHTTPVersionStrategy),
-		IPStrategy:                strings.TrimSpace(row.IPStrategy),
-		HTTPVersionStrategy:       strings.TrimSpace(row.HTTPVersionStrategy),
-		UpstreamTLSVerify:         row.UpstreamTLSVerify,
-		ApiPassthrough:            row.ApiPassthrough,
-		Remark:                    strings.TrimSpace(row.Remark),
-		LastError:                 strings.TrimSpace(row.LastError),
-		RuntimeStatus:             strings.TrimSpace(row.RuntimeStatus),
-		LocalConnectionCount:      counts.LocalOpen,
-		UpstreamConnectionCount:   counts.UpstreamOpen,
-		CertificateBalance:        append([]ReverseProxyCertificateBalanceDiagnostic(nil), balance...),
-		UpdatedAt:                 row.UpdatedAt.Unix(),
-		CreatedAt:                 row.CreatedAt.Unix(),
+		ID:                         row.Id,
+		DisplayID:                  row.DisplayID,
+		ListOrder:                  row.ListOrder,
+		Name:                       strings.TrimSpace(row.Name),
+		Enabled:                    row.Enabled,
+		ListenProtocol:             strings.TrimSpace(row.ListenProtocol),
+		ListenProtocolAlias:        strings.TrimSpace(row.ListenProtocolAlias),
+		ListenPort:                 row.ListenPort,
+		Hosts:                      hosts,
+		PathPrefix:                 strings.TrimSpace(row.PathPrefix),
+		ListenDNSPath:              strings.TrimSpace(row.ListenDNSPath),
+		TargetProtocol:             strings.TrimSpace(row.TargetProtocol),
+		TargetProtocolAlias:        strings.TrimSpace(row.TargetProtocolAlias),
+		TargetAddresses:            decodeReverseProxyList(row.TargetAddresses),
+		TargetPort:                 row.TargetPort,
+		TargetPath:                 strings.TrimSpace(row.TargetPath),
+		TargetDNSPath:              strings.TrimSpace(row.TargetDNSPath),
+		FallbackDNSUpstreams:       strings.TrimSpace(row.FallbackDNSUpstreams),
+		DNSUpstreamTimeoutSeconds:  reverseProxyDNSUpstreamTimeoutSeconds(row.DNSUpstreamTimeoutSeconds),
+		DNSCacheEnabled:            row.DNSCacheEnabled,
+		DNSCacheSizeBytes:          reverseProxyDNSCacheSizeBytes(row.DNSCacheSizeBytes),
+		DNSCacheMinTTL:             row.DNSCacheMinTTL,
+		DNSCacheMaxTTL:             row.DNSCacheMaxTTL,
+		DNSAllowedCIDRs:            decodeReverseProxyList(row.DNSAllowedCIDRs),
+		DNSRateLimitQPS:            reverseProxyDNSRateLimitQPS(row.DNSRateLimitQPS),
+		DNSMaxConcurrentQueries:    reverseProxyDNSMaxConcurrentQueries(row.DNSMaxConcurrentQueries),
+		EDNSEnabled:                row.EDNSEnabled,
+		EDNSMode:                   strings.TrimSpace(row.EDNSMode),
+		EDNSCustomIP:               strings.TrimSpace(row.EDNSCustomIP),
+		EDNSClientSubnetPolicy:     strings.TrimSpace(row.EDNSClientSubnetPolicy),
+		DisableIPv4Answer:          row.DisableIPv4Answer,
+		DisableIPv6Answer:          row.DisableIPv6Answer,
+		CertificateRecordIDs:       append([]uint(nil), certIDs...),
+		ListenHTTPVersionStrategy:  strings.TrimSpace(row.ListenHTTPVersionStrategy),
+		IPStrategy:                 strings.TrimSpace(row.IPStrategy),
+		HTTPVersionStrategy:        strings.TrimSpace(row.HTTPVersionStrategy),
+		UpstreamTLSVerify:          row.UpstreamTLSVerify,
+		MaxConcurrentConnections:   reverseProxyRuleLimit(row.MaxConcurrentConnections),
+		MaxConcurrentRequests:      reverseProxyMaxConcurrentRequests(row.MaxConcurrentRequests),
+		UpstreamMaxConnections:     reverseProxyRuleLimit(row.UpstreamMaxConnections),
+		UpstreamMaxIdleConnections: reverseProxyRuleLimit(row.UpstreamMaxIdleConnections),
+		MemoryLimitBytes:           row.MemoryLimitBytes,
+		ApiPassthrough:             row.ApiPassthrough,
+		AdvertiseHTTP3:             row.AdvertiseHTTP3,
+		Remark:                     strings.TrimSpace(row.Remark),
+		LastError:                  strings.TrimSpace(row.LastError),
+		RuntimeStatus:              strings.TrimSpace(row.RuntimeStatus),
+		LocalConnectionCount:       counts.LocalOpen,
+		UpstreamConnectionCount:    counts.UpstreamOpen,
+		CertificateBalance:         append([]ReverseProxyCertificateBalanceDiagnostic(nil), balance...),
+		UpdatedAt:                  row.UpdatedAt.Unix(),
+		CreatedAt:                  row.CreatedAt.Unix(),
+	}
+	if !row.Enabled {
+		view.RuntimeStatus = "disabled"
+		view.LastError = ""
+		view.LocalConnectionCount = 0
+		view.UpstreamConnectionCount = 0
+	} else if view.RuntimeStatus == "" {
+		view.RuntimeStatus = "pending"
 	}
 	if normalizedListenStrategy, err := normalizeReverseProxyListenHTTPVersionStrategy(row.ListenHTTPVersionStrategy, row.ListenProtocol); err == nil {
 		view.ListenHTTPVersionStrategy = normalizedListenStrategy
@@ -943,7 +2015,7 @@ func buildReverseProxyRuleView(row *model.ReverseProxyRule, certMap map[uint]Rev
 	view.CertificateLabels = certLabels
 	if len(certLabels) > 0 {
 		view.CertificateLabel = strings.Join(certLabels, ", ")
-		view.CertificateHints = buildReverseProxyCertificateHints(view.ListenIPs, view.Hosts, hintCerts)
+		view.CertificateHints = buildReverseProxyCertificateHints(view.Hosts, hintCerts)
 	}
 	return view
 }
@@ -953,71 +2025,209 @@ func reverseProxyRulePersistenceMap(row *model.ReverseProxyRule) map[string]inte
 		return map[string]interface{}{}
 	}
 	return map[string]interface{}{
-		"display_id":                   row.DisplayID,
-		"list_order":                   row.ListOrder,
-		"name":                         row.Name,
-		"enabled":                      row.Enabled,
-		"listen_protocol":              row.ListenProtocol,
-		"listen_protocol_alias":        row.ListenProtocolAlias,
-		"listen_ip":                    row.ListenIP,
-		"listen_ip_list":               row.ListenIPList,
-		"listen_port":                  row.ListenPort,
-		"host_list":                    row.HostList,
-		"path_prefix":                  row.PathPrefix,
-		"listen_dns_path":              row.ListenDNSPath,
-		"target_protocol":              row.TargetProtocol,
-		"target_protocol_alias":        row.TargetProtocolAlias,
-		"target_addresses":             row.TargetAddresses,
-		"target_port":                  row.TargetPort,
-		"target_path":                  row.TargetPath,
-		"target_dns_path":              row.TargetDNSPath,
-		"edns_enabled":                 row.EDNSEnabled,
-		"edns_mode":                    row.EDNSMode,
-		"edns_custom_ip":               row.EDNSCustomIP,
-		"edns_client_subnet_policy":    row.EDNSClientSubnetPolicy,
-		"disable_ipv4_answer":          row.DisableIPv4Answer,
-		"disable_ipv6_answer":          row.DisableIPv6Answer,
-		"certificate_record_list":      row.CertificateRecordList,
-		"certificate_record_id":        row.CertificateRecordID,
-		"listen_http_version_strategy": row.ListenHTTPVersionStrategy,
-		"ip_strategy":                  row.IPStrategy,
-		"http_version_strategy":        row.HTTPVersionStrategy,
-		"upstream_tls_verify":          row.UpstreamTLSVerify,
-		"api_passthrough":              row.ApiPassthrough,
-		"remark":                       row.Remark,
-		"last_error":                   row.LastError,
-		"runtime_status":               row.RuntimeStatus,
+		"display_id":                    row.DisplayID,
+		"list_order":                    row.ListOrder,
+		"name":                          row.Name,
+		"enabled":                       row.Enabled,
+		"listen_protocol":               row.ListenProtocol,
+		"listen_protocol_alias":         row.ListenProtocolAlias,
+		"listen_port":                   row.ListenPort,
+		"host_list":                     row.HostList,
+		"path_prefix":                   row.PathPrefix,
+		"listen_dns_path":               row.ListenDNSPath,
+		"target_protocol":               row.TargetProtocol,
+		"target_protocol_alias":         row.TargetProtocolAlias,
+		"target_addresses":              row.TargetAddresses,
+		"target_port":                   row.TargetPort,
+		"target_path":                   row.TargetPath,
+		"target_dns_path":               row.TargetDNSPath,
+		"fallback_dns_upstreams":        row.FallbackDNSUpstreams,
+		"dns_upstream_timeout_seconds":  row.DNSUpstreamTimeoutSeconds,
+		"dns_cache_enabled":             row.DNSCacheEnabled,
+		"dns_cache_size_bytes":          row.DNSCacheSizeBytes,
+		"dns_cache_min_ttl":             row.DNSCacheMinTTL,
+		"dns_cache_max_ttl":             row.DNSCacheMaxTTL,
+		"dns_allowed_cidrs":             row.DNSAllowedCIDRs,
+		"dns_rate_limit_qps":            row.DNSRateLimitQPS,
+		"dns_max_concurrent_queries":    row.DNSMaxConcurrentQueries,
+		"edns_enabled":                  row.EDNSEnabled,
+		"edns_mode":                     row.EDNSMode,
+		"edns_custom_ip":                row.EDNSCustomIP,
+		"edns_client_subnet_policy":     row.EDNSClientSubnetPolicy,
+		"disable_ipv4_answer":           row.DisableIPv4Answer,
+		"disable_ipv6_answer":           row.DisableIPv6Answer,
+		"certificate_record_list":       row.CertificateRecordList,
+		"certificate_record_id":         row.CertificateRecordID,
+		"listen_http_version_strategy":  row.ListenHTTPVersionStrategy,
+		"ip_strategy":                   row.IPStrategy,
+		"http_version_strategy":         row.HTTPVersionStrategy,
+		"upstream_tls_verify":           row.UpstreamTLSVerify,
+		"max_concurrent_connections":    row.MaxConcurrentConnections,
+		"max_concurrent_requests":       row.MaxConcurrentRequests,
+		"upstream_max_connections":      row.UpstreamMaxConnections,
+		"upstream_max_idle_connections": row.UpstreamMaxIdleConnections,
+		"memory_limit_bytes":            row.MemoryLimitBytes,
+		"api_passthrough":               row.ApiPassthrough,
+		"advertise_http3":               row.AdvertiseHTTP3,
+		"remark":                        row.Remark,
+		"last_error":                    row.LastError,
+		"runtime_status":                row.RuntimeStatus,
 	}
 }
 
-func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePayload) (reverseProxyNormalizedRule, error) {
-	listenIPInput := strings.TrimSpace(payload.ListenIPs)
-	if listenIPInput == "" {
-		listenIPInput = strings.TrimSpace(payload.ListenIP)
+func reverseProxyDNSUpstreamTimeoutSeconds(value int) int {
+	if value == 0 {
+		return reverseProxyDNSDefaultUpstreamTimeoutSeconds
 	}
-	legacyListenNames, err := normalizeReverseProxyLegacyListenNames(listenIPInput)
-	if err != nil {
-		return reverseProxyNormalizedRule{}, err
+	return value
+}
+
+func reverseProxyDNSCacheSizeBytes(value int) int {
+	if value == 0 {
+		return reverseProxyDNSDefaultCacheSizeBytes
+	}
+	return value
+}
+
+func reverseProxyDNSRateLimitQPS(value int) int {
+	if value <= 0 {
+		return reverseProxyDNSDefaultRateLimitQPS
+	}
+	return value
+}
+
+func reverseProxyDNSMaxConcurrentQueries(value int) int {
+	return reverseProxyRuleLimit(value)
+}
+
+func reverseProxyMaxConcurrentRequests(value int) int {
+	return reverseProxyRuleLimit(value)
+}
+
+func reverseProxyRuleLimit(value int) int {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func normalizeReverseProxyCIDRs(raw string) ([]string, error) {
+	parts := strings.FieldsFunc(strings.TrimSpace(raw), func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r' || r == '\t' || r == ' '
+	})
+	result := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, item := range parts {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(item))
+		if err != nil {
+			return nil, common.NewError("invalid dns allowed cidr: ", strings.TrimSpace(item))
+		}
+		prefix = prefix.Masked()
+		if prefix.Bits() == 0 {
+			return nil, common.NewError("dns allowed cidr must not allow the entire internet")
+		}
+		value := prefix.String()
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func validateReverseProxyDNSAdmissionSettings(row reverseProxyNormalizedRule) error {
+	if row.dnsRateLimitQPS < 1 || row.dnsRateLimitQPS > reverseProxyDNSMaxRateLimitQPS {
+		return common.NewError("dns rate limit qps must be between 1 and ", reverseProxyDNSMaxRateLimitQPS)
+	}
+	if row.dnsMaxConcurrentQueries < 0 || row.dnsMaxConcurrentQueries > reverseProxyDNSMaxConcurrentQueryLimit {
+		return common.NewError("dns max concurrent queries must be between 0 and ", reverseProxyDNSMaxConcurrentQueryLimit)
+	}
+	if row.maxConcurrentRequests < 0 || row.maxConcurrentRequests > reverseProxyMaxConcurrentRequestLimit {
+		return common.NewError("max concurrent requests must be between 0 and ", reverseProxyMaxConcurrentRequestLimit)
+	}
+	if len(row.dnsAllowedCIDRs) == 0 {
+		return common.NewError("dns wildcard listeners require at least one non-global allowed cidr")
+	}
+	return nil
+}
+
+func normalizeReverseProxyDNSUpstreamsText(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	value = strings.ReplaceAll(value, "\r", "\n")
+	lines := strings.Split(value, "\n")
+	for i := range lines {
+		lines[i] = strings.TrimSpace(lines[i])
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePayload) (reverseProxyNormalizedRule, error) {
+	dnsUpstreamTimeoutSeconds := reverseProxyDNSDefaultUpstreamTimeoutSeconds
+	if payload.DNSUpstreamTimeoutSeconds != nil {
+		dnsUpstreamTimeoutSeconds = *payload.DNSUpstreamTimeoutSeconds
+	}
+	dnsCacheSizeBytes := reverseProxyDNSDefaultCacheSizeBytes
+	if payload.DNSCacheSizeBytes != nil {
+		dnsCacheSizeBytes = *payload.DNSCacheSizeBytes
+	}
+	dnsRateLimitQPS := reverseProxyDNSDefaultRateLimitQPS
+	if payload.DNSRateLimitQPS != nil {
+		dnsRateLimitQPS = *payload.DNSRateLimitQPS
+	}
+	dnsMaxConcurrentQueries := 0
+	if payload.DNSMaxConcurrentQueries != nil {
+		dnsMaxConcurrentQueries = *payload.DNSMaxConcurrentQueries
+	}
+	maxConcurrentConnections := 0
+	if payload.MaxConcurrentConnections != nil {
+		maxConcurrentConnections = *payload.MaxConcurrentConnections
+	}
+	maxConcurrentRequests := 0
+	if payload.MaxConcurrentRequests != nil {
+		maxConcurrentRequests = *payload.MaxConcurrentRequests
+	}
+	upstreamMaxConnections := 0
+	if payload.UpstreamMaxConnections != nil {
+		upstreamMaxConnections = *payload.UpstreamMaxConnections
+	}
+	upstreamMaxIdleConnections := 0
+	if payload.UpstreamMaxIdleConnections != nil {
+		upstreamMaxIdleConnections = *payload.UpstreamMaxIdleConnections
+	}
+	memoryLimitBytes := int64(0)
+	if payload.MemoryLimitBytes != nil {
+		memoryLimitBytes = *payload.MemoryLimitBytes
 	}
 	listenNameInput := strings.TrimSpace(payload.Hosts)
-	if listenNameInput == "" && len(legacyListenNames) > 0 {
-		listenNameInput = strings.Join(legacyListenNames, ", ")
-	}
 	listenProtocolAliasInput := strings.ToLower(strings.TrimSpace(payload.ListenProtocolAlias))
 	targetProtocolAliasInput := strings.ToLower(strings.TrimSpace(payload.TargetProtocolAlias))
 	normalized := reverseProxyNormalizedRule{
-		id:                payload.ID,
-		name:              strings.TrimSpace(payload.Name),
-		enabled:           payload.Enabled,
-		listenPort:        payload.ListenPort,
-		targetPort:        payload.TargetPort,
-		upstreamTLSVerify: payload.UpstreamTLSVerify,
-		apiPassthrough:    payload.ApiPassthrough,
-		remark:            strings.TrimSpace(payload.Remark),
-		listenIPs:         extractReverseProxyLegacyListenIPs(listenIPInput),
-		ednsEnabled:       payload.EDNSEnabled,
-		disableIPv4Answer: payload.DisableIPv4Answer,
-		disableIPv6Answer: payload.DisableIPv6Answer,
+		id:                         payload.ID,
+		name:                       strings.TrimSpace(payload.Name),
+		enabled:                    payload.Enabled,
+		listenPort:                 payload.ListenPort,
+		targetPort:                 payload.TargetPort,
+		maxConcurrentConnections:   maxConcurrentConnections,
+		maxConcurrentRequests:      maxConcurrentRequests,
+		upstreamMaxConnections:     upstreamMaxConnections,
+		upstreamMaxIdleConnections: upstreamMaxIdleConnections,
+		memoryLimitBytes:           memoryLimitBytes,
+		apiPassthrough:             payload.ApiPassthrough,
+		advertiseHTTP3:             payload.AdvertiseHTTP3,
+		remark:                     strings.TrimSpace(payload.Remark),
+		fallbackDNSUpstreams:       normalizeReverseProxyDNSUpstreamsText(payload.FallbackDNSUpstreams),
+		dnsUpstreamTimeoutSeconds:  dnsUpstreamTimeoutSeconds,
+		dnsCacheEnabled:            payload.DNSCacheEnabled,
+		dnsCacheSizeBytes:          dnsCacheSizeBytes,
+		dnsCacheMinTTL:             payload.DNSCacheMinTTL,
+		dnsCacheMaxTTL:             payload.DNSCacheMaxTTL,
+		dnsRateLimitQPS:            dnsRateLimitQPS,
+		dnsMaxConcurrentQueries:    dnsMaxConcurrentQueries,
+		ednsEnabled:                payload.EDNSEnabled,
+		disableIPv4Answer:          payload.DisableIPv4Answer,
+		disableIPv6Answer:          payload.DisableIPv6Answer,
 	}
 	if normalized.name == "" {
 		normalized.name = buildReverseProxyDefaultName(payload.ListenProtocol, listenNameInput, payload.ListenPort, payload.PathPrefix)
@@ -1059,7 +2269,6 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		return reverseProxyNormalizedRule{}, err
 	}
 	normalized.hosts = hosts
-
 	normalized.pathPrefix = normalizeReverseProxyPath(payload.PathPrefix, false)
 
 	targetAddresses, err := normalizeReverseProxyTokens(payload.TargetAddresses, reverseProxyTokenModeTarget)
@@ -1087,13 +2296,28 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		if !reverseProxyProtocolIsDNS(normalized.listenProtocolAlias) || !reverseProxyProtocolIsDNS(normalized.targetProtocolAlias) {
 			return reverseProxyNormalizedRule{}, common.NewError("dns reverse proxy requires both local protocol and target protocol to be dns")
 		}
-		normalized.hosts = []string{}
+		if !reverseProxyDNSProtocolUsesTLS(normalized.listenProtocolAlias) {
+			normalized.hosts = []string{}
+		}
 		normalized.pathPrefix = ""
 		normalized.targetPath = ""
 		normalized.listenHTTPVersionStrategy = ""
 		normalized.httpVersionStrategy = ""
 		normalized.apiPassthrough = true
-		normalized.upstreamTLSVerify = payload.UpstreamTLSVerify
+		normalized.advertiseHTTP3 = false
+		normalized.maxConcurrentConnections = 0
+		normalized.maxConcurrentRequests = 0
+		normalized.upstreamMaxConnections = 0
+		normalized.upstreamMaxIdleConnections = 0
+		normalized.upstreamTLSVerify = reverseProxyPayloadTLSVerify(payload.UpstreamTLSVerify, payload.upstreamTLSVerifyDecoded, payload.upstreamTLSVerifySet, reverseProxyDNSProtocolUsesTLS(normalized.targetProtocolAlias))
+		allowedCIDRs, cidrErr := normalizeReverseProxyCIDRs(payload.DNSAllowedCIDRs)
+		if cidrErr != nil {
+			return reverseProxyNormalizedRule{}, cidrErr
+		}
+		normalized.dnsAllowedCIDRs = allowedCIDRs
+		if err := validateReverseProxyDNSAdmissionSettings(normalized); err != nil {
+			return reverseProxyNormalizedRule{}, err
+		}
 		if reverseProxyDNSProtocolUsesPath(normalized.listenProtocolAlias) && normalized.listenDNSPath == "" {
 			normalized.listenDNSPath = "/dns-query"
 		}
@@ -1124,6 +2348,9 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 				normalized.ednsCustomIP = ""
 			}
 		}
+		if err := validateReverseProxyDNSCacheSettings(normalized); err != nil {
+			return reverseProxyNormalizedRule{}, err
+		}
 		certIDs := normalizeReverseProxyCertificateIDList(payload.CertificateRecordIDs, payload.CertificateRecordID)
 		if reverseProxyDNSProtocolUsesTLS(normalized.listenProtocolAlias) {
 			if len(certIDs) == 0 {
@@ -1134,6 +2361,9 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		} else {
 			normalized.certificateRecordIDs = []uint{}
 			normalized.certificateRecordID = 0
+		}
+		if err := validateReverseProxyRuleResourceSettings(normalized); err != nil {
+			return reverseProxyNormalizedRule{}, err
 		}
 		return normalized, nil
 	}
@@ -1146,8 +2376,20 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 	normalized.disableIPv6Answer = false
 	normalized.listenDNSPath = ""
 	normalized.targetDNSPath = ""
+	normalized.fallbackDNSUpstreams = ""
+	normalized.dnsUpstreamTimeoutSeconds = reverseProxyDNSDefaultUpstreamTimeoutSeconds
+	normalized.dnsCacheEnabled = false
+	normalized.dnsCacheSizeBytes = reverseProxyDNSDefaultCacheSizeBytes
+	normalized.dnsCacheMinTTL = 0
+	normalized.dnsCacheMaxTTL = 0
+	normalized.dnsAllowedCIDRs = []string{}
+	normalized.dnsRateLimitQPS = reverseProxyDNSDefaultRateLimitQPS
+	normalized.dnsMaxConcurrentQueries = 0
 
 	listenHTTPVersionInput := payload.ListenHTTPVersionStrategy
+	if strings.EqualFold(normalized.listenProtocolAlias, "wss") {
+		listenHTTPVersionInput = reverseProxyListenHTTPVersionH2Only
+	}
 	if implied := reverseProxyListenProtocolAliasStrategy(listenProtocolInput); implied != "" {
 		explicit := strings.ToLower(strings.TrimSpace(payload.ListenHTTPVersionStrategy))
 		if explicit != "" && explicit != implied {
@@ -1160,6 +2402,10 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		return reverseProxyNormalizedRule{}, err
 	}
 	normalized.listenHTTPVersionStrategy = listenHTTPVersionStrategy
+	normalized.advertiseHTTP3 = normalized.advertiseHTTP3 &&
+		normalized.listenProtocol == reverseProxyProtocolHTTPS &&
+		normalized.listenHTTPVersionStrategy == reverseProxyListenHTTPVersionH2H3 &&
+		!reverseProxyIsWebSocketAlias(normalized.listenProtocolAlias)
 
 	httpVersionInput := payload.HTTPVersionStrategy
 	if implied := reverseProxyTargetProtocolAliasStrategy(targetProtocolInput); implied != "" {
@@ -1174,6 +2420,7 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		return reverseProxyNormalizedRule{}, err
 	}
 	normalized.httpVersionStrategy = httpVersionStrategy
+	normalized.upstreamTLSVerify = reverseProxyPayloadTLSVerify(payload.UpstreamTLSVerify, payload.upstreamTLSVerifyDecoded, payload.upstreamTLSVerifySet, normalized.targetProtocol == reverseProxyProtocolHTTPS)
 
 	if normalized.listenProtocol == reverseProxyProtocolHTTPS {
 		certIDs := normalizeReverseProxyCertificateIDList(payload.CertificateRecordIDs, payload.CertificateRecordID)
@@ -1191,7 +2438,42 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		normalized.httpVersionStrategy = ""
 		normalized.upstreamTLSVerify = false
 	}
+	if err := validateReverseProxyRuleResourceSettings(normalized); err != nil {
+		return reverseProxyNormalizedRule{}, err
+	}
 	return normalized, nil
+}
+
+func validateReverseProxyRuleResourceSettings(row reverseProxyNormalizedRule) error {
+	if row.maxConcurrentConnections < 0 || row.maxConcurrentConnections > reverseProxyMaximumConfiguredLimit {
+		return common.NewError("max concurrent connections must be between 0 and ", reverseProxyMaximumConfiguredLimit)
+	}
+	if row.maxConcurrentRequests < 0 || row.maxConcurrentRequests > reverseProxyMaxConcurrentRequestLimit {
+		return common.NewError("max concurrent requests must be between 0 and ", reverseProxyMaxConcurrentRequestLimit)
+	}
+	if row.dnsMaxConcurrentQueries < 0 || row.dnsMaxConcurrentQueries > reverseProxyDNSMaxConcurrentQueryLimit {
+		return common.NewError("dns max concurrent queries must be between 0 and ", reverseProxyDNSMaxConcurrentQueryLimit)
+	}
+	if row.upstreamMaxConnections < 0 || row.upstreamMaxConnections > reverseProxyMaximumConfiguredLimit {
+		return common.NewError("upstream max connections must be between 0 and ", reverseProxyMaximumConfiguredLimit)
+	}
+	if row.upstreamMaxIdleConnections < 0 || row.upstreamMaxIdleConnections > reverseProxyMaximumConfiguredLimit {
+		return common.NewError("upstream max idle connections must be between 0 and ", reverseProxyMaximumConfiguredLimit)
+	}
+	if row.memoryLimitBytes < 0 || row.memoryLimitBytes > reverseProxyMaximumMemoryPoolBytes {
+		return common.NewError("memory limit is invalid")
+	}
+	return nil
+}
+
+func reverseProxyPayloadTLSVerify(value bool, decodedFromJSON bool, explicitlySet bool, tlsTarget bool) bool {
+	if !tlsTarget {
+		return false
+	}
+	if decodedFromJSON && !explicitlySet {
+		return true
+	}
+	return value
 }
 
 func (s *ReverseProxyService) validateNormalizedRule(db *gorm.DB, row reverseProxyNormalizedRule) error {
@@ -1201,33 +2483,22 @@ func (s *ReverseProxyService) validateNormalizedRule(db *gorm.DB, row reversePro
 	if err := validateReverseProxyNoObviousLoop(row); err != nil {
 		return err
 	}
+	settings, err := loadReverseProxySettingsTx(db)
+	if err != nil {
+		return err
+	}
+	if err := validateReverseProxyRuleMemoryAgainstSettings(row, settings); err != nil {
+		return err
+	}
+	certificateIDs, err := validateReverseProxyCertificateRequirements(row)
+	if err != nil {
+		return err
+	}
+	if err := validateReverseProxyCertificateReferences(db, certificateIDs); err != nil {
+		return err
+	}
 	if reverseProxyProtocolIsDNS(row.listenProtocolAlias) {
-		return s.validateNormalizedDNSRule(db, row)
-	}
-	if row.listenProtocol == reverseProxyProtocolHTTP && (row.certificateRecordID != 0 || len(row.certificateRecordIDs) > 0) {
-		return common.NewError("http listener cannot bind certificate")
-	}
-	if row.listenProtocol == reverseProxyProtocolHTTPS {
-		certIDs := append([]uint(nil), row.certificateRecordIDs...)
-		if len(certIDs) == 0 && row.certificateRecordID > 0 {
-			certIDs = []uint{row.certificateRecordID}
-		}
-		if len(certIDs) == 0 {
-			return common.NewError("https listener requires certificate")
-		}
-		for _, certID := range certIDs {
-			// Reuse the caller's DB handle; SQLite runs with a single pooled connection.
-			cert, err := loadReverseProxyCertificateRecord(db, certID)
-			if err != nil {
-				if database.IsNotFound(err) {
-					return common.NewError("certificate not found")
-				}
-				return err
-			}
-			if cert == nil || len(cert.FullchainPEM) == 0 || len(cert.KeyPEM) == 0 {
-				return common.NewError("certificate material is incomplete")
-			}
-		}
+		return s.validateNormalizedDNSRuleMetadata(db, row)
 	}
 
 	rows := make([]model.ReverseProxyRule, 0)
@@ -1239,68 +2510,194 @@ func (s *ReverseProxyService) validateNormalizedRule(db *gorm.DB, row reversePro
 			continue
 		}
 		existingListenAlias := normalizeReverseProxyProtocolAlias(existing.ListenProtocolAlias, existing.ListenProtocol)
+		if !reverseProxyProtocolsShareUnderlyingSocket(existing.ListenProtocol, existing.ListenHTTPVersionStrategy, row.listenProtocol, row.listenHTTPVersionStrategy, existingListenAlias, row.listenProtocolAlias) {
+			continue
+		}
 		if reverseProxyProtocolIsDNS(existingListenAlias) {
-			if reverseProxyProtocolsShareUnderlyingSocket(existing.ListenProtocol, existing.ListenHTTPVersionStrategy, row.listenProtocol, row.listenHTTPVersionStrategy, existingListenAlias, row.listenProtocolAlias) {
-				return common.NewError("reverse proxy listener conflicts with existing dns listener on the same port")
+			if !reverseProxyListenIPSetsOverlap(reverseProxyDNSRuntimeListenIPs(&existing), reverseProxyNormalizedHTTPRuntimeListenIPs(row)) {
+				continue
 			}
+			if reverseProxyIsHTTPDNSAlias(existingListenAlias) && row.listenProtocol == reverseProxyProtocolHTTPS &&
+				!reverseProxyExistingNormalizedHTTPConditionsOverlap(&existing, row) {
+				continue
+			}
+			return common.NewError("reverse proxy listener conflicts with existing dns listener on the same port")
+		}
+		if !reverseProxyListenIPSetsOverlap(reverseProxyHTTPRuntimeListenIPs(&existing), reverseProxyNormalizedHTTPRuntimeListenIPs(row)) {
 			continue
 		}
 		if existing.ListenProtocol != row.listenProtocol {
-			if reverseProxyProtocolsShareUnderlyingSocket(existing.ListenProtocol, existing.ListenHTTPVersionStrategy, row.listenProtocol, row.listenHTTPVersionStrategy, existingListenAlias, row.listenProtocolAlias) {
-				return common.NewError("reverse proxy listener conflicts with existing reverse proxy listener on the same port")
-			}
+			return common.NewError("reverse proxy listener conflicts with existing reverse proxy listener on the same port")
 			continue
 		}
-		if row.listenProtocol == reverseProxyProtocolHTTPS {
-			existingListenStrategy, strategyErr := normalizeReverseProxyListenHTTPVersionStrategy(existing.ListenHTTPVersionStrategy, existing.ListenProtocol)
-			if strategyErr != nil {
-				existingListenStrategy = reverseProxyListenHTTPVersionH2H3
-			}
-			if existingListenStrategy != row.listenHTTPVersionStrategy {
-				return common.NewError("reverse proxy rules on the same https listener must use the same local http version strategy")
-			}
-		}
-		existingNames := reverseProxyRuleServerNames(&existing)
-		newNames := reverseProxyNormalizedServerNames(row)
-		if row.listenProtocol == reverseProxyProtocolHTTPS && reverseProxyRuleNameSetsAreSNIDisjoint(existingNames, newNames) {
+		if !reverseProxyExistingNormalizedHTTPConditionsOverlap(&existing, row) {
 			continue
 		}
-		if !reverseProxyRuleNamesOverlap(existingNames, newNames) {
+		return common.NewError("reverse proxy rule conflicts with existing host/path on the same listener")
+	}
+	return nil
+}
+
+func validateReverseProxyRuleMemoryAgainstSettings(row reverseProxyNormalizedRule, settings *model.ReverseProxySettings) error {
+	resources := reverseProxySettingsView(settings)
+	effective := row.memoryLimitBytes
+	if effective == 0 {
+		effective = resources.DefaultRuleMemoryLimitBytes
+	}
+	if effective < reverseProxyMinimumRewriteReservationBytes || effective > resources.MemoryPoolBytes {
+		return common.NewError("rule memory limit must fit in the shared reverse proxy memory pool")
+	}
+	if reverseProxyProtocolIsDNS(row.listenProtocolAlias) && row.dnsCacheEnabled && int64(row.dnsCacheSizeBytes) > effective {
+		return common.NewError("dns cache size must not exceed the effective rule memory limit")
+	}
+	return nil
+}
+
+func reverseProxyNormalizedCertificateIDs(row reverseProxyNormalizedRule) []uint {
+	ids := append([]uint(nil), row.certificateRecordIDs...)
+	if len(ids) == 0 && row.certificateRecordID > 0 {
+		ids = []uint{row.certificateRecordID}
+	}
+	if len(ids) < 2 {
+		return ids
+	}
+	seen := make(map[uint]struct{}, len(ids))
+	result := make([]uint, 0, len(ids))
+	for _, id := range ids {
+		if id == 0 {
 			continue
 		}
-		if reverseProxyRulePathsOverlap(existing.PathPrefix, row.pathPrefix) {
-			return common.NewError("reverse proxy rule conflicts with existing host/path on the same listener")
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	return result
+}
+
+// validateReverseProxyCertificateRequirements performs only deterministic
+// shape checks. It is safe to run both before and inside the SQLite write
+// transaction; loading and parsing PEM material is intentionally separate.
+func validateReverseProxyCertificateRequirements(row reverseProxyNormalizedRule) ([]uint, error) {
+	certificateIDs := reverseProxyNormalizedCertificateIDs(row)
+	if reverseProxyProtocolIsDNS(row.listenProtocolAlias) {
+		if reverseProxyDNSProtocolUsesTLS(row.listenProtocolAlias) {
+			if len(certificateIDs) == 0 {
+				return nil, common.NewError("dns tls listener requires certificate")
+			}
+			return certificateIDs, nil
+		}
+		if len(certificateIDs) > 0 {
+			return nil, common.NewError("plain dns listener cannot bind certificate")
+		}
+		return nil, nil
+	}
+	if row.listenProtocol == reverseProxyProtocolHTTP {
+		if len(certificateIDs) > 0 {
+			return nil, common.NewError("http listener cannot bind certificate")
+		}
+		return nil, nil
+	}
+	if row.listenProtocol == reverseProxyProtocolHTTPS {
+		if len(certificateIDs) == 0 {
+			return nil, common.NewError("https listener requires certificate")
+		}
+		return certificateIDs, nil
+	}
+	return certificateIDs, nil
+}
+
+// validateReverseProxyCertificateReferences keeps the transaction short: it
+// reads only primary keys, never certificate BLOBs or X.509 structures.
+func validateReverseProxyCertificateReferences(db *gorm.DB, certificateIDs []uint) error {
+	if len(certificateIDs) == 0 {
+		return nil
+	}
+	if db == nil {
+		db = database.GetDB()
+	}
+	if db == nil {
+		return common.NewError("database is not ready")
+	}
+	for _, certificateID := range certificateIDs {
+		if certificateID == 0 {
+			return common.NewError("certificate id is required")
+		}
+		row := &model.CertificateRecord{}
+		if err := db.Select("id").Where("id = ?", certificateID).First(row).Error; err != nil {
+			if database.IsNotFound(err) {
+				return common.NewError("certificate not found")
+			}
+			return err
 		}
 	}
 	return nil
 }
 
+// preflightReverseProxyCertificateMaterial runs before UpsertRule opens its
+// SQLite write transaction. Parsing the key pair here also catches corrupt
+// material early without holding the single SQLite connection during CPU- and
+// allocation-heavy X.509 work.
+func preflightReverseProxyCertificateMaterial(certificateIDs []uint) error {
+	materials, err := loadReverseProxyParsedCertificateMaterials(certificateIDs, false)
+	if err != nil {
+		return err
+	}
+	for _, certificateID := range certificateIDs {
+		material, exists := materials[certificateID]
+		if !exists {
+			return common.NewError("certificate not found")
+		}
+		if material.Err != nil {
+			return common.NewError("certificate material is invalid: ", material.Err)
+		}
+	}
+	return nil
+}
+
+func (s *ReverseProxyService) preflightNormalizedRule(row reverseProxyNormalizedRule) error {
+	if err := validateReverseProxyNoObviousLoop(row); err != nil {
+		return err
+	}
+	certificateIDs, err := validateReverseProxyCertificateRequirements(row)
+	if err != nil {
+		return err
+	}
+	if err := preflightReverseProxyCertificateMaterial(certificateIDs); err != nil {
+		return err
+	}
+	if reverseProxyProtocolIsDNS(row.listenProtocolAlias) {
+		// dnsproxy parses fallback upstream syntax and may construct resolver
+		// helpers. Keep that work outside the later SQLite write transaction.
+		if err := validateReverseProxyDNSFallbackUpstreams(row); err != nil {
+			return err
+		}
+	}
+	return s.validateReverseProxyResolvedLoop(row)
+}
+
 func (s *ReverseProxyService) validateNormalizedDNSRule(db *gorm.DB, row reverseProxyNormalizedRule) error {
+	certificateIDs, err := validateReverseProxyCertificateRequirements(row)
+	if err != nil {
+		return err
+	}
+	if err := validateReverseProxyCertificateReferences(db, certificateIDs); err != nil {
+		return err
+	}
+	return s.validateNormalizedDNSRuleMetadata(db, row)
+}
+
+// validateNormalizedDNSRuleMetadata is the SQLite transaction-safe portion of
+// DNS validation. Certificate material is deliberately loaded and parsed by
+// preflightNormalizedRule before the transaction starts, while this function
+// only checks rule metadata and listener conflicts.
+func (s *ReverseProxyService) validateNormalizedDNSRuleMetadata(db *gorm.DB, row reverseProxyNormalizedRule) error {
 	if !reverseProxyProtocolIsDNS(row.targetProtocolAlias) {
 		return common.NewError("dns reverse proxy target protocol is invalid")
 	}
-	if reverseProxyDNSProtocolUsesTLS(row.listenProtocolAlias) {
-		certIDs := append([]uint(nil), row.certificateRecordIDs...)
-		if len(certIDs) == 0 && row.certificateRecordID > 0 {
-			certIDs = []uint{row.certificateRecordID}
-		}
-		if len(certIDs) == 0 {
-			return common.NewError("dns tls listener requires certificate")
-		}
-		for _, certID := range certIDs {
-			cert, err := loadReverseProxyCertificateRecord(db, certID)
-			if err != nil {
-				if database.IsNotFound(err) {
-					return common.NewError("certificate not found")
-				}
-				return err
-			}
-			if cert == nil || len(cert.FullchainPEM) == 0 || len(cert.KeyPEM) == 0 {
-				return common.NewError("certificate material is incomplete")
-			}
-		}
-	} else if row.certificateRecordID != 0 || len(row.certificateRecordIDs) > 0 {
-		return common.NewError("plain dns listener cannot bind certificate")
+	if err := validateReverseProxyDNSCacheSettings(row); err != nil {
+		return err
 	}
 	if reverseProxyDNSProtocolUsesPath(row.listenProtocolAlias) && row.listenDNSPath == "" {
 		return common.NewError("doh listener requires url path")
@@ -1331,17 +2728,24 @@ func (s *ReverseProxyService) validateNormalizedDNSRule(db *gorm.DB, row reverse
 			if !reverseProxyDNSProtocolSharesSocket(existingListenAlias, row.listenProtocolAlias) {
 				continue
 			}
-			if !reverseProxyListenIPSetsOverlap(decodeReverseProxyListenIPs(&existing), row.listenIPs) {
+			if !reverseProxyListenIPSetsOverlap(reverseProxyDNSRuntimeListenIPs(&existing), reverseProxyNormalizedDNSRuntimeListenIPs(row)) {
 				continue
 			}
-			if reverseProxyDNSListenersCanSharePathSocket(&existing, row, existingListenAlias) {
+			if reverseProxyIsHTTPDNSAlias(existingListenAlias) && reverseProxyIsHTTPDNSAlias(row.listenProtocolAlias) &&
+				!reverseProxyExistingNormalizedHTTPConditionsOverlap(&existing, row) {
 				continue
 			}
 			return common.NewError("dns reverse proxy listener conflicts with existing dns listener on the same port")
 		}
-		if reverseProxyProtocolsShareUnderlyingSocket(existing.ListenProtocol, existing.ListenHTTPVersionStrategy, row.listenProtocol, row.listenHTTPVersionStrategy, existingListenAlias, row.listenProtocolAlias) {
-			return common.NewError("dns reverse proxy listener conflicts with existing reverse proxy listener on the same port")
+		if !reverseProxyProtocolsShareUnderlyingSocket(existing.ListenProtocol, existing.ListenHTTPVersionStrategy, row.listenProtocol, row.listenHTTPVersionStrategy, existingListenAlias, row.listenProtocolAlias) ||
+			!reverseProxyListenIPSetsOverlap(reverseProxyHTTPRuntimeListenIPs(&existing), reverseProxyNormalizedDNSRuntimeListenIPs(row)) {
+			continue
 		}
+		if reverseProxyIsHTTPDNSAlias(row.listenProtocolAlias) && strings.EqualFold(existing.ListenProtocol, reverseProxyProtocolHTTPS) &&
+			!reverseProxyExistingNormalizedHTTPConditionsOverlap(&existing, row) {
+			continue
+		}
+		return common.NewError("dns reverse proxy listener conflicts with existing reverse proxy listener on the same port")
 	}
 	return nil
 }
@@ -1356,7 +2760,7 @@ func reverseProxyDNSListenersCanSharePathSocket(existing *model.ReverseProxyRule
 	if !reverseProxyDNSProtocolUsesPath(row.listenProtocolAlias) {
 		return false
 	}
-	if !reverseProxyListenIPSetsEqual(decodeReverseProxyListenIPs(existing), row.listenIPs) {
+	if !reverseProxyListenIPSetsEqual(reverseProxyDNSRuntimeListenIPs(existing), reverseProxyNormalizedDNSRuntimeListenIPs(row)) {
 		return false
 	}
 	existingPath := normalizeReverseProxyDNSPath(existing.ListenDNSPath)
@@ -1425,39 +2829,101 @@ func loadReverseProxyCertificateRecord(db *gorm.DB, id uint) (*model.Certificate
 }
 
 func validateReverseProxyNoObviousLoop(row reverseProxyNormalizedRule) error {
-	if row.listenPort <= 0 || row.targetPort <= 0 || row.listenPort != row.targetPort {
+	return nil
+}
+
+func (s *ReverseProxyService) validateReverseProxyResolvedLoop(row reverseProxyNormalizedRule) error {
+	if row.listenPort <= 0 || row.targetPort <= 0 || row.listenPort != row.targetPort || len(row.targetAddresses) == 0 {
 		return nil
 	}
-	if row.listenProtocol != row.targetProtocol {
-		return nil
+	listenIPs := reverseProxyNormalizedHTTPRuntimeListenIPs(row)
+	if reverseProxyProtocolIsDNS(row.listenProtocolAlias) {
+		listenIPs = reverseProxyNormalizedDNSRuntimeListenIPs(row)
 	}
-	if len(row.listenIPs) == 0 || len(row.targetAddresses) == 0 {
-		return nil
-	}
-	listenSet := make(map[string]struct{}, len(row.listenIPs))
-	for _, item := range row.listenIPs {
-		value := strings.ToLower(strings.TrimSpace(item))
-		if value == "" {
-			continue
-		}
-		listenSet[value] = struct{}{}
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 	for _, target := range row.targetAddresses {
-		value := strings.ToLower(strings.TrimSpace(target))
-		if value == "" {
+		candidates, err := s.resolveTargetCandidates(ctx, target, row.targetPort, row.ipStrategy)
+		if err != nil {
+			// A temporary DNS failure must not make an otherwise valid rule
+			// unsavable. Runtime resolution applies the same guard before dialing.
 			continue
 		}
-		if _, exists := listenSet[value]; exists {
-			return common.NewError("target address must not point back to the same listener ip and port")
+		for _, candidate := range candidates {
+			if reverseProxyResolvedTargetLoopsToListener(listenIPs, row.listenPort, row.targetPort, candidate.address) {
+				return common.NewError("target address resolves back to the local listener")
+			}
 		}
 	}
 	return nil
+}
+
+func reverseProxyResolvedTargetLoopsToListener(listenIPs []string, listenPort int, targetPort int, targetAddress string) bool {
+	if listenPort <= 0 || targetPort <= 0 || listenPort != targetPort {
+		return false
+	}
+	target, err := netip.ParseAddr(strings.Trim(strings.TrimSpace(targetAddress), "[]"))
+	if err != nil {
+		return false
+	}
+	target = target.Unmap()
+	for _, item := range listenIPs {
+		listenAddr, parseErr := netip.ParseAddr(strings.Trim(strings.TrimSpace(item), "[]"))
+		if parseErr != nil {
+			continue
+		}
+		listenAddr = listenAddr.Unmap()
+		if listenAddr == target {
+			return true
+		}
+		if listenAddr.IsUnspecified() && sameReverseProxyIPFamily(listenAddr, target) && reverseProxyAddressIsLocal(target) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameReverseProxyIPFamily(left netip.Addr, right netip.Addr) bool {
+	return left.Is4() == right.Is4()
+}
+
+func reverseProxyAddressIsLocal(address netip.Addr) bool {
+	if !address.IsValid() {
+		return false
+	}
+	if address.IsLoopback() || address.IsUnspecified() {
+		return true
+	}
+	interfaces, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, item := range interfaces {
+		var candidate netip.Addr
+		switch value := item.(type) {
+		case *net.IPNet:
+			candidate, _ = netip.AddrFromSlice(value.IP)
+		case *net.IPAddr:
+			candidate, _ = netip.AddrFromSlice(value.IP)
+		}
+		if candidate.IsValid() && candidate.Unmap() == address.Unmap() {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *ReverseProxyService) repairDisplayIDsTx(db *gorm.DB) error {
 	rows := make([]model.ReverseProxyRule, 0)
 	if err := db.Order("id asc").Find(&rows).Error; err != nil {
 		return err
+	}
+	return repairReverseProxyRowsTx(db, rows)
+}
+
+func repairReverseProxyRowsTx(db *gorm.DB, rows []model.ReverseProxyRule) error {
+	if db == nil {
+		return nil
 	}
 	usedDisplayIDs := make(map[uint64]struct{}, len(rows))
 	needsRepair := false
@@ -1670,6 +3136,26 @@ func reverseProxyProtocolIsDNS(alias string) bool {
 	}
 }
 
+func reverseProxyIsHTTPDNSAlias(alias string) bool {
+	switch strings.ToLower(strings.TrimSpace(alias)) {
+	case reverseProxyDNSProtocolDoH, reverseProxyDNSProtocolDoHH3:
+		return true
+	default:
+		return false
+	}
+}
+
+func reverseProxyListenerGroupProtocol(row *model.ReverseProxyRule) string {
+	if row == nil {
+		return ""
+	}
+	alias := normalizeReverseProxyProtocolAlias(row.ListenProtocolAlias, row.ListenProtocol)
+	if reverseProxyIsHTTPDNSAlias(alias) {
+		return reverseProxyProtocolHTTPS
+	}
+	return strings.ToLower(strings.TrimSpace(row.ListenProtocol))
+}
+
 func reverseProxyDNSProtocolUsesPath(alias string) bool {
 	switch strings.ToLower(strings.TrimSpace(alias)) {
 	case reverseProxyDNSProtocolDoH, reverseProxyDNSProtocolDoHH3:
@@ -1713,7 +3199,7 @@ func reverseProxyDNSProtocolUsesTCP(alias string) bool {
 
 func reverseProxyDNSProtocolUsesUDP(alias string) bool {
 	switch strings.ToLower(strings.TrimSpace(alias)) {
-	case reverseProxyDNSProtocolDoH, reverseProxyDNSProtocolDoHH3, reverseProxyDNSProtocolDoQ, reverseProxyDNSProtocolUDP:
+	case reverseProxyDNSProtocolDoHH3, reverseProxyDNSProtocolDoQ, reverseProxyDNSProtocolUDP:
 		return true
 	default:
 		return false
@@ -1728,6 +3214,9 @@ func reverseProxyDNSProtocolSharesSocket(a string, b string) bool {
 func reverseProxyListenerUsesUnderlyingSockets(protocol string, listenStrategy string, alias string) (bool, bool) {
 	if reverseProxyProtocolIsDNS(alias) {
 		return reverseProxyDNSProtocolUsesTCP(alias), reverseProxyDNSProtocolUsesUDP(alias)
+	}
+	if reverseProxyIsWebSocketAlias(alias) {
+		return true, false
 	}
 	return reverseProxyHTTPListenerUsesSockets(protocol, listenStrategy)
 }
@@ -1883,34 +3372,6 @@ func normalizeReverseProxyLegacyListenNames(raw string) ([]string, error) {
 	return collectReverseProxyLegacyListenNames([]string{raw}, true)
 }
 
-func collectReverseProxyLegacyListenIPs(values []string) []string {
-	result := make([]string, 0)
-	seen := make(map[string]struct{})
-	for _, raw := range values {
-		for _, field := range splitReverseProxyTokenFields(raw) {
-			token := strings.TrimSpace(strings.Trim(field, "[]"))
-			if token == "" {
-				continue
-			}
-			parsedIP := reverseProxyParseIPLiteral(token)
-			if parsedIP == nil {
-				continue
-			}
-			canonical := strings.ToLower(parsedIP.String())
-			if _, exists := seen[canonical]; exists {
-				continue
-			}
-			seen[canonical] = struct{}{}
-			result = append(result, canonical)
-		}
-	}
-	return result
-}
-
-func extractReverseProxyLegacyListenIPs(raw string) []string {
-	return collectReverseProxyLegacyListenIPs([]string{raw})
-}
-
 func reverseProxyTokenHasExplicitPort(value string) bool {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -1968,10 +3429,7 @@ func reverseProxyRuleServerNames(row *model.ReverseProxyRule) []string {
 	if row == nil {
 		return []string{}
 	}
-	values := make([]string, 0)
-	values = append(values, decodeReverseProxyLegacyListenNames(row)...)
-	values = append(values, decodeReverseProxyList(row.HostList)...)
-	return reverseProxyCleanServerNames(values)
+	return reverseProxyCleanServerNames(decodeReverseProxyList(row.HostList))
 }
 
 func reverseProxyCleanServerNames(values []string) []string {
@@ -2000,7 +3458,7 @@ func reverseProxyNormalizeServerName(value string) string {
 
 func reverseProxyRuleNamesOverlap(a []string, b []string) bool {
 	if len(a) == 0 || len(b) == 0 {
-		return len(a) == 0 || len(b) == 0
+		return len(a) == 0 && len(b) == 0
 	}
 	for _, item := range a {
 		for _, candidate := range b {
@@ -2013,7 +3471,7 @@ func reverseProxyRuleNamesOverlap(a []string, b []string) bool {
 }
 
 func reverseProxyRuleNameSetsAreSNIDisjoint(a []string, b []string) bool {
-	return false
+	return !reverseProxyRuleNamesOverlap(a, b)
 }
 
 func reverseProxyRulePathsOverlap(a string, b string) bool {
@@ -2026,6 +3484,54 @@ func reverseProxyRulePathsOverlap(a string, b string) bool {
 		return true
 	}
 	return strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
+}
+
+func reverseProxyHTTPPathConditionsOverlap(a string, aExact bool, b string, bExact bool) bool {
+	if aExact {
+		a = normalizeReverseProxyDNSPath(a)
+		if a == "" {
+			a = "/dns-query"
+		}
+	} else {
+		a = reverseProxyNormalizePathPrefix(a)
+	}
+	if bExact {
+		b = normalizeReverseProxyDNSPath(b)
+		if b == "" {
+			b = "/dns-query"
+		}
+	} else {
+		b = reverseProxyNormalizePathPrefix(b)
+	}
+	if aExact && bExact {
+		return a == b
+	}
+	if aExact {
+		return b == "" || a == b || strings.HasPrefix(a, b+"/")
+	}
+	if bExact {
+		return a == "" || b == a || strings.HasPrefix(b, a+"/")
+	}
+	return reverseProxyRulePathsOverlap(a, b)
+}
+
+func reverseProxyExistingNormalizedHTTPConditionsOverlap(existing *model.ReverseProxyRule, row reverseProxyNormalizedRule) bool {
+	if existing == nil {
+		return false
+	}
+	existingAlias := normalizeReverseProxyProtocolAlias(existing.ListenProtocolAlias, existing.ListenProtocol)
+	existingDNSHTTP := reverseProxyIsHTTPDNSAlias(existingAlias)
+	newDNSHTTP := reverseProxyIsHTTPDNSAlias(row.listenProtocolAlias)
+	existingPath := existing.PathPrefix
+	if existingDNSHTTP {
+		existingPath = existing.ListenDNSPath
+	}
+	newPath := row.pathPrefix
+	if newDNSHTTP {
+		newPath = row.listenDNSPath
+	}
+	return reverseProxyRuleNamesOverlap(reverseProxyRuleServerNames(existing), reverseProxyNormalizedServerNames(row)) &&
+		reverseProxyHTTPPathConditionsOverlap(existingPath, existingDNSHTTP, newPath, newDNSHTTP)
 }
 
 func encodeReverseProxyList(values []string) string {
@@ -2065,31 +3571,6 @@ func decodeReverseProxyList(raw string) []string {
 		cleaned = append(cleaned, lower)
 	}
 	return cleaned
-}
-
-func decodeReverseProxyListenIPs(row *model.ReverseProxyRule) []string {
-	if row == nil {
-		return []string{}
-	}
-	values := make([]string, 0)
-	values = append(values, decodeReverseProxyList(row.ListenIPList)...)
-	if strings.TrimSpace(row.ListenIP) != "" {
-		values = append(values, row.ListenIP)
-	}
-	return collectReverseProxyLegacyListenIPs(values)
-}
-
-func decodeReverseProxyLegacyListenNames(row *model.ReverseProxyRule) []string {
-	if row == nil {
-		return []string{}
-	}
-	values := make([]string, 0)
-	values = append(values, decodeReverseProxyList(row.ListenIPList)...)
-	if strings.TrimSpace(row.ListenIP) != "" {
-		values = append(values, row.ListenIP)
-	}
-	names, _ := collectReverseProxyLegacyListenNames(values, false)
-	return names
 }
 
 func encodeReverseProxyUintList(values []uint) string {
@@ -2177,17 +3658,13 @@ func reverseProxyRuleCertificateIDs(row *model.ReverseProxyRule) []uint {
 	return []uint{}
 }
 
-func buildReverseProxyCertificateHints(listenIPs []string, hosts []string, certs []ReverseProxyCertificateOption) []string {
+func buildReverseProxyCertificateHints(hosts []string, certs []ReverseProxyCertificateOption) []string {
 	hints := make([]string, 0)
 	if len(certs) == 0 || len(hosts) == 0 {
 		return hints
 	}
-	hasIPSANCert := false
 	certDomains := make([]string, 0, len(certs)*3)
 	for _, cert := range certs {
-		if reverseProxyCertificateOptionHasIPSAN(cert) {
-			hasIPSANCert = true
-		}
 		mainDomain := strings.ToLower(strings.TrimSpace(cert.MainDomain))
 		if mainDomain != "" {
 			certDomains = append(certDomains, mainDomain)
@@ -2206,9 +3683,6 @@ func buildReverseProxyCertificateHints(listenIPs []string, hosts []string, certs
 				hints = append(hints, "证书未覆盖 IP: "+host)
 				continue
 			}
-			if hasIPSANCert {
-				continue
-			}
 			hints = append(hints, "证书未覆盖域名: "+host)
 		}
 		return hints
@@ -2220,24 +3694,11 @@ func buildReverseProxyCertificateHints(listenIPs []string, hosts []string, certs
 			}
 			continue
 		}
-		if hasIPSANCert {
-			continue
-		}
 		if !reverseProxyCertificateDomainsCoverHost(certDomains, host) {
 			hints = append(hints, "证书未覆盖域名: "+host)
 		}
 	}
 	return hints
-}
-
-func reverseProxyCertificateOptionHasIPSAN(cert ReverseProxyCertificateOption) bool {
-	values := append([]string{cert.MainDomain}, cert.Domains...)
-	for _, value := range values {
-		if reverseProxyParseIPLiteral(value) != nil {
-			return true
-		}
-	}
-	return false
 }
 
 func reverseProxyLeafMatchesServerName(leaf *x509.Certificate, serverName string) bool {
@@ -2263,44 +3724,6 @@ func reverseProxyCertificateBindingMatchesServerName(binding *reverseProxyRuleCe
 		return false
 	}
 	return reverseProxyLeafMatchesServerName(binding.Leaf.Leaf, serverName)
-}
-
-func reverseProxyNoSNICertificateMatchesLocalIP(binding *reverseProxyRuleCertificateBinding, localIP string) bool {
-	if !reverseProxyCertificateBindingUsable(binding, time.Now()) || !binding.Leaf.HasIPSAN {
-		return false
-	}
-	localIP = reverseProxyNormalizeServerName(localIP)
-	if reverseProxyParseIPLiteral(localIP) == nil {
-		return false
-	}
-	return reverseProxyCertificateBindingMatchesServerName(binding, localIP)
-}
-
-func reverseProxySplitNoSNICertificateCandidates(bindings []*reverseProxyRuleCertificateBinding, localIP string) ([]*reverseProxyRuleCertificateBinding, []*reverseProxyRuleCertificateBinding) {
-	localIP = reverseProxyNormalizeServerName(localIP)
-	ipPreferred := make([]*reverseProxyRuleCertificateBinding, 0, len(bindings))
-	others := make([]*reverseProxyRuleCertificateBinding, 0, len(bindings))
-	now := time.Now()
-	localIPIsLiteral := reverseProxyParseIPLiteral(localIP) != nil
-	for _, binding := range bindings {
-		if !reverseProxyCertificateBindingUsable(binding, now) {
-			continue
-		}
-		if localIPIsLiteral && reverseProxyCertificateBindingHasIPSAN(binding) && reverseProxyLeafMatchesServerName(binding.Leaf.Leaf, localIP) {
-			ipPreferred = append(ipPreferred, binding)
-			continue
-		}
-		others = append(others, binding)
-	}
-	return ipPreferred, others
-}
-
-func reverseProxyPickNoSNIBinding(bindings []*reverseProxyRuleCertificateBinding, localIP string) *reverseProxyRuleCertificateBinding {
-	ipPreferred, others := reverseProxySplitNoSNICertificateCandidates(bindings, localIP)
-	if selected := reverseProxyFallbackCertificateBinding(ipPreferred); selected != nil {
-		return selected
-	}
-	return reverseProxyFallbackCertificateBinding(others)
 }
 
 type reverseProxySNIMatchCategory int
@@ -2392,6 +3815,24 @@ func reverseProxyIPLiteralEqual(a string, b string) bool {
 	return ipA.Equal(ipB)
 }
 
+func reverseProxyLocalAddressMayHidePublicTarget(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	addr = addr.Unmap()
+	if addr.IsUnspecified() || addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() {
+		return true
+	}
+	if prefix, err := netip.ParsePrefix("100.64.0.0/10"); err == nil && prefix.Contains(addr) {
+		return true
+	}
+	return false
+}
+
 func reverseProxyHostPatternMatches(pattern string, host string) bool {
 	pattern = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(pattern), "."))
 	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
@@ -2430,13 +3871,22 @@ func buildReverseProxyDefaultName(protocol string, listenIP string, listenPort i
 func (r *reverseProxyRuntimeManager) SyncIfNeeded(service *ReverseProxyService, minGap time.Duration) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.reconcileLocked(service, minGap)
+	return r.reconcileLocked(service, minGap, false)
 }
 
 func (r *reverseProxyRuntimeManager) SyncNow(service *ReverseProxyService) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.reconcileLocked(service, 0)
+	return r.reconcileLocked(service, 0, true)
+}
+
+func (r *reverseProxyRuntimeManager) hasPendingReconcile() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.state.lastRenderKey == "" && strings.TrimSpace(r.reconcileError) != ""
 }
 
 func (r *reverseProxyRuntimeManager) Stop() error {
@@ -2444,69 +3894,268 @@ func (r *reverseProxyRuntimeManager) Stop() error {
 	defer r.mu.Unlock()
 	firstErr := shutdownReverseProxyListenerGroups(r.groups)
 	r.groups = make(map[string]*reverseProxyListenerGroup)
-	r.mismatchMu.Lock()
-	r.mismatchByIP = make(map[string]*reverseProxyMismatchEntry)
-	r.mismatchMu.Unlock()
+	r.loadedConfiguration = nil
+	r.resetMismatchTable()
 	r.state.lastRenderKey = ""
 	r.state.lastSyncAt = time.Now()
 	r.state.warnings = nil
+	r.state.revision = 0
+	r.state.certificateGeneration = 0
+	r.state.nextRetryAt = time.Time{}
+	r.state.retryDelay = 0
 	r.reconcileError = ""
 	return firstErr
 }
 
-func (r *reverseProxyRuntimeManager) reconcileLocked(service *ReverseProxyService, minGap time.Duration) error {
+func (r *reverseProxyRuntimeManager) reconcileLocked(service *ReverseProxyService, minGap time.Duration, force bool) error {
 	if service == nil {
 		return nil
 	}
 	now := time.Now()
-	if minGap > 0 && !r.state.lastSyncAt.IsZero() && now.Sub(r.state.lastSyncAt) < minGap {
-		return nil
+	certificateGeneration := currentReverseProxyCertificateGeneration()
+	if !force && minGap > 0 {
+		if !r.state.lastSyncAt.IsZero() && now.Sub(r.state.lastSyncAt) < minGap {
+			return nil
+		}
+		revision, err := service.peekReverseProxyRevision()
+		if err != nil {
+			return err
+		}
+		if revision != 0 && revision == r.state.revision && certificateGeneration == r.state.certificateGeneration {
+			if !r.state.nextRetryAt.IsZero() && now.Before(r.state.nextRetryAt) {
+				r.state.lastSyncAt = now
+				return nil
+			}
+			if r.state.lastRenderKey != "" {
+				r.state.lastSyncAt = now
+				return nil
+			}
+		}
 	}
 	db := database.GetDB()
+	settings, err := service.loadReverseProxySettings()
+	if err != nil {
+		return err
+	}
+	if settings != nil {
+		reverseProxyResources.apply(reverseProxySettingsView(settings))
+	}
 	rows, err := service.loadRulesLocked(db)
 	if err != nil {
 		return err
 	}
-	renderKey := computeReverseProxyRenderKey(db, rows)
-	if renderKey == r.state.lastRenderKey {
+	if err := prepareReverseProxyParsedCertificateMaterials(rows); err != nil {
+		return err
+	}
+	if settings != nil {
+		r.loadedConfiguration = &reverseProxyLoadedConfiguration{
+			Settings: *settings,
+			Rules:    append([]model.ReverseProxyRule(nil), rows...),
+		}
+	}
+	certificateState := loadReverseProxyCertificateRenderState(db, rows)
+	renderKey := computeReverseProxyRenderKeyWithCertificateState(rows, certificateState)
+	resourcesChanged := false
+	currentResources := reverseProxyResources.current()
+	for _, group := range r.groups {
+		if group == nil {
+			continue
+		}
+		group.mu.RLock()
+		changed := group.resources != currentResources
+		group.mu.RUnlock()
+		if changed {
+			resourcesChanged = true
+			break
+		}
+	}
+	configurationChanged := renderKey != r.state.lastRenderKey
+	if !configurationChanged && !resourcesChanged {
 		r.state.lastSyncAt = now
+		if settings != nil {
+			r.state.revision = settings.Revision
+		}
+		r.state.certificateGeneration = certificateGeneration
 		return nil
 	}
 	grouped := reverseProxyGroupRules(rows)
-	nextGroups := make(map[string]*reverseProxyListenerGroup, len(grouped))
-	createdGroups := make(map[string]*reverseProxyListenerGroup)
-	cleanupCreatedGroups := func() {
-		_ = shutdownReverseProxyListenerGroups(createdGroups)
+	nextGroups := make(map[string]*reverseProxyListenerGroup, len(grouped)+len(r.groups))
+	warnings := make([]string, 0)
+	type failedGroup struct {
+		key   string
+		rules []*model.ReverseProxyRule
+	}
+	failedGroups := make([]failedGroup, 0)
+	stoppedGroups := make(map[*reverseProxyListenerGroup]struct{})
+	reportGroupState := func(groupRows []*model.ReverseProxyRule, status string, listenerErr error) {
+		message := ""
+		if listenerErr != nil {
+			message = strings.TrimSpace(listenerErr.Error())
+		}
+		for _, rule := range groupRows {
+			if rule == nil {
+				continue
+			}
+			reverseProxyRuntime.reportRuleState(rule.Id, status, message)
+		}
 	}
 	for key, groupRows := range grouped {
+		groupRenderKey := computeReverseProxyRenderKeyWithCertificateState(reverseProxyRuleValues(groupRows), certificateState)
 		if existing, ok := r.groups[key]; ok && existing != nil {
-			if err := service.refreshListenerGroup(existing, groupRows); err != nil {
-				cleanupCreatedGroups()
-				return err
+			if reverseProxyListenerGroupNeedsRestart(existing, groupRows) {
+				if reverseProxyListenerGroupRestartNeedsClosingExisting(existing, groupRows) {
+					restorePoint := snapshotReverseProxyListenerGroup(existing)
+					// Stream limits are negotiated when the listener is created. The
+					// existing endpoint must therefore be closed before rebinding;
+					// keeping its stopped object would make every retry fail against
+					// the same socket while reporting a healthy listener.
+					if stopErr := existing.shutdown(); stopErr != nil {
+						stoppedGroups[existing] = struct{}{}
+						if restored, restoreErr := restoreReverseProxyListenerGroup(service, restorePoint); restoreErr == nil && restored != nil {
+							nextGroups[restorePoint.key] = restored
+						} else if restoreErr != nil {
+							warnings = append(warnings, "reverse proxy listener "+key+" rollback failed: "+strings.TrimSpace(restoreErr.Error()))
+						}
+						failedGroups = append(failedGroups, failedGroup{key: key, rules: groupRows})
+						reportGroupState(groupRows, "listener_error", stopErr)
+						warnings = append(warnings, "reverse proxy listener "+key+" stopped during rebuild: "+strings.TrimSpace(stopErr.Error()))
+						continue
+					}
+					stoppedGroups[existing] = struct{}{}
+					group, err := service.newListenerGroup(key, groupRows)
+					if err != nil {
+						if restored, restoreErr := restoreReverseProxyListenerGroup(service, restorePoint); restoreErr == nil && restored != nil {
+							nextGroups[restorePoint.key] = restored
+						} else if restoreErr != nil {
+							warnings = append(warnings, "reverse proxy listener "+key+" rollback failed: "+strings.TrimSpace(restoreErr.Error()))
+						}
+						failedGroups = append(failedGroups, failedGroup{key: key, rules: groupRows})
+						reportGroupState(groupRows, "listener_error", err)
+						warnings = append(warnings, "reverse proxy listener "+key+" rebuild failed after stop: "+strings.TrimSpace(err.Error()))
+						continue
+					}
+					nextGroups[key] = group
+					group.mu.Lock()
+					group.renderKey = groupRenderKey
+					group.mu.Unlock()
+					reportGroupState(groupRows, "running", nil)
+					continue
+				}
+				group, err := service.newListenerGroup(key, groupRows)
+				if err != nil {
+					nextGroups[key] = existing
+					failedGroups = append(failedGroups, failedGroup{key: key, rules: groupRows})
+					reportGroupState(groupRows, "listener_error", err)
+					warnings = append(warnings, "reverse proxy listener "+key+" retained previous instance: "+strings.TrimSpace(err.Error()))
+					continue
+				}
+				if err := existing.shutdown(); err != nil {
+					_ = group.shutdown()
+					stoppedGroups[existing] = struct{}{}
+					failedGroups = append(failedGroups, failedGroup{key: key, rules: groupRows})
+					reportGroupState(groupRows, "listener_error", err)
+					warnings = append(warnings, "reverse proxy listener "+key+" stopped during rebuild: "+strings.TrimSpace(err.Error()))
+					continue
+				}
+				stoppedGroups[existing] = struct{}{}
+				nextGroups[key] = group
+				group.mu.Lock()
+				group.renderKey = groupRenderKey
+				group.mu.Unlock()
+				reportGroupState(groupRows, "running", nil)
+				continue
 			}
+			existing.mu.RLock()
+			groupConfigurationChanged := existing.renderKey != groupRenderKey
+			existing.mu.RUnlock()
+			if !groupConfigurationChanged {
+				// All non-stream resource guards are adjustable.  Keep the
+				// listener, certificate bindings and healthy upstream pools in
+				// place; only a changed inherited idle-pool policy retires the
+				// affected transport cache below.
+				existing.applyResourceSettings(currentResources)
+				nextGroups[key] = existing
+				reportGroupState(groupRows, "running", nil)
+				continue
+			}
+			if err := service.refreshListenerGroup(existing, groupRows); err != nil {
+				nextGroups[key] = existing
+				failedGroups = append(failedGroups, failedGroup{key: key, rules: groupRows})
+				reportGroupState(groupRows, "listener_error", err)
+				warnings = append(warnings, "reverse proxy listener "+key+" retained previous instance: "+strings.TrimSpace(err.Error()))
+				continue
+			}
+			existing.mu.Lock()
+			existing.renderKey = groupRenderKey
+			existing.mu.Unlock()
 			nextGroups[key] = existing
+			reportGroupState(groupRows, "running", nil)
+			continue
+		}
+		blockers := reverseProxyBlockingListenerGroups(r.groups, grouped, key, groupRows, stoppedGroups)
+		restorePoints := make([]reverseProxyListenerGroupRestorePoint, 0, len(blockers))
+		stopErrors := make([]error, 0)
+		for _, blocker := range blockers {
+			if blocker.group == nil {
+				continue
+			}
+			restorePoints = append(restorePoints, snapshotReverseProxyListenerGroup(blocker.group))
+			if stopErr := blocker.group.shutdown(); stopErr != nil {
+				stopErrors = append(stopErrors, fmt.Errorf("%s: %w", blocker.key, stopErr))
+			}
+			stoppedGroups[blocker.group] = struct{}{}
+		}
+		if stopErr := errors.Join(stopErrors...); stopErr != nil {
+			restoreErrors := restoreReverseProxyListenerGroups(service, restorePoints, nextGroups)
+			if restoreErr := errors.Join(restoreErrors...); restoreErr != nil {
+				warnings = append(warnings, "reverse proxy listener "+key+" rollback failed: "+strings.TrimSpace(restoreErr.Error()))
+			}
+			failedGroups = append(failedGroups, failedGroup{key: key, rules: groupRows})
+			reportGroupState(groupRows, "listener_error", stopErr)
+			warnings = append(warnings, "reverse proxy listener "+key+" could not release the previous binding: "+strings.TrimSpace(stopErr.Error()))
 			continue
 		}
 		group, err := service.newListenerGroup(key, groupRows)
 		if err != nil {
-			cleanupCreatedGroups()
-			return err
+			restoreErrors := restoreReverseProxyListenerGroups(service, restorePoints, nextGroups)
+			if restoreErr := errors.Join(restoreErrors...); restoreErr != nil {
+				warnings = append(warnings, "reverse proxy listener "+key+" rollback failed: "+strings.TrimSpace(restoreErr.Error()))
+			}
+			failedGroups = append(failedGroups, failedGroup{key: key, rules: groupRows})
+			reportGroupState(groupRows, "listener_error", err)
+			warnings = append(warnings, "reverse proxy listener "+key+" failed: "+strings.TrimSpace(err.Error()))
+			continue
 		}
 		nextGroups[key] = group
-		createdGroups[key] = group
+		group.mu.Lock()
+		group.renderKey = groupRenderKey
+		group.mu.Unlock()
+		reportGroupState(groupRows, "running", nil)
 	}
 	for key, group := range r.groups {
 		if _, exists := nextGroups[key]; exists {
 			continue
 		}
+		if _, wasStopped := stoppedGroups[group]; wasStopped {
+			continue
+		}
+		keepPrevious := false
+		for _, failed := range failedGroups {
+			if reverseProxyListenerGroupOverlapsRules(group, failed.rules) || reverseProxyListenerGroupSharesRuleIDs(group, failed.rules) {
+				keepPrevious = true
+				break
+			}
+		}
+		if keepPrevious {
+			nextGroups[key] = group
+			continue
+		}
 		if group != nil {
 			if err := group.shutdown(); err != nil {
-				cleanupCreatedGroups()
-				return err
+				warnings = append(warnings, "reverse proxy listener "+key+" shutdown failed: "+strings.TrimSpace(err.Error()))
 			}
 		}
 	}
-	warnings := make([]string, 0)
 	for _, group := range nextGroups {
 		if group == nil || len(group.warnings) == 0 {
 			continue
@@ -2514,11 +4163,328 @@ func (r *reverseProxyRuntimeManager) reconcileLocked(service *ReverseProxyServic
 		warnings = append(warnings, group.warnings...)
 	}
 	r.groups = nextGroups
-	r.state.lastRenderKey = renderKey
+	if len(failedGroups) == 0 {
+		r.state.lastRenderKey = renderKey
+		r.state.nextRetryAt = time.Time{}
+		r.state.retryDelay = 0
+	} else {
+		// A failed group is retried with a bounded exponential backoff.  This
+		// avoids a permanently occupied port consuming CPU on every cron tick.
+		r.state.lastRenderKey = ""
+		if r.state.retryDelay <= 0 {
+			r.state.retryDelay = reverseProxyRuntimeRetryBaseDelay
+		} else {
+			r.state.retryDelay *= 2
+			if r.state.retryDelay > reverseProxyRuntimeRetryMaxDelay {
+				r.state.retryDelay = reverseProxyRuntimeRetryMaxDelay
+			}
+		}
+		r.state.nextRetryAt = now.Add(r.state.retryDelay)
+	}
 	r.state.lastSyncAt = now
+	if settings != nil {
+		r.state.revision = settings.Revision
+	}
+	r.state.certificateGeneration = certificateGeneration
 	r.state.warnings = warnings
-	r.reconcileError = ""
+	if len(failedGroups) == 0 {
+		r.reconcileError = ""
+	} else {
+		r.reconcileError = "reverse proxy listener rebuild is waiting for retry"
+	}
 	return nil
+}
+
+func reverseProxyListenerGroupOverlapsRules(group *reverseProxyListenerGroup, rules []*model.ReverseProxyRule) bool {
+	if group == nil || len(rules) == 0 {
+		return false
+	}
+	group.mu.RLock()
+	port := group.listenPort
+	socketKind := group.socketKind
+	listenIPs := append([]string(nil), group.listenIPs...)
+	group.mu.RUnlock()
+	for _, rule := range rules {
+		if rule == nil || rule.ListenPort != port {
+			continue
+		}
+		alias := normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
+		for _, desiredSocket := range reverseProxyListenerSocketKinds(rule.ListenProtocol, rule.ListenHTTPVersionStrategy, alias) {
+			if desiredSocket != socketKind {
+				continue
+			}
+			if reverseProxyListenIPSetsOverlap(listenIPs, reverseProxyHTTPRuntimeListenIPs(rule)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type reverseProxyListenerGroupRef struct {
+	key   string
+	group *reverseProxyListenerGroup
+}
+
+type reverseProxyListenerGroupRestorePoint struct {
+	key       string
+	renderKey string
+	rules     []model.ReverseProxyRule
+}
+
+func reverseProxyListenerGroupSharesRuleIDs(group *reverseProxyListenerGroup, rules []*model.ReverseProxyRule) bool {
+	if group == nil || len(rules) == 0 {
+		return false
+	}
+	desiredIDs := make(map[uint]struct{}, len(rules))
+	for _, rule := range rules {
+		if rule != nil && rule.Id != 0 {
+			desiredIDs[rule.Id] = struct{}{}
+		}
+	}
+	if len(desiredIDs) == 0 {
+		return false
+	}
+	group.mu.RLock()
+	defer group.mu.RUnlock()
+	for _, rule := range group.rules {
+		if rule == nil {
+			continue
+		}
+		if _, exists := desiredIDs[rule.Id]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+func reverseProxyBlockingListenerGroups(groups map[string]*reverseProxyListenerGroup, desired map[string][]*model.ReverseProxyRule, desiredKey string, rules []*model.ReverseProxyRule, stopped map[*reverseProxyListenerGroup]struct{}) []reverseProxyListenerGroupRef {
+	keys := make([]string, 0)
+	for key, group := range groups {
+		if key == desiredKey || group == nil {
+			continue
+		}
+		if _, stillDesired := desired[key]; stillDesired {
+			continue
+		}
+		if _, alreadyStopped := stopped[group]; alreadyStopped {
+			continue
+		}
+		if reverseProxyListenerGroupOverlapsRules(group, rules) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	result := make([]reverseProxyListenerGroupRef, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, reverseProxyListenerGroupRef{key: key, group: groups[key]})
+	}
+	return result
+}
+
+func snapshotReverseProxyListenerGroup(group *reverseProxyListenerGroup) reverseProxyListenerGroupRestorePoint {
+	if group == nil {
+		return reverseProxyListenerGroupRestorePoint{}
+	}
+	group.mu.RLock()
+	defer group.mu.RUnlock()
+	point := reverseProxyListenerGroupRestorePoint{
+		key:       group.key,
+		renderKey: group.renderKey,
+		rules:     make([]model.ReverseProxyRule, 0, len(group.rules)),
+	}
+	for _, rule := range group.rules {
+		if rule != nil {
+			point.rules = append(point.rules, *rule)
+		}
+	}
+	return point
+}
+
+func restoreReverseProxyListenerGroup(service *ReverseProxyService, point reverseProxyListenerGroupRestorePoint) (*reverseProxyListenerGroup, error) {
+	if service == nil || strings.TrimSpace(point.key) == "" || len(point.rules) == 0 {
+		return nil, nil
+	}
+	rules := make([]*model.ReverseProxyRule, len(point.rules))
+	for i := range point.rules {
+		rules[i] = &point.rules[i]
+	}
+	group, err := service.newListenerGroup(point.key, rules)
+	if err != nil {
+		return nil, err
+	}
+	group.mu.Lock()
+	group.renderKey = point.renderKey
+	group.mu.Unlock()
+	return group, nil
+}
+
+func restoreReverseProxyListenerGroups(service *ReverseProxyService, points []reverseProxyListenerGroupRestorePoint, target map[string]*reverseProxyListenerGroup) []error {
+	errs := make([]error, 0)
+	for _, point := range points {
+		group, err := restoreReverseProxyListenerGroup(service, point)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", point.key, err))
+			continue
+		}
+		if group != nil {
+			target[point.key] = group
+		}
+	}
+	return errs
+}
+
+const (
+	reverseProxySocketKindTCP = "tcp"
+	reverseProxySocketKindUDP = "udp"
+)
+
+func reverseProxyCanonicalListenIPs(items []string, fallback []string) []string {
+	if len(items) == 0 {
+		items = fallback
+	}
+	result := make([]string, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		value := strings.Trim(strings.TrimSpace(item), "[]")
+		if value == "" {
+			continue
+		}
+		addr, err := netip.ParseAddr(value)
+		if err != nil {
+			continue
+		}
+		value = addr.Unmap().String()
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	if len(result) == 0 {
+		for _, item := range fallback {
+			value := strings.Trim(strings.TrimSpace(item), "[]")
+			if value == "" {
+				continue
+			}
+			if _, exists := seen[value]; exists {
+				continue
+			}
+			seen[value] = struct{}{}
+			result = append(result, value)
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+func reverseProxyHTTPRuntimeListenIPs(row *model.ReverseProxyRule) []string {
+	return []string{"0.0.0.0", "::"}
+}
+
+func reverseProxyNormalizedHTTPRuntimeListenIPs(row reverseProxyNormalizedRule) []string {
+	return []string{"0.0.0.0", "::"}
+}
+
+func reverseProxyNormalizedDNSRuntimeListenIPs(row reverseProxyNormalizedRule) []string {
+	return []string{"0.0.0.0", "::"}
+}
+
+func reverseProxyListenerSocketKinds(protocol string, listenStrategy string, alias string) []string {
+	tcp, udp := reverseProxyListenerUsesUnderlyingSockets(protocol, listenStrategy, alias)
+	items := make([]string, 0, 2)
+	if tcp {
+		items = append(items, reverseProxySocketKindTCP)
+	}
+	if udp {
+		items = append(items, reverseProxySocketKindUDP)
+	}
+	return items
+}
+
+func reverseProxyListenerGroupKey(row *model.ReverseProxyRule, socketKind string) string {
+	if row == nil {
+		return ""
+	}
+	listenIPs := strings.Join(reverseProxyHTTPRuntimeListenIPs(row), ",")
+	return reverseProxyListenerKey(reverseProxyListenerGroupProtocol(row), row.ListenPort, socketKind, listenIPs)
+}
+
+func reverseProxyListenerSocketKindFromKey(key string) string {
+	parts := strings.SplitN(strings.TrimSpace(key), "|", 4)
+	if len(parts) >= 3 && (parts[2] == reverseProxySocketKindTCP || parts[2] == reverseProxySocketKindUDP) {
+		return parts[2]
+	}
+	return reverseProxySocketKindTCP
+}
+
+func reverseProxyGroupListenHTTPVersionStrategy(protocol string, socketKind string, rules []*model.ReverseProxyRule) string {
+	if !strings.EqualFold(strings.TrimSpace(protocol), reverseProxyProtocolHTTPS) {
+		return ""
+	}
+	for _, rule := range rules {
+		if rule == nil {
+			continue
+		}
+		strategy, err := normalizeReverseProxyListenHTTPVersionStrategy(rule.ListenHTTPVersionStrategy, rule.ListenProtocol)
+		if err == nil && strategy == reverseProxyListenHTTPVersionH2H3 {
+			return reverseProxyListenHTTPVersionH2H3
+		}
+	}
+	if socketKind == reverseProxySocketKindUDP {
+		return reverseProxyListenHTTPVersionH3Only
+	}
+	return reverseProxyListenHTTPVersionH2Only
+}
+
+// reverseProxyListenerGroupNeedsRestart reports changes that alter the bound
+// socket topology or stream settings negotiated during a new H2/H3 connection.
+// Adjustable connection, request, upstream and memory guards refresh in place.
+func reverseProxyListenerGroupNeedsRestart(group *reverseProxyListenerGroup, rules []*model.ReverseProxyRule) bool {
+	if group == nil || len(rules) == 0 {
+		return true
+	}
+	first := rules[0]
+	desiredProtocol := reverseProxyListenerGroupProtocol(first)
+	desiredIPs := reverseProxyHTTPRuntimeListenIPs(first)
+	group.mu.RLock()
+	defer group.mu.RUnlock()
+	return group.closed ||
+		group.listenPort != first.ListenPort ||
+		!strings.EqualFold(group.protocol, desiredProtocol) ||
+		!reverseProxyListenIPSetsEqual(group.listenIPs, desiredIPs) ||
+		reverseProxyListenerGroupStaticResourceRestartRequired(group.protocol, group.socketKind, group.resources, reverseProxyResources.current())
+}
+
+func reverseProxyListenerGroupRestartNeedsClosingExisting(group *reverseProxyListenerGroup, rules []*model.ReverseProxyRule) bool {
+	if group == nil || len(rules) == 0 {
+		return false
+	}
+	first := rules[0]
+	desiredIPs := reverseProxyHTTPRuntimeListenIPs(first)
+	group.mu.RLock()
+	defer group.mu.RUnlock()
+	if group.closed ||
+		group.listenPort != first.ListenPort ||
+		!strings.EqualFold(group.protocol, reverseProxyListenerGroupProtocol(first)) ||
+		!reverseProxyListenIPSetsEqual(group.listenIPs, desiredIPs) {
+		return false
+	}
+	return reverseProxyListenerGroupStaticResourceRestartRequired(group.protocol, group.socketKind, group.resources, reverseProxyResources.current())
+}
+
+func reverseProxyListenerGroupStaticResourceRestartRequired(protocol string, socketKind string, previous ReverseProxyResourceSettings, current ReverseProxyResourceSettings) bool {
+	if !strings.EqualFold(strings.TrimSpace(protocol), reverseProxyProtocolHTTPS) {
+		return false
+	}
+	switch socketKind {
+	case reverseProxySocketKindTCP:
+		return previous.HTTP2MaxConcurrentStreams != current.HTTP2MaxConcurrentStreams
+	case reverseProxySocketKindUDP:
+		return previous.QUICMaxIncomingStreams != current.QUICMaxIncomingStreams
+	default:
+		return false
+	}
 }
 
 func reverseProxyGroupRules(rows []model.ReverseProxyRule) map[string][]*model.ReverseProxyRule {
@@ -2528,11 +4494,14 @@ func reverseProxyGroupRules(rows []model.ReverseProxyRule) map[string][]*model.R
 		if !row.Enabled {
 			continue
 		}
-		if reverseProxyProtocolIsDNS(normalizeReverseProxyProtocolAlias(row.ListenProtocolAlias, row.ListenProtocol)) {
+		listenAlias := normalizeReverseProxyProtocolAlias(row.ListenProtocolAlias, row.ListenProtocol)
+		if reverseProxyProtocolIsDNS(listenAlias) && !reverseProxyIsHTTPDNSAlias(listenAlias) {
 			continue
 		}
-		key := reverseProxyListenerKey(row.ListenProtocol, row.ListenPort)
-		grouped[key] = append(grouped[key], row)
+		for _, socketKind := range reverseProxyListenerSocketKinds(row.ListenProtocol, row.ListenHTTPVersionStrategy, listenAlias) {
+			key := reverseProxyListenerGroupKey(row, socketKind)
+			grouped[key] = append(grouped[key], row)
+		}
 	}
 	for key := range grouped {
 		sort.SliceStable(grouped[key], func(i, j int) bool {
@@ -2543,6 +4512,20 @@ func reverseProxyGroupRules(rows []model.ReverseProxyRule) map[string][]*model.R
 		})
 	}
 	return grouped
+}
+
+func reverseProxyHTTPDNSRuleValues(rules []*model.ReverseProxyRule) []model.ReverseProxyRule {
+	result := make([]model.ReverseProxyRule, 0)
+	for _, rule := range rules {
+		if rule == nil {
+			continue
+		}
+		alias := normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
+		if reverseProxyIsHTTPDNSAlias(alias) {
+			result = append(result, *rule)
+		}
+	}
+	return result
 }
 
 func (r *reverseProxyRuntimeManager) swapGroupsLocked(next map[string]*reverseProxyListenerGroup) error {
@@ -2601,21 +4584,35 @@ func loadReverseProxyCertificateRenderState(db *gorm.DB, rows []model.ReversePro
 }
 
 func computeReverseProxyRenderKey(db *gorm.DB, rows []model.ReverseProxyRule) string {
+	return computeReverseProxyRenderKeyWithCertificateState(rows, loadReverseProxyCertificateRenderState(db, rows))
+}
+
+func reverseProxyRuleValues(rows []*model.ReverseProxyRule) []model.ReverseProxyRule {
+	result := make([]model.ReverseProxyRule, 0, len(rows))
+	for _, row := range rows {
+		if row != nil {
+			result = append(result, *row)
+		}
+	}
+	return result
+}
+
+func computeReverseProxyRenderKeyWithCertificateState(rows []model.ReverseProxyRule, certState map[uint]model.CertificateRecord) string {
 	httpRows := make([]model.ReverseProxyRule, 0, len(rows))
 	for i := range rows {
 		listenAlias := normalizeReverseProxyProtocolAlias(rows[i].ListenProtocolAlias, rows[i].ListenProtocol)
-		if reverseProxyProtocolIsDNS(listenAlias) {
+		if reverseProxyProtocolIsDNS(listenAlias) && !reverseProxyIsHTTPDNSAlias(listenAlias) {
 			continue
 		}
 		httpRows = append(httpRows, rows[i])
 	}
-	certState := loadReverseProxyCertificateRenderState(db, httpRows)
 	snapshot := make([]reverseProxyRenderRule, 0, len(httpRows))
 	for i := range httpRows {
 		row := httpRows[i]
 		listenProtocol := strings.ToLower(strings.TrimSpace(row.ListenProtocol))
 		listenAlias := normalizeReverseProxyProtocolAlias(row.ListenProtocolAlias, row.ListenProtocol)
 		targetProtocol := strings.ToLower(strings.TrimSpace(row.TargetProtocol))
+		targetAlias := normalizeReverseProxyProtocolAlias(row.TargetProtocolAlias, row.TargetProtocol)
 		listenHTTPVersionStrategy := strings.ToLower(strings.TrimSpace(row.ListenHTTPVersionStrategy))
 		certificateRecordIDs := []uint{}
 		certificateStates := []reverseProxyRenderCertificateState{}
@@ -2638,24 +4635,32 @@ func computeReverseProxyRenderKey(db *gorm.DB, rows []model.ReverseProxyRule) st
 			ListOrder:              row.ListOrder,
 			Enabled:                row.Enabled,
 			ListenProtocol:         listenProtocol,
-			ListenIPs:              decodeReverseProxyListenIPs(&row),
+			ListenProtocolAlias:    listenAlias,
 			ListenPort:             row.ListenPort,
 			Hosts:                  reverseProxyRuleServerNames(&row),
 			PathPrefix:             normalizeReverseProxyPath(row.PathPrefix, false),
 			ListenDNSPath:          normalizeReverseProxyDNSPath(row.ListenDNSPath),
 			TargetProtocol:         targetProtocol,
+			TargetProtocolAlias:    targetAlias,
 			TargetAddresses:        decodeReverseProxyList(row.TargetAddresses),
 			TargetPort:             row.TargetPort,
 			TargetPath:             normalizeReverseProxyPath(row.TargetPath, false),
 			TargetDNSPath:          normalizeReverseProxyDNSPath(row.TargetDNSPath),
+			AdvertiseHTTP3:         row.AdvertiseHTTP3,
 			EDNSEnabled:            false,
 			EDNSMode:               "",
 			EDNSCustomIP:           "",
 			EDNSClientSubnetPolicy: "",
 			DisableIPv4Answer:      false,
 			DisableIPv6Answer:      false,
-			CertificateRecordIDs:   certificateRecordIDs,
-			CertificateStates:      certificateStates,
+			DNSRuntimeState: func() string {
+				if reverseProxyIsHTTPDNSAlias(listenAlias) {
+					return reverseProxyDNSRouteRuntimeStateKey(&row)
+				}
+				return ""
+			}(),
+			CertificateRecordIDs: certificateRecordIDs,
+			CertificateStates:    certificateStates,
 			ListenHTTPVersionStrategy: func() string {
 				if listenProtocol != reverseProxyProtocolHTTPS {
 					return ""
@@ -2679,7 +4684,12 @@ func computeReverseProxyRenderKey(db *gorm.DB, rows []model.ReverseProxyRule) st
 				}
 				return false
 			}(),
-			ApiPassthrough: row.ApiPassthrough,
+			MaxConcurrentConnections:   reverseProxyRuleLimit(row.MaxConcurrentConnections),
+			MaxConcurrentRequests:      reverseProxyMaxConcurrentRequests(row.MaxConcurrentRequests),
+			UpstreamMaxConnections:     reverseProxyRuleLimit(row.UpstreamMaxConnections),
+			UpstreamMaxIdleConnections: reverseProxyRuleLimit(row.UpstreamMaxIdleConnections),
+			MemoryLimitBytes:           row.MemoryLimitBytes,
+			ApiPassthrough:             row.ApiPassthrough,
 		})
 	}
 	raw, _ := json.Marshal(snapshot)
@@ -2720,6 +4730,27 @@ func shutdownReverseProxyHTTPServer(server *http.Server) error {
 	return err
 }
 
+func shutdownReverseProxyHTTP3Server(server *http3.Server) error {
+	if server == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), reverseProxyShutdownTimeout)
+	err := server.Shutdown(ctx)
+	cancel()
+	if err == nil || errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	closeErr := server.Close()
+	if closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) && !errors.Is(closeErr, net.ErrClosed) {
+		return closeErr
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		logger.Warning("reverse proxy http3 graceful shutdown exceeded deadline; forced close applied")
+		return nil
+	}
+	return err
+}
+
 func (s *ReverseProxyService) buildListenerGroups(rows []model.ReverseProxyRule) (map[string]*reverseProxyListenerGroup, []string, error) {
 	grouped := reverseProxyGroupRules(rows)
 	nextGroups := make(map[string]*reverseProxyListenerGroup, len(grouped))
@@ -2737,42 +4768,175 @@ func (s *ReverseProxyService) buildListenerGroups(rows []model.ReverseProxyRule)
 	return nextGroups, warnings, nil
 }
 
-func reverseProxyListenerKey(protocol string, port int) string {
-	return strings.TrimSpace(protocol) + "|" + strconv.Itoa(port)
+func reverseProxyListenerKey(protocol string, port int, parts ...string) string {
+	keyParts := []string{strings.TrimSpace(protocol), strconv.Itoa(port)}
+	for _, part := range parts {
+		keyParts = append(keyParts, strings.TrimSpace(part))
+	}
+	return strings.Join(keyParts, "|")
+}
+
+func newReverseProxyAdjustableLimiter(max int) *reverseProxyAdjustableLimiter {
+	limiter := &reverseProxyAdjustableLimiter{}
+	limiter.SetMax(max)
+	return limiter
+}
+
+// configureRuleLimitersLocked refreshes the lookup maps for future requests.
+// A limiter belonging to a still-present rule is deliberately reused: active
+// requests, local connections and upstream sockets retain that same pointer,
+// so lowering a limit takes effect immediately without forgetting in-flight
+// leases.  Limiters for removed rules may outlive the map briefly; their
+// holders release them normally when the request or connection ends.
+func (g *reverseProxyListenerGroup) configureRuleLimitersLocked(rules []*model.ReverseProxyRule, resources ReverseProxyResourceSettings) {
+	if g == nil {
+		return
+	}
+	g.resources = resources
+	if g.listenerConnectionLimiter == nil {
+		g.listenerConnectionLimiter = newReverseProxyAdjustableLimiter(resources.ListenerConnectionLimit)
+	} else {
+		g.listenerConnectionLimiter.SetMax(resources.ListenerConnectionLimit)
+	}
+	previousRuleConnectionLimiters := g.ruleConnectionLimiters
+	previousRequestLimiters := g.requestLimiters
+	previousUpstreamLimiters := g.upstreamLimiters
+	nextRuleConnectionLimiters := make(map[uint]*reverseProxyAdjustableLimiter, len(rules))
+	nextRequestLimiters := make(map[uint]*reverseProxyAdjustableLimiter, len(rules))
+	nextUpstreamLimiters := make(map[uint]*reverseProxyAdjustableLimiter, len(rules))
+	for _, rule := range rules {
+		if rule == nil || rule.Id == 0 {
+			continue
+		}
+		ruleConnectionLimit := reverseProxyRuleLimit(rule.MaxConcurrentConnections)
+		requestLimit := reverseProxyMaxConcurrentRequests(rule.MaxConcurrentRequests)
+		upstreamLimit := reverseProxyRuleLimit(rule.UpstreamMaxConnections)
+
+		ruleConnectionLimiter := previousRuleConnectionLimiters[rule.Id]
+		if ruleConnectionLimiter == nil {
+			ruleConnectionLimiter = newReverseProxyAdjustableLimiter(ruleConnectionLimit)
+		} else {
+			ruleConnectionLimiter.SetMax(ruleConnectionLimit)
+		}
+		nextRuleConnectionLimiters[rule.Id] = ruleConnectionLimiter
+
+		requestLimiter := previousRequestLimiters[rule.Id]
+		if requestLimiter == nil {
+			requestLimiter = newReverseProxyAdjustableLimiter(requestLimit)
+		} else {
+			requestLimiter.SetMax(requestLimit)
+		}
+		nextRequestLimiters[rule.Id] = requestLimiter
+
+		upstreamLimiter := previousUpstreamLimiters[rule.Id]
+		if upstreamLimiter == nil {
+			upstreamLimiter = newReverseProxyAdjustableLimiter(upstreamLimit)
+		} else {
+			upstreamLimiter.SetMax(upstreamLimit)
+		}
+		nextUpstreamLimiters[rule.Id] = upstreamLimiter
+	}
+	g.ruleConnectionLimiters = nextRuleConnectionLimiters
+	g.requestLimiters = nextRequestLimiters
+	g.upstreamLimiters = nextUpstreamLimiters
+}
+
+// applyResourceSettings updates guards that can change while a listener is
+// live.  H2/QUIC stream limits are handled by the restart path because they
+// are negotiated at connection creation.  Changing the inherited idle-pool
+// setting is the lone dynamic field that must retire existing transports: the
+// net/http transport fields are immutable once a request has used them.
+func (g *reverseProxyListenerGroup) applyResourceSettings(resources ReverseProxyResourceSettings) {
+	if g == nil {
+		return
+	}
+	staleUpstreams := make([]*reverseProxyCachedUpstream, 0)
+	g.mu.Lock()
+	previous := g.resources
+	g.configureRuleLimitersLocked(g.rules, resources)
+	if previous.DefaultUpstreamMaxIdleConnections != resources.DefaultUpstreamMaxIdleConnections {
+		for ruleID, upstream := range g.upstreamByRule {
+			usesDefault := true
+			for _, rule := range g.rules {
+				if rule != nil && rule.Id == ruleID {
+					usesDefault = reverseProxyRuleLimit(rule.UpstreamMaxIdleConnections) == 0
+					break
+				}
+			}
+			if !usesDefault {
+				continue
+			}
+			delete(g.upstreamByRule, ruleID)
+			if upstream != nil {
+				staleUpstreams = append(staleUpstreams, upstream)
+			}
+		}
+	}
+	g.mu.Unlock()
+	for _, upstream := range staleUpstreams {
+		g.disposeCachedUpstream(upstream)
+	}
 }
 
 func (s *ReverseProxyService) newListenerGroup(key string, rules []*model.ReverseProxyRule) (*reverseProxyListenerGroup, error) {
+	resources := reverseProxyResources.current()
 	if len(rules) == 0 {
 		return &reverseProxyListenerGroup{
-			key:                   key,
-			service:               s,
-			upstreamByRule:        make(map[uint]*reverseProxyCachedUpstream),
-			connectionCounts:      make(map[uint]reverseProxyConnectionCounts),
-			localConnIDs:          make(map[net.Conn]string),
-			localConnStates:       make(map[string]reverseProxyLocalConnectionState),
-			localConnAddrToID:     make(map[string]string),
-			localConnAddrByID:     make(map[string]string),
-			pendingConnSelections: make(map[string]reverseProxyCertificateSelection),
+			key:                 key,
+			service:             s,
+			upstreamByRule:      make(map[uint]*reverseProxyCachedUpstream),
+			connectionCounts:    make(map[uint]reverseProxyConnectionCounts),
+			localConnIDs:        make(map[net.Conn]string),
+			localConnByID:       make(map[string]net.Conn),
+			localConnStates:     make(map[string]reverseProxyLocalConnectionState),
+			localConnAddrToID:   make(map[string]string),
+			localConnAddrByID:   make(map[string]string),
+			hijackedConnections: make(map[string]net.Conn),
+			connectionSlotIDs:   make(map[string]struct{}),
+			resources:           resources,
+			listenerConnectionLimiter: func() *reverseProxyAdjustableLimiter {
+				limiter := &reverseProxyAdjustableLimiter{}
+				limiter.SetMax(resources.ListenerConnectionLimit)
+				return limiter
+			}(),
+			ruleConnectionLimiters: make(map[uint]*reverseProxyAdjustableLimiter),
+			requestLimiters:        make(map[uint]*reverseProxyAdjustableLimiter),
+			upstreamLimiters:       make(map[uint]*reverseProxyAdjustableLimiter),
 		}, nil
 	}
 	first := rules[0]
+	socketKind := reverseProxyListenerSocketKindFromKey(key)
+	listenIPs := reverseProxyHTTPRuntimeListenIPs(first)
 
 	group := &reverseProxyListenerGroup{
-		key:                   key,
-		listenPort:            first.ListenPort,
-		protocol:              strings.TrimSpace(first.ListenProtocol),
-		rules:                 rules,
-		service:               s,
-		certBindingsByRule:    make(map[uint][]*reverseProxyRuleCertificateBinding),
-		orderedCertBindings:   make([]*reverseProxyRuleCertificateBinding, 0),
-		warnings:              make([]string, 0),
-		upstreamByRule:        make(map[uint]*reverseProxyCachedUpstream),
-		connectionCounts:      make(map[uint]reverseProxyConnectionCounts),
-		localConnIDs:          make(map[net.Conn]string),
-		localConnStates:       make(map[string]reverseProxyLocalConnectionState),
-		localConnAddrToID:     make(map[string]string),
-		localConnAddrByID:     make(map[string]string),
-		pendingConnSelections: make(map[string]reverseProxyCertificateSelection),
+		key:                 key,
+		listenIPs:           listenIPs,
+		listenPort:          first.ListenPort,
+		protocol:            reverseProxyListenerGroupProtocol(first),
+		socketKind:          socketKind,
+		rules:               rules,
+		service:             s,
+		certBindingsByRule:  make(map[uint][]*reverseProxyRuleCertificateBinding),
+		orderedCertBindings: make([]*reverseProxyRuleCertificateBinding, 0),
+		warnings:            make([]string, 0),
+		upstreamByRule:      make(map[uint]*reverseProxyCachedUpstream),
+		connectionCounts:    make(map[uint]reverseProxyConnectionCounts),
+		localConnIDs:        make(map[net.Conn]string),
+		localConnByID:       make(map[string]net.Conn),
+		localConnStates:     make(map[string]reverseProxyLocalConnectionState),
+		localConnAddrToID:   make(map[string]string),
+		localConnAddrByID:   make(map[string]string),
+		hijackedConnections: make(map[string]net.Conn),
+		connectionSlotIDs:   make(map[string]struct{}),
+		resources:           resources,
+		listenerConnectionLimiter: func() *reverseProxyAdjustableLimiter {
+			limiter := &reverseProxyAdjustableLimiter{}
+			limiter.SetMax(resources.ListenerConnectionLimit)
+			return limiter
+		}(),
+		ruleConnectionLimiters: make(map[uint]*reverseProxyAdjustableLimiter),
+		requestLimiters:        make(map[uint]*reverseProxyAdjustableLimiter),
+		upstreamLimiters:       make(map[uint]*reverseProxyAdjustableLimiter),
 	}
 
 	certBindingsByRule, orderedCertBindings, err := s.loadRuleCertificates(rules)
@@ -2781,42 +4945,23 @@ func (s *ReverseProxyService) newListenerGroup(key string, rules []*model.Revers
 	}
 	group.certBindingsByRule = certBindingsByRule
 	group.orderedCertBindings = orderedCertBindings
-	group.defaultCert, group.defaultLeaf = reverseProxyPickDefaultCertificate(orderedCertBindings)
-
-	listenHTTPVersionStrategy, err := normalizeReverseProxyListenHTTPVersionStrategy(first.ListenHTTPVersionStrategy, group.protocol)
-	if err != nil {
-		return nil, err
-	}
-	group.listenHTTPVersionStrategy = listenHTTPVersionStrategy
-	enableTCP := true
-	enableUDP := false
-	if group.protocol == reverseProxyProtocolHTTPS {
-		switch listenHTTPVersionStrategy {
-		case reverseProxyListenHTTPVersionH2Only:
-			enableTCP = true
-			enableUDP = false
-		case reverseProxyListenHTTPVersionH3Only:
-			enableTCP = false
-			enableUDP = true
-		default:
-			enableTCP = true
-			enableUDP = true
+	group.configureIPCertificateIndexesLocked()
+	if dnsRows := reverseProxyHTTPDNSRuleValues(rules); len(dnsRows) > 0 {
+		group.dnsHandler, err = buildReverseProxyDNSRuleHandler(dnsRows)
+		if err != nil {
+			return nil, err
 		}
 	}
 
+	group.listenHTTPVersionStrategy = reverseProxyGroupListenHTTPVersionStrategy(group.protocol, socketKind, rules)
+	enableTCP := socketKind == reverseProxySocketKindTCP
+	enableUDP := socketKind == reverseProxySocketKindUDP
+	group.configureRuleLimitersLocked(rules, resources)
+
 	handler := group.newHandler()
-	tcpHandler := handler
-	if strings.EqualFold(group.protocol, reverseProxyProtocolHTTPS) && enableUDP {
-		tcpHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if w != nil {
-				w.Header().Set("Alt-Svc", reverseProxyAltSvcValue(group.listenPort))
-			}
-			handler.ServeHTTP(w, r)
-		})
-	}
 	var firstErr error
 	if enableTCP {
-		binds := reverseProxyTCPListenBinds(first.ListenPort)
+		binds := reverseProxyTCPListenBinds(first.ListenPort, group.listenIPs)
 		for _, bind := range binds {
 			listener, listenErr := net.Listen(bind.network, bind.address)
 			if listenErr != nil {
@@ -2831,16 +4976,26 @@ func (s *ReverseProxyService) newListenerGroup(key string, rules []*model.Revers
 				return nil, firstErr
 			}
 			server := &http.Server{
-				Handler:           tcpHandler,
+				Handler:           handler,
 				ReadHeaderTimeout: reverseProxyReadHeaderTimeout,
+				ReadTimeout:       reverseProxyServerReadTimeout,
 				IdleTimeout:       reverseProxyServerIdleTimeout,
+				MaxHeaderBytes:    reverseProxyMaxHeaderBytes,
 				ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
 					return group.registerTCPConnectionContext(ctx, conn)
 				},
 				ConnState: func(conn net.Conn, state http.ConnState) {
-					if state == http.StateClosed || state == http.StateHijacked {
+					if state == http.StateClosed {
 						group.releaseLocalConnectionByConn(conn)
+					} else if state == http.StateHijacked {
+						group.markHijackedConnection(conn)
 					}
+				},
+			}
+			listener = &reverseProxyTrackedClientListener{
+				Listener: listener,
+				onClose: func(conn net.Conn) {
+					group.releaseLocalConnectionByAddrKey(reverseProxyConnectionAddrKey(conn))
 				},
 			}
 			if group.protocol == reverseProxyProtocolHTTPS {
@@ -2849,7 +5004,7 @@ func (s *ReverseProxyService) newListenerGroup(key string, rules []*model.Revers
 					MinVersion:     tls.VersionTLS12,
 					NextProtos:     []string{"h2", "http/1.1"},
 				}
-				if err := http2.ConfigureServer(server, nil); err != nil {
+				if err := http2.ConfigureServer(server, &http2.Server{MaxConcurrentStreams: resources.HTTP2MaxConcurrentStreams}); err != nil {
 					_ = listener.Close()
 					_ = group.shutdown()
 					return nil, err
@@ -2869,7 +5024,7 @@ func (s *ReverseProxyService) newListenerGroup(key string, rules []*model.Revers
 		}
 	}
 	if group.protocol == reverseProxyProtocolHTTPS && enableUDP {
-		udpBinds := reverseProxyUDPListenBinds(first.ListenPort)
+		udpBinds := reverseProxyUDPListenBinds(first.ListenPort, group.listenIPs)
 		for _, bind := range udpBinds {
 			packetConn, listenErr := net.ListenPacket(bind.network, bind.address)
 			if listenErr != nil {
@@ -2884,16 +5039,21 @@ func (s *ReverseProxyService) newListenerGroup(key string, rules []*model.Revers
 				return nil, firstErr
 			}
 			h3TLS := &tls.Config{
-				GetCertificate: group.getCertificate,
-				MinVersion:     tls.VersionTLS13,
+				GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+					return group.getCertificate(reverseProxyClientHelloWithLocalIPHint(hello, bind.listenIP))
+				},
+				MinVersion: tls.VersionTLS13,
 			}
 			h3Server := &http3.Server{
-				Handler:   handler,
-				TLSConfig: h3TLS,
-				Port:      first.ListenPort,
+				Handler:        handler,
+				TLSConfig:      h3TLS,
+				Port:           first.ListenPort,
+				MaxHeaderBytes: reverseProxyMaxHeaderBytes,
 				QUICConfig: &quic.Config{
-					KeepAlivePeriod: reverseProxyUpstreamQUICKeepAlivePeriod,
-					MaxIdleTimeout:  reverseProxyServerIdleTimeout,
+					KeepAlivePeriod:       reverseProxyUpstreamQUICKeepAlivePeriod,
+					MaxIdleTimeout:        reverseProxyServerIdleTimeout,
+					MaxIncomingStreams:    resources.QUICMaxIncomingStreams,
+					MaxIncomingUniStreams: resources.QUICMaxIncomingStreams,
 				},
 				ConnContext: func(ctx context.Context, conn *quic.Conn) context.Context {
 					return group.registerQUICConnectionContext(ctx, conn)
@@ -2942,40 +5102,83 @@ func (s *ReverseProxyService) newListenerGroup(key string, rules []*model.Revers
 	return group, nil
 }
 
-func reverseProxyTCPListenBinds(port int) []reverseProxyListenBind {
-	return []reverseProxyListenBind{
-		{
-			network:  "tcp4",
-			listenIP: "0.0.0.0",
-			address:  net.JoinHostPort("0.0.0.0", strconv.Itoa(port)),
-		},
-		{
-			network:  "tcp6",
-			listenIP: "::",
-			address:  net.JoinHostPort("::", strconv.Itoa(port)),
-			optional: true,
-		},
+func reverseProxyTCPListenBinds(port int, requestedIPs ...[]string) []reverseProxyListenBind {
+	listenIPs := []string{"0.0.0.0", "::"}
+	if len(requestedIPs) > 0 {
+		listenIPs = reverseProxyCanonicalListenIPs(requestedIPs[0], listenIPs)
 	}
+	return reverseProxyListenBindsForNetwork("tcp", port, listenIPs)
 }
 
-func reverseProxyUDPListenBinds(port int) []reverseProxyListenBind {
-	return []reverseProxyListenBind{
-		{
-			network:  "udp4",
-			listenIP: "0.0.0.0",
-			address:  net.JoinHostPort("0.0.0.0", strconv.Itoa(port)),
-		},
-		{
-			network:  "udp6",
-			listenIP: "::",
-			address:  net.JoinHostPort("::", strconv.Itoa(port)),
-			optional: true,
-		},
+func reverseProxyUDPListenBinds(port int, requestedIPs ...[]string) []reverseProxyListenBind {
+	listenIPs := []string{"0.0.0.0", "::"}
+	if len(requestedIPs) > 0 {
+		listenIPs = reverseProxyCanonicalListenIPs(requestedIPs[0], listenIPs)
 	}
+	return reverseProxyListenBindsForNetwork("udp", port, listenIPs)
+}
+
+func reverseProxyListenBindsForNetwork(protocol string, port int, listenIPs []string) []reverseProxyListenBind {
+	binds := make([]reverseProxyListenBind, 0, len(listenIPs))
+	for _, listenIP := range listenIPs {
+		addr, err := netip.ParseAddr(strings.Trim(strings.TrimSpace(listenIP), "[]"))
+		if err != nil {
+			continue
+		}
+		value := addr.Unmap().String()
+		networkName := protocol + "6"
+		if addr.Is4() || addr.Is4In6() {
+			networkName = protocol + "4"
+		}
+		binds = append(binds, reverseProxyListenBind{
+			network:  networkName,
+			listenIP: value,
+			address:  net.JoinHostPort(value, strconv.Itoa(port)),
+			// Keep the historic dual-stack fallback for an unavailable IPv6 stack.
+			optional: addr.Is6() && addr.IsUnspecified(),
+		})
+	}
+	return binds
 }
 
 func reverseProxyAltSvcValue(port int) string {
 	return fmt.Sprintf(`h3=":%d"; ma=%d`, port, reverseProxyAltSvcMaxAgeSeconds)
+}
+
+func (g *reverseProxyListenerGroup) http3AdvertisementHeader(host string, sni string, protoMajor int) string {
+	if g == nil || !strings.EqualFold(strings.TrimSpace(g.protocol), reverseProxyProtocolHTTPS) {
+		return ""
+	}
+	strategy, err := normalizeReverseProxyListenHTTPVersionStrategy(g.listenHTTPVersionStrategy, g.protocol)
+	if err != nil || strategy == reverseProxyListenHTTPVersionH3Only {
+		return ""
+	}
+
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	requireSNI := strings.EqualFold(g.protocol, reverseProxyProtocolHTTPS)
+	originMatched := false
+	for _, rule := range g.rules {
+		matched, _ := g.ruleRequestNameMatchLocked(rule, host, sni, requireSNI)
+		if !matched {
+			continue
+		}
+		originMatched = true
+		listenAlias := normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
+		if rule.AdvertiseHTTP3 && !reverseProxyIsWebSocketAlias(listenAlias) && strategy == reverseProxyListenHTTPVersionH2H3 {
+			if protoMajor < 3 {
+				return reverseProxyAltSvcValue(g.listenPort)
+			}
+			return ""
+		}
+	}
+	if !originMatched {
+		return ""
+	}
+	// Clear a cached alternative service even on an existing H3 connection.
+	// Otherwise a browser can keep retrying UDP after every rule for this
+	// origin disables H3 advertising or the listener switches to H2-only.
+	return "clear"
 }
 
 func reverseProxyListenErrorAllowsOptionalBind(bind reverseProxyListenBind, err error) bool {
@@ -3025,17 +5228,46 @@ func (s *ReverseProxyService) refreshListenerGroup(group *reverseProxyListenerGr
 	if err != nil {
 		return err
 	}
+	var nextDNSHandler *reverseProxyDNSRuleHandler
+	if dnsRows := reverseProxyHTTPDNSRuleValues(rules); len(dnsRows) > 0 {
+		nextDNSHandler, err = buildReverseProxyDNSRuleHandler(dnsRows)
+		if err != nil {
+			return err
+		}
+	}
 	group.mu.Lock()
+	previousRules := append([]*model.ReverseProxyRule(nil), group.rules...)
 	group.rules = rules
 	if len(rules) > 0 {
-		group.listenHTTPVersionStrategy = strings.TrimSpace(rules[0].ListenHTTPVersionStrategy)
+		group.listenIPs = reverseProxyHTTPRuntimeListenIPs(rules[0])
+		group.listenHTTPVersionStrategy = reverseProxyGroupListenHTTPVersionStrategy(group.protocol, group.socketKind, rules)
 	}
 	group.certBindingsByRule = certBindingsByRule
 	group.orderedCertBindings = orderedCertBindings
-	group.defaultCert, group.defaultLeaf = reverseProxyPickDefaultCertificate(orderedCertBindings)
+	group.configureIPCertificateIndexesLocked()
+	oldDNSHandler := group.dnsHandler
+	group.dnsHandler = nextDNSHandler
+	group.configureRuleLimitersLocked(rules, reverseProxyResources.current())
 	oldUpstreams := group.upstreamByRule
 	group.upstreamByRule = make(map[uint]*reverseProxyCachedUpstream)
 	group.mu.Unlock()
+	_ = closeReverseProxyDNSHandler(oldDNSHandler)
+	removedRuleIDs := make(map[uint]struct{})
+	activeRuleIDs := make(map[uint]struct{}, len(rules))
+	for _, rule := range rules {
+		if rule != nil && rule.Id != 0 {
+			activeRuleIDs[rule.Id] = struct{}{}
+		}
+	}
+	for _, rule := range previousRules {
+		if rule == nil || rule.Id == 0 {
+			continue
+		}
+		if _, stillActive := activeRuleIDs[rule.Id]; !stillActive {
+			removedRuleIDs[rule.Id] = struct{}{}
+		}
+	}
+	group.closeHijackedConnectionsForRules(removedRuleIDs)
 	for _, upstream := range oldUpstreams {
 		group.disposeCachedUpstream(upstream)
 	}
@@ -3047,12 +5279,19 @@ func (g *reverseProxyListenerGroup) acquireCachedUpstream(ruleID uint) *reverseP
 		return nil
 	}
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	upstream := g.upstreamByRule[ruleID]
 	if upstream == nil || upstream.closing || upstream.RoundTripper == nil {
+		g.mu.Unlock()
+		return nil
+	}
+	if !upstream.ResolvedAt.IsZero() && time.Since(upstream.ResolvedAt) >= reverseProxyUpstreamResolveCacheTTL {
+		delete(g.upstreamByRule, ruleID)
+		g.mu.Unlock()
+		g.disposeCachedUpstream(upstream)
 		return nil
 	}
 	upstream.refs++
+	g.mu.Unlock()
 	return upstream
 }
 
@@ -3129,33 +5368,237 @@ func buildReverseProxyTargetURL(rule *model.ReverseProxyRule, hostHeader string)
 	}
 }
 
+func reverseProxyReferencedCertificateIDs(rows []model.ReverseProxyRule) []uint {
+	seen := make(map[uint]struct{})
+	ids := make([]uint, 0)
+	for i := range rows {
+		listenAlias := normalizeReverseProxyProtocolAlias(rows[i].ListenProtocolAlias, rows[i].ListenProtocol)
+		if !rows[i].Enabled || !reverseProxyListenerUsesManagedCertificates(rows[i].ListenProtocol, listenAlias) {
+			continue
+		}
+		for _, id := range reverseProxyRuleCertificateIDs(&rows[i]) {
+			if id == 0 {
+				continue
+			}
+			if _, exists := seen[id]; exists {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+func loadReverseProxyParsedCertificateMaterials(ids []uint, replace bool) (map[uint]reverseProxyParsedCertificateMaterial, error) {
+	ids = normalizeReverseProxyCertificateIDList(ids, 0)
+	databaseGeneration := reverseProxyDatabaseGeneration.Load()
+	generation := currentReverseProxyCertificateGeneration()
+	if len(ids) == 0 {
+		if replace {
+			reverseProxyParsedCertificateMaterials.Lock()
+			reverseProxyParsedCertificateMaterials.databaseGeneration = databaseGeneration
+			reverseProxyParsedCertificateMaterials.generation = generation
+			reverseProxyParsedCertificateMaterials.items = make(map[uint]reverseProxyParsedCertificateMaterial)
+			reverseProxyParsedCertificateMaterials.Unlock()
+		}
+		return map[uint]reverseProxyParsedCertificateMaterial{}, nil
+	}
+	if !replace {
+		reverseProxyParsedCertificateMaterials.RLock()
+		allPresent := reverseProxyParsedCertificateMaterials.databaseGeneration == databaseGeneration &&
+			reverseProxyParsedCertificateMaterials.generation == generation
+		result := make(map[uint]reverseProxyParsedCertificateMaterial, len(ids))
+		if allPresent {
+			for _, id := range ids {
+				item, exists := reverseProxyParsedCertificateMaterials.items[id]
+				if !exists {
+					allPresent = false
+					break
+				}
+				result[id] = item
+			}
+		}
+		reverseProxyParsedCertificateMaterials.RUnlock()
+		if allPresent {
+			return result, nil
+		}
+	}
+
+	db := database.GetDB()
+	if db == nil {
+		return nil, common.NewError("database is not ready")
+	}
+	records := make([]model.CertificateRecord, 0, len(ids))
+	if err := db.Select("id", "fullchain_pem", "key_pem", "fingerprint", "updated_at").Where("id IN ?", ids).Find(&records).Error; err != nil {
+		return nil, err
+	}
+	byID := make(map[uint]model.CertificateRecord, len(records))
+	for i := range records {
+		byID[records[i].Id] = records[i]
+	}
+	loaded := make(map[uint]reverseProxyParsedCertificateMaterial, len(ids))
+	for _, id := range ids {
+		record, exists := byID[id]
+		if !exists {
+			loaded[id] = reverseProxyParsedCertificateMaterial{Err: common.NewError("certificate not found")}
+			continue
+		}
+		certificate, leaf, err := reverseProxyLoadCertificate(&record)
+		loaded[id] = reverseProxyParsedCertificateMaterial{Certificate: certificate, Leaf: leaf, Err: err}
+	}
+	if reverseProxyDatabaseGeneration.Load() != databaseGeneration || currentReverseProxyCertificateGeneration() != generation {
+		return nil, common.NewError("certificate inventory changed during reverse proxy refresh")
+	}
+	reverseProxyParsedCertificateMaterials.Lock()
+	if replace ||
+		reverseProxyParsedCertificateMaterials.databaseGeneration != databaseGeneration ||
+		reverseProxyParsedCertificateMaterials.generation != generation {
+		reverseProxyParsedCertificateMaterials.items = make(map[uint]reverseProxyParsedCertificateMaterial, len(loaded))
+	}
+	for id, item := range loaded {
+		reverseProxyParsedCertificateMaterials.items[id] = item
+	}
+	reverseProxyParsedCertificateMaterials.databaseGeneration = databaseGeneration
+	reverseProxyParsedCertificateMaterials.generation = generation
+	reverseProxyParsedCertificateMaterials.Unlock()
+	return loaded, nil
+}
+
+func prepareReverseProxyParsedCertificateMaterials(rows []model.ReverseProxyRule) error {
+	_, err := loadReverseProxyParsedCertificateMaterials(reverseProxyReferencedCertificateIDs(rows), true)
+	return err
+}
+
 func (s *ReverseProxyService) loadRuleCertificates(rules []*model.ReverseProxyRule) (map[uint][]*reverseProxyRuleCertificateBinding, []*reverseProxyRuleCertificateBinding, error) {
 	certBindingsByRule := make(map[uint][]*reverseProxyRuleCertificateBinding)
 	orderedCertBindings := make([]*reverseProxyRuleCertificateBinding, 0)
+	ids := make([]uint, 0)
+	for _, rule := range rules {
+		if rule != nil && reverseProxyListenerUsesManagedCertificates(rule.ListenProtocol, normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)) {
+			ids = append(ids, reverseProxyRuleCertificateIDs(rule)...)
+		}
+	}
+	materials, err := loadReverseProxyParsedCertificateMaterials(ids, false)
+	if err != nil {
+		return nil, nil, err
+	}
 	for _, rule := range rules {
 		if rule == nil || !reverseProxyListenerUsesManagedCertificates(rule.ListenProtocol, normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)) {
 			continue
 		}
 		for _, certID := range reverseProxyRuleCertificateIDs(rule) {
-			record, err := s.CertificateInventoryService.GetRecordByID(certID)
-			if err != nil {
-				return nil, nil, err
+			material, exists := materials[certID]
+			if !exists {
+				return nil, nil, common.NewError("certificate not found")
 			}
-			cert, leaf, err := reverseProxyLoadCertificate(record)
-			if err != nil {
-				return nil, nil, err
+			if material.Err != nil {
+				return nil, nil, material.Err
 			}
 			binding := &reverseProxyRuleCertificateBinding{
 				RuleID:              rule.Id,
 				CertificateRecordID: certID,
-				Certificate:         cert,
-				Leaf:                leaf,
+				Certificate:         material.Certificate,
+				Leaf:                material.Leaf,
 			}
 			certBindingsByRule[rule.Id] = append(certBindingsByRule[rule.Id], binding)
 			orderedCertBindings = append(orderedCertBindings, binding)
 		}
 	}
 	return certBindingsByRule, orderedCertBindings, nil
+}
+
+func reverseProxyCertificateBindingIPNames(binding *reverseProxyRuleCertificateBinding) []string {
+	if binding == nil || binding.Leaf == nil || binding.Leaf.Leaf == nil {
+		return nil
+	}
+	result := make([]string, 0, len(binding.Leaf.Leaf.IPAddresses))
+	seen := make(map[string]struct{}, len(binding.Leaf.Leaf.IPAddresses))
+	for _, raw := range binding.Leaf.Leaf.IPAddresses {
+		addr, ok := netip.AddrFromSlice(raw)
+		if !ok {
+			continue
+		}
+		value := addr.Unmap().String()
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func (g *reverseProxyListenerGroup) configureIPCertificateIndexesLocked() {
+	if g == nil {
+		return
+	}
+	g.ipCertBindings = make(map[string][]*reverseProxyRuleCertificateBinding)
+	g.ipCertificateUniverse = make(map[string]struct{})
+	g.natFallbackCertBindings = make(map[string][]*reverseProxyRuleCertificateBinding)
+	certIPs := make(map[uint]map[string]struct{})
+	universeByFamily := map[string]map[string]struct{}{
+		"4": {},
+		"6": {},
+	}
+	for _, binding := range g.orderedCertBindings {
+		if binding == nil || binding.CertificateRecordID == 0 {
+			continue
+		}
+		for _, value := range reverseProxyCertificateBindingIPNames(binding) {
+			g.ipCertBindings[value] = append(g.ipCertBindings[value], binding)
+			g.ipCertificateUniverse[value] = struct{}{}
+			if family := reverseProxyIPLiteralFamily(value); family != "" {
+				universeByFamily[family][value] = struct{}{}
+			}
+			items := certIPs[binding.CertificateRecordID]
+			if items == nil {
+				items = make(map[string]struct{})
+				certIPs[binding.CertificateRecordID] = items
+			}
+			items[value] = struct{}{}
+		}
+	}
+	for family, universe := range universeByFamily {
+		if len(universe) == 0 {
+			continue
+		}
+		for _, binding := range g.orderedCertBindings {
+			if binding == nil {
+				continue
+			}
+			coversAll := true
+			for value := range universe {
+				if _, exists := certIPs[binding.CertificateRecordID][value]; !exists {
+					coversAll = false
+					break
+				}
+			}
+			if coversAll {
+				g.natFallbackCertBindings[family] = append(g.natFallbackCertBindings[family], binding)
+			}
+		}
+	}
+}
+
+func reverseProxyIPLiteralFamily(value string) string {
+	addr, err := netip.ParseAddr(strings.Trim(strings.TrimSpace(value), "[]"))
+	if err != nil {
+		return ""
+	}
+	if addr.Unmap().Is4() {
+		return "4"
+	}
+	return "6"
+}
+
+func (g *reverseProxyListenerGroup) natFallbackCertificatesForLocalIP(ip net.IP) []*reverseProxyRuleCertificateBinding {
+	if g == nil || ip == nil {
+		return nil
+	}
+	return g.natFallbackCertBindings[reverseProxyIPLiteralFamily(ip.String())]
 }
 
 func reverseProxyListenerUsesManagedCertificates(listenProtocol string, listenAlias string) bool {
@@ -3165,14 +5608,6 @@ func reverseProxyListenerUsesManagedCertificates(listenProtocol string, listenAl
 		return true
 	}
 	return normalizedProtocol == reverseProxyProtocolDNS && reverseProxyDNSProtocolUsesTLS(normalizedAlias)
-}
-
-func reverseProxyPickDefaultCertificate(bindings []*reverseProxyRuleCertificateBinding) (*tls.Certificate, *x509LeafState) {
-	binding := reverseProxyPickNoSNIBinding(bindings, "")
-	if binding != nil {
-		return binding.Certificate, binding.Leaf
-	}
-	return nil, nil
 }
 
 func reverseProxyLoadCertificate(record *model.CertificateRecord) (*tls.Certificate, *x509LeafState, error) {
@@ -3208,35 +5643,59 @@ func (g *reverseProxyListenerGroup) getCertificate(hello *tls.ClientHelloInfo) (
 	if hello != nil {
 		serverName = reverseProxyNormalizeServerName(hello.ServerName)
 		if hello.Conn != nil {
-			connAddrKey = reverseProxyConnectionAddrKey(hello.Conn)
+			if _, isLocalHint := hello.Conn.(*reverseProxyClientHelloLocalHintConn); !isLocalHint {
+				connAddrKey = reverseProxyConnectionAddrKey(hello.Conn)
+			}
 			localIP = reverseProxyNormalizeLocalIP(hello.Conn.LocalAddr())
 		}
 	}
-	if serverName == "" {
-		ipPreferred, others := reverseProxySplitNoSNICertificateCandidates(g.orderedCertBindings, localIP)
-		if selected, selection, err := g.selectBalancedCertificate(ipPreferred, reverseProxyCertBalanceNoSNIBucket); err == nil && selected != nil {
-			g.bindCertificateSelectionToConnection(connAddrKey, selection)
-			return selected.Certificate, nil
-		}
-		if selected, selection, err := g.selectBalancedCertificate(others, reverseProxyCertBalanceNoSNIBucket); err == nil && selected != nil {
-			g.bindCertificateSelectionToConnection(connAddrKey, selection)
-			return selected.Certificate, nil
-		}
-		reverseProxyCloseClientHelloConn(hello)
-		return nil, common.NewError("tls listener certificate is unavailable")
+	remoteIP := ""
+	if hello != nil && hello.Conn != nil {
+		remoteIP = extractRemoteIP(hello.Conn.RemoteAddr().String())
 	}
-	if reverseProxyParseIPLiteral(serverName) != nil {
-		ipPreferred, others := reverseProxySplitNoSNICertificateCandidates(g.orderedCertBindings, serverName)
-		if selected, selection, err := g.selectBalancedCertificate(ipPreferred, serverName); err == nil && selected != nil {
-			g.bindCertificateSelectionToConnection(connAddrKey, selection)
-			return selected.Certificate, nil
+	if serverName == "" {
+		requestedIP := ""
+		var candidates []*reverseProxyRuleCertificateBinding
+		if localAddr := reverseProxyParseIPLiteral(localIP); localAddr != nil {
+			canonical := localAddr.String()
+			if _, configured := g.ipCertificateUniverse[canonical]; configured {
+				requestedIP = canonical
+				candidates = g.ipCertBindings[canonical]
+			} else if reverseProxyLocalAddressMayHidePublicTarget(localAddr) {
+				candidates = g.natFallbackCertificatesForLocalIP(localAddr)
+			}
 		}
-		if selected, selection, err := g.selectBalancedCertificate(others, serverName); err == nil && selected != nil {
-			g.bindCertificateSelectionToConnection(connAddrKey, selection)
-			return selected.Certificate, nil
+		if certificate, ok := g.selectAndBindCertificate(candidates, requestedIP, connAddrKey, reverseProxyTLSClientNoSNI, requestedIP); ok {
+			return certificate, nil
 		}
+		reverseProxyRuntime.registerMismatch(remoteIP, "missing_sni")
 		reverseProxyCloseClientHelloConn(hello)
-		return nil, common.NewError("tls listener certificate is unavailable")
+		return nil, common.NewError("tls listener has no unambiguous ip certificate for an empty sni")
+	}
+	if sniIP := reverseProxyParseIPLiteral(serverName); sniIP != nil {
+		requestedIP := sniIP.String()
+		localAddr := reverseProxyParseIPLiteral(localIP)
+		if localAddr != nil {
+			localValue := localAddr.String()
+			_, configured := g.ipCertificateUniverse[localValue]
+			if (configured || !reverseProxyLocalAddressMayHidePublicTarget(localAddr)) && !sniIP.Equal(localAddr) {
+				reverseProxyRuntime.registerMismatch(remoteIP, "cross_ip_sni")
+				reverseProxyCloseClientHelloConn(hello)
+				return nil, common.NewError("tls ip sni does not match the visible local target ip")
+			}
+		}
+		candidates := g.ipCertBindings[requestedIP]
+		if certificate, ok := g.selectAndBindCertificate(candidates, requestedIP, connAddrKey, reverseProxyTLSClientIP, requestedIP); ok {
+			return certificate, nil
+		}
+		if len(candidates) == 0 {
+			reverseProxyRuntime.registerMismatch(remoteIP, "cross_ip_sni")
+			reverseProxyCloseClientHelloConn(hello)
+			return nil, common.NewError("tls listener has no certificate covering the ip sni")
+		}
+		reverseProxyRuntime.registerMismatch(remoteIP, "ip_sni")
+		reverseProxyCloseClientHelloConn(hello)
+		return nil, common.NewError("tls listener ip certificate is unavailable")
 	}
 	matchedRule := false
 	exactCandidates := make([]*reverseProxyRuleCertificateBinding, 0)
@@ -3251,17 +5710,16 @@ func (g *reverseProxyListenerGroup) getCertificate(hello *tls.ClientHelloInfo) (
 		wildcardCandidates = append(wildcardCandidates, wildcardByRule...)
 	}
 	if selected, selection, err := g.selectBalancedCertificate(exactCandidates, serverName); err == nil && selected != nil {
+		selection.ClientKind = reverseProxyTLSClientDomain
 		g.bindCertificateSelectionToConnection(connAddrKey, selection)
 		return selected.Certificate, nil
 	}
 	if selected, selection, err := g.selectBalancedCertificate(wildcardCandidates, serverName); err == nil && selected != nil {
+		selection.ClientKind = reverseProxyTLSClientDomain
 		g.bindCertificateSelectionToConnection(connAddrKey, selection)
 		return selected.Certificate, nil
 	}
-	if selected, selection, err := g.selectBalancedCertificate(g.orderedCertBindings, serverName); err == nil && selected != nil {
-		g.bindCertificateSelectionToConnection(connAddrKey, selection)
-		return selected.Certificate, nil
-	}
+	reverseProxyRuntime.registerMismatch(remoteIP, "unrecognized_sni")
 	reverseProxyCloseClientHelloConn(hello)
 	if matchedRule {
 		return nil, common.NewError("tls listener certificate is unavailable")
@@ -3269,22 +5727,21 @@ func (g *reverseProxyListenerGroup) getCertificate(hello *tls.ClientHelloInfo) (
 	return nil, common.NewError("unrecognized tls sni")
 }
 
-func (g *reverseProxyListenerGroup) noSNICertificateCandidatesLocked(localIP string) []*reverseProxyRuleCertificateBinding {
-	if g == nil {
-		return nil
-	}
-	bindings := g.orderedCertBindings
-	if len(bindings) == 0 {
-		bindings = make([]*reverseProxyRuleCertificateBinding, 0)
-		for _, rule := range g.rules {
-			bindings = append(bindings, g.certBindingsByRule[rule.Id]...)
+func (g *reverseProxyListenerGroup) selectAndBindCertificate(candidates []*reverseProxyRuleCertificateBinding, sniBucket string, connAddrKey string, clientKind string, requestedIP string) (*tls.Certificate, bool) {
+	usable := make([]*reverseProxyRuleCertificateBinding, 0, len(candidates))
+	for _, candidate := range candidates {
+		if reverseProxyCertificateBindingUsable(candidate, time.Now()) {
+			usable = append(usable, candidate)
 		}
 	}
-	ipPreferred, others := reverseProxySplitNoSNICertificateCandidates(bindings, localIP)
-	if len(ipPreferred) > 0 {
-		return ipPreferred
+	selected, selection, err := g.selectBalancedCertificate(usable, sniBucket)
+	if err != nil || selected == nil {
+		return nil, false
 	}
-	return others
+	selection.ClientKind = clientKind
+	selection.RequestedIP = strings.TrimSpace(requestedIP)
+	g.bindCertificateSelectionToConnection(connAddrKey, selection)
+	return selected.Certificate, true
 }
 
 func reverseProxyCloseClientHelloConn(hello *tls.ClientHelloInfo) {
@@ -3295,9 +5752,18 @@ func reverseProxyCloseClientHelloConn(hello *tls.ClientHelloInfo) {
 }
 
 func (g *reverseProxyListenerGroup) bindCertificateSelectionToConnection(connAddrKey string, selection reverseProxyCertificateSelection) {
-	if g == nil || connAddrKey == "" || selection.CertificateRecordID == 0 || strings.TrimSpace(selection.ListenerKey) == "" {
+	if g == nil || selection.CertificateRecordID == 0 || strings.TrimSpace(selection.ListenerKey) == "" {
 		return
 	}
+	if strings.TrimSpace(connAddrKey) == "" {
+		// A certificate may be selected by a unit test, an unusual listener
+		// wrapper, or a connection whose addresses are unavailable.  It cannot
+		// be tied to a close event in that case, so release the balance lease
+		// immediately instead of retaining it until process shutdown.
+		g.releaseCertificateSelection(selection)
+		return
+	}
+	selectionsToRelease := make([]reverseProxyCertificateSelection, 0)
 	g.statsMu.Lock()
 	if g.localConnStates == nil {
 		g.localConnStates = make(map[string]reverseProxyLocalConnectionState)
@@ -3305,39 +5771,150 @@ func (g *reverseProxyListenerGroup) bindCertificateSelectionToConnection(connAdd
 	if g.localConnAddrToID == nil {
 		g.localConnAddrToID = make(map[string]string)
 	}
-	if g.pendingConnSelections == nil {
-		g.pendingConnSelections = make(map[string]reverseProxyCertificateSelection)
-	}
+	selectionsToRelease = append(selectionsToRelease, g.prunePendingCertificateSelectionsLocked(connAddrKey, time.Now())...)
 	connID := strings.TrimSpace(g.localConnAddrToID[connAddrKey])
 	if connID != "" {
+		if pending, exists := g.takePendingCertificateSelectionLocked(connAddrKey); exists {
+			selectionsToRelease = append(selectionsToRelease, pending)
+		}
 		state := g.localConnStates[connID]
 		if state.HasSelection {
-			prev := state.Selection
-			g.statsMu.Unlock()
-			g.releaseCertificateSelection(prev)
-			g.statsMu.Lock()
-			state = g.localConnStates[connID]
+			selectionsToRelease = append(selectionsToRelease, state.Selection)
 		}
 		state.Selection = selection
 		state.HasSelection = true
 		g.localConnStates[connID] = state
 		g.statsMu.Unlock()
+		for _, previous := range selectionsToRelease {
+			g.releaseCertificateSelection(previous)
+		}
 		return
 	}
-	g.pendingConnSelections[connAddrKey] = selection
+	selectionsToRelease = append(selectionsToRelease, g.putPendingCertificateSelectionLocked(connAddrKey, selection, time.Now())...)
 	g.statsMu.Unlock()
+	for _, previous := range selectionsToRelease {
+		g.releaseCertificateSelection(previous)
+	}
+}
+
+func (g *reverseProxyListenerGroup) pendingCertificateShard(connAddrKey string) *reverseProxyPendingCertificateShard {
+	if g == nil {
+		return nil
+	}
+	index := int(crc32.ChecksumIEEE([]byte(strings.TrimSpace(connAddrKey))) % reverseProxyRuntimeTableShardCount)
+	return &g.pendingConnSelectionShards[index]
+}
+
+func (g *reverseProxyListenerGroup) prunePendingCertificateSelectionsLocked(connAddrKey string, now time.Time) []reverseProxyCertificateSelection {
+	shard := g.pendingCertificateShard(connAddrKey)
+	if shard == nil || len(shard.selections) == 0 {
+		return nil
+	}
+	if shard.lru == nil {
+		shard.lru = list.New()
+		for key, pending := range shard.selections {
+			if pending == nil {
+				delete(shard.selections, key)
+				continue
+			}
+			pending.element = shard.lru.PushFront(key)
+		}
+	}
+	released := make([]reverseProxyCertificateSelection, 0)
+	for shard.lru.Len() > 0 {
+		oldestKey, _ := shard.lru.Back().Value.(string)
+		pending := shard.selections[oldestKey]
+		if pending != nil && !pending.CreatedAt.IsZero() && now.Sub(pending.CreatedAt) < reverseProxyRuntimeTableTTL {
+			break
+		}
+		if pending != nil {
+			released = append(released, pending.Selection)
+			if pending.element != nil {
+				shard.lru.Remove(pending.element)
+			}
+		}
+		delete(shard.selections, oldestKey)
+	}
+	return released
+}
+
+func (g *reverseProxyListenerGroup) putPendingCertificateSelectionLocked(connAddrKey string, selection reverseProxyCertificateSelection, now time.Time) []reverseProxyCertificateSelection {
+	if g == nil || strings.TrimSpace(connAddrKey) == "" {
+		return nil
+	}
+	shard := g.pendingCertificateShard(connAddrKey)
+	if shard == nil {
+		return nil
+	}
+	if shard.selections == nil {
+		shard.selections = make(map[string]*reverseProxyPendingCertificateSelection)
+	}
+	if shard.lru == nil {
+		shard.lru = list.New()
+	}
+	released := g.prunePendingCertificateSelectionsLocked(connAddrKey, now)
+	if previous := shard.selections[connAddrKey]; previous != nil {
+		released = append(released, previous.Selection)
+		if previous.element != nil {
+			shard.lru.Remove(previous.element)
+		}
+		delete(shard.selections, connAddrKey)
+	}
+	for len(shard.selections) >= reverseProxyPendingCertificateShardLimit && shard.lru.Len() > 0 {
+		oldestKey, _ := shard.lru.Back().Value.(string)
+		oldest := shard.selections[oldestKey]
+		if oldest != nil {
+			released = append(released, oldest.Selection)
+			if oldest.element != nil {
+				shard.lru.Remove(oldest.element)
+			}
+		}
+		delete(shard.selections, oldestKey)
+	}
+	pending := &reverseProxyPendingCertificateSelection{Selection: selection, CreatedAt: now}
+	pending.element = shard.lru.PushFront(connAddrKey)
+	shard.selections[connAddrKey] = pending
+	return released
+}
+
+func (g *reverseProxyListenerGroup) takePendingCertificateSelectionLocked(connAddrKey string) (reverseProxyCertificateSelection, bool) {
+	if g == nil || strings.TrimSpace(connAddrKey) == "" {
+		return reverseProxyCertificateSelection{}, false
+	}
+	shard := g.pendingCertificateShard(connAddrKey)
+	if shard == nil {
+		return reverseProxyCertificateSelection{}, false
+	}
+	pending := shard.selections[connAddrKey]
+	if pending == nil {
+		return reverseProxyCertificateSelection{}, false
+	}
+	if pending.element != nil && shard.lru != nil {
+		shard.lru.Remove(pending.element)
+	}
+	delete(shard.selections, connAddrKey)
+	return pending.Selection, true
 }
 
 func (g *reverseProxyListenerGroup) releaseCertificateSelection(selection reverseProxyCertificateSelection) {
-	if g == nil || g.service == nil {
+	if g == nil {
 		return
 	}
 	if selection.CertificateRecordID == 0 || strings.TrimSpace(selection.ListenerKey) == "" {
 		return
 	}
-	if err := g.service.releaseCertificateBalanceSelection(selection); err != nil {
-		logger.Warning("reverse proxy certificate selection release failed: ", err)
+	g.releaseCertificateBalanceSelection(selection)
+}
+
+func (g *reverseProxyListenerGroup) certificateSelectionFromContext(ctx context.Context) (reverseProxyCertificateSelection, bool) {
+	connID := g.connectionIDFromContext(ctx)
+	if g == nil || connID == "" {
+		return reverseProxyCertificateSelection{}, false
 	}
+	g.statsMu.Lock()
+	state, exists := g.localConnStates[connID]
+	g.statsMu.Unlock()
+	return state.Selection, exists && state.HasSelection
 }
 
 func (g *reverseProxyListenerGroup) newHandler() http.Handler {
@@ -3352,37 +5929,243 @@ func (g *reverseProxyListenerGroup) newHandler() http.Handler {
 		if r.TLS != nil {
 			sni = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(r.TLS.ServerName), "."))
 		}
-		rule, _ := g.findRule(host, sni, path)
+		selection, hasSelection := g.certificateSelectionFromContext(r.Context())
+		rule, nameMatched := g.findRuleWithSelection(host, sni, path, selection, hasSelection)
 		if rule == nil {
-			reverseProxyDropRejectedRequest(w)
+			status := http.StatusNotFound
+			if r.TLS != nil && !nameMatched {
+				if delay := reverseProxyRuntime.registerMismatch(extractRemoteIP(r.RemoteAddr), "host_sni_mismatch"); delay > 0 {
+					w.Header().Set("Retry-After", strconv.Itoa(int(delay.Seconds())))
+					http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+					return
+				}
+				status = http.StatusMisdirectedRequest
+			} else if nameMatched {
+				if altSvc := g.http3AdvertisementHeader(host, sni, r.ProtoMajor); altSvc != "" {
+					w.Header().Set("Alt-Svc", altSvc)
+				}
+			}
+			http.Error(w, http.StatusText(status), status)
 			return
 		}
-		if connID := g.connectionIDFromContext(r.Context()); connID != "" {
-			g.registerLocalConnectionRule(rule.Id, connID)
+		if reverseProxyIsHTTP3WebSocketRequest(r) {
+			http.Error(w, http.StatusText(http.StatusNotImplemented), http.StatusNotImplemented)
+			return
 		}
+		listenAlias := normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
+		targetAlias := normalizeReverseProxyProtocolAlias(rule.TargetProtocolAlias, rule.TargetProtocol)
+		if (reverseProxyIsWebSocketAlias(listenAlias) || reverseProxyIsWebSocketAlias(targetAlias)) && !reverseProxyIsWebSocketUpgradeRequest(r) {
+			w.Header().Set("Upgrade", "websocket")
+			http.Error(w, http.StatusText(http.StatusUpgradeRequired), http.StatusUpgradeRequired)
+			return
+		}
+		altSvc := g.http3AdvertisementHeader(host, sni, r.ProtoMajor)
+		if connID := g.connectionIDFromContext(r.Context()); connID != "" {
+			if !g.registerLocalConnectionRule(rule.Id, connID) {
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+				return
+			}
+			if reverseProxyIsWebSocketUpgradeRequest(r) {
+				g.setHijackedConnectionRule(connID, rule.Id)
+			}
+		}
+		if reverseProxyIsHTTPDNSAlias(listenAlias) {
+			g.mu.RLock()
+			dnsHandler := g.dnsHandler
+			g.mu.RUnlock()
+			if dnsHandler == nil {
+				http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+				return
+			}
+			reverseProxyRuntime.clearMismatch(extractRemoteIP(r.RemoteAddr))
+			dnsHandler.serveDoHRule(w, r, rule.Id)
+			return
+		}
+		if !reverseProxyResources.tryAcquireHTTP() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+			return
+		}
+		defer reverseProxyResources.releaseHTTP()
+		requestLimiter, acquired := g.acquireRequestSlot(rule.Id)
+		if !acquired {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+			return
+		}
+		defer g.releaseRequestSlot(requestLimiter)
 		reverseProxyRuntime.clearMismatch(extractRemoteIP(r.RemoteAddr))
-		g.forwardRequest(w, r, rule)
+		g.forwardRequest(w, r, rule, altSvc)
 	})
 }
 
+func (g *reverseProxyListenerGroup) acquireRequestSlot(ruleID uint) (*reverseProxyAdjustableLimiter, bool) {
+	if g == nil || ruleID == 0 {
+		return nil, true
+	}
+	g.mu.RLock()
+	limiter := g.requestLimiters[ruleID]
+	g.mu.RUnlock()
+	if limiter == nil {
+		return nil, true
+	}
+	return limiter, limiter.TryAcquire()
+}
+
+func (g *reverseProxyListenerGroup) releaseRequestSlot(limiter *reverseProxyAdjustableLimiter) {
+	if limiter != nil {
+		limiter.Release()
+	}
+}
+
 func (g *reverseProxyListenerGroup) findRule(host string, sni string, path string) (*model.ReverseProxyRule, bool) {
+	return g.findRuleWithSelection(host, sni, path, reverseProxyCertificateSelection{}, false)
+}
+
+func (g *reverseProxyListenerGroup) findRuleWithSelection(host string, sni string, path string, selection reverseProxyCertificateSelection, hasSelection bool) (*model.ReverseProxyRule, bool) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	hostMatched := false
+	nameMatched := false
 	requireSNI := strings.EqualFold(g.protocol, reverseProxyProtocolHTTPS)
+	var best *model.ReverseProxyRule
+	bestSpecificity := int(^uint(0) >> 1)
 	for _, rule := range g.rules {
-		matched, partial := reverseProxyRuleRequestNameMatchDetail(rule, host, sni, requireSNI)
-		if partial {
-			hostMatched = true
-		}
+		matched, _ := g.ruleRequestNameMatchWithSelectionLocked(rule, host, sni, requireSNI, selection, hasSelection)
 		if !matched {
 			continue
 		}
-		if reverseProxyRulePathMatch(rule, path) {
+		nameMatched = true
+		if !reverseProxyRuleRequestPathMatch(rule, path) {
+			continue
+		}
+		hostIP := reverseProxyParseIPLiteral(reverseProxyNormalizeServerName(host))
+		if hostIP == nil {
 			return rule, true
 		}
+		specificity := g.ruleIPSpecificityLocked(rule, hostIP.String())
+		if specificity < bestSpecificity {
+			best = rule
+			bestSpecificity = specificity
+		}
 	}
-	return nil, hostMatched
+	return best, nameMatched
+}
+
+func (g *reverseProxyListenerGroup) ruleRequestNameMatchLocked(rule *model.ReverseProxyRule, host string, sni string, requireSNI bool) (bool, bool) {
+	return g.ruleRequestNameMatchWithSelectionLocked(rule, host, sni, requireSNI, reverseProxyCertificateSelection{}, false)
+}
+
+func (g *reverseProxyListenerGroup) ruleRequestNameMatchWithSelectionLocked(rule *model.ReverseProxyRule, host string, sni string, requireSNI bool, selection reverseProxyCertificateSelection, hasSelection bool) (bool, bool) {
+	if rule == nil {
+		return false, false
+	}
+	host = reverseProxyNormalizeServerName(host)
+	sni = reverseProxyNormalizeServerName(sni)
+	hostIP := reverseProxyParseIPLiteral(host)
+	sniIP := reverseProxyParseIPLiteral(sni)
+	if !requireSNI {
+		if hostIP != nil {
+			return len(reverseProxyRuleServerNames(rule)) == 0, true
+		}
+		matched := host != "" && len(reverseProxyRuleServerNames(rule)) > 0 && reverseProxyRequestNameMatchesAny(reverseProxyRuleServerNames(rule), host)
+		return matched, matched
+	}
+	if sni == "" || sniIP != nil {
+		if hostIP == nil {
+			return false, false
+		}
+		requestedIP := hostIP.String()
+		if sniIP != nil && !hostIP.Equal(sniIP) {
+			return false, true
+		}
+		if hasSelection {
+			if sni == "" && selection.ClientKind != reverseProxyTLSClientNoSNI {
+				return false, false
+			}
+			if sniIP != nil && selection.ClientKind != reverseProxyTLSClientIP {
+				return false, false
+			}
+			if !g.certificateSelectionCoversIPLocked(selection, requestedIP) {
+				return false, true
+			}
+			if !g.ruleHasCertificateSelectionLocked(rule, selection, requestedIP) {
+				return false, true
+			}
+		}
+		matched := g.ruleHasMatchingIPCertificateLocked(rule, requestedIP)
+		return matched, matched
+	}
+	candidates := reverseProxyRuleServerNames(rule)
+	if len(candidates) == 0 || host == "" || hostIP != nil {
+		return false, false
+	}
+	hostMatch := reverseProxyRequestNameMatchesAny(candidates, host)
+	sniMatch := reverseProxyRequestNameMatchesAny(candidates, sni)
+	partial := hostMatch || sniMatch
+	if !hostMatch || !sniMatch || !strings.EqualFold(host, sni) {
+		return false, partial
+	}
+	if hasSelection && selection.ClientKind != reverseProxyTLSClientDomain {
+		return false, true
+	}
+	if hasSelection && !g.ruleHasCertificateSelectionLocked(rule, selection, sni) {
+		return false, true
+	}
+	return true, true
+}
+
+func (g *reverseProxyListenerGroup) ruleHasCertificateSelectionLocked(rule *model.ReverseProxyRule, selection reverseProxyCertificateSelection, serverName string) bool {
+	if g == nil || rule == nil || selection.CertificateRecordID == 0 {
+		return false
+	}
+	for _, binding := range g.certBindingsByRule[rule.Id] {
+		if binding != nil && binding.CertificateRecordID == selection.CertificateRecordID && reverseProxyCertificateBindingMatchesServerName(binding, serverName) {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *reverseProxyListenerGroup) ruleHasMatchingIPCertificateLocked(rule *model.ReverseProxyRule, ip string) bool {
+	if g == nil || rule == nil || reverseProxyParseIPLiteral(ip) == nil {
+		return false
+	}
+	for _, binding := range g.certBindingsByRule[rule.Id] {
+		if !reverseProxyCertificateBindingHasIPSAN(binding) {
+			continue
+		}
+		if reverseProxyCertificateBindingMatchesServerName(binding, ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *reverseProxyListenerGroup) certificateSelectionCoversIPLocked(selection reverseProxyCertificateSelection, ip string) bool {
+	if g == nil || selection.CertificateRecordID == 0 || reverseProxyParseIPLiteral(ip) == nil {
+		return false
+	}
+	for _, binding := range g.ipCertBindings[reverseProxyParseIPLiteral(ip).String()] {
+		if binding != nil && binding.CertificateRecordID == selection.CertificateRecordID && reverseProxyCertificateBindingMatchesServerName(binding, ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *reverseProxyListenerGroup) ruleIPSpecificityLocked(rule *model.ReverseProxyRule, ip string) int {
+	best := int(^uint(0) >> 1)
+	for _, binding := range g.certBindingsByRule[rule.Id] {
+		if !reverseProxyCertificateBindingMatchesServerName(binding, ip) {
+			continue
+		}
+		count := len(reverseProxyCertificateBindingIPNames(binding))
+		if count > 0 && count < best {
+			best = count
+		}
+	}
+	return best
 }
 
 func reverseProxyRuleRequestNameMatchDetail(rule *model.ReverseProxyRule, host string, sni string, requireSNI bool) (bool, bool) {
@@ -3390,29 +6173,24 @@ func reverseProxyRuleRequestNameMatchDetail(rule *model.ReverseProxyRule, host s
 		return false, false
 	}
 	candidates := reverseProxyRuleServerNames(rule)
-	if len(candidates) == 0 {
-		return true, true
-	}
 	host = reverseProxyNormalizeServerName(host)
 	sni = reverseProxyNormalizeServerName(sni)
 	hostIsIP := reverseProxyParseIPLiteral(host) != nil
 	sniIsIP := reverseProxyParseIPLiteral(sni) != nil
-	hostMatch := host == "" || hostIsIP || reverseProxyRequestNameMatchesAny(candidates, host)
-	sniMatch := sni == "" || sniIsIP || reverseProxyRequestNameMatchesAny(candidates, sni)
-	partial := hostMatch || sniMatch
-	if requireSNI {
-		if sni != "" && !sniIsIP && !sniMatch {
-			return false, partial
-		}
-		if host != "" && !hostIsIP && !hostMatch {
-			return false, true
-		}
-		return true, true
+	if requireSNI && (sni == "" || sniIsIP) {
+		matched := hostIsIP && (sni == "" || reverseProxyIPLiteralEqual(host, sni))
+		return matched, matched
 	}
-	if host != "" && !hostIsIP && !hostMatch {
+	if len(candidates) == 0 || host == "" || hostIsIP {
 		return false, false
 	}
-	return true, true
+	hostMatch := reverseProxyRequestNameMatchesAny(candidates, host)
+	sniMatch := sni != "" && !sniIsIP && reverseProxyRequestNameMatchesAny(candidates, sni)
+	partial := hostMatch || sniMatch
+	if requireSNI {
+		return hostMatch && sniMatch && strings.EqualFold(host, sni), partial
+	}
+	return hostMatch, hostMatch
 }
 
 func reverseProxyRequestNameMatchesAny(candidates []string, name string) bool {
@@ -3440,7 +6218,7 @@ func reverseProxyRuleServerNameMatch(rule *model.ReverseProxyRule, serverName st
 	}
 	candidates := reverseProxyRuleServerNames(rule)
 	if len(candidates) == 0 {
-		return true
+		return false
 	}
 	for _, candidate := range candidates {
 		if reverseProxyHostPatternMatches(candidate, serverName) {
@@ -3463,6 +6241,21 @@ func reverseProxyRulePathMatch(rule *model.ReverseProxyRule, path string) bool {
 		actual = "/"
 	}
 	return actual == expected || strings.HasPrefix(actual, expected+"/")
+}
+
+func reverseProxyRuleRequestPathMatch(rule *model.ReverseProxyRule, path string) bool {
+	if rule == nil {
+		return false
+	}
+	alias := normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
+	if reverseProxyIsHTTPDNSAlias(alias) {
+		actual := normalizeReverseProxyDNSPath(path)
+		if actual == "" {
+			actual = "/"
+		}
+		return actual == reverseProxyDNSRulePath(rule)
+	}
+	return reverseProxyRulePathMatch(rule, path)
 }
 
 func reverseProxyNormalizeRequestHost(raw string) string {
@@ -3581,16 +6374,6 @@ func reverseProxyExternalCookieDomain(rawHost string) string {
 	return host
 }
 
-func reverseProxyDropRejectedRequest(w http.ResponseWriter) {
-	controller := http.NewResponseController(w)
-	conn, _, err := controller.Hijack()
-	if err == nil {
-		_ = conn.Close()
-		return
-	}
-	panic(http.ErrAbortHandler)
-}
-
 func (g *reverseProxyListenerGroup) nextConnectionIDLocked() string {
 	g.nextConnID++
 	return strconv.FormatUint(g.nextConnID, 10)
@@ -3611,9 +6394,17 @@ func (g *reverseProxyListenerGroup) registerTCPConnectionContext(ctx context.Con
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if !g.acquireListenerConnectionSlot() {
+		go func() { _ = conn.Close() }()
+		return ctx
+	}
+	selectionsToRelease := make([]reverseProxyCertificateSelection, 0)
 	g.statsMu.Lock()
 	if g.localConnIDs == nil {
 		g.localConnIDs = make(map[net.Conn]string)
+	}
+	if g.localConnByID == nil {
+		g.localConnByID = make(map[string]net.Conn)
 	}
 	if g.localConnStates == nil {
 		g.localConnStates = make(map[string]reverseProxyLocalConnectionState)
@@ -3624,24 +6415,32 @@ func (g *reverseProxyListenerGroup) registerTCPConnectionContext(ctx context.Con
 	if g.localConnAddrByID == nil {
 		g.localConnAddrByID = make(map[string]string)
 	}
-	if g.pendingConnSelections == nil {
-		g.pendingConnSelections = make(map[string]reverseProxyCertificateSelection)
+	if g.hijackedConnections == nil {
+		g.hijackedConnections = make(map[string]net.Conn)
+	}
+	if g.connectionSlotIDs == nil {
+		g.connectionSlotIDs = make(map[string]struct{})
 	}
 	connID := g.nextConnectionIDLocked()
+	g.connectionSlotIDs[connID] = struct{}{}
 	g.localConnIDs[conn] = connID
+	g.localConnByID[connID] = conn
 	addrKey := reverseProxyConnectionAddrKey(conn)
 	if addrKey != "" {
 		g.localConnAddrToID[addrKey] = connID
 		g.localConnAddrByID[connID] = addrKey
-		if pending, exists := g.pendingConnSelections[addrKey]; exists {
+		selectionsToRelease = append(selectionsToRelease, g.prunePendingCertificateSelectionsLocked(addrKey, time.Now())...)
+		if pending, exists := g.takePendingCertificateSelectionLocked(addrKey); exists {
 			state := g.localConnStates[connID]
 			state.Selection = pending
 			state.HasSelection = true
 			g.localConnStates[connID] = state
-			delete(g.pendingConnSelections, addrKey)
 		}
 	}
 	g.statsMu.Unlock()
+	for _, selection := range selectionsToRelease {
+		g.releaseCertificateSelection(selection)
+	}
 	return context.WithValue(ctx, reverseProxyConnContextKey{}, connID)
 }
 
@@ -3652,6 +6451,11 @@ func (g *reverseProxyListenerGroup) registerQUICConnectionContext(ctx context.Co
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if !g.acquireListenerConnectionSlot() {
+		go func() { _ = conn.CloseWithError(0x10, "reverse proxy connection limit") }()
+		return ctx
+	}
+	selectionsToRelease := make([]reverseProxyCertificateSelection, 0)
 	g.statsMu.Lock()
 	if g.localConnStates == nil {
 		g.localConnStates = make(map[string]reverseProxyLocalConnectionState)
@@ -3662,23 +6466,30 @@ func (g *reverseProxyListenerGroup) registerQUICConnectionContext(ctx context.Co
 	if g.localConnAddrByID == nil {
 		g.localConnAddrByID = make(map[string]string)
 	}
-	if g.pendingConnSelections == nil {
-		g.pendingConnSelections = make(map[string]reverseProxyCertificateSelection)
+	if g.hijackedConnections == nil {
+		g.hijackedConnections = make(map[string]net.Conn)
+	}
+	if g.connectionSlotIDs == nil {
+		g.connectionSlotIDs = make(map[string]struct{})
 	}
 	connID := g.nextConnectionIDLocked()
+	g.connectionSlotIDs[connID] = struct{}{}
 	addrKey := reverseProxyConnectionAddrKeyFromAddrs(conn.LocalAddr(), conn.RemoteAddr())
 	if addrKey != "" {
 		g.localConnAddrToID[addrKey] = connID
 		g.localConnAddrByID[connID] = addrKey
-		if pending, exists := g.pendingConnSelections[addrKey]; exists {
+		selectionsToRelease = append(selectionsToRelease, g.prunePendingCertificateSelectionsLocked(addrKey, time.Now())...)
+		if pending, exists := g.takePendingCertificateSelectionLocked(addrKey); exists {
 			state := g.localConnStates[connID]
 			state.Selection = pending
 			state.HasSelection = true
 			g.localConnStates[connID] = state
-			delete(g.pendingConnSelections, addrKey)
 		}
 	}
 	g.statsMu.Unlock()
+	for _, selection := range selectionsToRelease {
+		g.releaseCertificateSelection(selection)
+	}
 	go func(id string, c *quic.Conn) {
 		if c == nil {
 			return
@@ -3689,10 +6500,13 @@ func (g *reverseProxyListenerGroup) registerQUICConnectionContext(ctx context.Co
 	return context.WithValue(ctx, reverseProxyConnContextKey{}, connID)
 }
 
-func (g *reverseProxyListenerGroup) registerLocalConnectionRule(ruleID uint, connID string) {
+func (g *reverseProxyListenerGroup) registerLocalConnectionRule(ruleID uint, connID string) bool {
 	if g == nil || ruleID == 0 || connID == "" {
-		return
+		return true
 	}
+	g.mu.RLock()
+	ruleLimiter := g.ruleConnectionLimiters[ruleID]
+	g.mu.RUnlock()
 	g.statsMu.Lock()
 	if g.connectionCounts == nil {
 		g.connectionCounts = make(map[uint]reverseProxyConnectionCounts)
@@ -3701,19 +6515,41 @@ func (g *reverseProxyListenerGroup) registerLocalConnectionRule(ruleID uint, con
 		g.localConnStates = make(map[string]reverseProxyLocalConnectionState)
 	}
 	state := g.localConnStates[connID]
-	if state.RuleID != 0 {
-		if state.RuleID != ruleID {
-			g.statsMu.Unlock()
-			return
-		}
+	if _, alreadyRegistered := state.RuleConnectionLimiters[ruleID]; alreadyRegistered {
 		g.statsMu.Unlock()
-		return
+		return true
 	}
-	state.RuleID = ruleID
+	if ruleLimiter != nil && !ruleLimiter.TryAcquire() {
+		g.statsMu.Unlock()
+		return false
+	}
+	if state.RuleConnectionLimiters == nil {
+		state.RuleConnectionLimiters = make(map[uint]*reverseProxyAdjustableLimiter)
+	}
+	state.RuleConnectionLimiters[ruleID] = ruleLimiter
 	g.localConnStates[connID] = state
 	counts := g.connectionCounts[ruleID]
 	counts.LocalOpen++
 	g.connectionCounts[ruleID] = counts
+	g.statsMu.Unlock()
+	return true
+}
+
+// setHijackedConnectionRule records the rule that initiated a classic
+// HTTP/1.1 WebSocket Upgrade.  HTTP/2 and HTTP/3 do not use this path, so a
+// later rule refresh can close exactly the old tunnel without disrupting
+// unrelated multiplexed requests on the same listener.
+func (g *reverseProxyListenerGroup) setHijackedConnectionRule(connID string, ruleID uint) {
+	if g == nil || connID == "" || ruleID == 0 {
+		return
+	}
+	g.statsMu.Lock()
+	if g.localConnStates == nil {
+		g.localConnStates = make(map[string]reverseProxyLocalConnectionState)
+	}
+	state := g.localConnStates[connID]
+	state.HijackedRuleID = ruleID
+	g.localConnStates[connID] = state
 	g.statsMu.Unlock()
 }
 
@@ -3728,12 +6564,16 @@ func (g *reverseProxyListenerGroup) releaseLocalConnectionByConn(conn net.Conn) 
 		connID = g.localConnIDs[conn]
 		delete(g.localConnIDs, conn)
 	}
-	if connID != "" && g.localConnAddrByID != nil {
-		addrKey = g.localConnAddrByID[connID]
-		delete(g.localConnAddrByID, connID)
+	if connID == "" {
+		addrKey = reverseProxyConnectionAddrKey(conn)
+		if addrKey != "" && g.localConnAddrToID != nil {
+			connID = g.localConnAddrToID[addrKey]
+		}
 	}
-	if addrKey != "" && g.localConnAddrToID != nil {
-		delete(g.localConnAddrToID, addrKey)
+	if connID != "" && g.localConnAddrByID != nil {
+		if addrKey == "" {
+			addrKey = g.localConnAddrByID[connID]
+		}
 	}
 	g.statsMu.Unlock()
 	if connID == "" {
@@ -3742,15 +6582,94 @@ func (g *reverseProxyListenerGroup) releaseLocalConnectionByConn(conn net.Conn) 
 	g.releaseLocalConnectionByID(connID)
 }
 
+func (g *reverseProxyListenerGroup) releaseLocalConnectionByAddrKey(addrKey string) {
+	if g == nil || strings.TrimSpace(addrKey) == "" {
+		return
+	}
+	g.statsMu.Lock()
+	connID := g.localConnAddrToID[addrKey]
+	g.statsMu.Unlock()
+	if connID != "" {
+		g.releaseLocalConnectionByID(connID)
+	}
+}
+
+func (g *reverseProxyListenerGroup) markHijackedConnection(conn net.Conn) {
+	if g == nil || conn == nil {
+		return
+	}
+	g.statsMu.Lock()
+	connID := g.localConnIDs[conn]
+	if connID == "" {
+		connID = g.localConnAddrToID[reverseProxyConnectionAddrKey(conn)]
+	}
+	if connID != "" {
+		if g.hijackedConnections == nil {
+			g.hijackedConnections = make(map[string]net.Conn)
+		}
+		tracked := g.localConnByID[connID]
+		if tracked == nil {
+			tracked = conn
+		}
+		g.hijackedConnections[connID] = tracked
+	}
+	g.statsMu.Unlock()
+}
+
+// closeHijackedConnectionsForRules terminates only WebSocket tunnels created
+// by rules that disappeared from a still-live listener group.  A full group
+// shutdown already closes every tracked tunnel; this narrower path covers a
+// disabled or deleted rule sharing its endpoint with other active rules.
+func (g *reverseProxyListenerGroup) closeHijackedConnectionsForRules(ruleIDs map[uint]struct{}) {
+	if g == nil || len(ruleIDs) == 0 {
+		return
+	}
+	type trackedConnection struct {
+		id   string
+		conn net.Conn
+	}
+	connections := make([]trackedConnection, 0)
+	g.statsMu.Lock()
+	for connID, conn := range g.hijackedConnections {
+		state, exists := g.localConnStates[connID]
+		if !exists {
+			continue
+		}
+		if _, removed := ruleIDs[state.HijackedRuleID]; !removed {
+			continue
+		}
+		connections = append(connections, trackedConnection{id: connID, conn: conn})
+	}
+	g.statsMu.Unlock()
+	for _, item := range connections {
+		if item.conn != nil {
+			_ = item.conn.Close()
+		}
+		// reverseProxyTrackedClientConn invokes this itself.  Calling it here as
+		// well keeps raw/listener-wrapped implementations leak-free and is
+		// idempotent once the tracked connection callback has removed the state.
+		g.releaseLocalConnectionByID(item.id)
+	}
+}
+
 func (g *reverseProxyListenerGroup) releaseLocalConnectionByID(connID string) {
 	if g == nil || connID == "" {
 		return
 	}
 	var selection reverseProxyCertificateSelection
 	hasSelection := false
+	ruleLimiters := make([]*reverseProxyAdjustableLimiter, 0)
+	releaseSlot := false
 	g.statsMu.Lock()
 	state := g.localConnStates[connID]
 	delete(g.localConnStates, connID)
+	delete(g.hijackedConnections, connID)
+	if conn := g.localConnByID[connID]; conn != nil {
+		delete(g.localConnByID, connID)
+		delete(g.localConnIDs, conn)
+	} else if g.localConnByID != nil {
+		delete(g.localConnByID, connID)
+	}
 	if g.localConnAddrByID != nil {
 		if addrKey := g.localConnAddrByID[connID]; addrKey != "" {
 			delete(g.localConnAddrByID, connID)
@@ -3759,12 +6678,15 @@ func (g *reverseProxyListenerGroup) releaseLocalConnectionByID(connID string) {
 			}
 		}
 	}
-	ruleID := state.RuleID
 	if state.HasSelection {
 		selection = state.Selection
 		hasSelection = true
 	}
-	if ruleID != 0 {
+	if _, exists := g.connectionSlotIDs[connID]; exists {
+		delete(g.connectionSlotIDs, connID)
+		releaseSlot = true
+	}
+	for ruleID, ruleLimiter := range state.RuleConnectionLimiters {
 		counts := g.connectionCounts[ruleID]
 		if counts.LocalOpen > 0 {
 			counts.LocalOpen--
@@ -3774,16 +6696,56 @@ func (g *reverseProxyListenerGroup) releaseLocalConnectionByID(connID string) {
 		} else {
 			g.connectionCounts[ruleID] = counts
 		}
+		if ruleLimiter != nil {
+			ruleLimiters = append(ruleLimiters, ruleLimiter)
+		}
 	}
 	g.statsMu.Unlock()
+	if releaseSlot {
+		g.releaseListenerConnectionSlot()
+	}
 	if hasSelection {
 		g.releaseCertificateSelection(selection)
 	}
+	for _, ruleLimiter := range ruleLimiters {
+		ruleLimiter.Release()
+	}
 }
 
-func (g *reverseProxyListenerGroup) incrementUpstreamConnection(ruleID uint) {
-	if g == nil || ruleID == 0 {
+func (g *reverseProxyListenerGroup) acquireListenerConnectionSlot() bool {
+	if g == nil {
+		return true
+	}
+	g.mu.RLock()
+	limiter := g.listenerConnectionLimiter
+	g.mu.RUnlock()
+	if limiter == nil {
+		return true
+	}
+	return limiter.TryAcquire()
+}
+
+func (g *reverseProxyListenerGroup) releaseListenerConnectionSlot() {
+	if g == nil {
 		return
+	}
+	g.mu.RLock()
+	limiter := g.listenerConnectionLimiter
+	g.mu.RUnlock()
+	if limiter != nil {
+		limiter.Release()
+	}
+}
+
+func (g *reverseProxyListenerGroup) acquireUpstreamConnection(ruleID uint) (*reverseProxyAdjustableLimiter, bool) {
+	if g == nil || ruleID == 0 {
+		return nil, true
+	}
+	g.mu.RLock()
+	limiter := g.upstreamLimiters[ruleID]
+	g.mu.RUnlock()
+	if limiter != nil && !limiter.TryAcquire() {
+		return limiter, false
 	}
 	g.statsMu.Lock()
 	if g.connectionCounts == nil {
@@ -3793,10 +6755,14 @@ func (g *reverseProxyListenerGroup) incrementUpstreamConnection(ruleID uint) {
 	counts.UpstreamOpen++
 	g.connectionCounts[ruleID] = counts
 	g.statsMu.Unlock()
+	return limiter, true
 }
 
-func (g *reverseProxyListenerGroup) decrementUpstreamConnection(ruleID uint) {
+func (g *reverseProxyListenerGroup) releaseUpstreamConnection(ruleID uint, limiter *reverseProxyAdjustableLimiter) {
 	if g == nil || ruleID == 0 {
+		if limiter != nil {
+			limiter.Release()
+		}
 		return
 	}
 	g.statsMu.Lock()
@@ -3810,6 +6776,9 @@ func (g *reverseProxyListenerGroup) decrementUpstreamConnection(ruleID uint) {
 		g.connectionCounts[ruleID] = counts
 	}
 	g.statsMu.Unlock()
+	if limiter != nil {
+		limiter.Release()
+	}
 }
 
 func (g *reverseProxyListenerGroup) snapshotConnectionCounts() map[uint]reverseProxyConnectionCounts {
@@ -3943,6 +6912,7 @@ func buildReverseProxyResponseRewritePlan(r *http.Request, rule *model.ReversePr
 		Replacements:         replacements,
 		UpstreamCookieDomain: upstreamHostNormalized,
 		ExternalCookieDomain: reverseProxyExternalCookieDomain(externalHostRaw),
+		UpstreamPathPrefix:   reverseProxyNormalizePathPrefix(targetURL.Path),
 		ExternalPathPrefix:   externalPathPrefix,
 	}
 }
@@ -3959,11 +6929,20 @@ func reverseProxyApplyStringReplacements(value string, replacements []reversePro
 }
 
 func reverseProxyRewriteSetCookieHeader(value string, upstreamDomain string, externalDomain string) string {
+	return reverseProxyRewriteSetCookieHeaderWithPath(value, upstreamDomain, externalDomain, "", "")
+}
+
+func reverseProxyRewriteSetCookieHeaderWithPath(value string, upstreamDomain string, externalDomain string, upstreamPathPrefix string, externalPathPrefix string) string {
 	if strings.TrimSpace(value) == "" || strings.TrimSpace(upstreamDomain) == "" {
 		return value
 	}
 	parts := strings.Split(value, ";")
 	filtered := make([]string, 0, len(parts))
+	isHostCookie := false
+	if len(parts) > 0 {
+		name, _, found := strings.Cut(strings.TrimSpace(parts[0]), "=")
+		isHostCookie = found && strings.HasPrefix(strings.TrimSpace(name), "__Host-")
+	}
 	for _, part := range parts {
 		trimmed := strings.TrimSpace(part)
 		if trimmed == "" {
@@ -3974,15 +6953,42 @@ func reverseProxyRewriteSetCookieHeader(value string, upstreamDomain string, ext
 			domainValue := strings.TrimSpace(trimmed[eqIndex+1:])
 			domainValue = strings.TrimPrefix(domainValue, ".")
 			if reverseProxyCookieDomainMatchesUpstream(domainValue, upstreamDomain) {
-				if externalDomain == "" {
+				if externalDomain == "" || isHostCookie {
 					continue
 				}
 				trimmed = "Domain=" + externalDomain
 			}
 		}
+		if eqIndex > 0 && strings.EqualFold(strings.TrimSpace(trimmed[:eqIndex]), "path") && !isHostCookie {
+			pathValue := strings.TrimSpace(trimmed[eqIndex+1:])
+			if rewrittenPath, changed := reverseProxyRewriteCookiePath(pathValue, upstreamPathPrefix, externalPathPrefix); changed {
+				trimmed = "Path=" + rewrittenPath
+			}
+		}
 		filtered = append(filtered, trimmed)
 	}
 	return strings.Join(filtered, "; ")
+}
+
+func reverseProxyRewriteCookiePath(value string, upstreamPathPrefix string, externalPathPrefix string) (string, bool) {
+	externalPathPrefix = reverseProxyNormalizePathPrefix(externalPathPrefix)
+	if externalPathPrefix == "" {
+		return value, false
+	}
+	value = strings.TrimSpace(value)
+	if value == "" || !strings.HasPrefix(value, "/") {
+		return value, false
+	}
+	upstreamPathPrefix = reverseProxyNormalizePathPrefix(upstreamPathPrefix)
+	if upstreamPathPrefix != "" {
+		if value == upstreamPathPrefix {
+			return externalPathPrefix, true
+		}
+		if strings.HasPrefix(value, upstreamPathPrefix+"/") {
+			return reverseProxyJoinExternalPathPrefix(externalPathPrefix, strings.TrimPrefix(value, upstreamPathPrefix)), true
+		}
+	}
+	return reverseProxyJoinExternalPathPrefix(externalPathPrefix, value), true
 }
 
 func reverseProxyCookieDomainMatchesUpstream(domainValue string, upstreamDomain string) bool {
@@ -4011,7 +7017,7 @@ func reverseProxyRewriteResponseHeaders(header http.Header, plan reverseProxyRes
 		if strings.EqualFold(key, "Set-Cookie") {
 			next := make([]string, 0, len(values))
 			for _, value := range values {
-				next = append(next, reverseProxyRewriteSetCookieHeader(value, plan.UpstreamCookieDomain, plan.ExternalCookieDomain))
+				next = append(next, reverseProxyRewriteSetCookieHeaderWithPath(value, plan.UpstreamCookieDomain, plan.ExternalCookieDomain, plan.UpstreamPathPrefix, plan.ExternalPathPrefix))
 			}
 			header[key] = next
 			continue
@@ -4032,6 +7038,9 @@ func reverseProxyResponseMayContainOriginReferences(contentType string) bool {
 		mediaType = strings.ToLower(strings.TrimSpace(contentType))
 	}
 	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if mediaType == "text/event-stream" || strings.HasPrefix(mediaType, "multipart/") {
+		return false
+	}
 	if strings.HasPrefix(mediaType, "text/") {
 		return true
 	}
@@ -4051,28 +7060,141 @@ func reverseProxyResponseMayContainOriginReferences(contentType string) bool {
 	}
 }
 
+type reverseProxyReplayReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
 func reverseProxyRewriteResponseBody(resp *http.Response, plan reverseProxyResponseRewritePlan) error {
-	if !plan.Enabled || resp == nil || resp.Body == nil {
+	// Keep this small wrapper for callers/tests that do not carry a rule.  It
+	// must still use the persisted resource policy rather than resurrecting a
+	// legacy hard-coded body ceiling.
+	return reverseProxyRewriteResponseBodyForRule(resp, plan, nil)
+}
+
+func reverseProxyRewriteResponseBodyForRule(resp *http.Response, plan reverseProxyResponseRewritePlan, rule *model.ReverseProxyRule) error {
+	settings := reverseProxyResources.current()
+	if !reverseProxyResponseBodyEligible(resp, plan, settings.ResponseRewriteInputBytes) {
 		return nil
 	}
+	inputBytes := settings.ResponseRewriteInputBytes
+	outputBytes := settings.ResponseRewriteOutputBytes
+	if inputBytes < reverseProxyMinimumRewriteReservationBytes || outputBytes < reverseProxyMinimumRewriteReservationBytes {
+		return nil
+	}
+	// The bounded conversion can hold the input and two output buffers while
+	// it applies origin and relative-path rewrites.  Reserve that real peak up
+	// front so the shared pool is authoritative instead of only accounting for
+	// an optimistic input+output estimate.
+	reserve := reverseProxyRewriteReservationBytes(inputBytes, outputBytes)
+	if resp.ContentLength >= 0 && resp.ContentLength < inputBytes {
+		reserve = reverseProxyRewriteReservationBytes(resp.ContentLength, outputBytes)
+	}
+	if reserve < reverseProxyMinimumRewriteReservationBytes {
+		reserve = reverseProxyMinimumRewriteReservationBytes
+	}
+	ruleID := uint(0)
+	if rule != nil {
+		ruleID = rule.Id
+	}
+	lease, acquired := reverseProxyResources.tryAcquireRewrite(ruleID, reverseProxyEffectiveRuleMemoryLimit(rule), reserve)
+	if !acquired {
+		// Under pressure we deliberately preserve the upstream stream rather
+		// than allocating an untracked buffer or returning a partial rewrite.
+		return nil
+	}
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { reverseProxyResources.releaseRewrite(lease) })
+	}
+	return reverseProxyRewriteResponseBodyWithLimits(resp, plan, inputBytes, outputBytes, release)
+}
+
+func reverseProxyResponseBodyEligible(resp *http.Response, plan reverseProxyResponseRewritePlan, inputLimit int64) bool {
+	if !plan.Enabled || resp == nil || resp.Body == nil {
+		return false
+	}
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		return false
+	}
 	if !reverseProxyResponseMayContainOriginReferences(resp.Header.Get("Content-Type")) {
+		return false
+	}
+	contentEncoding := strings.TrimSpace(resp.Header.Get("Content-Encoding"))
+	if contentEncoding != "" && !strings.EqualFold(contentEncoding, "identity") {
+		return false
+	}
+	if inputLimit <= 0 || resp.ContentLength < 0 || resp.ContentLength > inputLimit {
+		return false
+	}
+	return true
+}
+
+func reverseProxyRewriteResponseBodyWithLimits(resp *http.Response, plan reverseProxyResponseRewritePlan, inputLimit int64, outputLimit int64, release func()) error {
+	if !reverseProxyResponseBodyEligible(resp, plan, inputLimit) {
+		if release != nil {
+			release()
+		}
+		return nil
+	}
+	if outputLimit < reverseProxyMinimumRewriteReservationBytes {
+		if release != nil {
+			release()
+		}
 		return nil
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if err != nil {
+	originalBody := resp.Body
+	expectedLength := resp.ContentLength
+	if expectedLength < 0 || expectedLength > inputLimit {
+		if release != nil {
+			release()
+		}
+		return nil
+	}
+	body := make([]byte, int(expectedLength))
+	readCount, err := io.ReadFull(originalBody, body)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		_ = originalBody.Close()
+		if release != nil {
+			release()
+		}
 		return err
 	}
-	rewritten := body
-	for _, item := range plan.Replacements {
-		if item.Old == "" || item.Old == item.New {
-			continue
+	body = body[:readCount]
+	var extra [1]byte
+	extraCount, extraErr := originalBody.Read(extra[:])
+	if extraErr != nil && !errors.Is(extraErr, io.EOF) {
+		_ = originalBody.Close()
+		if release != nil {
+			release()
 		}
-		rewritten = bytes.ReplaceAll(rewritten, []byte(item.Old), []byte(item.New))
+		return extraErr
 	}
-	rewritten = reverseProxyRewriteRelativeBodyPaths(rewritten, plan.ExternalPathPrefix)
-	resp.Body = io.NopCloser(bytes.NewReader(rewritten))
+	if extraCount > 0 {
+		// Preserve a malformed response whose declared length was smaller than its body.
+		// Rewriting it would require buffering an unbounded upstream stream.
+		resp.Body = &reverseProxyCleanupReadCloser{ReadCloser: &reverseProxyReplayReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(body), bytes.NewReader(extra[:extraCount]), originalBody),
+			Closer: originalBody,
+		}, onClose: release}
+		resp.ContentLength = -1
+		resp.Header.Del("Content-Length")
+		return nil
+	}
+	_ = originalBody.Close()
+	rewritten, ok := reverseProxyApplyBoundedBodyReplacements(body, plan.Replacements, outputLimit)
+	if ok {
+		rewritten, ok = reverseProxyRewriteRelativeBodyPathsBounded(rewritten, plan.ExternalPathPrefix, outputLimit)
+	}
+	if !ok {
+		resp.Body = &reverseProxyCleanupReadCloser{ReadCloser: io.NopCloser(bytes.NewReader(body)), onClose: release}
+		resp.ContentLength = int64(len(body))
+		resp.TransferEncoding = nil
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return nil
+	}
+	resp.Body = &reverseProxyCleanupReadCloser{ReadCloser: io.NopCloser(bytes.NewReader(rewritten)), onClose: release}
 	resp.ContentLength = int64(len(rewritten))
 	resp.TransferEncoding = nil
 	resp.Header.Set("Content-Length", strconv.Itoa(len(rewritten)))
@@ -4081,13 +7203,88 @@ func reverseProxyRewriteResponseBody(resp *http.Response, plan reverseProxyRespo
 	return nil
 }
 
-func (g *reverseProxyListenerGroup) forwardRequest(w http.ResponseWriter, r *http.Request, rule *model.ReverseProxyRule) {
+func reverseProxyApplyBoundedBodyReplacements(body []byte, replacements []reverseProxyStringReplacement, maximum int64) ([]byte, bool) {
+	if maximum < 0 || int64(len(body)) > maximum {
+		return body, false
+	}
+	type replacement struct {
+		oldValue []byte
+		newValue []byte
+	}
+	items := make([]replacement, 0, len(replacements))
+	for _, item := range replacements {
+		oldValue := []byte(item.Old)
+		newValue := []byte(item.New)
+		if len(oldValue) == 0 || bytes.Equal(oldValue, newValue) {
+			continue
+		}
+		items = append(items, replacement{oldValue: oldValue, newValue: newValue})
+	}
+	if len(items) == 0 {
+		return body, true
+	}
+	outputLength := int64(0)
+	appendLength := func(length int) bool {
+		if length < 0 || outputLength > maximum-int64(length) {
+			return false
+		}
+		outputLength += int64(length)
+		return outputLength <= int64(^uint(0)>>1)
+	}
+	for index := 0; index < len(body); {
+		matchedIndex := -1
+		for itemIndex := range items {
+			item := &items[itemIndex]
+			if !bytes.HasPrefix(body[index:], item.oldValue) {
+				continue
+			}
+			if !appendLength(len(item.newValue)) {
+				return body, false
+			}
+			index += len(item.oldValue)
+			matchedIndex = itemIndex
+			break
+		}
+		if matchedIndex >= 0 {
+			continue
+		}
+		if !appendLength(1) {
+			return body, false
+		}
+		index++
+	}
+	out := make([]byte, int(outputLength))
+	offset := 0
+	for index := 0; index < len(body); {
+		matchedIndex := -1
+		for itemIndex := range items {
+			item := &items[itemIndex]
+			if !bytes.HasPrefix(body[index:], item.oldValue) {
+				continue
+			}
+			matchedIndex = itemIndex
+			break
+		}
+		if matchedIndex >= 0 {
+			item := &items[matchedIndex]
+			offset += copy(out[offset:], item.newValue)
+			index += len(item.oldValue)
+			continue
+		}
+		out[offset] = body[index]
+		offset++
+		index++
+	}
+	return out, true
+}
+
+func (g *reverseProxyListenerGroup) forwardRequest(w http.ResponseWriter, r *http.Request, rule *model.ReverseProxyRule, altSvc string) {
 	targetURL, transportBundle, err := g.buildUpstream(rule, r.Context())
 	if err != nil {
-		_ = database.GetDB().Model(&model.ReverseProxyRule{}).Where("id = ?", rule.Id).Updates(map[string]interface{}{
-			"last_error":     strings.TrimSpace(err.Error()),
-			"runtime_status": "upstream_error",
-		}).Error
+		reverseProxyRuntime.reportRuleState(rule.Id, "upstream_error", err.Error())
+		if altSvc != "" {
+			w.Header().Set("Alt-Svc", altSvc)
+		}
 		reverseProxyWriteGatewayError(w, err)
 		return
 	}
@@ -4107,28 +7304,32 @@ func (g *reverseProxyListenerGroup) forwardRequest(w http.ResponseWriter, r *htt
 		proxy.ErrorHandler = func(writer http.ResponseWriter, request *http.Request, proxyErr error) {
 			cleanupFn()
 			g.invalidateCachedUpstream(rule.Id)
-			_ = database.GetDB().Model(&model.ReverseProxyRule{}).Where("id = ?", rule.Id).Updates(map[string]interface{}{
-				"last_error":     strings.TrimSpace(proxyErr.Error()),
-				"runtime_status": "proxy_error",
-			}).Error
+			reverseProxyRuntime.reportRuleState(rule.Id, "proxy_error", proxyErr.Error())
+			if altSvc != "" {
+				writer.Header().Set("Alt-Svc", altSvc)
+			}
 			reverseProxyWriteGatewayError(writer, proxyErr)
 		}
 	} else {
 		proxy.ErrorHandler = func(writer http.ResponseWriter, request *http.Request, proxyErr error) {
 			g.invalidateCachedUpstream(rule.Id)
-			_ = database.GetDB().Model(&model.ReverseProxyRule{}).Where("id = ?", rule.Id).Updates(map[string]interface{}{
-				"last_error":     strings.TrimSpace(proxyErr.Error()),
-				"runtime_status": "proxy_error",
-			}).Error
+			reverseProxyRuntime.reportRuleState(rule.Id, "proxy_error", proxyErr.Error())
+			if altSvc != "" {
+				writer.Header().Set("Alt-Svc", altSvc)
+			}
 			reverseProxyWriteGatewayError(writer, proxyErr)
 		}
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		if altSvc != "" {
+			resp.Header.Del("Alt-Svc")
+			resp.Header.Set("Alt-Svc", altSvc)
+		}
 		reverseProxyRewriteResponseHeaders(resp.Header, rewritePlan)
 		if !bodyRewriteEnabled {
 			return nil
 		}
-		if err := reverseProxyRewriteResponseBody(resp, rewritePlan); err != nil {
+		if err := reverseProxyRewriteResponseBodyForRule(resp, rewritePlan, rule); err != nil {
 			return err
 		}
 		return nil
@@ -4139,18 +7340,55 @@ func (g *reverseProxyListenerGroup) forwardRequest(w http.ResponseWriter, r *htt
 		originalDirector(req)
 		req.Host = targetURL.Host
 		req.URL.RawQuery = r.URL.RawQuery
+		// Identity forwarding headers are an ingress trust boundary. Never let a
+		// client-provided forwarding chain reach the upstream unchanged.
+		for _, header := range []string{
+			"Forwarded",
+			"X-Forwarded-For",
+			"X-Forwarded-Host",
+			"X-Forwarded-Proto",
+			"X-Forwarded-Port",
+			"X-Real-IP",
+		} {
+			req.Header.Del(header)
+		}
 		if bodyRewriteEnabled {
 			req.Header.Set("Accept-Encoding", "identity")
 		}
+		forwardedScheme := reverseProxyRequestScheme(r, rule.ListenProtocol)
+		clientIP := extractRemoteIP(r.RemoteAddr)
 		req.Header.Set("X-Forwarded-Host", r.Host)
-		req.Header.Set("X-Forwarded-Proto", strings.TrimSpace(rule.ListenProtocol))
-		req.Header.Set("X-Forwarded-For", appendForwardedFor(r.Header.Get("X-Forwarded-For"), extractRemoteIP(r.RemoteAddr)))
+		req.Header.Set("X-Forwarded-Proto", forwardedScheme)
+		req.Header.Set("X-Forwarded-Port", strconv.Itoa(g.listenPort))
+		req.Header.Set("X-Real-IP", clientIP)
+		req.Header.Set("Forwarded", reverseProxyBuildForwardedHeader(clientIP, r.Host, forwardedScheme))
+		// httputil.ReverseProxy appends the peer address to X-Forwarded-For
+		// after Director returns.  Setting it here would duplicate that address.
 	}
-	_ = database.GetDB().Model(&model.ReverseProxyRule{}).Where("id = ?", rule.Id).Updates(map[string]interface{}{
-		"last_error":     "",
-		"runtime_status": "running",
-	}).Error
+	reverseProxyRuntime.reportRuleState(rule.Id, "running", "")
 	proxy.ServeHTTP(w, r)
+}
+
+func reverseProxyBuildForwardedHeader(clientIP string, host string, scheme string) string {
+	clientIP = strings.TrimSpace(strings.Trim(clientIP, "[]"))
+	if strings.Contains(clientIP, ":") {
+		clientIP = "\"[" + strings.ReplaceAll(clientIP, "\"", "") + "]\""
+	} else {
+		clientIP = strings.ReplaceAll(clientIP, "\"", "")
+	}
+	host = strings.ReplaceAll(strings.TrimSpace(host), "\"", "")
+	scheme = strings.ReplaceAll(strings.TrimSpace(scheme), "\"", "")
+	parts := make([]string, 0, 3)
+	if clientIP != "" {
+		parts = append(parts, "for="+clientIP)
+	}
+	if host != "" {
+		parts = append(parts, "host=\""+host+"\"")
+	}
+	if scheme != "" {
+		parts = append(parts, "proto="+scheme)
+	}
+	return strings.Join(parts, ";")
 }
 
 func reverseProxyRewriteRelativeHeaderValue(key string, value string, prefix string) string {
@@ -4189,60 +7427,78 @@ func reverseProxyBodyPathHasPrefix(body []byte, start int, prefix string) bool {
 	}
 }
 
-func reverseProxyRewriteQuotedRelativeBodyPaths(body []byte, prefix string) []byte {
+func reverseProxyRewriteRelativeBodyPathsBounded(body []byte, prefix string, maximum int64) ([]byte, bool) {
 	prefix = reverseProxyNormalizePathPrefix(prefix)
 	if prefix == "" || len(body) == 0 {
-		return body
+		return body, int64(len(body)) <= maximum
 	}
-	out := make([]byte, 0, len(body)+len(prefix)*4)
-	for i := 0; i < len(body); i++ {
-		ch := body[i]
-		out = append(out, ch)
+	if maximum < 0 || int64(len(body)) > maximum {
+		return body, false
+	}
+	// Apply quoted JavaScript/HTML paths and CSS url(/...) paths in one output
+	// buffer.  Count first, then allocate the exact final size: this avoids
+	// geometric slice growth temporarily retaining a second unaccounted output
+	// allocation while the shared memory lease is active.
+	prefixBytes := []byte(prefix)
+	cssPathPrefix := []byte("url(/")
+	needsCSSPrefix := func(index int) bool {
+		return bytes.HasPrefix(body[index:], cssPathPrefix) && (index+len(cssPathPrefix) >= len(body) || body[index+len(cssPathPrefix)] != '/')
+	}
+	needsQuotedPrefix := func(index int) bool {
+		ch := body[index]
 		if ch != '"' && ch != '\'' {
+			return false
+		}
+		if index+1 < len(body) && body[index+1] == '/' {
+			return (index+2 >= len(body) || body[index+2] != '/') && !reverseProxyBodyPathHasPrefix(body, index+1, prefix)
+		}
+		if index+2 < len(body) && body[index+1] == '\\' && body[index+2] == '/' {
+			return (index+4 >= len(body) || body[index+3] != '\\' || body[index+4] != '/') && !reverseProxyBodyPathHasPrefix(body, index+2, prefix)
+		}
+		return false
+	}
+	outputLength := int64(0)
+	appendLength := func(length int) bool {
+		if length < 0 || outputLength > maximum-int64(length) {
+			return false
+		}
+		outputLength += int64(length)
+		return outputLength <= int64(^uint(0)>>1)
+	}
+	for index := 0; index < len(body); {
+		if needsCSSPrefix(index) {
+			if !appendLength(len("url(") + len(prefixBytes) + len("/")) {
+				return body, false
+			}
+			index += len(cssPathPrefix)
 			continue
 		}
-		if i+1 < len(body) && body[i+1] == '/' {
-			if i+2 < len(body) && body[i+2] == '/' {
-				continue
-			}
-			if reverseProxyBodyPathHasPrefix(body, i+1, prefix) {
-				continue
-			}
-			out = append(out, prefix...)
+		if !appendLength(1) {
+			return body, false
+		}
+		if needsQuotedPrefix(index) && !appendLength(len(prefixBytes)) {
+			return body, false
+		}
+		index++
+	}
+	out := make([]byte, int(outputLength))
+	offset := 0
+	for index := 0; index < len(body); {
+		if needsCSSPrefix(index) {
+			offset += copy(out[offset:], "url(")
+			offset += copy(out[offset:], prefixBytes)
+			offset += copy(out[offset:], "/")
+			index += len(cssPathPrefix)
 			continue
 		}
-		if i+2 < len(body) && body[i+1] == '\\' && body[i+2] == '/' {
-			if i+4 < len(body) && body[i+3] == '\\' && body[i+4] == '/' {
-				continue
-			}
-			if reverseProxyBodyPathHasPrefix(body, i+2, prefix) {
-				continue
-			}
-			out = append(out, prefix...)
+		out[offset] = body[index]
+		offset++
+		if needsQuotedPrefix(index) {
+			offset += copy(out[offset:], prefixBytes)
 		}
+		index++
 	}
-	return out
-}
-
-func reverseProxyRewriteCSSRelativeBodyPaths(body []byte, prefix string) []byte {
-	prefix = reverseProxyNormalizePathPrefix(prefix)
-	if prefix == "" || len(body) == 0 {
-		return body
-	}
-	protected := bytes.ReplaceAll(body, []byte("url(//"), []byte("@@rp_url_scheme_1@@"))
-	protected = bytes.ReplaceAll(protected, []byte("url(/"), []byte("url("+prefix+"/"))
-	protected = bytes.ReplaceAll(protected, []byte("@@rp_url_scheme_1@@"), []byte("url(//"))
-	return protected
-}
-
-func reverseProxyRewriteRelativeBodyPaths(body []byte, prefix string) []byte {
-	prefix = reverseProxyNormalizePathPrefix(prefix)
-	if prefix == "" || len(body) == 0 {
-		return body
-	}
-	rewritten := reverseProxyRewriteQuotedRelativeBodyPaths(body, prefix)
-	rewritten = reverseProxyRewriteCSSRelativeBodyPaths(rewritten, prefix)
-	return rewritten
+	return out, true
 }
 
 func appendForwardedFor(existing string, ip string) string {
@@ -4281,11 +7537,13 @@ func (g *reverseProxyListenerGroup) buildUpstream(rule *model.ReverseProxyRule, 
 	ctx, cancel := context.WithTimeout(baseCtx, reverseProxyRequestTimeout)
 	defer cancel()
 
-	resolved, serverName, hostHeader, transportMode, err := g.service.pickUpstreamTarget(ctx, strings.TrimSpace(rule.TargetProtocol), targets, rule.TargetPort, rule.IPStrategy, httpVersionStrategy, rule.UpstreamTLSVerify)
+	resolved, serverName, hostHeader, transportMode, err := g.service.pickUpstreamTarget(ctx, strings.TrimSpace(rule.TargetProtocol), targets, rule.TargetPort, rule.IPStrategy, httpVersionStrategy, rule.UpstreamTLSVerify, func(candidate reverseProxyTargetCandidate) bool {
+		return g.resolvedTargetLoopsToListener(rule, candidate.address)
+	})
 	if err != nil {
 		return nil, reverseProxyTransportBundle{}, err
 	}
-	transportBundle, err := g.service.buildRoundTripper(g, rule.Id, strings.TrimSpace(rule.TargetProtocol), resolved, rule.TargetPort, serverName, rule.UpstreamTLSVerify, transportMode)
+	transportBundle, err := g.service.buildRoundTripper(g, rule.Id, strings.TrimSpace(rule.TargetProtocol), resolved, rule.TargetPort, serverName, rule.UpstreamTLSVerify, transportMode, reverseProxyRuleLimit(rule.UpstreamMaxConnections), reverseProxyEffectiveUpstreamMaxIdleConnections(rule))
 	if err != nil {
 		return nil, reverseProxyTransportBundle{}, err
 	}
@@ -4294,6 +7552,7 @@ func (g *reverseProxyListenerGroup) buildUpstream(rule *model.ReverseProxyRule, 
 		ServerName:      serverName,
 		HostHeader:      hostHeader,
 		TransportMode:   transportMode,
+		ResolvedAt:      time.Now(),
 		RoundTripper:    transportBundle.RoundTripper,
 		Cleanup:         transportBundle.Cleanup,
 	}
@@ -4331,37 +7590,10 @@ func reverseProxyTrimMatchedPathPrefix(path string, rawPath string, prefix strin
 	} else if !strings.HasPrefix(trimmedPath, "/") {
 		trimmedPath = "/" + trimmedPath
 	}
-	trimmedRawPath := reverseProxyTrimMatchedRawPathPrefix(normalizedRawPath, normalizedPrefix, trimmedPath)
-	return trimmedPath, trimmedRawPath
+	return trimmedPath, (&url.URL{Path: trimmedPath}).EscapedPath()
 }
 
-func reverseProxyTrimMatchedRawPathPrefix(rawPath string, decodedPrefix string, decodedTrimmedPath string) string {
-	fallback := (&url.URL{Path: decodedTrimmedPath}).EscapedPath()
-	rawPath = strings.TrimSpace(rawPath)
-	if rawPath == "" {
-		return fallback
-	}
-	escapedPrefix := (&url.URL{Path: decodedPrefix}).EscapedPath()
-	if escapedPrefix == "" || !strings.HasPrefix(rawPath, escapedPrefix) {
-		return fallback
-	}
-	trimmed := strings.TrimPrefix(rawPath, escapedPrefix)
-	if trimmed == "" {
-		trimmed = "/"
-	} else if !strings.HasPrefix(trimmed, "/") {
-		trimmed = "/" + trimmed
-	}
-	unescaped, err := url.PathUnescape(trimmed)
-	if err != nil {
-		return fallback
-	}
-	if normalizeReverseProxyPath(unescaped, true) != decodedTrimmedPath {
-		return fallback
-	}
-	return trimmed
-}
-
-func (s *ReverseProxyService) pickUpstreamTarget(ctx context.Context, protocol string, targets []string, port int, ipStrategy string, httpVersionStrategy string, strictVerify bool) (string, string, string, string, error) {
+func (s *ReverseProxyService) pickUpstreamTarget(ctx context.Context, protocol string, targets []string, port int, ipStrategy string, httpVersionStrategy string, strictVerify bool, loopGuard func(reverseProxyTargetCandidate) bool) (string, string, string, string, error) {
 	var firstErr error
 	for _, target := range targets {
 		candidates, err := s.resolveTargetCandidates(ctx, target, port, ipStrategy)
@@ -4373,6 +7605,12 @@ func (s *ReverseProxyService) pickUpstreamTarget(ctx context.Context, protocol s
 		}
 		preferred := reorderCandidatesByIPStrategy(candidates, ipStrategy)
 		for _, candidate := range preferred {
+			if loopGuard != nil && loopGuard(candidate) {
+				if firstErr == nil {
+					firstErr = common.NewError("resolved upstream target points back to the local listener")
+				}
+				continue
+			}
 			transportMode, probeErr := s.probeUpstream(ctx, protocol, candidate.address, port, candidate.serverName, strictVerify, httpVersionStrategy)
 			if probeErr == nil {
 				return candidate.address, candidate.serverName, candidate.hostHeader, transportMode, nil
@@ -4385,6 +7623,20 @@ func (s *ReverseProxyService) pickUpstreamTarget(ctx context.Context, protocol s
 		firstErr = common.NewError("resolve upstream target failed")
 	}
 	return "", "", "", "", firstErr
+}
+
+func (g *reverseProxyListenerGroup) resolvedTargetLoopsToListener(rule *model.ReverseProxyRule, targetAddress string) bool {
+	if g == nil || rule == nil {
+		return false
+	}
+	g.mu.RLock()
+	listenIPs := append([]string(nil), g.listenIPs...)
+	listenPort := g.listenPort
+	g.mu.RUnlock()
+	if len(listenIPs) == 0 {
+		listenIPs = reverseProxyHTTPRuntimeListenIPs(rule)
+	}
+	return reverseProxyResolvedTargetLoopsToListener(listenIPs, listenPort, rule.TargetPort, targetAddress)
 }
 
 func (s *ReverseProxyService) resolveTargetCandidates(ctx context.Context, target string, port int, ipStrategy string) ([]reverseProxyTargetCandidate, error) {
@@ -4464,29 +7716,38 @@ func reorderCandidatesByIPStrategy(items []reverseProxyTargetCandidate, strategy
 	}
 }
 
-func (s *ReverseProxyService) buildRoundTripper(group *reverseProxyListenerGroup, ruleID uint, protocol string, address string, port int, serverName string, strictVerify bool, transportMode string) (reverseProxyTransportBundle, error) {
+func (s *ReverseProxyService) buildRoundTripper(group *reverseProxyListenerGroup, ruleID uint, protocol string, address string, port int, serverName string, strictVerify bool, transportMode string, maxConnections int, maxIdleConnections int) (reverseProxyTransportBundle, error) {
+	if maxConnections < 0 {
+		maxConnections = 0
+	}
+	maxIdleConnections, maxIdleConnectionsPerHost := reverseProxyHTTPTransportIdleConnectionLimits(maxIdleConnections)
+	acquire := func() (func(), bool) {
+		if group == nil {
+			return func() {}, true
+		}
+		limiter, ok := group.acquireUpstreamConnection(ruleID)
+		if !ok {
+			return nil, false
+		}
+		return func() { group.releaseUpstreamConnection(ruleID, limiter) }, true
+	}
 	if protocol == reverseProxyProtocolHTTP {
 		dialer := &net.Dialer{
 			Timeout:   12 * time.Second,
 			KeepAlive: reverseProxyUpstreamTCPKeepAlive,
 		}
 		transport := &http.Transport{
-			DialContext: reverseProxyFixedAddressDialContextWithTracking(dialer, address, port, func() {
-				if group != nil {
-					group.incrementUpstreamConnection(ruleID)
-				}
-			}, func() {
-				if group != nil {
-					group.decrementUpstreamConnection(ruleID)
-				}
-			}),
+			DialContext:           reverseProxyFixedAddressDialContextWithTracking(dialer, address, port, acquire),
 			DisableCompression:    false,
 			DisableKeepAlives:     false,
-			ResponseHeaderTimeout: 30 * time.Second,
+			MaxConnsPerHost:       maxConnections,
+			MaxIdleConns:          maxIdleConnections,
+			MaxIdleConnsPerHost:   maxIdleConnectionsPerHost,
+			ResponseHeaderTimeout: reverseProxyUpstreamResponseHeaderTimeout,
 			IdleConnTimeout:       reverseProxyUpstreamIdleTimeout,
 		}
 		return reverseProxyTransportBundle{
-			RoundTripper: transport,
+			RoundTripper: reverseProxyWithResponseHeaderTimeout(transport),
 			Cleanup:      transport.CloseIdleConnections,
 		}, nil
 	}
@@ -4494,17 +7755,9 @@ func (s *ReverseProxyService) buildRoundTripper(group *reverseProxyListenerGroup
 	switch transportMode {
 	case reverseProxyUpstreamModeHTTPSH3:
 		tlsConfig := buildReverseProxyUpstreamTLSConfig(serverName, strictVerify, []string{"h3"})
-		transport := buildHTTP3RoundTripper(address, port, tlsConfig, func() {
-			if group != nil {
-				group.incrementUpstreamConnection(ruleID)
-			}
-		}, func() {
-			if group != nil {
-				group.decrementUpstreamConnection(ruleID)
-			}
-		})
+		transport := buildHTTP3RoundTripper(address, port, tlsConfig, acquire)
 		return reverseProxyTransportBundle{
-			RoundTripper: transport,
+			RoundTripper: reverseProxyWithResponseHeaderTimeout(transport),
 			Cleanup: func() {
 				_ = transport.Close()
 			},
@@ -4520,19 +7773,14 @@ func (s *ReverseProxyService) buildRoundTripper(group *reverseProxyListenerGroup
 			KeepAlive: reverseProxyUpstreamTCPKeepAlive,
 		}
 		transport := &http.Transport{
-			DialContext: reverseProxyFixedAddressDialContextWithTracking(dialer, address, port, func() {
-				if group != nil {
-					group.incrementUpstreamConnection(ruleID)
-				}
-			}, func() {
-				if group != nil {
-					group.decrementUpstreamConnection(ruleID)
-				}
-			}),
+			DialContext:           reverseProxyFixedAddressDialContextWithTracking(dialer, address, port, acquire),
 			DisableCompression:    false,
 			DisableKeepAlives:     false,
 			ForceAttemptHTTP2:     true,
-			ResponseHeaderTimeout: 30 * time.Second,
+			MaxConnsPerHost:       maxConnections,
+			MaxIdleConns:          maxIdleConnections,
+			MaxIdleConnsPerHost:   maxIdleConnectionsPerHost,
+			ResponseHeaderTimeout: reverseProxyUpstreamResponseHeaderTimeout,
 			IdleConnTimeout:       reverseProxyUpstreamIdleTimeout,
 			TLSHandshakeTimeout:   12 * time.Second,
 			TLSClientConfig:       tlsConfig,
@@ -4542,12 +7790,24 @@ func (s *ReverseProxyService) buildRoundTripper(group *reverseProxyListenerGroup
 			h2Transport.PingTimeout = reverseProxyUpstreamHTTP2PingTimeout
 		}
 		return reverseProxyTransportBundle{
-			RoundTripper: transport,
+			RoundTripper: reverseProxyWithResponseHeaderTimeout(transport),
 			Cleanup:      transport.CloseIdleConnections,
 		}, nil
 	default:
 		return reverseProxyTransportBundle{}, common.NewError("invalid upstream transport mode")
 	}
+}
+
+// reverseProxyHTTPTransportIdleConnectionLimits translates the panel value
+// into net/http's two related controls.  A panel value of zero means no
+// additional idle-pool ceiling.  http.Transport treats a zero
+// MaxIdleConnsPerHost as its hidden default of two, so use the largest native
+// int explicitly while leaving MaxIdleConns at zero (unlimited) instead.
+func reverseProxyHTTPTransportIdleConnectionLimits(value int) (total int, perHost int) {
+	if value > 0 {
+		return value, value
+	}
+	return 0, int(^uint(0) >> 1)
 }
 
 func buildReverseProxyUpstreamTLSConfig(serverName string, strictVerify bool, nextProtos []string) *tls.Config {
@@ -4562,7 +7822,10 @@ func buildReverseProxyUpstreamTLSConfig(serverName string, strictVerify bool, ne
 	return config
 }
 
-func buildHTTP3RoundTripper(address string, port int, tlsConfig *tls.Config, onOpen func(), onClose func()) *http3.Transport {
+func buildHTTP3RoundTripper(address string, port int, tlsConfig *tls.Config, acquire func() (func(), bool)) *http3.Transport {
+	if acquire == nil {
+		acquire = func() (func(), bool) { return func() {}, true }
+	}
 	return &http3.Transport{
 		TLSClientConfig: cloneTLSConfig(tlsConfig, tlsConfig),
 		QUICConfig: &quic.Config{
@@ -4570,22 +7833,23 @@ func buildHTTP3RoundTripper(address string, port int, tlsConfig *tls.Config, onO
 			MaxIdleTimeout:  reverseProxyUpstreamIdleTimeout,
 		},
 		Dial: func(ctx context.Context, _ string, cfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error) {
+			release, ok := acquire()
+			if !ok {
+				return nil, errors.New("reverse proxy upstream connection limit reached")
+			}
 			conn, err := quic.DialAddr(ctx, net.JoinHostPort(address, strconv.Itoa(port)), cloneTLSConfig(cfg, tlsConfig), quicCfg)
 			if err != nil {
+				release()
 				return nil, err
 			}
-			if onOpen != nil {
-				onOpen()
-			}
-			if onClose != nil {
-				go func(c *quic.Conn) {
-					if c == nil {
-						return
-					}
-					<-c.Context().Done()
-					onClose()
-				}(conn)
-			}
+			go func(c *quic.Conn) {
+				if c == nil {
+					release()
+					return
+				}
+				<-c.Context().Done()
+				release()
+			}(conn)
 			return conn, nil
 		},
 	}
@@ -4597,22 +7861,23 @@ func reverseProxyFixedAddressDialContext(dialer *net.Dialer, address string, por
 	}
 }
 
-func reverseProxyFixedAddressDialContextWithTracking(dialer *net.Dialer, address string, port int, onOpen func(), onClose func()) func(context.Context, string, string) (net.Conn, error) {
+func reverseProxyFixedAddressDialContextWithTracking(dialer *net.Dialer, address string, port int, acquire func() (func(), bool)) func(context.Context, string, string) (net.Conn, error) {
+	if acquire == nil {
+		acquire = func() (func(), bool) { return func() {}, true }
+	}
 	return func(ctx context.Context, networkName string, _ string) (net.Conn, error) {
+		release, ok := acquire()
+		if !ok {
+			return nil, errors.New("reverse proxy upstream connection limit reached")
+		}
 		conn, err := dialer.DialContext(ctx, networkName, net.JoinHostPort(address, strconv.Itoa(port)))
 		if err != nil {
+			release()
 			return nil, err
 		}
-		if onOpen != nil {
-			onOpen()
-		}
 		return &reverseProxyCountedConn{
-			Conn: conn,
-			onClose: func() {
-				if onClose != nil {
-					onClose()
-				}
-			},
+			Conn:    conn,
+			onClose: release,
 		}, nil
 	}
 }
@@ -4722,48 +7987,87 @@ func (g *reverseProxyListenerGroup) shutdown() error {
 	}
 	var firstErr error
 	selections := make([]reverseProxyCertificateSelection, 0)
+	ruleLimiters := make([]*reverseProxyAdjustableLimiter, 0)
+	hijackedConnections := make([]net.Conn, 0)
+	connectionSlotsToRelease := 0
 	g.statsMu.Lock()
 	for connID, state := range g.localConnStates {
 		if state.HasSelection {
 			selections = append(selections, state.Selection)
 		}
+		for _, ruleLimiter := range state.RuleConnectionLimiters {
+			if ruleLimiter != nil {
+				ruleLimiters = append(ruleLimiters, ruleLimiter)
+			}
+		}
 		delete(g.localConnStates, connID)
 	}
-	for addrKey, selection := range g.pendingConnSelections {
-		selections = append(selections, selection)
-		delete(g.pendingConnSelections, addrKey)
+	for index := range g.pendingConnSelectionShards {
+		shard := &g.pendingConnSelectionShards[index]
+		for addrKey, selection := range shard.selections {
+			if selection != nil {
+				selections = append(selections, selection.Selection)
+			}
+			delete(shard.selections, addrKey)
+		}
+		if shard.lru != nil {
+			shard.lru.Init()
+		}
 	}
 	g.localConnIDs = make(map[net.Conn]string)
+	g.localConnByID = make(map[string]net.Conn)
 	g.localConnAddrToID = make(map[string]string)
 	g.localConnAddrByID = make(map[string]string)
+	for _, conn := range g.hijackedConnections {
+		if conn != nil {
+			hijackedConnections = append(hijackedConnections, conn)
+		}
+	}
+	g.hijackedConnections = make(map[string]net.Conn)
+	g.connectionCounts = make(map[uint]reverseProxyConnectionCounts)
+	for connID := range g.connectionSlotIDs {
+		delete(g.connectionSlotIDs, connID)
+		connectionSlotsToRelease++
+	}
 	g.statsMu.Unlock()
+	for i := 0; i < connectionSlotsToRelease; i++ {
+		g.releaseListenerConnectionSlot()
+	}
 	for _, selection := range selections {
 		g.releaseCertificateSelection(selection)
 	}
+	for _, limiter := range ruleLimiters {
+		limiter.Release()
+	}
+	for _, conn := range hijackedConnections {
+		_ = conn.Close()
+	}
 	g.mu.Lock()
+	g.closed = true
 	oldUpstreams := g.upstreamByRule
+	oldDNSHandler := g.dnsHandler
 	g.upstreamByRule = make(map[uint]*reverseProxyCachedUpstream)
+	g.dnsHandler = nil
 	g.mu.Unlock()
 	for _, upstream := range oldUpstreams {
 		g.disposeCachedUpstream(upstream)
+	}
+	if err := closeReverseProxyDNSHandler(oldDNSHandler); err != nil && firstErr == nil {
+		firstErr = err
 	}
 	if len(g.h3Servers) > 0 {
 		for _, server := range g.h3Servers {
 			if server == nil {
 				continue
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), reverseProxyShutdownTimeout)
-			err := server.Shutdown(ctx)
-			cancel()
-			if err != nil && !errors.Is(err, http.ErrServerClosed) && firstErr == nil {
+			err := shutdownReverseProxyHTTP3Server(server)
+			if err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
 	} else if g.h3Server != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), reverseProxyShutdownTimeout)
-		err := g.h3Server.Shutdown(ctx)
-		cancel()
-		if err != nil && !errors.Is(err, http.ErrServerClosed) && firstErr == nil {
+		err := shutdownReverseProxyHTTP3Server(g.h3Server)
+		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -4805,13 +8109,49 @@ func (r *reverseProxyRuntimeManager) registerMismatch(ip string, reason string) 
 	if ip == "" {
 		return 0
 	}
-	r.mismatchMu.Lock()
-	defer r.mismatchMu.Unlock()
+	shard := r.mismatchShard(ip)
+	if shard == nil {
+		return 0
+	}
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 	now := time.Now()
-	entry, ok := r.mismatchByIP[ip]
-	if !ok || now.Sub(entry.LastAttempt) >= reverseProxyMismatchCooldown {
+	if shard.entries == nil {
+		shard.entries = make(map[string]*reverseProxyMismatchEntry)
+	}
+	if shard.lru == nil {
+		shard.lru = list.New()
+	}
+	for shard.lru.Len() > 0 {
+		oldestKey, _ := shard.lru.Back().Value.(string)
+		oldest := shard.entries[oldestKey]
+		if oldest != nil && !oldest.LastAttempt.IsZero() && now.Sub(oldest.LastAttempt) < reverseProxyRuntimeTableTTL {
+			break
+		}
+		if oldest != nil && oldest.element != nil {
+			shard.lru.Remove(oldest.element)
+		}
+		delete(shard.entries, oldestKey)
+	}
+	entry := shard.entries[ip]
+	if entry == nil || entry.LastAttempt.IsZero() || now.Sub(entry.LastAttempt) >= reverseProxyRuntimeTableTTL {
+		if entry != nil && entry.element != nil {
+			shard.lru.Remove(entry.element)
+		}
+		perShardLimit := reverseProxyMismatchMaxEntries / reverseProxyRuntimeTableShardCount
+		for len(shard.entries) >= perShardLimit && shard.lru.Len() > 0 {
+			oldestKey, _ := shard.lru.Back().Value.(string)
+			oldest := shard.entries[oldestKey]
+			if oldest != nil && oldest.element != nil {
+				shard.lru.Remove(oldest.element)
+			}
+			delete(shard.entries, oldestKey)
+		}
 		entry = &reverseProxyMismatchEntry{}
-		r.mismatchByIP[ip] = entry
+		entry.element = shard.lru.PushFront(ip)
+		shard.entries[ip] = entry
+	} else if entry.element != nil {
+		shard.lru.MoveToFront(entry.element)
 	}
 	entry.Count++
 	entry.LastAttempt = now
@@ -4829,7 +8169,35 @@ func (r *reverseProxyRuntimeManager) clearMismatch(ip string) {
 	if ip == "" {
 		return
 	}
-	r.mismatchMu.Lock()
-	delete(r.mismatchByIP, ip)
-	r.mismatchMu.Unlock()
+	shard := r.mismatchShard(ip)
+	if shard == nil {
+		return
+	}
+	shard.mu.Lock()
+	if entry := shard.entries[ip]; entry != nil && entry.element != nil && shard.lru != nil {
+		shard.lru.Remove(entry.element)
+	}
+	delete(shard.entries, ip)
+	shard.mu.Unlock()
+}
+
+func (r *reverseProxyRuntimeManager) mismatchShard(ip string) *reverseProxyMismatchShard {
+	if r == nil {
+		return nil
+	}
+	index := int(crc32.ChecksumIEEE([]byte(ip)) % reverseProxyRuntimeTableShardCount)
+	return &r.mismatchShards[index]
+}
+
+func (r *reverseProxyRuntimeManager) resetMismatchTable() {
+	if r == nil {
+		return
+	}
+	for index := range r.mismatchShards {
+		shard := &r.mismatchShards[index]
+		shard.mu.Lock()
+		shard.entries = make(map[string]*reverseProxyMismatchEntry)
+		shard.lru = list.New()
+		shard.mu.Unlock()
+	}
 }

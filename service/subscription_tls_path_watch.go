@@ -87,7 +87,7 @@ func CheckAndSyncAutoManagedSubscriptionsOnTLSPathChange(hostname string) (bool,
 		return false, err
 	}
 
-	LastUpdate = time.Now().Unix()
+	markLastUpdate(time.Now().Unix())
 	return true, nil
 }
 

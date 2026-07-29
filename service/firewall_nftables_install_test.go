@@ -4,9 +4,18 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/alireza0/s-ui/database/model"
+)
+
+var (
+	firewallRuntimeGOOS = runtime.GOOS
+	firewallReadFile    = os.ReadFile
+	nftRuntimeGOOS      = runtime.GOOS
 )
 
 func withFirewallNftablesTestGlobals(t *testing.T) {
@@ -15,28 +24,58 @@ func withFirewallNftablesTestGlobals(t *testing.T) {
 	originalFirewallRuntimeGOOS := firewallRuntimeGOOS
 	originalFirewallCommandLookPath := firewallCommandLookPath
 	originalFirewallReadFile := firewallReadFile
+	originalFirewallIsLinuxHost := firewallIsLinuxHost
+	originalFirewallOSReleaseFields := firewallOSReleaseFields
 	originalFirewallGeteuid := firewallGeteuid
 	originalFirewallRunInstall := firewallRunInstall
 	originalFirewallSupportedFn := firewallSupportedFn
 	originalFirewallState := firewallState
 	originalNftRuntimeGOOS := nftRuntimeGOOS
+	originalNftIsLinuxHost := nftIsLinuxHost
 	originalNftLookPathFn := nftLookPathFn
 	originalNftStatFn := nftStatFn
 	originalNftCandidates := append([]string{}, nftCandidates...)
+	originalVersionProbe := nftCapabilitiesRunVersionFn
+	originalJSONProbe := nftCapabilitiesRunJSONProbeFn
+	nftCapabilitiesSnapshot.mu.RLock()
+	originalCapabilities := nftCapabilitiesSnapshot.value
+	nftCapabilitiesSnapshot.mu.RUnlock()
+	nftCapabilityLayoutState.mu.RLock()
+	originalAppliedSignature := nftCapabilityLayoutState.appliedSignature
+	originalApplyError := nftCapabilityLayoutState.lastApplyError
+	nftCapabilityLayoutState.mu.RUnlock()
+	originalPlatform, originalPlatformErr := GetSystemPlatform()
 	originalInstallFailure := getFirewallNftInstallFailure()
 
 	t.Cleanup(func() {
 		firewallRuntimeGOOS = originalFirewallRuntimeGOOS
 		firewallCommandLookPath = originalFirewallCommandLookPath
 		firewallReadFile = originalFirewallReadFile
+		firewallIsLinuxHost = originalFirewallIsLinuxHost
+		firewallOSReleaseFields = originalFirewallOSReleaseFields
 		firewallGeteuid = originalFirewallGeteuid
 		firewallRunInstall = originalFirewallRunInstall
 		firewallSupportedFn = originalFirewallSupportedFn
 		firewallState = originalFirewallState
 		nftRuntimeGOOS = originalNftRuntimeGOOS
+		nftIsLinuxHost = originalNftIsLinuxHost
 		nftLookPathFn = originalNftLookPathFn
 		nftStatFn = originalNftStatFn
 		nftCandidates = originalNftCandidates
+		nftCapabilitiesRunVersionFn = originalVersionProbe
+		nftCapabilitiesRunJSONProbeFn = originalJSONProbe
+		nftCapabilitiesSnapshot.mu.Lock()
+		nftCapabilitiesSnapshot.value = originalCapabilities
+		nftCapabilitiesSnapshot.mu.Unlock()
+		nftCapabilityLayoutState.mu.Lock()
+		nftCapabilityLayoutState.appliedSignature = originalAppliedSignature
+		nftCapabilityLayoutState.lastApplyError = originalApplyError
+		nftCapabilityLayoutState.mu.Unlock()
+		if originalPlatformErr != nil || originalPlatform == nil {
+			clearSystemPlatformSnapshot()
+		} else {
+			setSystemPlatformSnapshot(originalPlatform)
+		}
 		setFirewallNftInstallFailure(originalInstallFailure)
 	})
 
@@ -44,6 +83,24 @@ func withFirewallNftablesTestGlobals(t *testing.T) {
 	firewallState.lastRenderHash = ""
 	firewallState.lastRuntimeHash = ""
 	firewallState.lastReconcile = time.Time{}
+	firewallIsLinuxHost = func() bool {
+		return firewallRuntimeGOOS == "linux"
+	}
+	firewallOSReleaseFields = func() map[string]string {
+		content, err := firewallReadFile("/etc/os-release")
+		if err != nil {
+			return map[string]string{}
+		}
+		return parseSystemPlatformOSReleaseFields(string(content))
+	}
+	nftIsLinuxHost = func() bool {
+		return nftRuntimeGOOS == "linux"
+	}
+	nftCapabilitiesRunVersionFn = func(string) (string, error) { return "nftables v0.9.8", nil }
+	nftCapabilitiesRunJSONProbeFn = func(string) error { return nil }
+	setSystemPlatformSnapshot(&model.SystemPlatform{OS: "linux", KernelRelease: "5.10.0"})
+	setNftCapabilitiesForTest(buildNftablesCapabilities("nftables v0.9.8", "5.10.0", nil))
+	markNftCapabilityLayoutApplied()
 }
 
 func firewallTestLookPath(paths map[string]string) func(string) (string, error) {
@@ -141,10 +198,10 @@ func TestFirewallNftablesOverviewStates(t *testing.T) {
 			wantAutoInstall:   false,
 			wantErrorContains: "Linux only",
 		},
-			{
-				name: "linux missing binary",
-				setup: func() {
-					firewallRuntimeGOOS = "linux"
+		{
+			name: "linux missing binary",
+			setup: func() {
+				firewallRuntimeGOOS = "linux"
 				nftRuntimeGOOS = "linux"
 				firewallSupportedFn = func() bool { return false }
 				firewallGeteuid = func() int { return 0 }
@@ -154,7 +211,7 @@ func TestFirewallNftablesOverviewStates(t *testing.T) {
 			wantReason:        firewallNftReasonMissingBinary,
 			wantInstalled:     false,
 			wantAutoInstall:   true,
-				wantErrorContains: "apt-get update",
+			wantErrorContains: "apt-get update",
 		},
 		{
 			name: "linux installed but permission denied",
@@ -246,6 +303,32 @@ func TestFirewallNftablesOverviewStates(t *testing.T) {
 	}
 }
 
+func TestFirewallNftablesStatusExposesCapabilityAndLayoutFailures(t *testing.T) {
+	withFirewallNftablesTestGlobals(t)
+	firewallRuntimeGOOS = "linux"
+	nftRuntimeGOOS = "linux"
+	nftLookPathFn = func(name string) (string, error) {
+		if name == "nft" {
+			return "/usr/sbin/nft", nil
+		}
+		return "", exec.ErrNotFound
+	}
+
+	setNftCapabilitiesForTest(buildNftablesCapabilities("unexpected", "5.10.0", nil))
+	status := buildFirewallNftablesStatus(true)
+	if status.Reason != firewallNftReasonCapabilityError || status.RendererSupported || status.CapabilityError == "" {
+		t.Fatalf("capability failure was not exposed: %+v", status)
+	}
+
+	setNftCapabilitiesForTest(buildNftablesCapabilities("nftables v0.9.8", "5.10.0", nil))
+	clearNftCapabilityLayoutApplied()
+	setNftCapabilityLayoutApplyError(errors.New("restore verification failed"))
+	status = buildFirewallNftablesStatus(true)
+	if status.Reason != firewallNftReasonApplyFailed || !status.LayoutPending || !strings.Contains(status.LastApplyError, "restore verification failed") {
+		t.Fatalf("layout apply failure was not exposed: %+v", status)
+	}
+}
+
 func TestDetectFirewallNftInstallPlanSelectsExpectedCommands(t *testing.T) {
 	withFirewallNftablesTestGlobals(t)
 
@@ -259,14 +342,14 @@ func TestDetectFirewallNftInstallPlanSelectsExpectedCommands(t *testing.T) {
 		wantFirstCommand    string
 		wantFirstManualStep string
 	}{
-			{
-				name:             "apt-get",
-				fields:           map[string]string{"ID": "debian", "ID_LIKE": "debian", "VERSION_ID": "10", "VERSION_CODENAME": "buster"},
-				paths:            map[string]string{"apt-get": "/usr/bin/apt-get"},
-				wantName:         "apt-get",
-				wantSystemFamily: "debian",
-				wantFirstCommand: "apt-get update",
-			},
+		{
+			name:             "apt-get",
+			fields:           map[string]string{"ID": "debian", "ID_LIKE": "debian", "VERSION_ID": "10", "VERSION_CODENAME": "buster"},
+			paths:            map[string]string{"apt-get": "/usr/bin/apt-get"},
+			wantName:         "apt-get",
+			wantSystemFamily: "debian",
+			wantFirstCommand: "apt-get update",
+		},
 		{
 			name:             "dnf",
 			fields:           map[string]string{"ID": "fedora", "ID_LIKE": "fedora"},
@@ -377,6 +460,21 @@ func TestBuildDebianUbuntuFirewallNftInstallPlanUsesOfficialSourcesAndServiceSta
 		wantManualInstall   string
 		wantServiceContains string
 	}{
+		{
+			name: "debian 9 install plan",
+			fields: map[string]string{
+				"ID":               "debian",
+				"ID_LIKE":          "debian",
+				"VERSION_ID":       "9",
+				"VERSION_CODENAME": "stretch",
+			},
+			manager:             "apt-get",
+			wantUpdateCommand:   "apt-get update",
+			wantInstallCommand:  "apt-get install -y nftables",
+			wantManualUpdate:    "apt-get update",
+			wantManualInstall:   "apt-get install -y nftables",
+			wantServiceContains: "systemctl enable --now nftables",
+		},
 		{
 			name: "debian 10 install plan",
 			fields: map[string]string{
@@ -539,7 +637,7 @@ func TestInstallNftablesReturnsRefreshedOverviewAfterSuccess(t *testing.T) {
 		return installed
 	}
 
-		executed := make([]string, 0, 3)
+	executed := make([]string, 0, 3)
 	firewallRunInstall = func(command []string) error {
 		executed = append(executed, strings.Join(command, " "))
 		if len(command) >= 2 && command[0] == "apt-get" && command[1] == "install" {
@@ -557,18 +655,18 @@ func TestInstallNftablesReturnsRefreshedOverviewAfterSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InstallNftables returned error: %v", err)
 	}
-		if len(executed) != 3 {
-			t.Fatalf("unexpected install command count: %d (%v)", len(executed), executed)
-		}
-		if executed[0] != "apt-get update" {
-			t.Fatalf("first install command mismatch: %q", executed[0])
-		}
-		if executed[1] != "apt-get install -y nftables" {
-			t.Fatalf("second install command mismatch: %q", executed[1])
-		}
-		if !strings.Contains(executed[2], "systemctl enable --now nftables") {
-			t.Fatalf("third install command mismatch: %q", executed[2])
-		}
+	if len(executed) != 3 {
+		t.Fatalf("unexpected install command count: %d (%v)", len(executed), executed)
+	}
+	if executed[0] != "apt-get update" {
+		t.Fatalf("first install command mismatch: %q", executed[0])
+	}
+	if executed[1] != "apt-get install -y nftables" {
+		t.Fatalf("second install command mismatch: %q", executed[1])
+	}
+	if !strings.Contains(executed[2], "systemctl enable --now nftables") {
+		t.Fatalf("third install command mismatch: %q", executed[2])
+	}
 	if !overview.Nftables.Installed {
 		t.Fatal("expected nftables to be marked installed after install")
 	}
@@ -612,9 +710,9 @@ func TestInstallNftablesWithoutSudoReturnsManualCommands(t *testing.T) {
 	if !strings.Contains(message, "requires root or passwordless sudo") {
 		t.Fatalf("unexpected permission error: %q", message)
 	}
-		if !strings.Contains(message, "apt-get update") {
-			t.Fatalf("manual update command missing from error: %q", message)
-		}
+	if !strings.Contains(message, "apt-get update") {
+		t.Fatalf("manual update command missing from error: %q", message)
+	}
 	if !strings.Contains(message, "apt-get install -y nftables") {
 		t.Fatalf("manual commands missing from error: %q", message)
 	}

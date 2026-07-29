@@ -41,6 +41,30 @@ func TestBuildSubManagerRuntimeOutbounds_PassThroughTypes(t *testing.T) {
 	}
 }
 
+func TestBuildSubManagerRuntimeOutbounds_ExpandsMixed(t *testing.T) {
+	raw := []map[string]interface{}{
+		{
+			"type":        "mixed",
+			"tag":         "manual-mixed",
+			"server":      "proxy.example.com",
+			"server_port": 1080,
+			"username":    "alice",
+			"password":    "secret",
+		},
+	}
+
+	outbounds, tags := buildSubManagerRuntimeOutbounds(raw)
+	if len(outbounds) != 2 || len(tags) != 2 {
+		t.Fatalf("mixed endpoint must expand into two runtime outbounds, got outbounds=%#v tags=%#v", outbounds, tags)
+	}
+	if tags[0] != "manual-mixed-socks" || tags[1] != "manual-mixed-http" {
+		t.Fatalf("unexpected mixed runtime tags: %#v", tags)
+	}
+	if outbounds[0]["type"] != "socks" || outbounds[1]["type"] != "http" {
+		t.Fatalf("unexpected mixed runtime outbounds: %#v", outbounds)
+	}
+}
+
 func TestBuildSubManagerRuntimeOutbounds_ShadowTLSSplit(t *testing.T) {
 	raw := []map[string]interface{}{
 		{

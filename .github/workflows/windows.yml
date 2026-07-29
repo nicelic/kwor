@@ -25,12 +25,6 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Validate manuals in repository root
-        shell: bash
-        run: |
-          test -f "User Manual.md" || { echo "Missing User Manual.md in repository root" >&2; exit 1; }
-          test -f "使用手册.md" || { echo "Missing 使用手册.md in repository root" >&2; exit 1; }
-
       - name: Install zip for Windows
         shell: powershell
         run: |
@@ -92,11 +86,6 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: '22'
-
-      - name: Validate manuals in repository root
-        run: |
-          test -f "User Manual.md" || { echo "Missing User Manual.md in repository root" >&2; exit 1; }
-          test -f "使用手册.md" || { echo "Missing 使用手册.md in repository root" >&2; exit 1; }
 
       - name: Build frontend
         run: |

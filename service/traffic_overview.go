@@ -3,8 +3,12 @@ package service
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	pathpkg "path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -22,7 +27,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/alireza0/s-ui/database"
+	"github.com/alireza0/s-ui/config"
 	"github.com/alireza0/s-ui/logger"
 	psnet "github.com/shirou/gopsutil/v4/net"
 )
@@ -50,26 +55,46 @@ type TrafficOverview struct {
 }
 
 type VnstatPackageStatus struct {
-	Supported      bool     `json:"supported"`
-	CanManage      bool     `json:"canManage"`
-	Installed      bool     `json:"installed"`
-	Managed        bool     `json:"managed"`
-	Running        bool     `json:"running"`
-	Version        string   `json:"version,omitempty"`
-	SystemFamily   string   `json:"systemFamily,omitempty"`
-	PackageManager string   `json:"packageManager,omitempty"`
-	InstallMethod  string   `json:"installMethod,omitempty"`
-	BinaryPath     string   `json:"binaryPath,omitempty"`
-	FileCount      int      `json:"fileCount"`
-	DataPaths      []string `json:"dataPaths,omitempty"`
-	ManageHint     string   `json:"manageHint,omitempty"`
-	Error          string   `json:"error,omitempty"`
+	Supported       bool                   `json:"supported"`
+	CanManage       bool                   `json:"canManage"`
+	Installed       bool                   `json:"installed"`
+	Managed         bool                   `json:"managed"`
+	Ownership       string                 `json:"ownership,omitempty"`
+	OwnershipState  string                 `json:"ownershipState,omitempty"`
+	OwnershipHint   string                 `json:"ownershipHint,omitempty"`
+	Running         bool                   `json:"running"`
+	Version         string                 `json:"version,omitempty"`
+	SystemFamily    string                 `json:"systemFamily,omitempty"`
+	SystemID        string                 `json:"systemId,omitempty"`
+	SystemVersion   string                 `json:"systemVersion,omitempty"`
+	PackageManager  string                 `json:"packageManager,omitempty"`
+	InstallMethod   string                 `json:"installMethod,omitempty"`
+	BinaryPath      string                 `json:"binaryPath,omitempty"`
+	FileCount       int                    `json:"fileCount"`
+	DataPaths       []string               `json:"dataPaths,omitempty"`
+	ExternalPaths   []string               `json:"externalPaths,omitempty"`
+	ExternalUnits   []string               `json:"externalUnits,omitempty"`
+	RuntimeConflict *VnstatRuntimeConflict `json:"runtimeConflict,omitempty"`
+	ManageHint      string                 `json:"manageHint,omitempty"`
+	Error           string                 `json:"error,omitempty"`
+}
+
+// VnstatRuntimeConflict is set only after a panel-managed daemon fails to
+// start and a separate running vnstatd process is then observed.
+type VnstatRuntimeConflict struct {
+	Message    string   `json:"message"`
+	Paths      []string `json:"paths,omitempty"`
+	PIDs       []int    `json:"pids,omitempty"`
+	Units      []string `json:"units,omitempty"`
+	DetectedAt int64    `json:"detectedAt"`
 }
 
 type VnstatVersionOption struct {
 	Value       string `json:"value"`
 	Title       string `json:"title"`
 	Description string `json:"description,omitempty"`
+	Available   bool   `json:"available"`
+	Reason      string `json:"reason,omitempty"`
 }
 
 type VnstatVersionListResult struct {
@@ -88,8 +113,31 @@ type VnstatVersionCheckResult struct {
 	Message        string `json:"message"`
 }
 
+// VnstatInstallJobStatus describes the one vnStat installation task that may
+// run at a time. Installing from a package manager or compiling a GitHub
+// source release can take several minutes, so it must not be tied to the HTTP
+// request lifetime.
+type VnstatInstallJobStatus struct {
+	ID         string `json:"id,omitempty"`
+	Source     string `json:"source,omitempty"`
+	State      string `json:"state"`
+	Phase      string `json:"phase,omitempty"`
+	Error      string `json:"error,omitempty"`
+	StartedAt  int64  `json:"startedAt,omitempty"`
+	FinishedAt int64  `json:"finishedAt,omitempty"`
+}
+
+type vnstatInstallJob struct {
+	status    VnstatInstallJobStatus
+	ctx       context.Context
+	operation *KworManagedOperationHandle
+}
+
+type vnstatInstallProgressReporter func(phase string)
+
 type trafficOverviewVnstatManifest struct {
 	Managed        bool     `json:"managed"`
+	Ownership      string   `json:"ownership"`
 	SystemFamily   string   `json:"systemFamily"`
 	PackageManager string   `json:"packageManager"`
 	InstallMethod  string   `json:"installMethod"`
@@ -99,7 +147,48 @@ type trafficOverviewVnstatManifest struct {
 	FilePaths      []string `json:"filePaths"`
 	DataPaths      []string `json:"dataPaths"`
 	ServiceUnits   []string `json:"serviceUnits"`
+	EvidenceNonce  string   `json:"evidenceNonce"`
+	EvidenceSchema int      `json:"evidenceSchema"`
 	InstalledAt    int64    `json:"installedAt"`
+}
+
+// trafficOverviewVnstatOwnershipEvidence is deliberately stored outside the
+// database. A copied/restored SQLite database must not grant permission to
+// stop or remove a vnStat installation on another host.
+type trafficOverviewVnstatOwnershipEvidence struct {
+	Schema          int                                 `json:"schema"`
+	HostFingerprint string                              `json:"hostFingerprint"`
+	Nonce           string                              `json:"nonce"`
+	Ownership       string                              `json:"ownership"`
+	InstallMethod   string                              `json:"installMethod"`
+	PackageManager  string                              `json:"packageManager"`
+	BinaryPath      string                              `json:"binaryPath"`
+	Files           []trafficOverviewVnstatEvidenceFile `json:"files"`
+	DataPaths       []string                            `json:"dataPaths"`
+	ServiceUnits    []string                            `json:"serviceUnits"`
+	CreatedAt       int64                               `json:"createdAt"`
+}
+
+type trafficOverviewVnstatEvidenceFile struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+}
+
+type vnstatOwnershipValidation struct {
+	Trusted bool
+	Reason  string
+}
+
+type vnstatExternalInstallation struct {
+	BinaryPath   string
+	DaemonPath   string
+	PIDs         []int
+	ServiceUnits []string
+}
+
+type vnstatVerifiedService struct {
+	Name    string
+	Systemd bool
 }
 
 const (
@@ -122,16 +211,68 @@ const (
 	vnstatPackageName                = "vnstat"
 	vnstatInstallMethodSystemPackage = "system-package"
 	vnstatInstallMethodGitHubRelease = "github-release"
+	vnstatOwnershipPanelInstalled    = "panel-installed"
+	vnstatOwnershipStateManaged      = "managed"
+	vnstatOwnershipStateUnmanaged    = "unmanaged"
+	vnstatOwnershipStateQuarantined  = "quarantined"
+	vnstatEvidenceSchema             = 2
 	vnstatGitHubLatestReleaseAPI     = "https://api.github.com/repos/vergoh/vnstat/releases/latest"
-	vnstatSystemdUnitPath            = "/etc/systemd/system/vnstat.service"
+	vnstatSystemdUnitPath            = "/etc/systemd/system/kwor-vnstat.service"
+	vnstatPanelSystemdUnit           = "kwor-vnstat"
 )
+
+var vnstatStandardProgramPaths = []string{
+	"/usr/bin/vnstat",
+	"/usr/bin/vnstati",
+	"/usr/sbin/vnstatd",
+}
+
+var vnstatStandardConfigAndUnitPaths = []string{
+	"/etc/vnstat.conf",
+	"/etc/default/vnstat",
+	"/etc/conf.d/vnstat",
+	"/etc/init.d/vnstat",
+	"/etc/systemd/system/kwor-vnstat.service",
+	"/lib/systemd/system/vnstat.service",
+	"/usr/lib/systemd/system/vnstat.service",
+}
+
+var vnstatStandardManPagePaths = []string{
+	"/usr/share/man/man1/vnstat.1",
+	"/usr/share/man/man1/vnstati.1",
+	"/usr/share/man/man5/vnstat.conf.5",
+	"/usr/share/man/man8/vnstatd.8",
+}
 
 var trafficOverviewStateMu sync.Mutex
 var trafficOverviewSnapshotMu sync.Mutex
 var trafficOverviewCapMu sync.Mutex
+var vnstatInstallJobMu sync.Mutex
+var vnstatInstallJobState *vnstatInstallJob
 var trafficOverviewShutdownEnabledFn = func() bool {
-	return runtime.GOOS == "linux" && nftSupported()
+	return IsSystemPlatformLinux() && nftSupported()
 }
+
+var (
+	vnstatEvidencePathFn = func() string {
+		return filepath.Join(config.GetDataDir(), "vnstat", "ownership.json")
+	}
+	vnstatHostFingerprintFn                   = readVnstatHostFingerprint
+	vnstatEvidenceFileHashFn                  = hashVnstatEvidenceFile
+	vnstatEvidenceFilePresentFn               = vnstatEvidenceFilePresent
+	vnstatCurrentEUIDFn                       = os.Geteuid
+	vnstatRuntimeGOOS                         = func() string { return runtime.GOOS }
+	vnstatStopForDeleteFn                     = stopVnstatDaemonForManifest
+	vnstatStopForUninstallFn                  = stopVnstatDaemonForUninstall
+	vnstatDiscoverRunningExternalFn           = discoverRunningExternalVnstatInstallations
+	vnstatStopRunningExternalFn               = stopRunningExternalVnstatForPanelInstall
+	vnstatRemoveTrackedDataFn                 = removeVnstatTrackedData
+	vnstatCleanupTrafficCapFn                 = cleanupTrafficCapRules
+	vnstatRandomReader              io.Reader = rand.Reader
+	vnstatManagedInstallRunner                = func(ctx context.Context, s *TrafficOverviewService, source string, report vnstatInstallProgressReporter) (*TrafficOverview, error) {
+		return s.installManagedVnstatWithContext(ctx, source, report)
+	}
+)
 
 type TrafficOverviewService struct{}
 
@@ -206,6 +347,13 @@ type trafficOverviewCapState struct {
 
 var trafficOverviewSnapshotCache trafficOverviewSnapshotState
 
+type vnstatRuntimeConflictState struct {
+	conflict *VnstatRuntimeConflict
+}
+
+var vnstatRuntimeConflictMu sync.RWMutex
+var vnstatRuntimeConflictCache vnstatRuntimeConflictState
+
 func (s *TrafficOverviewService) GetTrafficOverview() (*TrafficOverview, error) {
 	overview := &TrafficOverview{
 		Source:    "vnstat",
@@ -221,7 +369,7 @@ func (s *TrafficOverviewService) GetTrafficOverview() (*TrafficOverview, error) 
 	overview.LimitGiB = limitGiB
 	overview.ResetDay = resetDay
 	overview.ExpiryDate = expiryDate
-	now := time.Now().In(s.getOverviewLocation())
+	now := PanelNow()
 	overview.Expired = isTrafficOverviewExpired(expiryBoundary, now)
 	if nextResetAt, ok := nextClientMonthlyResetBoundary(resetDay, now); ok && !nextResetAt.IsZero() {
 		overview.NextResetAt = nextResetAt.Unix()
@@ -249,7 +397,7 @@ func (s *TrafficOverviewService) GetTrafficOverview() (*TrafficOverview, error) 
 		}
 	}
 
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		overview.Error = "vnstat is supported on linux only"
 		overview.Available = false
 		overview.Status = "unsupported"
@@ -395,10 +543,10 @@ func (s *TrafficOverviewService) SetTrafficOverviewEnabled(enabled bool) error {
 	if err := (&SettingService{}).setString(trafficOverviewEnabledKey, "true"); err != nil {
 		return err
 	}
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return nil
 	}
-	if _, err := exec.LookPath("vnstat"); err != nil {
+	if _, ok := loadTrustedVnstatManifest(); !ok {
 		return nil
 	}
 	if iface, err := detectDefaultTrafficInterface(); err == nil && iface != "" {
@@ -416,11 +564,11 @@ func (s *TrafficOverviewService) SetTrafficOverviewEnabled(enabled bool) error {
 }
 
 func (s *TrafficOverviewService) pauseTrafficOverviewAccounting() error {
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return s.pauseTrafficOverviewWithCachedSnapshot()
 	}
 
-	if _, err := exec.LookPath("vnstat"); err != nil {
+	if _, ok := loadTrustedVnstatManifest(); !ok {
 		return s.pauseTrafficOverviewWithCachedSnapshot()
 	}
 
@@ -442,7 +590,7 @@ func (s *TrafficOverviewService) pauseTrafficOverviewAccounting() error {
 		return cfgErr
 	}
 
-	now := time.Now().In(s.getOverviewLocation())
+	now := PanelNow()
 	trafficOverviewStateMu.Lock()
 	state, stateErr := s.loadRuntimeState()
 	if stateErr != nil {
@@ -535,10 +683,10 @@ func (s *TrafficOverviewService) resumeTrafficOverviewAccounting() error {
 	if !ok || !pauseState.Paused {
 		return nil
 	}
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return s.clearPauseState()
 	}
-	if _, err := exec.LookPath("vnstat"); err != nil {
+	if _, ok := loadTrustedVnstatManifest(); !ok {
 		return s.clearPauseState()
 	}
 
@@ -564,7 +712,7 @@ func (s *TrafficOverviewService) resumeTrafficOverviewAccounting() error {
 	if cfgErr != nil {
 		return cfgErr
 	}
-	now := time.Now().In(s.getOverviewLocation())
+	now := PanelNow()
 
 	trafficOverviewStateMu.Lock()
 	state, stateErr := s.loadRuntimeState()
@@ -601,11 +749,12 @@ func (s *TrafficOverviewService) resumeTrafficOverviewAccounting() error {
 
 func (s *TrafficOverviewService) GetVnstatStatus() VnstatPackageStatus {
 	status := VnstatPackageStatus{
-		Supported: runtime.GOOS == "linux",
-		CanManage: runtime.GOOS == "linux",
+		Supported: IsSystemPlatformLinux(),
+		CanManage: IsSystemPlatformLinux(),
 		DataPaths: defaultVnstatDataPaths(),
 	}
-	if runtime.GOOS != "linux" {
+	populateVnstatPlatformStatus(&status)
+	if !IsSystemPlatformLinux() {
 		status.Error = "vnstat is supported on linux only"
 		status.CanManage = false
 		return status
@@ -618,62 +767,510 @@ func (s *TrafficOverviewService) GetVnstatStatus() VnstatPackageStatus {
 	if manager := detectVnstatPackageManagerPlan(); manager != nil {
 		status.PackageManager = manager.Name
 		status.InstallMethod = vnstatInstallMethodSystemPackage
-		status.SystemFamily = manager.SystemFamily
-	}
-	if family := detectLinuxSystemFamily(); family != "" {
-		status.SystemFamily = family
+		if status.SystemFamily == "" {
+			status.SystemFamily = manager.SystemFamily
+		}
 	}
 
 	manifest, hasManifest := s.loadVnstatManifest()
-	if hasManifest {
-		status.Managed = manifest.Managed
+	if hasManifest && isPanelInstalledVnstatManifest(manifest) {
+		status.Ownership = manifest.Ownership
+		ownershipValidation := validateVnstatOwnership(manifest)
+		status.Managed = ownershipValidation.Trusted
+		if status.Managed {
+			status.OwnershipState = vnstatOwnershipStateManaged
+		} else {
+			status.OwnershipState = vnstatOwnershipStateQuarantined
+			status.OwnershipHint = firstNonEmpty(ownershipValidation.Reason, "vnstat 受管清单无法核验")
+		}
 		status.PackageManager = firstNonEmpty(manifest.PackageManager, status.PackageManager)
 		status.InstallMethod = firstNonEmpty(manifest.InstallMethod, normalizeVnstatInstallMethod("", manifest.PackageManager), status.InstallMethod)
-		status.SystemFamily = firstNonEmpty(manifest.SystemFamily, status.SystemFamily)
-		status.BinaryPath = strings.TrimSpace(manifest.BinaryPath)
+		status.SystemFamily = firstNonEmpty(status.SystemFamily, manifest.SystemFamily)
 		status.FileCount = len(normalizeAbsolutePathList(manifest.FilePaths))
 		if len(manifest.DataPaths) > 0 {
-			status.DataPaths = normalizeAbsolutePathList(manifest.DataPaths)
+			status.DataPaths = safeVnstatDataPaths(manifest.DataPaths)
+		}
+	} else {
+		status.OwnershipState = vnstatOwnershipStateUnmanaged
+		if hasManifest {
+			status.Ownership = manifest.Ownership
+			status.OwnershipHint = "历史 vnStat 记录不会自动接管，请在流量管理中重新安装"
 		}
 	}
 
-	if binaryPath, err := exec.LookPath("vnstat"); err == nil {
-		status.Installed = true
-		status.BinaryPath = firstNonEmpty(binaryPath, status.BinaryPath)
-		status.Running = isVnstatDaemonRunning()
-		if status.FileCount == 0 {
-			status.FileCount = len(collectVnstatPackageFilesByManager(status.PackageManager))
-		}
-		if status.InstallMethod == "" {
-			status.InstallMethod = normalizeVnstatInstallMethod("", status.PackageManager)
-		}
-		if status.InstallMethod == vnstatInstallMethodSystemPackage {
-			if version := detectInstalledVnstatPackageVersion(status.PackageManager); version != "" {
-				status.Version = version
+	if status.Managed {
+		binaryPath, binaryOK := managedVnstatBinaryPath(manifest)
+		if binaryOK {
+			status.Installed = true
+			status.BinaryPath = binaryPath
+			status.Running = isVnstatDaemonRunningForStatus(manifest)
+			if status.FileCount == 0 {
+				status.FileCount = len(safeVnstatFilePaths(collectVnstatPackageFilesByManager(status.PackageManager)))
 			}
-		}
-		if status.Version == "" {
-			if version := detectVnstatVersion(); version != "" {
-				status.Version = version
-			} else if hasManifest {
-				status.Version = strings.TrimSpace(manifest.Version)
+			if status.InstallMethod == vnstatInstallMethodSystemPackage {
+				if version := detectInstalledVnstatPackageVersion(status.PackageManager); version != "" {
+					status.Version = version
+				}
 			}
+			if status.Version == "" {
+				if version := detectVnstatVersionAt(binaryPath); version != "" {
+					status.Version = version
+				} else if hasManifest {
+					status.Version = strings.TrimSpace(manifest.Version)
+				}
+			}
+		} else if hasManifest {
+			status.Version = strings.TrimSpace(manifest.Version)
+			status.OwnershipHint = firstNonEmpty(status.OwnershipHint, "受管 vnstat 程序文件缺失，可删除以清理残留")
 		}
-	} else if hasManifest {
-		status.Version = strings.TrimSpace(manifest.Version)
+	}
+
+	if status.Managed {
+		status.RuntimeConflict = getVnstatRuntimeConflict()
 	}
 
 	return status
 }
 
+func populateVnstatPlatformStatus(status *VnstatPackageStatus) {
+	if status == nil {
+		return
+	}
+	platform, err := GetSystemPlatform()
+	if err != nil || platform == nil {
+		return
+	}
+	status.SystemFamily = strings.ToLower(strings.TrimSpace(platform.SystemFamily))
+	status.SystemID = strings.ToLower(strings.TrimSpace(platform.SystemID))
+	status.SystemVersion = strings.TrimSpace(platform.VersionID)
+}
+
+func getVnstatRuntimeConflict() *VnstatRuntimeConflict {
+	vnstatRuntimeConflictMu.RLock()
+	defer vnstatRuntimeConflictMu.RUnlock()
+	if vnstatRuntimeConflictCache.conflict == nil {
+		return nil
+	}
+	clone := *vnstatRuntimeConflictCache.conflict
+	clone.Paths = append([]string(nil), clone.Paths...)
+	clone.PIDs = append([]int(nil), clone.PIDs...)
+	clone.Units = append([]string(nil), clone.Units...)
+	return &clone
+}
+
+func clearVnstatRuntimeConflict() {
+	vnstatRuntimeConflictMu.Lock()
+	vnstatRuntimeConflictCache.conflict = nil
+	vnstatRuntimeConflictMu.Unlock()
+}
+
+func recordVnstatRuntimeConflict(installations []vnstatExternalInstallation) {
+	paths := externalPaths(installations)
+	pids := make([]int, 0)
+	for _, installation := range installations {
+		pids = append(pids, installation.PIDs...)
+	}
+	pids = uniqueSortedIntSlice(pids)
+	units := externalUnits(installations)
+	if len(paths) == 0 && len(pids) == 0 && len(units) == 0 {
+		clearVnstatRuntimeConflict()
+		return
+	}
+	vnstatRuntimeConflictMu.Lock()
+	vnstatRuntimeConflictCache.conflict = &VnstatRuntimeConflict{
+		Message:    "面板受管 vnStat 无法启动，检测到非面板 vnStat 正在运行，可能发生冲突。",
+		Paths:      paths,
+		PIDs:       pids,
+		Units:      units,
+		DetectedAt: time.Now().Unix(),
+	}
+	vnstatRuntimeConflictMu.Unlock()
+}
+
+func normalizeVnstatOwnership(value string, managed bool) string {
+	if managed && strings.EqualFold(strings.TrimSpace(value), vnstatOwnershipPanelInstalled) {
+		return vnstatOwnershipPanelInstalled
+	}
+	return ""
+}
+
+func isTrustedVnstatManifest(manifest trafficOverviewVnstatManifest) bool {
+	return validateVnstatOwnership(manifest).Trusted
+}
+
+func isPanelInstalledVnstatManifest(manifest trafficOverviewVnstatManifest) bool {
+	return manifest.Managed && strings.EqualFold(strings.TrimSpace(manifest.Ownership), vnstatOwnershipPanelInstalled)
+}
+
+func isVnstatManifestBaselineSafe(manifest trafficOverviewVnstatManifest) bool {
+	if !isPanelInstalledVnstatManifest(manifest) {
+		return false
+	}
+	if !isSafeVnstatCommandPath(manifest.BinaryPath) {
+		return false
+	}
+	requiredPrograms := map[string]bool{
+		normalizeVnstatPath("/usr/bin/vnstat"):   false,
+		normalizeVnstatPath("/usr/sbin/vnstatd"): false,
+	}
+	for _, path := range safeVnstatFilePaths(manifest.FilePaths) {
+		if _, required := requiredPrograms[normalizeVnstatPath(path)]; required {
+			requiredPrograms[normalizeVnstatPath(path)] = true
+		}
+	}
+	for _, present := range requiredPrograms {
+		if !present {
+			return false
+		}
+	}
+	if !sameVnstatDataPathInventory(manifest.DataPaths, defaultVnstatDataPaths()) {
+		return false
+	}
+	method := normalizeVnstatInstallMethod(manifest.InstallMethod, manifest.PackageManager)
+	return method == vnstatInstallMethodSystemPackage || method == vnstatInstallMethodGitHubRelease
+}
+
+func readVnstatHostFingerprint() (string, error) {
+	for _, path := range []string{"/etc/machine-id", "/var/lib/dbus/machine-id"} {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		machineID := strings.TrimSpace(string(content))
+		if machineID == "" {
+			continue
+		}
+		sum := sha256.Sum256([]byte(machineID))
+		return hex.EncodeToString(sum[:]), nil
+	}
+	return "", errors.New("unable to read linux machine-id for vnstat ownership evidence")
+}
+
+func newVnstatEvidenceNonce() (string, error) {
+	bytes := make([]byte, 32)
+	if _, err := io.ReadFull(vnstatRandomReader, bytes); err != nil {
+		return "", fmt.Errorf("generate vnstat ownership nonce failed: %w", err)
+	}
+	return hex.EncodeToString(bytes), nil
+}
+
+func hashVnstatEvidenceFile(path string) (string, error) {
+	if !isSafeVnstatResidualPath(path) || isSafeVnstatDataPath(path) {
+		return "", errors.New("refusing to hash an unsafe vnstat ownership file")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("vnstat ownership file must be a regular non-symlink file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	sum := sha256.New()
+	if _, err := io.Copy(sum, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(sum.Sum(nil)), nil
+}
+
+func buildVnstatOwnershipEvidence(manifest trafficOverviewVnstatManifest) (trafficOverviewVnstatOwnershipEvidence, error) {
+	if !isVnstatManifestBaselineSafe(manifest) {
+		return trafficOverviewVnstatOwnershipEvidence{}, errors.New("vnstat manifest is unsafe for ownership evidence")
+	}
+	hostFingerprint, err := vnstatHostFingerprintFn()
+	if err != nil {
+		return trafficOverviewVnstatOwnershipEvidence{}, err
+	}
+	if strings.TrimSpace(hostFingerprint) == "" {
+		return trafficOverviewVnstatOwnershipEvidence{}, errors.New("vnstat ownership host fingerprint is empty")
+	}
+	nonce := strings.TrimSpace(manifest.EvidenceNonce)
+	if nonce == "" {
+		nonce, err = newVnstatEvidenceNonce()
+		if err != nil {
+			return trafficOverviewVnstatOwnershipEvidence{}, err
+		}
+	}
+
+	files := make([]trafficOverviewVnstatEvidenceFile, 0, len(manifest.FilePaths))
+	for _, path := range safeVnstatFilePaths(manifest.FilePaths) {
+		if isSafeVnstatDataPath(path) {
+			continue
+		}
+		hash, hashErr := vnstatEvidenceFileHashFn(path)
+		if hashErr != nil {
+			return trafficOverviewVnstatOwnershipEvidence{}, fmt.Errorf("hash managed vnstat file %s failed: %w", path, hashErr)
+		}
+		files = append(files, trafficOverviewVnstatEvidenceFile{Path: normalizeVnstatPath(path), SHA256: hash})
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	if len(files) == 0 {
+		return trafficOverviewVnstatOwnershipEvidence{}, errors.New("vnstat ownership evidence requires a non-empty file inventory")
+	}
+	foundBinary := false
+	for _, file := range files {
+		if normalizeVnstatPath(file.Path) == normalizeVnstatPath(manifest.BinaryPath) {
+			foundBinary = true
+			break
+		}
+	}
+	if !foundBinary {
+		return trafficOverviewVnstatOwnershipEvidence{}, errors.New("vnstat ownership evidence does not contain the managed binary")
+	}
+
+	return trafficOverviewVnstatOwnershipEvidence{
+		Schema:          vnstatEvidenceSchema,
+		HostFingerprint: strings.TrimSpace(hostFingerprint),
+		Nonce:           nonce,
+		Ownership:       normalizeVnstatOwnership(manifest.Ownership, true),
+		InstallMethod:   normalizeVnstatInstallMethod(manifest.InstallMethod, manifest.PackageManager),
+		PackageManager:  strings.TrimSpace(strings.ToLower(manifest.PackageManager)),
+		BinaryPath:      normalizeVnstatPath(manifest.BinaryPath),
+		Files:           files,
+		DataPaths:       safeVnstatDataPaths(manifest.DataPaths),
+		ServiceUnits:    managedVnstatServiceUnits(manifest),
+		CreatedAt:       time.Now().Unix(),
+	}, nil
+}
+
+func readVnstatOwnershipEvidence() (trafficOverviewVnstatOwnershipEvidence, error) {
+	path := strings.TrimSpace(vnstatEvidencePathFn())
+	if path == "" {
+		return trafficOverviewVnstatOwnershipEvidence{}, errors.New("vnstat ownership evidence path is empty")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return trafficOverviewVnstatOwnershipEvidence{}, err
+	}
+	evidence := trafficOverviewVnstatOwnershipEvidence{}
+	if err := json.Unmarshal(raw, &evidence); err != nil {
+		return trafficOverviewVnstatOwnershipEvidence{}, fmt.Errorf("decode vnstat ownership evidence failed: %w", err)
+	}
+	return evidence, nil
+}
+
+func writeVnstatOwnershipEvidence(evidence trafficOverviewVnstatOwnershipEvidence) error {
+	path := strings.TrimSpace(vnstatEvidencePathFn())
+	if path == "" || !filepath.IsAbs(path) {
+		return errors.New("vnstat ownership evidence path is unsafe")
+	}
+	raw, err := json.Marshal(evidence)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), ".ownership-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	cleanup := func() {
+		_ = temp.Close()
+		_ = os.Remove(tempPath)
+	}
+	if err := temp.Chmod(0o600); err != nil {
+		cleanup()
+		return err
+	}
+	if _, err := temp.Write(raw); err != nil {
+		cleanup()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		_ = os.Remove(tempPath)
+		return err
+	}
+	return nil
+}
+
+func removeVnstatOwnershipEvidence() error {
+	path := strings.TrimSpace(vnstatEvidencePathFn())
+	if path == "" || !filepath.IsAbs(path) {
+		return errors.New("vnstat ownership evidence path is unsafe")
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func validateVnstatOwnership(manifest trafficOverviewVnstatManifest) vnstatOwnershipValidation {
+	if !isVnstatManifestBaselineSafe(manifest) {
+		return vnstatOwnershipValidation{Reason: "vnstat 清单不符合受管安全条件"}
+	}
+	if manifest.EvidenceSchema != vnstatEvidenceSchema || strings.TrimSpace(manifest.EvidenceNonce) == "" {
+		return vnstatOwnershipValidation{Reason: "vnstat 缺少本机受管凭据"}
+	}
+	evidence, err := readVnstatOwnershipEvidence()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return vnstatOwnershipValidation{Reason: "vnstat 本机受管凭据不存在"}
+		}
+		return vnstatOwnershipValidation{Reason: "无法读取 vnstat 本机受管凭据"}
+	}
+	if evidence.Schema != vnstatEvidenceSchema || strings.TrimSpace(evidence.Nonce) != strings.TrimSpace(manifest.EvidenceNonce) {
+		return vnstatOwnershipValidation{Reason: "vnstat 本机受管凭据与数据库记录不匹配"}
+	}
+	hostFingerprint, hostErr := vnstatHostFingerprintFn()
+	if hostErr != nil || strings.TrimSpace(hostFingerprint) == "" || strings.TrimSpace(evidence.HostFingerprint) != strings.TrimSpace(hostFingerprint) {
+		return vnstatOwnershipValidation{Reason: "vnstat 受管凭据不属于当前主机"}
+	}
+	if evidence.Ownership != normalizeVnstatOwnership(manifest.Ownership, true) ||
+		evidence.InstallMethod != normalizeVnstatInstallMethod(manifest.InstallMethod, manifest.PackageManager) ||
+		evidence.PackageManager != strings.TrimSpace(strings.ToLower(manifest.PackageManager)) ||
+		normalizeVnstatPath(evidence.BinaryPath) != normalizeVnstatPath(manifest.BinaryPath) {
+		return vnstatOwnershipValidation{Reason: "vnstat 受管凭据内容不匹配"}
+	}
+	if len(evidence.Files) == 0 {
+		return vnstatOwnershipValidation{Reason: "vnstat 受管凭据缺少文件清单"}
+	}
+	if !sameVnstatOwnershipInventory(manifest.FilePaths, evidence.Files) {
+		return vnstatOwnershipValidation{Reason: "vnstat 数据库文件清单与本机受管凭据不匹配"}
+	}
+	if !sameVnstatDataPathInventory(manifest.DataPaths, evidence.DataPaths) {
+		return vnstatOwnershipValidation{Reason: "vnstat 数据目录清单与本机受管凭据不匹配"}
+	}
+	if !sameManagedVnstatServiceUnitInventory(manifest.ServiceUnits, evidence.ServiceUnits) {
+		return vnstatOwnershipValidation{Reason: "vnstat 服务清单与本机受管凭据不匹配"}
+	}
+	foundBinary := false
+	for _, file := range evidence.Files {
+		path := normalizeVnstatPath(file.Path)
+		if !isSafeVnstatResidualPath(path) || isSafeVnstatDataPath(path) || strings.TrimSpace(file.SHA256) == "" {
+			return vnstatOwnershipValidation{Reason: "vnstat 受管凭据包含不安全文件"}
+		}
+		if path == normalizeVnstatPath(manifest.BinaryPath) {
+			foundBinary = true
+		}
+		present, presentErr := vnstatEvidenceFilePresentFn(path)
+		if presentErr != nil {
+			return vnstatOwnershipValidation{Reason: "无法核验 vnstat 受管文件"}
+		}
+		if !present {
+			// Missing files are allowed only as managed residuals. The caller may
+			// still use the evidence to clean the remaining exact paths.
+			continue
+		}
+		hash, hashErr := vnstatEvidenceFileHashFn(path)
+		if hashErr != nil || hash != file.SHA256 {
+			return vnstatOwnershipValidation{Reason: "vnstat 受管文件已变化，已停止接管"}
+		}
+	}
+	if !foundBinary {
+		return vnstatOwnershipValidation{Reason: "vnstat 受管凭据缺少程序文件"}
+	}
+	return vnstatOwnershipValidation{Trusted: true}
+}
+
+func vnstatEvidenceFilePresent(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// sameVnstatOwnershipInventory makes the database manifest a projection of
+// the immutable evidence marker. Without this comparison, a modified database
+// record could add another otherwise-allowed path to the deletion list.
+func sameVnstatOwnershipInventory(manifestPaths []string, evidenceFiles []trafficOverviewVnstatEvidenceFile) bool {
+	manifestSet := make(map[string]struct{})
+	for _, path := range safeVnstatFilePaths(manifestPaths) {
+		if isSafeVnstatDataPath(path) {
+			continue
+		}
+		manifestSet[normalizeVnstatPath(path)] = struct{}{}
+	}
+	evidenceSet := make(map[string]struct{})
+	for _, file := range evidenceFiles {
+		path := normalizeVnstatPath(file.Path)
+		if !isSafeVnstatResidualPath(path) || isSafeVnstatDataPath(path) {
+			return false
+		}
+		evidenceSet[path] = struct{}{}
+	}
+	if len(manifestSet) != len(evidenceSet) {
+		return false
+	}
+	for path := range manifestSet {
+		if _, ok := evidenceSet[path]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func sameVnstatDataPathInventory(manifestPaths []string, evidencePaths []string) bool {
+	manifestSafe := safeVnstatDataPaths(manifestPaths)
+	evidenceSafe := safeVnstatDataPaths(evidencePaths)
+	if !stringSliceEqual(normalizeAbsolutePathList(manifestPaths), manifestSafe) ||
+		!stringSliceEqual(normalizeAbsolutePathList(evidencePaths), evidenceSafe) {
+		return false
+	}
+	return stringSliceEqual(manifestSafe, evidenceSafe)
+}
+
+func sameManagedVnstatServiceUnitInventory(manifestUnits []string, evidenceUnits []string) bool {
+	manifestAll := normalizeVnstatServiceUnitList(manifestUnits)
+	evidenceAll := normalizeVnstatServiceUnitList(evidenceUnits)
+	manifestManaged := managedVnstatServiceUnits(trafficOverviewVnstatManifest{ServiceUnits: manifestUnits})
+	evidenceManaged := managedVnstatServiceUnits(trafficOverviewVnstatManifest{ServiceUnits: evidenceUnits})
+	if !stringSliceEqual(manifestAll, manifestManaged) || !stringSliceEqual(evidenceAll, evidenceManaged) {
+		return false
+	}
+	return stringSliceEqual(manifestManaged, evidenceManaged)
+}
+
+func stringSliceEqual(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *TrafficOverviewService) GetVnstatVersionOptions() (*VnstatVersionListResult, error) {
 	title := "系统软件源"
 	description := "使用当前系统的软件包管理器安装或重装 vnstat"
-	if manager := detectVnstatPackageManagerPlan(); manager != nil {
+	manager := detectVnstatPackageManagerPlan()
+	canManage, manageHint := vnstatManagementSupport()
+	systemAvailable := canManage && manager != nil
+	systemReason := ""
+	if manager != nil {
 		description = fmt.Sprintf("通过 %s 安装或重装 vnstat", manager.Name)
 	}
-	if canManage, manageHint := vnstatManagementSupport(); !canManage {
+	if !canManage {
 		description = manageHint
+		systemReason = manageHint
+	} else if manager == nil {
+		systemReason = "未识别到当前系统可用的软件包管理器"
+		description = systemReason
+	}
+	githubAvailable := canManage
+	githubReason := ""
+	if !githubAvailable {
+		githubReason = manageHint
 	}
 	return &VnstatVersionListResult{
 		Versions: []VnstatVersionOption{
@@ -681,11 +1278,15 @@ func (s *TrafficOverviewService) GetVnstatVersionOptions() (*VnstatVersionListRe
 				Value:       vnstatInstallMethodSystemPackage,
 				Title:       title,
 				Description: description,
+				Available:   systemAvailable,
+				Reason:      systemReason,
 			},
 			{
 				Value:       vnstatInstallMethodGitHubRelease,
 				Title:       "GitHub 官方源码包",
 				Description: "从 GitHub 官方 release 源码包编译安装或重装 vnstat",
+				Available:   githubAvailable,
+				Reason:      githubReason,
 			},
 		},
 	}, nil
@@ -741,8 +1342,130 @@ func (s *TrafficOverviewService) GetVnstatUpdateInfo(source string) (*VnstatVers
 	return result, nil
 }
 
+// StartManagedVnstatInstall starts (or returns) the current asynchronous
+// install task. A repeated request for the same source is deliberately
+// idempotent so a dropped browser response cannot create competing installs.
+func (s *TrafficOverviewService) StartManagedVnstatInstall(source string) (VnstatInstallJobStatus, error) {
+	selectedSource := normalizeRequestedVnstatSource(source)
+	if selectedSource == "" {
+		return VnstatInstallJobStatus{}, errors.New("请先选择来源")
+	}
+
+	vnstatInstallJobMu.Lock()
+	defer vnstatInstallJobMu.Unlock()
+	if current := vnstatInstallJobState; current != nil && current.status.State == "running" {
+		if current.status.Source != selectedSource {
+			return VnstatInstallJobStatus{}, fmt.Errorf("已有 vnstat 安装任务正在运行（当前来源：%s）", describeVnstatInstallMethod(current.status.Source, ""))
+		}
+		return cloneVnstatInstallJobStatus(current.status), nil
+	}
+
+	jobID, err := newVnstatEvidenceNonce()
+	if err != nil {
+		return VnstatInstallJobStatus{}, err
+	}
+	operationContext, operation, err := BeginKworManagedOperation("vnstat-install")
+	if err != nil {
+		return VnstatInstallJobStatus{}, err
+	}
+	job := &vnstatInstallJob{status: VnstatInstallJobStatus{
+		ID:        jobID,
+		Source:    selectedSource,
+		State:     "running",
+		Phase:     "正在准备 vnStat 安装任务",
+		StartedAt: time.Now().Unix(),
+	}, ctx: operationContext, operation: operation}
+	vnstatInstallJobState = job
+	go s.runManagedVnstatInstallJob(jobID, selectedSource, operationContext, operation)
+	return cloneVnstatInstallJobStatus(job.status), nil
+}
+
+// GetManagedVnstatInstallJob returns the latest task. Supplying an ID avoids
+// accidentally attaching a browser tab to a newer task after a page reload.
+func (s *TrafficOverviewService) GetManagedVnstatInstallJob(jobID string) VnstatInstallJobStatus {
+	vnstatInstallJobMu.Lock()
+	defer vnstatInstallJobMu.Unlock()
+	if vnstatInstallJobState == nil || (strings.TrimSpace(jobID) != "" && vnstatInstallJobState.status.ID != strings.TrimSpace(jobID)) {
+		return VnstatInstallJobStatus{State: "idle"}
+	}
+	return cloneVnstatInstallJobStatus(vnstatInstallJobState.status)
+}
+
+func (s *TrafficOverviewService) runManagedVnstatInstallJob(jobID string, source string, ctx context.Context, operation *KworManagedOperationHandle) {
+	if operation != nil {
+		defer operation.Done()
+	}
+	overview, err := vnstatManagedInstallRunner(ctx, s, source, func(phase string) {
+		s.updateManagedVnstatInstallJob(jobID, phase)
+	})
+
+	vnstatInstallJobMu.Lock()
+	defer vnstatInstallJobMu.Unlock()
+	if vnstatInstallJobState == nil || vnstatInstallJobState.status.ID != jobID {
+		return
+	}
+	status := &vnstatInstallJobState.status
+	status.FinishedAt = time.Now().Unix()
+	if err != nil {
+		status.State = "failed"
+		status.Phase = "vnStat 安装失败"
+		status.Error = strings.TrimSpace(err.Error())
+		return
+	}
+	if overview == nil {
+		status.State = "failed"
+		status.Phase = "vnStat 安装失败"
+		status.Error = "安装完成后未能读取 vnStat 状态"
+		return
+	}
+	status.State = "succeeded"
+	status.Phase = "vnStat 安装完成"
+	status.Error = ""
+}
+
+func (s *TrafficOverviewService) updateManagedVnstatInstallJob(jobID string, phase string) {
+	phase = strings.TrimSpace(phase)
+	if phase == "" {
+		return
+	}
+	vnstatInstallJobMu.Lock()
+	defer vnstatInstallJobMu.Unlock()
+	if vnstatInstallJobState == nil || vnstatInstallJobState.status.ID != jobID || vnstatInstallJobState.status.State != "running" {
+		return
+	}
+	vnstatInstallJobState.status.Phase = phase
+}
+
+func isManagedVnstatInstallRunning() bool {
+	vnstatInstallJobMu.Lock()
+	defer vnstatInstallJobMu.Unlock()
+	return vnstatInstallJobState != nil && vnstatInstallJobState.status.State == "running"
+}
+
+func cloneVnstatInstallJobStatus(status VnstatInstallJobStatus) VnstatInstallJobStatus {
+	return status
+}
+
+func reportVnstatInstallProgress(report vnstatInstallProgressReporter, phase string) {
+	if report != nil {
+		report(phase)
+	}
+}
+
 func (s *TrafficOverviewService) InstallManagedVnstat(source string) (*TrafficOverview, error) {
-	if runtime.GOOS != "linux" {
+	return s.installManagedVnstat(source, nil)
+}
+
+func (s *TrafficOverviewService) installManagedVnstat(source string, report vnstatInstallProgressReporter) (*TrafficOverview, error) {
+	return s.installManagedVnstatWithContext(context.Background(), source, report)
+}
+
+func (s *TrafficOverviewService) installManagedVnstatWithContext(ctx context.Context, source string, report vnstatInstallProgressReporter) (*TrafficOverview, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	reportVnstatInstallProgress(report, "正在验证 vnStat 安装环境")
+	if !IsSystemPlatformLinux() {
 		return nil, errors.New("vnstat is supported on linux only")
 	}
 	if canManage, manageHint := vnstatManagementSupport(); !canManage {
@@ -754,9 +1477,13 @@ func (s *TrafficOverviewService) InstallManagedVnstat(source string) (*TrafficOv
 	}
 
 	manager := detectVnstatPackageManagerPlan()
+	if selectedSource == vnstatInstallMethodSystemPackage && manager == nil {
+		return nil, errors.New("未识别到当前系统的软件包管理器，无法通过系统软件源安装 vnstat")
+	}
 	manifest, hasManifest := s.loadVnstatManifest()
-	if binaryPath, lookErr := exec.LookPath("vnstat"); lookErr == nil {
-		currentMethod := detectInstalledVnstatInstallMethod(manifest, hasManifest, manager, binaryPath)
+	managed := hasManifest && isTrustedVnstatManifest(manifest)
+	if managed {
+		currentMethod := detectInstalledVnstatInstallMethod(manifest, true, manager, manifest.BinaryPath)
 		if currentMethod != "" && currentMethod != selectedSource {
 			return nil, fmt.Errorf(
 				"当前 vnstat 安装方式为%s；如需切换到%s，请先删除 vnstat 后再重新安装",
@@ -767,25 +1494,55 @@ func (s *TrafficOverviewService) InstallManagedVnstat(source string) (*TrafficOv
 		if currentMethod == "" {
 			return nil, errors.New("检测到现有 vnstat 安装来源不明确；请先删除 vnstat 后再按所选来源重新安装")
 		}
-		if os.Geteuid() != 0 {
-			if selectedSource == vnstatInstallMethodSystemPackage && manager != nil && len(manager.InstallPlan) > 0 {
-				return nil, fmt.Errorf("vnstat reinstall/update requires root. install it manually: %s", strings.Join(manager.InstallPlan[len(manager.InstallPlan)-1], " "))
-			}
-			return nil, errors.New("vnstat reinstall/update requires root")
-		}
-	} else if os.Geteuid() != 0 {
+	}
+	if vnstatCurrentEUIDFn() != 0 {
 		if selectedSource == vnstatInstallMethodSystemPackage && manager != nil && len(manager.InstallPlan) > 0 {
 			return nil, fmt.Errorf("vnstat install requires root. install it manually: %s", strings.Join(manager.InstallPlan[len(manager.InstallPlan)-1], " "))
 		}
 		return nil, errors.New("vnstat install requires root")
 	}
+	// External vnStat inspection happens only for this explicit install action.
+	// It considers running daemons only; non-panel files outside the fixed
+	// panel paths are never removed.
+	external := vnstatDiscoverRunningExternalFn(manifest, managed)
+	if len(external) > 0 {
+		reportVnstatInstallProgress(report, "正在停止并核验已发现的 vnStat")
+		if err := vnstatStopRunningExternalFn(external); err != nil {
+			return nil, err
+		}
+	}
+	if !managed && shouldPrepareVnstatPanelPathForInstall(manager, selectedSource, external) {
+		reportVnstatInstallProgress(report, "正在释放面板默认 vnStat 路径")
+		if err := prepareUnmanagedStandardVnstatForPanelInstall(manager); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := BeginVnstatHostOwnership(vnstatOwnershipCandidatePaths(), nil, map[string]string{
+		"installMethod":  selectedSource,
+		"packageManager": packageManagerName(manager),
+		"packageName":    vnstatPackageName,
+		"ownership":      vnstatOwnershipPanelInstalled,
+	}); err != nil {
+		return nil, fmt.Errorf("record pending vnstat ownership: %w", err)
+	}
 
-	manifest, err := s.installManagedVnstatFromSource(manager, selectedSource)
+	manifest, err := s.installManagedVnstatFromSourceWithContext(ctx, manager, selectedSource, report)
 	if err != nil {
 		return nil, err
 	}
+	reportVnstatInstallProgress(report, "正在写入本机受管凭据")
 	if err := s.saveVnstatManifest(manifest); err != nil {
 		return nil, err
+	}
+	ownedPaths := append([]string{manifest.BinaryPath, strings.TrimSpace(vnstatEvidencePathFn())}, manifest.FilePaths...)
+	ownedPaths = append(ownedPaths, manifest.DataPaths...)
+	if err := RegisterVnstatHostOwnership(ownedPaths, manifest.ServiceUnits, map[string]string{
+		"installMethod":  manifest.InstallMethod,
+		"packageManager": manifest.PackageManager,
+		"packageName":    manifest.PackageName,
+		"ownership":      manifest.Ownership,
+	}); err != nil {
+		return nil, fmt.Errorf("record managed vnstat ownership: %w", err)
 	}
 	if err := (&SettingService{}).setString(trafficOverviewEnabledKey, "true"); err != nil {
 		return nil, err
@@ -795,152 +1552,303 @@ func (s *TrafficOverviewService) InstallManagedVnstat(source string) (*TrafficOv
 	}
 
 	if iface, detectErr := detectDefaultTrafficInterface(); detectErr == nil && iface != "" {
+		reportVnstatInstallProgress(report, "正在配置 vnStat 流量网卡")
 		if trackErr := ensureVnstatTracking(iface); trackErr != nil {
 			logger.Warning("ensure vnstat tracking after install failed:", trackErr)
 		}
 	}
-	if daemonErr := ensureVnstatDaemonRunning(); daemonErr != nil {
-		logger.Warning("ensure vnstat daemon after install failed:", daemonErr)
+	reportVnstatInstallProgress(report, "正在启动 vnStat 服务")
+	if daemonErr := restartVnstatDaemonForManifest(manifest); daemonErr != nil {
+		logger.Warning("restart vnstat daemon after install failed:", daemonErr)
+		recordVnstatRuntimeConflict(vnstatDiscoverRunningExternalFn(manifest, true))
+	} else {
+		clearVnstatRuntimeConflict()
 	}
 
+	reportVnstatInstallProgress(report, "正在刷新 vnStat 状态")
 	return s.GetTrafficOverview()
 }
 
-func (s *TrafficOverviewService) RemoveManagedVnstat() (*TrafficOverview, error) {
-	if runtime.GOOS != "linux" {
-		return nil, errors.New("vnstat is supported on linux only")
+func vnstatOwnershipCandidatePaths() []string {
+	paths := make([]string, 0, len(vnstatStandardProgramPaths)+len(vnstatStandardConfigAndUnitPaths)+len(vnstatStandardManPagePaths)+len(defaultVnstatDataPaths())+1)
+	paths = append(paths, vnstatStandardProgramPaths...)
+	paths = append(paths, vnstatStandardConfigAndUnitPaths...)
+	paths = append(paths, vnstatStandardManPagePaths...)
+	paths = append(paths, defaultVnstatDataPaths()...)
+	paths = append(paths, strings.TrimSpace(vnstatEvidencePathFn()))
+	return normalizeAbsolutePathList(paths)
+}
+
+func shouldPrepareVnstatPanelPathForInstall(manager *vnstatPackageManagerPlan, source string, installations []vnstatExternalInstallation) bool {
+	for _, installation := range installations {
+		if isPanelDefaultVnstatRuntimePath(installation.DaemonPath) {
+			return true
+		}
+	}
+	// GitHub source installation writes the panel's fixed /usr paths. Release
+	// package ownership first so it never overwrites files still owned by the
+	// distribution package manager.
+	return normalizeRequestedVnstatSource(source) == vnstatInstallMethodGitHubRelease &&
+		manager != nil && packageOwnsStandardVnstatBinary(collectVnstatPackageFilesByManager(manager.Name))
+}
+
+type managedVnstatRemovalPlan struct {
+	manifest      trafficOverviewVnstatManifest
+	installMethod string
+	installed     bool
+	manager       *vnstatPackageManagerPlan
+}
+
+// prepareManagedVnstatRemoval accepts only a panel-installed manifest whose
+// database inventory, local credential, host fingerprint, and current file
+// hashes all agree. A historical or externally-created vnStat never reaches
+// the destructive phase.
+func (s *TrafficOverviewService) prepareManagedVnstatRemoval() (managedVnstatRemovalPlan, error) {
+	if vnstatRuntimeGOOS() != "linux" {
+		return managedVnstatRemovalPlan{}, errors.New("vnstat is supported on linux only")
 	}
 	if canManage, manageHint := vnstatManagementSupport(); !canManage {
-		return nil, errors.New(manageHint)
+		return managedVnstatRemovalPlan{}, errors.New(manageHint)
 	}
+	return s.prepareManagedVnstatRemovalWithManager(managedVnstatPackageManager)
+}
 
+// prepareManagedVnstatRemovalForUninstall deliberately avoids the database
+// platform snapshot. The panel database is allowed to be damaged or removed
+// while uninstalling, so only the actual runtime and the signed local
+// ownership evidence may authorize host cleanup.
+func (s *TrafficOverviewService) prepareManagedVnstatRemovalForUninstall() (managedVnstatRemovalPlan, error) {
+	if vnstatRuntimeGOOS() != "linux" {
+		return managedVnstatRemovalPlan{}, errors.New("vnstat is supported on linux only")
+	}
+	return s.prepareManagedVnstatRemovalWithManager(managedVnstatPackageManagerForUninstall)
+}
+
+func (s *TrafficOverviewService) prepareManagedVnstatRemovalWithManager(resolveManager func(trafficOverviewVnstatManifest) (*vnstatPackageManagerPlan, bool)) (managedVnstatRemovalPlan, error) {
 	manifest, hasManifest := s.loadVnstatManifest()
-	manager := detectVnstatPackageManagerPlan()
-	if hasManifest && strings.TrimSpace(manifest.PackageManager) != "" {
-		if detected := managerByName(manifest.PackageManager); detected != nil {
-			manager = detected
+	if !hasManifest || !isTrustedVnstatManifest(manifest) {
+		return managedVnstatRemovalPlan{}, errors.New("未检测到可安全删除的面板受管 vnstat")
+	}
+	if vnstatCurrentEUIDFn() != 0 {
+		return managedVnstatRemovalPlan{}, errors.New("removing vnstat requires root")
+	}
+
+	plan := managedVnstatRemovalPlan{
+		manifest:      manifest,
+		installMethod: normalizeVnstatInstallMethod(manifest.InstallMethod, manifest.PackageManager),
+	}
+	_, plan.installed = managedVnstatBinaryPath(manifest)
+	if plan.installMethod == vnstatInstallMethodSystemPackage {
+		manager, ok := resolveManager(manifest)
+		if ok {
+			plan.manager = manager
+		} else if plan.installed {
+			return managedVnstatRemovalPlan{}, errors.New("vnstat 系统软件包归属无法验证，已拒绝卸载以保护系统文件")
 		}
 	}
-	installMethod := normalizeVnstatInstallMethod(manifest.InstallMethod, manifest.PackageManager)
+	return plan, nil
+}
 
-	installed := false
-	if _, err := exec.LookPath("vnstat"); err == nil {
-		installed = true
-	}
-	if installed && os.Geteuid() != 0 {
-		return nil, errors.New("removing vnstat requires root")
-	}
-
-	if err := s.SetTrafficOverviewEnabled(false); err != nil {
-		return nil, err
-	}
-	stopVnstatDaemon()
-
-	if installed && installMethod != vnstatInstallMethodGitHubRelease {
-		if manager == nil {
-			return nil, errors.New("vnstat is installed, but no supported linux package manager was found for removal")
-		}
-		for _, command := range manager.RemovePlan {
+func removeManagedVnstatArtifacts(plan managedVnstatRemovalPlan) error {
+	if plan.manager != nil {
+		for _, command := range plan.manager.RemovePlan {
 			if err := runInstallCommand(command); err != nil {
-				return nil, err
+				return err
 			}
 		}
 	}
+	return vnstatRemoveTrackedDataFn(plan.manifest)
+}
 
-	if err := removeVnstatTrackedData(manifest); err != nil {
-		return nil, err
-	}
+// disableTrafficOverviewForVnstatRemoval deliberately skips the normal pause
+// snapshot. The daemon has already been confirmed stopped and all associated
+// overview state is removed immediately afterwards.
+func (s *TrafficOverviewService) disableTrafficOverviewForVnstatRemoval() error {
+	return (&SettingService{}).setString(trafficOverviewEnabledKey, "false")
+}
+
+func (s *TrafficOverviewService) finishManagedVnstatRemoval() error {
 	if systemctlPath, err := exec.LookPath("systemctl"); err == nil {
-		_ = exec.Command(systemctlPath, "daemon-reload").Run()
-		_ = exec.Command(systemctlPath, "reset-failed").Run()
+		_ = runCommandWithTimeout(systemCommandTimeout, systemctlPath, "daemon-reload")
+		_ = runCommandWithTimeout(systemCommandTimeout, systemctlPath, "reset-failed")
 	}
 	if err := s.clearVnstatManagedState(); err != nil {
-		return nil, err
+		return err
 	}
-	if err := cleanupTrafficCapRules(); err != nil {
+	if err := RemoveHostResource("vnstat-managed-runtime"); err != nil {
+		return fmt.Errorf("clear vnstat host ownership: %w", err)
+	}
+	clearVnstatRuntimeConflict()
+	if err := vnstatCleanupTrafficCapFn(); err != nil {
 		logger.Warning("cleanup traffic cap after vnstat removal failed:", err)
 	}
+	return nil
+}
 
+func (s *TrafficOverviewService) RemoveManagedVnstat() (*TrafficOverview, error) {
+	if isManagedVnstatInstallRunning() {
+		return nil, errors.New("vnstat 安装任务正在运行，请等待完成后再删除")
+	}
+	plan, err := s.prepareManagedVnstatRemoval()
+	if err != nil {
+		return nil, err
+	}
+	if err := vnstatStopForDeleteFn(plan.manifest); err != nil {
+		return nil, fmt.Errorf("停止并确认 vnstat 已退出失败，已取消删除：%w", err)
+	}
+	if err := s.disableTrafficOverviewForVnstatRemoval(); err != nil {
+		return nil, err
+	}
+	if err := removeManagedVnstatArtifacts(plan); err != nil {
+		return nil, err
+	}
+	if err := s.finishManagedVnstatRemoval(); err != nil {
+		return nil, err
+	}
 	return s.GetTrafficOverview()
 }
 
 func (s *TrafficOverviewService) RemoveManagedVnstatForUninstall() error {
-	if runtime.GOOS != "linux" {
+	if isManagedVnstatInstallRunning() {
+		return errors.New("vnstat 安装任务正在运行，请等待完成后再卸载面板")
+	}
+	if vnstatRuntimeGOOS() != "linux" {
+		cleanupTrafficCapAfterSkippedVnstatUninstall()
 		return nil
 	}
-	if database.GetDB() == nil {
-		return removeVnstatWithoutDatabase()
+	if runningInsideContainer() {
+		cleanupTrafficCapAfterSkippedVnstatUninstall()
+		return nil
 	}
-	_, err := s.RemoveManagedVnstat()
-	return err
+
+	// A missing, historical, or tampered manifest is intentionally not an
+	// error for the overall panel uninstall. It is not authorization to delete
+	// host vnStat files, so only panel firewall state is cleaned up.
+	manifest, hasManifest := s.loadVnstatManifest()
+	if !hasManifest || !isTrustedVnstatManifest(manifest) {
+		cleanupTrafficCapAfterSkippedVnstatUninstall()
+		return nil
+	}
+	plan, err := s.prepareManagedVnstatRemovalForUninstall()
+	if err != nil {
+		return err
+	}
+	if err := vnstatStopForUninstallFn(plan.manifest); err != nil {
+		return fmt.Errorf("停止并确认受管 vnstat 已退出失败，已取消面板 vnstat 清理：%w", err)
+	}
+	if err := s.disableTrafficOverviewForVnstatRemoval(); err != nil {
+		return err
+	}
+	if err := removeManagedVnstatArtifacts(plan); err != nil {
+		return err
+	}
+	return s.finishManagedVnstatRemoval()
 }
 
-func removeVnstatWithoutDatabase() error {
-	manifest := trafficOverviewVnstatManifest{
-		Managed:      true,
-		PackageName:  vnstatPackageName,
-		DataPaths:    defaultVnstatDataPaths(),
-		ServiceUnits: []string{"vnstat", "vnstatd"},
+func cleanupTrafficCapAfterSkippedVnstatUninstall() {
+	if err := vnstatCleanupTrafficCapFn(); err != nil {
+		logger.Warning("cleanup traffic cap while skipping unmanaged vnstat uninstall failed:", err)
 	}
-	manager := detectVnstatPackageManagerPlan()
-	if binaryPath, err := exec.LookPath("vnstat"); err == nil {
-		manifest.BinaryPath = binaryPath
-		if manager != nil {
-			manifest.PackageManager = manager.Name
-			manifest.InstallMethod = vnstatInstallMethodSystemPackage
-			manifest.FilePaths = collectVnstatPackageFilesByManager(manager.Name)
-		}
-	}
-	manifest.FilePaths = appendDetectedVnstatManagedPaths(manifest.FilePaths)
+}
 
-	stopVnstatDaemon()
-	if manifest.BinaryPath != "" && os.Geteuid() == 0 && manager != nil {
+func prepareUnmanagedStandardVnstatForPanelInstall(manager *vnstatPackageManagerPlan) error {
+	if manager == nil {
+		return nil
+	}
+	if packageFiles := collectVnstatPackageFilesByManager(manager.Name); packageOwnsStandardVnstatBinary(packageFiles) {
 		for _, command := range manager.RemovePlan {
 			if err := runInstallCommand(command); err != nil {
 				return err
 			}
 		}
 	}
-	if err := removeVnstatTrackedData(manifest); err != nil {
-		return err
-	}
-	if systemctlPath, err := exec.LookPath("systemctl"); err == nil {
-		_ = exec.Command(systemctlPath, "daemon-reload").Run()
-		_ = exec.Command(systemctlPath, "reset-failed").Run()
-	}
-	return cleanupTrafficCapRules()
+	// Do not delete any untracked file or data directory here. The selected
+	// install source owns its fixed output paths and will overwrite only what
+	// it installs; external installations in other directories are preserved.
+	return nil
 }
 
-func (s *TrafficOverviewService) installManagedVnstatFromSource(manager *vnstatPackageManagerPlan, source string) (trafficOverviewVnstatManifest, error) {
+func managedVnstatPackageManager(manifest trafficOverviewVnstatManifest) (*vnstatPackageManagerPlan, bool) {
+	manager := detectVnstatPackageManagerPlan()
+	if manager == nil {
+		return nil, false
+	}
+	if configured := strings.ToLower(strings.TrimSpace(manifest.PackageManager)); configured != "" && configured != manager.Name {
+		return nil, false
+	}
+	if !packageOwnsStandardVnstatBinary(collectVnstatPackageFilesByManager(manager.Name)) {
+		return nil, false
+	}
+	return manager, true
+}
+
+// managedVnstatPackageManagerForUninstall verifies the manager named by the
+// trusted ownership manifest instead of rediscovering the platform from the
+// panel database. It still requires both the executable and ownership of the
+// standard vnStat binary before a package removal is allowed.
+func managedVnstatPackageManagerForUninstall(manifest trafficOverviewVnstatManifest) (*vnstatPackageManagerPlan, bool) {
+	manager := managerByName(manifest.PackageManager)
+	if manager == nil {
+		return nil, false
+	}
+	if _, err := exec.LookPath(manager.Name); err != nil {
+		return nil, false
+	}
+	if !packageOwnsStandardVnstatBinary(collectVnstatPackageFilesByManager(manager.Name)) {
+		return nil, false
+	}
+	return manager, true
+}
+
+func packageOwnsStandardVnstatBinary(paths []string) bool {
+	for _, path := range paths {
+		if isSafeVnstatCommandPath(path) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *TrafficOverviewService) installManagedVnstatFromSource(manager *vnstatPackageManagerPlan, source string, report vnstatInstallProgressReporter) (trafficOverviewVnstatManifest, error) {
+	return s.installManagedVnstatFromSourceWithContext(context.Background(), manager, source, report)
+}
+
+func (s *TrafficOverviewService) installManagedVnstatFromSourceWithContext(ctx context.Context, manager *vnstatPackageManagerPlan, source string, report vnstatInstallProgressReporter) (trafficOverviewVnstatManifest, error) {
 	switch normalizeRequestedVnstatSource(source) {
 	case vnstatInstallMethodSystemPackage:
-		return s.installVnstatViaSystemPackage(manager)
+		return s.installVnstatViaSystemPackageWithContext(ctx, manager, report)
 	case vnstatInstallMethodGitHubRelease:
-		return s.installVnstatViaGitHubRelease(manager)
+		return s.installVnstatViaGitHubReleaseWithContext(ctx, manager, report)
 	default:
 		return trafficOverviewVnstatManifest{}, errors.New("请先选择来源")
 	}
 }
 
-func (s *TrafficOverviewService) installVnstatViaSystemPackage(manager *vnstatPackageManagerPlan) (trafficOverviewVnstatManifest, error) {
+func (s *TrafficOverviewService) installVnstatViaSystemPackage(manager *vnstatPackageManagerPlan, report vnstatInstallProgressReporter) (trafficOverviewVnstatManifest, error) {
+	return s.installVnstatViaSystemPackageWithContext(context.Background(), manager, report)
+}
+
+func (s *TrafficOverviewService) installVnstatViaSystemPackageWithContext(ctx context.Context, manager *vnstatPackageManagerPlan, report vnstatInstallProgressReporter) (trafficOverviewVnstatManifest, error) {
 	if manager == nil {
 		return trafficOverviewVnstatManifest{}, errors.New("no supported linux package manager was found")
 	}
+	reportVnstatInstallProgress(report, "正在通过系统软件源安装 vnStat")
 	for _, command := range manager.InstallPlan {
-		if err := runInstallCommand(command); err != nil {
+		if err := runInstallCommandContext(ctx, command); err != nil {
 			return trafficOverviewVnstatManifest{}, err
 		}
 	}
 
-	binaryPath, err := exec.LookPath("vnstat")
-	if err != nil {
-		return trafficOverviewVnstatManifest{}, fmt.Errorf("vnstat package install completed but binary is still missing: %w", err)
+	binaryPath, binaryFound := findStandardVnstatBinaryPath()
+	if !binaryFound {
+		return trafficOverviewVnstatManifest{}, errors.New("vnstat package install completed but the standard binary /usr/bin/vnstat is missing")
 	}
 
 	filePaths := appendDetectedVnstatManagedPaths(collectVnstatPackageFilesByManager(manager.Name))
-	version := firstNonEmpty(detectInstalledVnstatPackageVersion(manager.Name), detectVnstatVersion())
+	version := firstNonEmpty(detectInstalledVnstatPackageVersion(manager.Name), detectVnstatVersionAt(binaryPath))
 	return trafficOverviewVnstatManifest{
 		Managed:        true,
+		Ownership:      vnstatOwnershipPanelInstalled,
 		SystemFamily:   firstNonEmpty(detectLinuxSystemFamily(), manager.SystemFamily),
 		PackageManager: manager.Name,
 		InstallMethod:  vnstatInstallMethodSystemPackage,
@@ -954,11 +1862,16 @@ func (s *TrafficOverviewService) installVnstatViaSystemPackage(manager *vnstatPa
 	}, nil
 }
 
-func (s *TrafficOverviewService) installVnstatViaGitHubRelease(manager *vnstatPackageManagerPlan) (trafficOverviewVnstatManifest, error) {
+func (s *TrafficOverviewService) installVnstatViaGitHubRelease(manager *vnstatPackageManagerPlan, report vnstatInstallProgressReporter) (trafficOverviewVnstatManifest, error) {
+	return s.installVnstatViaGitHubReleaseWithContext(context.Background(), manager, report)
+}
+
+func (s *TrafficOverviewService) installVnstatViaGitHubReleaseWithContext(ctx context.Context, manager *vnstatPackageManagerPlan, report vnstatInstallProgressReporter) (trafficOverviewVnstatManifest, error) {
 	var buildDepsErr error
 	if manager != nil {
+		reportVnstatInstallProgress(report, "正在安装 GitHub 源码构建依赖")
 		for _, command := range manager.BuildDepsPlan {
-			if err := runInstallCommand(command); err != nil {
+			if err := runInstallCommandContext(ctx, command); err != nil {
 				buildDepsErr = fmt.Errorf("install build dependencies failed: %w", err)
 				logger.Warning(buildDepsErr)
 				break
@@ -966,7 +1879,8 @@ func (s *TrafficOverviewService) installVnstatViaGitHubRelease(manager *vnstatPa
 		}
 	}
 
-	release, err := fetchLatestVnstatRelease()
+	reportVnstatInstallProgress(report, "正在查询 GitHub 官方 vnStat 版本")
+	release, err := fetchLatestVnstatReleaseContext(ctx)
 	if err != nil {
 		return trafficOverviewVnstatManifest{}, err
 	}
@@ -982,21 +1896,25 @@ func (s *TrafficOverviewService) installVnstatViaGitHubRelease(manager *vnstatPa
 	defer os.RemoveAll(workDir)
 
 	archivePath := filepath.Join(workDir, asset.Name)
-	if err := downloadFileWithUserAgent(asset.BrowserDownloadURL, archivePath, 10*time.Minute); err != nil {
+	reportVnstatInstallProgress(report, "正在下载 GitHub 官方 vnStat 源码")
+	if err := downloadFileWithUserAgentContext(ctx, asset.BrowserDownloadURL, archivePath, 10*time.Minute); err != nil {
 		return trafficOverviewVnstatManifest{}, fmt.Errorf("download GitHub release asset failed: %w", err)
 	}
 
+	reportVnstatInstallProgress(report, "正在解压 vnStat 源码")
 	sourceDir, err := extractVnstatSourceArchive(archivePath, workDir)
 	if err != nil {
 		return trafficOverviewVnstatManifest{}, fmt.Errorf("extract vnstat source archive failed: %w", err)
 	}
-	if _, err := runCommandInDir(sourceDir, 5*time.Minute, "./configure", "--prefix=/usr", "--sysconfdir=/etc"); err != nil {
+	reportVnstatInstallProgress(report, "正在配置 vnStat 源码")
+	if _, err := runCommandInDirContext(ctx, sourceDir, 5*time.Minute, "./configure", "--prefix=/usr", "--sysconfdir=/etc"); err != nil {
 		if buildDepsErr != nil {
 			return trafficOverviewVnstatManifest{}, fmt.Errorf("%w; %v", err, buildDepsErr)
 		}
 		return trafficOverviewVnstatManifest{}, fmt.Errorf("configure vnstat source failed: %w", err)
 	}
-	if _, err := runCommandInDir(sourceDir, 10*time.Minute, "make"); err != nil {
+	reportVnstatInstallProgress(report, "正在编译 vnStat 源码")
+	if _, err := runCommandInDirContext(ctx, sourceDir, 10*time.Minute, "make"); err != nil {
 		if buildDepsErr != nil {
 			return trafficOverviewVnstatManifest{}, fmt.Errorf("%w; %v", err, buildDepsErr)
 		}
@@ -1004,40 +1922,50 @@ func (s *TrafficOverviewService) installVnstatViaGitHubRelease(manager *vnstatPa
 	}
 
 	stageDir := filepath.Join(workDir, "stage")
-	managedPaths := []string{}
-	if _, err := runCommandInDir(sourceDir, 5*time.Minute, "make", "install", "DESTDIR="+stageDir); err == nil {
-		managedPaths = collectManagedSourceVnstatPaths(stageDir)
-	} else {
-		logger.Warning("stage vnstat source install for manifest collection failed:", err)
+	reportVnstatInstallProgress(report, "正在核验源码阶段安装文件")
+	if _, err := runCommandInDirContext(ctx, sourceDir, 5*time.Minute, "make", "install", "DESTDIR="+stageDir); err != nil {
+		return trafficOverviewVnstatManifest{}, fmt.Errorf("stage vnstat source install for ownership inventory failed: %w", err)
+	}
+	managedPaths := collectManagedSourceVnstatPaths(stageDir)
+	if err := validateManagedSourceVnstatPaths(managedPaths); err != nil {
+		return trafficOverviewVnstatManifest{}, err
 	}
 
-	if _, err := runCommandInDir(sourceDir, 5*time.Minute, "make", "install"); err != nil {
+	reportVnstatInstallProgress(report, "正在安装 vnStat 到面板默认路径")
+	if _, err := runCommandInDirContext(ctx, sourceDir, 5*time.Minute, "make", "install"); err != nil {
 		return trafficOverviewVnstatManifest{}, fmt.Errorf("install vnstat source failed: %w", err)
 	}
 
-	if unitPath, unitErr := installVnstatSystemdUnit(sourceDir); unitErr == nil && unitPath != "" {
+	serviceUnits := []string{}
+	reportVnstatInstallProgress(report, "正在创建面板专属 vnStat 服务")
+	if unitPath, unitErr := installVnstatSystemdUnitContext(ctx, sourceDir); unitErr == nil && unitPath != "" {
 		managedPaths = append(managedPaths, unitPath)
+		serviceUnits = append(serviceUnits, vnstatPanelSystemdUnit)
 	} else if unitErr != nil {
-		logger.Warning("install vnstat systemd unit failed:", unitErr)
+		return trafficOverviewVnstatManifest{}, fmt.Errorf("install panel vnstat systemd unit failed: %w", unitErr)
 	}
 
-	binaryPath, err := exec.LookPath("vnstat")
-	if err != nil {
-		return trafficOverviewVnstatManifest{}, fmt.Errorf("vnstat GitHub install completed but binary is still missing: %w", err)
+	binaryPath, binaryFound := findStandardVnstatBinaryPath()
+	if !binaryFound {
+		return trafficOverviewVnstatManifest{}, errors.New("vnstat GitHub install completed but the standard binary /usr/bin/vnstat is missing")
 	}
 
 	managedPaths = appendDetectedVnstatManagedPaths(managedPaths)
+	if err := validateManagedSourceVnstatPaths(managedPaths); err != nil {
+		return trafficOverviewVnstatManifest{}, err
+	}
 	return trafficOverviewVnstatManifest{
 		Managed:        true,
+		Ownership:      vnstatOwnershipPanelInstalled,
 		SystemFamily:   firstNonEmpty(detectLinuxSystemFamily(), systemFamilyFromManager(manager)),
 		PackageManager: packageManagerName(manager),
 		InstallMethod:  vnstatInstallMethodGitHubRelease,
 		PackageName:    vnstatPackageName,
-		Version:        firstNonEmpty(detectVnstatVersion(), strings.TrimPrefix(strings.TrimSpace(release.TagName), "v")),
+		Version:        firstNonEmpty(detectVnstatVersionAt(binaryPath), strings.TrimPrefix(strings.TrimSpace(release.TagName), "v")),
 		BinaryPath:     binaryPath,
 		FilePaths:      managedPaths,
 		DataPaths:      defaultVnstatDataPaths(),
-		ServiceUnits:   []string{"vnstat", "vnstatd"},
+		ServiceUnits:   serviceUnits,
 		InstalledAt:    time.Now().Unix(),
 	}, nil
 }
@@ -1070,18 +1998,15 @@ func systemFamilyFromManager(manager *vnstatPackageManagerPlan) string {
 }
 
 func appendDetectedVnstatManagedPaths(paths []string) []string {
-	if binaryPath, err := exec.LookPath("vnstat"); err == nil {
-		paths = append(paths, binaryPath)
-	}
-	if daemonPath, err := exec.LookPath("vnstatd"); err == nil {
-		paths = append(paths, daemonPath)
-	}
-	for _, candidate := range []string{"/usr/bin/vnstati", "/etc/vnstat.conf", vnstatSystemdUnitPath} {
-		if _, err := os.Stat(candidate); err == nil {
-			paths = append(paths, candidate)
+	managed := make([]string, 0, len(paths))
+	for _, candidate := range safeVnstatFilePaths(paths) {
+		info, err := os.Lstat(candidate)
+		if err != nil || info.IsDir() {
+			continue
 		}
+		managed = append(managed, candidate)
 	}
-	return normalizeAbsolutePathList(paths)
+	return normalizeAbsolutePathList(managed)
 }
 
 func normalizeVnstatInstallMethod(method string, packageManager string) string {
@@ -1142,8 +2067,12 @@ func detectInstalledVnstatInstallMethod(manifest trafficOverviewVnstatManifest, 
 }
 
 func fetchLatestVnstatRelease() (GitHubRelease, error) {
+	return fetchLatestVnstatReleaseContext(context.Background())
+}
+
+func fetchLatestVnstatReleaseContext(ctx context.Context) (GitHubRelease, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequest("GET", vnstatGitHubLatestReleaseAPI, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", vnstatGitHubLatestReleaseAPI, nil)
 	if err != nil {
 		return GitHubRelease{}, err
 	}
@@ -1160,7 +2089,7 @@ func fetchLatestVnstatRelease() (GitHubRelease, error) {
 	}
 
 	release := GitHubRelease{}
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	if err := unmarshalBoundedHTTPResponseJSON(resp.Body, coreGitHubResponseMaxBytes, &release); err != nil {
 		return GitHubRelease{}, err
 	}
 	return release, nil
@@ -1177,8 +2106,12 @@ func selectVnstatReleaseSourceAsset(release GitHubRelease) (GitHubAsset, error) 
 }
 
 func downloadFileWithUserAgent(url string, destPath string, timeout time.Duration) error {
+	return downloadFileWithUserAgentContext(context.Background(), url, destPath, timeout)
+}
+
+func downloadFileWithUserAgentContext(ctx context.Context, url string, destPath string, timeout time.Duration) error {
 	client := &http.Client{Timeout: timeout}
-	req, err := http.NewRequest("GET", strings.TrimSpace(url), nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", strings.TrimSpace(url), nil)
 	if err != nil {
 		return err
 	}
@@ -1286,18 +2219,20 @@ func extractVnstatSourceArchive(archivePath string, workDir string) (string, err
 }
 
 func runCommandInDir(dir string, timeout time.Duration, name string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+	return runCommandInDirContext(context.Background(), dir, timeout, name, args...)
+}
 
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Dir = dir
-	output, err := cmd.CombinedOutput()
+func runCommandInDirContext(parent context.Context, dir string, timeout time.Duration, name string, args ...string) (string, error) {
+	output, err, timedOut := runManagedCommandOutputContext(parent, dir, timeout, name, args...)
 	text := strings.TrimSpace(string(output))
-	if ctx.Err() == context.DeadlineExceeded {
+	if timedOut {
 		if text == "" {
 			return "", fmt.Errorf("%s timed out", name)
 		}
 		return text, fmt.Errorf("%s timed out: %s", name, text)
+	}
+	if errors.Is(parent.Err(), context.Canceled) {
+		return text, fmt.Errorf("%s canceled: %w", name, parent.Err())
 	}
 	if err != nil {
 		if text == "" {
@@ -1306,6 +2241,31 @@ func runCommandInDir(dir string, timeout time.Duration, name string, args ...str
 		return text, fmt.Errorf("%s failed: %w: %s", name, err, text)
 	}
 	return text, nil
+}
+
+func runManagedCommandOutputContext(parent context.Context, dir string, timeout time.Duration, name string, args ...string) ([]byte, error, bool) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	PrepareKworManagedCommandContext(parent, cmd)
+	if err := cmd.Start(); err != nil {
+		return output.Bytes(), err, false
+	}
+	if err := TrackKworManagedCommandContext(parent, cmd); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return output.Bytes(), fmt.Errorf("record command process: %w", err), false
+	}
+	err := cmd.Wait()
+	return output.Bytes(), err, errors.Is(ctx.Err(), context.DeadlineExceeded)
 }
 
 func collectManagedSourceVnstatPaths(stageRoot string) []string {
@@ -1333,16 +2293,28 @@ func collectManagedSourceVnstatPaths(stageRoot string) []string {
 }
 
 func isManagedSourceVnstatPath(path string) bool {
-	switch filepath.ToSlash(filepath.Clean(strings.TrimSpace(path))) {
-	case "/usr/bin/vnstat", "/usr/sbin/vnstatd", "/usr/bin/vnstati", "/etc/vnstat.conf":
-		return true
-	default:
-		return false
+	return !isSafeVnstatDataPath(path) && isSafeVnstatResidualPath(path)
+}
+
+func validateManagedSourceVnstatPaths(paths []string) error {
+	available := make(map[string]struct{}, len(paths))
+	for _, path := range safeVnstatFilePaths(paths) {
+		available[normalizeVnstatPath(path)] = struct{}{}
 	}
+	for _, required := range []string{"/usr/bin/vnstat", "/usr/sbin/vnstatd", "/etc/vnstat.conf"} {
+		if _, ok := available[normalizeVnstatPath(required)]; !ok {
+			return fmt.Errorf("vnstat source ownership inventory is incomplete: missing %s", required)
+		}
+	}
+	return nil
 }
 
 func installVnstatSystemdUnit(sourceDir string) (string, error) {
-	if runtime.GOOS != "linux" {
+	return installVnstatSystemdUnitContext(context.Background(), sourceDir)
+}
+
+func installVnstatSystemdUnitContext(ctx context.Context, sourceDir string) (string, error) {
+	if vnstatRuntimeGOOS() != "linux" {
 		return "", nil
 	}
 	systemctlPath, err := exec.LookPath("systemctl")
@@ -1350,22 +2322,30 @@ func installVnstatSystemdUnit(sourceDir string) (string, error) {
 		return "", nil
 	}
 
-	unitContent, readErr := os.ReadFile(filepath.Join(sourceDir, "examples", "systemd", "simple", "vnstat.service"))
-	if readErr != nil {
-		unitContent = []byte("[Unit]\nDescription=vnStat network traffic monitor\nDocumentation=man:vnstatd(8) man:vnstat(1) man:vnstat.conf(5)\nAfter=network.target\n\n[Service]\nExecStart=/usr/sbin/vnstatd --nodaemon\nExecReload=/bin/kill -HUP $MAINPID\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\nAlias=vnstatd.service\n")
+	_ = sourceDir // Keep the source directory in the signature for install-call context.
+	ownership, err := BeginSystemdHostOwnership("vnstat-systemd", vnstatPanelSystemdUnit, []string{vnstatSystemdUnitPath}, nil)
+	if err != nil {
+		return "", fmt.Errorf("record pending vnstat systemd ownership: %w", err)
 	}
+	unitContent := []byte("# kwor-owner:v1 resource=vnstat-systemd\n[Unit]\nDescription=kwor managed vnStat network traffic monitor\nDocumentation=man:vnstatd(8) man:vnstat(1) man:vnstat.conf(5)\nAfter=network.target\n\n[Service]\nExecStart=/usr/sbin/vnstatd --nodaemon\nExecReload=/bin/kill -HUP $MAINPID\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n")
 	if err := os.WriteFile(vnstatSystemdUnitPath, unitContent, 0o644); err != nil {
 		return "", err
 	}
-	output, err := exec.Command(systemctlPath, "daemon-reload").CombinedOutput()
+	output, err, timedOut := runManagedCommandOutputContext(ctx, "", systemCommandTimeout, systemctlPath, "daemon-reload")
+	if timedOut {
+		return "", fmt.Errorf("systemctl daemon-reload timed out")
+	}
 	if err != nil {
 		return "", fmt.Errorf("systemctl daemon-reload failed: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	if err := VerifyAndActivateHostResource(ownership.ID); err != nil {
+		return "", fmt.Errorf("activate vnstat systemd ownership: %w", err)
 	}
 	return vnstatSystemdUnitPath, nil
 }
 
 func (s *TrafficOverviewService) ResetAllTrafficOverviewStats() error {
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return nil
 	}
 	if enabled, err := s.isOverviewEnabled(); err != nil {
@@ -1392,7 +2372,7 @@ func (s *TrafficOverviewService) ResetAllTrafficOverviewStats() error {
 		return cfgErr
 	}
 
-	now := time.Now().In(s.getOverviewLocation())
+	now := PanelNow()
 	trafficOverviewStateMu.Lock()
 	state, stateErr := s.loadRuntimeState()
 	if stateErr != nil {
@@ -1447,7 +2427,7 @@ func (s *TrafficOverviewService) ResetAllTrafficOverviewStats() error {
 }
 
 func (s *TrafficOverviewService) ResetPeriodTrafficOverviewStats() error {
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return nil
 	}
 	if enabled, err := s.isOverviewEnabled(); err != nil {
@@ -1474,7 +2454,7 @@ func (s *TrafficOverviewService) ResetPeriodTrafficOverviewStats() error {
 		return cfgErr
 	}
 
-	now := time.Now().In(s.getOverviewLocation())
+	now := PanelNow()
 	trafficOverviewStateMu.Lock()
 	state, stateErr := s.loadRuntimeState()
 	if stateErr != nil {
@@ -1529,7 +2509,7 @@ func (s *TrafficOverviewService) ResetPeriodTrafficOverviewStats() error {
 }
 
 func (s *TrafficOverviewService) ResetTotalTrafficOverviewStats() error {
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return nil
 	}
 	if enabled, err := s.isOverviewEnabled(); err != nil {
@@ -1551,7 +2531,7 @@ func (s *TrafficOverviewService) ResetTotalTrafficOverviewStats() error {
 		return err
 	}
 
-	now := time.Now().In(s.getOverviewLocation())
+	now := PanelNow()
 	trafficOverviewStateMu.Lock()
 	state, stateErr := s.loadRuntimeState()
 	if stateErr != nil {
@@ -1604,7 +2584,7 @@ func (s *TrafficOverviewService) ResetTotalTrafficOverviewStats() error {
 }
 
 func (s *TrafficOverviewService) EnsureRuntimeReady() error {
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return nil
 	}
 	if enabled, err := s.isOverviewEnabled(); err != nil {
@@ -1612,8 +2592,15 @@ func (s *TrafficOverviewService) EnsureRuntimeReady() error {
 	} else if !enabled {
 		return nil
 	}
-	if _, err := exec.LookPath("vnstat"); err != nil {
+	if _, ok := loadTrustedVnstatManifest(); !ok {
 		return nil
+	}
+	// Do not inspect any external process while the panel-owned daemon is
+	// healthy. A collision is meaningful only when the panel daemon itself
+	// cannot be started.
+	if err := ensureVnstatDaemonRunning(); err != nil {
+		logger.Warning("initial vnstat daemon ensure failed:", err)
+		return err
 	}
 
 	iface, err := detectDefaultTrafficInterface()
@@ -1626,9 +2613,6 @@ func (s *TrafficOverviewService) EnsureRuntimeReady() error {
 
 	if err := ensureVnstatTracking(iface); err != nil {
 		return err
-	}
-	if err := ensureVnstatDaemonRunning(); err != nil {
-		logger.Warning("initial vnstat daemon ensure failed:", err)
 	}
 	if err := s.ReconcileTrafficCap(); err != nil {
 		logger.Warning("initial traffic cap reconcile failed:", err)
@@ -1678,7 +2662,7 @@ func (s *TrafficOverviewService) CleanupTrafficCapOnShutdown() error {
 }
 
 func (s *TrafficOverviewService) reconcileTrafficCapFromOverview(overview *TrafficOverview) error {
-	if runtime.GOOS != "linux" || !nftSupported() {
+	if !IsSystemPlatformLinux() || !nftSupported() {
 		return nil
 	}
 
@@ -1693,7 +2677,7 @@ func (s *TrafficOverviewService) reconcileTrafficCapFromOverview(overview *Traff
 		if err == nil {
 			limitGiB = normalizeLimitGiB(loadedLimitGiB)
 			if overview == nil {
-				expired = isTrafficOverviewExpired(expiryBoundary, time.Now().In(s.getOverviewLocation()))
+				expired = isTrafficOverviewExpired(expiryBoundary, PanelNow())
 			}
 		}
 	}
@@ -1717,12 +2701,7 @@ func (s *TrafficOverviewService) reconcileTrafficCapFromOverview(overview *Traff
 	limitReached := evaluateTrafficOverviewCapReached(
 		state.LimitReached,
 		limitGiB,
-		func() int64 {
-			if overview == nil {
-				return 0
-			}
-			return overview.AccumTotal
-		}(),
+		trafficCapUsageBytes(overview),
 		func() bool {
 			if overview == nil {
 				return false
@@ -2128,7 +3107,7 @@ func absInt64(value int64) int64 {
 func (s *TrafficOverviewService) getOverviewLocation() *time.Location {
 	loc, err := (&SettingService{}).GetTimeLocation()
 	if err != nil || loc == nil {
-		return time.Local
+		return time.UTC
 	}
 	return loc
 }
@@ -2256,7 +3235,7 @@ func parseTrafficOverviewExpiryDate(value string, loc *time.Location) (string, t
 		return "", time.Time{}, nil
 	}
 	if loc == nil {
-		loc = time.Local
+		loc = time.UTC
 	}
 	parsed, err := time.ParseInLocation("2006-01-02", normalized, loc)
 	if err != nil {
@@ -2270,7 +3249,7 @@ func isTrafficOverviewExpired(boundary time.Time, now time.Time) bool {
 		return false
 	}
 	if now.IsZero() {
-		now = time.Now()
+		now = PanelNow()
 	}
 	if now.Location() != boundary.Location() {
 		now = now.In(boundary.Location())
@@ -2312,7 +3291,17 @@ func limitGiBToBytes(limitGiB float64) int64 {
 	return int64(total)
 }
 
-func evaluateTrafficOverviewCapReached(previous bool, limitGiB float64, accumTotal int64, available bool, errText string, expired bool, hasOverview bool) bool {
+// trafficCapUsageBytes returns the current billing-period usage. Historical
+// accumulated traffic is intentionally independent from the monthly reset and
+// must not cause a new period to remain capped.
+func trafficCapUsageBytes(overview *TrafficOverview) int64 {
+	if overview == nil {
+		return 0
+	}
+	return maxInt64(overview.Total, 0)
+}
+
+func evaluateTrafficOverviewCapReached(previous bool, limitGiB float64, periodTotal int64, available bool, errText string, expired bool, hasOverview bool) bool {
 	if expired {
 		return true
 	}
@@ -2322,7 +3311,7 @@ func evaluateTrafficOverviewCapReached(previous bool, limitGiB float64, accumTot
 		return false
 	}
 	if hasOverview && available && strings.TrimSpace(errText) == "" {
-		return accumTotal >= limitGiBToBytes(normalizedLimitGiB)
+		return periodTotal >= limitGiBToBytes(normalizedLimitGiB)
 	}
 	return previous
 }
@@ -2348,7 +3337,7 @@ func resolveTrafficCapAllowedPorts() []int {
 }
 
 func detectSSHPorts() []int {
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return []int{22}
 	}
 	ports := parseSSHPortsFromConfig(detectSSHConfigMainPath())
@@ -2466,7 +3455,7 @@ func expandSSHIncludePattern(pattern string, basePath string) []string {
 }
 
 func applyTrafficCapRules(allowedPorts []int) error {
-	if runtime.GOOS != "linux" || !nftSupported() {
+	if !IsSystemPlatformLinux() || !nftSupported() {
 		return nil
 	}
 
@@ -2503,14 +3492,14 @@ func applyTrafficCapRules(allowedPorts []int) error {
 }
 
 func cleanupTrafficCapRules() error {
-	if runtime.GOOS != "linux" || !nftSupported() {
+	if !IsSystemPlatformLinux() || !nftSupported() {
 		return nil
 	}
 	return deleteRulesByCommentPrefix(trafficCapNftRuleComments.prefix)
 }
 
 func hasTrafficCapRules() bool {
-	if runtime.GOOS != "linux" || !nftSupported() || !nftTableExists() {
+	if !IsSystemPlatformLinux() || !nftSupported() || !nftTableExists() {
 		return false
 	}
 	inHandle := findHandleByComment(nftChainIn, trafficCapNftRuleComments.in(trafficCapTagDropExcept))
@@ -2647,20 +3636,75 @@ func ensureVnstatTracking(iface string) error {
 }
 
 func ensureVnstatAvailable() error {
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return nil
 	}
 
-	if _, err := exec.LookPath("vnstat"); err == nil {
-		return nil
+	manifest, hasManifest := (&TrafficOverviewService{}).loadVnstatManifest()
+	if hasManifest {
+		if _, ok := managedVnstatBinaryPath(manifest); ok {
+			return nil
+		}
 	}
 
-	return errors.New("vnstat is not installed")
+	return errors.New("vnstat is not installed or is not managed by the panel")
+}
+
+func loadTrustedVnstatManifest() (trafficOverviewVnstatManifest, bool) {
+	manifest, ok := (&TrafficOverviewService{}).loadVnstatManifest()
+	if !ok || !isTrustedVnstatManifest(manifest) {
+		return trafficOverviewVnstatManifest{}, false
+	}
+	if _, ok := managedVnstatBinaryPath(manifest); !ok {
+		return trafficOverviewVnstatManifest{}, false
+	}
+	return manifest, true
+}
+
+func runVnstatCommand(args ...string) (string, error) {
+	manifest, ok := loadTrustedVnstatManifest()
+	if !ok {
+		return "", errors.New("vnstat is not installed or is not managed by the panel")
+	}
+	binaryPath, ok := managedVnstatBinaryPath(manifest)
+	if !ok {
+		return "", errors.New("managed vnstat binary is unavailable")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, binaryPath, args...)
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", ctx.Err()
+	}
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return strings.TrimSpace(string(output)), nil
 }
 
 func detectVnstatPackageManagerPlan() *vnstatPackageManagerPlan {
+	return selectVnstatPackageManagerPlan(detectLinuxSystemFamily(), func(name string) bool {
+		_, err := exec.LookPath(name)
+		return err == nil
+	})
+}
+
+// selectVnstatPackageManagerPlan only considers package managers belonging to
+// the platform family captured at panel startup. It must not infer a different
+// distribution from whichever command happens to appear in PATH.
+func selectVnstatPackageManagerPlan(systemFamily string, commandAvailable func(string) bool) *vnstatPackageManagerPlan {
+	systemFamily = strings.ToLower(strings.TrimSpace(systemFamily))
+	if systemFamily == "" || commandAvailable == nil {
+		return nil
+	}
 	for _, candidate := range vnstatPackageManagerPlans() {
-		if _, err := exec.LookPath(candidate.Name); err == nil {
+		if !strings.EqualFold(candidate.SystemFamily, systemFamily) {
+			continue
+		}
+		if commandAvailable(candidate.Name) {
 			plan := candidate
 			return &plan
 		}
@@ -2752,17 +3796,20 @@ func vnstatPackageManagerPlans() []vnstatPackageManagerPlan {
 }
 
 func runInstallCommand(command []string) error {
+	return runInstallCommandContext(context.Background(), command)
+}
+
+func runInstallCommandContext(parent context.Context, command []string) error {
 	if len(command) == 0 {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
+	output, err, timedOut := runManagedCommandOutputContext(parent, "", 2*time.Minute, command[0], command[1:]...)
+	if timedOut {
 		return fmt.Errorf("install command timed out: %s", strings.Join(command, " "))
+	}
+	if errors.Is(parent.Err(), context.Canceled) {
+		return fmt.Errorf("install command canceled: %s: %w", strings.Join(command, " "), parent.Err())
 	}
 	if err != nil {
 		return fmt.Errorf("install command failed (%s): %w: %s", strings.Join(command, " "), err, strings.TrimSpace(string(output)))
@@ -2996,11 +4043,15 @@ func detectInstalledVnstatPackageVersion(managerName string) string {
 	return ""
 }
 
-func detectVnstatVersion() string {
-	if _, err := exec.LookPath("vnstat"); err != nil {
+func detectVnstatVersionAt(binaryPath string) string {
+	binaryPath = normalizeVnstatPath(binaryPath)
+	if !isSafeVnstatCommandPath(binaryPath) {
 		return ""
 	}
-	output, err := runCommandOutput([]string{"vnstat", "--version"}, 4*time.Second)
+	if info, err := os.Lstat(binaryPath); err != nil || info.IsDir() {
+		return ""
+	}
+	output, err := runCommandOutput([]string{binaryPath, "--version"}, 4*time.Second)
 	if err != nil {
 		return ""
 	}
@@ -3202,88 +4253,667 @@ func looksLikeDottedVersion(value string) bool {
 }
 
 func isVnstatDaemonRunning() bool {
-	if runtime.GOOS != "linux" {
+	manifest, ok := loadTrustedVnstatManifest()
+	return ok && isVnstatDaemonRunningForManifest(manifest)
+}
+
+func isVnstatDaemonRunningForManifest(manifest trafficOverviewVnstatManifest) bool {
+	if !IsSystemPlatformLinux() || !isTrustedVnstatManifest(manifest) {
 		return false
 	}
 	if systemctlPath, err := exec.LookPath("systemctl"); err == nil {
-		for _, unit := range []string{"vnstat", "vnstatd"} {
-			if exec.Command(systemctlPath, "is-active", "--quiet", unit).Run() == nil {
+		for _, service := range verifiedVnstatServices(manifest, systemctlPath) {
+			if service.Systemd && runCommandWithTimeout(shortSystemCommandTimeout, systemctlPath, "is-active", "--quiet", service.Name) == nil {
 				return true
 			}
 		}
 	}
-	if pgrepPath, err := exec.LookPath("pgrep"); err == nil {
-		for _, name := range []string{"vnstatd", "vnstat"} {
-			if exec.Command(pgrepPath, "-x", name).Run() == nil {
-				return true
-			}
+	return isManagedVnstatDaemonProcessRunning(manifest)
+}
+
+// isVnstatDaemonRunningForStatus avoids /proc so the traffic-page polling
+// endpoint never performs process discovery. Runtime start/stop paths still
+// use the exact PID check when they need to prove daemon termination.
+func isVnstatDaemonRunningForStatus(manifest trafficOverviewVnstatManifest) bool {
+	if !IsSystemPlatformLinux() || !isTrustedVnstatManifest(manifest) {
+		return false
+	}
+	systemctlPath, err := exec.LookPath("systemctl")
+	if err != nil {
+		return false
+	}
+	for _, service := range verifiedVnstatServices(manifest, systemctlPath) {
+		if service.Systemd && runCommandWithTimeout(shortSystemCommandTimeout, systemctlPath, "is-active", "--quiet", service.Name) == nil {
+			return true
 		}
 	}
 	return false
 }
 
-func stopVnstatDaemon() {
-	if runtime.GOOS != "linux" {
-		return
+func isManagedVnstatDaemonProcessRunning(manifest trafficOverviewVnstatManifest) bool {
+	return len(managedVnstatDaemonPIDs(manifest)) > 0
+}
+
+func stopVnstatDaemon() error {
+	manifest, ok := loadTrustedVnstatManifest()
+	if !ok {
+		return nil
 	}
-	if systemctlPath, err := exec.LookPath("systemctl"); err == nil {
-		for _, unit := range []string{"vnstat", "vnstatd"} {
-			_ = exec.Command(systemctlPath, "stop", unit).Run()
-			_ = exec.Command(systemctlPath, "disable", unit).Run()
+	return stopVnstatDaemonForManifest(manifest)
+}
+
+// stopVnstatDaemonForManifest stops and disables only service registrations
+// that are verified to execute the exact managed daemon binary. It returns an
+// error until every matching process has exited; callers must never delete
+// files after a failed stop.
+func stopVnstatDaemonForManifest(manifest trafficOverviewVnstatManifest) error {
+	if !IsSystemPlatformLinux() || !isTrustedVnstatManifest(manifest) {
+		return errors.New("managed vnstat daemon is unavailable")
+	}
+	return stopVnstatDaemonWithOptions(manifest, true)
+}
+
+// stopVnstatDaemonForUninstall uses runtime.GOOS through vnstatRuntimeGOOS
+// rather than the database platform snapshot. A deleted or stale database
+// must never let a panel-owned daemon survive the panel uninstall.
+func stopVnstatDaemonForUninstall(manifest trafficOverviewVnstatManifest) error {
+	if vnstatRuntimeGOOS() != "linux" || !isTrustedVnstatManifest(manifest) {
+		return errors.New("managed vnstat daemon is unavailable")
+	}
+	return stopVnstatDaemonWithOptions(manifest, true)
+}
+
+func stopVnstatDaemonForRestart(manifest trafficOverviewVnstatManifest) error {
+	if !IsSystemPlatformLinux() || !isTrustedVnstatManifest(manifest) {
+		return errors.New("managed vnstat daemon is unavailable")
+	}
+	return stopVnstatDaemonWithOptions(manifest, false)
+}
+
+func stopVnstatDaemonWithOptions(manifest trafficOverviewVnstatManifest, disableAutostart bool) error {
+	pids := managedVnstatDaemonPIDs(manifest)
+	systemctlPath := ""
+	if path, err := exec.LookPath("systemctl"); err == nil {
+		systemctlPath = path
+	}
+	verified := verifiedVnstatServices(manifest, systemctlPath)
+	if systemctlPath != "" {
+		for _, service := range verified {
+			if !service.Systemd {
+				continue
+			}
+			if err := runCommandWithTimeout(systemCommandTimeout, systemctlPath, "stop", service.Name); err != nil {
+				return fmt.Errorf("stop managed vnstat systemd unit %s failed: %w", service.Name, err)
+			}
+			if disableAutostart {
+				if err := runCommandWithTimeout(systemCommandTimeout, systemctlPath, "disable", service.Name); err != nil {
+					return fmt.Errorf("disable managed vnstat systemd unit %s failed: %w", service.Name, err)
+				}
+			}
 		}
-		_ = exec.Command(systemctlPath, "daemon-reload").Run()
-		_ = exec.Command(systemctlPath, "reset-failed").Run()
-	}
-	if servicePath, err := exec.LookPath("service"); err == nil {
-		for _, unit := range []string{"vnstat", "vnstatd"} {
-			_ = exec.Command(servicePath, unit, "stop").Run()
+		if len(verified) > 0 {
+			if err := runCommandWithTimeout(systemCommandTimeout, systemctlPath, "daemon-reload"); err != nil {
+				return fmt.Errorf("reload systemd after stopping managed vnstat failed: %w", err)
+			}
+			_ = runCommandWithTimeout(systemCommandTimeout, systemctlPath, "reset-failed")
 		}
 	}
-	if pkillPath, err := exec.LookPath("pkill"); err == nil {
-		for _, name := range []string{"vnstatd", "vnstat"} {
-			_ = exec.Command(pkillPath, "-x", name).Run()
+	servicePath := ""
+	if path, err := exec.LookPath("service"); err == nil {
+		servicePath = path
+	}
+	for _, service := range verified {
+		if service.Systemd {
+			continue
+		}
+		if servicePath != "" {
+			if err := runCommandWithTimeout(systemCommandTimeout, servicePath, service.Name, "stop"); err != nil {
+				return fmt.Errorf("stop managed vnstat service %s failed: %w", service.Name, err)
+			}
+		} else if err := runCommandWithTimeout(systemCommandTimeout, filepath.Join("/etc/init.d", service.Name), "stop"); err != nil {
+			return fmt.Errorf("stop managed vnstat service %s failed: %w", service.Name, err)
+		}
+		if disableAutostart {
+			if err := disableVerifiedSysVService(service.Name); err != nil {
+				return fmt.Errorf("disable managed vnstat SysV autostart %s failed: %w", service.Name, err)
+			}
 		}
 	}
+	if err := terminateVnstatPIDs(pids); err != nil {
+		return err
+	}
+	if remaining := managedVnstatDaemonPIDs(manifest); len(remaining) > 0 {
+		return fmt.Errorf("managed vnstat daemon is still running: %v", remaining)
+	}
+	return nil
 }
 
 func ensureVnstatDaemonRunning() error {
-	if runtime.GOOS != "linux" {
+	if !IsSystemPlatformLinux() {
 		return nil
 	}
-	if _, err := exec.LookPath("vnstat"); err != nil {
+	manifest, ok := loadTrustedVnstatManifest()
+	if !ok {
 		return nil
 	}
-	if isVnstatDaemonRunning() {
+	if isVnstatDaemonRunningForManifest(manifest) {
+		clearVnstatRuntimeConflict()
 		return nil
 	}
-	return restartVnstatDaemon()
+	if err := restartVnstatDaemonForManifest(manifest); err != nil {
+		recordVnstatRuntimeConflict(vnstatDiscoverRunningExternalFn(manifest, true))
+		return err
+	}
+	clearVnstatRuntimeConflict()
+	return nil
 }
 
 func restartVnstatDaemon() error {
-	if runtime.GOOS != "linux" {
+	manifest, ok := loadTrustedVnstatManifest()
+	if !ok {
 		return nil
 	}
-	if systemctlPath, err := exec.LookPath("systemctl"); err == nil {
-		for _, unit := range []string{"vnstat", "vnstatd"} {
-			if err := exec.Command(systemctlPath, "restart", unit).Run(); err == nil {
+	return restartVnstatDaemonForManifest(manifest)
+}
+
+func restartVnstatDaemonForManifest(manifest trafficOverviewVnstatManifest) error {
+	if !IsSystemPlatformLinux() || !isTrustedVnstatManifest(manifest) {
+		return errors.New("managed vnstat daemon is unavailable")
+	}
+	systemctlPath := ""
+	if path, err := exec.LookPath("systemctl"); err == nil {
+		systemctlPath = path
+	}
+	verified := verifiedVnstatServices(manifest, systemctlPath)
+	if systemctlPath != "" {
+		for _, service := range verified {
+			if service.Systemd && runCommandWithTimeout(systemCommandTimeout, systemctlPath, "restart", service.Name) == nil && waitForManagedVnstatDaemon(manifest) {
 				return nil
 			}
 		}
 	}
 	if servicePath, err := exec.LookPath("service"); err == nil {
-		for _, unit := range []string{"vnstat", "vnstatd"} {
-			if err := exec.Command(servicePath, unit, "restart").Run(); err == nil {
+		for _, service := range verified {
+			if !service.Systemd && runCommandWithTimeout(systemCommandTimeout, servicePath, service.Name, "restart") == nil && waitForManagedVnstatDaemon(manifest) {
 				return nil
 			}
 		}
 	}
-	if daemonPath, err := exec.LookPath("vnstatd"); err == nil {
-		stopVnstatDaemon()
-		if err := exec.Command(daemonPath, "--daemon").Run(); err == nil {
+	if daemonPath, ok := managedVnstatDaemonPath(manifest); ok {
+		if err := stopVnstatDaemonForRestart(manifest); err != nil {
+			return err
+		}
+		if err := runCommandWithTimeout(systemCommandTimeout, daemonPath, "--daemon"); err == nil && waitForManagedVnstatDaemon(manifest) {
 			return nil
 		}
 	}
 	return errors.New("vnstat daemon restart failed")
+}
+
+func waitForManagedVnstatDaemon(manifest trafficOverviewVnstatManifest) bool {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if isVnstatDaemonRunningForManifest(manifest) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func managedVnstatServiceUnits(manifest trafficOverviewVnstatManifest) []string {
+	seen := make(map[string]struct{})
+	units := make([]string, 0, 3)
+	for _, raw := range manifest.ServiceUnits {
+		unit := strings.ToLower(strings.TrimSpace(raw))
+		if unit != "vnstat" && unit != "vnstatd" && unit != vnstatPanelSystemdUnit {
+			continue
+		}
+		if _, exists := seen[unit]; exists {
+			continue
+		}
+		seen[unit] = struct{}{}
+		units = append(units, unit)
+	}
+	sort.Strings(units)
+	return units
+}
+
+func verifiedVnstatServices(manifest trafficOverviewVnstatManifest, systemctlPath string) []vnstatVerifiedService {
+	daemonPath, ok := managedVnstatDaemonPath(manifest)
+	if !ok {
+		return nil
+	}
+	services := make([]vnstatVerifiedService, 0, len(managedVnstatServiceUnits(manifest)))
+	for _, unit := range managedVnstatServiceUnits(manifest) {
+		if systemctlPath != "" && systemdUnitExecutesPath(systemctlPath, unit, daemonPath) {
+			services = append(services, vnstatVerifiedService{Name: unit, Systemd: true})
+			continue
+		}
+		if initScriptExecutesPath(unit, daemonPath) {
+			services = append(services, vnstatVerifiedService{Name: unit, Systemd: false})
+		}
+	}
+	return services
+}
+
+func systemdUnitExecutesPath(systemctlPath string, unit string, daemonPath string) bool {
+	if strings.TrimSpace(systemctlPath) == "" || strings.TrimSpace(unit) == "" || strings.TrimSpace(daemonPath) == "" {
+		return false
+	}
+	output, err := runCommandOutput([]string{systemctlPath, "show", "--property=ExecStart", "--value", unit}, shortSystemCommandTimeout)
+	if err != nil {
+		return false
+	}
+	for _, candidate := range parseSystemdExecStartPaths(output) {
+		if normalizeVnstatPath(candidate) == normalizeVnstatPath(daemonPath) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseSystemdExecStartPaths(output string) []string {
+	parts := strings.Split(output, "path=")
+	paths := make([]string, 0, len(parts))
+	for index, part := range parts {
+		if index == 0 {
+			continue
+		}
+		candidate := strings.TrimLeft(part, " \t\"")
+		if end := strings.IndexAny(candidate, " \t;}"); end >= 0 {
+			candidate = candidate[:end]
+		}
+		candidate = normalizeVnstatPath(candidate)
+		if candidate != "" {
+			paths = append(paths, candidate)
+		}
+	}
+	return normalizeAbsolutePathList(paths)
+}
+
+func initScriptExecutesPath(unit string, daemonPath string) bool {
+	if unit != "vnstat" && unit != "vnstatd" {
+		return false
+	}
+	path := filepath.Join("/etc/init.d", unit)
+	info, err := os.Lstat(path)
+	if err != nil || info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(content), normalizeVnstatPath(daemonPath))
+}
+
+// disableVerifiedSysVService is intentionally restricted to the two standard
+// vnStat init-script names. It never edits rc.local, cron, shell profiles, or
+// any unknown startup mechanism.
+func disableVerifiedSysVService(unit string) error {
+	if unit != "vnstat" && unit != "vnstatd" {
+		return errors.New("refusing to disable an unknown SysV service")
+	}
+	if updateRCD, err := exec.LookPath("update-rc.d"); err == nil {
+		return runCommandWithTimeout(systemCommandTimeout, updateRCD, unit, "disable")
+	}
+	if chkconfig, err := exec.LookPath("chkconfig"); err == nil {
+		return runCommandWithTimeout(systemCommandTimeout, chkconfig, unit, "off")
+	}
+	if rcUpdate, err := exec.LookPath("rc-update"); err == nil {
+		return runCommandWithTimeout(systemCommandTimeout, rcUpdate, "del", unit, "default")
+	}
+	return errors.New("no supported SysV autostart controller is available")
+}
+
+func terminateVnstatPIDs(pids []int) error {
+	if len(pids) == 0 {
+		return nil
+	}
+	killPath, err := exec.LookPath("kill")
+	if err != nil {
+		return errors.New("cannot stop vnstat daemon because kill command is unavailable")
+	}
+	for _, pid := range pids {
+		if _, statErr := os.Stat(filepath.Join("/proc", strconv.Itoa(pid))); os.IsNotExist(statErr) {
+			continue
+		}
+		if err := runCommandWithTimeout(shortSystemCommandTimeout, killPath, "-TERM", strconv.Itoa(pid)); err != nil {
+			if _, statErr := os.Stat(filepath.Join("/proc", strconv.Itoa(pid))); os.IsNotExist(statErr) {
+				continue
+			}
+			return fmt.Errorf("stop vnstat pid %d failed: %w", pid, err)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		remaining := runningVnstatPIDs(pids)
+		if len(remaining) == 0 {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("vnstat daemon did not stop: %v", runningVnstatPIDs(pids))
+}
+
+func runningVnstatPIDs(pids []int) []int {
+	remaining := make([]int, 0, len(pids))
+	for _, pid := range pids {
+		if _, err := os.Stat(filepath.Join("/proc", strconv.Itoa(pid))); err == nil {
+			remaining = append(remaining, pid)
+		}
+	}
+	return remaining
+}
+
+func managedVnstatDaemonPath(manifest trafficOverviewVnstatManifest) (string, bool) {
+	for _, path := range manifest.FilePaths {
+		if normalizeVnstatPath(path) != normalizeVnstatPath("/usr/sbin/vnstatd") {
+			continue
+		}
+		// Keep the inventory path even when its file was already removed. A
+		// daemon started from that file can remain alive as "(deleted)" and
+		// must still be stopped before data or residual files are cleaned.
+		return normalizeVnstatPath(path), true
+	}
+	return "", false
+}
+
+func managedVnstatDaemonPIDs(manifest trafficOverviewVnstatManifest) []int {
+	daemonPath, ok := managedVnstatDaemonPath(manifest)
+	if !ok {
+		return nil
+	}
+	return vnstatDaemonPIDsAtPath(daemonPath)
+}
+
+func vnstatDaemonPIDsAtPath(daemonPath string) []int {
+	daemonPath = normalizeVnstatPath(daemonPath)
+	if daemonPath == "" || !filepath.IsAbs(daemonPath) {
+		return nil
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	pids := make([]int, 0)
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		exePath, err := os.Readlink(filepath.Join("/proc", entry.Name(), "exe"))
+		if err != nil || normalizeProcExecutablePath(exePath) != daemonPath {
+			continue
+		}
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+	return pids
+}
+
+func normalizeProcExecutablePath(path string) string {
+	return normalizeVnstatPath(strings.TrimSuffix(strings.TrimSpace(path), " (deleted)"))
+}
+
+// discoverRunningExternalVnstatInstallations observes only currently running
+// vnstatd processes. It deliberately does not inspect standard paths, PATH,
+// stopped units, cron, rc.local, or startup scripts. A systemd unit is exposed
+// only when the process belongs to that unit and its ExecStart is verified to
+// execute the exact discovered daemon path.
+func discoverRunningExternalVnstatInstallations(manifest trafficOverviewVnstatManifest, managed bool) []vnstatExternalInstallation {
+	if !IsSystemPlatformLinux() {
+		return nil
+	}
+	managedDaemon := ""
+	if managed {
+		if daemonPath, ok := managedVnstatDaemonPath(manifest); ok {
+			managedDaemon = daemonPath
+		}
+	}
+
+	installations := make(map[string]*vnstatExternalInstallation)
+	processUnits := make(map[string]map[string]struct{})
+	addDaemon := func(path string, pid int) {
+		path = normalizeVnstatPath(path)
+		if path == "" || !filepath.IsAbs(path) || filepath.Base(path) != "vnstatd" || path == managedDaemon {
+			return
+		}
+		key := externalVnstatInstallationKey(path)
+		installation, ok := installations[key]
+		if !ok {
+			installation = &vnstatExternalInstallation{DaemonPath: path}
+			installations[key] = installation
+		}
+		if pid > 0 {
+			installation.PIDs = append(installation.PIDs, pid)
+			if unit := systemdServiceUnitForPID(pid); unit != "" {
+				if processUnits[key] == nil {
+					processUnits[key] = make(map[string]struct{})
+				}
+				processUnits[key][unit] = struct{}{}
+			}
+		}
+	}
+
+	if entries, err := os.ReadDir("/proc"); err == nil {
+		for _, entry := range entries {
+			pid, parseErr := strconv.Atoi(entry.Name())
+			if parseErr != nil || pid <= 0 {
+				continue
+			}
+			exePath, readErr := os.Readlink(filepath.Join("/proc", entry.Name(), "exe"))
+			path := normalizeProcExecutablePath(exePath)
+			if readErr == nil && filepath.Base(path) == "vnstatd" {
+				addDaemon(path, pid)
+			}
+		}
+	}
+
+	systemctlPath := ""
+	if path, err := exec.LookPath("systemctl"); err == nil {
+		systemctlPath = path
+	}
+	if systemctlPath != "" {
+		for key, installation := range installations {
+			for unit := range processUnits[key] {
+				if systemdUnitExecutesPath(systemctlPath, unit, installation.DaemonPath) {
+					installation.ServiceUnits = append(installation.ServiceUnits, unit)
+				}
+			}
+		}
+	}
+
+	result := make([]vnstatExternalInstallation, 0, len(installations))
+	for _, installation := range installations {
+		installation.PIDs = uniqueSortedIntSlice(installation.PIDs)
+		installation.ServiceUnits = normalizeVnstatServiceUnitList(installation.ServiceUnits)
+		result = append(result, *installation)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return firstNonEmpty(result[i].DaemonPath, result[i].BinaryPath) < firstNonEmpty(result[j].DaemonPath, result[j].BinaryPath)
+	})
+	return result
+}
+
+func externalVnstatInstallationKey(path string) string {
+	path = normalizeVnstatPath(path)
+	if isPanelDefaultVnstatRuntimePath(path) {
+		return "panel-default"
+	}
+	return "directory:" + normalizeVnstatPath(filepath.Dir(path))
+}
+
+func isPanelDefaultVnstatRuntimePath(path string) bool {
+	path = normalizeVnstatPath(path)
+	return path == normalizeVnstatPath("/usr/bin/vnstat") || path == normalizeVnstatPath("/usr/sbin/vnstatd")
+}
+
+func systemdServiceUnitForPID(pid int) string {
+	if pid <= 0 {
+		return ""
+	}
+	content, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cgroup"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(strings.ReplaceAll(string(content), "\r\n", "\n"), "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		unit := filepath.Base(strings.TrimSpace(parts[2]))
+		if strings.HasSuffix(unit, ".service") && isSafeSystemdUnitName(unit) {
+			return unit
+		}
+	}
+	return ""
+}
+
+func isSafeSystemdUnitName(unit string) bool {
+	unit = strings.TrimSpace(unit)
+	if unit == "" || strings.ContainsAny(unit, `/\\`) {
+		return false
+	}
+	for _, r := range unit {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' || r == '@' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func normalizeVnstatServiceUnitList(units []string) []string {
+	seen := make(map[string]struct{})
+	result := make([]string, 0, len(units))
+	for _, raw := range units {
+		unit := strings.TrimSpace(raw)
+		if !isSafeSystemdUnitName(unit) {
+			continue
+		}
+		if _, ok := seen[unit]; ok {
+			continue
+		}
+		seen[unit] = struct{}{}
+		result = append(result, unit)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func uniqueSortedIntSlice(values []int) []int {
+	seen := make(map[int]struct{})
+	result := make([]int, 0, len(values))
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Ints(result)
+	return result
+}
+
+func externalPaths(installations []vnstatExternalInstallation) []string {
+	paths := make([]string, 0, len(installations)*2)
+	for _, installation := range installations {
+		paths = append(paths, installation.BinaryPath, installation.DaemonPath)
+	}
+	return normalizeAbsolutePathList(paths)
+}
+
+func externalUnits(installations []vnstatExternalInstallation) []string {
+	units := make([]string, 0, len(installations))
+	for _, installation := range installations {
+		units = append(units, installation.ServiceUnits...)
+	}
+	return normalizeVnstatServiceUnitList(units)
+}
+
+// stopRunningExternalVnstatForPanelInstall intentionally operates only on a daemon
+// process or a registered systemd/SysV service that has been checked against
+// its exact executable path. It never deletes any external-path file and does
+// not inspect cron, rc.local, shell configuration, or other opaque startup.
+func stopRunningExternalVnstatForPanelInstall(installations []vnstatExternalInstallation) error {
+	if len(installations) == 0 {
+		return nil
+	}
+	systemctlPath := ""
+	if path, err := exec.LookPath("systemctl"); err == nil {
+		systemctlPath = path
+	}
+	servicePath := ""
+	if path, err := exec.LookPath("service"); err == nil {
+		servicePath = path
+	}
+
+	verifiedSystemd := make(map[string]string)
+	verifiedSysV := make(map[string]string)
+	pids := make([]int, 0)
+	for _, installation := range installations {
+		pids = append(pids, installation.PIDs...)
+		daemonPath := normalizeVnstatPath(installation.DaemonPath)
+		if daemonPath == "" {
+			continue
+		}
+		for _, unit := range normalizeVnstatServiceUnitList(append(append([]string{}, installation.ServiceUnits...), "vnstat", "vnstatd")) {
+			if systemctlPath != "" && systemdUnitExecutesPath(systemctlPath, unit, daemonPath) {
+				verifiedSystemd[unit] = daemonPath
+				continue
+			}
+			if (unit == "vnstat" || unit == "vnstatd") && initScriptExecutesPath(unit, daemonPath) {
+				verifiedSysV[unit] = daemonPath
+			}
+		}
+	}
+
+	for unit := range verifiedSystemd {
+		if err := runCommandWithTimeout(systemCommandTimeout, systemctlPath, "stop", unit); err != nil {
+			return fmt.Errorf("stop external vnstat systemd unit %s failed: %w", unit, err)
+		}
+		if err := runCommandWithTimeout(systemCommandTimeout, systemctlPath, "disable", unit); err != nil {
+			return fmt.Errorf("disable external vnstat systemd unit %s failed: %w", unit, err)
+		}
+	}
+	if len(verifiedSystemd) > 0 {
+		if err := runCommandWithTimeout(systemCommandTimeout, systemctlPath, "daemon-reload"); err != nil {
+			return fmt.Errorf("reload systemd after stopping external vnstat failed: %w", err)
+		}
+		_ = runCommandWithTimeout(systemCommandTimeout, systemctlPath, "reset-failed")
+	}
+	for unit := range verifiedSysV {
+		if servicePath != "" {
+			if err := runCommandWithTimeout(systemCommandTimeout, servicePath, unit, "stop"); err != nil {
+				return fmt.Errorf("stop external vnstat SysV service %s failed: %w", unit, err)
+			}
+		} else if err := runCommandWithTimeout(systemCommandTimeout, filepath.Join("/etc/init.d", unit), "stop"); err != nil {
+			return fmt.Errorf("stop external vnstat SysV service %s failed: %w", unit, err)
+		}
+		if err := disableVerifiedSysVService(unit); err != nil {
+			return fmt.Errorf("disable external vnstat SysV autostart %s failed: %w", unit, err)
+		}
+	}
+
+	pids = uniqueSortedIntSlice(pids)
+	if err := terminateVnstatPIDs(pids); err != nil {
+		return err
+	}
+	for _, installation := range installations {
+		if daemonPath := normalizeVnstatPath(installation.DaemonPath); daemonPath != "" {
+			if remaining := vnstatDaemonPIDsAtPath(daemonPath); len(remaining) > 0 {
+				return fmt.Errorf("external vnstat daemon is still running at %s: %v", daemonPath, remaining)
+			}
+		}
+	}
+	return nil
 }
 
 func (s *TrafficOverviewService) isOverviewEnabled() (bool, error) {
@@ -3292,7 +4922,7 @@ func (s *TrafficOverviewService) isOverviewEnabled() (bool, error) {
 
 func (s *TrafficOverviewService) hasManagedVnstatManifest() bool {
 	manifest, ok := s.loadVnstatManifest()
-	return ok && manifest.Managed
+	return ok && isTrustedVnstatManifest(manifest)
 }
 
 func (s *TrafficOverviewService) loadVnstatManifest() (trafficOverviewVnstatManifest, bool) {
@@ -3308,34 +4938,65 @@ func (s *TrafficOverviewService) loadVnstatManifest() (trafficOverviewVnstatMani
 	if err := json.Unmarshal([]byte(trimmed), &manifest); err != nil {
 		return trafficOverviewVnstatManifest{}, false
 	}
+	manifest.Ownership = normalizeVnstatOwnership(manifest.Ownership, manifest.Managed)
 	manifest.PackageManager = strings.TrimSpace(strings.ToLower(manifest.PackageManager))
 	manifest.SystemFamily = strings.TrimSpace(strings.ToLower(manifest.SystemFamily))
 	manifest.InstallMethod = normalizeVnstatInstallMethod(manifest.InstallMethod, manifest.PackageManager)
 	manifest.PackageName = firstNonEmpty(manifest.PackageName, vnstatPackageName)
-	manifest.BinaryPath = strings.TrimSpace(manifest.BinaryPath)
+	manifest.BinaryPath = normalizeVnstatPath(manifest.BinaryPath)
 	manifest.Version = strings.TrimSpace(manifest.Version)
-	manifest.FilePaths = normalizeAbsolutePathList(manifest.FilePaths)
-	manifest.DataPaths = normalizeAbsolutePathList(manifest.DataPaths)
-	manifest.ServiceUnits = uniqueStringList(manifest.ServiceUnits)
+	manifest.EvidenceNonce = strings.TrimSpace(manifest.EvidenceNonce)
+	manifest.FilePaths = safeVnstatFilePaths(manifest.FilePaths)
+	manifest.DataPaths = safeVnstatDataPaths(manifest.DataPaths)
+	manifest.ServiceUnits = managedVnstatServiceUnits(manifest)
 	return manifest, manifest.Managed || manifest.BinaryPath != "" || len(manifest.FilePaths) > 0
 }
 
 func (s *TrafficOverviewService) saveVnstatManifest(manifest trafficOverviewVnstatManifest) error {
 	manifest.Managed = true
+	manifest.Ownership = normalizeVnstatOwnership(manifest.Ownership, true)
+	if manifest.Ownership == "" {
+		return errors.New("vnstat ownership is required")
+	}
 	manifest.PackageManager = strings.TrimSpace(strings.ToLower(manifest.PackageManager))
 	manifest.SystemFamily = strings.TrimSpace(strings.ToLower(manifest.SystemFamily))
 	manifest.InstallMethod = normalizeVnstatInstallMethod(manifest.InstallMethod, manifest.PackageManager)
 	manifest.PackageName = firstNonEmpty(manifest.PackageName, vnstatPackageName)
-	manifest.BinaryPath = strings.TrimSpace(manifest.BinaryPath)
+	manifest.BinaryPath = normalizeVnstatPath(manifest.BinaryPath)
+	if !isSafeVnstatCommandPath(manifest.BinaryPath) {
+		return errors.New("refusing to save an unsafe vnstat binary path")
+	}
 	manifest.Version = strings.TrimSpace(manifest.Version)
-	manifest.FilePaths = normalizeAbsolutePathList(manifest.FilePaths)
-	manifest.DataPaths = normalizeAbsolutePathList(manifest.DataPaths)
-	manifest.ServiceUnits = uniqueStringList(manifest.ServiceUnits)
+	manifest.FilePaths = safeVnstatFilePaths(manifest.FilePaths)
+	manifest.DataPaths = safeVnstatDataPaths(manifest.DataPaths)
+	manifest.ServiceUnits = managedVnstatServiceUnits(manifest)
+	if !isVnstatManifestBaselineSafe(manifest) {
+		return errors.New("refusing to save an unsafe vnstat manifest")
+	}
+	evidence, err := buildVnstatOwnershipEvidence(manifest)
+	if err != nil {
+		return err
+	}
+	manifest.EvidenceNonce = evidence.Nonce
+	manifest.EvidenceSchema = evidence.Schema
 	raw, err := json.Marshal(manifest)
 	if err != nil {
 		return err
 	}
-	return (&SettingService{}).setString(trafficOverviewVnstatManifestKey, string(raw))
+	evidencePath := strings.TrimSpace(vnstatEvidencePathFn())
+	previousEvidence, previousErr := os.ReadFile(evidencePath)
+	if err := writeVnstatOwnershipEvidence(evidence); err != nil {
+		return fmt.Errorf("write vnstat ownership evidence failed: %w", err)
+	}
+	if err := (&SettingService{}).setString(trafficOverviewVnstatManifestKey, string(raw)); err != nil {
+		if previousErr == nil {
+			_ = os.WriteFile(evidencePath, previousEvidence, 0o600)
+		} else {
+			_ = removeVnstatOwnershipEvidence()
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *TrafficOverviewService) clearVnstatManagedState() error {
@@ -3358,46 +5019,69 @@ func (s *TrafficOverviewService) clearVnstatManagedState() error {
 	trafficOverviewSnapshotMu.Lock()
 	trafficOverviewSnapshotCache = trafficOverviewSnapshotState{}
 	trafficOverviewSnapshotMu.Unlock()
+	if err := removeVnstatOwnershipEvidence(); err != nil {
+		return err
+	}
 	return nil
 }
 
 func removeVnstatTrackedData(manifest trafficOverviewVnstatManifest) error {
 	targets := defaultVnstatDataPaths()
 	targets = append(targets, manifest.DataPaths...)
-	for _, path := range normalizeAbsolutePathList(targets) {
-		if !isSafeVnstatDataPath(path) {
-			continue
-		}
-		if err := os.RemoveAll(path); err != nil && !os.IsNotExist(err) {
+	for _, path := range safeVnstatDataPaths(targets) {
+		if err := removeExactVnstatDataPath(path); err != nil {
 			return fmt.Errorf("remove vnstat data path failed %s: %w", path, err)
 		}
 	}
 
-	for _, path := range normalizeAbsolutePathList(manifest.FilePaths) {
-		if !isSafeVnstatResidualPath(path) {
+	for _, path := range safeVnstatFilePaths(manifest.FilePaths) {
+		if isSafeVnstatDataPath(path) {
 			continue
 		}
-		info, err := os.Stat(path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return err
-		}
-		if info.IsDir() {
-			if !isSafeVnstatDataPath(path) {
-				continue
-			}
-			if err := os.RemoveAll(path); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-			continue
-		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		if err := removeExactVnstatResidualFile(path); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func removeExactVnstatDataPath(path string) error {
+	if !isSafeVnstatDataPath(path) {
+		return errors.New("refusing to remove an unsafe vnstat data path")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	// Never follow a link while removing a directory. Removing the link itself
+	// is safe; recursively removing its target is not.
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return os.Remove(path)
+	}
+	return os.RemoveAll(path)
+}
+
+func removeExactVnstatResidualFile(path string) error {
+	if !isSafeVnstatResidualPath(path) || isSafeVnstatDataPath(path) {
+		return errors.New("refusing to remove an unsafe vnstat file")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	// Residual paths are always individual files or links. A directory at one
+	// of these paths is deliberately left untouched rather than recursively
+	// deleting a parent or an unexpected replacement directory.
+	if info.IsDir() {
+		return nil
+	}
+	return os.Remove(path)
 }
 
 func defaultVnstatDataPaths() []string {
@@ -3408,8 +5092,28 @@ func defaultVnstatDataPaths() []string {
 	}
 }
 
+func safeVnstatDataPaths(paths []string) []string {
+	filtered := make([]string, 0, len(paths))
+	for _, path := range normalizeAbsolutePathList(paths) {
+		if isSafeVnstatDataPath(path) {
+			filtered = append(filtered, path)
+		}
+	}
+	return filtered
+}
+
+func safeVnstatFilePaths(paths []string) []string {
+	filtered := make([]string, 0, len(paths))
+	for _, path := range normalizeAbsolutePathList(paths) {
+		if isSafeVnstatResidualPath(path) {
+			filtered = append(filtered, path)
+		}
+	}
+	return filtered
+}
+
 func vnstatManagementSupport() (bool, string) {
-	return vnstatManagementSupportForRuntime(runtime.GOOS, runningInsideContainer())
+	return vnstatManagementSupportForRuntime(GetSystemPlatformOS(), runningInsideContainer())
 }
 
 func vnstatManagementSupportForRuntime(goos string, insideContainer bool) (bool, string) {
@@ -3423,9 +5127,9 @@ func vnstatManagementSupportForRuntime(goos string, insideContainer bool) (bool,
 }
 
 func isSafeVnstatDataPath(path string) bool {
-	cleaned := filepath.Clean(strings.TrimSpace(path))
+	cleaned := normalizeVnstatPath(path)
 	for _, allowed := range defaultVnstatDataPaths() {
-		if cleaned == filepath.Clean(allowed) {
+		if cleaned == normalizeVnstatPath(allowed) {
 			return true
 		}
 	}
@@ -3433,35 +5137,76 @@ func isSafeVnstatDataPath(path string) bool {
 }
 
 func isSafeVnstatResidualPath(path string) bool {
-	cleaned := filepath.Clean(strings.TrimSpace(path))
+	cleaned := normalizeVnstatPath(path)
 	if isSafeVnstatDataPath(cleaned) {
 		return true
 	}
-	allowedFiles := map[string]struct{}{
-		"/etc/vnstat.conf":                       {},
-		"/etc/default/vnstat":                    {},
-		"/etc/conf.d/vnstat":                     {},
-		"/etc/init.d/vnstat":                     {},
-		"/etc/systemd/system/vnstat.service":     {},
-		"/lib/systemd/system/vnstat.service":     {},
-		"/usr/lib/systemd/system/vnstat.service": {},
-		"/usr/bin/vnstat":                        {},
-		"/usr/bin/vnstati":                       {},
-		"/usr/sbin/vnstatd":                      {},
+	for _, allowed := range append(append([]string{}, vnstatStandardProgramPaths...), vnstatStandardConfigAndUnitPaths...) {
+		if cleaned == normalizeVnstatPath(allowed) {
+			return true
+		}
 	}
-	_, ok := allowedFiles[cleaned]
-	return ok
+	for _, allowed := range vnstatStandardManPagePaths {
+		if cleaned == normalizeVnstatPath(allowed) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSafeVnstatProgramPath(path string) bool {
+	cleaned := normalizeVnstatPath(path)
+	for _, allowed := range vnstatStandardProgramPaths {
+		if cleaned == normalizeVnstatPath(allowed) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSafeVnstatCommandPath(path string) bool {
+	return normalizeVnstatPath(path) == normalizeVnstatPath("/usr/bin/vnstat")
+}
+
+func managedVnstatBinaryPath(manifest trafficOverviewVnstatManifest) (string, bool) {
+	path := normalizeVnstatPath(manifest.BinaryPath)
+	if !isTrustedVnstatManifest(manifest) || !isSafeVnstatCommandPath(path) {
+		return "", false
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.IsDir() {
+		return "", false
+	}
+	return path, true
+}
+
+func findStandardVnstatBinaryPath() (string, bool) {
+	path := normalizeVnstatPath("/usr/bin/vnstat")
+	info, err := os.Lstat(path)
+	if err != nil || info.IsDir() {
+		return "", false
+	}
+	return path, true
+}
+
+func normalizeVnstatPath(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	return pathpkg.Clean(strings.ReplaceAll(trimmed, "\\", "/"))
 }
 
 func normalizeAbsolutePathList(items []string) []string {
 	seen := make(map[string]struct{})
 	result := make([]string, 0, len(items))
 	for _, item := range items {
-		path := strings.TrimSpace(item)
-		if path == "" || !filepath.IsAbs(path) {
+		path := normalizeVnstatPath(item)
+		// vnStat manifests always use Linux paths. Keep that interpretation
+		// stable when Go unit tests run on a non-Linux development host.
+		if path == "" || !strings.HasPrefix(path, "/") {
 			continue
 		}
-		path = filepath.Clean(path)
 		if _, exists := seen[path]; exists {
 			continue
 		}
@@ -3473,27 +5218,11 @@ func normalizeAbsolutePathList(items []string) []string {
 }
 
 func detectLinuxSystemFamily() string {
-	content, err := os.ReadFile("/etc/os-release")
+	platform, err := GetSystemPlatform()
 	if err != nil {
 		return ""
 	}
-	values := parseOsReleaseFields(string(content))
-	idLike := strings.ToLower(values["ID_LIKE"])
-	id := strings.ToLower(values["ID"])
-	switch {
-	case strings.Contains(idLike, "debian") || id == "debian" || id == "ubuntu":
-		return "debian"
-	case strings.Contains(idLike, "rhel") || strings.Contains(idLike, "fedora") || id == "fedora" || id == "rhel" || id == "centos" || id == "rocky" || id == "almalinux":
-		return "rhel"
-	case strings.Contains(idLike, "suse") || id == "sles" || id == "opensuse":
-		return "suse"
-	case strings.Contains(idLike, "arch") || id == "arch":
-		return "arch"
-	case id == "alpine":
-		return "alpine"
-	default:
-		return id
-	}
+	return strings.TrimSpace(platform.SystemFamily)
 }
 
 func parseOsReleaseFields(content string) map[string]string {
@@ -3519,21 +5248,6 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-func runVnstatCommand(args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "vnstat", args...)
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
-		return "", ctx.Err()
-	}
-	if err != nil {
-		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
-	}
-	return strings.TrimSpace(string(output)), nil
 }
 
 func detectDefaultTrafficInterface() (string, error) {

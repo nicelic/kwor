@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -39,11 +40,64 @@ type DBBackupArchive struct {
 	Data     []byte
 }
 
+type boundedBytesBuffer struct {
+	buffer   bytes.Buffer
+	maxBytes int64
+}
+
+func (b *boundedBytesBuffer) Write(data []byte) (int, error) {
+	if b.maxBytes <= 0 {
+		return 0, fmt.Errorf("buffer size limit must be positive")
+	}
+	if int64(b.buffer.Len())+int64(len(data)) > b.maxBytes {
+		return 0, fmt.Errorf("output exceeds %d bytes", b.maxBytes)
+	}
+	return b.buffer.Write(data)
+}
+
+func (b *boundedBytesBuffer) Bytes() []byte {
+	return b.buffer.Bytes()
+}
+
 type pendingDBRestoreMarker struct {
 	StageDir  string `json:"stageDir"`
 	BackupDir string `json:"backupDir,omitempty"`
 	Applied   bool   `json:"applied,omitempty"`
 }
+
+const (
+	databaseImportMaxBytes               int64 = 256 * 1024 * 1024
+	dbBackupArchiveMaxBytes              int64 = 256 * 1024 * 1024
+	dbBackupArchiveMaxEntryBytes         int64 = 256 * 1024 * 1024
+	dbBackupArchiveMaxEntries                  = 16
+	databaseUploadMultipartOverheadBytes int64 = 1024 * 1024
+)
+
+// MaxDatabaseImportUploadBytes leaves room for multipart boundaries and field metadata.
+func MaxDatabaseImportUploadBytes() int64 {
+	return databaseImportMaxBytes + databaseUploadMultipartOverheadBytes
+}
+
+// MaxDBBackupArchiveUploadBytes leaves room for multipart boundaries and field metadata.
+func MaxDBBackupArchiveUploadBytes() int64 {
+	return dbBackupArchiveMaxBytes + databaseUploadMultipartOverheadBytes
+}
+
+type dbBackupArchiveLimits struct {
+	maxEntries    int
+	maxEntryBytes int64
+	maxTotalBytes int64
+}
+
+var defaultDBBackupArchiveLimits = dbBackupArchiveLimits{
+	maxEntries:    dbBackupArchiveMaxEntries,
+	maxEntryBytes: dbBackupArchiveMaxEntryBytes,
+	maxTotalBytes: dbBackupArchiveMaxBytes,
+}
+
+// Database replacement changes the live SQLite file. Keep the legacy import
+// and archive restore paths mutually exclusive inside one panel process.
+var databaseImportRestoreMu sync.Mutex
 
 func (managedRuntimeFileBackupEntry) TableName() string {
 	return "managed_runtime_files"
@@ -85,10 +139,24 @@ func GetDb(exclude string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	backupSQLDB, err := backupDb.DB()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = backupSQLDB.Close()
+	}()
 	defer os.Remove(dbPath)
 
 	err = backupDb.AutoMigrate(
 		&model.Setting{},
+		&model.SettingsState{},
+		// ACME/DNS account state and certificate inventory are all database
+		// source data. Keep them together in the lightweight database export as
+		// well as the full archive backup.
+		&model.AcmeAccount{},
+		&model.AcmeDNSAccount{},
+		&model.CertificateRecord{},
 		&model.Tls{},
 		&model.MihomoTls{},
 		&model.Inbound{},
@@ -109,7 +177,12 @@ func GetDb(exclude string) ([]byte, error) {
 		&model.ClientPortLimitState{},
 		&model.MihomoClientPortLimitState{},
 		&model.PortForwardRule{},
+		&model.PortForwardRuleTrafficState{},
+		&model.PortForwardOverviewTrafficState{},
+		// PortForwardKernelForwardState is deliberately excluded: it records
+		// host-local sysctl ownership and must never cross a database backup.
 		&model.ReverseProxyRule{},
+		&model.ReverseProxySettings{},
 		&model.ReverseProxyCertificateBalanceState{},
 		&model.PanelCertificateBalanceState{},
 		&model.ClientInboundTrafficState{},
@@ -125,6 +198,10 @@ func GetDb(exclude string) ([]byte, error) {
 
 	copySteps := []func() error{
 		func() error { return copyBackupTable[model.Setting](db, backupDb) },
+		func() error { return copyBackupTable[model.SettingsState](db, backupDb) },
+		func() error { return copyBackupTable[model.AcmeAccount](db, backupDb) },
+		func() error { return copyBackupTable[model.AcmeDNSAccount](db, backupDb) },
+		func() error { return copyBackupTable[model.CertificateRecord](db, backupDb) },
 		func() error { return copyBackupTable[model.Tls](db, backupDb) },
 		func() error { return copyBackupTable[model.MihomoTls](db, backupDb) },
 		func() error { return copyBackupTable[model.Inbound](db, backupDb) },
@@ -145,7 +222,11 @@ func GetDb(exclude string) ([]byte, error) {
 		func() error { return copyBackupTable[model.ClientPortLimitState](db, backupDb) },
 		func() error { return copyBackupTable[model.MihomoClientPortLimitState](db, backupDb) },
 		func() error { return copyBackupTable[model.PortForwardRule](db, backupDb) },
+		func() error { return copyBackupTable[model.PortForwardRuleTrafficState](db, backupDb) },
+		func() error { return copyBackupTable[model.PortForwardOverviewTrafficState](db, backupDb) },
+		// Do not copy model.PortForwardKernelForwardState; see AutoMigrate list.
 		func() error { return copyBackupTable[model.ReverseProxyRule](db, backupDb) },
+		func() error { return copyBackupTable[model.ReverseProxySettings](db, backupDb) },
 		func() error { return copyBackupTable[model.ReverseProxyCertificateBalanceState](db, backupDb) },
 		func() error { return copyBackupTable[model.PanelCertificateBalanceState](db, backupDb) },
 		func() error { return copyBackupTable[model.ClientInboundTrafficState](db, backupDb) },
@@ -175,8 +256,9 @@ func GetDb(exclude string) ([]byte, error) {
 		return nil, err
 	}
 
-	bdb, _ := backupDb.DB()
-	_ = bdb.Close()
+	if err := backupSQLDB.Close(); err != nil {
+		return nil, err
+	}
 
 	file, err := os.Open(dbPath)
 	if err != nil {
@@ -184,7 +266,7 @@ func GetDb(exclude string) ([]byte, error) {
 	}
 	defer file.Close()
 
-	fileContents, err := io.ReadAll(file)
+	fileContents, err := readReaderWithLimit(file, databaseImportMaxBytes, "数据库备份")
 	if err != nil {
 		return nil, err
 	}
@@ -207,8 +289,9 @@ func BuildDBBackupArchive() (*DBBackupArchive, error) {
 		return nil, common.NewError("db 目录中没有可备份文件")
 	}
 
-	var buffer bytes.Buffer
-	zipWriter := zip.NewWriter(&buffer)
+	buffer := &boundedBytesBuffer{maxBytes: dbBackupArchiveMaxBytes}
+	zipWriter := zip.NewWriter(buffer)
+	var totalSnapshotBytes int64
 
 	for _, item := range items {
 		rel, err := filepath.Rel(snapshotDir, item)
@@ -222,6 +305,11 @@ func BuildDBBackupArchive() (*DBBackupArchive, error) {
 		if err != nil {
 			_ = zipWriter.Close()
 			return nil, err
+		}
+		remainingBytes := dbBackupArchiveMaxBytes - totalSnapshotBytes
+		if info.Size() < 0 || info.Size() > remainingBytes {
+			_ = zipWriter.Close()
+			return nil, common.NewErrorf("数据库备份内容超过 %d 字节限制", dbBackupArchiveMaxBytes)
 		}
 
 		header, err := zip.FileInfoHeader(info)
@@ -243,7 +331,12 @@ func BuildDBBackupArchive() (*DBBackupArchive, error) {
 			_ = zipWriter.Close()
 			return nil, err
 		}
-		_, copyErr := io.Copy(writer, file)
+		var copyErr error
+		if info.Size() > 0 {
+			var written int64
+			written, copyErr = copyReaderWithLimit(writer, file, remainingBytes)
+			totalSnapshotBytes += written
+		}
 		closeErr := file.Close()
 		if copyErr != nil {
 			_ = zipWriter.Close()
@@ -267,6 +360,15 @@ func BuildDBBackupArchive() (*DBBackupArchive, error) {
 }
 
 func ImportDB(file multipart.File) error {
+	if file == nil {
+		return common.NewError("未选择数据库文件")
+	}
+	databaseImportRestoreMu.Lock()
+	defer databaseImportRestoreMu.Unlock()
+	if err := ensureNoPendingDBRestore(); err != nil {
+		return err
+	}
+
 	isValidDb, err := IsSQLiteDB(file)
 	if err != nil {
 		return common.NewErrorf("Error checking db file format: %v", err)
@@ -288,52 +390,73 @@ func ImportDB(file multipart.File) error {
 	if err != nil {
 		return common.NewErrorf("Error creating temporary db file: %v", err)
 	}
-	defer tempFile.Close()
 	defer os.Remove(tempPath)
 
+	if _, err = copyReaderWithLimit(tempFile, file, databaseImportMaxBytes); err != nil {
+		_ = tempFile.Close()
+		return common.NewErrorf("Error saving db: %v", err)
+	}
+	if err := tempFile.Close(); err != nil {
+		return common.NewErrorf("Error closing temporary db: %v", err)
+	}
+
+	if err := validateSQLiteDatabaseFile(tempPath); err != nil {
+		return common.NewErrorf("Error checking db: %v", err)
+	}
+
+	return replaceMainDatabaseWithImportedFile(tempPath)
+}
+
+func replaceMainDatabaseWithImportedFile(tempPath string) error {
+	dbPath := config.GetDBPath()
+	fallbackPath := fmt.Sprintf("%s.backup", dbPath)
 	if err := closeMainDatabase(); err != nil {
 		return common.NewErrorf("Error closing existing db: %v", err)
 	}
 
-	if _, err = io.Copy(tempFile, file); err != nil {
-		return common.NewErrorf("Error saving db: %v", err)
-	}
-
-	newDb, err := gorm.Open(sqlite.Open(tempPath), &gorm.Config{})
-	if err != nil {
-		return common.NewErrorf("Error checking db: %v", err)
-	}
-	newDBHandle, _ := newDb.DB()
-	_ = newDBHandle.Close()
-
-	fallbackPath := fmt.Sprintf("%s.backup", config.GetDBPath())
-	if err := removeIfExists(fallbackPath); err != nil {
-		return common.NewErrorf("Error removing existing fallback db file: %v", err)
-	}
-
-	if err := os.Rename(config.GetDBPath(), fallbackPath); err != nil {
-		return common.NewErrorf("Error backing up temporary db file: %v", err)
-	}
-	defer os.Remove(fallbackPath)
-
-	if err := os.Rename(tempPath, config.GetDBPath()); err != nil {
-		if errRename := os.Rename(fallbackPath, config.GetDBPath()); errRename != nil {
-			return common.NewErrorf("Error moving db file and restoring fallback: %v", errRename)
+	reopenOriginal := func(cause error) error {
+		if reopenErr := InitDB(dbPath); reopenErr != nil {
+			return common.NewErrorf("%v; Error reopening original db: %v", cause, reopenErr)
 		}
-		return common.NewErrorf("Error moving db file: %v", err)
+		return cause
+	}
+
+	if err := removeIfExists(fallbackPath); err != nil {
+		return reopenOriginal(common.NewErrorf("Error removing existing fallback db file: %v", err))
+	}
+
+	if err := os.Rename(dbPath, fallbackPath); err != nil {
+		return reopenOriginal(common.NewErrorf("Error backing up original db file: %v", err))
+	}
+
+	restoreOriginal := func(cause error) error {
+		if closeErr := closeMainDatabase(); closeErr != nil {
+			return common.NewErrorf("%v; Error closing failed imported db: %v", cause, closeErr)
+		}
+		if removeErr := removeIfExists(dbPath); removeErr != nil {
+			return common.NewErrorf("%v; Error removing failed imported db: %v", cause, removeErr)
+		}
+		if restoreErr := os.Rename(fallbackPath, dbPath); restoreErr != nil {
+			return common.NewErrorf("%v; Error restoring original db: %v", cause, restoreErr)
+		}
+		if reopenErr := InitDB(dbPath); reopenErr != nil {
+			return common.NewErrorf("%v; Error reopening restored db: %v", cause, reopenErr)
+		}
+		return cause
+	}
+
+	if err := os.Rename(tempPath, dbPath); err != nil {
+		return restoreOriginal(common.NewErrorf("Error moving imported db file: %v", err))
 	}
 
 	if err := migration.MigrateDbWithError(); err != nil {
-		if errRename := os.Rename(fallbackPath, config.GetDBPath()); errRename != nil {
-			return common.NewErrorf("Error migrating db and restoring fallback: %v", errRename)
-		}
-		return common.NewErrorf("Error migrating db: %v", err)
+		return restoreOriginal(common.NewErrorf("Error migrating db: %v", err))
 	}
-	if err := InitDB(config.GetDBPath()); err != nil {
-		if errRename := os.Rename(fallbackPath, config.GetDBPath()); errRename != nil {
-			return common.NewErrorf("Error migrating db and restoring fallback: %v", errRename)
-		}
-		return common.NewErrorf("Error migrating db: %v", err)
+	if err := InitDB(dbPath); err != nil {
+		return restoreOriginal(common.NewErrorf("Error initializing imported db: %v", err))
+	}
+	if err := os.Remove(fallbackPath); err != nil && !os.IsNotExist(err) {
+		logger.Warning("remove imported db fallback file failed: ", err)
 	}
 
 	if err := SendSighup(); err != nil {
@@ -350,11 +473,13 @@ func RestoreDBBackupArchive(file multipart.File, panelRestarter func() error, st
 	if panelRestarter == nil {
 		return common.NewError("面板重启回调不可用")
 	}
-	if HasPendingDBRestore() {
-		return common.NewError("已有待处理的备份恢复任务，请等待当前恢复完成后再试")
+	databaseImportRestoreMu.Lock()
+	defer databaseImportRestoreMu.Unlock()
+	if err := ensureNoPendingDBRestore(); err != nil {
+		return err
 	}
 
-	archiveData, err := io.ReadAll(file)
+	archiveData, err := readReaderWithLimit(file, dbBackupArchiveMaxBytes, "备份文件")
 	if err != nil {
 		return common.NewErrorf("读取备份文件失败: %v", err)
 	}
@@ -425,6 +550,9 @@ func HasPendingDBRestoreToFinalize() bool {
 }
 
 func ApplyPendingDBRestore() error {
+	databaseImportRestoreMu.Lock()
+	defer databaseImportRestoreMu.Unlock()
+
 	marker, err := readPendingDBRestoreMarker()
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -458,14 +586,6 @@ func ApplyPendingDBRestore() error {
 		cleanupPendingDBRestoreBaseDir()
 		return common.NewErrorf("关闭主数据库失败: %v", err)
 	}
-	if err := runBeforeDBRestoreHooks(); err != nil {
-		clearPendingDBRestoreMarker()
-		_ = os.RemoveAll(stageDir)
-		cleanupPendingDBRestoreBaseDir()
-		_ = InitDB(config.GetDBPath())
-		_ = runAfterDBRestoreHooks()
-		return common.NewErrorf("执行恢复前清理失败: %v", err)
-	}
 
 	if currentExists {
 		if err := os.Rename(dbDir, backupDir); err != nil {
@@ -473,7 +593,6 @@ func ApplyPendingDBRestore() error {
 			_ = os.RemoveAll(stageDir)
 			cleanupPendingDBRestoreBaseDir()
 			_ = InitDB(config.GetDBPath())
-			_ = runAfterDBRestoreHooks()
 			return common.NewErrorf("备份当前 db 目录失败: %v", err)
 		}
 	}
@@ -513,14 +632,6 @@ func ApplyPendingDBRestore() error {
 		}
 		return common.NewErrorf("重新初始化主数据库失败: %v", err)
 	}
-	if err := runAfterDBRestoreHooks(); err != nil {
-		clearPendingDBRestoreMarker()
-		cleanupPendingDBRestoreBaseDir()
-		if rollbackErr := rollbackPendingDBRestore(currentExists, dbDir, backupDir); rollbackErr != nil {
-			return common.NewErrorf("执行恢复后初始化失败: %v；回滚失败: %v", err, rollbackErr)
-		}
-		return common.NewErrorf("执行恢复后初始化失败: %v", err)
-	}
 
 	marker.StageDir = dbDir
 	marker.BackupDir = backupDir
@@ -536,6 +647,9 @@ func ApplyPendingDBRestore() error {
 }
 
 func FinalizePendingDBRestore() error {
+	databaseImportRestoreMu.Lock()
+	defer databaseImportRestoreMu.Unlock()
+
 	marker, err := readPendingDBRestoreMarker()
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -547,6 +661,67 @@ func FinalizePendingDBRestore() error {
 		return nil
 	}
 	return finalizePendingDBRestore(marker, filepath.Clean(pendingDBRestoreBaseDir()))
+}
+
+func ensureNoPendingDBRestore() error {
+	marker, err := readPendingDBRestoreMarker()
+	if err == nil && marker != nil {
+		return common.NewError("已有待处理的备份恢复任务，请等待当前恢复完成后再试")
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return common.NewErrorf("读取待处理备份恢复任务失败: %v", err)
+	}
+	return nil
+}
+
+func readReaderWithLimit(reader io.Reader, maxBytes int64, label string) ([]byte, error) {
+	if reader == nil {
+		return nil, fmt.Errorf("%s is empty", label)
+	}
+	if maxBytes <= 0 {
+		return nil, fmt.Errorf("%s size limit must be positive", label)
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("%s exceeds %d bytes", label, maxBytes)
+	}
+	return data, nil
+}
+
+func copyReaderWithLimit(dst io.Writer, src io.Reader, maxBytes int64) (int64, error) {
+	if dst == nil || src == nil {
+		return 0, fmt.Errorf("source or destination is nil")
+	}
+	if maxBytes <= 0 {
+		return 0, fmt.Errorf("copy size limit must be positive")
+	}
+	written, err := io.Copy(dst, io.LimitReader(src, maxBytes+1))
+	if err != nil {
+		return written, err
+	}
+	if written > maxBytes {
+		return written, fmt.Errorf("input exceeds %d bytes", maxBytes)
+	}
+	return written, nil
+}
+
+func validateSQLiteDatabaseFile(path string) error {
+	tempDB, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+	if err != nil {
+		return err
+	}
+	sqlDB, err := tempDB.DB()
+	if err != nil {
+		return err
+	}
+	defer sqlDB.Close()
+	if err := sqlDB.Ping(); err != nil {
+		return err
+	}
+	return tempDB.Exec("PRAGMA schema_version").Error
 }
 
 func IsSQLiteDB(file io.Reader) (bool, error) {
@@ -567,13 +742,17 @@ func SendSighup() error {
 
 	go func() {
 		time.Sleep(3 * time.Second)
+		// The process target OS is fixed by the running binary. Do not acquire
+		// the single SQLite connection during database recovery merely to choose
+		// how this process is restarted.
+		var signalErr error
 		if runtime.GOOS == "windows" {
-			err = process.Kill()
+			signalErr = process.Kill()
 		} else {
-			err = process.Signal(syscall.SIGHUP)
+			signalErr = process.Signal(syscall.SIGHUP)
 		}
-		if err != nil {
-			logger.Error("send signal SIGHUP failed:", err)
+		if signalErr != nil {
+			logger.Error("send panel restart signal failed:", signalErr)
 		}
 	}()
 	return nil
@@ -668,7 +847,29 @@ func createSQLiteSnapshot(sourcePath string, targetPath string) error {
 		return err
 	}
 	sql := fmt.Sprintf("VACUUM INTO '%s'", escapeSQLiteLiteral(filepath.ToSlash(targetPath)))
-	return sourceDB.Exec(sql).Error
+	if err := sourceDB.Exec(sql).Error; err != nil {
+		return err
+	}
+	// This is a copy-only operation on the snapshot. The forwarding sysctl
+	// ownership record is host-local runtime evidence, so it must not survive
+	// either lightweight exports or full archive backups.
+	return removePortForwardKernelForwardStateFromSnapshot(targetPath)
+}
+
+func removePortForwardKernelForwardStateFromSnapshot(path string) error {
+	snapshotDB, err := gorm.Open(sqlite.Open(sqliteDSNWithPragmas(path)), &gorm.Config{})
+	if err != nil {
+		return err
+	}
+	sqlDB, err := snapshotDB.DB()
+	if err != nil {
+		return err
+	}
+	defer sqlDB.Close()
+	if !snapshotDB.Migrator().HasTable(&model.PortForwardKernelForwardState{}) {
+		return nil
+	}
+	return snapshotDB.Migrator().DropTable(&model.PortForwardKernelForwardState{})
 }
 
 func escapeSQLiteLiteral(value string) string {
@@ -739,9 +940,6 @@ func rollbackPendingDBRestore(currentExists bool, dbDir string, backupDir string
 		if err := InitDB(config.GetDBPath()); err != nil {
 			return err
 		}
-		if err := runAfterDBRestoreHooks(); err != nil {
-			return err
-		}
 	}
 	return nil
 }
@@ -766,6 +964,13 @@ func finalizePendingDBRestore(marker *pendingDBRestoreMarker, baseDir string) er
 }
 
 func readDBBackupArchiveEntries(data []byte) (map[string][]byte, error) {
+	return readDBBackupArchiveEntriesWithLimits(data, defaultDBBackupArchiveLimits)
+}
+
+func readDBBackupArchiveEntriesWithLimits(data []byte, limits dbBackupArchiveLimits) (map[string][]byte, error) {
+	if limits.maxEntries <= 0 || limits.maxEntryBytes <= 0 || limits.maxTotalBytes <= 0 {
+		return nil, common.NewError("备份压缩包大小限制无效")
+	}
 	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return nil, common.NewErrorf("备份文件不是有效的 zip 压缩包: %v", err)
@@ -773,9 +978,14 @@ func readDBBackupArchiveEntries(data []byte) (map[string][]byte, error) {
 
 	entries := make(map[string][]byte)
 	seenNames := make(map[string]struct{})
+	entryCount := 0
+	totalBytes := int64(0)
 	for _, file := range reader.File {
 		if file.FileInfo().IsDir() {
 			continue
+		}
+		if entryCount >= limits.maxEntries {
+			return nil, common.NewErrorf("备份压缩包文件数量超过上限 %d", limits.maxEntries)
 		}
 
 		name, err := normalizeDBBackupArchiveEntryName(file.Name)
@@ -787,12 +997,23 @@ func readDBBackupArchiveEntries(data []byte) (map[string][]byte, error) {
 			return nil, common.NewErrorf("备份压缩包包含重复文件: %s", name)
 		}
 		seenNames[lowerName] = struct{}{}
+		if file.UncompressedSize64 > uint64(limits.maxEntryBytes) {
+			return nil, common.NewErrorf("备份压缩包文件过大: %s", name)
+		}
+		if totalBytes > limits.maxTotalBytes-int64(file.UncompressedSize64) {
+			return nil, common.NewErrorf("备份压缩包解压后总大小超过上限 %d", limits.maxTotalBytes)
+		}
 
 		rc, err := file.Open()
 		if err != nil {
 			return nil, common.NewErrorf("读取压缩包文件失败 %s: %v", name, err)
 		}
-		content, readErr := io.ReadAll(rc)
+		remainingBytes := limits.maxTotalBytes - totalBytes
+		entryLimit := limits.maxEntryBytes
+		if entryLimit > remainingBytes {
+			entryLimit = remainingBytes
+		}
+		content, readErr := readReaderWithLimit(rc, entryLimit, "备份压缩包文件")
 		closeErr := rc.Close()
 		if readErr != nil {
 			return nil, common.NewErrorf("读取压缩包文件失败 %s: %v", name, readErr)
@@ -801,6 +1022,8 @@ func readDBBackupArchiveEntries(data []byte) (map[string][]byte, error) {
 			return nil, common.NewErrorf("关闭压缩包文件失败 %s: %v", name, closeErr)
 		}
 		entries[name] = content
+		entryCount++
+		totalBytes += int64(len(content))
 	}
 
 	return entries, nil
@@ -863,32 +1086,8 @@ func validateRestoredDatabaseSet(stageDir string) error {
 		return common.NewError("备份中的主数据库不是有效的 SQLite 文件")
 	}
 
-	tempDB, err := gorm.Open(sqlite.Open(mainDBPath), &gorm.Config{})
-	if err != nil {
+	if err := validateSQLiteDatabaseFile(mainDBPath); err != nil {
 		return common.NewErrorf("备份中的主数据库无法打开: %v", err)
-	}
-	sqlDB, dbErr := tempDB.DB()
-	if dbErr == nil {
-		_ = sqlDB.Close()
-	}
-
-	monitorDBPath := filepath.Join(stageDir, filepath.Base(config.GetSystemMonitorDBPath()))
-	if fileExists(monitorDBPath) {
-		monitorFile, err := os.Open(monitorDBPath)
-		if err != nil {
-			return common.NewErrorf("打开监控数据库失败: %v", err)
-		}
-		monitorSQLite, checkErr := IsSQLiteDB(monitorFile)
-		closeErr := monitorFile.Close()
-		if checkErr != nil {
-			return common.NewErrorf("校验监控数据库失败: %v", checkErr)
-		}
-		if closeErr != nil {
-			return common.NewErrorf("关闭监控数据库失败: %v", closeErr)
-		}
-		if !monitorSQLite {
-			return common.NewError("备份中的监控数据库不是有效的 SQLite 文件")
-		}
 	}
 
 	return nil

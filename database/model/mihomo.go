@@ -95,6 +95,13 @@ func sanitizeMihomoOutboundRaw(raw json.RawMessage, outType string) json.RawMess
 	}
 
 	switch outType {
+	case "shadowquic":
+		// ShadowQUIC uses native SNI/ALPN and never has a mihomo_TLS block.
+		delete(payload, "tls")
+		delete(payload, "detour")
+		delete(payload, "routing_mark")
+		delete(payload, "rule")
+		delete(payload, "proxy")
 	case "selector":
 		delete(payload, "default")
 		delete(payload, "url")

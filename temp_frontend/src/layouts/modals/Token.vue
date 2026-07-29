@@ -132,6 +132,7 @@
 <script lang="ts">
 import { i18n } from '@/locales'
 import HttpUtils from '@/plugins/httputil'
+import { formatPanelDate } from '@/plugins/panelTime'
 import Clipboard from 'clipboard'
 import { push } from 'notivue';
 
@@ -166,12 +167,15 @@ export default {
   methods: {
     async loadData() {
       this.loading = true
-      const data = await HttpUtils.get('api/tokens')
-      if (data.success) {
-        this.tokens = data.obj ?? []
-        this.delOverlay = new Array<boolean>(this.tokens.length).fill(false)
+      try {
+        const data = await HttpUtils.get('api/tokens')
+        if (data.success) {
+          this.tokens = data.obj ?? []
+          this.delOverlay = new Array<boolean>(this.tokens.length).fill(false)
+        }
+      } finally {
+        this.loading = false
       }
-      this.loading = false
     },
     resetNewToken() {
       this.newToken={
@@ -186,27 +190,32 @@ export default {
     },
     async addToken() {
       this.loading = true
-      this.newToken.expiry = this.newToken.expiry>0 ? this.newToken.expiry : 0
-      const response = await HttpUtils.post('api/addToken', { desc: this.newToken.desc, expiry: this.newToken.expiry })
-      if (response.success) {
-        this.newToken.token = response.obj
-        this.loadData()
-        this.showNewToken = false
+      try {
+        this.newToken.expiry = this.newToken.expiry>0 ? this.newToken.expiry : 0
+        const response = await HttpUtils.post('api/addToken', { desc: this.newToken.desc, expiry: this.newToken.expiry })
+        if (response.success) {
+          this.newToken.token = response.obj
+          await this.loadData()
+          this.showNewToken = false
+        }
+      } finally {
+        this.loading = false
       }
-      this.loading = false
     },
     async deleteToken(id: number) {
       this.loading = true
-      const response = await HttpUtils.post('api/deleteToken', { id: id })
-      if (response.success) {
-        this.loadData()
+      try {
+        const response = await HttpUtils.post('api/deleteToken', { id: id })
+        if (response.success) {
+          await this.loadData()
+        }
+      } finally {
+        this.loading = false
       }
-      this.loading = false
     },
     dateFormatted(expiry: number) {
       if (expiry == 0) return i18n.global.t('unlimited')
-      const date = new Date(expiry*1000)
-      return date.toLocaleString(this.locale, {
+      return formatPanelDate(expiry * 1000, this.locale, {
         year: 'numeric',
         month: '2-digit',
         day: '2-digit',

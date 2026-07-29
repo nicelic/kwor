@@ -188,3 +188,42 @@ type PortForwardLimitState struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 	CreatedAt time.Time `json:"createdAt"`
 }
+
+// PortForwardRuleTrafficState stores independent persisted traffic cursors for
+// one forwarding rule. Rule and overview cursors intentionally differ: a rule
+// reset must not erase traffic that has already contributed to the overview.
+type PortForwardRuleTrafficState struct {
+	Id     uint `json:"id" gorm:"primaryKey;autoIncrement"`
+	RuleId uint `json:"ruleId" gorm:"uniqueIndex"`
+
+	LastUpBytes   int64 `json:"lastUpBytes"`
+	LastDownBytes int64 `json:"lastDownBytes"`
+	UsedUpBytes   int64 `json:"usedUpBytes"`
+	UsedDownBytes int64 `json:"usedDownBytes"`
+
+	OverviewLastUpBytes   int64 `json:"overviewLastUpBytes"`
+	OverviewLastDownBytes int64 `json:"overviewLastDownBytes"`
+
+	// AppliedResetDay and ResetPeriodTag preserve the monthly-reset cursor
+	// independently from the rule configuration. Changing or first enabling a
+	// reset day must retain the current usage; only a later calendar boundary
+	// clears the rule's own counters.
+	AppliedResetDay int    `json:"appliedResetDay"`
+	ResetPeriodTag  string `json:"resetPeriodTag" gorm:"size:64"`
+	LastResetAt     int64  `json:"lastResetAt"`
+
+	UpdatedAt time.Time `json:"updatedAt"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// PortForwardOverviewTrafficState is the singleton aggregate for the
+// forwarding runtime. It intentionally survives rule resets and deletions.
+type PortForwardOverviewTrafficState struct {
+	Id uint `json:"id" gorm:"primaryKey"`
+
+	UsedUpBytes   int64 `json:"usedUpBytes"`
+	UsedDownBytes int64 `json:"usedDownBytes"`
+
+	UpdatedAt time.Time `json:"updatedAt"`
+	CreatedAt time.Time `json:"createdAt"`
+}

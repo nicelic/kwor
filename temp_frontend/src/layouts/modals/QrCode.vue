@@ -1,5 +1,5 @@
 <template>
-  <v-dialog transition="dialog-bottom-transition" width="400">
+  <v-dialog transition="dialog-bottom-transition" width="calc(100vw - 32px)" max-width="400">
     <v-card class="rounded-lg" id="qrcode-modal" :loading="loading">
       <v-card-title>
         <v-row>
@@ -27,30 +27,46 @@
         </v-tabs>
         <v-window v-model="tab" style="margin-top: 10px;">
           <v-window-item value="sub" v-if="showSubscriptionQr">
-            <v-row>
-              <v-col style="text-align: center;">
-                <v-chip>{{ $t('setting.sub') }}</v-chip><br />
-                <QrcodeVue :value="clientSub" :size="size" @click="copyToClipboard(clientSub)" :margin="1" style="border-radius: 1rem; cursor: copy;" />
-              </v-col>
-            </v-row>
-            <v-row>
-              <v-col style="text-align: center;">
-                <v-chip>{{ $t('setting.jsonSub') }}</v-chip><br />
-                <QrcodeVue :value="clientJsonSub" :size="size" @click="copyToClipboard(clientJsonSub)" :margin="1" style="border-radius: 1rem; cursor: copy;" />
-              </v-col>
-            </v-row>
-            <v-row>
-              <v-col style="text-align: center;">
-                <v-chip>{{ $t('setting.clashSub') }}</v-chip><br />
-                <QrcodeVue :value="clientClashSub" :size="size" @click="copyToClipboard(clientClashSub)" :margin="1" style="border-radius: 1rem; cursor: copy;" />
-              </v-col>
-            </v-row>
-            <v-row>
-              <v-col style="text-align: center;">
-                <v-chip>SING-BOX (scan only)</v-chip><br />
-                <QrcodeVue :value="singbox" :size="size" :margin="1" style="border-radius: .8rem; cursor: not-allowed;" />
-              </v-col>
-            </v-row>
+            <template v-if="subscriptionUriReady">
+              <v-row>
+                <v-col style="text-align: center;">
+                  <v-chip>{{ $t('setting.sub') }}</v-chip><br />
+                  <QrcodeVue :value="clientSub" :size="size" @click="copyToClipboard(clientSub)" :margin="1" style="border-radius: 1rem; cursor: copy;" />
+                </v-col>
+              </v-row>
+              <v-row>
+                <v-col style="text-align: center;">
+                  <v-chip>{{ $t('setting.jsonSub') }}</v-chip><br />
+                  <QrcodeVue :value="clientJsonSub" :size="size" @click="copyToClipboard(clientJsonSub)" :margin="1" style="border-radius: 1rem; cursor: copy;" />
+                </v-col>
+              </v-row>
+              <v-row>
+                <v-col style="text-align: center;">
+                  <v-chip>{{ $t('setting.clashSub') }}</v-chip><br />
+                  <QrcodeVue :value="clientClashSub" :size="size" @click="copyToClipboard(clientClashSub)" :margin="1" style="border-radius: 1rem; cursor: copy;" />
+                </v-col>
+              </v-row>
+              <v-row>
+                <v-col style="text-align: center;">
+                  <v-chip>SING-BOX (scan only)</v-chip><br />
+                  <QrcodeVue :value="singbox" :size="size" :margin="1" style="border-radius: .8rem; cursor: not-allowed;" />
+                </v-col>
+              </v-row>
+            </template>
+            <v-alert v-else class="ma-3" type="error" variant="tonal">
+              <div v-if="subscriptionUriLoading" class="d-flex align-center flex-wrap" style="gap: 10px;">
+                <v-progress-circular indeterminate size="20" width="2" />
+                <span>正在验证订阅地址…</span>
+              </div>
+              <template v-else>
+                <div class="text-body-2">无法生成订阅二维码：{{ subscriptionUriError || '订阅地址不可用。' }}</div>
+                <div class="d-flex flex-wrap mt-3" style="gap: 8px;">
+                  <v-btn color="primary" size="small" variant="outlined" @click="refreshSubscriptionUri">
+                    重新加载订阅地址
+                  </v-btn>
+                </div>
+              </template>
+            </v-alert>
           </v-window-item>
           <v-window-item value="link">
             <v-row v-for="l in clientLinks">
@@ -87,16 +103,29 @@ export default {
       tab: 'sub',
       client: <any>{},
       loading: false,
+      subscriptionUriReady: false,
+      subscriptionUriLoading: false,
+      subscriptionUriError: '',
+      subscriptionUriRequestSequence: 0,
+      clientLoadRequestSequence: 0,
     }
   },
   methods: {
     async load() {
+      const requestSequence = ++this.clientLoadRequestSequence
       this.loading = true
-      const newData = await getNamespaceStore(this.namespace).loadClients(this.$props.id ?? 0)
-      this.client = newData
-      this.loading = false
+      try {
+        const newData = await getNamespaceStore(this.namespace).loadClients(this.$props.id ?? 0)
+        if (requestSequence !== this.clientLoadRequestSequence || !this.$props.visible) return
+        this.client = newData
+      } finally {
+        if (requestSequence === this.clientLoadRequestSequence) {
+          this.loading = false
+        }
+      }
     },
     copyToClipboard(txt: string) {
+      if (!txt) return
       const hiddenButton = document.createElement('button')
       hiddenButton.className = 'clipboard-btn'
       document.body.appendChild(hiddenButton)
@@ -125,8 +154,30 @@ export default {
       hiddenButton.click()
       document.body.removeChild(hiddenButton)
     },
+    async refreshSubscriptionUri() {
+      const requestSequence = ++this.subscriptionUriRequestSequence
+      this.subscriptionUriReady = false
+      this.subscriptionUriLoading = true
+      this.subscriptionUriError = ''
+      try {
+        const store = getNamespaceStore(this.namespace)
+        const success = await store.refreshSubscriptionURI()
+        if (requestSequence !== this.subscriptionUriRequestSequence || !this.$props.visible) return
+        if (success) {
+          this.subscriptionUriReady = true
+          return
+        }
+        this.subscriptionUriError = store.subscriptionUriError || '订阅地址不可用。'
+      } finally {
+        if (requestSequence === this.subscriptionUriRequestSequence) {
+          this.subscriptionUriLoading = false
+        }
+      }
+    },
     buildSubscriptionUrl(format?: string) {
+      if (!this.subscriptionUriReady) return ''
       const baseURI = getNamespaceStore(this.namespace).subURI
+      if (!baseURI) return ''
       const name = encodeURIComponent(String(this.client?.name ?? ''))
       const query = format ? '&format=' + encodeURIComponent(format) : ''
       if (this.namespace === 'mihomo') {
@@ -149,22 +200,31 @@ export default {
       return this.buildSubscriptionUrl('clash')
     },
     singbox() {
+      if (!this.clientJsonSub) return ''
       return 'sing-box://import-remote-profile?url=' + encodeURIComponent(this.clientJsonSub) + '#' + encodeURIComponent(String(this.client?.name ?? ''))
     },
     clientLinks() {
       return this.client.links ?? []
     },
     size() {
-      if (window.innerWidth > 380) return 300
-      if (window.innerWidth > 330) return 280
-      return 250
+      return Math.max(120, Math.min(300, window.innerWidth - 72))
     },
   },
   watch: {
     visible(v) {
       if (v) {
         this.tab = this.showSubscriptionQr ? 'sub' : 'link'
-        this.load()
+        void this.load()
+        if (this.showSubscriptionQr) {
+          void this.refreshSubscriptionUri()
+        }
+      } else {
+        this.clientLoadRequestSequence += 1
+        this.subscriptionUriRequestSequence += 1
+        this.client = {}
+        this.loading = false
+        this.subscriptionUriReady = false
+        this.subscriptionUriLoading = false
       }
     },
   },

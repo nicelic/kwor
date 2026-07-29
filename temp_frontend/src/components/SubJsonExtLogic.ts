@@ -2,6 +2,7 @@
 
 import { push } from 'notivue'
 import { i18n } from '@/locales'
+import { probeSubscriptionRuleSets } from './subscriptionRuleSetProbe'
 import {
   defaultLog,
   defaultTunInbound,
@@ -11,9 +12,6 @@ import {
   defaultDns,
   domainIpTypes,
   tunIpOptions,
-  RULE_SET_URL_TEMPLATES,
-  METACUBEX_NAME_MAP,
-  SOURCES_NEED_NAME_MAP,
 } from './SubJsonExtConstants'
 import {
   buildManagedCustomDomainKeywordDnsRules,
@@ -26,6 +24,7 @@ import {
 const tlsStoreValues = ['system', 'mozilla', 'chrome', 'none']
 const QUIXOTICHEART_GITHUB_SOURCE = 'quixoticheart_github'
 const SINGBOX_ALLOWED_RULE_SET_EXTENSIONS = new Set(['.srs', '.json'])
+const SUBSCRIPTION_EXTENSION_MAX_BYTES = 4 * 1024 * 1024
 
 // Comment cleaned to avoid mojibake.
 
@@ -122,71 +121,11 @@ function getSingBoxRuleSetFormat(url: string): 'binary' | 'source' {
   return 'binary'
 }
 
-/**
- * Comment cleaned.
- */
-function resolveTemplateNamesForRuleSetSource(
-  source: string,
-  prefix: 'geosite' | 'geoip',
-  cleanName: string
-): string[] {
-  let baseName = cleanName
-  if (SOURCES_NEED_NAME_MAP.includes(source)) {
-    baseName = METACUBEX_NAME_MAP[cleanName] || cleanName
-  }
-
-  if (source !== QUIXOTICHEART_GITHUB_SOURCE || prefix !== 'geoip') {
-    return [baseName]
-  }
-
-  // QuixoticHeart singbox geoip:
-  // - Country/region-style short names are usually "{name}cidr.srs".
-  // - Service-style names are usually "{name}.srs".
-  // Keep a second candidate for validation/auto-match fallback.
-  if (baseName.endsWith('cidr')) return [baseName]
-  const preferCidr = /^[a-z]{2}$/.test(baseName)
-  const candidates = preferCidr ? [`${baseName}cidr`, baseName] : [baseName, `${baseName}cidr`]
-  return Array.from(new Set(candidates))
-}
-
-function buildRuleSetUrlCandidates(source: string, prefix: 'geosite' | 'geoip', name: string): string[] {
-  const rawName = typeof name === 'string' ? name.trim() : ''
-  if (!rawName) return []
-
-  if (isHttpRuleSetInput(rawName)) {
-    return [rawName]
-  }
-
-  const cleanName = normalizeName(rawName)
-  if (!cleanName) return []
-
-  const templates = RULE_SET_URL_TEMPLATES[source]
-  if (!templates) return []
-
-  const template = prefix === 'geosite' ? templates.geosite : templates.geoip
-  const names = resolveTemplateNamesForRuleSetSource(source, prefix, cleanName)
-  return Array.from(
-    new Set(
-      names
-        .map((item) => template.replace('{name}', item))
-        .filter((url) => typeof url === 'string' && url.trim().length > 0)
-    )
-  )
-}
-
-/**
- * Comment cleaned.
- */
-function buildRuleSetUrl(source: string, prefix: 'geosite' | 'geoip', name: string): string {
-  const candidates = buildRuleSetUrlCandidates(source, prefix, name)
-  return candidates.length > 0 ? candidates[0] : ''
-}
-
 function normalizeRuleSetSourceSelection(input: any): string {
   if (typeof input !== 'string') return ''
   const source = input.trim()
   if (!source) return ''
-  return RULE_SET_URL_TEMPLATES[source] ? source : ''
+	return source
 }
 
 function normalizeRuleSetSourceOverride(input: any): string | null {
@@ -194,7 +133,7 @@ function normalizeRuleSetSourceOverride(input: any): string | null {
   if (typeof input !== 'string') return null
   const source = input.trim()
   if (source === '') return ''
-  return RULE_SET_URL_TEMPLATES[source] ? source : null
+	return source
 }
 
 function getRuleSetSourceCacheKey(source: string): string {
@@ -254,7 +193,7 @@ function buildRuleSetEntry(
   if (!rawName) return null
 
   const forcedUrl = typeof overrideUrl === 'string' ? overrideUrl.trim() : ''
-  const url = forcedUrl || buildRuleSetUrl(source, prefix, rawName)
+	const url = forcedUrl || (isHttpRuleSetInput(rawName) ? rawName : '')
   if (!url) return null
   if (!isSupportedSingBoxRuleSetUrl(url)) return null
 
@@ -457,6 +396,7 @@ type CustomRuleRow = {
 }
 
 type RuleRow = {
+	id: string
   kind: RuleRowKind
   name: string
   customType: string
@@ -467,6 +407,7 @@ type RuleRow = {
 }
 
 type DnsRouteRow = {
+	id: string
   kind: DnsRouteRowKind
   server: string
   ruleSet: string[]
@@ -477,6 +418,14 @@ const ruleRowKindValues: RuleRowKind[] = ['custom', 'ruleset']
 const ruleSetScopeValues: RuleSetScope[] = ['domain', 'ip']
 const dnsRouteRowKindValues: DnsRouteRowKind[] = ['rule-set', 'query-type']
 const dnsQueryTypeValues = ['A', 'AAAA']
+let subscriptionRowSequence = 0
+
+function stableSubscriptionRowId(raw: any, prefix: string): string {
+	const existing = typeof raw?.id === 'string' ? raw.id.trim() : ''
+	if (existing) return existing
+	subscriptionRowSequence += 1
+	return `${prefix}-${Date.now().toString(36)}-${subscriptionRowSequence.toString(36)}`
+}
 
 function normalizeCustomRuleType(input: any): string {
   const type = typeof input === 'string' ? input.trim() : ''
@@ -621,18 +570,20 @@ function normalizeDnsRouteRowKind(input: any): DnsRouteRowKind {
   return 'rule-set'
 }
 
-function createDefaultDnsRouteRow(server: string = 'proxy-dns'): DnsRouteRow {
+function createDefaultDnsRouteRow(server: string = 'proxy-dns', id?: string): DnsRouteRow {
   const normalizedServer = typeof server === 'string' && server.trim() ? server.trim() : 'proxy-dns'
   return {
+	id: id || stableSubscriptionRowId(null, 'json-dns'),
     kind: 'rule-set',
     server: normalizedServer,
     ruleSet: [],
   }
 }
 
-function createDefaultDnsQueryTypeRouteRow(server: string = 'proxy-dns'): DnsRouteRow {
+function createDefaultDnsQueryTypeRouteRow(server: string = 'proxy-dns', id?: string): DnsRouteRow {
   const normalizedServer = typeof server === 'string' && server.trim() ? server.trim() : 'proxy-dns'
   return {
+	id: id || stableSubscriptionRowId(null, 'json-dns'),
     kind: 'query-type',
     server: normalizedServer,
     ruleSet: [],
@@ -653,11 +604,11 @@ function normalizeDnsRouteRows(input: any, fakeipEnabled: boolean = false): DnsR
     if (kind === 'query-type') {
       if (hasQueryTypeRow) continue
       hasQueryTypeRow = true
-      rows.push(createDefaultDnsQueryTypeRouteRow(server))
+	  rows.push(createDefaultDnsQueryTypeRouteRow(server, stableSubscriptionRowId(raw, 'json-dns')))
       continue
     }
     const ruleSet = normalizeRuleSetValues(raw?.ruleSet)
-    rows.push({ kind, server, ruleSet })
+	rows.push({ id: stableSubscriptionRowId(raw, 'json-dns'), kind, server, ruleSet })
   }
 
   if (!rows.some((row: DnsRouteRow) => row.kind === 'rule-set')) {
@@ -703,7 +654,7 @@ function buildDnsRouteRowsFromDnsRules(rules: any, fakeipEnabled: boolean): DnsR
       const rawServer = typeof rule?.server === 'string' && rule.server.trim() ? rule.server.trim() : 'proxy-dns'
       const server = rawServer === 'fakeip' && !fakeipEnabled ? 'proxy-dns' : rawServer
       const ruleSet = normalizeRuleSetValues(rule?.rule_set)
-      rows.push({ kind: 'rule-set', server, ruleSet })
+	  rows.push({ id: stableSubscriptionRowId(rule, 'json-dns'), kind: 'rule-set', server, ruleSet })
       continue
     }
     if (isDnsQueryTypeRouteRule(rule)) {
@@ -768,9 +719,10 @@ function filterNonEmptyCustomRuleRows(rows: CustomRuleRow[]): CustomRuleRow[] {
 
 function createDefaultRuleRow(kind: RuleRowKind, route: CustomRuleRoute = 'reject'): RuleRow {
   return {
+	id: stableSubscriptionRowId(null, 'json-rule'),
     kind,
     name: '',
-    customType: 'domain',
+    customType: 'domain_keyword',
     ruleSetScope: 'domain',
     ruleSetSourceOverride: null,
     route,
@@ -798,6 +750,7 @@ function normalizeRuleRows(input: any): RuleRow[] {
     const values = normalizeCustomRuleValues(raw?.values)
 
     return {
+	  id: stableSubscriptionRowId(raw, 'json-rule'),
       kind: inferredKind,
       name,
       customType,
@@ -869,6 +822,7 @@ function buildLegacyRuleRows(config: any): RuleRow[] {
 
   for (const row of customRows) {
     rows.push({
+	  id: stableSubscriptionRowId(row, 'json-rule'),
       kind: 'custom',
       name: '',
       customType: row.type,
@@ -892,6 +846,7 @@ function buildLegacyRuleRows(config: any): RuleRow[] {
     const values = normalizeCustomRuleValues(row.values)
     if (values.length === 0) continue
     rows.push({
+	  id: stableSubscriptionRowId(row, 'json-rule'),
       kind: 'ruleset',
       name: '',
       customType: 'domain',
@@ -915,29 +870,6 @@ function getRuleSetTypeLabelForRow(route: CustomRuleRoute, scope: RuleSetScope):
   return `${routeLabelMap[route]} Ruleset (${scopeLabel})`
 }
 
-async function validateUrl(url: string): Promise<boolean> {
-  if (!url) return false
-  try {
-    const response = await fetch(url, {
-      method: 'HEAD',
-      mode: 'cors',
-      signal: AbortSignal.timeout(8000),
-    })
-    return response.ok
-  } catch {
-    try {
-      const response = await fetch(url, {
-        method: 'HEAD',
-        mode: 'no-cors',
-        signal: AbortSignal.timeout(8000),
-      })
-      return response.type === 'opaque'
-    } catch {
-      return false
-    }
-  }
-}
-
 function normalizeLatencyInput(input: any): string {
   return typeof input === 'string' ? input.trim() : ''
 }
@@ -947,11 +879,11 @@ function getSingboxLatencyIntervalError(input: any): string {
   if (!value) return ''
 
   if (/^\d+$/.test(value)) {
-    return '测试延迟间隔需要带单位（s/m/h/d），例如 3m 或 30s。'
+	return String(i18n.global.t('subscriptionEditor.jsonIntervalRequired'))
   }
 
   if (!/^[1-9]\d*(s|m|h|d)$/i.test(value)) {
-    return '测试延迟间隔格式无效，仅支持“正整数 + 单位（s/m/h/d）”，不支持 ms。'
+	return String(i18n.global.t('subscriptionEditor.jsonIntervalInvalid'))
   }
 
   return ''
@@ -969,7 +901,7 @@ function getLatencyToleranceMsError(input: any): string {
   if (!value) return ''
 
   if (!/^[1-9]\d*$/.test(value)) {
-    return '延迟容差单位为 ms；可留空，填写时仅输入数字（不要写 ms）。'
+	return String(i18n.global.t('subscriptionEditor.toleranceInvalid'))
   }
 
   return ''
@@ -1273,22 +1205,30 @@ function normalizeSubJsonClashApiDetour(parsed: any) {
   }
 }
 
-// Debounce timers for validation warnings.
-const validationTimers: Record<string, ReturnType<typeof setTimeout>> = {}
-
 export const SubJsonExtMixin = {
   created(this: any) {
+	this._probeAbortController = new AbortController()
     this.captureRuleRowsValidationSnapshot(this.ruleRows)
+  },
+  beforeUnmount(this: any) {
+	this.autoMatchRunToken = (this.autoMatchRunToken || 0) + 1
+	this._probeAbortController?.abort()
   },
   watch: {
     'settings.subJsonExt': {
       handler(this: any, v: string) {
-        if (!v) {
-          this.subJsonExt = {}
-          return
-        }
+		const raw = typeof v === 'string' ? v : ''
+		this._rawSource = raw
+		if (!raw.trim()) {
+		  this.subJsonExt = {}
+		  this._parseError = ''
+		  return
+		}
         try {
-          const parsed = JSON.parse(v)
+		  const parsed = JSON.parse(raw)
+		  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+			throw new Error(String(i18n.global.t('subscriptionEditor.jsonTopLevel')))
+		  }
           if (parsed._uiConfig && typeof parsed._uiConfig === 'object' && parsed._uiConfig.routeFinal !== undefined) {
             parsed._uiConfig.routeFinal = normalizeRouteFinalValue(parsed._uiConfig.routeFinal)
           }
@@ -1304,39 +1244,14 @@ export const SubJsonExtMixin = {
           if (JSON.stringify(parsed) !== JSON.stringify(this.subJsonExt)) {
             this.subJsonExt = parsed
           }
-        } catch {
-          // invalid json, ignore
+		  this._parseError = ''
+		} catch (error: any) {
+		  this._parseError = String(i18n.global.t('subscriptionEditor.jsonParseFailed', { error: String(error?.message || error) }))
+		  this.subJsonExt = {}
         }
       },
       immediate: true,
     },
-    subJsonExt: {
-      handler(this: any, v: any) {
-        const str =
-          Object.keys(v).length === 0
-            ? ''
-            : JSON.stringify(
-                v,
-                (_key: string, value: any) => {
-                  if (value && typeof value === 'object' && !Array.isArray(value)) {
-                    return Object.keys(value)
-                      .sort()
-                      .reduce((sorted: any, k: string) => {
-                        sorted[k] = value[k]
-                        return sorted
-                      }, {} as any)
-                  }
-                  return value
-                },
-                2
-              )
-        if (str !== this.settings.subJsonExt) {
-          this.settings.subJsonExt = str
-        }
-      },
-      deep: true,
-    },
-
     'subJsonExt._uiConfig': {
       handler(this: any, config: any) {
         if (!config) return
@@ -1446,6 +1361,98 @@ export const SubJsonExtMixin = {
 
   },
   methods: {
+	markUserDirty(this: any) {
+	  const wasDirty = this._dirty === true
+	  this._dirty = true
+	  this._resetRequested = false
+	  this._editorSourcePending = false
+	  if (!wasDirty) this.$emit?.('dirty-change', true)
+	},
+	isDirty(this: any): boolean {
+	  return this._dirty === true
+	},
+	validateAndSerialize(this: any) {
+	  const dirty = this._dirty === true
+	  if (!dirty) {
+		return { ok: true, dirty: false, value: this._rawSource || '' }
+	  }
+	  if (this._resetRequested === true) {
+		return { ok: true, dirty: true, reset: true, value: '' }
+	  }
+	  if (this._parseError) {
+		return { ok: false, dirty: true, value: this._rawSource || '', error: this._parseError }
+	  }
+	  if (this._editorSourcePending === true) {
+		const validationError = this.validateSubscriptionForm?.()
+		let value = ''
+		try {
+		  value = Object.keys(this.subJsonExt || {}).length === 0 ? '' : JSON.stringify(this.subJsonExt, null, 2)
+		} catch (error: any) {
+		  return { ok: false, dirty: true, value: '', error: String(i18n.global.t('subscriptionEditor.jsonSerializeFailed', { error: String(error?.message || error) })) }
+		}
+		if (new TextEncoder().encode(value).length > SUBSCRIPTION_EXTENSION_MAX_BYTES) {
+		  return { ok: false, dirty: true, value, error: String(i18n.global.t('subscriptionEditor.configTooLarge')) }
+		}
+		this.settings.subJsonExt = value
+		this._rawSource = value
+		return { ok: !validationError, dirty: true, value, error: validationError || '' }
+	  }
+
+	  this.commitCustomRuleRows?.()
+	  this.commitDnsRouteRows?.()
+	  this.regenerateRuleConfig?.()
+	  this.updateJson?.()
+	  const validationError = this.validateSubscriptionForm?.()
+	  let value = ''
+	  try {
+		value = Object.keys(this.subJsonExt || {}).length === 0
+		  ? ''
+		  : JSON.stringify(this.subJsonExt, null, 2)
+	  } catch (error: any) {
+		return { ok: false, dirty: true, value: '', error: String(i18n.global.t('subscriptionEditor.jsonSerializeFailed', { error: String(error?.message || error) })) }
+	  }
+	  if (new TextEncoder().encode(value).length > SUBSCRIPTION_EXTENSION_MAX_BYTES) {
+		return { ok: false, dirty: true, value, error: String(i18n.global.t('subscriptionEditor.configTooLarge')) }
+	  }
+	  this.settings.subJsonExt = value
+	  this._rawSource = value
+	  return { ok: !validationError, dirty: true, value, error: validationError || '' }
+	},
+	validateSubscriptionForm(this: any): string {
+	  if (this.latencyTestIntervalError) return this.latencyTestIntervalError
+	  if (this.latencyToleranceError) return this.latencyToleranceError
+	  const inbounds = Array.isArray(this.subJsonExt?.inbounds) ? this.subJsonExt.inbounds : []
+	  for (const inbound of inbounds) {
+		const port = inbound?.listen_port
+		if (port !== undefined && (!Number.isInteger(Number(port)) || Number(port) < 1 || Number(port) > 65535)) {
+		  return String(i18n.global.t('subscriptionEditor.inboundPortInvalid'))
+		}
+		const mtu = inbound?.mtu
+		if (mtu !== undefined && (!Number.isInteger(Number(mtu)) || Number(mtu) < 576 || Number(mtu) > 65535)) {
+		  return String(i18n.global.t('subscriptionEditor.tunMtuInvalid'))
+		}
+	  }
+	  const servers = Array.isArray(this.subJsonExt?.dns?.servers) ? this.subJsonExt.dns.servers : []
+	  const seenTags = new Set<string>()
+	  for (const server of servers) {
+		const tag = String(server?.tag || '').trim()
+		const type = String(server?.type || '').trim().toLowerCase()
+		if (!tag || !type) return String(i18n.global.t('subscriptionEditor.dnsServerTagTypeRequired'))
+		if (seenTags.has(tag)) return String(i18n.global.t('subscriptionEditor.dnsTagDuplicate', { tag }))
+		seenTags.add(tag)
+		if (!['local', 'dhcp', 'fakeip'].includes(type) && !String(server?.server || '').trim()) {
+		  return String(i18n.global.t('subscriptionEditor.dnsServerMissing', { tag }))
+		}
+	  }
+	  return ''
+	},
+	acknowledgeSaved(this: any, value: string) {
+	  this._dirty = false
+	  this._resetRequested = false
+	  this._editorSourcePending = false
+	  this._rawSource = value
+	  this.$emit?.('dirty-change', false)
+	},
     normalizeTunIpSelection(this: any, input: any): string[] {
       const normalized = normalizeCustomRuleValues(input)
       const ipv4 = normalized.find((ip: string) => !ip.includes(':'))
@@ -1523,6 +1530,9 @@ export const SubJsonExtMixin = {
       this._ruleRowsValidationSnapshot = deepCopy(normalizeRuleRows(rows))
     },
     openEditor(this: any) {
+	  this.autoMatchRunToken = (this.autoMatchRunToken || 0) + 1
+	  this._probeAbortController?.abort()
+	  this._probeAbortController = new AbortController()
       this.enableEditor = true
     },
     resetSubJsonPage(this: any) {
@@ -1536,10 +1546,26 @@ export const SubJsonExtMixin = {
         }
       }
 
-      this.subJsonExt = {}
-      this.settings.subJsonExt = ''
-      this._uiConfigLoaded = false
-      this.captureRuleRowsValidationSnapshot(this.ruleRows)
+	  let canonical: any = {}
+	  try {
+		canonical = JSON.parse(String(this.canonicalDefault || '{}'))
+	  } catch {
+		canonical = {}
+	  }
+	  this.subJsonExt = canonical
+	  this.settings.subJsonExt = String(this.canonicalDefault || '')
+	  this._rawSource = this.settings.subJsonExt
+	  this._parseError = ''
+	  this._dirty = true
+	  this._resetRequested = true
+	  this._editorSourcePending = false
+	  this._uiConfigLoaded = false
+	  this.captureRuleRowsValidationSnapshot(this.ruleRows)
+	  this.settings.serverTlsStoreEnabled = 'true'
+	  this.settings.serverTlsStore = 'chrome'
+	  this.settings.clientTlsStoreEnabled = 'true'
+	  this.settings.clientTlsStore = 'chrome'
+	  this.$emit?.('dirty-change', true)
 
       this.$nextTick(() => {
         this._suspendRuleRegeneration = false
@@ -1548,7 +1574,7 @@ export const SubJsonExtMixin = {
     saveEditor(this: any, data: string) {
       try {
         const result = JSON.parse(data)
-        if (typeof result !== 'object' || Array.isArray(result)) {
+		if (result === null || typeof result !== 'object' || Array.isArray(result)) {
           push.warning({
             title: i18n.global.t('error'),
             message: i18n.global.t('setting.jsonNotObj'),
@@ -1557,14 +1583,21 @@ export const SubJsonExtMixin = {
           return
         }
         normalizeSubJsonDns(result)
-        normalizeDefaultDomainResolver(result)
-        normalizeTunPlatform(result)
+		normalizeDefaultDomainResolver(result)
+		normalizeTunPlatform(result)
+		this.markUserDirty()
+		this._parseError = ''
+		this._resetRequested = false
+		this._editorSourcePending = true
         const fakeipEnabled = Array.isArray(result?.dns?.servers) &&
           result.dns.servers.some((s: any) => s?.type === 'fakeip')
         this.dnsRouteRows = buildDnsRouteRowsFromDnsRules(result?.dns?.rules, fakeipEnabled)
         this.subJsonExt = result
         this._uiConfigLoaded = false
         this.updateJson()
+		const normalized = JSON.stringify(this.subJsonExt, null, 2)
+		this._rawSource = normalized
+		this.settings.subJsonExt = normalized
         this.enableEditor = false
       } catch (e) {
         push.warning({
@@ -1575,11 +1608,18 @@ export const SubJsonExtMixin = {
       }
     },
     getTypeLabel(this: any, type: string): string {
-      const found = domainIpTypes.find((t) => t.value === type)
-      return found ? found.title : type
+	  const keys: Record<string, string> = {
+		domain: 'subscriptionEditor.domainExact',
+		domain_suffix: 'subscriptionEditor.domainSuffix',
+		domain_keyword: 'subscriptionEditor.domainKeyword',
+		domain_regex: 'subscriptionEditor.domainRegex',
+		ip_cidr: 'subscriptionEditor.ipCidr',
+		ip_is_private: 'subscriptionEditor.privateIp',
+	  }
+	  return keys[type] ? `${i18n.global.t(keys[type])} (${type})` : type
     },
     getRuleSetScopeLabel(this: any, scope: string): string {
-      return scope === 'ip' ? 'IP 规则集' : '域名规则集'
+	  return String(i18n.global.t(scope === 'ip' ? 'subscriptionEditor.ipRuleSet' : 'subscriptionEditor.domainRuleSet'))
     },
     applyRuleNameConstraints(this: any, rows: RuleRow[]): RuleNameConstraintResult {
       return applyRuleNameConstraints(normalizeRuleRows(rows))
@@ -1596,12 +1636,12 @@ export const SubJsonExtMixin = {
         if (seen.has(key)) continue
         seen.add(key)
 
-        const message = issue.code === 'custom_conflicts_ruleset'
-          ? `规则集名称冲突：自定义匹配名称“${name}”与规则集名称重复，已自动清空该名称。`
-          : `匹配类型不一致：自定义匹配名称“${name}”仅允许同匹配类型合并（当前应为 ${issue.expectedType || '同类型'}），已自动清空该名称。`
+		const message = issue.code === 'custom_conflicts_ruleset'
+		  ? String(i18n.global.t('subscriptionEditor.ruleNameConflict', { name }))
+		  : String(i18n.global.t('subscriptionEditor.ruleTypeConflict', { name, type: issue.expectedType || issue.currentType }))
 
         push.warning({
-          title: '名称已自动修正',
+		  title: String(i18n.global.t('subscriptionEditor.nameAutoFixed')),
           message,
           duration: 5000,
         })
@@ -1789,9 +1829,32 @@ export const SubJsonExtMixin = {
       const options = Array.isArray(this.ruleSetSourceOptions) ? this.ruleSetSourceOptions : []
       return options
         .map((item: any) => (typeof item?.value === 'string' ? item.value : ''))
-        .filter((value: string) => value.length > 0 && Boolean(RULE_SET_URL_TEMPLATES[value]))
+		.filter((value: string) => value.length > 0)
         .filter((value: string, idx: number, arr: string[]) => arr.indexOf(value) === idx)
     },
+	getRuleSetSourceOverrideOptions(this: any, scope: string) {
+	  const templateKey = scope === 'ip' ? 'ipTemplate' : 'domainTemplate'
+	  const options = (Array.isArray(this.ruleSetSources) ? this.ruleSetSources : [])
+		.filter((item: any) => typeof item?.[templateKey] === 'string' && item[templateKey].trim())
+		.map((item: any) => ({ title: item.title || item.id, value: item.id }))
+	  return [{ title: i18n.global.t('subscriptionEditor.useGlobalRuleSetSource'), value: null }, ...options]
+	},
+	buildRuleSetUrlFromRegistry(this: any, source: string, prefix: 'geosite' | 'geoip', rawName: string): string {
+	  if (isHttpRuleSetInput(rawName)) return rawName.trim()
+	  const entry = (Array.isArray(this.ruleSetSources) ? this.ruleSetSources : [])
+		.find((item: any) => item?.id === source)
+	  const template = prefix === 'geoip' ? entry?.ipTemplate : entry?.domainTemplate
+	  if (typeof template !== 'string' || !template.trim()) return ''
+	  let name = normalizeName(rawName)
+	  if (['metacubex_github', 'metacubex_cdn', 'karingx_github', 'karingx_cdn'].includes(source)) {
+		if (name === 'ads') name = 'category-ads-all'
+		if (name === 'ir') name = 'category-ir'
+	  }
+	  if (source === QUIXOTICHEART_GITHUB_SOURCE && prefix === 'geoip' && /^[a-z]{2}$/.test(name)) {
+		name = `${name}cidr`
+	  }
+	  return template.replace('{name}', encodeURIComponent(name))
+	},
     getCurrentRuleSetSource(this: any): string {
       return normalizeRuleSetSourceSelection(this.ruleSetSource)
     },
@@ -1850,21 +1913,9 @@ export const SubJsonExtMixin = {
       typeLabel: string,
       sourceContext: { source: string; sourceBinding: RuleSetSourceBinding }
     ) {
-      const fromUrl = isHttpRuleSetInput(rawName)
-      const cleanName = fromUrl ? extractRuleSetNameFromUrl(rawName) : normalizeName(rawName)
-      if (!cleanName) return
       const source = normalizeRuleSetSourceSelection(sourceContext?.source)
       const sourceBinding: RuleSetSourceBinding = sourceContext?.sourceBinding === 'override' ? 'override' : 'global'
-      const timerKey = fromUrl
-        ? `auto-match:${sourceBinding}:${prefix}:url:${rawName.trim()}`
-        : `auto-match:${sourceBinding}:${getRuleSetSourceCacheKey(source)}:${prefix}:${cleanName}`
-      if (validationTimers[timerKey]) {
-        clearTimeout(validationTimers[timerKey])
-      }
-      validationTimers[timerKey] = setTimeout(async () => {
-        await this.tryAutoMatchRuleSetEntry(rawName, prefix, typeLabel, { source, sourceBinding })
-        delete validationTimers[timerKey]
-      }, 500)
+	  void this.tryAutoMatchRuleSetEntry(rawName, prefix, typeLabel, { source, sourceBinding })
     },
     async tryAutoMatchRuleSetEntry(
       this: any,
@@ -1881,131 +1932,51 @@ export const SubJsonExtMixin = {
       const currentSource = normalizeRuleSetSourceSelection(sourceContext?.source)
       const sourceBinding: RuleSetSourceBinding = sourceContext?.sourceBinding === 'override' ? 'override' : 'global'
       const allowFallback = sourceBinding === 'global'
-      const noFallbackMessage = (sourceValue: string) => sourceValue
-        ? `${typeLabel} ${cleanName}：当前来源 ${this.getRuleSetSourceTitle(sourceValue)} 检测失败，不进行回退`
-        : `${typeLabel} ${cleanName}：当前所选规则集来源检测失败，不进行回退`
+	  const probeId = `${sourceBinding}:${prefix}:${cleanName}`
+	  const [probe] = await probeSubscriptionRuleSets([{
+	    id: probeId,
+	    kind: 'json',
+	    sourceId: currentSource,
+	    scope: prefix === 'geoip' ? 'ip' : 'domain',
+	    name: fromUrl ? undefined : cleanName,
+	    url: fromUrl ? rawName.trim() : undefined,
+	    allowFallback,
+	  }], this._probeAbortController?.signal)
+	  if (token !== (this.autoMatchRunToken || 0) || this._probeAbortController?.signal?.aborted) return
 
-      if (fromUrl) {
-        const url = rawName.trim()
-        if (!url) return
-        if (!isSupportedSingBoxRuleSetUrl(url)) {
-          push.error({
-            title: 'Rule-set validation',
-            message: `${typeLabel} ${cleanName}: unsupported file extension. JSON subscription only supports .json or .srs`,
-            duration: 5000,
-          })
-          return
-        }
-        const isValid = await validateUrl(url)
-        if (token !== (this.autoMatchRunToken || 0)) return
-        if (isValid) {
-          push.success({
-            title: '规则集校验',
-            message: `${typeLabel} ${cleanName}：链接可用`,
-            duration: 3000,
-          })
-        } else {
-          push.warning({
-            title: '规则集校验',
-            message: `${typeLabel} ${cleanName}：链接不可用，不进行回退`,
-            duration: 3000,
-          })
-        }
-        return
-      }
+	  const key = fromUrl ? '' : getRuleSetAutoMatchKey(prefix, cleanName, currentSource, sourceBinding)
+	  if (!probe?.valid) {
+	    if (key && this.autoMatchedRuleSetUrls?.[key]) {
+	      const next = { ...this.autoMatchedRuleSetUrls }
+	      delete next[key]
+	      this.autoMatchedRuleSetUrls = next
+	      this.regenerateRuleConfig()
+	    }
+	    push.warning({
+	      title: String(i18n.global.t('subscriptionEditor.probeTitle')),
+	      message: String(i18n.global.t('subscriptionEditor.probeFailed', { type: typeLabel, name: cleanName, error: probe?.error || 'Unavailable' })),
+	      duration: 4000,
+	    })
+	    return
+	  }
 
-      const key = getRuleSetAutoMatchKey(prefix, cleanName, currentSource, sourceBinding)
-      if (!key) return
-
-      const sourceOrder = this.getRuleSetSourceOrderForFallback()
-      let matchedSource = ''
-      let matchedUrl = ''
-      let notifiedNoFallback = false
-
-      if (currentSource) {
-        const currentUrls = buildRuleSetUrlCandidates(currentSource, prefix, cleanName)
-        for (const url of currentUrls) {
-          if (!isSupportedSingBoxRuleSetUrl(url)) continue
-          const isValid = await validateUrl(url)
-          if (token !== (this.autoMatchRunToken || 0)) return
-          if (isValid) {
-            matchedSource = currentSource
-            matchedUrl = url
-            break
-          }
-        }
-        if (matchedUrl) {
-          push.success({
-            title: '规则集校验',
-            message: `${typeLabel} ${cleanName}：当前来源 ${this.getRuleSetSourceTitle(currentSource)} 可用`,
-            duration: 3000,
-          })
-        } else {
-          push.warning({
-            title: '规则集校验',
-            message: allowFallback
-              ? `${typeLabel} ${cleanName}：当前来源 ${this.getRuleSetSourceTitle(currentSource)} 检测失败，开始回退`
-              : noFallbackMessage(currentSource),
-            duration: 3000,
-          })
-          notifiedNoFallback = !allowFallback
-        }
-      }
-
-      const fallbackSources = sourceOrder.filter((source: string) => source !== currentSource)
-      if (!matchedUrl && allowFallback) {
-        for (const source of fallbackSources) {
-          const urls = buildRuleSetUrlCandidates(source, prefix, cleanName)
-          for (const url of urls) {
-            if (!isSupportedSingBoxRuleSetUrl(url)) continue
-            const isValid = await validateUrl(url)
-            if (token !== (this.autoMatchRunToken || 0)) return
-            if (isValid) {
-              matchedSource = source
-              matchedUrl = url
-              break
-            }
-          }
-          if (matchedUrl) break
-        }
-      }
-
-      if (!matchedUrl) {
-        const cached = this.autoMatchedRuleSetUrls?.[key]
-        if (cached) {
-          const next = { ...this.autoMatchedRuleSetUrls }
-          delete next[key]
-          this.autoMatchedRuleSetUrls = next
-          this.regenerateRuleConfig()
-        }
-        if (allowFallback || !notifiedNoFallback) {
-          push.warning({
-            title: '规则集校验',
-            message: allowFallback
-              ? `${typeLabel} ${cleanName}：未找到可用来源`
-              : noFallbackMessage(currentSource),
-            duration: 3000,
-          })
-        }
-        return
-      }
-
-      if (allowFallback && (!currentSource || matchedSource !== currentSource)) {
-        push.success({
-          title: '规则集校验',
-          message: `${typeLabel} ${cleanName}：已回退到 ${this.getRuleSetSourceTitle(matchedSource)}`,
-          duration: 3000,
-        })
-      }
-
-      const current = this.autoMatchedRuleSetUrls?.[key]
-      if (current?.url === matchedUrl && current?.source === matchedSource) return
-
-      this.autoMatchedRuleSetUrls = {
-        ...(this.autoMatchedRuleSetUrls || {}),
-        [key]: { url: matchedUrl, source: matchedSource },
-      }
-      this.regenerateRuleConfig()
+	  const matchedSource = probe.sourceId || currentSource
+	  const matchedUrl = probe.url || (fromUrl ? rawName.trim() : '')
+	  push.success({
+	    title: String(i18n.global.t('subscriptionEditor.probeTitle')),
+	    message: allowFallback && currentSource && matchedSource !== currentSource
+	      ? String(i18n.global.t('subscriptionEditor.probeFallback', { type: typeLabel, name: cleanName, source: this.getRuleSetSourceTitle(matchedSource) }))
+	      : String(i18n.global.t('subscriptionEditor.probeAvailable', { type: typeLabel, name: cleanName })),
+	    duration: 3000,
+	  })
+	  if (!key || !matchedUrl) return
+	  const current = this.autoMatchedRuleSetUrls?.[key]
+	  if (current?.url === matchedUrl && current?.source === matchedSource) return
+	  this.autoMatchedRuleSetUrls = {
+	    ...(this.autoMatchedRuleSetUrls || {}),
+	    [key]: { url: matchedUrl, source: matchedSource },
+	  }
+	  this.regenerateRuleConfig()
     },
     updateJson(this: any) {
       if (this.subJsonExt?.route_final !== undefined) {
@@ -2034,7 +2005,7 @@ export const SubJsonExtMixin = {
      * Comment cleaned.
      */
     regenerateRuleConfig(this: any) {
-      if (this._suspendRuleRegeneration) return
+	  if (this._suspendRuleRegeneration || this._editorSourcePending) return
       if (!this.subJsonExt || typeof this.subJsonExt !== 'object') {
         this.subJsonExt = {}
       }
@@ -2107,6 +2078,7 @@ export const SubJsonExtMixin = {
       this.subJsonExt._uiConfig = {
         ruleSetSource: this.getCurrentRuleSetSource(),
         ruleRows: persistedRows.map((row: RuleRow) => ({
+		  id: row.id,
           kind: row.kind,
           name: row.name,
           customType: row.customType,
@@ -2137,6 +2109,7 @@ export const SubJsonExtMixin = {
         enableRejectQuic: this.enableRejectQuic,
         enableReject443Udp: this.enableReject443Udp,
         dnsRouteRows: persistedDnsRouteRows.map((row: DnsRouteRow) => ({
+		  id: row.id,
           kind: row.kind,
           server: row.server,
           ruleSet: [...row.ruleSet],
@@ -2175,7 +2148,8 @@ export const SubJsonExtMixin = {
         prefix: 'geosite' | 'geoip',
         rawName: string,
         sourceBinding: RuleSetSourceBinding
-      ) => this.getResolvedRuleSetUrl(prefix, rawName, source, sourceBinding)
+	  ) => this.getResolvedRuleSetUrl(prefix, rawName, source, sourceBinding)
+		|| this.buildRuleSetUrlFromRegistry(source, prefix, rawName)
       const { ruleSetMap, tagsByGroup } = buildRuleSetPayload(detour, interval, allRuleSetInputs, resolveRuleSetUrl)
 
       const rules: any[] = []
@@ -2372,14 +2346,21 @@ export const SubJsonExtMixin = {
      */
     showValidationWarning(this: any, typeLabel: string, name: string) {
       push.warning({
-        title: '规则集校验失败',
-        message: `${typeLabel} ${name} 无效`,
+		title: String(i18n.global.t('subscriptionEditor.probeTitle')),
+		message: String(i18n.global.t('subscriptionEditor.probeFailed', {
+		  type: typeLabel,
+		  name,
+		  error: i18n.global.t('subscriptionEditor.unavailable'),
+		})),
         duration: 5000,
       })
     },
   },
 
   computed: {
+	parseError(this: any): string {
+	  return this._parseError || ''
+	},
     latencyTestIntervalError(this: any): string {
       return getSingboxLatencyIntervalError(this.latencyTestInterval)
     },
@@ -2387,16 +2368,9 @@ export const SubJsonExtMixin = {
       return getLatencyToleranceMsError(this.latencyTolerance)
     },
     editorData(this: any): string {
+	  if (this._parseError) return this._rawSource || ''
       if (Object.keys(this.subJsonExt).length === 0) return ''
-      // Comment cleaned to avoid mojibake.
-      const hiddenKeys = new Set(['_uiConfig', 'route_final', 'latency_test_url', 'latency_test_interval', 'latency_tolerance', 'selector_groups'])
-      const filtered: any = {}
-      for (const key of Object.keys(this.subJsonExt)) {
-        if (!hiddenKeys.has(key)) {
-          filtered[key] = this.subJsonExt[key]
-        }
-      }
-      return JSON.stringify(filtered, null, 2)
+	  return JSON.stringify(this.subJsonExt, null, 2)
     },
 
     // Comment cleaned to avoid mojibake.
@@ -2645,7 +2619,8 @@ export const SubJsonExtMixin = {
         prefix: 'geosite' | 'geoip',
         rawName: string,
         sourceBinding: RuleSetSourceBinding
-      ) => this.getResolvedRuleSetUrl(prefix, rawName, source, sourceBinding)
+	  ) => this.getResolvedRuleSetUrl(prefix, rawName, source, sourceBinding)
+		|| this.buildRuleSetUrlFromRegistry(source, prefix, rawName)
 
       const { tagsByGroup } = buildRuleSetPayload(
         detour,

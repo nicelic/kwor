@@ -3,12 +3,10 @@ package service
 import (
 	"fmt"
 	"net/netip"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/util/common"
 	"gorm.io/gorm"
 )
@@ -20,33 +18,11 @@ const (
 
 var (
 	portForwardRuntimeGOOS = func() string {
-		return runtime.GOOS
+		return GetSystemPlatformOS()
 	}
-	portForwardReadSocketSnapshot = readSocketSnapshot
+	portForwardReadSocketConflictSockets    = readProcListenerSockets
+	portForwardReadSocketConflictBindV6Only = readIPv6BindV6OnlyDefault
 )
-
-type portForwardReservedRange struct {
-	label      string
-	normalized string
-	tcp        bool
-	udp        bool
-	spans      []portSpan
-}
-
-func (r portForwardReservedRange) matchesProtocol(protocol string) bool {
-	reservedProtocol := ""
-	switch {
-	case r.tcp && r.udp:
-		reservedProtocol = portForwardProtocolTCPUDP
-	case r.tcp:
-		reservedProtocol = portForwardProtocolTCP
-	case r.udp:
-		reservedProtocol = portForwardProtocolUDP
-	default:
-		return false
-	}
-	return portForwardProtocolsOverlap(protocol, reservedProtocol)
-}
 
 func portForwardTargetIsLocal(targetIP string) bool {
 	trimmed := strings.TrimSpace(strings.Trim(targetIP, "[]"))
@@ -160,23 +136,26 @@ func validatePortForwardRuleAvailability(db *gorm.DB, row normalizedPortForwardR
 		))
 	}
 
-	reservedRanges, err := collectPortForwardReservedRanges(db)
+	claims, err := collectPortForwardListenerClaims(db)
 	if err != nil {
 		return err
 	}
-	for _, reserved := range reservedRanges {
-		if !reserved.matchesProtocol(row.protocol) {
+	for _, claim := range claims {
+		if !portForwardProtocolsOverlap(row.protocol, claim.protocol) {
 			continue
 		}
-		overlap := collectPortForwardSpanOverlapPorts(row.localPortSpans, reserved.spans)
-		if len(overlap) == 0 {
+		if !portForwardFamiliesOverlap(row.family, claim.family) {
+			continue
+		}
+		overlap := summarizePortForwardSpanOverlap(row.localPortSpans, claim.spans)
+		if overlap.count == 0 {
 			continue
 		}
 		issues = append(issues, fmt.Sprintf(
-			"conflicts with %s port-hop range %s (overlap: %s)",
-			reserved.label,
-			reserved.normalized,
-			portForwardFormatPortSample(overlap),
+			"conflicts with %s listener %s (overlap: %s)",
+			claim.label,
+			formatPortForwardSpans(claim.spans),
+			portForwardFormatOverlap(overlap),
 		))
 	}
 
@@ -195,32 +174,57 @@ func findPortForwardSocketConflicts(row normalizedPortForwardRule) ([]int, []int
 	if portForwardRuntimeGOOS() != "linux" {
 		return nil, nil, nil
 	}
-	snapshot, err := portForwardReadSocketSnapshot()
-	if err != nil {
-		return nil, nil, err
-	}
 	spans := row.localPortSpans
 	if len(spans) == 0 {
 		spans = []portSpan{{start: row.localPortStart, end: row.localPortEnd}}
 	}
-
+	filter := firewallListenerFilter{}
 	flags := portForwardProtocolFlagsFor(row.protocol)
-	occupiedTCP := make([]int, 0)
-	occupiedUDP := make([]int, 0)
-	if flags.tcp {
-		occupiedTCP = collectOccupiedPorts(snapshot.tcp, spans)
+	for _, span := range spans {
+		current := portRange{start: span.start, end: span.end}
+		if flags.tcp {
+			filter.tcpRanges = append(filter.tcpRanges, current)
+		}
+		if flags.udp {
+			filter.udpRanges = append(filter.udpRanges, current)
+		}
 	}
-	if flags.udp {
-		occupiedUDP = collectOccupiedPorts(snapshot.udp, spans)
+	filter.tcpRanges = mergePortRanges(filter.tcpRanges)
+	filter.udpRanges = mergePortRanges(filter.udpRanges)
+	sockets, err := portForwardReadSocketConflictSockets(filter)
+	if err != nil {
+		return nil, nil, err
 	}
+	bindV6Only, bindV6OnlyKnown := portForwardReadSocketConflictBindV6Only()
+	occupiedTCPSet := make(map[int]struct{})
+	occupiedUDPSet := make(map[int]struct{})
+	for _, socket := range sockets {
+		stack, _ := resolveProcListenerStack(socket, bindV6Only, bindV6OnlyKnown)
+		if !portForwardNormalizedRuleMatchesSocket(row, socket, stack) {
+			continue
+		}
+		switch socket.protocol {
+		case firewallProtocolTCP:
+			occupiedTCPSet[socket.port] = struct{}{}
+		case firewallProtocolUDP:
+			occupiedUDPSet[socket.port] = struct{}{}
+		}
+	}
+	occupiedTCP := portForwardSortedPortSet(occupiedTCPSet)
+	occupiedUDP := portForwardSortedPortSet(occupiedUDPSet)
 	return occupiedTCP, occupiedUDP, nil
 }
 
-func collectPortForwardSpanOverlapPorts(a []portSpan, b []portSpan) []int {
-	if len(a) == 0 || len(b) == 0 {
-		return nil
-	}
-	out := make([]int, 0)
+type portForwardSpanOverlap struct {
+	count  int
+	sample []int
+}
+
+// summarizePortForwardSpanOverlap keeps conflict checks bounded even for a
+// whole-port-space declaration. It counts intersections arithmetically and
+// stores only a short representative sample for diagnostics.
+func summarizePortForwardSpanOverlap(a []portSpan, b []portSpan) portForwardSpanOverlap {
+	result := portForwardSpanOverlap{sample: make([]int, 0, 12)}
 	for _, left := range a {
 		for _, right := range b {
 			start := left.start
@@ -234,76 +238,63 @@ func collectPortForwardSpanOverlapPorts(a []portSpan, b []portSpan) []int {
 			if start > end {
 				continue
 			}
-			for port := start; port <= end; port++ {
-				out = append(out, port)
+			result.count += end - start + 1
+			for port := start; port <= end && len(result.sample) < 12; port++ {
+				result.sample = append(result.sample, port)
 			}
 		}
 	}
-	return out
+	return result
 }
 
-func collectPortForwardReservedRanges(db *gorm.DB) ([]portForwardReservedRange, error) {
-	if db == nil {
-		return nil, nil
-	}
+func collectPortForwardSpanOverlapPorts(a []portSpan, b []portSpan) []int {
+	return summarizePortForwardSpanOverlap(a, b).sample
+}
 
-	result := make([]portForwardReservedRange, 0)
+func portForwardFormatOverlap(overlap portForwardSpanOverlap) string {
+	if overlap.count == 0 {
+		return "-"
+	}
+	value := portForwardFormatPortSample(overlap.sample)
+	if overlap.count > len(overlap.sample) {
+		return value + " (total " + strconv.Itoa(overlap.count) + ")"
+	}
+	return value
+}
 
-	defaultInbounds := make([]model.Inbound, 0)
-	if err := db.Select("id, type, tag, options").
-		Where("type IN ?", []string{"hysteria", "hysteria2"}).
-		Find(&defaultInbounds).Error; err != nil {
-		return nil, err
+func portForwardSortedPortSet(values map[int]struct{}) []int {
+	ports := make([]int, 0, len(values))
+	for port := range values {
+		ports = append(ports, port)
 	}
-	for _, inbound := range defaultInbounds {
-		rangeText := strings.TrimSpace(extractPortHopRange(inbound.Options))
-		if rangeText == "" {
-			continue
-		}
-		spans, normalized, err := parseStrictPortRanges(rangeText)
-		if err != nil || len(spans) == 0 {
-			continue
-		}
-		result = append(result, portForwardReservedRange{
-			label:      buildPortForwardReservedLabel(false, inbound.Type, inbound.Tag),
-			normalized: normalized,
-			udp:        true,
-			spans:      spans,
-		})
-	}
+	sort.Ints(ports)
+	return ports
+}
 
-	mihomoInbounds := make([]model.MihomoInbound, 0)
-	if err := db.Select("id, type, tag, options, out_json").
-		Where("type IN ?", []string{"hysteria", "hysteria2", "mieru"}).
-		Find(&mihomoInbounds).Error; err != nil {
-		return nil, err
+func portForwardNormalizedRuleMatchesSocket(row normalizedPortForwardRule, socket procListenerSocket, socketStack string) bool {
+	flags := portForwardProtocolFlagsFor(row.protocol)
+	if socket.protocol == firewallProtocolTCP && !flags.tcp {
+		return false
 	}
-	for _, inbound := range mihomoInbounds {
-		rangeText, redirectTCP := resolveMihomoInboundRedirectSpec(&inbound)
-		rangeText = strings.TrimSpace(rangeText)
-		if rangeText == "" {
-			continue
-		}
-		spans, normalized, err := parseStrictPortRanges(rangeText)
-		if err != nil || len(spans) == 0 {
-			continue
-		}
-		result = append(result, portForwardReservedRange{
-			label:      buildPortForwardReservedLabel(true, inbound.Type, inbound.Tag),
-			normalized: normalized,
-			tcp:        redirectTCP,
-			udp:        true,
-			spans:      spans,
-		})
+	if socket.protocol == firewallProtocolUDP && !flags.udp {
+		return false
 	}
-
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].label == result[j].label {
-			return result[i].normalized < result[j].normalized
-		}
-		return result[i].label < result[j].label
-	})
-	return result, nil
+	spans := row.localPortSpans
+	if len(spans) == 0 {
+		spans = []portSpan{{start: row.localPortStart, end: row.localPortEnd}}
+	}
+	if !portForwardPortInSpans(socket.port, spans) {
+		return false
+	}
+	family := portForwardFamilyFlagsFor(row.family)
+	switch socketStack {
+	case firewallFamilyDual:
+		return family.ipv4 || family.ipv6
+	case firewallFamilyIPv4:
+		return family.ipv4
+	default:
+		return family.ipv6
+	}
 }
 
 func buildPortForwardReservedLabel(isMihomo bool, inboundType string, tag string) string {
@@ -326,30 +317,6 @@ func buildPortForwardReservedLabel(isMihomo bool, inboundType string, tag string
 		return "Mihomo " + name + " [" + tag + "]"
 	}
 	return name + " [" + tag + "]"
-}
-
-func collectPortForwardOverlapPorts(start int, end int, spans []portSpan) []int {
-	if start < 1 || end < start || len(spans) == 0 {
-		return nil
-	}
-	out := make([]int, 0)
-	for _, span := range spans {
-		overlapStart := start
-		if span.start > overlapStart {
-			overlapStart = span.start
-		}
-		overlapEnd := end
-		if span.end < overlapEnd {
-			overlapEnd = span.end
-		}
-		if overlapStart > overlapEnd {
-			continue
-		}
-		for port := overlapStart; port <= overlapEnd; port++ {
-			out = append(out, port)
-		}
-	}
-	return out
 }
 
 func portForwardFormatPortSample(ports []int) string {

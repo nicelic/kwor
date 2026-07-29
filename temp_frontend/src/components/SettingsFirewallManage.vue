@@ -53,14 +53,29 @@
             </div>
 
             <div class="firewall-hero__chips">
-              <v-chip size="small" :color="overview.enabled ? 'success' : 'grey'" variant="flat">
+              <v-chip
+                size="small"
+                :color="overview.enabled ? 'success' : 'grey'"
+                variant="flat"
+                :class="[
+                  'firewall-hero-chip',
+                  overview.enabled ? 'firewall-hero-chip--running' : 'firewall-hero-chip--stopped',
+                ]">
                 {{ overview.enabled ? '运行中' : '已关闭' }}
               </v-chip>
-              <v-chip size="small" color="info" variant="tonal">
+              <v-chip size="small" color="info" variant="flat" class="firewall-hero-chip firewall-hero-chip--ports">
                 当前保留 {{ formatPortList(overview.defaultPorts.active) }}
               </v-chip>
-              <v-chip size="small" color="warning" variant="tonal">
+              <v-chip size="small" color="warning" variant="flat" class="firewall-hero-chip firewall-hero-chip--sync">
                 上次同步：{{ lastSyncLabel }}
+              </v-chip>
+              <v-chip
+                v-if="overview.nftables.installed || overview.nftables.kernelVersion"
+                size="small"
+                :color="nftCapabilityChipColor"
+                variant="flat"
+                class="firewall-hero-chip firewall-hero-chip--capability">
+                {{ nftCapabilityLabel }}
               </v-chip>
             </div>
 
@@ -825,11 +840,16 @@
 </template>
 
 <script setup lang="ts">
-import HttpUtils from '@/plugins/httputil'
+import HttpUtils, { type Msg } from '@/plugins/httputil'
+import { confirm } from '@/plugins/confirm'
+import { i18n } from '@/locales'
+import { formatPanelDateTime } from '@/plugins/panelTime'
 import { firewallGeoCountryCodeOptions, firewallGeoSourceProviderOptions } from './SettingsFirewallGeoOptions'
 import { push } from 'notivue'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useDisplay } from 'vuetify'
+
+const confirmAction = (action: string) => i18n.global.t(`confirmDialog.actions.${action}`)
 
 type FirewallRule = {
   id: number
@@ -912,6 +932,22 @@ type FirewallNftablesStatus = {
   installed: boolean
   autoInstallSupported: boolean
   binaryPath: string
+  nftVersion: string
+  kernelVersion: string
+  compatibilityMode: string
+  rendererSupported: boolean
+  supportsJson: boolean
+  supportsNamedCounters: boolean
+  supportsMeters: boolean
+  supportsInetNat: boolean
+  supportsTransportHeader: boolean
+  supportsTableComments: boolean
+  capabilityError: string
+  versionProbeError: string
+  jsonProbeError: string
+  meterProbeError: string
+  layoutPending: boolean
+  lastApplyError: string
   systemFamily: string
   packageManager: string
   manualCommands: string[]
@@ -994,6 +1030,22 @@ const emptyOverview = (): FirewallOverview => ({
     installed: false,
     autoInstallSupported: false,
     binaryPath: '',
+    nftVersion: '',
+    kernelVersion: '',
+    compatibilityMode: 'conservative',
+    rendererSupported: false,
+    supportsJson: false,
+    supportsNamedCounters: false,
+    supportsMeters: false,
+    supportsInetNat: false,
+    supportsTransportHeader: false,
+    supportsTableComments: false,
+    capabilityError: '',
+    versionProbeError: '',
+    jsonProbeError: '',
+    meterProbeError: '',
+    layoutPending: false,
+    lastApplyError: '',
     systemFamily: '',
     packageManager: '',
     manualCommands: [],
@@ -1084,6 +1136,7 @@ const originFilter = ref('all')
 const dialogVisible = ref(false)
 const geoDialogVisible = ref(false)
 const pollTimer = ref<number | null>(null)
+const overviewRequest = ref<Promise<Msg> | null>(null)
 const geoSearchText = ref('')
 const geoFamilyFilter = ref('all')
 const geoActionFilter = ref('all')
@@ -1257,6 +1310,34 @@ const lastSyncLabel = computed(() => {
   return formatTimestamp(overview.value.lastSyncAt)
 })
 
+const nftCapabilityLabel = computed(() => {
+  const nftables = overview.value.nftables
+  const version = nftables.nftVersion ? `nft ${nftables.nftVersion}` : 'nft 版本未知'
+  const kernel = nftables.kernelVersion ? `内核 ${nftables.kernelVersion}` : '内核版本未知'
+  const modeMap: Record<string, string> = {
+    native: '原生布局',
+    compatibility: '兼容布局',
+    conservative: '保守兼容布局',
+  }
+  const renderer = nftables.rendererSupported ? '' : ' · 渲染不可用'
+  const pending = nftables.layoutPending ? ' · 待完整校验' : ''
+  return `${version} · ${kernel} · ${modeMap[nftables.compatibilityMode] || '保守兼容布局'}${renderer}${pending}`
+})
+
+const nftCapabilityChipColor = computed(() => {
+  if (!overview.value.nftables.rendererSupported || overview.value.nftables.layoutPending) {
+    return 'warning'
+  }
+  switch (overview.value.nftables.compatibilityMode) {
+    case 'native':
+      return 'success'
+    case 'compatibility':
+      return 'info'
+    default:
+      return 'warning'
+  }
+})
+
 const geoLastRefreshLabel = computed(() => {
   if (!overview.value.geoLastRefreshAt) return '未刷新'
   return formatTimestamp(overview.value.geoLastRefreshAt)
@@ -1341,7 +1422,7 @@ const formatPortList = (ports: number[]) => {
 
 const formatTimestamp = (timestamp: number) => {
   if (!timestamp) return '未刷新'
-  return new Date(timestamp * 1000).toLocaleString()
+  return formatPanelDateTime(timestamp * 1000)
 }
 
 const formatMetricCount = (value: number) => {
@@ -1606,15 +1687,26 @@ const applyOverview = (raw: any) => {
 }
 
 const fetchOverview = async (silent = false) => {
+  if (overviewRequest.value) {
+    return overviewRequest.value
+  }
   if (!silent) {
     loading.value = true
   }
-  try {
+  const request = (async () => {
     const msg = await HttpUtils.get('api/firewall-overview')
     if (msg.success && msg.obj) {
       applyOverview(msg.obj)
     }
+    return msg
+  })()
+  overviewRequest.value = request
+  try {
+    return await request
   } finally {
+    if (overviewRequest.value === request) {
+      overviewRequest.value = null
+    }
     if (!silent) {
       loading.value = false
     }
@@ -1659,12 +1751,14 @@ const onToggleFirewall = async (nextValue: boolean | null) => {
   }
   if (nextValue === switchEnabled.value) return
 
-  const confirmed = window.confirm(
-    nextValue
+  const confirmed = await confirm({
+    message: nextValue
       ? '开启后会按当前面板规则重建防火墙链，仅放行系统保留端口和面板已配置规则，并扫描系统已有放行规则供展示，是否继续？'
-      : '关闭后会删除面板自己的防火墙链，但保留当前规则记录，是否继续？'
-  )
-  if (!confirmed) {
+      : '关闭后会删除面板自己的防火墙链，但保留当前规则记录，是否继续？',
+    severity: 'warning',
+    confirmText: confirmAction(nextValue ? 'enable' : 'disable'),
+  })
+  if (!confirmed || switchBusy.value || !overview.value.available || nextValue === overview.value.enabled) {
     switchEnabled.value = overview.value.enabled
     return
   }
@@ -1713,8 +1807,18 @@ const saveSSHPort = async () => {
     return
   }
 
-  const confirmed = window.confirm(`确认将 SSH 端口改为 ${nextPort}，并重启 SSH 服务使其生效吗？`)
-  if (!confirmed) {
+  const confirmed = await confirm({
+    message: `确认将 SSH 端口改为 ${nextPort}，并重启 SSH 服务使其生效吗？`,
+    severity: 'warning',
+    confirmText: confirmAction('save'),
+  })
+  if (
+    !confirmed
+    || savingSSHPort.value
+    || !sshPortInputValid.value
+    || sshPortInputValue.value !== nextPort
+    || nextPort === sshPortBaseline.value
+  ) {
     return
   }
 
@@ -1840,11 +1944,13 @@ const saveRule = async () => {
 }
 
 const removeRule = async (rule: FirewallRule) => {
-  const confirmed = window.confirm(
-    rule.origin === 'system'
+  const confirmed = await confirm({
+    message: rule.origin === 'system'
       ? `确定移除系统保留「${rule.name}」吗？移除后防火墙将不再自动放行对应端口。`
-      : `确定删除规则「${rule.name}」吗？`
-  )
+      : `确定删除规则「${rule.name}」吗？`,
+    severity: 'danger',
+    confirmText: confirmAction(rule.origin === 'system' ? 'remove' : 'delete'),
+  })
   if (!confirmed) return
 
   const msg = await HttpUtils.post('api/firewall-rule-delete', { id: rule.id }, {
@@ -1864,12 +1970,14 @@ const removeRule = async (rule: FirewallRule) => {
 const setSystemRuleReserved = async (systemKey: string, enabled: boolean) => {
   if (!['ssh', 'sub'].includes(systemKey)) return
   const actionLabel = enabled ? '恢复保留' : '移除保留'
-  const confirmed = window.confirm(
-    enabled
+  const confirmed = await confirm({
+    message: enabled
       ? `确定恢复 ${systemKey === 'ssh' ? 'SSH' : '订阅'} 的系统保留吗？恢复后会重新自动放行对应端口。`
-      : `确定移除 ${systemKey === 'ssh' ? 'SSH' : '订阅'} 的系统保留吗？移除后防火墙将不再自动放行对应端口。`
-  )
-  if (!confirmed) return
+      : `确定移除 ${systemKey === 'ssh' ? 'SSH' : '订阅'} 的系统保留吗？移除后防火墙将不再自动放行对应端口。`,
+    severity: enabled ? 'warning' : 'danger',
+    confirmText: confirmAction(enabled ? 'restore' : 'remove'),
+  })
+  if (!confirmed || systemRuleBusyKey.value !== '') return
 
   systemRuleBusyKey.value = systemKey
   try {
@@ -1963,7 +2071,11 @@ const saveGeoRule = async () => {
 }
 
 const removeGeoRule = async (rule: FirewallGeoRule) => {
-  const confirmed = window.confirm(`确定删除 GeoIP 规则「${rule.name}」吗？`)
+  const confirmed = await confirm({
+    message: `确定删除 GeoIP 规则「${rule.name}」吗？`,
+    severity: 'danger',
+    confirmText: confirmAction('delete'),
+  })
   if (!confirmed) return
 
   const msg = await HttpUtils.post('api/firewall-geo-rule-delete', { id: rule.id }, {
@@ -2032,19 +2144,23 @@ const saveGeoSettings = async () => {
 
 const stopPolling = () => {
   if (pollTimer.value != null) {
-    window.clearInterval(pollTimer.value)
+    window.clearTimeout(pollTimer.value)
     pollTimer.value = null
   }
 }
 
-const startPolling = () => {
+const schedulePolling = (delay = 10000) => {
   stopPolling()
   if (!props.active) return
   if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
-  pollTimer.value = window.setInterval(() => {
-    void fetchOverview(true)
-  }, 4000)
+  pollTimer.value = window.setTimeout(async () => {
+    pollTimer.value = null
+    const msg = await fetchOverview(true)
+    schedulePolling(msg.success ? 10000 : 30000)
+  }, delay)
 }
+
+const startPolling = () => schedulePolling()
 
 const handleVisibilityChange = () => {
   if (document.visibilityState === 'visible') {
@@ -2230,6 +2346,52 @@ onBeforeUnmount(() => {
   margin-top: 18px;
 }
 
+.firewall-hero__chips :deep(.v-chip) {
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.firewall-hero-chip {
+  min-height: 28px;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+}
+
+.firewall-hero-chip--running {
+  background: #15803d !important;
+  color: #f0fdf4 !important;
+}
+
+.firewall-hero-chip--stopped {
+  background: #475569 !important;
+  color: #f8fafc !important;
+}
+
+.firewall-hero-chip--ports {
+  max-width: 100%;
+  background: #1d4ed8 !important;
+  color: #eff6ff !important;
+}
+
+.firewall-hero-chip--sync {
+  background: #92400e !important;
+  color: #fef3c7 !important;
+}
+
+.firewall-hero-chip--capability {
+  max-width: 100%;
+  min-height: 28px;
+}
+
+.firewall-hero-chip--capability :deep(.v-chip__content) {
+  overflow-wrap: anywhere;
+  padding-block: 2px;
+  white-space: normal;
+}
+
+.firewall-hero-chip :deep(.v-chip__content) {
+  color: inherit !important;
+}
+
 .firewall-ssh-row {
   margin-top: 14px;
   display: grid;
@@ -2362,6 +2524,16 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 960px) {
+  .firewall-hero-chip--ports {
+    height: auto;
+  }
+
+  .firewall-hero-chip--ports :deep(.v-chip__content) {
+    overflow-wrap: anywhere;
+    padding-block: 2px;
+    white-space: normal;
+  }
+
   .firewall-hero__controls {
     width: 100%;
   }
