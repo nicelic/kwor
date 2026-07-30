@@ -555,6 +555,7 @@ const feedback = ref<{ type: 'success' | 'warning' | 'error' | 'info'; message: 
   type: 'info',
   message: '',
 })
+let downloadFeedbackTimer: number | null = null
 
 const createLoadingGuard = (loadingRef: Ref<boolean>) => {
   let pendingCount = 0
@@ -705,7 +706,24 @@ const setFeedback = (type: 'success' | 'warning' | 'error' | 'info', message: st
 }
 
 const clearFeedback = () => {
+  if (downloadFeedbackTimer != null) {
+    window.clearTimeout(downloadFeedbackTimer)
+    downloadFeedbackTimer = null
+  }
   feedback.value.message = ''
+}
+
+const showTransientDownloadFeedback = (type: 'success' | 'warning' | 'error' | 'info', message: string, duration = 4500) => {
+  if (downloadFeedbackTimer != null) {
+    window.clearTimeout(downloadFeedbackTimer)
+  }
+  feedback.value = { type, message }
+  downloadFeedbackTimer = window.setTimeout(() => {
+    if (feedback.value.message === message) {
+      feedback.value.message = ''
+    }
+    downloadFeedbackTimer = null
+  }, duration)
 }
 
 const normalizeKernelSystemCleanup = (raw: any): KernelSystemCleanupInfo => {
@@ -1155,33 +1173,53 @@ const isTerminalKernelDownload = (progress: KernelDownloadProgress) => (
 
 let completedKernelDownloadTaskID = ''
 
-const completeKernelDownloadTask = async (progress: KernelDownloadProgress) => {
-  if (!progress.id || completedKernelDownloadTaskID === progress.id) return
+const clearCompletedKernelDownloadTask = (id: string) => {
+  if (downloadProgress.value.id === id && isTerminalKernelDownload(downloadProgress.value)) {
+    resetDownloadProgress()
+  }
+  if (downloadProgressSessionId.value === id) {
+    downloadProgressSessionId.value = ''
+  }
+  kernelDownloadStopRequestPending.value = false
+}
+
+const completeKernelDownloadTask = async (progress: KernelDownloadProgress, allowTerminal = true) => {
+  if (!progress.id) return
+  if (completedKernelDownloadTaskID === progress.id) {
+    clearCompletedKernelDownloadTask(progress.id)
+    return
+  }
+  if (!allowTerminal) {
+    clearCompletedKernelDownloadTask(progress.id)
+    return
+  }
   completedKernelDownloadTaskID = progress.id
   kernelDownloadStopRequestPending.value = false
-  if (progress.state === 'success' || progress.status === 'success') {
-    const count = Math.max(0, progress.downloadedCount)
-    setFeedback('success', t('kernelManager.downloadDone', { count }))
-    await Promise.all([
-      loadRuntimeOverview(),
-      loadOverview(),
-    ])
-    return
-  }
-  if (progress.state === 'cancelled') {
-    setFeedback('info', '内核包下载已停止，未完成的临时文件已清理')
-    return
-  }
-  if (progress.state === 'timed_out') {
-    setFeedback('warning', '内核包下载超过 20 分钟，已停止并清理临时文件')
-    return
-  }
-  if (progress.error) {
-    setFeedback('error', progress.error)
+  try {
+    if (progress.state === 'success' || progress.status === 'success') {
+      const count = Math.max(0, progress.downloadedCount)
+      showTransientDownloadFeedback('success', t('kernelManager.downloadDone', { count }))
+      await Promise.all([
+        loadRuntimeOverview(),
+        loadOverview(),
+      ])
+      return
+    }
+    if (progress.state === 'cancelled') {
+      showTransientDownloadFeedback('info', '内核包下载已停止，未完成的临时文件已清理')
+      return
+    }
+    if (progress.state === 'timed_out') {
+      showTransientDownloadFeedback('warning', '内核包下载超过 20 分钟，已停止并清理临时文件')
+      return
+    }
+    showTransientDownloadFeedback('error', progress.error || t('kernelManager.downloadFailed'), 5500)
+  } finally {
+    clearCompletedKernelDownloadTask(progress.id)
   }
 }
 
-const applyKernelDownloadProgress = (raw: any) => {
+const applyKernelDownloadProgress = (raw: any, allowTerminal = true) => {
   const nextProgress = normalizeKernelDownloadProgress(raw)
   downloadProgress.value = nextProgress
   if (nextProgress.id !== '') {
@@ -1189,7 +1227,7 @@ const applyKernelDownloadProgress = (raw: any) => {
   }
   if (isTerminalKernelDownload(nextProgress)) {
     stopDownloadProgressPolling()
-    void completeKernelDownloadTask(nextProgress)
+    void completeKernelDownloadTask(nextProgress, allowTerminal)
   }
 }
 
@@ -1222,12 +1260,14 @@ const startDownloadProgressPolling = (sessionId: string) => {
   void pollDownloadProgress()
 }
 
-const recoverKernelDownloadTask = async (): Promise<boolean> => {
+const recoverKernelDownloadTask = async (allowTerminal = false): Promise<boolean> => {
   const msg = await HttpUtils.get('api/kernel-download-progress', {}, { silentAuthCheck: true })
   if (!msg.success || !msg.obj) return false
   const nextProgress = normalizeKernelDownloadProgress(msg.obj)
   if (nextProgress.id === '' || nextProgress.state === 'idle' || nextProgress.status === 'missing') return false
-  applyKernelDownloadProgress(nextProgress)
+  const terminal = isTerminalKernelDownload(nextProgress)
+  applyKernelDownloadProgress(nextProgress, allowTerminal)
+  if (terminal) return allowTerminal
   if (kernelDownloadTaskActive.value) {
     startDownloadProgressPolling(nextProgress.id)
   }
@@ -1535,6 +1575,10 @@ watch(() => props.active, (active) => {
 onBeforeUnmount(() => {
   stopDownloadProgressPolling()
   clearReconnectTimer()
+  if (downloadFeedbackTimer != null) {
+    window.clearTimeout(downloadFeedbackTimer)
+    downloadFeedbackTimer = null
+  }
   if (typeof document !== 'undefined') {
     document.removeEventListener('visibilitychange', handleVisibilityChange)
   }

@@ -3001,7 +3001,8 @@ const selfSignedAuthorityItems = computed(() => {
 })
 
 const shouldPauseOverviewPolling = computed(() => {
-  return issueDialogVisible.value
+  return installing.value
+    || issueDialogVisible.value
     || selfSignedDialogVisible.value
     || selfSignedAuthorityManagerVisible.value
     || selfSignedAuthorityFormVisible.value
@@ -3788,38 +3789,55 @@ const clearAcmeInstallTaskPolling = () => {
   }
 }
 
+const clearCompletedAcmeInstallTask = (id: string) => {
+  if (acmeInstallTask.value?.id === id && isTerminalAcmeInstallTask(acmeInstallTask.value)) {
+    acmeInstallTask.value = null
+  }
+  acmeInstallStopRequestPending.value = false
+}
+
 const isAcmeInstallPollingAllowed = () => (
   props.active && (typeof document === 'undefined' || document.visibilityState === 'visible')
 )
 
 const completeAcmeInstallTask = async (task: AcmeInstallTaskStatus) => {
-  if (!task.id || completedAcmeInstallTaskID === task.id) return
+  if (!task.id) return
+  if (completedAcmeInstallTaskID === task.id) {
+    clearCompletedAcmeInstallTask(task.id)
+    return
+  }
   completedAcmeInstallTaskID = task.id
   acmeInstallStopRequestPending.value = false
-  if (task.state === 'success') {
-    await refreshOverview(true)
-    push.success({ duration: 3600, message: 'acme.sh 下载 / 重装完成' })
-    return
-  }
-  if (task.state === 'cancelled') {
-    push.info({ duration: 3600, message: 'acme.sh 下载任务已停止，临时文件已清理' })
-    return
-  }
-  if (task.state === 'timed_out') {
-    push.warning({ duration: 4600, message: 'acme.sh 下载任务超过 20 分钟，已停止并清理临时文件' })
-    return
-  }
-  if (task.error) {
-    push.error({ duration: 5000, message: task.error })
+  try {
+    if (task.state === 'success') {
+      await refreshOverview(true)
+      push.success({ duration: 3600, message: 'acme.sh 下载 / 重装完成' })
+      return
+    }
+    if (task.state === 'cancelled') {
+      push.info({ duration: 3600, message: 'acme.sh 下载任务已停止，临时文件已清理' })
+      return
+    }
+    if (task.state === 'timed_out') {
+      push.warning({ duration: 4600, message: 'acme.sh 下载任务超过 20 分钟，已停止并清理临时文件' })
+      return
+    }
+    push.error({ duration: 5000, message: task.error || 'acme.sh 下载 / 重装失败' })
+  } finally {
+    clearCompletedAcmeInstallTask(task.id)
   }
 }
 
-const applyAcmeInstallTaskStatus = (raw: any) => {
+const applyAcmeInstallTaskStatus = (raw: any, notifyTerminal = true) => {
   const task = normalizeAcmeInstallTaskStatus(raw)
   acmeInstallTask.value = task.id === '' || task.state === 'idle' ? null : task
   if (acmeInstallTask.value != null && isTerminalAcmeInstallTask(acmeInstallTask.value)) {
     clearAcmeInstallTaskPolling()
-    void completeAcmeInstallTask(acmeInstallTask.value)
+    if (notifyTerminal) {
+      void completeAcmeInstallTask(acmeInstallTask.value)
+    } else {
+      clearCompletedAcmeInstallTask(acmeInstallTask.value.id)
+    }
   }
 }
 
@@ -3861,12 +3879,14 @@ const startAcmeInstallTaskPolling = () => {
   void pollAcmeInstallTask()
 }
 
-const recoverAcmeInstallTask = async (): Promise<boolean> => {
+const recoverAcmeInstallTask = async (allowTerminal = false): Promise<boolean> => {
   const msg = await HttpUtils.get('api/acme-install-status', {}, { silentAuthCheck: true })
   if (!msg.success || !msg.obj) return false
   const task = normalizeAcmeInstallTaskStatus(msg.obj)
   if (task.id === '' || task.state === 'idle') return false
-  applyAcmeInstallTaskStatus(task)
+  const terminal = isTerminalAcmeInstallTask(task)
+  applyAcmeInstallTaskStatus(task, allowTerminal)
+  if (terminal) return allowTerminal
   if (acmeInstallTaskActive.value) {
     startAcmeInstallTaskPolling()
   }
@@ -3930,10 +3950,12 @@ const installAcme = async () => {
       return
     }
     const recovered = await recoverAcmeInstallTask()
-    if (!recovered && targetVersion !== '') {
-      push.warning({
-        duration: 4200,
-        message: `版本 ${targetVersion} 无法下载或安装`,
+    if (!recovered) {
+      push.error({
+        duration: 5000,
+        message: String(msg.msg || (targetVersion !== ''
+          ? `版本 ${targetVersion} 无法下载或安装`
+          : beforeVersion === '' ? 'acme.sh 下载任务未能受理' : 'acme.sh 重装任务未能受理')),
       })
     }
   } catch {

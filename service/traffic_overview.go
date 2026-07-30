@@ -2485,10 +2485,12 @@ func runManagedCommandOutputContext(parent context.Context, dir string, timeout 
 		return output.Bytes(), err, false
 	}
 	if err := TrackKworManagedCommandContext(parent, cmd); err != nil {
-		_ = cmd.Process.Kill()
+		stopKworManagedCommand(cmd)
 		_ = cmd.Wait()
 		return output.Bytes(), fmt.Errorf("record command process: %w", err), false
 	}
+	stopWatchingCommand := watchKworManagedCommandContext(ctx, cmd)
+	defer stopWatchingCommand()
 	err := cmd.Wait()
 	return output.Bytes(), err, errors.Is(ctx.Err(), context.DeadlineExceeded)
 }

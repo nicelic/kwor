@@ -1016,10 +1016,12 @@ func validatePanelBinaryContext(parent context.Context, binPath string) error {
 		return fmt.Errorf("downloaded kwor binary is not executable: %v", err)
 	}
 	if err := TrackKworManagedCommandContext(parent, cmd); err != nil {
-		_ = cmd.Process.Kill()
+		stopKworManagedCommand(cmd)
 		_ = cmd.Wait()
 		return fmt.Errorf("record downloaded kwor binary validation process: %w", err)
 	}
+	stopWatchingCommand := watchKworManagedCommandContext(ctx, cmd)
+	defer stopWatchingCommand()
 	err := cmd.Wait()
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Errorf("downloaded kwor binary validation timed out")
@@ -1129,10 +1131,12 @@ func launchPanelUpdateSystemdWorker(ctx context.Context, systemdArgs []string) p
 		return panelUpdateSystemdLaunchResult{Output: output.String(), Err: err}
 	}
 	if err := TrackKworManagedCommandContext(ctx, cmd); err != nil {
-		_ = cmd.Process.Kill()
+		stopKworManagedCommand(cmd)
 		_ = cmd.Wait()
 		return panelUpdateSystemdLaunchResult{Started: true, Output: output.String(), Err: fmt.Errorf("record panel update launcher process: %w", err)}
 	}
+	stopWatchingCommand := watchKworManagedCommandContext(ctx, cmd)
+	defer stopWatchingCommand()
 	runErr := cmd.Wait()
 	return panelUpdateSystemdLaunchResult{Started: true, Output: output.String(), Err: runErr}
 }

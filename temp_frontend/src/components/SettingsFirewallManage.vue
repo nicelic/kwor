@@ -1811,6 +1811,25 @@ const clearNftablesInstallPolling = () => {
   }
 }
 
+const resetNftablesInstallTask = () => {
+  clearNftablesInstallPolling()
+  nftablesInstallTask.value = {
+    id: '',
+    state: 'idle',
+    phase: '',
+    canCancel: false,
+    stopRequested: false,
+    deadlineExceeded: false,
+    error: '',
+    startedAt: 0,
+    updatedAt: 0,
+    deadlineAt: 0,
+    finishedAt: 0,
+  }
+  installingNftables.value = false
+  nftablesStopRequestPending.value = false
+}
+
 const scheduleNftablesInstallPolling = () => {
   clearNftablesInstallPolling()
   if (!hasActiveNftablesInstall.value || !props.active) return
@@ -1821,7 +1840,7 @@ const scheduleNftablesInstallPolling = () => {
 }
 
 let completedNftablesTaskID = ''
-const applyNftablesInstallTask = async (raw: any) => {
+const applyNftablesInstallTask = async (raw: any, allowTerminal = true) => {
   const task = normalizeManagedInstallTask(raw)
   nftablesInstallTask.value = task
   installingNftables.value = hasActiveNftablesInstall.value
@@ -1831,27 +1850,44 @@ const applyNftablesInstallTask = async (raw: any) => {
     return
   }
   clearNftablesInstallPolling()
-  if (!task.id || completedNftablesTaskID === task.id) return
+  if (!task.id) {
+    if (!allowTerminal) resetNftablesInstallTask()
+    return
+  }
+  if (completedNftablesTaskID === task.id) {
+    resetNftablesInstallTask()
+    return
+  }
+  if (!allowTerminal) {
+    resetNftablesInstallTask()
+    return
+  }
   completedNftablesTaskID = task.id
-  await fetchOverview(true)
-  if (task.state === 'success') {
-    push.success({ duration: 4000, message: 'nftables 已安装并完成应用' })
-    return
-  }
-  if (task.state === 'cancelled' || task.state === 'timed_out') {
-    push.info({ duration: 5000, message: task.state === 'timed_out' ? 'nftables 下载超时，任务已停止' : 'nftables 下载已停止' })
-    return
-  }
-  if (task.state === 'error') {
-    push.warning({ duration: 6000, message: task.error || task.phase || 'nftables 安装失败' })
+  try {
+    await fetchOverview(true)
+    if (task.state === 'success') {
+      push.success({ duration: 4000, message: 'nftables 已安装并完成应用' })
+      return
+    }
+    if (task.state === 'cancelled' || task.state === 'timed_out') {
+      push.info({ duration: 5000, message: task.state === 'timed_out' ? 'nftables 下载超时，任务已停止' : 'nftables 下载已停止' })
+      return
+    }
+    if (task.state === 'error') {
+      push.warning({ duration: 6000, message: task.error || task.phase || 'nftables 安装失败' })
+    }
+  } finally {
+    resetNftablesInstallTask()
   }
 }
 
-const recoverNftablesInstall = async () => {
+const recoverNftablesInstall = async (allowTerminal = false) => {
   const msg = await HttpUtils.get('api/firewall-nftables-install-status', {}, { silentAuthCheck: true })
   if (!msg.success || !msg.obj) return false
-  await applyNftablesInstallTask(msg.obj)
-  return hasActiveNftablesInstall.value
+  const task = normalizeManagedInstallTask(msg.obj)
+  const terminal = task.id !== '' && ['success', 'error', 'cancelled', 'timed_out'].includes(task.state)
+  await applyNftablesInstallTask(task, allowTerminal)
+  return hasActiveNftablesInstall.value || (allowTerminal && terminal)
 }
 
 const pollNftablesInstall = async () => {
@@ -1865,6 +1901,8 @@ const pollNftablesInstall = async () => {
 }
 
 const installNftables = async () => {
+  completedNftablesTaskID = ''
+  resetNftablesInstallTask()
   installingNftables.value = true
   try {
     const msg = await HttpUtils.post('api/firewall-nftables-install', {}, {

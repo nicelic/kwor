@@ -730,6 +730,39 @@ func PrepareKworManagedCommandContext(ctx context.Context, cmd *exec.Cmd) {
 	cmd.Env = setKworCommandEnvironment(cmd.Environ(), kworLifecycleOperationIDEnv, handle.id)
 }
 
+// stopKworManagedCommand terminates the complete prepared process group when
+// the platform supports one. Commands in managed download tasks may spawn
+// curl, tar, or shell children, so killing only the outer process can leave a
+// failed task holding resources in the background.
+func stopKworManagedCommand(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = stopKworManagedCommandProcess(cmd.Process)
+}
+
+// watchKworManagedCommandContext closes the entire prepared process group as
+// soon as its operation context is cancelled. exec.CommandContext otherwise
+// kills only the outer process, which is insufficient for shell-based
+// downloaders that have already spawned children.
+func watchKworManagedCommandContext(ctx context.Context, cmd *exec.Cmd) func() {
+	if ctx == nil || cmd == nil || cmd.Process == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		select {
+		case <-ctx.Done():
+			stopKworManagedCommand(cmd)
+		case <-done:
+		}
+	}()
+	return func() {
+		once.Do(func() { close(done) })
+	}
+}
+
 func setKworCommandEnvironment(environment []string, key string, value string) []string {
 	key = strings.TrimSpace(key)
 	if key == "" {

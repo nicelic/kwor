@@ -604,6 +604,7 @@ const deletingCore = ref(false)
 const autoCheckSaving = ref(false)
 const feedbackMsg = ref('')
 const feedbackType = ref<'success' | 'error' | 'info'>('info')
+let downloadFeedbackTimer: number | null = null
 
 const autoCheckEnabled = ref(false)
 const autoCheckIntervalInput = ref('12')
@@ -1103,6 +1104,38 @@ const resetDownloadProgress = () => {
   }
 }
 
+const clearDownloadFeedback = () => {
+  if (downloadFeedbackTimer != null) {
+    window.clearTimeout(downloadFeedbackTimer)
+    downloadFeedbackTimer = null
+  }
+  feedbackMsg.value = ''
+}
+
+const showTransientDownloadFeedback = (type: 'success' | 'error' | 'info', message: string, duration = 4500) => {
+  if (downloadFeedbackTimer != null) {
+    window.clearTimeout(downloadFeedbackTimer)
+  }
+  feedbackType.value = type
+  feedbackMsg.value = message
+  downloadFeedbackTimer = window.setTimeout(() => {
+    if (feedbackMsg.value === message) {
+      feedbackMsg.value = ''
+    }
+    downloadFeedbackTimer = null
+  }, duration)
+}
+
+const clearCompletedCoreDownloadTask = (id: string) => {
+  if (downloadProgress.value.id === id && isTerminalCoreDownload(downloadProgress.value)) {
+    resetDownloadProgress()
+  }
+  if (downloadProgressSessionId.value === id) {
+    downloadProgressSessionId.value = ''
+  }
+  downloading.value = false
+}
+
 const makeDownloadSessionId = () => {
   const randomPart = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
@@ -1123,23 +1156,32 @@ const isTerminalCoreDownload = (progress: CoreDownloadProgress) => (
 )
 
 let completedDownloadTaskId = ''
-const completeCoreDownloadTask = async (progress: CoreDownloadProgress) => {
-  if (progress.id === '' || completedDownloadTaskId === progress.id) return
+const completeCoreDownloadTask = async (progress: CoreDownloadProgress, allowTerminal = true) => {
+  if (progress.id === '') return
+  if (completedDownloadTaskId === progress.id) {
+    clearCompletedCoreDownloadTask(progress.id)
+    return
+  }
+  if (!allowTerminal) {
+    clearCompletedCoreDownloadTask(progress.id)
+    return
+  }
   completedDownloadTaskId = progress.id
   downloading.value = false
-  if (progress.state === 'success' || (progress.state === 'idle' && progress.status === 'success')) {
-    feedbackMsg.value = t('coreManager.downloadSuccess', { coreName: mihomoCore.coreName, version: '' })
-    feedbackType.value = 'success'
-    await Promise.all([loadCoreStatus(), loadCoreUpdateInfo(false)])
-    return
+  try {
+    if (progress.state === 'success' || (progress.state === 'idle' && progress.status === 'success')) {
+      showTransientDownloadFeedback('success', t('coreManager.downloadSuccess', { coreName: mihomoCore.coreName, version: '' }))
+      await Promise.all([loadCoreStatus(), loadCoreUpdateInfo(false)])
+      return
+    }
+    if (progress.state === 'cancelled' || progress.state === 'timed_out') {
+      showTransientDownloadFeedback('info', progress.state === 'timed_out' ? '下载超时，任务已停止并清理临时文件' : '下载已停止并清理临时文件')
+      return
+    }
+    showTransientDownloadFeedback('error', progress.error || t('coreManager.downloadFailed'), 5500)
+  } finally {
+    clearCompletedCoreDownloadTask(progress.id)
   }
-  if (progress.state === 'cancelled' || progress.state === 'timed_out') {
-    feedbackMsg.value = progress.state === 'timed_out' ? '下载超时，任务已停止并清理临时文件' : '下载已停止并清理临时文件'
-    feedbackType.value = 'info'
-    return
-  }
-  feedbackMsg.value = progress.error || t('coreManager.downloadFailed')
-  feedbackType.value = 'error'
 }
 
 const pollDownloadProgress = async (): Promise<void> => {
@@ -1187,7 +1229,7 @@ const startDownloadProgressPolling = (sessionId: string) => {
   void pollDownloadProgress()
 }
 
-const recoverCoreDownloadTask = async () => {
+const recoverCoreDownloadTask = async (allowTerminal = false) => {
   const data = await HttpUtils.get(mihomoCore.progressEndpoint, {}, { silentAuthCheck: true })
   if (!data.success || !data.obj) return
   const nextProgress = normalizeCoreDownloadProgress(data.obj)
@@ -1199,7 +1241,7 @@ const recoverCoreDownloadTask = async () => {
       startDownloadProgressPolling(nextProgress.id)
     }
   } else if (isTerminalCoreDownload(nextProgress)) {
-    void completeCoreDownloadTask(nextProgress)
+    void completeCoreDownloadTask(nextProgress, allowTerminal)
   }
 }
 
@@ -1373,7 +1415,7 @@ const saveAutoCheckSettings = async () => {
   }
 
   autoCheckSaving.value = true
-  feedbackMsg.value = ''
+  clearDownloadFeedback()
   try {
     const data = await HttpUtils.post(mihomoCore.updateSettingsEndpoint, {
       enabled: autoCheckEnabled.value ? 'true' : 'false',
@@ -1426,15 +1468,13 @@ const submitCoreDownload = async (formData: FormData, versionLabel: string) => {
     }
     await recoverCoreDownloadTask()
     if (coreDownloadTaskActive.value) return
-    feedbackMsg.value = data.msg || t('coreManager.downloadFailed')
-    feedbackType.value = 'error'
+    showTransientDownloadFeedback('error', data.msg || t('coreManager.downloadFailed'), 5500)
   } catch (error: any) {
     await recoverCoreDownloadTask()
     if (coreDownloadTaskActive.value) return
-    feedbackMsg.value = t('coreManager.downloadFailedWithReason', {
+    showTransientDownloadFeedback('error', t('coreManager.downloadFailedWithReason', {
       reason: error?.message || t('coreManager.unknown'),
-    })
-    feedbackType.value = 'error'
+    }), 5500)
   } finally {
     downloading.value = false
   }
@@ -1627,6 +1667,10 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   stopDownloadProgressPolling()
+  if (downloadFeedbackTimer != null) {
+    window.clearTimeout(downloadFeedbackTimer)
+    downloadFeedbackTimer = null
+  }
   if (typeof document !== 'undefined') {
     document.removeEventListener('visibilitychange', handleVisibilityChange)
   }

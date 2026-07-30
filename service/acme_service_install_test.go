@@ -73,6 +73,39 @@ func TestActivateManagedAcmeInstallKeepsOldOnIncompleteStage(t *testing.T) {
 	}
 }
 
+func TestLegacyCertificateCleanupKeepsActiveManagedAcmeWorkspace(t *testing.T) {
+	stageDir, cleanupStage, err := createManagedAcmeInstallWorkspace(acmeManagedWorkspaceStagePrefix)
+	if err != nil {
+		t.Fatalf("create managed ACME stage: %v", err)
+	}
+	defer cleanupStage()
+
+	markerPath := filepath.Join(stageDir, "acme.sh")
+	if err := os.WriteFile(markerPath, []byte("staged-script"), 0o700); err != nil {
+		t.Fatalf("write staged marker: %v", err)
+	}
+	if err := cleanupLegacyCertificateManagedDirs(); err != nil {
+		t.Fatalf("run legacy certificate cleanup: %v", err)
+	}
+	if !pathExists(markerPath) {
+		t.Fatal("overview maintenance removed the active managed ACME workspace")
+	}
+}
+
+func TestReadAcmeVersionFromScriptFile(t *testing.T) {
+	scriptPath := filepath.Join(t.TempDir(), "acme.sh")
+	if err := os.WriteFile(scriptPath, []byte("#!/usr/bin/env sh\nVER=3.1.5\nPROJECT_NAME=acme.sh\n"), 0o700); err != nil {
+		t.Fatalf("write ACME script fixture: %v", err)
+	}
+	version, err := readAcmeVersionFromScriptFile(scriptPath)
+	if err != nil {
+		t.Fatalf("read version from ACME script header: %v", err)
+	}
+	if version != "3.1.5" {
+		t.Fatalf("version = %q, want 3.1.5", version)
+	}
+}
+
 func TestActivateManagedAcmeInstallReplacesOnlyManagedArtifacts(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "acme-install-activate.db")
 	if err := database.InitDB(dbPath); err != nil {

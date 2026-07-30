@@ -23,6 +23,8 @@ const kworLifecycleControlSocketName = "lifecycle.sock"
 
 const kworLifecycleMetadataLockName = "metadata.lock"
 
+const kworManagedOperationIdentityRetryWindow = 250 * time.Millisecond
+
 type kworLifecycleControlRequest struct {
 	Command string `json:"command"`
 }
@@ -439,18 +441,24 @@ func kworProcessEnvironmentHasOperationID(pid int, operationID string) (bool, er
 }
 
 func kworManagedOperationProcessIdentity(pid int, operationID string) (uint64, error) {
-	startTime, err := kworLifecycleProcessStartTime(pid)
-	if err != nil {
-		return 0, err
+	deadline := time.Now().Add(kworManagedOperationIdentityRetryWindow)
+	for {
+		startTime, err := kworLifecycleProcessStartTime(pid)
+		if err != nil {
+			return 0, err
+		}
+		owned, err := kworProcessEnvironmentHasOperationID(pid, operationID)
+		if err != nil {
+			return 0, err
+		}
+		if owned {
+			return startTime, nil
+		}
+		if time.Now().After(deadline) {
+			return 0, errors.New("受管子进程未继承 operation ID")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	owned, err := kworProcessEnvironmentHasOperationID(pid, operationID)
-	if err != nil {
-		return 0, err
-	}
-	if !owned {
-		return 0, errors.New("受管子进程未继承 operation ID")
-	}
-	return startTime, nil
 }
 
 func verifyKworPanelUpdateSystemdUnit(systemctlPath string, unit string, operationID string, requireToken bool) (bool, error) {
@@ -694,6 +702,17 @@ func kworManagedOperationProcessGroup(pid int) int {
 		return 0
 	}
 	return pgid
+}
+
+func stopKworManagedCommandProcess(process *os.Process) error {
+	if process == nil || process.Pid <= 0 {
+		return nil
+	}
+	pgid := kworManagedOperationProcessGroup(process.Pid)
+	if pgid > 0 && pgid != unix.Getpgrp() {
+		return signalKworProcessGroup(pgid, unix.SIGKILL)
+	}
+	return process.Kill()
 }
 
 func prepareKworManagedCommand(cmd *exec.Cmd) {

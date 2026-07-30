@@ -617,7 +617,7 @@ func (s *AcmeService) GetOverview() (*AcmeOverview, error) {
 	overview.Installed = installed
 
 	if installed {
-		version, err := readAcmeVersionByScript(scriptPath, homeDir)
+		version, err := readAcmeVersionFromScriptFile(scriptPath)
 		if err != nil {
 			overview.Error = strings.TrimSpace(err.Error())
 		} else {
@@ -819,10 +819,10 @@ func (s *AcmeService) CheckUpdate() (*AcmeVersionCheckResult, error) {
 		return result, nil
 	}
 
-	scriptPath, homeDir, installed := s.resolveAcmeScript()
+	scriptPath, _, installed := s.resolveAcmeScript()
 	result.Installed = installed
 	if installed {
-		current, err := readAcmeVersionByScript(scriptPath, homeDir)
+		current, err := readAcmeVersionFromScriptFile(scriptPath)
 		if err == nil {
 			result.CurrentVersion = current
 		}
@@ -923,7 +923,25 @@ func (s *AcmeService) installOrReinstallWithContext(ctx context.Context, payload
 		}
 	}
 
-	tmpFile, err := os.CreateTemp("", "acme-install-*.sh")
+	shellPath, err := resolveManagedScriptShell()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := cleanupStaleManagedAcmeInstallWorkspaces(managedAcmeWorkspaceParentDir()); err != nil {
+		return nil, err
+	}
+
+	stagedHomeDir, cleanupStagedHomeDir, err := createManagedAcmeInstallWorkspace(acmeManagedWorkspaceStagePrefix)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanupStagedHomeDir()
+
+	// acme.sh's online installer creates its archive in the current working
+	// directory. Keep both that archive and the installer script in this owned
+	// workspace so every failure path can remove them together.
+	tmpFile, err := os.CreateTemp(stagedHomeDir, ".acme-installer-*.sh")
 	if err != nil {
 		return nil, common.NewError("create acme installer temp file failed: ", err)
 	}
@@ -939,21 +957,6 @@ func (s *AcmeService) installOrReinstallWithContext(ctx context.Context, payload
 	if err := downloadAcmeInstallerScriptContext(ctx, tmpPath); err != nil {
 		return nil, err
 	}
-
-	shellPath, err := resolveManagedScriptShell()
-	if err != nil {
-		return nil, err
-	}
-
-	if err := cleanupStaleManagedAcmeInstallWorkspaces(managedAcmeWorkspaceParentDir()); err != nil {
-		return nil, err
-	}
-
-	stagedHomeDir, cleanupStagedHomeDir, err := createManagedAcmeInstallWorkspace(acmeManagedWorkspaceStagePrefix)
-	if err != nil {
-		return nil, err
-	}
-	defer cleanupStagedHomeDir()
 
 	args := []string{
 		tmpPath,
@@ -971,7 +974,7 @@ func (s *AcmeService) installOrReinstallWithContext(ctx context.Context, payload
 	if report != nil {
 		report("installing")
 	}
-	output, err := runCommandOutputWithTimeoutEnvLog(90*time.Second, shellPath, args, nil, logSession)
+	output, err := runCommandOutputWithTimeoutEnvContextLogInDir(ctx, 90*time.Second, shellPath, args, nil, logSession, stagedHomeDir)
 	if err != nil {
 		return nil, common.NewError("install acme.sh failed: ", err)
 	}
@@ -5460,9 +5463,6 @@ func cleanupLegacyCertificateManagedDirs() error {
 	); err != nil {
 		return err
 	}
-	if err := cleanupStaleManagedAcmeInstallWorkspaces(managedAcmeWorkspaceParentDir()); err != nil {
-		return err
-	}
 	if err := cleanupObsoleteLegacyManagedAcmeInstallRoot(); err != nil {
 		return err
 	}
@@ -7420,6 +7420,39 @@ func readAcmeVersionByScript(scriptPath string, homeDir string) (string, error) 
 	return readAcmeVersionByScriptContext(context.Background(), scriptPath, homeDir)
 }
 
+// readAcmeVersionFromScriptFile keeps the overview path side-effect free. The
+// installed acme.sh script exposes VER near its header, so a bounded local
+// read avoids spawning acme.sh for every settings-page poll.
+func readAcmeVersionFromScriptFile(scriptPath string) (string, error) {
+	scriptPath = filepath.Clean(strings.TrimSpace(scriptPath))
+	if scriptPath == "" || scriptPath == "." {
+		return "", common.NewError("acme.sh script path is empty")
+	}
+	file, err := os.Open(scriptPath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(io.LimitReader(file, 64*1024))
+	scanner.Buffer(make([]byte, 256), 64*1024)
+	for scanner.Scan() {
+		key, value, found := strings.Cut(strings.TrimSpace(scanner.Text()), "=")
+		if !found || strings.TrimSpace(key) != "VER" {
+			continue
+		}
+		version := normalizeAcmeVersionTag(strings.Trim(strings.TrimSpace(value), "\"'"))
+		if version != "" && isLikelySemverTag(version) {
+			return version, nil
+		}
+		return "", common.NewError("unable to detect acme.sh version from script header")
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return "", common.NewError("unable to detect acme.sh version from script header")
+}
+
 func readAcmeVersionByScriptContext(ctx context.Context, scriptPath string, homeDir string) (string, error) {
 	output, err := runCommandOutputWithTimeoutEnvContext(ctx, 12*time.Second, scriptPath, append(acmeHomeArgs(homeDir), "--version"), nil)
 	if err != nil {
@@ -7848,6 +7881,10 @@ func runCommandOutputWithTimeoutEnvContext(parent context.Context, timeout time.
 }
 
 func runCommandOutputWithTimeoutEnvContextLog(parent context.Context, timeout time.Duration, command string, args []string, envPairs []string, logSession *acmeLogSession) (string, error) {
+	return runCommandOutputWithTimeoutEnvContextLogInDir(parent, timeout, command, args, envPairs, logSession, "")
+}
+
+func runCommandOutputWithTimeoutEnvContextLogInDir(parent context.Context, timeout time.Duration, command string, args []string, envPairs []string, logSession *acmeLogSession, workingDir string) (string, error) {
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -7856,6 +7893,9 @@ func runCommandOutputWithTimeoutEnvContextLog(parent context.Context, timeout ti
 
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Env = buildAcmeCommandEnv(envPairs)
+	if workingDir = strings.TrimSpace(workingDir); workingDir != "" {
+		cmd.Dir = filepath.Clean(workingDir)
+	}
 	PrepareKworManagedCommandContext(parent, cmd)
 
 	var output strings.Builder
@@ -7873,10 +7913,12 @@ func runCommandOutputWithTimeoutEnvContextLog(parent context.Context, timeout ti
 		return "", err
 	}
 	if err := TrackKworManagedCommandContext(parent, cmd); err != nil {
-		_ = cmd.Process.Kill()
+		stopKworManagedCommand(cmd)
 		_ = cmd.Wait()
 		return "", fmt.Errorf("登记 ACME 命令进程失败: %w", err)
 	}
+	stopWatchingCommand := watchKworManagedCommandContext(ctx, cmd)
+	defer stopWatchingCommand()
 
 	var wg sync.WaitGroup
 	collect := func(reader io.Reader) {

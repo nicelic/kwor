@@ -1409,7 +1409,7 @@ const installVnstat = async () => {
 
     // If the initial response was lost after the server accepted the task,
     // attach to that running task instead of showing a false installation error.
-    if (await recoverVnstatInstallJob(true)) {
+    if (await recoverVnstatInstallJob()) {
       return
     }
     clearVnstatInstallTask()
@@ -1421,7 +1421,7 @@ const installVnstat = async () => {
   } catch (error) {
     // HttpUtils normally converts request errors to Msg, but keeping this
     // branch makes the UI recover safely if its transport implementation changes.
-    if (await recoverVnstatInstallJob(true)) {
+    if (await recoverVnstatInstallJob()) {
       return
     }
     clearVnstatInstallTask()
@@ -1636,7 +1636,7 @@ const handleVisibilityChange = () => {
   if (document.visibilityState === 'visible') {
     if (!props.active) return
     void fetchOverview(true)
-    void recoverVnstatInstallJob(true)
+    void recoverVnstatInstallJob()
     startPolling()
     return
   }
@@ -1647,7 +1647,7 @@ const handleVisibilityChange = () => {
 watch(() => props.active, (active) => {
   if (active) {
     void fetchOverview(true)
-		void recoverVnstatInstallJob(true)
+		void recoverVnstatInstallJob()
     startPolling()
     return
   }

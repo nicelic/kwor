@@ -2830,10 +2830,12 @@ func (s *CoreManagerService) extractCoreByExternalToolContext(ctx context.Contex
 			return err
 		}
 		if err := TrackKworManagedCommandContext(ctx, cmd); err != nil {
-			_ = cmd.Process.Kill()
+			stopKworManagedCommand(cmd)
 			_ = cmd.Wait()
 			return fmt.Errorf("record extraction command: %w", err)
 		}
+		stopWatchingCommand := watchKworManagedCommandContext(commandCtx, cmd)
+		defer stopWatchingCommand()
 		err := cmd.Wait()
 		if commandErr := commandCtx.Err(); commandErr != nil {
 			return commandErr

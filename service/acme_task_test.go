@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -189,6 +190,25 @@ func TestAcmeLogSessionEnsureManagedOperationReusesQueuedHandle(t *testing.T) {
 		t.Fatal("no-op cleanup must not finish the queued operation")
 	default:
 	}
+}
+
+func TestAcmeCommandEnvironmentRetainsManagedOperationID(t *testing.T) {
+	ctx, handle, err := BeginKworManagedOperation("acme-command-env")
+	if err != nil {
+		t.Fatalf("create managed ACME operation: %v", err)
+	}
+	defer handle.Done()
+
+	cmd := exec.Command("acme-test-command")
+	cmd.Env = buildAcmeCommandEnv([]string{"CF_Token=masked-for-test"})
+	PrepareKworManagedCommandContext(ctx, cmd)
+	want := kworLifecycleOperationIDEnv + "=" + handle.ID()
+	for _, entry := range cmd.Env {
+		if entry == want {
+			return
+		}
+	}
+	t.Fatalf("ACME command environment does not retain managed operation ID %q", want)
 }
 
 func waitForAcmeTask(t *testing.T, store *acmeTaskStore, id string, expectedStatus string) *AcmeTaskView {

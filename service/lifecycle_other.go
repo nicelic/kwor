@@ -2,7 +2,10 @@
 
 package service
 
-import "os/exec"
+import (
+	"os"
+	"os/exec"
+)
 
 func acquireKworLifecycleMetadataLock() (func() error, error) {
 	return func() error { return nil }, nil
@@ -33,6 +36,13 @@ func finishKworLifecycleRuntimeCleanup() error { return nil }
 func syncKworLifecycleDirectory(string) error { return nil }
 
 func kworManagedOperationProcessGroup(int) int { return 0 }
+
+func stopKworManagedCommandProcess(process *os.Process) error {
+	if process == nil {
+		return nil
+	}
+	return process.Kill()
+}
 
 func stopStartedKworDetachedWorker(int, int, uint64) error { return nil }
 
