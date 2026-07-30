@@ -884,13 +884,19 @@ func (s *CoreManagerService) DownloadCore(version string, target SingboxCoreDown
 		return "", err
 	}
 	defer operation.Done()
-	lifecycleLock, err := AcquireKworLifecycleLock()
+	return s.downloadCoreWithContext(operationContext, version, target, requestedSessionID)
+}
+
+func (s *CoreManagerService) downloadCoreWithContext(operationContext context.Context, version string, target SingboxCoreDownloadTarget, requestedSessionID string) (string, error) {
+	lifecycleLock, err := AcquireKworLifecycleLockContext(operationContext)
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = lifecycleLock.Release() }()
 
-	s.mu.Lock()
+	if err := lockManagedDownloadTaskMutex(operationContext, &s.mu); err != nil {
+		return "", err
+	}
 	defer s.mu.Unlock()
 
 	sessionID := StartCoreDownloadProgressSession("sing-box", requestedSessionID, false)
@@ -989,6 +995,7 @@ func (s *CoreManagerService) DownloadCore(version string, target SingboxCoreDown
 
 	tmpExt := detectCoreArchiveExtFromURL(downloadURL)
 	tmpFile := filepath.Join(coreDir, "sing-box-download"+tmpExt)
+	defer os.Remove(tmpFile)
 
 	out, err := os.Create(tmpFile)
 	if err != nil {
@@ -997,7 +1004,7 @@ func (s *CoreManagerService) DownloadCore(version string, target SingboxCoreDown
 		return "", err
 	}
 
-	_, err = io.Copy(out, io.TeeReader(resp.Body, &coreDownloadProgressWriter{sessionID: sessionID}))
+	_, err = copyManagedDownloadTaskContext(operationContext, out, io.TeeReader(resp.Body, &coreDownloadProgressWriter{sessionID: sessionID}))
 	if err != nil {
 		_ = out.Close()
 		os.Remove(tmpFile)
@@ -1011,23 +1018,31 @@ func (s *CoreManagerService) DownloadCore(version string, target SingboxCoreDown
 		failProgress(coreDownloadStageDownloading, err)
 		return "", err
 	}
+	if err = operationContext.Err(); err != nil {
+		failProgress(coreDownloadStageDownloading, err)
+		return "", err
+	}
 
-	SetCoreDownloadProgressStage(sessionID, coreDownloadStageReplacing)
+	SetCoreDownloadProgressStage(sessionID, coreDownloadStageExtracting)
 	stageDir, cleanupStageDir, err := createManagedCoreInstallWorkspace(coreDir, singboxCoreInstallStagePrefix)
 	if err != nil {
 		os.Remove(tmpFile)
-		failProgress(coreDownloadStageReplacing, err)
+		failProgress(coreDownloadStageExtracting, err)
 		return "", err
 	}
 	defer cleanupStageDir()
 
-	err = s.installCoreFromArchiveFile(tmpFile, stageDir)
+	err = s.installCoreFromArchiveFileContext(operationContext, tmpFile, stageDir)
 
 	os.Remove(tmpFile)
 
 	if err != nil {
 		err = fmt.Errorf("解压失败: %v", err)
-		failProgress(coreDownloadStageReplacing, err)
+		failProgress(coreDownloadStageExtracting, err)
+		return "", err
+	}
+	if err = operationContext.Err(); err != nil {
+		failProgress(coreDownloadStageExtracting, err)
 		return "", err
 	}
 
@@ -1040,6 +1055,12 @@ func (s *CoreManagerService) DownloadCore(version string, target SingboxCoreDown
 		failProgress(coreDownloadStageValidating, err)
 		return "", err
 	}
+	if !beginManagedCoreDownloadApplying(sessionID, coreDownloadStageReplacing) {
+		err = coreDownloadTaskCancelledError(operationContext)
+		failProgress(coreDownloadStageValidating, err)
+		return "", err
+	}
+	SetCoreDownloadProgressStage(sessionID, coreDownloadStageReplacing)
 
 	activation, activationStage, err := activateManagedCoreBinaryInstallWithRuntime(
 		wasRunning,
@@ -1109,6 +1130,16 @@ func (s *CoreManagerService) DownloadCore(version string, target SingboxCoreDown
 }
 
 func (s *CoreManagerService) extractZip(zipPath, destDir, binName string) error {
+	return s.extractZipContext(context.Background(), zipPath, destDir, binName)
+}
+
+func (s *CoreManagerService) extractZipContext(ctx context.Context, zipPath, destDir, binName string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	r, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return err
@@ -1116,6 +1147,9 @@ func (s *CoreManagerService) extractZip(zipPath, destDir, binName string) error 
 	defer r.Close()
 
 	for _, f := range r.File {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		name := filepath.Base(f.Name)
 		if name == binName {
 			rc, err := f.Open()
@@ -1131,7 +1165,7 @@ func (s *CoreManagerService) extractZip(zipPath, destDir, binName string) error 
 			}
 			defer outFile.Close()
 
-			_, err = io.Copy(outFile, rc)
+			_, err = copyManagedDownloadTaskContext(ctx, outFile, rc)
 			return err
 		}
 	}
@@ -1139,6 +1173,16 @@ func (s *CoreManagerService) extractZip(zipPath, destDir, binName string) error 
 }
 
 func (s *CoreManagerService) extractTarGz(tarGzPath, destDir, binName string) error {
+	return s.extractTarGzContext(context.Background(), tarGzPath, destDir, binName)
+}
+
+func (s *CoreManagerService) extractTarGzContext(ctx context.Context, tarGzPath, destDir, binName string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f, err := os.Open(tarGzPath)
 	if err != nil {
 		return err
@@ -1154,6 +1198,9 @@ func (s *CoreManagerService) extractTarGz(tarGzPath, destDir, binName string) er
 	tr := tar.NewReader(gzr)
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		header, err := tr.Next()
 		if err == io.EOF {
 			break
@@ -1171,7 +1218,7 @@ func (s *CoreManagerService) extractTarGz(tarGzPath, destDir, binName string) er
 			}
 			defer outFile.Close()
 
-			_, err = io.Copy(outFile, tr)
+			_, err = copyManagedDownloadTaskContext(ctx, outFile, tr)
 			return err
 		}
 	}
@@ -2287,13 +2334,19 @@ func (s *CoreManagerService) DownloadCoreFromURL(downloadURL string, requestedSe
 		return "", err
 	}
 	defer operation.Done()
-	lifecycleLock, err := AcquireKworLifecycleLock()
+	return s.downloadCoreFromURLWithContext(operationContext, downloadURL, requestedSessionID)
+}
+
+func (s *CoreManagerService) downloadCoreFromURLWithContext(operationContext context.Context, downloadURL string, requestedSessionID string) (string, error) {
+	lifecycleLock, err := AcquireKworLifecycleLockContext(operationContext)
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = lifecycleLock.Release() }()
 
-	s.mu.Lock()
+	if err := lockManagedDownloadTaskMutex(operationContext, &s.mu); err != nil {
+		return "", err
+	}
 	defer s.mu.Unlock()
 
 	sessionID := StartCoreDownloadProgressSession("sing-box", requestedSessionID, false)
@@ -2384,7 +2437,7 @@ func (s *CoreManagerService) DownloadCoreFromURL(downloadURL string, requestedSe
 		return "", err
 	}
 
-	_, err = io.Copy(out, io.TeeReader(resp.Body, &coreDownloadProgressWriter{sessionID: sessionID}))
+	_, err = copyManagedDownloadTaskContext(operationContext, out, io.TeeReader(resp.Body, &coreDownloadProgressWriter{sessionID: sessionID}))
 	if err != nil {
 		_ = out.Close()
 		err = fmt.Errorf("write temp file failed: %v", err)
@@ -2396,18 +2449,26 @@ func (s *CoreManagerService) DownloadCoreFromURL(downloadURL string, requestedSe
 		failProgress(coreDownloadStageDownloading, err)
 		return "", err
 	}
+	if err = operationContext.Err(); err != nil {
+		failProgress(coreDownloadStageDownloading, err)
+		return "", err
+	}
 
-	SetCoreDownloadProgressStage(sessionID, coreDownloadStageReplacing)
+	SetCoreDownloadProgressStage(sessionID, coreDownloadStageExtracting)
 	stageDir, cleanupStageDir, err := createManagedCoreInstallWorkspace(coreDir, singboxCoreInstallStagePrefix)
 	if err != nil {
-		failProgress(coreDownloadStageReplacing, err)
+		failProgress(coreDownloadStageExtracting, err)
 		return "", err
 	}
 	defer cleanupStageDir()
 
-	if err = s.installCoreFromArchiveFile(tmpFile, stageDir); err != nil {
+	if err = s.installCoreFromArchiveFileContext(operationContext, tmpFile, stageDir); err != nil {
 		err = fmt.Errorf("extract/install failed: %v", err)
-		failProgress(coreDownloadStageReplacing, err)
+		failProgress(coreDownloadStageExtracting, err)
+		return "", err
+	}
+	if err = operationContext.Err(); err != nil {
+		failProgress(coreDownloadStageExtracting, err)
 		return "", err
 	}
 
@@ -2419,6 +2480,12 @@ func (s *CoreManagerService) DownloadCoreFromURL(downloadURL string, requestedSe
 		failProgress(coreDownloadStageValidating, err)
 		return "", err
 	}
+	if !beginManagedCoreDownloadApplying(sessionID, coreDownloadStageReplacing) {
+		err = coreDownloadTaskCancelledError(operationContext)
+		failProgress(coreDownloadStageValidating, err)
+		return "", err
+	}
+	SetCoreDownloadProgressStage(sessionID, coreDownloadStageReplacing)
 
 	activation, activationStage, err := activateManagedCoreBinaryInstallWithRuntime(
 		wasRunning,
@@ -2510,6 +2577,16 @@ func detectCoreArchiveExtFromURL(downloadURL string) string {
 }
 
 func (s *CoreManagerService) installCoreFromArchiveFile(archivePath, coreDir string) error {
+	return s.installCoreFromArchiveFileContext(context.Background(), archivePath, coreDir)
+}
+
+func (s *CoreManagerService) installCoreFromArchiveFileContext(ctx context.Context, archivePath, coreDir string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	binName := s.getCoreBinName()
 	binPath := filepath.Join(coreDir, binName)
 	_ = os.Remove(binPath)
@@ -2519,18 +2596,18 @@ func (s *CoreManagerService) installCoreFromArchiveFile(archivePath, coreDir str
 
 	switch {
 	case strings.HasSuffix(lower, ".zip"):
-		err = s.extractZip(archivePath, coreDir, binName)
+		err = s.extractZipContext(ctx, archivePath, coreDir, binName)
 	case strings.HasSuffix(lower, ".tar.gz"), strings.HasSuffix(lower, ".tgz"):
-		err = s.extractTarGz(archivePath, coreDir, binName)
+		err = s.extractTarGzContext(ctx, archivePath, coreDir, binName)
 	case strings.HasSuffix(lower, ".tar"):
-		err = extractCoreTar(archivePath, coreDir, binName)
+		err = extractCoreTarContext(ctx, archivePath, coreDir, binName)
 	case strings.HasSuffix(lower, ".gz"):
-		err = extractCoreGzipBinary(archivePath, coreDir, binName)
+		err = extractCoreGzipBinaryContext(ctx, archivePath, coreDir, binName)
 	case strings.HasSuffix(lower, ".tar.xz"), strings.HasSuffix(lower, ".txz"),
 		strings.HasSuffix(lower, ".tar.bz2"), strings.HasSuffix(lower, ".tbz2"):
-		err = s.extractCoreByExternalTool(archivePath, coreDir, binName)
+		err = s.extractCoreByExternalToolContext(ctx, archivePath, coreDir, binName)
 	default:
-		if copyErr := copyCoreFile(archivePath, binPath); copyErr == nil {
+		if copyErr := copyCoreFileContext(ctx, archivePath, binPath); copyErr == nil {
 			if !IsSystemPlatformWindows() {
 				_ = os.Chmod(binPath, 0o755)
 			}
@@ -2539,11 +2616,14 @@ func (s *CoreManagerService) installCoreFromArchiveFile(archivePath, coreDir str
 			}
 			_ = os.Remove(binPath)
 		}
-		err = s.extractCoreByExternalTool(archivePath, coreDir, binName)
+		err = s.extractCoreByExternalToolContext(ctx, archivePath, coreDir, binName)
 	}
 
 	if err != nil {
-		fallbackErr := s.extractCoreByExternalTool(archivePath, coreDir, binName)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		fallbackErr := s.extractCoreByExternalToolContext(ctx, archivePath, coreDir, binName)
 		if fallbackErr != nil {
 			return fmt.Errorf("%v; fallback failed: %v", err, fallbackErr)
 		}
@@ -2554,6 +2634,9 @@ func (s *CoreManagerService) installCoreFromArchiveFile(archivePath, coreDir str
 	}
 	if _, statErr := os.Stat(binPath); statErr != nil {
 		return fmt.Errorf("core binary not found after extraction")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -2636,6 +2719,16 @@ func isSingboxCheckCommandUnsupported(output string) bool {
 }
 
 func extractCoreTar(tarPath, destDir, binName string) error {
+	return extractCoreTarContext(context.Background(), tarPath, destDir, binName)
+}
+
+func extractCoreTarContext(ctx context.Context, tarPath, destDir, binName string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f, err := os.Open(tarPath)
 	if err != nil {
 		return err
@@ -2644,6 +2737,9 @@ func extractCoreTar(tarPath, destDir, binName string) error {
 
 	tr := tar.NewReader(f)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		header, err := tr.Next()
 		if err == io.EOF {
 			break
@@ -2658,7 +2754,7 @@ func extractCoreTar(tarPath, destDir, binName string) error {
 				return err
 			}
 			defer outFile.Close()
-			_, err = io.Copy(outFile, tr)
+			_, err = copyManagedDownloadTaskContext(ctx, outFile, tr)
 			return err
 		}
 	}
@@ -2666,6 +2762,16 @@ func extractCoreTar(tarPath, destDir, binName string) error {
 }
 
 func extractCoreGzipBinary(gzPath, destDir, binName string) error {
+	return extractCoreGzipBinaryContext(context.Background(), gzPath, destDir, binName)
+}
+
+func extractCoreGzipBinaryContext(ctx context.Context, gzPath, destDir, binName string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f, err := os.Open(gzPath)
 	if err != nil {
 		return err
@@ -2685,13 +2791,23 @@ func extractCoreGzipBinary(gzPath, destDir, binName string) error {
 	}
 	defer outFile.Close()
 
-	_, err = io.Copy(outFile, gzr)
+	_, err = copyManagedDownloadTaskContext(ctx, outFile, gzr)
 	return err
 }
 
 var errCoreBinaryFound = errors.New("core binary found")
 
 func (s *CoreManagerService) extractCoreByExternalTool(archivePath, destDir, binName string) error {
+	return s.extractCoreByExternalToolContext(context.Background(), archivePath, destDir, binName)
+}
+
+func (s *CoreManagerService) extractCoreByExternalToolContext(ctx context.Context, archivePath, destDir, binName string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	tmpDir := filepath.Join(destDir, fmt.Sprintf("extract_tmp_%d", time.Now().UnixNano()))
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		return err
@@ -2699,15 +2815,37 @@ func (s *CoreManagerService) extractCoreByExternalTool(archivePath, destDir, bin
 	defer os.RemoveAll(tmpDir)
 
 	runAndCopy := func(name string, args ...string) error {
-		output, err := runCommandOutputInDirWithTimeout(2*time.Minute, tmpDir, name, args...)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		commandCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		defer cancel()
+		cmd := exec.CommandContext(commandCtx, name, args...)
+		cmd.Dir = tmpDir
+		var output strings.Builder
+		cmd.Stdout = &output
+		cmd.Stderr = &output
+		PrepareKworManagedCommandContext(ctx, cmd)
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		if err := TrackKworManagedCommandContext(ctx, cmd); err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return fmt.Errorf("record extraction command: %w", err)
+		}
+		err := cmd.Wait()
+		if commandErr := commandCtx.Err(); commandErr != nil {
+			return commandErr
+		}
 		if err != nil {
-			msg := strings.TrimSpace(string(output))
+			msg := strings.TrimSpace(output.String())
 			if msg == "" {
 				msg = err.Error()
 			}
 			return fmt.Errorf("%s failed: %s", name, msg)
 		}
-		if err = s.copyCoreBinaryFromExtractedDir(tmpDir, filepath.Join(destDir, binName), binName); err != nil {
+		if err = s.copyCoreBinaryFromExtractedDirContext(ctx, tmpDir, filepath.Join(destDir, binName), binName); err != nil {
 			return fmt.Errorf("%s extracted but core binary not found: %v", name, err)
 		}
 		return nil
@@ -2717,15 +2855,24 @@ func (s *CoreManagerService) extractCoreByExternalTool(archivePath, destDir, bin
 		if err = runAndCopy("7z", "x", "-y", "-o"+tmpDir, archivePath); err == nil {
 			return nil
 		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 	}
 	if _, err := exec.LookPath("tar"); err == nil {
 		if err = runAndCopy("tar", "-xf", archivePath, "-C", tmpDir); err == nil {
 			return nil
 		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 	}
 	if _, err := exec.LookPath("unzip"); err == nil {
 		if err = runAndCopy("unzip", "-o", archivePath, "-d", tmpDir); err == nil {
 			return nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
 		}
 	}
 
@@ -2733,8 +2880,21 @@ func (s *CoreManagerService) extractCoreByExternalTool(archivePath, destDir, bin
 }
 
 func (s *CoreManagerService) copyCoreBinaryFromExtractedDir(srcDir, destPath, binName string) error {
+	return s.copyCoreBinaryFromExtractedDirContext(context.Background(), srcDir, destPath, binName)
+}
+
+func (s *CoreManagerService) copyCoreBinaryFromExtractedDirContext(ctx context.Context, srcDir, destPath, binName string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	var sourcePath string
 	walkErr := filepath.WalkDir(srcDir, func(path string, d os.DirEntry, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil || d == nil {
 			return nil
 		}
@@ -2753,10 +2913,20 @@ func (s *CoreManagerService) copyCoreBinaryFromExtractedDir(srcDir, destPath, bi
 	if sourcePath == "" {
 		return fmt.Errorf("core binary %s not found", binName)
 	}
-	return copyCoreFile(sourcePath, destPath)
+	return copyCoreFileContext(ctx, sourcePath, destPath)
 }
 
 func copyCoreFile(src, dst string) error {
+	return copyCoreFileContext(context.Background(), src, dst)
+}
+
+func copyCoreFileContext(ctx context.Context, src, dst string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -2769,6 +2939,6 @@ func copyCoreFile(src, dst string) error {
 	}
 	defer out.Close()
 
-	_, err = io.Copy(out, in)
+	_, err = copyManagedDownloadTaskContext(ctx, out, in)
 	return err
 }

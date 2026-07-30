@@ -62,10 +62,44 @@ func parseCoreIntervalHours(raw string) (int, error) {
 }
 
 func (a *ApiService) GetCoreDownloadProgress(c *gin.Context) {
-	id := strings.TrimSpace(c.Query("id"))
-	if id == "" {
-		jsonMsg(c, "", fmt.Errorf("id is required"))
+	jsonObj(c, service.GetManagedCoreDownloadProgress("sing-box", c.Query("id")), nil)
+}
+
+func (a *ApiService) GetMihomoCoreDownloadProgress(c *gin.Context) {
+	jsonObj(c, service.GetManagedCoreDownloadProgress("mihomo", c.Query("id")), nil)
+}
+
+type coreDownloadStopRequest struct {
+	ID *string `json:"id" form:"id"`
+}
+
+func parseCoreDownloadStopRequest(c *gin.Context) (string, error) {
+	req := coreDownloadStopRequest{}
+	if err := c.ShouldBind(&req); err != nil {
+		return "", fmt.Errorf("invalid request body: %w", err)
+	}
+	if req.ID == nil || strings.TrimSpace(*req.ID) == "" {
+		return "", fmt.Errorf("id is required")
+	}
+	return strings.TrimSpace(*req.ID), nil
+}
+
+func (a *ApiService) StopCoreDownload(c *gin.Context) {
+	id, err := parseCoreDownloadStopRequest(c)
+	if err != nil {
+		jsonMsg(c, "", err)
 		return
 	}
-	jsonObj(c, service.GetCoreDownloadProgress(id), nil)
+	progress, err := service.StopManagedCoreDownload("sing-box", id)
+	jsonObj(c, progress, err)
+}
+
+func (a *ApiService) StopMihomoCoreDownload(c *gin.Context) {
+	id, err := parseCoreDownloadStopRequest(c)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	progress, err := service.StopManagedCoreDownload("mihomo", id)
+	jsonObj(c, progress, err)
 }

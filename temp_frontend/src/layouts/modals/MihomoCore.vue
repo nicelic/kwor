@@ -56,7 +56,7 @@
             variant="tonal"
             size="small"
             prepend-icon="mdi-delete"
-            :disabled="!installed || downloading || startingCore || stoppingCore || restartingCore || deletingCore"
+            :disabled="!installed || downloading || coreDownloadTaskActive || startingCore || stoppingCore || restartingCore || deletingCore"
             :loading="deletingCore"
             @click="deleteCore"
           >
@@ -220,12 +220,11 @@
             <v-btn
               color="primary"
               variant="flat"
-              prepend-icon="mdi-download"
-              :loading="downloading"
-              :disabled="!canDownloadSelectedVersion || downloading"
-              @click="downloadCore"
+              :prepend-icon="coreDownloadTaskActive ? (coreDownloadTaskApplying ? 'mdi-progress-wrench' : 'mdi-stop') : 'mdi-download'"
+              :disabled="coreDownloadTaskStopping || coreDownloadTaskApplying || (!coreDownloadTaskActive && (!canDownloadSelectedVersion || downloading))"
+              @click="coreDownloadTaskActive ? stopCoreDownload() : downloadCore()"
             >
-              {{ t('coreManager.download') }}
+              {{ coreDownloadTaskActive ? coreDownloadStopLabel : t('coreManager.download') }}
             </v-btn>
           </v-col>
         </v-row>
@@ -275,8 +274,7 @@
               color="secondary"
               variant="flat"
               prepend-icon="mdi-link-variant-plus"
-              :loading="downloading"
-              :disabled="!canDownloadCustom || downloading"
+              :disabled="coreDownloadTaskActive || !canDownloadCustom || downloading"
               @click="downloadCoreFromCustomURL"
             >
               {{ t('coreManager.customDownload') }}
@@ -413,7 +411,7 @@
                   variant="flat"
                   size="small"
                   prepend-icon="mdi-play"
-                  :disabled="coreRunning || !coreReady"
+                  :disabled="coreDownloadTaskActive || coreRunning || !coreReady"
                   :loading="startingCore"
                   @click="startCore"
                 >
@@ -424,7 +422,7 @@
                   variant="flat"
                   size="small"
                   prepend-icon="mdi-stop"
-                  :disabled="!coreRunning"
+                  :disabled="coreDownloadTaskActive || !coreRunning"
                   :loading="stoppingCore"
                   @click="stopCore"
                 >
@@ -435,7 +433,7 @@
                   variant="flat"
                   size="small"
                   prepend-icon="mdi-restart"
-                  :disabled="!coreRunning || !coreReady"
+                  :disabled="coreDownloadTaskActive || !coreRunning || !coreReady"
                   :loading="restartingCore"
                   @click="restartCore"
                 >
@@ -619,7 +617,11 @@ type CoreDownloadProgress = {
   id: string
   core: string
   status: string
+  state: string
   stage: string
+  canCancel: boolean
+  stopRequested: boolean
+  deadlineExceeded: boolean
   runningBefore: boolean
   percent: number
   approximate: boolean
@@ -632,7 +634,11 @@ const downloadProgress = ref<CoreDownloadProgress>({
   id: '',
   core: '',
   status: 'missing',
+  state: 'idle',
   stage: '',
+  canCancel: false,
+  stopRequested: false,
+  deadlineExceeded: false,
   runningBefore: false,
   percent: 0,
   approximate: false,
@@ -718,8 +724,23 @@ const downloadingVersionLabel = computed(() => (
       : downloadingVersion.value
 ))
 
+const coreDownloadTaskActive = computed(() => (
+  ['queued', 'running', 'stopping'].includes(downloadProgress.value.state)
+  || (downloadProgress.value.state === '' && downloadProgress.value.status === 'running')
+))
+const coreDownloadTaskStopping = computed(() => (
+  downloadProgress.value.state === 'stopping' || downloadProgress.value.stopRequested
+))
+const coreDownloadTaskApplying = computed(() => (
+  coreDownloadTaskActive.value
+  && !coreDownloadTaskStopping.value
+  && downloadProgress.value.canCancel === false
+))
+const coreDownloadStopLabel = computed(() => (
+  coreDownloadTaskStopping.value ? '正在停止' : coreDownloadTaskApplying.value ? '正在应用' : '停止'
+))
 const hasActiveDownloadProgress = computed(() => (
-  downloading.value || (
+  downloading.value || coreDownloadTaskActive.value || (
     downloadProgress.value.id.length > 0 &&
     downloadProgress.value.status !== 'missing'
   )
@@ -739,6 +760,8 @@ const downloadProgressStageText = computed(() => {
       return t('coreManager.stageStopping')
     case 'downloading':
       return t('coreManager.stageDownloading')
+    case 'extracting':
+      return '正在解压'
     case 'replacing':
       return t('coreManager.stageReplacing')
     case 'validating':
@@ -749,6 +772,10 @@ const downloadProgressStageText = computed(() => {
       return t('coreManager.stageStarted')
     case 'completed':
       return t('coreManager.stageCompleted')
+    case 'cancelled':
+      return '已停止'
+    case 'timed_out':
+      return '下载超时，已停止'
     default:
       return downloading.value ? t('coreManager.stageDownloading') : t('coreManager.unknown')
   }
@@ -999,6 +1026,7 @@ watch(
       if (downloadProgressSessionId.value) {
         startDownloadProgressPolling(downloadProgressSessionId.value)
       }
+      void recoverCoreDownloadTask()
       void refreshAll()
     }
   },
@@ -1043,7 +1071,11 @@ const normalizeCoreDownloadProgress = (raw: any): CoreDownloadProgress => ({
   id: String(raw?.id ?? '').trim(),
   core: String(raw?.core ?? '').trim(),
   status: String(raw?.status ?? '').trim().toLowerCase() || 'missing',
+  state: String(raw?.state ?? '').trim().toLowerCase() || 'idle',
   stage: String(raw?.stage ?? '').trim().toLowerCase(),
+  canCancel: raw?.canCancel === true,
+  stopRequested: raw?.stopRequested === true,
+  deadlineExceeded: raw?.deadlineExceeded === true,
   runningBefore: raw?.runningBefore === true,
   percent: Number.isFinite(Number(raw?.percent)) ? Number(raw.percent) : 0,
   approximate: raw?.approximate === true,
@@ -1057,7 +1089,11 @@ const resetDownloadProgress = () => {
     id: '',
     core: '',
     status: 'missing',
+    state: 'idle',
     stage: '',
+    canCancel: false,
+    stopRequested: false,
+    deadlineExceeded: false,
     runningBefore: false,
     percent: 0,
     approximate: false,
@@ -1081,8 +1117,34 @@ const stopDownloadProgressPolling = () => {
   }
 }
 
+const isTerminalCoreDownload = (progress: CoreDownloadProgress) => (
+  ['success', 'error', 'cancelled', 'timed_out'].includes(progress.state)
+  || ['success', 'error', 'missing'].includes(progress.status)
+)
+
+let completedDownloadTaskId = ''
+const completeCoreDownloadTask = async (progress: CoreDownloadProgress) => {
+  if (progress.id === '' || completedDownloadTaskId === progress.id) return
+  completedDownloadTaskId = progress.id
+  downloading.value = false
+  if (progress.state === 'success' || (progress.state === 'idle' && progress.status === 'success')) {
+    feedbackMsg.value = t('coreManager.downloadSuccess', { coreName: mihomoCore.coreName, version: '' })
+    feedbackType.value = 'success'
+    await Promise.all([loadCoreStatus(), loadCoreUpdateInfo(false)])
+    return
+  }
+  if (progress.state === 'cancelled' || progress.state === 'timed_out') {
+    feedbackMsg.value = progress.state === 'timed_out' ? '下载超时，任务已停止并清理临时文件' : '下载已停止并清理临时文件'
+    feedbackType.value = 'info'
+    return
+  }
+  feedbackMsg.value = progress.error || t('coreManager.downloadFailed')
+  feedbackType.value = 'error'
+}
+
 const pollDownloadProgress = async (): Promise<void> => {
   if (downloadProgressRequest) return downloadProgressRequest
+  if (!dialogVisible.value) return
   const sessionId = downloadProgressSessionId.value.trim()
   if (!sessionId) {
     return
@@ -1091,23 +1153,16 @@ const pollDownloadProgress = async (): Promise<void> => {
     const data = await HttpUtils.get(mihomoCore.progressEndpoint, { id: sessionId }, { silentAuthCheck: true })
     if (sessionId !== downloadProgressSessionId.value.trim()) return
     if (!data.success) {
-      if (!downloading.value) {
-        downloadProgress.value = {
-          ...downloadProgress.value,
-          status: 'error',
-          error: data.msg || t('coreManager.downloadProgressUnavailable'),
-        }
-        stopDownloadProgressPolling()
-      }
       return
     }
     const nextProgress = normalizeCoreDownloadProgress(data.obj)
-    if (nextProgress.status === 'missing' && downloading.value) {
+    if (nextProgress.status === 'missing' && coreDownloadTaskActive.value) {
       return
     }
     downloadProgress.value = nextProgress
-    if (nextProgress.status === 'success' || nextProgress.status === 'error' || nextProgress.status === 'missing') {
+    if (isTerminalCoreDownload(nextProgress)) {
       stopDownloadProgressPolling()
+      void completeCoreDownloadTask(nextProgress)
     }
   })()
   downloadProgressRequest = request
@@ -1123,7 +1178,7 @@ const pollDownloadProgress = async (): Promise<void> => {
 const startDownloadProgressPolling = (sessionId: string) => {
   stopDownloadProgressPolling()
   downloadProgressSessionId.value = sessionId.trim()
-  if (!downloadProgressSessionId.value) {
+  if (!downloadProgressSessionId.value || !dialogVisible.value) {
     return
   }
   downloadProgressTimerId.value = window.setInterval(() => {
@@ -1132,11 +1187,28 @@ const startDownloadProgressPolling = (sessionId: string) => {
   void pollDownloadProgress()
 }
 
+const recoverCoreDownloadTask = async () => {
+  const data = await HttpUtils.get(mihomoCore.progressEndpoint, {}, { silentAuthCheck: true })
+  if (!data.success || !data.obj) return
+  const nextProgress = normalizeCoreDownloadProgress(data.obj)
+  if (nextProgress.id === '' || nextProgress.state === 'idle') return
+  downloadProgress.value = nextProgress
+  downloadProgressSessionId.value = nextProgress.id
+  if (coreDownloadTaskActive.value) {
+    if (dialogVisible.value) {
+      startDownloadProgressPolling(nextProgress.id)
+    }
+  } else if (isTerminalCoreDownload(nextProgress)) {
+    void completeCoreDownloadTask(nextProgress)
+  }
+}
+
 const handleVisibilityChange = () => {
   if (document.visibilityState === 'visible') {
     if (dialogVisible.value && downloadProgressSessionId.value) {
       startDownloadProgressPolling(downloadProgressSessionId.value)
     }
+    void recoverCoreDownloadTask()
     return
   }
   stopDownloadProgressPolling()
@@ -1338,137 +1410,76 @@ const ackCoreUpdateNotice = async () => {
   }
 }
 
-const downloadCore = async () => {
-  if (!selectedVersion.value || downloading.value) {
-    return
+const submitCoreDownload = async (formData: FormData, versionLabel: string) => {
+  downloading.value = true
+  downloadingVersion.value = versionLabel
+  completedDownloadTaskId = ''
+  resetDownloadProgress()
+  feedbackMsg.value = ''
+  try {
+    const data = await HttpUtils.post(mihomoCore.downloadEndpoint, formData, { silentAuthCheck: true })
+    if (data.success && data.obj) {
+      const nextProgress = normalizeCoreDownloadProgress(data.obj)
+      downloadProgress.value = nextProgress
+      if (nextProgress.id !== '') startDownloadProgressPolling(nextProgress.id)
+      return
+    }
+    await recoverCoreDownloadTask()
+    if (coreDownloadTaskActive.value) return
+    feedbackMsg.value = data.msg || t('coreManager.downloadFailed')
+    feedbackType.value = 'error'
+  } catch (error: any) {
+    await recoverCoreDownloadTask()
+    if (coreDownloadTaskActive.value) return
+    feedbackMsg.value = t('coreManager.downloadFailedWithReason', {
+      reason: error?.message || t('coreManager.unknown'),
+    })
+    feedbackType.value = 'error'
+  } finally {
+    downloading.value = false
   }
+}
+
+const downloadCore = async () => {
+  if (!selectedVersion.value || downloading.value || coreDownloadTaskActive.value) return
   if (!hasCompleteLinuxTargetSelection.value) {
     feedbackMsg.value = t('coreManager.downloadTargetRequired')
     feedbackType.value = 'error'
     return
   }
-
-  const sessionId = makeDownloadSessionId()
-  downloading.value = true
-  downloadingVersion.value = selectedVersion.value.replace(/^v/, '')
-  downloadProgressSessionId.value = sessionId
-  resetDownloadProgress()
-  downloadProgress.value.id = sessionId
-  downloadProgress.value.core = mihomoCore.coreName
-  downloadProgress.value.status = 'running'
-  startDownloadProgressPolling(sessionId)
-  feedbackMsg.value = ''
-
-  try {
-    const formData = new FormData()
-    formData.append('version', selectedVersion.value)
-    formData.append('downloadSessionId', sessionId)
-    if (showLinuxArchSelector.value && selectedLinuxArch.value) {
-      formData.append('target_os', 'linux')
-      formData.append('target_arch', selectedLinuxArch.value)
-      if (showLinuxAmd64LevelSelector.value && selectedAmd64Level.value) {
-        formData.append('target_amd64_level', selectedAmd64Level.value)
-      }
+  const formData = new FormData()
+  formData.append('version', selectedVersion.value)
+  if (showLinuxArchSelector.value && selectedLinuxArch.value) {
+    formData.append('target_os', 'linux')
+    formData.append('target_arch', selectedLinuxArch.value)
+    if (showLinuxAmd64LevelSelector.value && selectedAmd64Level.value) {
+      formData.append('target_amd64_level', selectedAmd64Level.value)
     }
-    const data = await HttpUtils.post(mihomoCore.downloadEndpoint, formData)
-    await pollDownloadProgress()
-    if (data.success) {
-      const version = data.obj?.version || ''
-      feedbackMsg.value = t('coreManager.downloadSuccess', {
-        coreName: mihomoCore.coreName,
-        version,
-      })
-      feedbackType.value = 'success'
-      setTimeout(() => {
-        void loadCoreStatus()
-      }, 1200)
-      await loadCoreUpdateInfo(false)
-      return
-    }
-    if (downloadProgress.value.status === 'running') {
-      downloadProgress.value = {
-        ...downloadProgress.value,
-        status: 'error',
-        error: data.msg || t('coreManager.downloadFailed'),
-      }
-    }
-    feedbackMsg.value = data.msg || t('coreManager.downloadFailed')
-    feedbackType.value = 'error'
-  } catch (error: any) {
-    if (downloadProgress.value.status === 'running') {
-      downloadProgress.value = {
-        ...downloadProgress.value,
-        status: 'error',
-        error: error.message || t('coreManager.unknown'),
-      }
-    }
-    feedbackMsg.value = t('coreManager.downloadFailedWithReason', {
-      reason: error.message || t('coreManager.unknown'),
-    })
-    feedbackType.value = 'error'
-  } finally {
-    stopDownloadProgressPolling()
-    downloading.value = false
   }
+  await submitCoreDownload(formData, selectedVersion.value.replace(/^v/, ''))
 }
 
 const downloadCoreFromCustomURL = async () => {
   const url = customDownloadURL.value.trim()
-  if (!/^https?:\/\/.+/i.test(url) || downloading.value) {
-    return
-  }
+  if (!/^https?:\/\/.+/i.test(url) || downloading.value || coreDownloadTaskActive.value) return
+  const formData = new FormData()
+  formData.append('custom_url', url)
+  await submitCoreDownload(formData, 'custom')
+}
 
-  const sessionId = makeDownloadSessionId()
-  downloading.value = true
-  downloadingVersion.value = 'custom'
-  downloadProgressSessionId.value = sessionId
-  resetDownloadProgress()
-  downloadProgress.value.id = sessionId
-  downloadProgress.value.core = mihomoCore.coreName
-  downloadProgress.value.status = 'running'
-  startDownloadProgressPolling(sessionId)
-  feedbackMsg.value = ''
-
+const stopCoreDownload = async () => {
+  const id = downloadProgress.value.id.trim()
+  if (!id || !downloadProgress.value.canCancel || coreDownloadTaskStopping.value) return
+  downloadProgress.value = { ...downloadProgress.value, state: 'stopping', stopRequested: true, canCancel: false }
   try {
-    const formData = new FormData()
-    formData.append('custom_url', url)
-    formData.append('downloadSessionId', sessionId)
-    const data = await HttpUtils.post(mihomoCore.downloadEndpoint, formData)
-    await pollDownloadProgress()
-    if (data.success) {
-      const version = data.obj?.version || ''
-      feedbackMsg.value = t('coreManager.customDownloadSuccess', { version })
-      feedbackType.value = 'success'
-      setTimeout(() => {
-        void loadCoreStatus()
-      }, 1200)
-      await loadCoreUpdateInfo(false)
+    const data = await HttpUtils.post('api/mihomo-core-download-stop', { id }, { silentAuthCheck: true })
+    if (data.success && data.obj) {
+      downloadProgress.value = normalizeCoreDownloadProgress(data.obj)
+      startDownloadProgressPolling(id)
       return
     }
-    if (downloadProgress.value.status === 'running') {
-      downloadProgress.value = {
-        ...downloadProgress.value,
-        status: 'error',
-        error: data.msg || t('coreManager.customDownloadFailed'),
-      }
-    }
-    feedbackMsg.value = data.msg || t('coreManager.customDownloadFailed')
-    feedbackType.value = 'error'
-  } catch (error: any) {
-    if (downloadProgress.value.status === 'running') {
-      downloadProgress.value = {
-        ...downloadProgress.value,
-        status: 'error',
-        error: error.message || t('coreManager.unknown'),
-      }
-    }
-    feedbackMsg.value = t('coreManager.customDownloadFailedWithReason', {
-      reason: error.message || t('coreManager.unknown'),
-    })
-    feedbackType.value = 'error'
   } finally {
-    stopDownloadProgressPolling()
-    downloading.value = false
+    await recoverCoreDownloadTask()
   }
 }
 
@@ -1477,7 +1488,7 @@ const openReleasePage = () => {
 }
 
 const startCore = async () => {
-  if (!coreReady.value) {
+  if (coreDownloadTaskActive.value || startingCore.value || !coreReady.value) {
     return
   }
   startingCore.value = true
@@ -1507,6 +1518,7 @@ const startCore = async () => {
 }
 
 const stopCore = async () => {
+  if (coreDownloadTaskActive.value || stoppingCore.value) return
   stoppingCore.value = true
   feedbackMsg.value = ''
   try {
@@ -1534,7 +1546,7 @@ const stopCore = async () => {
 }
 
 const restartCore = async () => {
-  if (!coreReady.value) {
+  if (coreDownloadTaskActive.value || restartingCore.value || !coreReady.value) {
     return
   }
   restartingCore.value = true
@@ -1564,7 +1576,7 @@ const restartCore = async () => {
 }
 
 const deleteCore = async () => {
-  if (deletingCore.value || !installed.value) {
+  if (coreDownloadTaskActive.value || deletingCore.value || !installed.value) {
     return
   }
 
@@ -1573,7 +1585,7 @@ const deleteCore = async () => {
     severity: 'danger',
     confirmText: t('confirmDialog.actions.delete'),
   })
-  if (!confirmDelete || deletingCore.value || !installed.value) {
+  if (!confirmDelete || coreDownloadTaskActive.value || deletingCore.value || !installed.value) {
     return
   }
 
@@ -1610,6 +1622,7 @@ onMounted(() => {
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', handleVisibilityChange)
   }
+  void recoverCoreDownloadTask()
 })
 
 onBeforeUnmount(() => {

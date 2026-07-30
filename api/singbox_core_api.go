@@ -157,33 +157,24 @@ func (a *ApiService) syncNftablesWithCoreState() {
 
 func (a *ApiService) DownloadCoreManager(c *gin.Context) {
 	request := parseSingboxCoreDownloadRequest(c)
-
-	var localVersion string
-	var err error
 	if request.CustomURL != "" {
 		if !strings.HasPrefix(request.CustomURL, "http://") && !strings.HasPrefix(request.CustomURL, "https://") {
 			jsonMsg(c, "", fmt.Errorf("custom_url must start with http:// or https://"))
 			return
 		}
-		localVersion, err = a.coreManagerService().DownloadCoreFromURL(request.CustomURL, request.DownloadSessionID)
-		if err == nil {
-			if saveErr := a.coreManagerService().SaveCustomDownloadURL(request.CustomURL); saveErr != nil {
-				logger.Warning("save core custom download url failed: ", saveErr)
-			}
-		}
-	} else {
-		if request.Version == "" {
-			jsonMsg(c, "", fmt.Errorf("version or custom_url is required"))
-			return
-		}
-		localVersion, err = a.coreManagerService().DownloadCore(request.Version, request.Target, request.DownloadSessionID)
 	}
+	if request.CustomURL == "" && request.Version == "" {
+		jsonMsg(c, "", fmt.Errorf("version or custom_url is required"))
+		return
+	}
+	progress, err := a.coreManagerService().StartManagedCoreDownload(request.Version, request.Target, request.CustomURL, func() {
+		a.syncNftablesWithCoreState()
+	})
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
 	}
-	a.syncNftablesWithCoreState()
-	jsonObj(c, map[string]string{"version": localVersion}, nil)
+	jsonObj(c, progress, nil)
 }
 
 func (a *ApiService) SaveCoreDownloadPreference(c *gin.Context) {

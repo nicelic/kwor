@@ -813,6 +813,40 @@ func TestKernelDownloadFailureSchedulesCleanup(t *testing.T) {
 	}
 }
 
+func TestCleanupManagedKernelStagingPreservesCompletedDownload(t *testing.T) {
+	svc := &KernelManagerService{}
+	root := svc.getKernelDownloadRoot("")
+	unique := fmt.Sprintf("managed-staging-%d", time.Now().UnixNano())
+	stagingDir := filepath.Join(root, ".staging", unique)
+	completedDir := filepath.Join(root, "completed-test", unique)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(stagingDir)
+		_ = os.RemoveAll(completedDir)
+	})
+
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		t.Fatalf("create staging directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingDir, "linux-image-test.deb.tmp"), []byte("partial"), 0o644); err != nil {
+		t.Fatalf("write staging artifact: %v", err)
+	}
+	if err := os.MkdirAll(completedDir, 0o755); err != nil {
+		t.Fatalf("create completed directory: %v", err)
+	}
+	completedFile := filepath.Join(completedDir, "linux-image-complete.deb")
+	if err := os.WriteFile(completedFile, []byte("complete"), 0o644); err != nil {
+		t.Fatalf("write completed artifact: %v", err)
+	}
+
+	svc.cleanupManagedKernelStaging(stagingDir)
+	if _, err := os.Stat(stagingDir); !os.IsNotExist(err) {
+		t.Fatalf("expected staging directory removed, got err=%v", err)
+	}
+	if content, err := os.ReadFile(completedFile); err != nil || string(content) != "complete" {
+		t.Fatalf("completed download must be preserved, content=%q err=%v", string(content), err)
+	}
+}
+
 func TestClearDownloadedKernelRemovesMarkerAndLegacyArtifacts(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "kernel-clear.db")
 	if err := database.InitDB(dbPath); err != nil {

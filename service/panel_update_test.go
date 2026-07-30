@@ -49,6 +49,54 @@ func TestClearPanelUpdateLastError(t *testing.T) {
 	}
 }
 
+func TestCleanupPanelUpdateWorkDirRemovesAllOwnedContents(t *testing.T) {
+	workDir, err := os.MkdirTemp("", "kwor-panel-update-")
+	if err != nil {
+		t.Fatalf("create panel update work directory: %v", err)
+	}
+	unknownArtifact := filepath.Join(workDir, "kwor-linux-armv7.tar.gz.tmp")
+	if err := os.MkdirAll(filepath.Dir(unknownArtifact), 0o755); err != nil {
+		t.Fatalf("create artifact parent: %v", err)
+	}
+	if err := os.WriteFile(unknownArtifact, []byte("partial archive"), 0o600); err != nil {
+		t.Fatalf("write unknown artifact: %v", err)
+	}
+
+	cleanupPanelUpdateWorkDir(workDir)
+	if _, err := os.Stat(workDir); !os.IsNotExist(err) {
+		t.Fatalf("expected owned work directory to be removed, stat err=%v", err)
+	}
+
+	outsideDir := t.TempDir()
+	sentinel := filepath.Join(outsideDir, "keep.txt")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("write outside sentinel: %v", err)
+	}
+	cleanupPanelUpdateWorkDir(outsideDir)
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("cleanup must not remove a non-workspace path: %v", err)
+	}
+}
+
+func TestPanelUpdateWorkerContextOutlivesPreparationTaskContext(t *testing.T) {
+	operationContext, operation, err := BeginKworManagedOperation("panel-update-test")
+	if err != nil {
+		t.Fatalf("create managed operation: %v", err)
+	}
+	defer operation.Done()
+
+	preparationContext, cancelPreparation := context.WithCancel(operationContext)
+	defer cancelPreparation()
+	workerContext := panelUpdateWorkerContext(preparationContext, operation)
+	cancelPreparation()
+
+	select {
+	case <-workerContext.Done():
+		t.Fatal("worker context should not be cancelled when the preparation task completes")
+	default:
+	}
+}
+
 func TestPanelUpdateVersionSelectable(t *testing.T) {
 	testCases := []struct {
 		name    string

@@ -806,24 +806,35 @@ func (s *MihomoCoreManagerService) getDownloadAssetContext(ctx context.Context, 
 }
 
 func (s *MihomoCoreManagerService) installCoreFromArchiveFile(archivePath, coreDir string) error {
+	return s.installCoreFromArchiveFileContext(context.Background(), archivePath, coreDir)
+}
+
+func (s *MihomoCoreManagerService) installCoreFromArchiveFileContext(ctx context.Context, archivePath, coreDir string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	binName := s.getCoreBinName()
 	binPath := filepath.Join(coreDir, binName)
 	_ = os.Remove(binPath)
+	extractor := &CoreManagerService{}
 
 	lower := strings.ToLower(archivePath)
 	var err error
 
 	switch {
 	case strings.HasSuffix(lower, ".zip"):
-		err = s.extractZip(archivePath, coreDir, binName)
+		err = extractor.extractZipContext(ctx, archivePath, coreDir, binName)
 	case strings.HasSuffix(lower, ".tar.gz"), strings.HasSuffix(lower, ".tgz"):
-		err = s.extractTarGz(archivePath, coreDir, binName)
+		err = extractor.extractTarGzContext(ctx, archivePath, coreDir, binName)
 	case strings.HasSuffix(lower, ".tar"):
-		err = extractCoreTar(archivePath, coreDir, binName)
+		err = extractCoreTarContext(ctx, archivePath, coreDir, binName)
 	case strings.HasSuffix(lower, ".gz"):
-		err = extractCoreGzipBinary(archivePath, coreDir, binName)
+		err = extractCoreGzipBinaryContext(ctx, archivePath, coreDir, binName)
 	default:
-		if copyErr := copyCoreFile(archivePath, binPath); copyErr == nil {
+		if copyErr := copyCoreFileContext(ctx, archivePath, binPath); copyErr == nil {
 			if !IsSystemPlatformWindows() {
 				_ = os.Chmod(binPath, 0o755)
 			}
@@ -832,10 +843,13 @@ func (s *MihomoCoreManagerService) installCoreFromArchiveFile(archivePath, coreD
 			}
 			_ = os.Remove(binPath)
 		}
-		err = s.extractCoreByExternalTool(archivePath, coreDir, binName)
+		err = extractor.extractCoreByExternalToolContext(ctx, archivePath, coreDir, binName)
 	}
 
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return err
 	}
 	if !IsSystemPlatformWindows() {
@@ -843,6 +857,9 @@ func (s *MihomoCoreManagerService) installCoreFromArchiveFile(archivePath, coreD
 	}
 	if _, statErr := os.Stat(binPath); statErr != nil {
 		return fmt.Errorf("core binary not found after extraction")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -853,13 +870,19 @@ func (s *MihomoCoreManagerService) DownloadCore(version string, target MihomoCor
 		return "", err
 	}
 	defer operation.Done()
-	lifecycleLock, err := AcquireKworLifecycleLock()
+	return s.downloadCoreWithContext(operationContext, version, target, requestedSessionID)
+}
+
+func (s *MihomoCoreManagerService) downloadCoreWithContext(operationContext context.Context, version string, target MihomoCoreDownloadTarget, requestedSessionID string) (string, error) {
+	lifecycleLock, err := AcquireKworLifecycleLockContext(operationContext)
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = lifecycleLock.Release() }()
 
-	s.mu.Lock()
+	if err := lockManagedDownloadTaskMutex(operationContext, &s.mu); err != nil {
+		return "", err
+	}
 	defer s.mu.Unlock()
 
 	sessionID := StartCoreDownloadProgressSession("mihomo", requestedSessionID, false)
@@ -961,7 +984,7 @@ func (s *MihomoCoreManagerService) DownloadCore(version string, target MihomoCor
 		return "", err
 	}
 
-	if _, err = io.Copy(out, io.TeeReader(resp.Body, &coreDownloadProgressWriter{sessionID: sessionID})); err != nil {
+	if _, err = copyManagedDownloadTaskContext(operationContext, out, io.TeeReader(resp.Body, &coreDownloadProgressWriter{sessionID: sessionID})); err != nil {
 		_ = out.Close()
 		err = fmt.Errorf("write temp file failed: %v", err)
 		failProgress(coreDownloadStageDownloading, err)
@@ -972,18 +995,26 @@ func (s *MihomoCoreManagerService) DownloadCore(version string, target MihomoCor
 		failProgress(coreDownloadStageDownloading, err)
 		return "", err
 	}
+	if err = operationContext.Err(); err != nil {
+		failProgress(coreDownloadStageDownloading, err)
+		return "", err
+	}
 
-	SetCoreDownloadProgressStage(sessionID, coreDownloadStageReplacing)
+	SetCoreDownloadProgressStage(sessionID, coreDownloadStageExtracting)
 	stageDir, cleanupStageDir, err := createManagedCoreInstallWorkspace(coreDir, mihomoCoreInstallStagePrefix)
 	if err != nil {
-		failProgress(coreDownloadStageReplacing, err)
+		failProgress(coreDownloadStageExtracting, err)
 		return "", err
 	}
 	defer cleanupStageDir()
 
-	if err = s.installCoreFromArchiveFile(tmpFile, stageDir); err != nil {
+	if err = s.installCoreFromArchiveFileContext(operationContext, tmpFile, stageDir); err != nil {
 		err = fmt.Errorf("extract/install failed: %v", err)
-		failProgress(coreDownloadStageReplacing, err)
+		failProgress(coreDownloadStageExtracting, err)
+		return "", err
+	}
+	if err = operationContext.Err(); err != nil {
+		failProgress(coreDownloadStageExtracting, err)
 		return "", err
 	}
 
@@ -995,6 +1026,12 @@ func (s *MihomoCoreManagerService) DownloadCore(version string, target MihomoCor
 		failProgress(coreDownloadStageValidating, err)
 		return "", err
 	}
+	if !beginManagedCoreDownloadApplying(sessionID, coreDownloadStageReplacing) {
+		err = coreDownloadTaskCancelledError(operationContext)
+		failProgress(coreDownloadStageValidating, err)
+		return "", err
+	}
+	SetCoreDownloadProgressStage(sessionID, coreDownloadStageReplacing)
 
 	activation, activationStage, err := activateManagedCoreBinaryInstallWithRuntime(
 		wasRunning,
@@ -1067,13 +1104,19 @@ func (s *MihomoCoreManagerService) DownloadCoreFromURL(downloadURL string, reque
 		return "", err
 	}
 	defer operation.Done()
-	lifecycleLock, err := AcquireKworLifecycleLock()
+	return s.downloadCoreFromURLWithContext(operationContext, downloadURL, requestedSessionID)
+}
+
+func (s *MihomoCoreManagerService) downloadCoreFromURLWithContext(operationContext context.Context, downloadURL string, requestedSessionID string) (string, error) {
+	lifecycleLock, err := AcquireKworLifecycleLockContext(operationContext)
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = lifecycleLock.Release() }()
 
-	s.mu.Lock()
+	if err := lockManagedDownloadTaskMutex(operationContext, &s.mu); err != nil {
+		return "", err
+	}
 	defer s.mu.Unlock()
 
 	sessionID := StartCoreDownloadProgressSession("mihomo", requestedSessionID, false)
@@ -1162,7 +1205,7 @@ func (s *MihomoCoreManagerService) DownloadCoreFromURL(downloadURL string, reque
 		return "", err
 	}
 
-	if _, err = io.Copy(out, io.TeeReader(resp.Body, &coreDownloadProgressWriter{sessionID: sessionID})); err != nil {
+	if _, err = copyManagedDownloadTaskContext(operationContext, out, io.TeeReader(resp.Body, &coreDownloadProgressWriter{sessionID: sessionID})); err != nil {
 		_ = out.Close()
 		err = fmt.Errorf("write temp file failed: %v", err)
 		failProgress(coreDownloadStageDownloading, err)
@@ -1173,18 +1216,26 @@ func (s *MihomoCoreManagerService) DownloadCoreFromURL(downloadURL string, reque
 		failProgress(coreDownloadStageDownloading, err)
 		return "", err
 	}
+	if err = operationContext.Err(); err != nil {
+		failProgress(coreDownloadStageDownloading, err)
+		return "", err
+	}
 
-	SetCoreDownloadProgressStage(sessionID, coreDownloadStageReplacing)
+	SetCoreDownloadProgressStage(sessionID, coreDownloadStageExtracting)
 	stageDir, cleanupStageDir, err := createManagedCoreInstallWorkspace(coreDir, mihomoCoreInstallStagePrefix)
 	if err != nil {
-		failProgress(coreDownloadStageReplacing, err)
+		failProgress(coreDownloadStageExtracting, err)
 		return "", err
 	}
 	defer cleanupStageDir()
 
-	if err = s.installCoreFromArchiveFile(tmpFile, stageDir); err != nil {
+	if err = s.installCoreFromArchiveFileContext(operationContext, tmpFile, stageDir); err != nil {
 		err = fmt.Errorf("extract/install failed: %v", err)
-		failProgress(coreDownloadStageReplacing, err)
+		failProgress(coreDownloadStageExtracting, err)
+		return "", err
+	}
+	if err = operationContext.Err(); err != nil {
+		failProgress(coreDownloadStageExtracting, err)
 		return "", err
 	}
 
@@ -1196,6 +1247,12 @@ func (s *MihomoCoreManagerService) DownloadCoreFromURL(downloadURL string, reque
 		failProgress(coreDownloadStageValidating, err)
 		return "", err
 	}
+	if !beginManagedCoreDownloadApplying(sessionID, coreDownloadStageReplacing) {
+		err = coreDownloadTaskCancelledError(operationContext)
+		failProgress(coreDownloadStageValidating, err)
+		return "", err
+	}
+	SetCoreDownloadProgressStage(sessionID, coreDownloadStageReplacing)
 
 	activation, activationStage, err := activateManagedCoreBinaryInstallWithRuntime(
 		wasRunning,

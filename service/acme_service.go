@@ -139,6 +139,13 @@ var (
 	}
 )
 
+var acmeInstallTaskManager = NewManagedDownloadTaskManager("acme.sh install")
+var acmeInstallTaskState = struct {
+	sync.Mutex
+	id           string
+	logSessionID string
+}{}
+
 type acmeAutoRenewBatchState struct {
 	mu           sync.Mutex
 	loaded       bool
@@ -470,6 +477,11 @@ type AcmeTaskView struct {
 	Error        string            `json:"error,omitempty"`
 	Warnings     []string          `json:"warnings,omitempty"`
 	Result       *AcmeActionResult `json:"result,omitempty"`
+}
+
+type AcmeInstallTaskStatus struct {
+	ManagedDownloadTaskStatus
+	LogSessionID string `json:"logSessionId,omitempty"`
 }
 
 type AcmeVersionItem struct {
@@ -856,8 +868,26 @@ func (s *AcmeService) Install(email string) (*AcmeActionResult, error) {
 }
 
 func (s *AcmeService) InstallOrReinstall(payload AcmeInstallPayload) (*AcmeActionResult, error) {
-	acmeOperationMu.Lock()
+	return s.installOrReinstallWithContext(context.Background(), payload, nil, nil, nil)
+}
+
+func (s *AcmeService) installOrReinstallWithContext(ctx context.Context, payload AcmeInstallPayload, report func(string), beginApplying func() bool, logSession *acmeLogSession) (*AcmeActionResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := lockManagedDownloadTaskMutex(ctx, &acmeOperationMu); err != nil {
+		return nil, err
+	}
 	defer acmeOperationMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if report != nil {
+		report("preparing")
+	}
 
 	if !IsSystemPlatformLinux() {
 		return nil, common.NewError("ACME certificate management is only supported on Linux")
@@ -877,7 +907,7 @@ func (s *AcmeService) InstallOrReinstall(payload AcmeInstallPayload) (*AcmeActio
 	}
 
 	if version != "" {
-		ok, checkErr := s.checkVersionDownloadableLocked(version)
+		ok, checkErr := s.checkVersionDownloadableLockedContext(ctx, version)
 		if checkErr != nil {
 			return nil, checkErr
 		}
@@ -888,7 +918,7 @@ func (s *AcmeService) InstallOrReinstall(payload AcmeInstallPayload) (*AcmeActio
 
 	beforeVersion := ""
 	if scriptPath, homeDir, installed := s.resolveAcmeScript(); installed {
-		if v, err := readAcmeVersionByScript(scriptPath, homeDir); err == nil {
+		if v, err := readAcmeVersionByScriptContext(ctx, scriptPath, homeDir); err == nil {
 			beforeVersion = v
 		}
 	}
@@ -903,7 +933,10 @@ func (s *AcmeService) InstallOrReinstall(payload AcmeInstallPayload) (*AcmeActio
 		_ = os.Remove(tmpPath)
 	}()
 
-	if err := downloadAcmeInstallerScript(tmpPath); err != nil {
+	if report != nil {
+		report("downloading")
+	}
+	if err := downloadAcmeInstallerScriptContext(ctx, tmpPath); err != nil {
 		return nil, err
 	}
 
@@ -935,7 +968,10 @@ func (s *AcmeService) InstallOrReinstall(payload AcmeInstallPayload) (*AcmeActio
 	if contact != "" {
 		args = append(args, "--accountemail", contact)
 	}
-	output, err := runCommandOutputWithTimeoutEnv(90*time.Second, shellPath, args, nil)
+	if report != nil {
+		report("installing")
+	}
+	output, err := runCommandOutputWithTimeoutEnvLog(90*time.Second, shellPath, args, nil, logSession)
 	if err != nil {
 		return nil, common.NewError("install acme.sh failed: ", err)
 	}
@@ -948,18 +984,30 @@ func (s *AcmeService) InstallOrReinstall(payload AcmeInstallPayload) (*AcmeActio
 		}
 		return nil, common.NewError("acme.sh install finished but staged script path was not found")
 	}
-	if _, err := readAcmeVersionByScript(stagedScriptPath, stagedHomeDir); err != nil {
+	if _, err := readAcmeVersionByScriptContext(ctx, stagedScriptPath, stagedHomeDir); err != nil {
 		detail := summarizeAcmeInstallOutput(output)
 		if detail != "" {
 			return nil, common.NewError("staged acme.sh install is incomplete: ", detail)
 		}
 		return nil, common.NewError("staged acme.sh install is incomplete: ", err)
 	}
+	if beginApplying != nil && !beginApplying() {
+		return nil, coreDownloadTaskCancelledError(ctx)
+	}
+	if report != nil {
+		report("applying")
+	}
 
 	acmeOwnership, err := BeginAcmeHostOwnership([]string{managedAcmeHomeDir()}, nil)
 	if err != nil {
 		return nil, common.NewError("record pending managed acme ownership failed: ", err)
 	}
+	ownershipActivated := false
+	defer func() {
+		if !ownershipActivated && acmeOwnership.ID != "" {
+			_ = RemoveHostResource(acmeOwnership.ID)
+		}
+	}()
 	scriptPath, err := s.activateManagedAcmeInstallLocked(stagedHomeDir)
 	if err != nil {
 		return nil, err
@@ -975,6 +1023,7 @@ func (s *AcmeService) InstallOrReinstall(payload AcmeInstallPayload) (*AcmeActio
 	if err := VerifyAndActivateHostResource(acmeOwnership.ID); err != nil {
 		return nil, common.NewError("activate managed acme ownership failed: ", err)
 	}
+	ownershipActivated = true
 	if err := syncManagedAcmeCertificateOwnership(); err != nil {
 		return nil, common.NewError("refresh managed acme ownership failed: ", err)
 	}
@@ -1011,6 +1060,116 @@ func (s *AcmeService) InstallOrReinstall(payload AcmeInstallPayload) (*AcmeActio
 		Msg:      msg,
 		Output:   strings.TrimSpace(output),
 	}, nil
+}
+
+func acmeInstallTaskFingerprint(payload AcmeInstallPayload) string {
+	value := strings.TrimSpace(payload.Version) + "\x00" + normalizeAcmeEmail(payload.Email) + "\x00" + strconv.FormatBool(payload.EmailProvided)
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+func startAcmeInstallTaskLog(taskID string, ctx context.Context) *acmeLogSession {
+	logSession := acmeLogSessionStore.start("log-"+strings.TrimSpace(taskID), "acme.sh 下载 / 重装")
+	if logSession == nil {
+		return nil
+	}
+	acmeLogSessionStore.mu.Lock()
+	logSession.taskID = strings.TrimSpace(taskID)
+	logSession.taskStatus = managedDownloadTaskRunning
+	logSession.ctx = ctx
+	logSession.updatedAt = time.Now().Unix()
+	acmeLogSessionStore.mu.Unlock()
+	logSession.append("后台下载任务已启动")
+	return logSession
+}
+
+func (s *AcmeService) StartManagedInstallOrReinstall(payload AcmeInstallPayload) (AcmeInstallTaskStatus, error) {
+	handle, taskStatus, created, err := acmeInstallTaskManager.Start("acme-install", acmeInstallTaskFingerprint(payload))
+	if err != nil {
+		return AcmeInstallTaskStatus{}, err
+	}
+	if !created {
+		return s.GetManagedAcmeInstall(taskStatus.ID), nil
+	}
+	logSessionID, err := acmeTaskSessionStore.enqueueManaged("install", "acme.sh 下载 / 重装", handle, func(queuedLogSessionID string) (*AcmeActionResult, error) {
+		return s.runManagedInstallOrReinstall(handle, payload, queuedLogSessionID)
+	})
+	if err != nil {
+		return AcmeInstallTaskStatus{}, err
+	}
+	acmeInstallTaskState.Lock()
+	acmeInstallTaskState.id = handle.ID()
+	acmeInstallTaskState.logSessionID = logSessionID
+	acmeInstallTaskState.Unlock()
+	return AcmeInstallTaskStatus{ManagedDownloadTaskStatus: taskStatus, LogSessionID: logSessionID}, nil
+}
+
+func (s *AcmeService) runManagedInstallOrReinstall(handle *ManagedDownloadTaskHandle, payload AcmeInstallPayload, logSessionID string) (*AcmeActionResult, error) {
+	if handle == nil || !handle.MarkRunning("preparing") {
+		if handle != nil {
+			handle.FinishCancelled("cancelled")
+		}
+		return nil, context.Canceled
+	}
+	ctx := handle.Context()
+	logSession := startAcmeInstallTaskLog(handle.ID(), ctx)
+	result, installErr := s.installOrReinstallWithContext(ctx, payload, func(phase string) {
+		handle.SetPhase(phase, true)
+		if logSession != nil {
+			logSession.append("阶段: " + phase)
+		}
+	}, func() bool {
+		return handle.BeginApplying("applying")
+	}, logSession)
+	if installErr != nil {
+		if ctx.Err() != nil {
+			handle.FinishCancelled("cancelled")
+		} else {
+			handle.FinishError("failed", installErr)
+		}
+		status := handle.Snapshot()
+		if logSession != nil {
+			logSession.fail(firstNonEmpty(status.Error, installErr.Error()))
+		}
+		return nil, installErr
+	}
+	handle.FinishSuccess("completed")
+	if logSession != nil {
+		logSession.finish("acme.sh 下载 / 重装完成")
+	}
+	_ = logSessionID
+	return result, nil
+}
+
+func (s *AcmeService) GetManagedAcmeInstall(id string) AcmeInstallTaskStatus {
+	status := acmeInstallTaskManager.Get(id)
+	if status.State == managedDownloadTaskIdle {
+		return AcmeInstallTaskStatus{ManagedDownloadTaskStatus: status}
+	}
+	acmeInstallTaskState.Lock()
+	logSessionID := ""
+	if strings.TrimSpace(id) == "" || acmeInstallTaskState.id == strings.TrimSpace(id) || acmeInstallTaskState.id == status.ID {
+		logSessionID = acmeInstallTaskState.logSessionID
+	}
+	acmeInstallTaskState.Unlock()
+	return AcmeInstallTaskStatus{ManagedDownloadTaskStatus: status, LogSessionID: logSessionID}
+}
+
+func (s *AcmeService) StopManagedAcmeInstall(id string) (AcmeInstallTaskStatus, error) {
+	status, err := acmeInstallTaskManager.Stop(id)
+	if err == nil {
+		acmeTaskSessionStore.finishQueuedManagedIfCancelled(status.ID)
+	}
+	result := s.GetManagedAcmeInstall(status.ID)
+	if result.LogSessionID != "" {
+		acmeLogSessionStore.mu.Lock()
+		logSession := acmeLogSessionStore.sessions[result.LogSessionID]
+		acmeLogSessionStore.mu.Unlock()
+		if logSession != nil {
+			logSession.append("正在停止下载任务")
+		}
+	}
+	return result, err
 }
 
 func (s *AcmeService) Upgrade() (*AcmeActionResult, error) {
@@ -7083,12 +7242,22 @@ func collectManagedAcmeInstallPaths(homeDir string) ([]string, error) {
 }
 
 func (s *AcmeService) checkVersionDownloadableLocked(version string) (bool, error) {
+	return s.checkVersionDownloadableLockedContext(context.Background(), version)
+}
+
+func (s *AcmeService) checkVersionDownloadableLockedContext(ctx context.Context, version string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	version = normalizeAcmeVersionTag(version)
 	if version == "" {
 		return false, nil
 	}
 	client := &http.Client{Timeout: 20 * time.Second}
-	req, err := http.NewRequest("GET", acmeGitHubReleaseTagAPI+version, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", acmeGitHubReleaseTagAPI+version, nil)
 	if err != nil {
 		return false, err
 	}
@@ -7107,7 +7276,7 @@ func (s *AcmeService) checkVersionDownloadableLocked(version string) (bool, erro
 		perPage := 100
 		for page <= 3 {
 			url := fmt.Sprintf("%s?per_page=%d&page=%d", acmeGitHubTagsAPI, perPage, page)
-			tags, hasMore, err := s.fetchAcmeTagPageByURL(client, url, perPage)
+			tags, hasMore, err := s.fetchAcmeTagPageByURLContext(ctx, client, url, perPage)
 			if err != nil {
 				return false, err
 			}
@@ -7198,7 +7367,17 @@ func (s *AcmeService) fetchAcmeTagPage(client *http.Client, page int, perPage in
 }
 
 func (s *AcmeService) fetchAcmeTagPageByURL(client *http.Client, apiURL string, perPage int) ([]AcmeVersionItem, bool, error) {
-	req, err := http.NewRequest("GET", apiURL, nil)
+	return s.fetchAcmeTagPageByURLContext(context.Background(), client, apiURL, perPage)
+}
+
+func (s *AcmeService) fetchAcmeTagPageByURLContext(ctx context.Context, client *http.Client, apiURL string, perPage int) ([]AcmeVersionItem, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -7238,7 +7417,11 @@ func (s *AcmeService) fetchAcmeTagPageByURL(client *http.Client, apiURL string, 
 }
 
 func readAcmeVersionByScript(scriptPath string, homeDir string) (string, error) {
-	output, err := runCommandOutputWithTimeoutEnv(12*time.Second, scriptPath, append(acmeHomeArgs(homeDir), "--version"), nil)
+	return readAcmeVersionByScriptContext(context.Background(), scriptPath, homeDir)
+}
+
+func readAcmeVersionByScriptContext(ctx context.Context, scriptPath string, homeDir string) (string, error) {
+	output, err := runCommandOutputWithTimeoutEnvContext(ctx, 12*time.Second, scriptPath, append(acmeHomeArgs(homeDir), "--version"), nil)
 	if err != nil {
 		return "", err
 	}
@@ -7512,21 +7695,42 @@ func uniqueStringList(items []string) []string {
 }
 
 func downloadAcmeInstallerScript(targetPath string) error {
+	return downloadAcmeInstallerScriptContext(context.Background(), targetPath)
+}
+
+func downloadAcmeInstallerScriptContext(parent context.Context, targetPath string) error {
 	if targetPath == "" {
 		return common.NewError("acme installer target path is empty")
 	}
+	if parent == nil {
+		parent = context.Background()
+	}
 
 	if curlPath, err := exec.LookPath("curl"); err == nil {
-		if err := runCommandWithTimeout(45*time.Second, curlPath, "-fsSL", defaultAcmeInstallScriptURL, "-o", targetPath); err == nil {
+		if err := runAcmeCommandWithContext(parent, 45*time.Second, curlPath, "-fsSL", defaultAcmeInstallScriptURL, "-o", targetPath); err == nil {
 			return nil
 		}
 	}
 	if wgetPath, err := exec.LookPath("wget"); err == nil {
-		if err := runCommandWithTimeout(45*time.Second, wgetPath, "-qO", targetPath, defaultAcmeInstallScriptURL); err == nil {
+		if err := runAcmeCommandWithContext(parent, 45*time.Second, wgetPath, "-qO", targetPath, defaultAcmeInstallScriptURL); err == nil {
 			return nil
 		}
 	}
 	return common.NewError("failed to download acme.sh installer: curl/wget unavailable or network failed")
+}
+
+func runAcmeCommandWithContext(parent context.Context, timeout time.Duration, command string, args ...string) error {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, command, args...)
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil {
+		return fmt.Errorf("command failed (%s): %w: %s", command, err, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func firstNonEmptyLine(raw string) string {
@@ -7628,13 +7832,24 @@ func normalizeAcmeOutputForMatch(raw string) string {
 }
 
 func runCommandOutputWithTimeoutEnv(timeout time.Duration, command string, args []string, envPairs []string) (string, error) {
-	return runCommandOutputWithTimeoutEnvLog(timeout, command, args, envPairs, nil)
+	return runCommandOutputWithTimeoutEnvContext(context.Background(), timeout, command, args, envPairs)
 }
 
 func runCommandOutputWithTimeoutEnvLog(timeout time.Duration, command string, args []string, envPairs []string, logSession *acmeLogSession) (string, error) {
 	parent := context.Background()
 	if logSession != nil {
 		parent = logSession.operationContext()
+	}
+	return runCommandOutputWithTimeoutEnvContextLog(parent, timeout, command, args, envPairs, logSession)
+}
+
+func runCommandOutputWithTimeoutEnvContext(parent context.Context, timeout time.Duration, command string, args []string, envPairs []string) (string, error) {
+	return runCommandOutputWithTimeoutEnvContextLog(parent, timeout, command, args, envPairs, nil)
+}
+
+func runCommandOutputWithTimeoutEnvContextLog(parent context.Context, timeout time.Duration, command string, args []string, envPairs []string, logSession *acmeLogSession) (string, error) {
+	if parent == nil {
+		parent = context.Background()
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()

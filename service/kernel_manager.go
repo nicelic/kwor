@@ -59,6 +59,7 @@ var kernelFailedDownloadCleanupDelay = 5 * time.Second
 var kernelDownloadProgressStore = newKernelDownloadProgressStore()
 var kernelDownloadCleanupStore = newKernelDownloadCleanupScheduler()
 var kernelOperationMu sync.Mutex
+var kernelDownloadTaskManager = NewManagedDownloadTaskManager("kernel package download")
 
 var bbrplusVersionDisplayPriority = map[string]int{
 	"6.1.81-bbrplus": 0,
@@ -239,19 +240,25 @@ type KernelDownloadResult struct {
 }
 
 type KernelDownloadProgress struct {
-	ID              string  `json:"id"`
-	Status          string  `json:"status"`
-	Percent         float64 `json:"percent"`
-	Approximate     bool    `json:"approximate"`
-	DownloadedBytes int64   `json:"downloadedBytes"`
-	TotalBytes      int64   `json:"totalBytes"`
-	CurrentPackage  string  `json:"currentPackage"`
-	DownloadedCount int     `json:"downloadedCount"`
-	TotalCount      int     `json:"totalCount"`
-	Error           string  `json:"error,omitempty"`
-	StartedAt       int64   `json:"startedAt"`
-	UpdatedAt       int64   `json:"updatedAt"`
-	FinishedAt      int64   `json:"finishedAt,omitempty"`
+	ID               string  `json:"id"`
+	Status           string  `json:"status"`
+	State            string  `json:"state,omitempty"`
+	Phase            string  `json:"phase,omitempty"`
+	CanCancel        bool    `json:"canCancel"`
+	StopRequested    bool    `json:"stopRequested"`
+	DeadlineExceeded bool    `json:"deadlineExceeded"`
+	Percent          float64 `json:"percent"`
+	Approximate      bool    `json:"approximate"`
+	DownloadedBytes  int64   `json:"downloadedBytes"`
+	TotalBytes       int64   `json:"totalBytes"`
+	CurrentPackage   string  `json:"currentPackage"`
+	DownloadedCount  int     `json:"downloadedCount"`
+	TotalCount       int     `json:"totalCount"`
+	Error            string  `json:"error,omitempty"`
+	StartedAt        int64   `json:"startedAt"`
+	UpdatedAt        int64   `json:"updatedAt"`
+	DeadlineAt       int64   `json:"deadlineAt,omitempty"`
+	FinishedAt       int64   `json:"finishedAt,omitempty"`
 }
 
 type kernelDownloadProgressSessionStore struct {
@@ -983,6 +990,16 @@ func (s *KernelManagerService) GetArches(provider, line, version string) (*Kerne
 }
 
 func (s *KernelManagerService) GetPackages(provider, line, version, arch string) (*KernelPackageListResponse, error) {
+	return s.getPackagesContext(context.Background(), provider, line, version, arch)
+}
+
+func (s *KernelManagerService) getPackagesContext(ctx context.Context, provider, line, version, arch string) (*KernelPackageListResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	normalizedProvider, err := normalizeKernelProviderRequired(provider)
 	if err != nil {
 		return nil, err
@@ -1035,12 +1052,12 @@ func (s *KernelManagerService) GetPackages(provider, line, version, arch string)
 		return nil, err
 	}
 
-	archDir, err := s.resolveKernelArchDirectory(normalizedProvider, normalizedLine, normalizedVersion, normalizedArch)
+	archDir, err := s.resolveKernelArchDirectoryContext(ctx, normalizedProvider, normalizedLine, normalizedVersion, normalizedArch)
 	if err != nil {
 		return nil, err
 	}
 
-	entries, err := fetchSourceForgeFileEntries(pathJoinSlash("releases", normalizedLine, normalizedVersion, archDir))
+	entries, err := fetchSourceForgeFileEntriesContext(ctx, pathJoinSlash("releases", normalizedLine, normalizedVersion, archDir))
 	if err != nil {
 		return nil, err
 	}
@@ -1087,16 +1104,25 @@ func (s *KernelManagerService) DownloadPackages(provider, line, version, arch st
 	}
 	defer release()
 
-	return s.downloadPackagesLocked(provider, line, version, arch, downloadSessionID)
+	return s.downloadPackagesLockedContext(context.Background(), provider, line, version, arch, downloadSessionID, false, nil)
 }
 
-func (s *KernelManagerService) downloadPackagesLocked(provider, line, version, arch string, downloadSessionID string) (*KernelDownloadResult, error) {
+func (s *KernelManagerService) downloadPackagesLockedContext(ctx context.Context, provider, line, version, arch string, downloadSessionID string, useStaging bool, beginApplying func() bool) (*KernelDownloadResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := kernelEnsureRuntimeSupported(); err != nil {
 		return nil, err
 	}
 
-	pkgs, err := s.GetPackages(provider, line, version, arch)
+	pkgs, err := s.getPackagesContext(ctx, provider, line, version, arch)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if len(pkgs.Packages) == 0 {
@@ -1107,18 +1133,26 @@ func (s *KernelManagerService) downloadPackagesLocked(provider, line, version, a
 		return nil, err
 	}
 
-	if err := s.removeKernelDownloadPath(s.getKernelDownloadRoot("")); err != nil {
+	session := kernelDownloadProgressStore.start(downloadSessionID, len(pkgs.Packages))
+	sessionID := session.id
+	finalDownloadDir := pkgs.Directory
+	downloadDir := finalDownloadDir
+	if useStaging {
+		downloadDir = filepath.Join(s.getKernelDownloadRoot(""), ".staging", sanitizeKernelCleanupPathSegment(sessionID))
+	} else if err := s.removeKernelDownloadPath(s.getKernelDownloadRoot("")); err != nil {
 		return nil, err
 	}
-
-	downloadDir := pkgs.Directory
 	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create kernel download directory failed: %w", err)
 	}
-
-	session := kernelDownloadProgressStore.start(downloadSessionID, len(pkgs.Packages))
-	sessionID := session.id
 	kernelDownloadCleanupStore.markRunning(downloadDir)
+	cleanupFailedDownload := func() {
+		if useStaging {
+			s.cleanupManagedKernelStaging(downloadDir)
+			return
+		}
+		s.scheduleKernelFailedDownloadCleanup(downloadDir)
+	}
 	kernelDownloadProgressStore.setTotals(
 		sessionID,
 		int64(len(pkgs.Packages))*kernelUnknownPackageSizeEstimate,
@@ -1129,7 +1163,12 @@ func (s *KernelManagerService) downloadPackagesLocked(provider, line, version, a
 	var knownTotal int64
 	knownCount := 0
 	for _, pkg := range pkgs.Packages {
-		size, ok := probeRemoteContentLength(pkg.DownloadURL)
+		if err := ctx.Err(); err != nil {
+			kernelDownloadProgressStore.finishError(sessionID, err.Error())
+			cleanupFailedDownload()
+			return nil, err
+		}
+		size, ok := probeRemoteContentLengthContext(ctx, pkg.DownloadURL)
 		if !ok || size <= 0 {
 			continue
 		}
@@ -1163,14 +1202,20 @@ func (s *KernelManagerService) downloadPackagesLocked(provider, line, version, a
 	completedUnknownCount := 0
 	var completedUnknownBytes int64
 	for _, pkg := range pkgs.Packages {
+		if err := ctx.Err(); err != nil {
+			kernelDownloadProgressStore.finishError(sessionID, err.Error())
+			cleanupFailedDownload()
+			return nil, err
+		}
 		if strings.TrimSpace(pkg.DownloadURL) == "" {
 			kernelDownloadProgressStore.finishError(sessionID, fmt.Sprintf("package %s does not provide download url", pkg.Name))
-			s.scheduleKernelFailedDownloadCleanup(downloadDir)
+			cleanupFailedDownload()
 			return nil, fmt.Errorf("package %s does not provide download url", pkg.Name)
 		}
 		localPath := filepath.Join(downloadDir, pkg.Name)
 		kernelDownloadProgressStore.setCurrentPackage(sessionID, pkg.Name)
-		if err := downloadFileToPath(
+		if err := downloadFileToPathContext(
+			ctx,
 			pkg.DownloadURL,
 			localPath,
 			func(delta int64) {
@@ -1178,7 +1223,7 @@ func (s *KernelManagerService) downloadPackagesLocked(provider, line, version, a
 			},
 		); err != nil {
 			kernelDownloadProgressStore.finishError(sessionID, fmt.Sprintf("download %s failed: %v", pkg.Name, err))
-			s.scheduleKernelFailedDownloadCleanup(downloadDir)
+			cleanupFailedDownload()
 			return nil, fmt.Errorf("download %s failed: %w", pkg.Name, err)
 		}
 		kernelDownloadProgressStore.incrementDownloadedCount(sessionID)
@@ -1216,8 +1261,30 @@ func (s *KernelManagerService) downloadPackagesLocked(provider, line, version, a
 
 	if err := validateKernelDownloadedPair(downloadDir); err != nil {
 		kernelDownloadProgressStore.finishError(sessionID, err.Error())
-		s.scheduleKernelFailedDownloadCleanup(downloadDir)
+		cleanupFailedDownload()
 		return nil, err
+	}
+	if useStaging {
+		if beginApplying != nil && !beginApplying() {
+			err := ctx.Err()
+			if err == nil {
+				err = fmt.Errorf("kernel download task stopped")
+			}
+			kernelDownloadProgressStore.finishError(sessionID, err.Error())
+			cleanupFailedDownload()
+			return nil, err
+		}
+		if err := s.commitManagedKernelDownload(downloadDir, finalDownloadDir); err != nil {
+			kernelDownloadProgressStore.finishError(sessionID, err.Error())
+			cleanupFailedDownload()
+			return nil, err
+		}
+		kernelDownloadCleanupStore.markCompleted(downloadDir)
+		downloadDir = finalDownloadDir
+		result.Directory = finalDownloadDir
+		for index := range result.Downloaded {
+			result.Downloaded[index].LocalPath = filepath.Join(finalDownloadDir, result.Downloaded[index].Name)
+		}
 	}
 
 	kernelDownloadProgressStore.finishSuccess(sessionID)
@@ -1237,6 +1304,147 @@ func (s *KernelManagerService) downloadPackagesLocked(provider, line, version, a
 
 func (s *KernelManagerService) GetDownloadProgress(id string) *KernelDownloadProgress {
 	return kernelDownloadProgressStore.get(id)
+}
+
+func applyManagedTaskToKernelProgress(progress *KernelDownloadProgress, task ManagedDownloadTaskStatus) *KernelDownloadProgress {
+	if progress == nil {
+		progress = &KernelDownloadProgress{Status: "missing"}
+	}
+	if task.State == managedDownloadTaskIdle {
+		return progress
+	}
+	if progress.ID == "" {
+		progress.ID = task.ID
+	}
+	progress.State = task.State
+	progress.Phase = task.Phase
+	progress.CanCancel = task.CanCancel
+	progress.StopRequested = task.StopRequested
+	progress.DeadlineExceeded = task.DeadlineExceeded
+	progress.DeadlineAt = task.DeadlineAt
+	if task.StartedAt > 0 {
+		progress.StartedAt = task.StartedAt
+	}
+	if task.UpdatedAt > 0 {
+		progress.UpdatedAt = task.UpdatedAt
+	}
+	if task.FinishedAt > 0 {
+		progress.FinishedAt = task.FinishedAt
+	}
+	if task.Error != "" {
+		progress.Error = task.Error
+	}
+	switch task.State {
+	case managedDownloadTaskQueued, managedDownloadTaskRunning, managedDownloadTaskStopping:
+		progress.Status = "running"
+	case managedDownloadTaskSuccess:
+		progress.Status = "success"
+	case managedDownloadTaskCancelled, managedDownloadTaskTimedOut, managedDownloadTaskError:
+		progress.Status = "error"
+	}
+	return progress
+}
+
+func (s *KernelManagerService) GetManagedDownloadProgress(id string) *KernelDownloadProgress {
+	task := kernelDownloadTaskManager.Get(id)
+	progressID := strings.TrimSpace(id)
+	if progressID == "" && task.ID != "" {
+		progressID = task.ID
+	}
+	return applyManagedTaskToKernelProgress(s.GetDownloadProgress(progressID), task)
+}
+
+func (s *KernelManagerService) StartManagedDownloadPackages(provider, line, version, arch string) (*KernelDownloadProgress, error) {
+	fingerprint := strings.Join([]string{strings.TrimSpace(provider), strings.TrimSpace(line), strings.TrimSpace(version), strings.TrimSpace(arch)}, "|")
+	handle, status, created, err := kernelDownloadTaskManager.Start("kernel-download", fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	if !created {
+		return applyManagedTaskToKernelProgress(s.GetDownloadProgress(status.ID), status), nil
+	}
+	go func() {
+		defer finishManagedDownloadTaskPanic(handle, "failed", "kernel download")
+		if !handle.MarkRunning("preparing") {
+			handle.FinishCancelled("cancelled")
+			return
+		}
+		release, lockErr := acquireKernelOperationLock()
+		if lockErr != nil {
+			handle.FinishError("failed", lockErr)
+			return
+		}
+		defer release()
+		ctx := handle.Context()
+		if err := ctx.Err(); err != nil {
+			handle.FinishCancelled("cancelled")
+			return
+		}
+		handle.SetPhase("downloading", true)
+		_, downloadErr := s.downloadPackagesLockedContext(ctx, provider, line, version, arch, handle.ID(), true, func() bool {
+			return handle.BeginApplying("applying")
+		})
+		if downloadErr != nil {
+			if ctx.Err() != nil {
+				handle.FinishCancelled("cancelled")
+			} else {
+				handle.FinishError("failed", downloadErr)
+			}
+			return
+		}
+		handle.FinishSuccess("completed")
+	}()
+	return applyManagedTaskToKernelProgress(s.GetDownloadProgress(status.ID), status), nil
+}
+
+func (s *KernelManagerService) StopManagedDownloadPackages(id string) (*KernelDownloadProgress, error) {
+	task, err := kernelDownloadTaskManager.Stop(id)
+	return applyManagedTaskToKernelProgress(s.GetDownloadProgress(id), task), err
+}
+
+func (s *KernelManagerService) commitManagedKernelDownload(stagingDir string, finalDir string) error {
+	stagingDir = filepath.Clean(strings.TrimSpace(stagingDir))
+	finalDir = filepath.Clean(strings.TrimSpace(finalDir))
+	root := filepath.Clean(s.getKernelDownloadRoot(""))
+	if stagingDir == "" || finalDir == "" || !isPathWithinRoot(stagingDir, root) || !isPathWithinRoot(finalDir, root) {
+		return fmt.Errorf("kernel download staging path is outside managed root")
+	}
+	if err := os.MkdirAll(filepath.Dir(finalDir), 0o755); err != nil {
+		return err
+	}
+	backupDir := finalDir + ".replace-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	hadPrevious := false
+	if _, err := os.Stat(finalDir); err == nil {
+		if err := os.Rename(finalDir, backupDir); err != nil {
+			return fmt.Errorf("prepare previous kernel download for replacement failed: %w", err)
+		}
+		hadPrevious = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Rename(stagingDir, finalDir); err != nil {
+		if hadPrevious {
+			_ = os.Rename(backupDir, finalDir)
+		}
+		return fmt.Errorf("commit kernel download staging directory failed: %w", err)
+	}
+	if hadPrevious {
+		// The new pair is already committed. Keep a leftover backup for the
+		// normal cleanup path rather than misreporting a successful download as
+		// failed and removing its new marker candidate.
+		_ = s.removeKernelDownloadPath(backupDir)
+	}
+	return nil
+}
+
+func (s *KernelManagerService) cleanupManagedKernelStaging(downloadDir string) {
+	downloadDir = filepath.Clean(strings.TrimSpace(downloadDir))
+	stagingRoot := filepath.Join(s.getKernelDownloadRoot(""), ".staging")
+	if downloadDir == "" || !isPathWithinRoot(downloadDir, stagingRoot) {
+		return
+	}
+	kernelDownloadCleanupStore.release(downloadDir)
+	_ = s.removeKernelDownloadPath(downloadDir)
 }
 
 func ensureKernelPackagePair(packages []KernelPackageItem) error {
@@ -1998,6 +2206,16 @@ func (s *KernelManagerService) RebootSystem() error {
 }
 
 func (s *KernelManagerService) resolveKernelArchDirectory(provider, line, version, arch string) (string, error) {
+	return s.resolveKernelArchDirectoryContext(context.Background(), provider, line, version, arch)
+}
+
+func (s *KernelManagerService) resolveKernelArchDirectoryContext(ctx context.Context, provider, line, version, arch string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	normalizedProvider, err := normalizeKernelProvider(provider)
 	if err != nil {
 		return "", err
@@ -2010,13 +2228,20 @@ func (s *KernelManagerService) resolveKernelArchDirectory(provider, line, versio
 		return normalizedArch, nil
 	}
 
-	arches, err := s.GetArches(kernelProviderXanMod, line, version)
+	normalizedLine, normalizedVersion, err := normalizeKernelLineVersion(line, version)
 	if err != nil {
 		return "", err
 	}
-	for _, item := range arches.Arches {
-		if item.Arch == arch {
-			return item.DirName, nil
+	entries, err := fetchSourceForgeFileEntriesContext(ctx, pathJoinSlash("releases", normalizedLine, normalizedVersion))
+	if err != nil {
+		return "", err
+	}
+	for _, entry := range entries {
+		if entry.Type != "d" {
+			continue
+		}
+		if extractKernelArchLevel(entry.Name) == arch {
+			return entry.Name, nil
 		}
 	}
 	return "", fmt.Errorf("architecture %s not available for %s/%s", arch, line, version)
@@ -2876,6 +3101,16 @@ func runKernelCommandOutput(timeout time.Duration, command string, args ...strin
 }
 
 func fetchSourceForgeFileEntries(relativePath string) ([]sourceForgeFileEntry, error) {
+	return fetchSourceForgeFileEntriesContext(context.Background(), relativePath)
+}
+
+func fetchSourceForgeFileEntriesContext(ctx context.Context, relativePath string) ([]sourceForgeFileEntry, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	relativePath = strings.TrimSpace(relativePath)
 	if relativePath == "" {
 		return nil, fmt.Errorf("relative path is required")
@@ -2884,7 +3119,7 @@ func fetchSourceForgeFileEntries(relativePath string) ([]sourceForgeFileEntry, e
 	url := fmt.Sprintf("%s/%s/", xanmodSourceForgeBaseURL, relativePath)
 
 	client := &http.Client{Timeout: 45 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -2981,13 +3216,20 @@ func extractNetSFFilesJSON(html string) (string, error) {
 }
 
 func probeRemoteContentLength(url string) (int64, bool) {
+	return probeRemoteContentLengthContext(context.Background(), url)
+}
+
+func probeRemoteContentLengthContext(parent context.Context, url string) (int64, bool) {
 	url = strings.TrimSpace(url)
 	if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
 		return 0, false
 	}
 
+	if parent == nil {
+		parent = context.Background()
+	}
 	client := &http.Client{Timeout: 20 * time.Second}
-	req, err := http.NewRequest(http.MethodHead, url, nil)
+	req, err := http.NewRequestWithContext(parent, http.MethodHead, url, nil)
 	if err != nil {
 		return 0, false
 	}
@@ -3009,6 +3251,10 @@ func probeRemoteContentLength(url string) (int64, bool) {
 }
 
 func downloadFileToPath(url, targetPath string, onProgress func(delta int64)) error {
+	return downloadFileToPathContext(context.Background(), url, targetPath, onProgress)
+}
+
+func downloadFileToPathContext(parent context.Context, url, targetPath string, onProgress func(delta int64)) error {
 	url = strings.TrimSpace(url)
 	if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
 		return fmt.Errorf("invalid download url: %s", url)
@@ -3021,8 +3267,14 @@ func downloadFileToPath(url, targetPath string, onProgress func(delta int64)) er
 		return err
 	}
 
+	if parent == nil {
+		parent = context.Background()
+	}
+	if err := parent.Err(); err != nil {
+		return err
+	}
 	client := &http.Client{Timeout: 10 * time.Minute}
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(parent, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
@@ -3045,6 +3297,11 @@ func downloadFileToPath(url, targetPath string, onProgress func(delta int64)) er
 
 	buf := make([]byte, 32*1024)
 	for {
+		if err := parent.Err(); err != nil {
+			_ = out.Close()
+			_ = os.Remove(tmpPath)
+			return err
+		}
 		readCount, readErr := resp.Body.Read(buf)
 		if readCount > 0 {
 			writtenCount, writeErr := out.Write(buf[:readCount])
@@ -3072,6 +3329,10 @@ func downloadFileToPath(url, targetPath string, onProgress func(delta int64)) er
 		}
 	}
 	if err = out.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := parent.Err(); err != nil {
 		_ = os.Remove(tmpPath)
 		return err
 	}

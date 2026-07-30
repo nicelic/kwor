@@ -23,6 +23,7 @@ type acmeTask struct {
 	view      AcmeTaskView
 	ctx       context.Context
 	operation *KworManagedOperationHandle
+	managed   *ManagedDownloadTaskHandle
 }
 
 type acmeTaskJob struct {
@@ -34,9 +35,10 @@ type acmeTaskJob struct {
 // global operation lock already, and a small serial queue makes that waiting
 // visible to the UI instead of leaving browser requests open for minutes.
 type acmeTaskStore struct {
-	mu    sync.Mutex
-	tasks map[string]*acmeTask
-	queue chan acmeTaskJob
+	mu      sync.Mutex
+	queueMu sync.Mutex
+	tasks   map[string]*acmeTask
+	queue   chan acmeTaskJob
 }
 
 var acmeTaskSessionStore = newAcmeTaskStore()
@@ -82,14 +84,144 @@ func (s *acmeTaskStore) enqueue(operation string, title string, run func(logSess
 	acmeLogSessionStore.queue(logSessionID, title, taskID, operationContext, operationHandle)
 
 	job := acmeTaskJob{id: taskID, run: run}
+	if s.enqueueJob(job) {
+		return cloneAcmeTaskView(&entry.view), nil
+	}
+	s.finish(taskID, nil, fmt.Errorf("ACME 后台任务队列已满，请稍后重试"))
+	operationHandle.Done()
+	return nil, fmt.Errorf("ACME 后台任务队列已满，请稍后重试")
+}
+
+// enqueueManaged keeps install/reinstall work behind the same ACME serial
+// queue as certificate actions while the managed download task remains the
+// sole owner of cancellation, deadline handling and operation cleanup.
+func (s *acmeTaskStore) enqueueManaged(operation string, title string, handle *ManagedDownloadTaskHandle, run func(logSessionID string) (*AcmeActionResult, error)) (string, error) {
+	if handle == nil || strings.TrimSpace(handle.ID()) == "" {
+		return "", fmt.Errorf("managed ACME task handle is required")
+	}
+	if run == nil {
+		return "", fmt.Errorf("acme task runner is required")
+	}
+	operation = strings.TrimSpace(operation)
+	if operation == "" {
+		return "", fmt.Errorf("acme task operation is required")
+	}
+
+	now := time.Now().Unix()
+	taskID := handle.ID()
+	logSessionID := "log-" + taskID
+	entry := &acmeTask{
+		ctx:     handle.Context(),
+		managed: handle,
+		view: AcmeTaskView{
+			ID:           taskID,
+			Operation:    operation,
+			Status:       acmeTaskStatusQueued,
+			LogSessionID: logSessionID,
+			StartedAt:    now,
+			UpdatedAt:    now,
+		},
+	}
+
+	s.mu.Lock()
+	s.pruneLocked(now)
+	s.tasks[taskID] = entry
+	s.mu.Unlock()
+	acmeLogSessionStore.queue(logSessionID, title, taskID, entry.ctx, handle.Operation())
+
+	job := acmeTaskJob{id: taskID, run: run}
+	if s.enqueueJob(job) {
+		go s.finishQueuedManagedWhenCancelled(taskID)
+		return logSessionID, nil
+	}
+	queueErr := fmt.Errorf("ACME 后台任务队列已满，请稍后重试")
+	handle.FinishError("failed", queueErr)
+	s.finishManaged(taskID, nil, queueErr, handle.Snapshot())
+	return "", queueErr
+}
+
+func (s *acmeTaskStore) enqueueJob(job acmeTaskJob) bool {
+	if s == nil {
+		return false
+	}
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
 	select {
 	case s.queue <- job:
-		return cloneAcmeTaskView(&entry.view), nil
+		return true
 	default:
-		s.finish(taskID, nil, fmt.Errorf("ACME 后台任务队列已满，请稍后重试"))
-		operationHandle.Done()
-		return nil, fmt.Errorf("ACME 后台任务队列已满，请稍后重试")
+		return false
 	}
+}
+
+// removeQueuedJob returns a cancelled managed install's queue slot immediately.
+// A worker may already have received the job; in that race the cancelled task
+// context makes the worker exit without running the installer.
+func (s *acmeTaskStore) removeQueuedJob(id string) bool {
+	if s == nil {
+		return false
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	queued := make([]acmeTaskJob, 0, len(s.queue))
+	removed := false
+	for {
+		select {
+		case job := <-s.queue:
+			if job.id == id {
+				removed = true
+				continue
+			}
+			queued = append(queued, job)
+		default:
+			for _, job := range queued {
+				s.queue <- job
+			}
+			return removed
+		}
+	}
+}
+
+// finishQueuedManagedWhenCancelled releases an install that never left the
+// shared ACME queue. Running work is deliberately left to its own worker so it
+// can close files and processes before finalizing the managed task.
+func (s *acmeTaskStore) finishQueuedManagedWhenCancelled(id string) {
+	s.mu.Lock()
+	entry := s.tasks[strings.TrimSpace(id)]
+	if entry == nil || entry.managed == nil || entry.ctx == nil {
+		s.mu.Unlock()
+		return
+	}
+	ctx := entry.ctx
+	s.mu.Unlock()
+
+	<-ctx.Done()
+	s.finishQueuedManagedIfCancelled(id)
+}
+
+func (s *acmeTaskStore) finishQueuedManagedIfCancelled(id string) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+
+	s.mu.Lock()
+	entry := s.tasks[id]
+	if entry == nil || entry.managed == nil || entry.view.Status != acmeTaskStatusQueued || entry.ctx == nil || entry.ctx.Err() == nil {
+		s.mu.Unlock()
+		return
+	}
+	managed := entry.managed
+	s.mu.Unlock()
+
+	s.removeQueuedJob(id)
+	managed.FinishCancelled("cancelled")
+	s.finishManaged(id, nil, context.Canceled, managed.Snapshot())
 }
 
 func (s *acmeTaskStore) run() {
@@ -99,20 +231,49 @@ func (s *acmeTaskStore) run() {
 		if !ok {
 			continue
 		}
-		ctx, operation := s.getOperation(job.id)
+		ctx, operation, managed := s.getOperation(job.id)
 		if ctx != nil && ctx.Err() != nil {
-			s.finish(job.id, nil, fmt.Errorf("ACME 后台任务已取消: %w", ctx.Err()))
-			if operation != nil {
+			cancelErr := fmt.Errorf("ACME 后台任务已取消: %w", ctx.Err())
+			if managed != nil {
+				managed.FinishCancelled("cancelled")
+				s.finishManaged(job.id, nil, cancelErr, managed.Snapshot())
+			} else {
+				s.finish(job.id, nil, cancelErr)
+			}
+			if managed == nil && operation != nil {
 				operation.Done()
 			}
 			continue
 		}
-		result, err := job.run(logSessionID)
-		s.finish(job.id, result, err)
-		if operation != nil {
+		result, err := runAcmeTaskJob(job.run, logSessionID)
+		if managed != nil {
+			managedStatus := managed.Snapshot()
+			if err != nil && !isManagedDownloadTaskTerminal(managedStatus.State) {
+				if ctx != nil && ctx.Err() != nil {
+					managed.FinishCancelled("cancelled")
+				} else {
+					managed.FinishError("failed", err)
+				}
+				managedStatus = managed.Snapshot()
+			}
+			s.finishManaged(job.id, result, err, managedStatus)
+		} else {
+			s.finish(job.id, result, err)
+		}
+		if managed == nil && operation != nil {
 			operation.Done()
 		}
 	}
+}
+
+func runAcmeTaskJob(run func(logSessionID string) (*AcmeActionResult, error), logSessionID string) (result *AcmeActionResult, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("ACME background task panicked: %v", recovered)
+			result = nil
+		}
+	}()
+	return run(logSessionID)
 }
 
 func (s *acmeTaskStore) markRunning(id string) {
@@ -202,14 +363,57 @@ func (s *acmeTaskStore) getLogSessionID(id string) (string, bool) {
 	return entry.view.LogSessionID, true
 }
 
-func (s *acmeTaskStore) getOperation(id string) (context.Context, *KworManagedOperationHandle) {
+func (s *acmeTaskStore) getOperation(id string) (context.Context, *KworManagedOperationHandle, *ManagedDownloadTaskHandle) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry := s.tasks[id]
 	if entry == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
-	return entry.ctx, entry.operation
+	return entry.ctx, entry.operation, entry.managed
+}
+
+func (s *acmeTaskStore) finishManaged(id string, result *AcmeActionResult, taskErr error, managedStatus ManagedDownloadTaskStatus) {
+	now := time.Now().Unix()
+	s.mu.Lock()
+	entry := s.tasks[id]
+	if entry == nil {
+		s.mu.Unlock()
+		return
+	}
+	entry.view.Result = cloneManagedAcmeTaskResult(result)
+	entry.view.UpdatedAt = now
+	entry.view.FinishedAt = now
+	entry.view.Error = strings.TrimSpace(managedStatus.Error)
+	entry.view.Warnings = nil
+	switch managedStatus.State {
+	case managedDownloadTaskSuccess:
+		entry.view.Status = acmeTaskStatusSuccess
+	case managedDownloadTaskCancelled, managedDownloadTaskTimedOut, managedDownloadTaskError:
+		entry.view.Status = acmeTaskStatusError
+		if entry.view.Error == "" && taskErr != nil {
+			entry.view.Error = strings.TrimSpace(taskErr.Error())
+		}
+	default:
+		entry.view.Status = acmeTaskStatusError
+		if taskErr != nil {
+			entry.view.Error = strings.TrimSpace(taskErr.Error())
+		}
+	}
+	view := cloneAcmeTaskView(&entry.view)
+	s.mu.Unlock()
+	acmeLogSessionStore.setTaskState(view.LogSessionID, view.ID, view.Status, nil, view.Result, view.Error)
+}
+
+func cloneManagedAcmeTaskResult(source *AcmeActionResult) *AcmeActionResult {
+	if source == nil {
+		return nil
+	}
+	return cloneAcmeActionResult(&AcmeActionResult{
+		Overview: source.Overview,
+		Msg:      source.Msg,
+		Warnings: source.Warnings,
+	})
 }
 
 func (s *acmeTaskStore) pruneLocked(now int64) {

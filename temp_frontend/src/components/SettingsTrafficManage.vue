@@ -79,10 +79,19 @@
                 clearable />
               <div class="traffic-runtime__button-group">
                 <v-btn
+                  v-if="hasActiveVnstatInstall"
+                  class="traffic-runtime-btn traffic-runtime-btn--install"
+                  :color="vnstatInstallCanCancel ? 'error' : 'primary'"
+                  :prepend-icon="vnstatInstallCanCancel ? 'mdi-stop-circle-outline' : 'mdi-progress-wrench'"
+                  :disabled="vnstatStopRequestPending || !vnstatInstallCanCancel"
+                  @click="stopVnstatInstall">
+                  {{ vnstatStopButtonLabel }}
+                </v-btn>
+                <v-btn
+                  v-else
                   class="traffic-runtime-btn traffic-runtime-btn--install"
                   color="primary"
                   prepend-icon="mdi-download"
-                  :loading="installingVnstat"
                   :disabled="loading || togglingTraffic || installingVnstat || removingVnstat || checkingVnstatUpdate || !overview.vnstat.supported || !overview.vnstat.canManage || !hasSelectedVnstatSource"
                   @click="installVnstat">
                   {{ vnstatInstallButtonLabel }}
@@ -109,7 +118,7 @@
                 </v-btn>
               </div>
             </div>
-            <div v-if="installingVnstat" class="traffic-install-progress mb-3" role="status" aria-live="polite">
+			<div v-if="hasActiveVnstatInstall" class="traffic-install-progress mb-3" role="status" aria-live="polite">
               <v-progress-circular indeterminate size="18" width="2" color="primary" />
               <span>{{ vnstatInstallPhase || '正在等待 vnStat 安装任务响应' }}</span>
             </div>
@@ -248,7 +257,7 @@
                 color="primary"
                 variant="tonal"
                 :loading="savingSettings"
-                :disabled="savingSettings || !hasPendingSettingsChanges"
+                :disabled="savingSettings || installingVnstat || !hasPendingSettingsChanges"
               @click="saveTrafficSettings">
               {{ t('actions.save') }}
             </v-btn>
@@ -393,6 +402,9 @@ type VnstatInstallJob = {
 	source: string
 	state: string
 	phase: string
+	canCancel: boolean
+	stopRequested: boolean
+	deadlineExceeded: boolean
 	error: string
 	startedAt: number
 	finishedAt: number
@@ -429,6 +441,9 @@ const togglingTraffic = ref(false)
 const installingVnstat = ref(false)
 const vnstatInstallJobId = ref('')
 const vnstatInstallPhase = ref('')
+const vnstatInstallState = ref('idle')
+const vnstatInstallCanCancel = ref(false)
+const vnstatStopRequestPending = ref(false)
 const vnstatInstallBeforeVersion = ref('')
 const removingVnstat = ref(false)
 const checkingVnstatUpdate = ref(false)
@@ -686,6 +701,9 @@ const normalizeVnstatInstallJob = (raw: unknown): VnstatInstallJob => {
     source: readStringField(input, ['source'], '').trim(),
     state: readStringField(input, ['state'], 'idle').trim().toLowerCase() || 'idle',
     phase: readStringField(input, ['phase'], '').trim(),
+		canCancel: readBoolField(input, ['canCancel', 'can_cancel'], false),
+		stopRequested: readBoolField(input, ['stopRequested', 'stop_requested'], false),
+		deadlineExceeded: readBoolField(input, ['deadlineExceeded', 'deadline_exceeded'], false),
     error: readStringField(input, ['error'], '').trim(),
     startedAt: readNumberField(input, ['startedAt', 'started_at'], 0),
     finishedAt: readNumberField(input, ['finishedAt', 'finished_at'], 0),
@@ -780,6 +798,13 @@ const vnstatSourceAvailabilityHint = computed(() => (
 ))
 const vnstatInstallButtonLabel = computed(() => {
   return overview.value.vnstat.installed ? '下载 / 重装' : '下载 / 安装'
+})
+const hasActiveVnstatInstall = computed(() => (
+  installingVnstat.value && ['queued', 'running', 'stopping'].includes(vnstatInstallState.value)
+))
+const vnstatStopButtonLabel = computed(() => {
+  if (vnstatStopRequestPending.value || vnstatInstallState.value === 'stopping') return '正在停止'
+  return vnstatInstallCanCancel.value ? '停止' : '正在应用'
 })
 const vnstatVersionText = computed(() => overview.value.vnstat.version || '-')
 const vnstatLatestVersionText = computed(() => vnstatUpdateInfo.value.latestVersion || '-')
@@ -1207,7 +1232,10 @@ const stopVnstatInstallPolling = () => {
 
 const scheduleVnstatInstallPolling = () => {
   stopVnstatInstallPolling()
-  if (!installingVnstat.value || vnstatInstallJobId.value === '') {
+  if (!hasActiveVnstatInstall.value || vnstatInstallJobId.value === '' || !props.active) {
+    return
+  }
+  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
     return
   }
   vnstatInstallPollingTimer = window.setTimeout(() => {
@@ -1220,6 +1248,9 @@ const clearVnstatInstallTask = () => {
   installingVnstat.value = false
   vnstatInstallJobId.value = ''
   vnstatInstallPhase.value = ''
+	vnstatInstallState.value = 'idle'
+	vnstatInstallCanCancel.value = false
+	vnstatStopRequestPending.value = false
   vnstatInstallBeforeVersion.value = ''
 }
 
@@ -1228,7 +1259,7 @@ const completeVnstatInstallJob = async (job: VnstatInstallJob) => {
   const beforeVersion = vnstatInstallBeforeVersion.value
   clearVnstatInstallTask()
 
-  if (job.state === 'succeeded') {
+  if (job.state === 'success') {
     await fetchOverview(true)
     const afterVersion = overview.value.vnstat.version.trim()
     if (beforeVersion === '') {
@@ -1255,6 +1286,13 @@ const completeVnstatInstallJob = async (job: VnstatInstallJob) => {
   }
 
   await fetchOverview(true)
+  if (job.state === 'cancelled' || job.state === 'timed_out') {
+    push.info({
+      duration: 5000,
+      message: job.state === 'timed_out' ? 'vnStat 下载超时，任务已停止并清理临时文件' : 'vnStat 下载已停止并清理临时文件',
+    })
+    return
+  }
   push.warning({
     title: 'vnStat 安装失败',
     duration: 6500,
@@ -1263,10 +1301,13 @@ const completeVnstatInstallJob = async (job: VnstatInstallJob) => {
 }
 
 const applyVnstatInstallJob = async (job: VnstatInstallJob) => {
-  if (job.state === 'running' && job.id !== '') {
+  if (['queued', 'running', 'stopping'].includes(job.state) && job.id !== '') {
     vnstatInstallJobId.value = job.id
     installingVnstat.value = true
-    vnstatInstallPhase.value = job.phase || 'vnStat 正在安装，请勿关闭面板'
+    vnstatInstallState.value = job.state
+    vnstatInstallCanCancel.value = job.canCancel === true
+    vnstatStopRequestPending.value = job.stopRequested === true || job.state === 'stopping'
+    vnstatInstallPhase.value = job.phase || (job.canCancel ? 'vnStat 正在下载，请勿关闭面板' : 'vnStat 正在应用更改')
     if (vnstatInstallBeforeVersion.value === '') {
       vnstatInstallBeforeVersion.value = overview.value.vnstat.version.trim()
     }
@@ -1274,21 +1315,19 @@ const applyVnstatInstallJob = async (job: VnstatInstallJob) => {
     return
   }
 
-  if (job.state === 'succeeded' || job.state === 'failed') {
+  if (['success', 'error', 'cancelled', 'timed_out'].includes(job.state)) {
     await completeVnstatInstallJob(job)
     return
   }
 
   clearVnstatInstallTask()
   void fetchOverview(true)
-  push.warning({
-    title: 'vnStat 安装状态不可用',
-    duration: 5500,
-    message: '安装任务状态已丢失。若面板刚重启，请刷新状态后再决定是否重试。',
-  })
 }
 
 const pollVnstatInstallJob = async (jobID: string) => {
+  if (!props.active || (typeof document !== 'undefined' && document.visibilityState !== 'visible')) {
+    return
+  }
   if (jobID === '' || jobID !== vnstatInstallJobId.value) {
     return
   }
@@ -1310,8 +1349,8 @@ const recoverVnstatInstallJob = async (allowTerminal = false) => {
     return false
   }
   const job = normalizeVnstatInstallJob(msg.obj)
-  if (job.state !== 'running' || job.id === '') {
-    if (allowTerminal && (job.state === 'succeeded' || job.state === 'failed')) {
+  if (!['queued', 'running', 'stopping'].includes(job.state) || job.id === '') {
+    if (allowTerminal && ['success', 'error', 'cancelled', 'timed_out'].includes(job.state)) {
       await completeVnstatInstallJob(job)
       return true
     }
@@ -1350,6 +1389,9 @@ const installVnstat = async () => {
 
   vnstatInstallBeforeVersion.value = overview.value.vnstat.version.trim()
   installingVnstat.value = true
+  vnstatInstallState.value = 'queued'
+  vnstatInstallCanCancel.value = true
+  vnstatStopRequestPending.value = false
   vnstatInstallPhase.value = '正在提交 vnStat 安装任务'
   try {
     const msg = await HttpUtils.post('api/traffic-overview-vnstat-install', {
@@ -1388,6 +1430,32 @@ const installVnstat = async () => {
       duration: 5500,
       message: error instanceof Error ? error.message : '安装任务未被服务器接受，请稍后重试。',
     })
+  }
+}
+
+const stopVnstatInstall = async () => {
+  const id = vnstatInstallJobId.value.trim()
+  if (!id || !vnstatInstallCanCancel.value || vnstatStopRequestPending.value) return
+  vnstatStopRequestPending.value = true
+  vnstatInstallState.value = 'stopping'
+  vnstatInstallCanCancel.value = false
+  vnstatInstallPhase.value = '正在停止 vnStat 下载任务'
+  try {
+    const msg = await HttpUtils.post('api/traffic-overview-vnstat-install-stop', { id }, {
+      headers: { 'Content-Type': 'application/json' },
+      silentAuthCheck: true,
+    })
+    if (msg.success && msg.obj) {
+      await applyVnstatInstallJob(normalizeVnstatInstallJob(msg.obj))
+      return
+    }
+    await pollVnstatInstallJob(id)
+  } catch {
+    await pollVnstatInstallJob(id)
+  } finally {
+    if (vnstatInstallState.value !== 'stopping') {
+      vnstatStopRequestPending.value = false
+    }
   }
 }
 
@@ -1566,20 +1634,25 @@ const startPolling = () => schedulePolling()
 
 const handleVisibilityChange = () => {
   if (document.visibilityState === 'visible') {
+    if (!props.active) return
     void fetchOverview(true)
+    void recoverVnstatInstallJob(true)
     startPolling()
     return
   }
   stopPolling()
+  stopVnstatInstallPolling()
 }
 
 watch(() => props.active, (active) => {
   if (active) {
     void fetchOverview(true)
+		void recoverVnstatInstallJob(true)
     startPolling()
     return
   }
   stopPolling()
+  stopVnstatInstallPolling()
 })
 
 watch(() => selectedVnstatVersion.value, (value, previousValue) => {
@@ -1681,6 +1754,11 @@ onBeforeUnmount(() => {
   color: #dbeafe;
   font-size: 0.84rem;
   font-weight: 600;
+}
+
+.traffic-install-progress span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .traffic-vnstat-conflict {

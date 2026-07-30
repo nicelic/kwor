@@ -118,22 +118,29 @@ type VnstatVersionCheckResult struct {
 // source release can take several minutes, so it must not be tied to the HTTP
 // request lifetime.
 type VnstatInstallJobStatus struct {
-	ID         string `json:"id,omitempty"`
-	Source     string `json:"source,omitempty"`
-	State      string `json:"state"`
-	Phase      string `json:"phase,omitempty"`
-	Error      string `json:"error,omitempty"`
-	StartedAt  int64  `json:"startedAt,omitempty"`
-	FinishedAt int64  `json:"finishedAt,omitempty"`
+	ID               string `json:"id,omitempty"`
+	Source           string `json:"source,omitempty"`
+	State            string `json:"state"`
+	Phase            string `json:"phase,omitempty"`
+	CanCancel        bool   `json:"canCancel"`
+	StopRequested    bool   `json:"stopRequested"`
+	DeadlineExceeded bool   `json:"deadlineExceeded"`
+	Error            string `json:"error,omitempty"`
+	StartedAt        int64  `json:"startedAt,omitempty"`
+	UpdatedAt        int64  `json:"updatedAt,omitempty"`
+	DeadlineAt       int64  `json:"deadlineAt,omitempty"`
+	FinishedAt       int64  `json:"finishedAt,omitempty"`
 }
 
 type vnstatInstallJob struct {
-	status    VnstatInstallJobStatus
-	ctx       context.Context
-	operation *KworManagedOperationHandle
+	status VnstatInstallJobStatus
+	task   *ManagedDownloadTaskHandle
 }
 
-type vnstatInstallProgressReporter func(phase string)
+// vnstatInstallProgressReporter returns false when the managed task was
+// stopped before the reported phase could begin. This makes the transition
+// into a host-changing phase atomic with a concurrent stop request.
+type vnstatInstallProgressReporter func(phase string) bool
 
 type trafficOverviewVnstatManifest struct {
 	Managed        bool     `json:"managed"`
@@ -249,6 +256,7 @@ var trafficOverviewSnapshotMu sync.Mutex
 var trafficOverviewCapMu sync.Mutex
 var vnstatInstallJobMu sync.Mutex
 var vnstatInstallJobState *vnstatInstallJob
+var vnstatInstallTaskManager = NewManagedDownloadTaskManager("vnstat install")
 var trafficOverviewShutdownEnabledFn = func() bool {
 	return IsSystemPlatformLinux() && nftSupported()
 }
@@ -1350,34 +1358,29 @@ func (s *TrafficOverviewService) StartManagedVnstatInstall(source string) (Vnsta
 	if selectedSource == "" {
 		return VnstatInstallJobStatus{}, errors.New("请先选择来源")
 	}
-
-	vnstatInstallJobMu.Lock()
-	defer vnstatInstallJobMu.Unlock()
-	if current := vnstatInstallJobState; current != nil && current.status.State == "running" {
-		if current.status.Source != selectedSource {
-			return VnstatInstallJobStatus{}, fmt.Errorf("已有 vnstat 安装任务正在运行（当前来源：%s）", describeVnstatInstallMethod(current.status.Source, ""))
-		}
-		return cloneVnstatInstallJobStatus(current.status), nil
-	}
-
-	jobID, err := newVnstatEvidenceNonce()
+	handle, taskStatus, created, err := vnstatInstallTaskManager.Start("vnstat-install", "source|"+selectedSource)
 	if err != nil {
 		return VnstatInstallJobStatus{}, err
 	}
-	operationContext, operation, err := BeginKworManagedOperation("vnstat-install")
-	if err != nil {
-		return VnstatInstallJobStatus{}, err
+	if !created {
+		return s.GetManagedVnstatInstallJob(taskStatus.ID), nil
 	}
 	job := &vnstatInstallJob{status: VnstatInstallJobStatus{
-		ID:        jobID,
-		Source:    selectedSource,
-		State:     "running",
-		Phase:     "正在准备 vnStat 安装任务",
-		StartedAt: time.Now().Unix(),
-	}, ctx: operationContext, operation: operation}
+		ID:         handle.ID(),
+		Source:     selectedSource,
+		State:      managedDownloadTaskQueued,
+		Phase:      "正在准备 vnStat 安装任务",
+		CanCancel:  true,
+		StartedAt:  taskStatus.StartedAt,
+		UpdatedAt:  taskStatus.UpdatedAt,
+		DeadlineAt: taskStatus.DeadlineAt,
+	}, task: handle}
+	vnstatInstallJobMu.Lock()
 	vnstatInstallJobState = job
-	go s.runManagedVnstatInstallJob(jobID, selectedSource, operationContext, operation)
-	return cloneVnstatInstallJobStatus(job.status), nil
+	initialStatus := cloneVnstatInstallJobStatus(job.status)
+	vnstatInstallJobMu.Unlock()
+	go s.runManagedVnstatInstallJob(handle.ID(), selectedSource, handle)
+	return initialStatus, nil
 }
 
 // GetManagedVnstatInstallJob returns the latest task. Supplying an ID avoids
@@ -1385,18 +1388,30 @@ func (s *TrafficOverviewService) StartManagedVnstatInstall(source string) (Vnsta
 func (s *TrafficOverviewService) GetManagedVnstatInstallJob(jobID string) VnstatInstallJobStatus {
 	vnstatInstallJobMu.Lock()
 	defer vnstatInstallJobMu.Unlock()
-	if vnstatInstallJobState == nil || (strings.TrimSpace(jobID) != "" && vnstatInstallJobState.status.ID != strings.TrimSpace(jobID)) {
-		return VnstatInstallJobStatus{State: "idle"}
+	if vnstatInstallJobState != nil && vnstatInstallJobState.status.FinishedAt > 0 && time.Since(time.Unix(vnstatInstallJobState.status.FinishedAt, 0)) > managedDownloadTaskTTL {
+		vnstatInstallJobState = nil
 	}
-	return cloneVnstatInstallJobStatus(vnstatInstallJobState.status)
+	if vnstatInstallJobState != nil && (strings.TrimSpace(jobID) == "" || vnstatInstallJobState.status.ID == strings.TrimSpace(jobID)) {
+		return applyManagedVnstatTaskStatus(vnstatInstallJobState.status, vnstatInstallTaskManager.Get(vnstatInstallJobState.status.ID))
+	}
+	taskStatus := vnstatInstallTaskManager.Get(jobID)
+	if taskStatus.State == managedDownloadTaskIdle {
+		return VnstatInstallJobStatus{State: managedDownloadTaskIdle}
+	}
+	return applyManagedVnstatTaskStatus(VnstatInstallJobStatus{ID: taskStatus.ID}, taskStatus)
 }
 
-func (s *TrafficOverviewService) runManagedVnstatInstallJob(jobID string, source string, ctx context.Context, operation *KworManagedOperationHandle) {
-	if operation != nil {
-		defer operation.Done()
+func (s *TrafficOverviewService) runManagedVnstatInstallJob(jobID string, source string, task *ManagedDownloadTaskHandle) {
+	defer s.recoverManagedVnstatInstallPanic(jobID, task)
+	if task == nil || !task.MarkRunning("preparing") {
+		if task != nil {
+			task.FinishCancelled("cancelled")
+		}
+		return
 	}
-	overview, err := vnstatManagedInstallRunner(ctx, s, source, func(phase string) {
-		s.updateManagedVnstatInstallJob(jobID, phase)
+	ctx := task.Context()
+	overview, err := vnstatManagedInstallRunner(ctx, s, source, func(phase string) bool {
+		return s.updateManagedVnstatInstallJob(jobID, phase)
 	})
 
 	vnstatInstallJobMu.Lock()
@@ -1405,51 +1420,179 @@ func (s *TrafficOverviewService) runManagedVnstatInstallJob(jobID string, source
 		return
 	}
 	status := &vnstatInstallJobState.status
+	managedStatus := task.Snapshot()
+	vnstatInstallJobState.status = applyManagedVnstatTaskStatus(*status, managedStatus)
+	status = &vnstatInstallJobState.status
 	status.FinishedAt = time.Now().Unix()
 	if err != nil {
-		status.State = "failed"
-		status.Phase = "vnStat 安装失败"
-		status.Error = strings.TrimSpace(err.Error())
+		if errors.Is(ctx.Err(), context.Canceled) {
+			task.FinishCancelled("cancelled")
+			status.State = task.Snapshot().State
+			status.Phase = "vnStat 安装已停止"
+			status.Error = task.Snapshot().Error
+		} else {
+			task.FinishError("failed", err)
+			status.State = task.Snapshot().State
+			status.Phase = "vnStat 安装失败"
+			status.Error = strings.TrimSpace(err.Error())
+		}
+		vnstatInstallJobState.status = applyManagedVnstatTaskStatus(*status, task.Snapshot())
 		return
 	}
 	if overview == nil {
-		status.State = "failed"
+		err = errors.New("安装完成后未能读取 vnStat 状态")
+		task.FinishError("failed", err)
+		status.State = task.Snapshot().State
 		status.Phase = "vnStat 安装失败"
-		status.Error = "安装完成后未能读取 vnStat 状态"
+		status.Error = err.Error()
+		vnstatInstallJobState.status = applyManagedVnstatTaskStatus(*status, task.Snapshot())
 		return
 	}
-	status.State = "succeeded"
+	task.FinishSuccess("completed")
+	status.State = task.Snapshot().State
 	status.Phase = "vnStat 安装完成"
 	status.Error = ""
+	vnstatInstallJobState.status = applyManagedVnstatTaskStatus(*status, task.Snapshot())
 }
 
-func (s *TrafficOverviewService) updateManagedVnstatInstallJob(jobID string, phase string) {
+func (s *TrafficOverviewService) recoverManagedVnstatInstallPanic(jobID string, task *ManagedDownloadTaskHandle) {
+	if recovered := recover(); recovered == nil || task == nil {
+		return
+	} else {
+		panicErr := fmt.Errorf("vnStat install task panicked: %v", recovered)
+		task.FinishError("failed", panicErr)
+		managedStatus := task.Snapshot()
+
+		vnstatInstallJobMu.Lock()
+		defer vnstatInstallJobMu.Unlock()
+		if vnstatInstallJobState == nil || vnstatInstallJobState.status.ID != jobID {
+			return
+		}
+		status := applyManagedVnstatTaskStatus(vnstatInstallJobState.status, managedStatus)
+		status.Phase = "vnStat 安装失败"
+		status.Error = panicErr.Error()
+		vnstatInstallJobState.status = status
+	}
+}
+
+func (s *TrafficOverviewService) updateManagedVnstatInstallJob(jobID string, phase string) bool {
 	phase = strings.TrimSpace(phase)
 	if phase == "" {
-		return
+		return true
 	}
 	vnstatInstallJobMu.Lock()
 	defer vnstatInstallJobMu.Unlock()
-	if vnstatInstallJobState == nil || vnstatInstallJobState.status.ID != jobID || vnstatInstallJobState.status.State != "running" {
-		return
+	if vnstatInstallJobState == nil || vnstatInstallJobState.status.ID != jobID || isManagedDownloadTaskTerminal(vnstatInstallJobState.status.State) {
+		return false
 	}
 	vnstatInstallJobState.status.Phase = phase
+	vnstatInstallJobState.status.UpdatedAt = time.Now().Unix()
+	if vnstatInstallJobState.task != nil {
+		advanced := false
+		if vnstatInstallPhaseIsIrreversible(phase) {
+			advanced = vnstatInstallJobState.task.BeginApplying(phase)
+		} else {
+			advanced = vnstatInstallJobState.task.SetPhase(phase, true)
+		}
+		vnstatInstallJobState.status = applyManagedVnstatTaskStatus(vnstatInstallJobState.status, vnstatInstallJobState.task.Snapshot())
+		return advanced
+	}
+	return true
 }
 
 func isManagedVnstatInstallRunning() bool {
 	vnstatInstallJobMu.Lock()
 	defer vnstatInstallJobMu.Unlock()
-	return vnstatInstallJobState != nil && vnstatInstallJobState.status.State == "running"
+	return vnstatInstallJobState != nil && !isManagedDownloadTaskTerminal(vnstatInstallJobState.status.State) && vnstatInstallJobState.status.State != managedDownloadTaskIdle
+}
+
+func (s *TrafficOverviewService) StopManagedVnstatInstall(jobID string) (VnstatInstallJobStatus, error) {
+	taskStatus, err := vnstatInstallTaskManager.Stop(jobID)
+	vnstatInstallJobMu.Lock()
+	defer vnstatInstallJobMu.Unlock()
+	if vnstatInstallJobState != nil && vnstatInstallJobState.status.ID == strings.TrimSpace(jobID) {
+		vnstatInstallJobState.status = applyManagedVnstatTaskStatus(vnstatInstallJobState.status, taskStatus)
+		return cloneVnstatInstallJobStatus(vnstatInstallJobState.status), err
+	}
+	return applyManagedVnstatTaskStatus(VnstatInstallJobStatus{ID: taskStatus.ID}, taskStatus), err
 }
 
 func cloneVnstatInstallJobStatus(status VnstatInstallJobStatus) VnstatInstallJobStatus {
 	return status
 }
 
-func reportVnstatInstallProgress(report vnstatInstallProgressReporter, phase string) {
-	if report != nil {
-		report(phase)
+func applyManagedVnstatTaskStatus(status VnstatInstallJobStatus, task ManagedDownloadTaskStatus) VnstatInstallJobStatus {
+	if task.State == managedDownloadTaskIdle {
+		return cloneVnstatInstallJobStatus(status)
 	}
+	if status.ID == "" {
+		status.ID = task.ID
+	}
+	status.State = task.State
+	status.CanCancel = task.CanCancel
+	status.StopRequested = task.StopRequested
+	status.DeadlineExceeded = task.DeadlineExceeded
+	if status.Phase == "" && task.Phase != "" {
+		status.Phase = task.Phase
+	}
+	if task.Error != "" {
+		status.Error = task.Error
+	}
+	if task.StartedAt > 0 {
+		status.StartedAt = task.StartedAt
+	}
+	if task.UpdatedAt > 0 {
+		status.UpdatedAt = task.UpdatedAt
+	}
+	if task.DeadlineAt > 0 {
+		status.DeadlineAt = task.DeadlineAt
+	}
+	if task.FinishedAt > 0 {
+		status.FinishedAt = task.FinishedAt
+	}
+	return status
+}
+
+func vnstatInstallPhaseIsIrreversible(phase string) bool {
+	phase = strings.TrimSpace(phase)
+	for _, marker := range []string{
+		"正在停止并核验",
+		"正在释放面板默认",
+		"正在通过系统软件源安装",
+		"正在安装 GitHub 源码构建依赖",
+		"正在安装 vnStat 到面板默认路径",
+		"正在创建面板专属 vnStat 服务",
+		"正在写入本机受管凭据",
+		"正在启动 vnStat 服务",
+	} {
+		if strings.Contains(phase, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func reportVnstatInstallProgress(report vnstatInstallProgressReporter, phase string) bool {
+	if report == nil {
+		return true
+	}
+	return report(phase)
+}
+
+func reportVnstatInstallProgressContext(ctx context.Context, report vnstatInstallProgressReporter, phase string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !reportVnstatInstallProgress(report, phase) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return context.Canceled
+	}
+	return ctx.Err()
 }
 
 func (s *TrafficOverviewService) InstallManagedVnstat(source string) (*TrafficOverview, error) {
@@ -1464,7 +1607,9 @@ func (s *TrafficOverviewService) installManagedVnstatWithContext(ctx context.Con
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	reportVnstatInstallProgress(report, "正在验证 vnStat 安装环境")
+	if err := reportVnstatInstallProgressContext(ctx, report, "正在验证 vnStat 安装环境"); err != nil {
+		return nil, err
+	}
 	if !IsSystemPlatformLinux() {
 		return nil, errors.New("vnstat is supported on linux only")
 	}
@@ -1506,31 +1651,44 @@ func (s *TrafficOverviewService) installManagedVnstatWithContext(ctx context.Con
 	// panel paths are never removed.
 	external := vnstatDiscoverRunningExternalFn(manifest, managed)
 	if len(external) > 0 {
-		reportVnstatInstallProgress(report, "正在停止并核验已发现的 vnStat")
+		if err := reportVnstatInstallProgressContext(ctx, report, "正在停止并核验已发现的 vnStat"); err != nil {
+			return nil, err
+		}
 		if err := vnstatStopRunningExternalFn(external); err != nil {
 			return nil, err
 		}
 	}
 	if !managed && shouldPrepareVnstatPanelPathForInstall(manager, selectedSource, external) {
-		reportVnstatInstallProgress(report, "正在释放面板默认 vnStat 路径")
+		if err := reportVnstatInstallProgressContext(ctx, report, "正在释放面板默认 vnStat 路径"); err != nil {
+			return nil, err
+		}
 		if err := prepareUnmanagedStandardVnstatForPanelInstall(manager); err != nil {
 			return nil, err
 		}
 	}
-	if _, err := BeginVnstatHostOwnership(vnstatOwnershipCandidatePaths(), nil, map[string]string{
+	pendingOwnership, err := BeginVnstatHostOwnership(vnstatOwnershipCandidatePaths(), nil, map[string]string{
 		"installMethod":  selectedSource,
 		"packageManager": packageManagerName(manager),
 		"packageName":    vnstatPackageName,
 		"ownership":      vnstatOwnershipPanelInstalled,
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, fmt.Errorf("record pending vnstat ownership: %w", err)
 	}
+	pendingOwnershipActivated := false
+	defer func() {
+		if !pendingOwnershipActivated && pendingOwnership.ID != "" {
+			_ = RemoveHostResource(pendingOwnership.ID)
+		}
+	}()
 
-	manifest, err := s.installManagedVnstatFromSourceWithContext(ctx, manager, selectedSource, report)
+	manifest, err = s.installManagedVnstatFromSourceWithContext(ctx, manager, selectedSource, report)
 	if err != nil {
 		return nil, err
 	}
-	reportVnstatInstallProgress(report, "正在写入本机受管凭据")
+	if err := reportVnstatInstallProgressContext(ctx, report, "正在写入本机受管凭据"); err != nil {
+		return nil, err
+	}
 	if err := s.saveVnstatManifest(manifest); err != nil {
 		return nil, err
 	}
@@ -1544,6 +1702,7 @@ func (s *TrafficOverviewService) installManagedVnstatWithContext(ctx context.Con
 	}); err != nil {
 		return nil, fmt.Errorf("record managed vnstat ownership: %w", err)
 	}
+	pendingOwnershipActivated = true
 	if err := (&SettingService{}).setString(trafficOverviewEnabledKey, "true"); err != nil {
 		return nil, err
 	}
@@ -1552,12 +1711,16 @@ func (s *TrafficOverviewService) installManagedVnstatWithContext(ctx context.Con
 	}
 
 	if iface, detectErr := detectDefaultTrafficInterface(); detectErr == nil && iface != "" {
-		reportVnstatInstallProgress(report, "正在配置 vnStat 流量网卡")
+		if err := reportVnstatInstallProgressContext(ctx, report, "正在配置 vnStat 流量网卡"); err != nil {
+			return nil, err
+		}
 		if trackErr := ensureVnstatTracking(iface); trackErr != nil {
 			logger.Warning("ensure vnstat tracking after install failed:", trackErr)
 		}
 	}
-	reportVnstatInstallProgress(report, "正在启动 vnStat 服务")
+	if err := reportVnstatInstallProgressContext(ctx, report, "正在启动 vnStat 服务"); err != nil {
+		return nil, err
+	}
 	if daemonErr := restartVnstatDaemonForManifest(manifest); daemonErr != nil {
 		logger.Warning("restart vnstat daemon after install failed:", daemonErr)
 		recordVnstatRuntimeConflict(vnstatDiscoverRunningExternalFn(manifest, true))
@@ -1565,7 +1728,9 @@ func (s *TrafficOverviewService) installManagedVnstatWithContext(ctx context.Con
 		clearVnstatRuntimeConflict()
 	}
 
-	reportVnstatInstallProgress(report, "正在刷新 vnStat 状态")
+	if err := reportVnstatInstallProgressContext(ctx, report, "正在刷新 vnStat 状态"); err != nil {
+		return nil, err
+	}
 	return s.GetTrafficOverview()
 }
 
@@ -1832,7 +1997,9 @@ func (s *TrafficOverviewService) installVnstatViaSystemPackageWithContext(ctx co
 	if manager == nil {
 		return trafficOverviewVnstatManifest{}, errors.New("no supported linux package manager was found")
 	}
-	reportVnstatInstallProgress(report, "正在通过系统软件源安装 vnStat")
+	if err := reportVnstatInstallProgressContext(ctx, report, "正在通过系统软件源安装 vnStat"); err != nil {
+		return trafficOverviewVnstatManifest{}, err
+	}
 	for _, command := range manager.InstallPlan {
 		if err := runInstallCommandContext(ctx, command); err != nil {
 			return trafficOverviewVnstatManifest{}, err
@@ -1869,7 +2036,9 @@ func (s *TrafficOverviewService) installVnstatViaGitHubRelease(manager *vnstatPa
 func (s *TrafficOverviewService) installVnstatViaGitHubReleaseWithContext(ctx context.Context, manager *vnstatPackageManagerPlan, report vnstatInstallProgressReporter) (trafficOverviewVnstatManifest, error) {
 	var buildDepsErr error
 	if manager != nil {
-		reportVnstatInstallProgress(report, "正在安装 GitHub 源码构建依赖")
+		if err := reportVnstatInstallProgressContext(ctx, report, "正在安装 GitHub 源码构建依赖"); err != nil {
+			return trafficOverviewVnstatManifest{}, err
+		}
 		for _, command := range manager.BuildDepsPlan {
 			if err := runInstallCommandContext(ctx, command); err != nil {
 				buildDepsErr = fmt.Errorf("install build dependencies failed: %w", err)
@@ -1879,7 +2048,9 @@ func (s *TrafficOverviewService) installVnstatViaGitHubReleaseWithContext(ctx co
 		}
 	}
 
-	reportVnstatInstallProgress(report, "正在查询 GitHub 官方 vnStat 版本")
+	if err := reportVnstatInstallProgressContext(ctx, report, "正在查询 GitHub 官方 vnStat 版本"); err != nil {
+		return trafficOverviewVnstatManifest{}, err
+	}
 	release, err := fetchLatestVnstatReleaseContext(ctx)
 	if err != nil {
 		return trafficOverviewVnstatManifest{}, err
@@ -1896,24 +2067,32 @@ func (s *TrafficOverviewService) installVnstatViaGitHubReleaseWithContext(ctx co
 	defer os.RemoveAll(workDir)
 
 	archivePath := filepath.Join(workDir, asset.Name)
-	reportVnstatInstallProgress(report, "正在下载 GitHub 官方 vnStat 源码")
+	if err := reportVnstatInstallProgressContext(ctx, report, "正在下载 GitHub 官方 vnStat 源码"); err != nil {
+		return trafficOverviewVnstatManifest{}, err
+	}
 	if err := downloadFileWithUserAgentContext(ctx, asset.BrowserDownloadURL, archivePath, 10*time.Minute); err != nil {
 		return trafficOverviewVnstatManifest{}, fmt.Errorf("download GitHub release asset failed: %w", err)
 	}
 
-	reportVnstatInstallProgress(report, "正在解压 vnStat 源码")
-	sourceDir, err := extractVnstatSourceArchive(archivePath, workDir)
+	if err := reportVnstatInstallProgressContext(ctx, report, "正在解压 vnStat 源码"); err != nil {
+		return trafficOverviewVnstatManifest{}, err
+	}
+	sourceDir, err := extractVnstatSourceArchiveContext(ctx, archivePath, workDir)
 	if err != nil {
 		return trafficOverviewVnstatManifest{}, fmt.Errorf("extract vnstat source archive failed: %w", err)
 	}
-	reportVnstatInstallProgress(report, "正在配置 vnStat 源码")
+	if err := reportVnstatInstallProgressContext(ctx, report, "正在配置 vnStat 源码"); err != nil {
+		return trafficOverviewVnstatManifest{}, err
+	}
 	if _, err := runCommandInDirContext(ctx, sourceDir, 5*time.Minute, "./configure", "--prefix=/usr", "--sysconfdir=/etc"); err != nil {
 		if buildDepsErr != nil {
 			return trafficOverviewVnstatManifest{}, fmt.Errorf("%w; %v", err, buildDepsErr)
 		}
 		return trafficOverviewVnstatManifest{}, fmt.Errorf("configure vnstat source failed: %w", err)
 	}
-	reportVnstatInstallProgress(report, "正在编译 vnStat 源码")
+	if err := reportVnstatInstallProgressContext(ctx, report, "正在编译 vnStat 源码"); err != nil {
+		return trafficOverviewVnstatManifest{}, err
+	}
 	if _, err := runCommandInDirContext(ctx, sourceDir, 10*time.Minute, "make"); err != nil {
 		if buildDepsErr != nil {
 			return trafficOverviewVnstatManifest{}, fmt.Errorf("%w; %v", err, buildDepsErr)
@@ -1922,7 +2101,9 @@ func (s *TrafficOverviewService) installVnstatViaGitHubReleaseWithContext(ctx co
 	}
 
 	stageDir := filepath.Join(workDir, "stage")
-	reportVnstatInstallProgress(report, "正在核验源码阶段安装文件")
+	if err := reportVnstatInstallProgressContext(ctx, report, "正在核验源码阶段安装文件"); err != nil {
+		return trafficOverviewVnstatManifest{}, err
+	}
 	if _, err := runCommandInDirContext(ctx, sourceDir, 5*time.Minute, "make", "install", "DESTDIR="+stageDir); err != nil {
 		return trafficOverviewVnstatManifest{}, fmt.Errorf("stage vnstat source install for ownership inventory failed: %w", err)
 	}
@@ -1931,13 +2112,17 @@ func (s *TrafficOverviewService) installVnstatViaGitHubReleaseWithContext(ctx co
 		return trafficOverviewVnstatManifest{}, err
 	}
 
-	reportVnstatInstallProgress(report, "正在安装 vnStat 到面板默认路径")
+	if err := reportVnstatInstallProgressContext(ctx, report, "正在安装 vnStat 到面板默认路径"); err != nil {
+		return trafficOverviewVnstatManifest{}, err
+	}
 	if _, err := runCommandInDirContext(ctx, sourceDir, 5*time.Minute, "make", "install"); err != nil {
 		return trafficOverviewVnstatManifest{}, fmt.Errorf("install vnstat source failed: %w", err)
 	}
 
 	serviceUnits := []string{}
-	reportVnstatInstallProgress(report, "正在创建面板专属 vnStat 服务")
+	if err := reportVnstatInstallProgressContext(ctx, report, "正在创建面板专属 vnStat 服务"); err != nil {
+		return trafficOverviewVnstatManifest{}, err
+	}
 	if unitPath, unitErr := installVnstatSystemdUnitContext(ctx, sourceDir); unitErr == nil && unitPath != "" {
 		managedPaths = append(managedPaths, unitPath)
 		serviceUnits = append(serviceUnits, vnstatPanelSystemdUnit)
@@ -2110,6 +2295,12 @@ func downloadFileWithUserAgent(url string, destPath string, timeout time.Duratio
 }
 
 func downloadFileWithUserAgentContext(ctx context.Context, url string, destPath string, timeout time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	client := &http.Client{Timeout: timeout}
 	req, err := http.NewRequestWithContext(ctx, "GET", strings.TrimSpace(url), nil)
 	if err != nil {
@@ -2127,17 +2318,42 @@ func downloadFileWithUserAgentContext(ctx context.Context, url string, destPath 
 		return fmt.Errorf("download failed, HTTP %d", resp.StatusCode)
 	}
 
-	out, err := os.Create(destPath)
+	tmpPath := destPath + ".tmp"
+	out, err := os.Create(tmpPath)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
-
-	_, err = io.Copy(out, resp.Body)
-	return err
+	if _, err := copyManagedDownloadTaskContext(ctx, out, resp.Body); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 func extractVnstatSourceArchive(archivePath string, workDir string) (string, error) {
+	return extractVnstatSourceArchiveContext(context.Background(), archivePath, workDir)
+}
+
+func extractVnstatSourceArchiveContext(ctx context.Context, archivePath string, workDir string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	extractRoot := filepath.Join(workDir, "source")
 	if err := os.MkdirAll(extractRoot, 0o755); err != nil {
 		return "", err
@@ -2160,6 +2376,9 @@ func extractVnstatSourceArchive(archivePath string, workDir string) (string, err
 	rootName := ""
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		header, err := tr.Next()
 		if err == io.EOF {
 			break
@@ -2195,11 +2414,17 @@ func extractVnstatSourceArchive(archivePath string, workDir string) (string, err
 			if err != nil {
 				return "", err
 			}
-			if _, err := io.Copy(out, tr); err != nil {
+			if _, err := copyManagedDownloadTaskContext(ctx, out, tr); err != nil {
 				_ = out.Close()
+				_ = os.Remove(targetPath)
 				return "", err
 			}
 			if err := out.Close(); err != nil {
+				_ = os.Remove(targetPath)
+				return "", err
+			}
+			if err := ctx.Err(); err != nil {
+				_ = os.Remove(targetPath)
 				return "", err
 			}
 			if err := os.Chmod(targetPath, header.FileInfo().Mode().Perm()); err != nil {

@@ -102,6 +102,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.AckCoreUpdateNotice(c)
 	case "core-download-preference":
 		a.ApiService.SaveCoreDownloadPreference(c)
+	case "core-download-stop":
+		a.ApiService.StopCoreDownload(c)
 	case "mihomo-coreDownload":
 		a.ApiService.DownloadMihomoCoreManager(c)
 	case "mihomo-coreStart":
@@ -118,8 +120,12 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.AckMihomoCoreUpdateNotice(c)
 	case "mihomo-core-download-preference":
 		a.ApiService.SaveMihomoCoreDownloadPreference(c)
+	case "mihomo-core-download-stop":
+		a.ApiService.StopMihomoCoreDownload(c)
 	case "panel-update-install":
 		a.ApiService.InstallPanelUpdate(c)
+	case "panel-update-stop":
+		a.ApiService.StopPanelUpdate(c)
 	case "panel-uninstall":
 		a.ApiService.UninstallPanel(c)
 	case "importdb":
@@ -154,12 +160,16 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.ResetTrafficOverview(c)
 	case "traffic-overview-vnstat-install":
 		a.ApiService.InstallTrafficOverviewVnstat(c)
+	case "traffic-overview-vnstat-install-stop":
+		a.ApiService.StopTrafficOverviewVnstatInstall(c)
 	case "traffic-overview-vnstat-remove":
 		a.ApiService.RemoveTrafficOverviewVnstat(c)
 	case "firewall-switch":
 		a.ApiService.SaveFirewallSwitch(c)
 	case "firewall-nftables-install":
 		a.ApiService.InstallFirewallNftables(c)
+	case "firewall-nftables-install-stop":
+		a.ApiService.StopFirewallNftablesInstall(c)
 	case "firewall-ssh-port":
 		a.ApiService.SaveFirewallSSHPort(c)
 	case "firewall-ssh-proxy":
@@ -200,6 +210,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.SaveReverseProxySettings(c)
 	case "kernel-download":
 		a.ApiService.DownloadKernelPackages(c)
+	case "kernel-download-stop":
+		a.ApiService.StopKernelDownload(c)
 	case "kernel-install":
 		a.ApiService.InstallKernelPackages(c)
 	case "kernel-reboot":
@@ -234,6 +246,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.SaveSystemMTUOptimizationMTU(c)
 	case "acme-install":
 		a.ApiService.InstallAcme(c)
+	case "acme-install-stop":
+		a.ApiService.StopAcmeInstall(c)
 	case "acme-remove":
 		a.ApiService.RemoveAcme(c)
 	case "acme-upgrade":
@@ -371,6 +385,8 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetTrafficOverviewVnstatInstallStatus(c)
 	case "firewall-overview":
 		a.ApiService.GetFirewallOverview(c)
+	case "firewall-nftables-install-status":
+		a.ApiService.GetFirewallNftablesInstallStatus(c)
 	case "port-forward-overview":
 		a.ApiService.GetPortForwardOverview(c)
 	case "reverse-proxy-overview":
@@ -399,6 +415,8 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetSystemMTUOptimizationOverview(c)
 	case "acme-overview":
 		a.ApiService.GetAcmeOverview(c)
+	case "acme-install-status":
+		a.ApiService.GetAcmeInstallStatus(c)
 	case "acme-versions":
 		a.ApiService.GetAcmeVersions(c)
 	case "acme-update-info":
@@ -456,7 +474,7 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 	case "mihomo-core-update-info":
 		a.ApiService.GetMihomoCoreUpdateInfo(c)
 	case "mihomo-core-download-progress":
-		a.ApiService.GetCoreDownloadProgress(c)
+		a.ApiService.GetMihomoCoreDownloadProgress(c)
 	case "panel-update-status":
 		a.ApiService.GetPanelUpdateStatus(c)
 	case "panel-update-versions":

@@ -111,6 +111,7 @@ type PanelUpdateStatus struct {
 	DockerUninstallCommands []PanelDockerUninstallCommand `json:"dockerUninstallCommands,omitempty"`
 	LastUpdateLogPath       string                        `json:"lastUpdateLogPath,omitempty"`
 	LastUpdateError         string                        `json:"lastUpdateError,omitempty"`
+	UpdateTask              *ManagedDownloadTaskStatus    `json:"updateTask,omitempty"`
 }
 
 type PanelVersionItem struct {
@@ -160,6 +161,7 @@ var panelUpdateVersionCache = struct {
 }
 
 var panelUpdateMu sync.Mutex
+var panelUpdateTaskManager = NewManagedDownloadTaskManager("panel update")
 
 const panelUpdateLogMaxBytes = 128 * 1024
 const panelUpdateLogMaxLines = 300
@@ -172,6 +174,12 @@ func (s *PanelUpdateService) GetStatus() (*PanelUpdateStatus, error) {
 	uninstallStatus := GetPanelUninstallStatus()
 	lastUpdateLogPath := filepath.Join(config.GetRuntimeSupportDir(), "panel-update-last.log")
 	lastUpdateError := readPanelUpdateLastError(lastUpdateLogPath)
+	updateTask := panelUpdateTaskManager.Get("")
+	var updateTaskView *ManagedDownloadTaskStatus
+	if updateTask.State != managedDownloadTaskIdle {
+		copy := cloneManagedDownloadTaskStatus(updateTask)
+		updateTaskView = &copy
+	}
 
 	return &PanelUpdateStatus{
 		LocalVersion:            config.GetVersion(),
@@ -199,6 +207,7 @@ func (s *PanelUpdateService) GetStatus() (*PanelUpdateStatus, error) {
 		DockerUninstallCommands: uninstallStatus.DockerCommands,
 		LastUpdateLogPath:       lastUpdateLogPath,
 		LastUpdateError:         lastUpdateError,
+		UpdateTask:              updateTaskView,
 	}, nil
 }
 
@@ -284,7 +293,6 @@ func (s *PanelUpdateService) GetRemoteVersionsContext(ctx context.Context, offse
 func (s *PanelUpdateService) Install(version string) (*PanelInstallResult, error) {
 	panelUpdateMu.Lock()
 	defer panelUpdateMu.Unlock()
-
 	if supported, reason := panelUpdateInstallSupport(); !supported {
 		return nil, fmt.Errorf("%s", reason)
 	}
@@ -297,48 +305,131 @@ func (s *PanelUpdateService) Install(version string) (*PanelInstallResult, error
 	if err != nil {
 		return nil, err
 	}
-	operationDetached := false
-	defer func() {
-		if !operationDetached {
-			operation.Done()
+	result, detached, installErr := s.installWithContext(operationContext, operation, version, nil, nil)
+	if detached {
+		operation.Detach()
+	} else {
+		operation.Done()
+	}
+	return result, installErr
+}
+
+func (s *PanelUpdateService) StartManagedInstall(version string) (ManagedDownloadTaskStatus, error) {
+	version = normalizePanelVersionTag(version)
+	if version == "" {
+		return ManagedDownloadTaskStatus{}, fmt.Errorf("version is required")
+	}
+	if !isPanelUpdateVersionSelectable(version) {
+		return ManagedDownloadTaskStatus{}, fmt.Errorf("only %s and later panel versions can be installed", panelUpdateMinimumVersion)
+	}
+	if supported, reason := panelUpdateInstallSupport(); !supported {
+		return ManagedDownloadTaskStatus{}, fmt.Errorf("%s", reason)
+	}
+	handle, status, created, err := panelUpdateTaskManager.Start("panel-update", "version|"+version)
+	if err != nil || !created {
+		return status, err
+	}
+	go func() {
+		defer finishManagedDownloadTaskPanic(handle, "failed", "panel update")
+		if !handle.MarkRunning("preparing") {
+			handle.FinishCancelled("cancelled")
+			return
 		}
+		if lockErr := lockManagedDownloadTaskMutex(handle.Context(), &panelUpdateMu); lockErr != nil {
+			handle.FinishCancelled("cancelled")
+			return
+		}
+		defer panelUpdateMu.Unlock()
+		ctx := handle.Context()
+		if err := ctx.Err(); err != nil {
+			handle.FinishCancelled("cancelled")
+			return
+		}
+		lifecycleLock, lockErr := AcquireKworLifecycleLockContext(ctx)
+		if lockErr != nil {
+			handle.FinishError("failed", lockErr)
+			return
+		}
+		defer func() { _ = lifecycleLock.Release() }()
+		if err := ctx.Err(); err != nil {
+			handle.FinishCancelled("cancelled")
+			return
+		}
+		_, detached, installErr := s.installWithContext(ctx, handle.Operation(), version, func(phase string) {
+			handle.SetPhase(phase, true)
+		}, func() bool {
+			return handle.BeginApplying("handoff")
+		})
+		if detached {
+			handle.DetachOperation()
+		}
+		if installErr != nil {
+			if errors.Is(ctx.Err(), context.Canceled) && !detached {
+				handle.FinishCancelled("cancelled")
+			} else {
+				handle.FinishError("failed", installErr)
+			}
+			return
+		}
+		if detached {
+			// The updater now owns the detached managed operation. The browser-facing
+			// preparation task must still become terminal, otherwise it would keep the
+			// single-resource slot occupied until process restart.
+			handle.FinishSuccess("handoff")
+			return
+		}
+		handle.FinishSuccess("completed")
 	}()
+	return status, nil
+}
+
+func (s *PanelUpdateService) StopManagedInstall(id string) (ManagedDownloadTaskStatus, error) {
+	return panelUpdateTaskManager.Stop(id)
+}
+
+func (s *PanelUpdateService) installWithContext(operationContext context.Context, operation *KworManagedOperationHandle, version string, report func(string), beginApplying func() bool) (*PanelInstallResult, bool, error) {
 
 	version = normalizePanelVersionTag(version)
 	if version == "" {
-		return nil, fmt.Errorf("version is required")
+		return nil, false, fmt.Errorf("version is required")
 	}
 	if !isPanelUpdateVersionSelectable(version) {
-		return nil, fmt.Errorf("only %s and later panel versions can be installed", panelUpdateMinimumVersion)
+		return nil, false, fmt.Errorf("only %s and later panel versions can be installed", panelUpdateMinimumVersion)
+	}
+	if report != nil {
+		report("preparing")
 	}
 
 	status, err := s.GetStatus()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if strings.TrimSpace(status.BinaryPath) == "" {
-		return nil, fmt.Errorf("failed to resolve current panel binary path")
+		return nil, false, fmt.Errorf("failed to resolve current panel binary path")
 	}
 	if _, statErr := os.Lstat(status.BinaryPath + ".bak"); statErr == nil {
-		return nil, fmt.Errorf("refuse to overwrite an existing panel backup: %s", status.BinaryPath+".bak")
+		return nil, false, fmt.Errorf("refuse to overwrite an existing panel backup: %s", status.BinaryPath+".bak")
 	} else if !os.IsNotExist(statErr) {
-		return nil, fmt.Errorf("inspect panel backup path failed: %v", statErr)
+		return nil, false, fmt.Errorf("inspect panel backup path failed: %v", statErr)
 	}
 
+	if report != nil {
+		report("downloading")
+	}
 	downloadURL, err := getPanelReleaseAssetURLContext(operationContext, version)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	workDir, err := os.MkdirTemp("", "kwor-panel-update-")
 	if err != nil {
-		return nil, fmt.Errorf("create update work dir failed: %v", err)
+		return nil, false, fmt.Errorf("create update work dir failed: %v", err)
 	}
 	workspaceID := "panel-update-workspace-" + filepath.Base(workDir)
 	workspaceOwnership, err := BeginUpdateWorkspaceOwnership(workspaceID, workDir, status.BinaryPath)
 	if err != nil {
 		cleanupPanelUpdateWorkDir(workDir)
-		return nil, fmt.Errorf("record update workspace ownership failed: %v", err)
+		return nil, false, fmt.Errorf("record update workspace ownership failed: %v", err)
 	}
 	archivePath := filepath.Join(workDir, filepath.Base(downloadURL))
 	stagedBinPath := filepath.Join(workDir, "kwor")
@@ -354,69 +445,90 @@ func (s *PanelUpdateService) Install(version string) (*PanelInstallResult, error
 		}
 	}()
 	if err := os.WriteFile(filepath.Join(workDir, panelUpdateWorkspaceMarkerFileName), []byte(panelUpdateWorkspaceMarkerContent), 0o600); err != nil {
-		return nil, fmt.Errorf("write update workspace ownership marker failed: %v", err)
+		return nil, false, fmt.Errorf("write update workspace ownership marker failed: %v", err)
 	}
 
 	if err := downloadPanelReleaseArchiveContext(operationContext, downloadURL, archivePath); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	if err := extractPanelReleasePayload(archivePath, stagedBinPath, stagedInstallScriptPath); err != nil {
-		return nil, err
+	if report != nil {
+		report("extracting")
+	}
+	if err := extractPanelReleasePayloadContext(operationContext, archivePath, stagedBinPath, stagedInstallScriptPath); err != nil {
+		return nil, false, err
 	}
 	_ = os.Remove(archivePath)
 	if err := downloadPanelLatestInstallScriptContext(operationContext, stagedInstallScriptPath); err != nil {
+		if ctxErr := operationContext.Err(); ctxErr != nil {
+			return nil, false, ctxErr
+		}
 		logger.Warning("download latest panel install.sh failed, fallback to release packaged script: ", err)
+	}
+	if err := operationContext.Err(); err != nil {
+		return nil, false, err
 	}
 	if _, err := os.Stat(stagedInstallScriptPath); err != nil {
 		stagedInstallScriptPath = ""
 	} else if err := os.Chmod(stagedInstallScriptPath, 0o755); err != nil {
-		return nil, fmt.Errorf("chmod staged install script failed: %v", err)
+		return nil, false, fmt.Errorf("chmod staged install script failed: %v", err)
 	}
 	if err := os.WriteFile(stagedServiceFilePath, []byte(BuildPanelSystemdServiceContent(status.BinaryPath)), 0o644); err != nil {
-		return nil, fmt.Errorf("write staged systemd service failed: %v", err)
+		return nil, false, fmt.Errorf("write staged systemd service failed: %v", err)
 	}
 	if err := os.Chmod(stagedBinPath, 0o755); err != nil {
-		return nil, fmt.Errorf("chmod staged binary failed: %v", err)
+		return nil, false, fmt.Errorf("chmod staged binary failed: %v", err)
+	}
+	if report != nil {
+		report("validating")
 	}
 	if err := validatePanelBinaryContext(operationContext, stagedBinPath); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	installScriptPath, err := writePanelUpdateScriptWithOperation(workDir, status.BinaryPath, stagedBinPath, stagedInstallScriptPath, stagedServiceFilePath, status.BinaryName, operation.ID())
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if workspaceOwnership.ID != "" {
 		if err := ActivateHostResource(workspaceOwnership.ID); err != nil {
-			return nil, fmt.Errorf("activate update workspace ownership failed: %v", err)
+			return nil, false, fmt.Errorf("activate update workspace ownership failed: %v", err)
 		}
 	}
 	cleanupWorkDir = false
 	clearPanelUpdateLastError(status.LastUpdateLogPath)
 
+	if beginApplying != nil && !beginApplying() {
+		cleanupWorkDir = true
+		return nil, false, coreDownloadTaskCancelledError(operationContext)
+	}
+	if report != nil {
+		report("handoff")
+	}
 	if err := operation.SetBlockNewWork(true); err != nil {
 		cleanupWorkDir = true
-		return nil, fmt.Errorf("block new work while handing off panel update: %w", err)
+		return nil, false, fmt.Errorf("block new work while handing off panel update: %w", err)
 	}
-	if err := startPanelUpdateWorker(operationContext, operation, installScriptPath); err != nil {
+	// The preparation task is complete once the updater is handed off. Launch
+	// the detached worker with the operation context, not the task child
+	// context: FinishSuccess cancels that child context to release the task
+	// slot, while the updater must keep running until it completes the swap.
+	workerContext := panelUpdateWorkerContext(operationContext, operation)
+	if err := startPanelUpdateWorker(workerContext, operation, installScriptPath); err != nil {
 		if panelUpdateWorkerRollbackIncomplete(err) {
 			cleanupWorkDir = false
-			operation.Detach()
-			operationDetached = true
+			return nil, true, err
 		} else {
 			cleanupWorkDir = true
 		}
-		return nil, err
+		return nil, false, err
 	}
-	operation.Detach()
-	operationDetached = true
 
 	return &PanelInstallResult{
 		Version:    version,
 		BinaryPath: status.BinaryPath,
 		Started:    true,
 		Message:    "更新任务已启动，面板会自动停止、替换并重新启动",
-	}, nil
+	}, true, nil
 }
 
 func (s *PanelUpdateService) GetLastUpdateLog() (*PanelUpdateLogView, error) {
@@ -531,6 +643,12 @@ func downloadPanelReleaseArchive(downloadURL string, archivePath string) error {
 }
 
 func downloadPanelReleaseArchiveContext(ctx context.Context, downloadURL string, archivePath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	client := &http.Client{Timeout: 600 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
@@ -545,45 +663,37 @@ func downloadPanelReleaseArchiveContext(ctx context.Context, downloadURL string,
 		return fmt.Errorf("download release archive failed, HTTP %d", resp.StatusCode)
 	}
 
-	out, err := os.Create(archivePath)
+	tmpPath := archivePath + ".tmp"
+	out, err := os.Create(tmpPath)
 	if err != nil {
 		return fmt.Errorf("create release archive file failed: %v", err)
 	}
-	if _, err = io.Copy(out, resp.Body); err != nil {
+	if _, err = copyManagedDownloadTaskContext(ctx, out, resp.Body); err != nil {
 		_ = out.Close()
-		_ = os.Remove(archivePath)
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("write release archive failed: %v", err)
 	}
 	if err = out.Close(); err != nil {
-		_ = os.Remove(archivePath)
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("close release archive failed: %v", err)
+	}
+	if err = ctx.Err(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err = os.Rename(tmpPath, archivePath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("commit release archive failed: %v", err)
 	}
 	return nil
 }
 
 func cleanupPanelUpdateWorkDir(workDir string) {
-	workDir = strings.TrimSpace(workDir)
-	if workDir == "" {
+	workDir = filepath.Clean(strings.TrimSpace(workDir))
+	if !panelUpdateWorkspacePathStrict(workDir) {
 		return
 	}
-	for _, name := range []string{
-		panelUpdateWorkspaceMarkerFileName,
-		"kwor",
-		"install.sh",
-		"install.sh.download",
-		"kwor.service",
-		"apply-update.sh",
-		"apply-update.log",
-		"kwor-linux-amd64.tar.gz",
-		"kwor-linux-arm64.tar.gz",
-	} {
-		_ = os.Remove(filepath.Join(workDir, name))
-	}
-	_ = os.Remove(filepath.Join(workDir, "kwor", "kwor"))
-	_ = os.Remove(filepath.Join(workDir, "kwor", "install.sh"))
-	_ = os.Remove(filepath.Join(workDir, "kwor", "kwor.service"))
-	_ = os.Remove(filepath.Join(workDir, "kwor"))
-	_ = os.Remove(workDir)
+	_ = os.RemoveAll(workDir)
 }
 
 func panelUpdateScriptPathFromCommandText(command string) string {
@@ -745,6 +855,16 @@ func normalizePanelUpdateLogLines(content []byte, maxLines int) []string {
 }
 
 func extractPanelReleasePayload(archivePath string, stagedBinPath string, stagedInstallScriptPath string) error {
+	return extractPanelReleasePayloadContext(context.Background(), archivePath, stagedBinPath, stagedInstallScriptPath)
+}
+
+func extractPanelReleasePayloadContext(ctx context.Context, archivePath string, stagedBinPath string, stagedInstallScriptPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f, err := os.Open(archivePath)
 	if err != nil {
 		return err
@@ -760,6 +880,9 @@ func extractPanelReleasePayload(archivePath string, stagedBinPath string, staged
 	tr := tar.NewReader(gzr)
 	foundBinary := false
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		header, err := tr.Next()
 		if err == io.EOF {
 			break
@@ -772,13 +895,13 @@ func extractPanelReleasePayload(archivePath string, stagedBinPath string, staged
 		}
 		switch filepath.Base(header.Name) {
 		case "kwor":
-			if err := writePanelTarFile(tr, stagedBinPath); err != nil {
+			if err := writePanelTarFileContext(ctx, tr, stagedBinPath); err != nil {
 				return err
 			}
 			foundBinary = true
 		case "install.sh":
 			if strings.TrimSpace(stagedInstallScriptPath) != "" {
-				if err := writePanelTarFile(tr, stagedInstallScriptPath); err != nil {
+				if err := writePanelTarFileContext(ctx, tr, stagedInstallScriptPath); err != nil {
 					return err
 				}
 			}
@@ -791,11 +914,15 @@ func extractPanelReleasePayload(archivePath string, stagedBinPath string, staged
 }
 
 func writePanelTarFile(reader io.Reader, targetPath string) error {
+	return writePanelTarFileContext(context.Background(), reader, targetPath)
+}
+
+func writePanelTarFileContext(ctx context.Context, reader io.Reader, targetPath string) error {
 	out, err := os.Create(targetPath)
 	if err != nil {
 		return err
 	}
-	if _, err = io.Copy(out, reader); err != nil {
+	if _, err = copyManagedDownloadTaskContext(ctx, out, reader); err != nil {
 		_ = out.Close()
 		_ = os.Remove(targetPath)
 		return err
@@ -837,7 +964,7 @@ func downloadPanelLatestInstallScriptContext(ctx context.Context, targetPath str
 	if err != nil {
 		return err
 	}
-	written, copyErr := io.Copy(out, io.LimitReader(resp.Body, panelUpdateSupportFileMaxLen+1))
+	written, copyErr := copyManagedDownloadTaskContext(ctx, out, io.LimitReader(resp.Body, panelUpdateSupportFileMaxLen+1))
 	closeErr := out.Close()
 	if copyErr != nil {
 		_ = os.Remove(tmpPath)
@@ -850,6 +977,10 @@ func downloadPanelLatestInstallScriptContext(ctx context.Context, targetPath str
 	if written > panelUpdateSupportFileMaxLen {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("install script is too large")
+	}
+	if err := ctx.Err(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
 	}
 	content, err := os.ReadFile(tmpPath)
 	if err != nil {
@@ -897,6 +1028,16 @@ func validatePanelBinaryContext(parent context.Context, binPath string) error {
 		return fmt.Errorf("downloaded kwor binary is not executable: %v: %s", err, strings.TrimSpace(output.String()))
 	}
 	return nil
+}
+
+func panelUpdateWorkerContext(preparationContext context.Context, operation *KworManagedOperationHandle) context.Context {
+	if operation != nil && operation.Context() != nil {
+		return operation.Context()
+	}
+	if preparationContext != nil {
+		return preparationContext
+	}
+	return context.Background()
 }
 
 func startPanelUpdateWorker(ctx context.Context, operation *KworManagedOperationHandle, scriptPath string) error {

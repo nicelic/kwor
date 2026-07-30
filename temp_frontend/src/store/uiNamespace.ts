@@ -7,6 +7,7 @@ export interface NamespaceCoreConfig {
   modalButtonLabel: string
   supportsPrereleaseChannel: boolean
   statusEndpoint: string
+  progressEndpoint: string
   updateInfoEndpoint: string
   startEndpoint: string
   stopEndpoint: string
@@ -38,6 +39,7 @@ const defaultNamespaceApi: NamespaceApiConfig = {
     modalButtonLabel: 'coreManager.singboxTitle',
     supportsPrereleaseChannel: true,
     statusEndpoint: 'api/core-status',
+    progressEndpoint: 'api/core-download-progress',
     updateInfoEndpoint: 'api/core-update-info',
     startEndpoint: 'api/coreStart',
     stopEndpoint: 'api/coreStop',
@@ -58,6 +60,7 @@ const mihomoNamespaceApi: NamespaceApiConfig = {
     modalButtonLabel: 'coreManager.mihomoTitle',
     supportsPrereleaseChannel: false,
     statusEndpoint: 'api/mihomo-core-status',
+    progressEndpoint: 'api/mihomo-core-download-progress',
     updateInfoEndpoint: 'api/mihomo-core-update-info',
     startEndpoint: 'api/mihomo-coreStart',
     stopEndpoint: 'api/mihomo-coreStop',

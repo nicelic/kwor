@@ -89,10 +89,13 @@ var (
 	firewallIsLinuxHost      = IsSystemPlatformLinux
 	firewallOSReleaseFields  = GetSystemPlatformReleaseFields
 	firewallNftInstallStateM sync.Mutex
+	firewallNftInstallMu     sync.Mutex
 	firewallNftInstallState  = struct {
 		lastFailure string
 	}{}
 )
+
+var firewallNftInstallTaskManager = NewManagedDownloadTaskManager("nftables install")
 
 var (
 	firewallDebianCodenameByMajor = map[int]string{
@@ -602,17 +605,23 @@ func buildFirewallNftablesStatus(available bool) FirewallNftablesStatus {
 }
 
 func runFirewallNftInstallCommand(command []string) error {
+	return runFirewallNftInstallCommandContext(context.Background(), command)
+}
+
+func runFirewallNftInstallCommandContext(parent context.Context, command []string) error {
 	if len(command) == 0 {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
+	if parent == nil {
+		parent = context.Background()
+	}
+	output, err, timedOut := runManagedCommandOutputContext(parent, "", 5*time.Minute, command[0], command[1:]...)
+	if timedOut {
 		return fmt.Errorf("nftables install command timed out: %s", strings.Join(command, " "))
+	}
+	if err := parent.Err(); err != nil {
+		return err
 	}
 	if err != nil {
 		return fmt.Errorf("nftables install command failed (%s): %w: %s", strings.Join(command, " "), err, strings.TrimSpace(string(output)))
@@ -694,6 +703,70 @@ func buildFirewallNftablesOverviewError(status FirewallNftablesStatus) string {
 }
 
 func (s *FirewallService) InstallNftables() (*FirewallOverview, error) {
+	firewallNftInstallMu.Lock()
+	defer firewallNftInstallMu.Unlock()
+	return s.installNftablesWithContext(context.Background(), nil, nil, firewallRunInstall)
+}
+
+func (s *FirewallService) StartManagedNftablesInstall() (ManagedDownloadTaskStatus, error) {
+	handle, status, created, err := firewallNftInstallTaskManager.Start("firewall-nftables-install", "install")
+	if err != nil || !created {
+		return status, err
+	}
+	go func() {
+		defer finishManagedDownloadTaskPanic(handle, "failed", "nftables install")
+		if !handle.MarkRunning("preparing") {
+			handle.FinishCancelled("cancelled")
+			return
+		}
+		if lockErr := lockManagedDownloadTaskMutex(handle.Context(), &firewallNftInstallMu); lockErr != nil {
+			handle.FinishCancelled("cancelled")
+			return
+		}
+		defer firewallNftInstallMu.Unlock()
+		ctx := handle.Context()
+		if err := ctx.Err(); err != nil {
+			handle.FinishCancelled("cancelled")
+			return
+		}
+		_, installErr := s.installNftablesWithContext(ctx, func(phase string) {
+			handle.SetPhase(phase, true)
+		}, func() bool {
+			return handle.BeginApplying("installing")
+		}, func(command []string) error {
+			return runFirewallNftInstallCommandContext(ctx, command)
+		})
+		if installErr != nil {
+			if ctx.Err() != nil {
+				handle.FinishCancelled("cancelled")
+			} else {
+				handle.FinishError("failed", installErr)
+			}
+			return
+		}
+		handle.FinishSuccess("completed")
+	}()
+	return status, nil
+}
+
+func (s *FirewallService) GetManagedNftablesInstall() ManagedDownloadTaskStatus {
+	return firewallNftInstallTaskManager.Get("")
+}
+
+func (s *FirewallService) StopManagedNftablesInstall(id string) (ManagedDownloadTaskStatus, error) {
+	return firewallNftInstallTaskManager.Stop(id)
+}
+
+func (s *FirewallService) installNftablesWithContext(ctx context.Context, report func(string), beginApplying func() bool, runInstall func([]string) error) (*FirewallOverview, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if report != nil {
+		report("preparing")
+	}
 	if !firewallIsLinuxHost() {
 		return nil, common.NewError("nftables install is supported on Linux only")
 	}
@@ -701,6 +774,12 @@ func (s *FirewallService) InstallNftables() (*FirewallOverview, error) {
 	available := firewallSupportedFn()
 	status := buildFirewallNftablesStatus(available)
 	if status.Installed {
+		if beginApplying != nil && !beginApplying() {
+			return nil, ctx.Err()
+		}
+		if report != nil {
+			report("applying")
+		}
 		if available {
 			clearFirewallNftInstallFailure()
 			capabilities := RefreshNftablesCapabilities()
@@ -723,8 +802,14 @@ func (s *FirewallService) InstallNftables() (*FirewallOverview, error) {
 	}
 
 	commands := buildFirewallAutomaticInstallCommands(plan, privilege)
+	if beginApplying != nil && !beginApplying() {
+		return nil, ctx.Err()
+	}
+	if report != nil {
+		report("installing")
+	}
 	for _, command := range commands {
-		if err := firewallRunInstall(command); err != nil {
+		if err := runInstall(command); err != nil {
 			message := strings.TrimSpace(err.Error())
 			setFirewallNftInstallFailure(message)
 			return nil, common.NewError(buildFirewallNftablesOverviewError(buildFirewallNftablesStatus(false)))
@@ -732,6 +817,9 @@ func (s *FirewallService) InstallNftables() (*FirewallOverview, error) {
 	}
 
 	clearFirewallNftInstallFailure()
+	if report != nil {
+		report("applying")
+	}
 	capabilities := RefreshNftablesCapabilities()
 	if !capabilities.RendererSupported {
 		return nil, common.NewError(buildFirewallNftablesOverviewError(buildFirewallNftablesStatus(false)))

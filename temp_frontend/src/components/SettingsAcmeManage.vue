@@ -120,6 +120,7 @@
               spellcheck="false"
               hide-details
               :loading="savingInstallEmail"
+              :disabled="installing || upgrading || removingAcme || !overview.supported"
               @focus="onInstallEmailFocus"
               @blur="onInstallEmailBlur"
               class="mb-3" />
@@ -142,11 +143,12 @@
                 <v-btn
                   class="acme-runtime-btn acme-runtime-btn--install"
                   color="primary"
-                  prepend-icon="mdi-download"
-                  :loading="installing"
-                  :disabled="installing || upgrading || removingAcme || !overview.supported"
-                  @click="installAcme">
-                  下载 / 重装
+                  :prepend-icon="acmeInstallTaskActive ? (acmeInstallTaskApplying ? 'mdi-progress-wrench' : 'mdi-stop') : 'mdi-download'"
+                  :disabled="acmeInstallTaskActive
+                    ? acmeInstallStopRequestPending || !acmeInstallTaskCanCancel
+                    : installing || upgrading || removingAcme || !overview.supported"
+                  @click="acmeInstallTaskActive ? stopAcmeInstallTask() : installAcme()">
+                  {{ acmeInstallButtonText }}
                 </v-btn>
                 <v-btn
                   class="acme-runtime-btn acme-runtime-btn--check"
@@ -168,6 +170,18 @@
                   @click="removeAcme">
                   删除 acme.sh
                 </v-btn>
+              </div>
+            </div>
+
+            <div v-if="acmeInstallTask || installStartPending" class="acme-install-task mt-3" aria-live="polite">
+              <div class="d-flex align-center justify-space-between flex-wrap" style="gap: 8px;">
+                <span class="font-weight-medium acme-install-task__status">{{ acmeInstallTaskStatusText }}</span>
+                <span v-if="acmeInstallTask?.id" class="text-caption text-medium-emphasis acme-install-task__id">
+                  {{ acmeInstallTask.id }}
+                </span>
+              </div>
+              <div v-if="acmeInstallTask?.error" class="text-caption text-error mt-1 acme-install-task__error">
+                {{ acmeInstallTask.error }}
               </div>
             </div>
 
@@ -1453,7 +1467,7 @@ import { formatPanelDateTime, panelNow } from '@/plugins/panelTime'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { push } from 'notivue'
 
-const acmeInstallRequestTimeout = 2 * 60 * 1000
+const acmeInstallRequestTimeout = 35 * 1000
 const acmeRemoveRequestTimeout = 90 * 1000
 const acmeIssueRequestTimeout = 3 * 60 * 1000 + 30 * 1000
 const confirmAction = (action: string) => i18n.global.t(`confirmDialog.actions.${action}`)
@@ -1667,6 +1681,21 @@ type AcmeTask = {
   result?: AcmeActionResult
 }
 
+type AcmeInstallTaskStatus = {
+  id: string
+  state: string
+  phase: string
+  canCancel: boolean
+  stopRequested: boolean
+  deadlineExceeded: boolean
+  startedAt: number
+  updatedAt: number
+  deadlineAt: number
+  finishedAt: number
+  error: string
+  logSessionId: string
+}
+
 type AcmeVersionItem = {
   tag_name: string
   name: string
@@ -1728,7 +1757,12 @@ const props = withDefaults(defineProps<{ active?: boolean }>(), {
 })
 
 const loadingOverview = ref(false)
-const installing = ref(false)
+const installStartPending = ref(false)
+const acmeInstallTask = ref<AcmeInstallTaskStatus | null>(null)
+const acmeInstallPollTimer = ref<number | null>(null)
+const acmeInstallStopRequestPending = ref(false)
+let acmeInstallStatusRequest: Promise<void> | null = null
+let completedAcmeInstallTaskID = ''
 const upgrading = ref(false)
 const removingAcme = ref(false)
 const checkingAcmeUpdate = ref(false)
@@ -1764,6 +1798,46 @@ const acmeUpdateInfo = ref<AcmeVersionCheckResult>({
   latestVersion: '',
   hasUpdate: false,
   message: '',
+})
+
+const acmeInstallTaskActive = computed(() => {
+  const state = String(acmeInstallTask.value?.state ?? '').trim().toLowerCase()
+  return state === 'queued' || state === 'running' || state === 'stopping'
+})
+const acmeInstallTaskStopping = computed(() => (
+  acmeInstallTaskActive.value
+  && (acmeInstallTask.value?.stopRequested === true || acmeInstallTask.value?.state === 'stopping')
+))
+const acmeInstallTaskCanCancel = computed(() => (
+  acmeInstallTaskActive.value
+  && acmeInstallTask.value?.canCancel === true
+  && !acmeInstallTaskStopping.value
+))
+const acmeInstallTaskApplying = computed(() => (
+  acmeInstallTaskActive.value
+  && !acmeInstallTaskStopping.value
+  && acmeInstallTask.value?.canCancel === false
+))
+const installing = computed(() => installStartPending.value || acmeInstallTaskActive.value)
+const acmeInstallButtonText = computed(() => {
+  if (installStartPending.value) return '正在提交'
+  if (acmeInstallStopRequestPending.value || acmeInstallTaskStopping.value) return '正在停止'
+  if (acmeInstallTaskActive.value) return acmeInstallTaskCanCancel.value ? '停止' : '正在应用'
+  return '下载 / 重装'
+})
+const acmeInstallTaskStatusText = computed(() => {
+  const task = acmeInstallTask.value
+  if (installStartPending.value) return '正在提交 acme.sh 下载 / 重装任务'
+  if (task == null) return ''
+  const state = task.state
+  if (acmeInstallTaskStopping.value) return '正在停止 acme.sh 下载任务'
+  if (acmeInstallTaskApplying.value) return task.phase ? `正在应用：${task.phase}` : '正在应用 acme.sh 安装'
+  if (acmeInstallTaskActive.value) return task.phase ? `正在准备：${task.phase}` : '正在准备 acme.sh 下载 / 重装'
+  if (state === 'success') return 'acme.sh 下载 / 重装完成'
+  if (state === 'cancelled') return 'acme.sh 下载任务已停止，临时文件已清理'
+  if (state === 'timed_out') return 'acme.sh 下载任务超时，临时文件已清理'
+  if (state === 'error') return 'acme.sh 下载 / 重装失败'
+  return task.phase || 'acme.sh 安装状态未知'
 })
 
 const createIdleAcmeUpdateInfo = (): AcmeVersionCheckResult => ({
@@ -3688,7 +3762,142 @@ const pollIssueLog = async (): Promise<void> => {
   }
 }
 
+const normalizeAcmeInstallTaskStatus = (raw: any): AcmeInstallTaskStatus => ({
+  id: String(raw?.id ?? '').trim(),
+  state: String(raw?.state ?? '').trim().toLowerCase() || 'idle',
+  phase: String(raw?.phase ?? '').trim(),
+  canCancel: raw?.canCancel === true,
+  stopRequested: raw?.stopRequested === true,
+  deadlineExceeded: raw?.deadlineExceeded === true,
+  startedAt: Number(raw?.startedAt) || 0,
+  updatedAt: Number(raw?.updatedAt) || 0,
+  deadlineAt: Number(raw?.deadlineAt) || 0,
+  finishedAt: Number(raw?.finishedAt) || 0,
+  error: String(raw?.error ?? '').trim(),
+  logSessionId: String(raw?.logSessionId ?? '').trim(),
+})
+
+const isTerminalAcmeInstallTask = (task: AcmeInstallTaskStatus) => (
+  ['success', 'error', 'cancelled', 'timed_out'].includes(task.state)
+)
+
+const clearAcmeInstallTaskPolling = () => {
+  if (acmeInstallPollTimer.value !== null) {
+    window.clearTimeout(acmeInstallPollTimer.value)
+    acmeInstallPollTimer.value = null
+  }
+}
+
+const isAcmeInstallPollingAllowed = () => (
+  props.active && (typeof document === 'undefined' || document.visibilityState === 'visible')
+)
+
+const completeAcmeInstallTask = async (task: AcmeInstallTaskStatus) => {
+  if (!task.id || completedAcmeInstallTaskID === task.id) return
+  completedAcmeInstallTaskID = task.id
+  acmeInstallStopRequestPending.value = false
+  if (task.state === 'success') {
+    await refreshOverview(true)
+    push.success({ duration: 3600, message: 'acme.sh 下载 / 重装完成' })
+    return
+  }
+  if (task.state === 'cancelled') {
+    push.info({ duration: 3600, message: 'acme.sh 下载任务已停止，临时文件已清理' })
+    return
+  }
+  if (task.state === 'timed_out') {
+    push.warning({ duration: 4600, message: 'acme.sh 下载任务超过 20 分钟，已停止并清理临时文件' })
+    return
+  }
+  if (task.error) {
+    push.error({ duration: 5000, message: task.error })
+  }
+}
+
+const applyAcmeInstallTaskStatus = (raw: any) => {
+  const task = normalizeAcmeInstallTaskStatus(raw)
+  acmeInstallTask.value = task.id === '' || task.state === 'idle' ? null : task
+  if (acmeInstallTask.value != null && isTerminalAcmeInstallTask(acmeInstallTask.value)) {
+    clearAcmeInstallTaskPolling()
+    void completeAcmeInstallTask(acmeInstallTask.value)
+  }
+}
+
+const scheduleAcmeInstallTaskPolling = () => {
+  clearAcmeInstallTaskPolling()
+  if (!acmeInstallTaskActive.value || !isAcmeInstallPollingAllowed()) return
+  acmeInstallPollTimer.value = window.setTimeout(() => {
+    void pollAcmeInstallTask()
+  }, 1200)
+}
+
+const pollAcmeInstallTask = async (): Promise<void> => {
+  if (acmeInstallStatusRequest) return acmeInstallStatusRequest
+  if (!isAcmeInstallPollingAllowed()) return
+  const request = (async () => {
+    const msg = await HttpUtils.get('api/acme-install-status', {}, { silentAuthCheck: true })
+    if (!msg.success || !msg.obj) {
+      scheduleAcmeInstallTaskPolling()
+      return
+    }
+    applyAcmeInstallTaskStatus(msg.obj)
+    if (acmeInstallTaskActive.value) {
+      scheduleAcmeInstallTaskPolling()
+    }
+  })()
+  acmeInstallStatusRequest = request
+  try {
+    await request
+  } finally {
+    if (acmeInstallStatusRequest === request) {
+      acmeInstallStatusRequest = null
+    }
+  }
+}
+
+const startAcmeInstallTaskPolling = () => {
+  clearAcmeInstallTaskPolling()
+  if (!acmeInstallTaskActive.value || !isAcmeInstallPollingAllowed()) return
+  void pollAcmeInstallTask()
+}
+
+const recoverAcmeInstallTask = async (): Promise<boolean> => {
+  const msg = await HttpUtils.get('api/acme-install-status', {}, { silentAuthCheck: true })
+  if (!msg.success || !msg.obj) return false
+  const task = normalizeAcmeInstallTaskStatus(msg.obj)
+  if (task.id === '' || task.state === 'idle') return false
+  applyAcmeInstallTaskStatus(task)
+  if (acmeInstallTaskActive.value) {
+    startAcmeInstallTaskPolling()
+  }
+  return true
+}
+
+const stopAcmeInstallTask = async () => {
+  const task = acmeInstallTask.value
+  if (task == null || !acmeInstallTaskCanCancel.value || acmeInstallStopRequestPending.value) return
+  acmeInstallStopRequestPending.value = true
+  acmeInstallTask.value = {
+    ...task,
+    state: 'stopping',
+    phase: 'stopping',
+    canCancel: false,
+    stopRequested: true,
+  }
+  try {
+    const msg = await HttpUtils.post('api/acme-install-stop', { id: task.id }, { silentAuthCheck: true })
+    if (msg.success && msg.obj) {
+      applyAcmeInstallTaskStatus(msg.obj)
+    }
+  } catch {
+    // 状态轮询会确认已经受理但响应丢失的停止请求。
+  } finally {
+    startAcmeInstallTaskPolling()
+  }
+}
+
 const installAcme = async () => {
+  if (installStartPending.value || acmeInstallTaskActive.value) return
   const beforeVersion = overview.value.version.trim()
   let targetVersion = selectedAcmeVersion.value.trim()
   if (targetVersion === '__load_more__') {
@@ -3705,41 +3914,35 @@ const installAcme = async () => {
     }
   }
 
-  installing.value = true
+  installStartPending.value = true
+  completedAcmeInstallTaskID = ''
   try {
     const msg = await HttpUtils.post('api/acme-install', {
       email: installEmail.value.trim(),
       version: targetVersion,
     }, { timeout: acmeInstallRequestTimeout })
-    if (msg.success) {
-      applyActionResult(msg.obj)
-      const afterVersion = overview.value.version.trim()
-      const displayAfter = afterVersion || targetVersion || '未知版本'
-      if (beforeVersion === '') {
-        push.success({
-          duration: 3500,
-          message: `acme.sh 已安装，当前版本：${displayAfter}`,
-        })
-      } else {
-        push.success({
-          duration: 3500,
-          message: `acme.sh 已重装：${beforeVersion} -> ${displayAfter}`,
-        })
-      }
+    if (msg.success && msg.obj) {
+      applyAcmeInstallTaskStatus(msg.obj)
       if (targetVersion !== '') {
         selectedAcmeVersion.value = targetVersion
       }
-      void refreshOverview(true)
+      startAcmeInstallTaskPolling()
       return
     }
-    if (targetVersion !== '') {
+    const recovered = await recoverAcmeInstallTask()
+    if (!recovered && targetVersion !== '') {
       push.warning({
         duration: 4200,
         message: `版本 ${targetVersion} 无法下载或安装`,
       })
     }
+  } catch {
+    const recovered = await recoverAcmeInstallTask()
+    if (!recovered) {
+      push.error({ duration: 5000, message: beforeVersion === '' ? 'acme.sh 下载任务未能受理' : 'acme.sh 重装任务未能受理' })
+    }
   } finally {
-    installing.value = false
+    installStartPending.value = false
   }
 }
 
@@ -4701,10 +4904,12 @@ const handleVisibilityChange = () => {
     } else {
       void restoreActiveAcmeTask()
     }
+    void recoverAcmeInstallTask()
     return
   }
   stopPolling()
   stopIssueLogPolling()
+  clearAcmeInstallTaskPolling()
 }
 
 watch(() => props.active, (value) => {
@@ -4717,9 +4922,11 @@ watch(() => props.active, (value) => {
     void refreshSelfSignedAuthorities()
     startPolling()
     void restoreActiveAcmeTask()
+    void recoverAcmeInstallTask()
     return
   }
   stopPolling()
+  clearAcmeInstallTaskPolling()
 })
 
 watch(shouldPauseOverviewPolling, (paused) => {
@@ -4887,6 +5094,7 @@ onMounted(() => {
     void refreshSelfSignedAuthorities()
     startPolling()
     void restoreActiveAcmeTask()
+    void recoverAcmeInstallTask()
   }
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', handleVisibilityChange)
@@ -4896,6 +5104,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   stopPolling()
   closeIssueLog()
+  clearAcmeInstallTaskPolling()
   if (typeof document !== 'undefined') {
     document.removeEventListener('visibilitychange', handleVisibilityChange)
   }
@@ -5096,6 +5305,21 @@ onBeforeUnmount(() => {
 
 .acme-runtime-btn {
   min-width: 112px;
+}
+
+.acme-install-task {
+  width: 100%;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid rgba(20, 184, 166, 0.34);
+  border-radius: 6px;
+}
+
+.acme-install-task__status,
+.acme-install-task__id,
+.acme-install-task__error {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .acme-runtime-btn.acme-runtime-btn--check {

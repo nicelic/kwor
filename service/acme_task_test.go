@@ -48,6 +48,77 @@ func TestAcmeTaskStoreQueuesCompletesAndFails(t *testing.T) {
 	}
 }
 
+func TestAcmeTaskStoreFinishesCancelledQueuedManagedInstall(t *testing.T) {
+	store := newAcmeTaskStore()
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	first, err := store.enqueue("issue", "blocking task", func(string) (*AcmeActionResult, error) {
+		close(firstStarted)
+		<-releaseFirst
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("enqueue blocking task: %v", err)
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("blocking task did not start")
+	}
+
+	manager := NewManagedDownloadTaskManager("test acme install")
+	handle, _, created, err := manager.Start("acme-install", "test")
+	if err != nil || !created {
+		t.Fatalf("create managed install task: handle=%v created=%v err=%v", handle, created, err)
+	}
+	runnerStarted := make(chan struct{})
+	if _, err := store.enqueueManaged("install", "queued install", handle, func(string) (*AcmeActionResult, error) {
+		close(runnerStarted)
+		return nil, nil
+	}); err != nil {
+		t.Fatalf("enqueue managed install: %v", err)
+	}
+
+	if _, err := manager.Stop(handle.ID()); err != nil {
+		t.Fatalf("stop queued managed install: %v", err)
+	}
+	store.finishQueuedManagedIfCancelled(handle.ID())
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if status := manager.Get(handle.ID()); status.State == managedDownloadTaskCancelled {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if status := manager.Get(handle.ID()); status.State != managedDownloadTaskCancelled {
+		t.Fatalf("queued task should be cancelled without waiting for queue, got %#v", status)
+	}
+	if view := store.get(handle.ID()); view == nil || view.Status != acmeTaskStatusError {
+		t.Fatalf("queued task view should be finalized, got %#v", view)
+	}
+	deadline = time.Now().Add(time.Second)
+	for len(store.queue) > 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(store.queue) != 0 {
+		t.Fatal("cancelled queued managed task should release its queue slot immediately")
+	}
+	select {
+	case <-runnerStarted:
+		t.Fatal("cancelled queued runner must not start")
+	default:
+	}
+
+	close(releaseFirst)
+	_ = waitForAcmeTask(t, store, first.ID, acmeTaskStatusSuccess)
+	select {
+	case <-runnerStarted:
+		t.Fatal("released worker must not execute a task removed from the queue")
+	default:
+	}
+}
+
 func TestCloneAcmeActionResultKeepsUTF8SafeOutputSummary(t *testing.T) {
 	source := &AcmeActionResult{Output: strings.Repeat("签发输出", acmeTaskResultOutputMaxRunes)}
 	clone := cloneAcmeActionResult(source)

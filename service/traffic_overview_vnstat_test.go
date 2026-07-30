@@ -168,7 +168,7 @@ func TestManagedVnstatInstallJobTracksProgressAndPreventsConcurrentInstalls(t *t
 	if err != nil {
 		t.Fatalf("start managed vnStat install failed: %v", err)
 	}
-	if job.State != "running" || job.ID == "" {
+	if job.State != managedDownloadTaskQueued || job.ID == "" {
 		t.Fatalf("unexpected newly started job: %#v", job)
 	}
 	select {
@@ -185,7 +185,7 @@ func TestManagedVnstatInstallJobTracksProgressAndPreventsConcurrentInstalls(t *t
 	if err != nil || repeated.ID != job.ID {
 		t.Fatalf("same-source retry must return the active job, got job=%#v err=%v", repeated, err)
 	}
-	if _, err := svc.StartManagedVnstatInstall(vnstatInstallMethodGitHubRelease); err == nil || !strings.Contains(err.Error(), "正在运行") {
+	if _, err := svc.StartManagedVnstatInstall(vnstatInstallMethodGitHubRelease); err == nil || !strings.Contains(err.Error(), "already running") {
 		t.Fatalf("different-source concurrent install must be rejected, got %v", err)
 	}
 
@@ -195,9 +195,9 @@ func TestManagedVnstatInstallJobTracksProgressAndPreventsConcurrentInstalls(t *t
 	case <-time.After(time.Second):
 		t.Fatal("install runner did not finish")
 	}
-	completed := svc.GetManagedVnstatInstallJob(job.ID)
-	if completed.State != "succeeded" || completed.FinishedAt == 0 {
-		t.Fatalf("expected succeeded job, got %#v", completed)
+	completed := waitForManagedVnstatInstallJobState(t, svc, job.ID, managedDownloadTaskSuccess)
+	if completed.FinishedAt == 0 {
+		t.Fatalf("expected successful job to have a completion time, got %#v", completed)
 	}
 
 	// A terminal task permits a later install, while surfacing its actual error
@@ -220,10 +220,172 @@ func TestManagedVnstatInstallJobTracksProgressAndPreventsConcurrentInstalls(t *t
 	case <-time.After(time.Second):
 		t.Fatal("follow-up install runner did not finish")
 	}
-	failed := svc.GetManagedVnstatInstallJob(failedJob.ID)
-	if failed.State != "failed" || !strings.Contains(failed.Error, "GitHub test install failed") {
+	failed := waitForManagedVnstatInstallJobState(t, svc, failedJob.ID, managedDownloadTaskError)
+	if !strings.Contains(failed.Error, "GitHub test install failed") {
 		t.Fatalf("expected failed job status, got %#v", failed)
 	}
+}
+
+func TestManagedVnstatInstallStopsBeforeApplying(t *testing.T) {
+	previousRunner := vnstatManagedInstallRunner
+	vnstatInstallJobMu.Lock()
+	previousJob := vnstatInstallJobState
+	vnstatInstallJobState = nil
+	vnstatInstallJobMu.Unlock()
+
+	started := make(chan struct{})
+	done := make(chan struct{})
+	vnstatManagedInstallRunner = func(ctx context.Context, _ *TrafficOverviewService, _ string, report vnstatInstallProgressReporter) (*TrafficOverview, error) {
+		defer close(done)
+		report("正在下载测试 vnStat")
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	t.Cleanup(func() {
+		vnstatManagedInstallRunner = previousRunner
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+		vnstatInstallJobMu.Lock()
+		vnstatInstallJobState = previousJob
+		vnstatInstallJobMu.Unlock()
+	})
+
+	svc := &TrafficOverviewService{}
+	job, err := svc.StartManagedVnstatInstall(vnstatInstallMethodSystemPackage)
+	if err != nil {
+		t.Fatalf("start managed vnStat install: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("install runner did not start")
+	}
+
+	stopping, err := svc.StopManagedVnstatInstall(job.ID)
+	if err != nil {
+		t.Fatalf("stop managed vnStat install: %v", err)
+	}
+	if stopping.State != managedDownloadTaskStopping || !stopping.StopRequested {
+		t.Fatalf("unexpected stop status: %#v", stopping)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled vnStat runner did not finish")
+	}
+
+	_ = waitForManagedVnstatInstallJobState(t, svc, job.ID, managedDownloadTaskCancelled)
+}
+
+func TestManagedVnstatInstallStopWinsBeforeIrreversiblePhase(t *testing.T) {
+	previousRunner := vnstatManagedInstallRunner
+	vnstatInstallJobMu.Lock()
+	previousJob := vnstatInstallJobState
+	vnstatInstallJobState = nil
+	vnstatInstallJobMu.Unlock()
+
+	ready := make(chan struct{})
+	allowIrreversiblePhase := make(chan struct{})
+	irreversibleWorkStarted := make(chan struct{})
+	done := make(chan struct{})
+	vnstatManagedInstallRunner = func(ctx context.Context, _ *TrafficOverviewService, _ string, report vnstatInstallProgressReporter) (*TrafficOverview, error) {
+		defer close(done)
+		if !report("正在下载测试 vnStat") {
+			return nil, ctx.Err()
+		}
+		close(ready)
+		<-allowIrreversiblePhase
+		if !report("正在通过系统软件源安装 vnStat") {
+			return nil, ctx.Err()
+		}
+		close(irreversibleWorkStarted)
+		return &TrafficOverview{}, nil
+	}
+	t.Cleanup(func() {
+		select {
+		case <-allowIrreversiblePhase:
+		default:
+			close(allowIrreversiblePhase)
+		}
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+		vnstatManagedInstallRunner = previousRunner
+		vnstatInstallJobMu.Lock()
+		vnstatInstallJobState = previousJob
+		vnstatInstallJobMu.Unlock()
+	})
+
+	svc := &TrafficOverviewService{}
+	job, err := svc.StartManagedVnstatInstall(vnstatInstallMethodSystemPackage)
+	if err != nil {
+		t.Fatalf("start managed vnStat install: %v", err)
+	}
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("install runner did not reach the reversible phase")
+	}
+
+	if _, err := svc.StopManagedVnstatInstall(job.ID); err != nil {
+		t.Fatalf("stop managed vnStat install: %v", err)
+	}
+	close(allowIrreversiblePhase)
+	select {
+	case <-irreversibleWorkStarted:
+		t.Fatal("stop request must prevent irreversible vnStat work from starting")
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled vnStat runner did not finish")
+	}
+
+	_ = waitForManagedVnstatInstallJobState(t, svc, job.ID, managedDownloadTaskCancelled)
+}
+
+func TestManagedVnstatInstallPanicBecomesTaskError(t *testing.T) {
+	previousRunner := vnstatManagedInstallRunner
+	vnstatInstallJobMu.Lock()
+	previousJob := vnstatInstallJobState
+	vnstatInstallJobState = nil
+	vnstatInstallJobMu.Unlock()
+	vnstatManagedInstallRunner = func(context.Context, *TrafficOverviewService, string, vnstatInstallProgressReporter) (*TrafficOverview, error) {
+		panic("test vnStat worker panic")
+	}
+	t.Cleanup(func() {
+		vnstatManagedInstallRunner = previousRunner
+		vnstatInstallJobMu.Lock()
+		vnstatInstallJobState = previousJob
+		vnstatInstallJobMu.Unlock()
+	})
+
+	svc := &TrafficOverviewService{}
+	job, err := svc.StartManagedVnstatInstall(vnstatInstallMethodSystemPackage)
+	if err != nil {
+		t.Fatalf("start managed vnStat install: %v", err)
+	}
+	finished := waitForManagedVnstatInstallJobState(t, svc, job.ID, managedDownloadTaskError)
+	if !strings.Contains(finished.Error, "test vnStat worker panic") || finished.Phase != "vnStat 安装失败" {
+		t.Fatalf("panic should be exposed as a managed task error, got %#v", finished)
+	}
+}
+
+func waitForManagedVnstatInstallJobState(t *testing.T, svc *TrafficOverviewService, jobID string, expectedState string) VnstatInstallJobStatus {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	var latest VnstatInstallJobStatus
+	for time.Now().Before(deadline) {
+		latest = svc.GetManagedVnstatInstallJob(jobID)
+		if latest.State == expectedState {
+			return latest
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected vnStat task %q state %q, got %#v", jobID, expectedState, latest)
+	return VnstatInstallJobStatus{}
 }
 
 func TestRemoveManagedVnstatRejectsWhileInstallTaskRuns(t *testing.T) {

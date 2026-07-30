@@ -51,7 +51,7 @@
         variant="flat"
         size="x-small"
         icon="mdi-play"
-        :disabled="coreRunning"
+        :disabled="coreDownloadTaskActive || coreRunning"
         :loading="startingCore"
         @click="startCore"
       >
@@ -63,7 +63,7 @@
         variant="flat"
         size="x-small"
         icon="mdi-stop"
-        :disabled="!coreRunning"
+        :disabled="coreDownloadTaskActive || !coreRunning"
         :loading="stoppingCore"
         @click="stopCore"
       >
@@ -75,7 +75,7 @@
         variant="flat"
         size="x-small"
         icon="mdi-restart"
-        :disabled="!coreRunning"
+        :disabled="coreDownloadTaskActive || !coreRunning"
         :loading="restartingCore"
         @click="restartCore"
       >
@@ -96,6 +96,16 @@
           {{ t(namespaceApi.core.modalButtonLabel) }}
         </v-btn>
       </v-badge>
+    </v-col>
+    <v-col v-if="coreDownloadTaskActive" cols="12" class="pt-0">
+      <v-alert type="info" variant="tonal" density="compact" class="core-download-hint">
+        <div class="d-flex align-center justify-space-between flex-wrap" style="gap: 8px;">
+          <span class="core-download-hint__text">{{ coreDownloadTaskHint }}</span>
+          <v-btn size="small" variant="text" color="primary" prepend-icon="mdi-engine" @click="openCoreModal">
+            查看
+          </v-btn>
+        </div>
+      </v-alert>
     </v-col>
   </v-row>
 
@@ -211,6 +221,14 @@ interface PortLogEntry {
   message: string
 }
 
+interface CoreDownloadTaskStatus {
+  id: string
+  state: string
+  stage: string
+  canCancel: boolean
+  stopRequested: boolean
+}
+
 const props = withDefaults(defineProps<{ namespace?: UiNamespace }>(), {
   namespace: 'default',
 })
@@ -254,6 +272,8 @@ const stoppingCore = ref(false)
 const restartingCore = ref(false)
 const coreUpdateCount = ref(0)
 const coreUpdateTimerId = ref<ReturnType<typeof setInterval> | 0>(0)
+const coreDownloadTask = ref<CoreDownloadTaskStatus | null>(null)
+const coreDownloadTimerId = ref<number | null>(null)
 
 const showModal = (id: number) => {
   modal.value.id = id
@@ -320,6 +340,38 @@ const portCheckUnsupportedHinted = ref(false)
 const coreRunning = ref(false)
 let portRangeMonitorRequest: Promise<void> | null = null
 let coreUpdateMarkerRequest: Promise<void> | null = null
+let coreDownloadTaskRequest: Promise<void> | null = null
+
+const coreDownloadTaskActive = computed(() => {
+  const state = String(coreDownloadTask.value?.state ?? '').trim().toLowerCase()
+  return state === 'queued' || state === 'running' || state === 'stopping'
+})
+
+const coreDownloadTaskStageText = computed(() => {
+  const stage = String(coreDownloadTask.value?.stage ?? '').trim().toLowerCase()
+  switch (stage) {
+    case 'downloading':
+      return t('coreManager.stageDownloading')
+    case 'extracting':
+      return t('coreManager.stageExtracting')
+    case 'validating':
+      return t('coreManager.stageValidating')
+    case 'stopping':
+      return t('coreManager.stageStopping')
+    case 'replacing':
+      return t('coreManager.stageReplacing')
+    case 'starting':
+      return t('coreManager.stageStarting')
+    default:
+      return stage || '准备中'
+  }
+})
+
+const coreDownloadTaskHint = computed(() => {
+  if (coreDownloadTask.value?.stopRequested) return '核心下载任务正在停止'
+  if (coreDownloadTask.value?.canCancel === false) return `核心下载任务正在应用：${coreDownloadTaskStageText.value}`
+  return `核心下载任务进行中：${coreDownloadTaskStageText.value}`
+})
 
 const summarizePorts = (ports: number[]): string => {
   if (!ports || ports.length === 0) return '-'
@@ -511,7 +563,67 @@ const loadCoreUpdateMarker = (): Promise<void> => {
   return request
 }
 
+const clearCoreDownloadTaskPolling = () => {
+  if (coreDownloadTimerId.value !== null) {
+    window.clearTimeout(coreDownloadTimerId.value)
+    coreDownloadTimerId.value = null
+  }
+}
+
+const normalizeCoreDownloadTaskStatus = (raw: any): CoreDownloadTaskStatus | null => {
+  const id = String(raw?.id ?? '').trim()
+  const state = String(raw?.state ?? '').trim().toLowerCase()
+  if (!id || !state || state === 'idle') return null
+  return {
+    id,
+    state,
+    stage: String(raw?.stage ?? raw?.phase ?? '').trim(),
+    canCancel: raw?.canCancel === true,
+    stopRequested: raw?.stopRequested === true,
+  }
+}
+
+const scheduleCoreDownloadTaskPolling = () => {
+  clearCoreDownloadTaskPolling()
+  if (!coreDownloadTaskActive.value || (typeof document !== 'undefined' && document.visibilityState !== 'visible')) return
+  coreDownloadTimerId.value = window.setTimeout(() => {
+    void loadCoreDownloadTask()
+  }, 1500)
+}
+
+const loadCoreDownloadTask = async (): Promise<void> => {
+  if (coreDownloadTaskRequest || !namespaceApi.showCoreControlsOnInbounds) return
+  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+  const request = (async () => {
+    try {
+      const data = await HttpUtils.get(namespaceApi.core.progressEndpoint, {}, { silentAuthCheck: true })
+      if (!data.success || !data.obj) {
+        scheduleCoreDownloadTaskPolling()
+        return
+      }
+      const task = normalizeCoreDownloadTaskStatus(data.obj)
+      coreDownloadTask.value = task
+      if (coreDownloadTaskActive.value) {
+        scheduleCoreDownloadTaskPolling()
+      } else {
+        clearCoreDownloadTaskPolling()
+      }
+    } catch {
+      scheduleCoreDownloadTaskPolling()
+    }
+  })()
+  coreDownloadTaskRequest = request
+  try {
+    await request
+  } finally {
+    if (coreDownloadTaskRequest === request) {
+      coreDownloadTaskRequest = null
+    }
+  }
+}
+
 const startCore = async () => {
+  if (coreDownloadTaskActive.value || startingCore.value) return
   startingCore.value = true
   try {
     await HttpUtils.post(namespaceApi.core.startEndpoint, {})
@@ -525,6 +637,7 @@ const startCore = async () => {
 }
 
 const stopCore = async () => {
+  if (coreDownloadTaskActive.value || stoppingCore.value) return
   stoppingCore.value = true
   try {
     await HttpUtils.post(namespaceApi.core.stopEndpoint, {})
@@ -538,6 +651,7 @@ const stopCore = async () => {
 }
 
 const restartCore = async () => {
+  if (coreDownloadTaskActive.value || restartingCore.value) return
   restartingCore.value = true
   try {
     await HttpUtils.post(namespaceApi.core.restartEndpoint, {})
@@ -559,6 +673,7 @@ const stopBackgroundPolling = () => {
     clearInterval(coreUpdateTimerId.value)
     coreUpdateTimerId.value = 0
   }
+  clearCoreDownloadTaskPolling()
 }
 
 const startBackgroundPolling = () => {
@@ -566,6 +681,7 @@ const startBackgroundPolling = () => {
   if (namespaceApi.showCoreControlsOnInbounds) {
     void loadCoreStatus()
     void loadCoreUpdateMarker()
+    void loadCoreDownloadTask()
     if (coreUpdateTimerId.value === 0) {
       coreUpdateTimerId.value = setInterval(() => {
         void loadCoreUpdateMarker()
@@ -615,3 +731,10 @@ onUnmounted(() => {
   }
 })
 </script>
+
+<style scoped>
+.core-download-hint__text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+</style>

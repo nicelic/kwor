@@ -18,6 +18,7 @@ const (
 
 	coreDownloadStageStopping    = "stopping"
 	coreDownloadStageDownloading = "downloading"
+	coreDownloadStageExtracting  = "extracting"
 	coreDownloadStageReplacing   = "replacing"
 	coreDownloadStageValidating  = "validating"
 	coreDownloadStageStarting    = "starting"
@@ -26,19 +27,24 @@ const (
 )
 
 type CoreDownloadProgress struct {
-	ID              string  `json:"id"`
-	Core            string  `json:"core"`
-	Status          string  `json:"status"`
-	Stage           string  `json:"stage"`
-	RunningBefore   bool    `json:"runningBefore"`
-	Percent         float64 `json:"percent"`
-	Approximate     bool    `json:"approximate"`
-	DownloadedBytes int64   `json:"downloadedBytes"`
-	TotalBytes      int64   `json:"totalBytes"`
-	Error           string  `json:"error,omitempty"`
-	StartedAt       int64   `json:"startedAt"`
-	UpdatedAt       int64   `json:"updatedAt"`
-	FinishedAt      int64   `json:"finishedAt,omitempty"`
+	ID               string  `json:"id"`
+	Core             string  `json:"core"`
+	Status           string  `json:"status"`
+	State            string  `json:"state,omitempty"`
+	Stage            string  `json:"stage"`
+	CanCancel        bool    `json:"canCancel"`
+	StopRequested    bool    `json:"stopRequested"`
+	DeadlineExceeded bool    `json:"deadlineExceeded"`
+	RunningBefore    bool    `json:"runningBefore"`
+	Percent          float64 `json:"percent"`
+	Approximate      bool    `json:"approximate"`
+	DownloadedBytes  int64   `json:"downloadedBytes"`
+	TotalBytes       int64   `json:"totalBytes"`
+	Error            string  `json:"error,omitempty"`
+	StartedAt        int64   `json:"startedAt"`
+	UpdatedAt        int64   `json:"updatedAt"`
+	DeadlineAt       int64   `json:"deadlineAt,omitempty"`
+	FinishedAt       int64   `json:"finishedAt,omitempty"`
 }
 
 type coreDownloadProgressStore struct {
@@ -275,6 +281,7 @@ func GetCoreDownloadProgress(id string) *CoreDownloadProgress {
 
 func SetCoreDownloadProgressStage(id string, stage string) {
 	sharedCoreDownloadProgressStore.setStage(id, stage)
+	updateManagedCoreDownloadTaskPhase(id, stage)
 }
 
 func SetCoreDownloadProgressTotals(id string, totalBytes int64, approximate bool) {

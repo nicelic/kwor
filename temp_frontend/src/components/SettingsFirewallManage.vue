@@ -20,17 +20,35 @@
               </div>
               <div class="firewall-hero__controls">
 	                <div
-	                  v-if="overview.nftables.supported && !overview.nftables.installed"
+	                  v-if="showNftablesInstallTask"
 	                  class="firewall-hero__install">
-	                  <div class="text-caption text-medium-emphasis mb-2">缺少 nft 命令</div>
+	                  <div v-if="!overview.nftables.installed" class="text-caption text-medium-emphasis mb-2">缺少 nft 命令</div>
                   <v-btn
+                    v-if="hasActiveNftablesInstall"
+                    :color="nftablesInstallTask.canCancel ? 'error' : 'primary'"
+                    :prepend-icon="nftablesInstallTask.canCancel ? 'mdi-stop-circle-outline' : 'mdi-progress-wrench'"
+                    :disabled="nftablesStopRequestPending || !nftablesInstallTask.canCancel"
+                    @click="stopNftablesInstall">
+                    {{ nftablesStopButtonLabel }}
+                  </v-btn>
+                  <v-btn
+                    v-else-if="!overview.nftables.installed"
                     color="primary"
                     prepend-icon="mdi-download"
-                    :loading="installingNftables"
                     :disabled="loading || installingNftables"
                     @click="installNftables">
                     下载 nftables
                   </v-btn>
+                  <div v-if="hasActiveNftablesInstall" class="firewall-nftables-progress mt-2" role="status" aria-live="polite">
+                    <v-progress-circular indeterminate size="16" width="2" color="primary" />
+                    <span>{{ nftablesInstallTask.phase || (nftablesInstallTask.canCancel ? '正在准备下载' : '正在应用 nftables') }}</span>
+                  </div>
+	                  <div v-else-if="hasTerminalNftablesInstallTask" class="firewall-nftables-progress mt-2" role="status" aria-live="polite">
+	                    <v-icon :color="nftablesInstallTask.state === 'error' ? 'error' : 'warning'" size="16">
+	                      {{ nftablesInstallTask.state === 'error' ? 'mdi-alert-circle-outline' : 'mdi-information-outline' }}
+	                    </v-icon>
+	                    <span>{{ nftablesInstallTask.error || nftablesInstallTask.phase || nftablesInstallTerminalText }}</span>
+	                  </div>
 	                  <div class="text-caption text-medium-emphasis mt-2">
 	                    {{ overview.nftables.packageManager || overview.nftables.systemFamily || 'Linux' }}
 	                  </div>
@@ -42,7 +60,7 @@
                   <div class="text-caption text-medium-emphasis mb-1">总开关</div>
                   <v-switch
                     :model-value="switchEnabled"
-                    :disabled="!overview.available || switchBusy"
+                    :disabled="!overview.available || switchBusy || hasActiveNftablesInstall"
                     :loading="switchBusy"
                     color="success"
                     inset
@@ -954,6 +972,20 @@ type FirewallNftablesStatus = {
   reason: string
 }
 
+type ManagedInstallTask = {
+  id: string
+  state: string
+  phase: string
+  canCancel: boolean
+  stopRequested: boolean
+  deadlineExceeded: boolean
+  error: string
+  startedAt: number
+  updatedAt: number
+  deadlineAt: number
+  finishedAt: number
+}
+
 type FirewallOverview = {
   enabled: boolean
   available: boolean
@@ -1117,6 +1149,21 @@ const loading = ref(false)
 const refreshing = ref(false)
 const switchBusy = ref(false)
 const installingNftables = ref(false)
+const nftablesInstallTask = ref<ManagedInstallTask>({
+  id: '',
+  state: 'idle',
+  phase: '',
+  canCancel: false,
+  stopRequested: false,
+  deadlineExceeded: false,
+  error: '',
+  startedAt: 0,
+  updatedAt: 0,
+  deadlineAt: 0,
+  finishedAt: 0,
+})
+const nftablesStopRequestPending = ref(false)
+const nftablesInstallPollingTimer = ref<number | null>(null)
 const savingSSHPort = ref(false)
 const switchingSSHProxy = ref(false)
 const systemRuleBusyKey = ref('')
@@ -1336,6 +1383,27 @@ const nftCapabilityChipColor = computed(() => {
     default:
       return 'warning'
   }
+})
+const hasActiveNftablesInstall = computed(() => (
+  ['queued', 'running', 'stopping'].includes(nftablesInstallTask.value.state)
+))
+const hasTerminalNftablesInstallTask = computed(() => (
+  nftablesInstallTask.value.id !== ''
+  && ['error', 'cancelled', 'timed_out'].includes(nftablesInstallTask.value.state)
+))
+const showNftablesInstallTask = computed(() => (
+  (overview.value.nftables.supported && !overview.value.nftables.installed)
+  || hasActiveNftablesInstall.value
+  || hasTerminalNftablesInstallTask.value
+))
+const nftablesStopButtonLabel = computed(() => {
+  if (nftablesStopRequestPending.value || nftablesInstallTask.value.state === 'stopping') return '正在停止'
+  return nftablesInstallTask.value.canCancel ? '停止' : '正在应用'
+})
+const nftablesInstallTerminalText = computed(() => {
+  if (nftablesInstallTask.value.state === 'cancelled') return 'nftables 下载已停止'
+  if (nftablesInstallTask.value.state === 'timed_out') return 'nftables 下载超时，任务已停止'
+  return 'nftables 安装失败'
 })
 
 const geoLastRefreshLabel = computed(() => {
@@ -1722,6 +1790,80 @@ const refreshOverview = async () => {
   }
 }
 
+const normalizeManagedInstallTask = (raw: any): ManagedInstallTask => ({
+  id: String(raw?.id ?? '').trim(),
+  state: String(raw?.state ?? 'idle').trim().toLowerCase() || 'idle',
+  phase: String(raw?.phase ?? '').trim(),
+  canCancel: raw?.canCancel === true,
+  stopRequested: raw?.stopRequested === true,
+  deadlineExceeded: raw?.deadlineExceeded === true,
+  error: String(raw?.error ?? '').trim(),
+  startedAt: Number(raw?.startedAt ?? 0) || 0,
+  updatedAt: Number(raw?.updatedAt ?? 0) || 0,
+  deadlineAt: Number(raw?.deadlineAt ?? 0) || 0,
+  finishedAt: Number(raw?.finishedAt ?? 0) || 0,
+})
+
+const clearNftablesInstallPolling = () => {
+  if (nftablesInstallPollingTimer.value != null) {
+    window.clearTimeout(nftablesInstallPollingTimer.value)
+    nftablesInstallPollingTimer.value = null
+  }
+}
+
+const scheduleNftablesInstallPolling = () => {
+  clearNftablesInstallPolling()
+  if (!hasActiveNftablesInstall.value || !props.active) return
+  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+  nftablesInstallPollingTimer.value = window.setTimeout(() => {
+    void pollNftablesInstall()
+  }, 1200)
+}
+
+let completedNftablesTaskID = ''
+const applyNftablesInstallTask = async (raw: any) => {
+  const task = normalizeManagedInstallTask(raw)
+  nftablesInstallTask.value = task
+  installingNftables.value = hasActiveNftablesInstall.value
+  nftablesStopRequestPending.value = task.stopRequested || task.state === 'stopping'
+  if (hasActiveNftablesInstall.value) {
+    scheduleNftablesInstallPolling()
+    return
+  }
+  clearNftablesInstallPolling()
+  if (!task.id || completedNftablesTaskID === task.id) return
+  completedNftablesTaskID = task.id
+  await fetchOverview(true)
+  if (task.state === 'success') {
+    push.success({ duration: 4000, message: 'nftables 已安装并完成应用' })
+    return
+  }
+  if (task.state === 'cancelled' || task.state === 'timed_out') {
+    push.info({ duration: 5000, message: task.state === 'timed_out' ? 'nftables 下载超时，任务已停止' : 'nftables 下载已停止' })
+    return
+  }
+  if (task.state === 'error') {
+    push.warning({ duration: 6000, message: task.error || task.phase || 'nftables 安装失败' })
+  }
+}
+
+const recoverNftablesInstall = async () => {
+  const msg = await HttpUtils.get('api/firewall-nftables-install-status', {}, { silentAuthCheck: true })
+  if (!msg.success || !msg.obj) return false
+  await applyNftablesInstallTask(msg.obj)
+  return hasActiveNftablesInstall.value
+}
+
+const pollNftablesInstall = async () => {
+  if (!props.active || (typeof document !== 'undefined' && document.visibilityState !== 'visible')) return
+  const msg = await HttpUtils.get('api/firewall-nftables-install-status', {}, { silentAuthCheck: true })
+  if (!msg.success || !msg.obj) {
+    scheduleNftablesInstallPolling()
+    return
+  }
+  await applyNftablesInstallTask(msg.obj)
+}
+
 const installNftables = async () => {
   installingNftables.value = true
   try {
@@ -1731,16 +1873,39 @@ const installNftables = async () => {
       },
     })
     if (msg.success && msg.obj) {
-      applyOverview(msg.obj)
-      push.success({
-        duration: 4000,
-        message: 'nftables 已安装',
-      })
+      await applyNftablesInstallTask(msg.obj)
       return
     }
+    if (await recoverNftablesInstall()) return
     await fetchOverview(true)
   } finally {
-    installingNftables.value = false
+    if (!hasActiveNftablesInstall.value) {
+      installingNftables.value = false
+    }
+  }
+}
+
+const stopNftablesInstall = async () => {
+  const id = nftablesInstallTask.value.id.trim()
+  if (!id || !nftablesInstallTask.value.canCancel || nftablesStopRequestPending.value) return
+  nftablesStopRequestPending.value = true
+  nftablesInstallTask.value = { ...nftablesInstallTask.value, state: 'stopping', canCancel: false, stopRequested: true, phase: '正在停止' }
+  try {
+    const msg = await HttpUtils.post('api/firewall-nftables-install-stop', { id }, {
+      headers: { 'Content-Type': 'application/json' },
+      silentAuthCheck: true,
+    })
+    if (msg.success && msg.obj) {
+      await applyNftablesInstallTask(msg.obj)
+      return
+    }
+    await pollNftablesInstall()
+  } catch {
+    await pollNftablesInstall()
+  } finally {
+    if (nftablesInstallTask.value.state !== 'stopping') {
+      nftablesStopRequestPending.value = false
+    }
   }
 }
 
@@ -2164,11 +2329,14 @@ const startPolling = () => schedulePolling()
 
 const handleVisibilityChange = () => {
   if (document.visibilityState === 'visible') {
+    if (!props.active) return
     void fetchOverview(true)
+		void recoverNftablesInstall()
     startPolling()
     return
   }
   stopPolling()
+	clearNftablesInstallPolling()
 }
 
 watch(geoIntervalInput, value => {
@@ -2193,14 +2361,17 @@ watch(() => editingRule.value.protocol, protocol => {
 watch(() => props.active, (active) => {
   if (active) {
     void fetchOverview(true)
+		void recoverNftablesInstall()
     startPolling()
     return
   }
   stopPolling()
+	clearNftablesInstallPolling()
 })
 
 onMounted(() => {
   void fetchOverview()
+	void recoverNftablesInstall()
   startPolling()
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', handleVisibilityChange)
@@ -2209,6 +2380,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   stopPolling()
+	clearNftablesInstallPolling()
   if (typeof document !== 'undefined') {
     document.removeEventListener('visibilitychange', handleVisibilityChange)
   }
@@ -2337,6 +2509,22 @@ onBeforeUnmount(() => {
   border-radius: 16px;
   background: rgba(15, 23, 42, 0.42);
   border: 1px solid rgba(148, 163, 184, 0.14);
+}
+
+.firewall-nftables-progress {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  color: rgba(219, 234, 254, 0.96);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.firewall-nftables-progress span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .firewall-hero__chips {
@@ -2539,6 +2727,10 @@ onBeforeUnmount(() => {
   }
 
   .firewall-hero__install {
+    width: 100%;
+  }
+
+  .firewall-hero__install .v-btn {
     width: 100%;
   }
 

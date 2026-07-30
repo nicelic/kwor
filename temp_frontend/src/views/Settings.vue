@@ -276,17 +276,36 @@
               </v-btn>
             </v-col>
 
-            <v-col cols="auto">
+            <v-col cols="12" sm="auto">
               <v-btn
                 color="primary"
                 variant="flat"
-                prepend-icon="mdi-download"
-                :loading="panelInstalling"
-                :disabled="!panelSelectedVersion || panelLifecycleBusy || panelRemoteLoading || !panelCanInstall"
-                @click="openPanelInstallDialog"
+                :prepend-icon="panelUpdateTaskActive ? (panelUpdateTaskApplying ? 'mdi-progress-wrench' : 'mdi-stop') : 'mdi-download'"
+                :disabled="panelUpdateTaskActive
+                  ? panelUpdateStopRequestPending || !panelUpdateTaskCanCancel
+                  : !panelSelectedVersion || panelLifecycleBusy || panelRemoteLoading || !panelCanInstall"
+                @click="panelUpdateTaskActive ? stopPanelUpdateTask() : openPanelInstallDialog()"
               >
-                {{ $t('setting.panelInstall') }}
+                {{ panelUpdateTaskButtonText }}
               </v-btn>
+            </v-col>
+          </v-row>
+
+          <v-row v-if="panelManagedUpdateTask" class="mt-1">
+            <v-col cols="12">
+              <v-alert
+                :type="panelUpdateTaskAlertType"
+                variant="tonal"
+                density="compact"
+                class="panel-update-task-status"
+              >
+                <div class="d-flex align-center justify-space-between flex-wrap" style="gap: 8px;">
+                  <span class="panel-update-task-status__text">{{ panelUpdateTaskStatusText }}</span>
+                  <span v-if="panelManagedUpdateTask.id" class="text-caption text-medium-emphasis panel-update-task-status__id">
+                    {{ panelManagedUpdateTask.id }}
+                  </span>
+                </div>
+              </v-alert>
             </v-col>
           </v-row>
 
@@ -544,7 +563,9 @@
           <v-card-actions>
             <v-spacer></v-spacer>
             <v-btn variant="text" :disabled="panelInstalling" @click="panelInstallDialogVisible = false">{{ $t('setting.panelCancel') }}</v-btn>
-            <v-btn color="primary" variant="flat" :loading="panelInstalling" @click="installPanelVersion">{{ $t('setting.panelConfirmInstall') }}</v-btn>
+            <v-btn color="primary" variant="flat" :disabled="panelInstalling" @click="installPanelVersion">
+              {{ panelInstalling ? '正在提交' : $t('setting.panelConfirmInstall') }}
+            </v-btn>
           </v-card-actions>
         </v-card>
       </v-dialog>
@@ -717,6 +738,20 @@ type PanelVersionItem = {
   assetSize?: number
 }
 
+type PanelManagedUpdateTask = {
+  id: string
+  state: string
+  phase: string
+  canCancel: boolean
+  stopRequested: boolean
+  deadlineExceeded: boolean
+  startedAt: number
+  updatedAt: number
+  deadlineAt: number
+  finishedAt: number
+  error: string
+}
+
 type PanelUpdateStatus = {
   localVersion?: string
   binaryPath?: string
@@ -746,6 +781,7 @@ type PanelUpdateStatus = {
   }>
   lastUpdateLogPath?: string
   lastUpdateError?: string
+  updateTask?: PanelManagedUpdateTask
 }
 
 type PanelUpdateLogView = {
@@ -794,6 +830,9 @@ const panelUpdateFeedbackType = ref<'success' | 'error' | 'info' | 'warning'>('i
 let panelVersionsRequest: Promise<void> | null = null
 const panelReconnectTimerId = ref<number | null>(null)
 const panelUninstallPollTimerId = ref<number | null>(null)
+const panelUpdateTaskPollTimerId = ref<number | null>(null)
+const panelUpdateStopRequestPending = ref(false)
+let panelUpdateTaskRequest: Promise<void> | null = null
 
 const settings = ref<Record<string, string>>({
   webListen: '',
@@ -1231,6 +1270,9 @@ const retryLoadSystemTimeZone = () => {
 }
 
 onMounted(() => {
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', handlePanelUpdateTaskVisibilityChange)
+  }
   void loadSettingsAndPanelStatus()
 })
 
@@ -1275,7 +1317,56 @@ const panelUninstallFailed = computed(() => panelUninstallState.value === 'faile
 const panelUninstallButtonText = computed(() => panelHasDockerUninstallGuide.value
   ? i18n.global.t('setting.uninstallDockerGuide')
   : i18n.global.t('setting.uninstallPanel'))
-const panelLifecycleBusy = computed(() => panelInstalling.value || panelUninstalling.value)
+const panelManagedUpdateTask = computed(() => panelUpdateStatus.value?.updateTask ?? null)
+const panelUpdateTaskActive = computed(() => {
+  const state = String(panelManagedUpdateTask.value?.state ?? '').trim().toLowerCase()
+  return state === 'queued' || state === 'running' || state === 'stopping'
+})
+const panelUpdateTaskStopping = computed(() => (
+  panelUpdateTaskActive.value && (
+    panelManagedUpdateTask.value?.stopRequested === true
+    || String(panelManagedUpdateTask.value?.state ?? '').trim().toLowerCase() === 'stopping'
+  )
+))
+const panelUpdateTaskCanCancel = computed(() => (
+  panelUpdateTaskActive.value
+  && panelManagedUpdateTask.value?.canCancel === true
+  && !panelUpdateTaskStopping.value
+))
+const panelUpdateTaskApplying = computed(() => (
+  panelUpdateTaskActive.value
+  && !panelUpdateTaskStopping.value
+  && panelManagedUpdateTask.value?.canCancel === false
+))
+const panelUpdateTaskButtonText = computed(() => {
+  if (panelUpdateStopRequestPending.value || panelUpdateTaskStopping.value) return '正在停止'
+  if (panelUpdateTaskActive.value) {
+    return panelUpdateTaskCanCancel.value ? '停止' : '正在应用'
+  }
+  return i18n.global.t('setting.panelInstall')
+})
+const panelUpdateTaskAlertType = computed<'info' | 'success' | 'warning' | 'error'>(() => {
+  const state = String(panelManagedUpdateTask.value?.state ?? '').trim().toLowerCase()
+  if (state === 'success') return 'success'
+  if (state === 'error') return 'error'
+  if (state === 'cancelled' || state === 'timed_out') return 'warning'
+  return 'info'
+})
+const panelUpdateTaskStatusText = computed(() => {
+  const task = panelManagedUpdateTask.value
+  if (task == null) return ''
+  const state = task.state.trim().toLowerCase()
+  const phase = task.phase.trim()
+  if (panelUpdateTaskStopping.value) return '正在停止面板更新任务'
+  if (panelUpdateTaskActive.value && !task.canCancel) return phase ? `正在应用：${phase}` : '正在应用面板更新'
+  if (panelUpdateTaskActive.value) return phase ? `正在准备更新：${phase}` : '正在准备面板更新'
+  if (state === 'success') return phase === 'handoff' ? '更新 worker 已接手，面板将自动重启' : '面板更新准备已完成'
+  if (state === 'cancelled') return '面板更新已停止'
+  if (state === 'timed_out') return '面板更新准备超时，已停止并清理临时文件'
+  if (state === 'error') return task.error ? `面板更新失败：${task.error}` : '面板更新失败'
+  return phase || '面板更新状态未知'
+})
+const panelLifecycleBusy = computed(() => panelInstalling.value || panelUninstalling.value || panelUpdateTaskActive.value)
 
 const panelRemoteVersionLabel = computed(() => {
   if (panelRemoteLoading.value) return i18n.global.t('setting.panelLoading')
@@ -1316,18 +1407,82 @@ const describePanelUninstallFailure = (status: PanelUpdateStatus | null) => {
   return phase ? `${prefix} (${phase})：${reason}` : `${prefix}：${reason}`
 }
 
+const normalizePanelManagedUpdateTask = (raw: any): PanelManagedUpdateTask => ({
+  id: String(raw?.id ?? '').trim(),
+  state: String(raw?.state ?? '').trim().toLowerCase() || 'idle',
+  phase: String(raw?.phase ?? '').trim(),
+  canCancel: raw?.canCancel === true,
+  stopRequested: raw?.stopRequested === true,
+  deadlineExceeded: raw?.deadlineExceeded === true,
+  startedAt: Number(raw?.startedAt) || 0,
+  updatedAt: Number(raw?.updatedAt) || 0,
+  deadlineAt: Number(raw?.deadlineAt) || 0,
+  finishedAt: Number(raw?.finishedAt) || 0,
+  error: String(raw?.error ?? '').trim(),
+})
+
+const normalizePanelUpdateStatus = (raw: any): PanelUpdateStatus | null => {
+  if (raw == null || typeof raw !== 'object') return null
+  const updateTask = raw.updateTask == null ? undefined : normalizePanelManagedUpdateTask(raw.updateTask)
+  return { ...raw, updateTask }
+}
+
+const isPanelUpdatePollingAllowed = () => (
+  tab.value === 't1'
+  && (typeof document === 'undefined' || document.visibilityState === 'visible')
+)
+
+const clearPanelUpdateTaskPolling = () => {
+  if (panelUpdateTaskPollTimerId.value !== null) {
+    window.clearTimeout(panelUpdateTaskPollTimerId.value)
+    panelUpdateTaskPollTimerId.value = null
+  }
+}
+
+const schedulePanelUpdateTaskPolling = () => {
+  clearPanelUpdateTaskPolling()
+  if (!panelUpdateTaskActive.value || !isPanelUpdatePollingAllowed()) return
+  panelUpdateTaskPollTimerId.value = window.setTimeout(() => {
+    void pollPanelUpdateTask()
+  }, 1200)
+}
+
+const handlePanelUpdateTaskTerminal = () => {
+  const task = panelManagedUpdateTask.value
+  if (task == null || panelUpdateTaskActive.value) return
+  panelUpdateStopRequestPending.value = false
+  panelInstalling.value = false
+  clearPanelUpdateTaskPolling()
+  // A page can reload after the updater accepts the handoff but before this
+  // panel process exits. The terminal handoff snapshot itself is sufficient to
+  // resume reconnect polling; a new panel process has no such in-memory task.
+  const shouldReconnect = task.state === 'success' && task.phase === 'handoff'
+  if (shouldReconnect) {
+    startPanelReconnectPolling()
+  }
+}
+
+const applyPanelUpdateStatus = (raw: any) => {
+  panelUpdateStatus.value = normalizePanelUpdateStatus(raw)
+}
+
 const loadPanelUpdateStatus = async () => {
   panelStatusLoading.value = true
   try {
     const msg = await HttpUtils.get('api/panel-update-status', {}, { silentAuthCheck: true })
     if (msg.success) {
-      panelUpdateStatus.value = msg.obj ?? null
+      applyPanelUpdateStatus(msg.obj)
       if (panelUninstallFailed.value) {
         panelUpdateFeedback.value = describePanelUninstallFailure(panelUpdateStatus.value)
         panelUpdateFeedbackType.value = 'error'
       } else if (panelLastUpdateError.value) {
     panelUpdateFeedback.value = `${i18n.global.t('setting.panelPreviousUpdateFailed')}：${panelLastUpdateError.value}`
         panelUpdateFeedbackType.value = 'warning'
+      }
+      if (panelUpdateTaskActive.value) {
+        schedulePanelUpdateTaskPolling()
+      } else {
+        handlePanelUpdateTaskTerminal()
       }
     }
   } finally {
@@ -1565,6 +1720,78 @@ const clearPanelUninstallStatusTimer = () => {
   }
 }
 
+const pollPanelUpdateTask = async (): Promise<void> => {
+  if (panelUpdateTaskRequest) return panelUpdateTaskRequest
+  if (!isPanelUpdatePollingAllowed()) return
+  const request = (async () => {
+    const msg = await HttpUtils.get('api/panel-update-status', {}, { silentAuthCheck: true })
+    if (!msg.success) {
+      schedulePanelUpdateTaskPolling()
+      return
+    }
+    applyPanelUpdateStatus(msg.obj)
+    if (panelUpdateTaskActive.value) {
+      schedulePanelUpdateTaskPolling()
+      return
+    }
+    handlePanelUpdateTaskTerminal()
+  })()
+  panelUpdateTaskRequest = request
+  try {
+    await request
+  } finally {
+    if (panelUpdateTaskRequest === request) {
+      panelUpdateTaskRequest = null
+    }
+  }
+}
+
+const startPanelUpdateTaskPolling = () => {
+	clearPanelUpdateTaskPolling()
+	if (!panelUpdateTaskActive.value || !isPanelUpdatePollingAllowed()) return
+	void pollPanelUpdateTask()
+}
+
+const handlePanelUpdateTaskVisibilityChange = () => {
+  if (typeof document === 'undefined') return
+  if (document.visibilityState !== 'visible') {
+    clearPanelUpdateTaskPolling()
+    return
+  }
+  if (tab.value === 't1') {
+    void loadPanelUpdateStatus()
+  }
+}
+
+const stopPanelUpdateTask = async () => {
+  const task = panelManagedUpdateTask.value
+  if (task == null || !panelUpdateTaskCanCancel.value || panelUpdateStopRequestPending.value) return
+  panelUpdateStopRequestPending.value = true
+  panelUpdateStatus.value = {
+    ...(panelUpdateStatus.value ?? {}),
+    updateTask: {
+      ...task,
+      state: 'stopping',
+      phase: 'stopping',
+      canCancel: false,
+      stopRequested: true,
+    },
+  }
+  try {
+    const msg = await HttpUtils.post('api/panel-update-stop', { id: task.id }, { silentAuthCheck: true })
+    if (msg.success && msg.obj) {
+      panelUpdateStatus.value = {
+        ...(panelUpdateStatus.value ?? {}),
+        updateTask: normalizePanelManagedUpdateTask(msg.obj),
+      }
+    }
+  } catch {
+    // 由紧随其后的状态轮询确认停止请求是否已被后端受理。
+  } finally {
+    startPanelUpdateTaskPolling()
+  }
+}
+
 const startPanelUninstallStatusPolling = () => {
   clearPanelUninstallStatusTimer()
 
@@ -1636,16 +1863,30 @@ const installPanelVersion = async () => {
   panelInstalling.value = true
   const version = panelSelectedVersion.value
   try {
-    const msg = await HttpUtils.post('api/panel-update-install', { version }, { silentAuthCheck: true, timeout: 120000 })
+    const msg = await HttpUtils.post('api/panel-update-install', { version }, { silentAuthCheck: true, timeout: 35000 })
     panelInstallDialogVisible.value = false
 
-    if (msg.success) {
+    if (msg.success && msg.obj) {
+      const task = normalizePanelManagedUpdateTask(msg.obj)
+      panelUpdateStatus.value = {
+        ...(panelUpdateStatus.value ?? {}),
+        updateTask: task,
+      }
       panelUpdateFeedback.value = ''
       panelUpdateFeedbackType.value = 'info'
-      await nextTick()
-      startPanelReconnectPolling()
+      startPanelUpdateTaskPolling()
+      void loadPanelUpdateStatus()
     } else {
-      panelUpdateFeedback.value = msg.msg || i18n.global.t('setting.panelInstallFailed')
+      await loadPanelUpdateStatus()
+      if (!panelUpdateTaskActive.value) {
+        panelUpdateFeedback.value = msg.msg || i18n.global.t('setting.panelInstallFailed')
+        panelUpdateFeedbackType.value = 'error'
+      }
+    }
+  } catch {
+    await loadPanelUpdateStatus()
+    if (!panelUpdateTaskActive.value) {
+      panelUpdateFeedback.value = i18n.global.t('setting.panelInstallFailed')
       panelUpdateFeedbackType.value = 'error'
     }
   } finally {
@@ -1704,8 +1945,13 @@ const persistSubscriptionDraft = (target: 'json' | 'clash', requireValid = false
 watch(tab, (value, previous) => {
 	if (previous === 't3') persistSubscriptionDraft('json')
 	if (previous === 't4') persistSubscriptionDraft('clash')
+	if (previous === 't1') clearPanelUpdateTaskPolling()
 	if (value === 't3') void loadSubscriptionDraft('json')
 	if (value === 't4') void loadSubscriptionDraft('clash')
+	if (value === 't1') {
+		void loadPanelUpdateStatus()
+		if (panelUpdateTaskActive.value) startPanelUpdateTaskPolling()
+	}
 })
 
 watch(() => settings.value.timeLocation, value => {
@@ -1724,6 +1970,10 @@ onBeforeUnmount(() => {
 	if (tab.value === 't4') persistSubscriptionDraft('clash')
   clearPanelReconnectTimer()
   clearPanelUninstallStatusTimer()
+  clearPanelUpdateTaskPolling()
+  if (typeof document !== 'undefined') {
+    document.removeEventListener('visibilitychange', handlePanelUpdateTaskVisibilityChange)
+  }
   if (settingsRequestWasLoading) {
     loading.value = false
   }
@@ -2086,6 +2336,12 @@ const showTopActionBar = computed(() => tab.value !== 't6' && tab.value !== 't7'
 .panel-uninstall-message-list {
   margin-bottom: 0;
   padding-left: 20px;
+  overflow-wrap: anywhere;
+}
+
+.panel-update-task-status__text,
+.panel-update-task-status__id {
+  min-width: 0;
   overflow-wrap: anywhere;
 }
 

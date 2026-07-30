@@ -855,6 +855,22 @@ func (a *ApiService) InstallTrafficOverviewVnstat(c *gin.Context) {
 	jsonObj(c, job, nil)
 }
 
+func (a *ApiService) StopTrafficOverviewVnstatInstall(c *gin.Context) {
+	req := struct {
+		ID *string `json:"id" form:"id"`
+	}{}
+	if err := c.ShouldBind(&req); err != nil {
+		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+	if req.ID == nil || strings.TrimSpace(*req.ID) == "" {
+		jsonMsg(c, "", fmt.Errorf("id is required"))
+		return
+	}
+	job, err := a.TrafficOverviewService.StopManagedVnstatInstall(strings.TrimSpace(*req.ID))
+	jsonObj(c, job, err)
+}
+
 func (a *ApiService) RemoveTrafficOverviewVnstat(c *gin.Context) {
 	overview, err := a.TrafficOverviewService.RemoveManagedVnstat()
 	if err != nil {
@@ -945,12 +961,32 @@ func (a *ApiService) SaveFirewallSwitch(c *gin.Context) {
 }
 
 func (a *ApiService) InstallFirewallNftables(c *gin.Context) {
-	overview, err := a.FirewallService.InstallNftables()
+	task, err := a.FirewallService.StartManagedNftablesInstall()
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
 	}
-	jsonObj(c, overview, nil)
+	jsonObj(c, task, nil)
+}
+
+func (a *ApiService) GetFirewallNftablesInstallStatus(c *gin.Context) {
+	jsonObj(c, a.FirewallService.GetManagedNftablesInstall(), nil)
+}
+
+func (a *ApiService) StopFirewallNftablesInstall(c *gin.Context) {
+	req := struct {
+		ID *string `json:"id" form:"id"`
+	}{}
+	if err := c.ShouldBind(&req); err != nil {
+		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+	if req.ID == nil || strings.TrimSpace(*req.ID) == "" {
+		jsonMsg(c, "", fmt.Errorf("id is required"))
+		return
+	}
+	task, err := a.FirewallService.StopManagedNftablesInstall(strings.TrimSpace(*req.ID))
+	jsonObj(c, task, err)
 }
 
 func (a *ApiService) SaveFirewallSSHPort(c *gin.Context) {
@@ -1388,7 +1424,7 @@ func (a *ApiService) InstallAcme(c *gin.Context) {
 	if req.Version != nil {
 		version = strings.TrimSpace(*req.Version)
 	}
-	result, err := a.AcmeService.InstallOrReinstall(service.AcmeInstallPayload{
+	result, err := a.AcmeService.StartManagedInstallOrReinstall(service.AcmeInstallPayload{
 		Email:         email,
 		EmailProvided: emailProvided,
 		Version:       version,
@@ -1398,6 +1434,26 @@ func (a *ApiService) InstallAcme(c *gin.Context) {
 		return
 	}
 	jsonObj(c, result, nil)
+}
+
+func (a *ApiService) GetAcmeInstallStatus(c *gin.Context) {
+	jsonObj(c, a.AcmeService.GetManagedAcmeInstall(c.Query("id")), nil)
+}
+
+func (a *ApiService) StopAcmeInstall(c *gin.Context) {
+	req := struct {
+		ID *string `json:"id" form:"id"`
+	}{}
+	if err := c.ShouldBind(&req); err != nil {
+		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+	if req.ID == nil || strings.TrimSpace(*req.ID) == "" {
+		jsonMsg(c, "", fmt.Errorf("id is required"))
+		return
+	}
+	result, err := a.AcmeService.StopManagedAcmeInstall(strings.TrimSpace(*req.ID))
+	jsonObj(c, result, err)
 }
 
 func (a *ApiService) SaveAcmeContactEmail(c *gin.Context) {
@@ -2540,11 +2596,7 @@ func (a *ApiService) DownloadKernelPackages(c *gin.Context) {
 	if req.Arch != nil {
 		arch = strings.TrimSpace(*req.Arch)
 	}
-	downloadSessionID := ""
-	if req.DownloadSessionID != nil {
-		downloadSessionID = strings.TrimSpace(*req.DownloadSessionID)
-	}
-	result, err := a.KernelManagerService.DownloadPackages(provider, line, *req.Version, arch, downloadSessionID)
+	result, err := a.KernelManagerService.StartManagedDownloadPackages(provider, line, *req.Version, arch)
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
@@ -2553,13 +2605,24 @@ func (a *ApiService) DownloadKernelPackages(c *gin.Context) {
 }
 
 func (a *ApiService) GetKernelDownloadProgress(c *gin.Context) {
-	id := strings.TrimSpace(c.Query("id"))
-	if id == "" {
+	progress := a.KernelManagerService.GetManagedDownloadProgress(c.Query("id"))
+	jsonObj(c, progress, nil)
+}
+
+func (a *ApiService) StopKernelDownload(c *gin.Context) {
+	req := struct {
+		ID *string `json:"id" form:"id"`
+	}{}
+	if err := c.ShouldBind(&req); err != nil {
+		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+	if req.ID == nil || strings.TrimSpace(*req.ID) == "" {
 		jsonMsg(c, "", fmt.Errorf("id is required"))
 		return
 	}
-	progress := a.KernelManagerService.GetDownloadProgress(id)
-	jsonObj(c, progress, nil)
+	progress, err := a.KernelManagerService.StopManagedDownloadPackages(strings.TrimSpace(*req.ID))
+	jsonObj(c, progress, err)
 }
 
 func (a *ApiService) InstallKernelPackages(c *gin.Context) {
@@ -3321,12 +3384,28 @@ func (a *ApiService) InstallPanelUpdate(c *gin.Context) {
 		}
 	}
 
-	result, err := a.PanelUpdateService.Install(version)
+	result, err := a.PanelUpdateService.StartManagedInstall(version)
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
 	}
 	jsonObj(c, result, nil)
+}
+
+func (a *ApiService) StopPanelUpdate(c *gin.Context) {
+	req := struct {
+		ID *string `json:"id" form:"id"`
+	}{}
+	if err := c.ShouldBind(&req); err != nil {
+		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+	if req.ID == nil || strings.TrimSpace(*req.ID) == "" {
+		jsonMsg(c, "", fmt.Errorf("id is required"))
+		return
+	}
+	result, err := a.PanelUpdateService.StopManagedInstall(strings.TrimSpace(*req.ID))
+	jsonObj(c, result, err)
 }
 
 func (a *ApiService) UninstallPanel(c *gin.Context) {

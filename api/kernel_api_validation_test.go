@@ -118,12 +118,19 @@ func TestKernelAPIValidation(t *testing.T) {
 		}
 	})
 
-	t.Run("download progress id required", func(t *testing.T) {
+	t.Run("download progress without id returns current or idle task", func(t *testing.T) {
 		rec, msg := performKernelAPIGet(t, svc.GetKernelDownloadProgress, "/api/kernel-download-progress")
-		if msg.Success {
-			t.Fatalf("expected failure when progress id is missing")
+		if !msg.Success || rec.Code != 200 {
+			t.Fatalf("unexpected response: code=%d msg=%q", rec.Code, msg.Msg)
 		}
-		if rec.Code != 200 || !strings.Contains(msg.Msg, "id is required") {
+	})
+
+	t.Run("download stop rejects unknown id", func(t *testing.T) {
+		rec, msg := performKernelAPIPostJSON(t, svc.StopKernelDownload, `{"id":"kernel-unknown-task"}`)
+		if msg.Success {
+			t.Fatal("expected unknown download task stop to fail")
+		}
+		if rec.Code != 200 || !strings.Contains(msg.Msg, "cannot be stopped") {
 			t.Fatalf("unexpected response: code=%d msg=%q", rec.Code, msg.Msg)
 		}
 	})

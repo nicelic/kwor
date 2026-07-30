@@ -157,33 +157,24 @@ func (a *ApiService) syncMihomoNftablesWithCoreState() {
 
 func (a *ApiService) DownloadMihomoCoreManager(c *gin.Context) {
 	request := parseMihomoCoreDownloadRequest(c)
-
-	var localVersion string
-	var err error
 	if request.CustomURL != "" {
 		if !strings.HasPrefix(request.CustomURL, "http://") && !strings.HasPrefix(request.CustomURL, "https://") {
 			jsonMsg(c, "", fmt.Errorf("custom_url must start with http:// or https://"))
 			return
 		}
-		localVersion, err = a.mihomoCoreManagerService().DownloadCoreFromURL(request.CustomURL, request.DownloadSessionID)
-		if err == nil {
-			if saveErr := a.mihomoCoreManagerService().SaveCustomDownloadURL(request.CustomURL); saveErr != nil {
-				logger.Warning("save mihomo custom download url failed: ", saveErr)
-			}
-		}
-	} else {
-		if request.Version == "" {
-			jsonMsg(c, "", fmt.Errorf("version or custom_url is required"))
-			return
-		}
-		localVersion, err = a.mihomoCoreManagerService().DownloadCore(request.Version, request.Target, request.DownloadSessionID)
 	}
+	if request.CustomURL == "" && request.Version == "" {
+		jsonMsg(c, "", fmt.Errorf("version or custom_url is required"))
+		return
+	}
+	progress, err := a.mihomoCoreManagerService().StartManagedCoreDownload(request.Version, request.Target, request.CustomURL, func() {
+		a.syncMihomoNftablesWithCoreState()
+	})
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
 	}
-	a.syncMihomoNftablesWithCoreState()
-	jsonObj(c, map[string]string{"version": localVersion}, nil)
+	jsonObj(c, progress, nil)
 }
 
 func (a *ApiService) SaveMihomoCoreDownloadPreference(c *gin.Context) {

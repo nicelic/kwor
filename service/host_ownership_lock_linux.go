@@ -3,6 +3,7 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,6 +39,19 @@ func AcquireKworLifecycleLock() (*KworLifecycleLock, error) {
 		return nil, fmt.Errorf("another kwor lifecycle operation is already running: %w", err)
 	}
 	return &KworLifecycleLock{file: file}, nil
+}
+
+// AcquireKworLifecycleLockContext keeps the background-task API symmetric on
+// Linux. flock is deliberately non-blocking here, so cancellation is checked
+// before the single acquisition attempt.
+func AcquireKworLifecycleLockContext(ctx context.Context) (*KworLifecycleLock, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return AcquireKworLifecycleLock()
 }
 
 func (l *KworLifecycleLock) Release() error {

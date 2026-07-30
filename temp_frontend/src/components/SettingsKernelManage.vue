@@ -136,27 +136,18 @@
           </tbody>
         </v-table>
 
-        <v-row>
+        <v-row class="kernel-download-actions">
           <v-col cols="12" md="4">
             <v-btn
               class="kernel-action-btn kernel-action-btn--download"
               block
               color="primary"
-              prepend-icon="mdi-download"
-              :loading="downloading"
-              :disabled="!canDownload"
-              @click="downloadPackages">
-              <template #loader>
-                <span class="kernel-download-loader">
-                  <v-progress-circular
-                    indeterminate
-                    size="16"
-                    width="2"
-                    color="white" />
-                  <span class="kernel-download-loader__text">{{ downloadProgressText }}</span>
-                </span>
-              </template>
-              {{ t('kernelManager.download') }}
+              :prepend-icon="kernelDownloadTaskActive ? (kernelDownloadTaskApplying ? 'mdi-progress-wrench' : 'mdi-stop') : 'mdi-download'"
+              :disabled="kernelDownloadTaskActive
+                ? kernelDownloadStopRequestPending || !downloadProgress.canCancel
+                : !canDownload"
+              @click="kernelDownloadTaskActive ? stopKernelDownload() : downloadPackages()">
+              {{ kernelDownloadButtonText }}
             </v-btn>
           </v-col>
           <v-col cols="12" md="4">
@@ -182,6 +173,29 @@
               @click="rebootHost">
               {{ t('kernelManager.reboot') }}
             </v-btn>
+          </v-col>
+        </v-row>
+
+        <v-row v-if="hasKernelDownloadProgress" class="mt-1">
+          <v-col cols="12">
+            <div class="kernel-download-progress" aria-live="polite">
+              <div class="d-flex align-center justify-space-between flex-wrap" style="gap: 8px;">
+                <span class="font-weight-medium kernel-download-progress__status">{{ kernelDownloadStatusText }}</span>
+                <span class="text-caption text-medium-emphasis">{{ downloadProgressText }}</span>
+              </div>
+              <v-progress-linear
+                class="mt-2"
+                :indeterminate="kernelDownloadTaskActive && downloadProgress.totalBytes <= 0"
+                :model-value="downloadProgress.percent"
+                :color="kernelDownloadProgressColor"
+                height="8"
+                rounded />
+              <div class="kernel-download-progress__detail text-caption text-medium-emphasis mt-2">
+                <span v-if="downloadProgress.currentPackage">{{ downloadProgress.currentPackage }}</span>
+                <span v-else-if="downloadProgress.error">{{ downloadProgress.error }}</span>
+                <span v-else-if="downloadProgress.phase">{{ downloadProgress.phase }}</span>
+              </div>
+            </div>
           </v-col>
         </v-row>
 
@@ -377,6 +391,11 @@ type KernelCleanupPackageItem = {
 type KernelDownloadProgress = {
   id: string
   status: string
+  state: string
+  phase: string
+  canCancel: boolean
+  stopRequested: boolean
+  deadlineExceeded: boolean
   percent: number
   approximate: boolean
   downloadedBytes: number
@@ -385,6 +404,10 @@ type KernelDownloadProgress = {
   downloadedCount: number
   totalCount: number
   error: string
+  startedAt: number
+  updatedAt: number
+  deadlineAt: number
+  finishedAt: number
 }
 
 type KernelSystemCleanupInfo = {
@@ -395,7 +418,7 @@ type KernelSystemCleanupInfo = {
 
 type KernelProvider = 'xanmod' | 'bbrplus'
 
-const kernelDownloadRequestTimeout = 11 * 60 * 1000
+const kernelDownloadRequestTimeout = 35 * 1000
 const kernelPackageOperationTimeout = 41 * 60 * 1000
 const kernelAutoCleanupRequestTimeout = 21 * 60 * 1000
 
@@ -417,7 +440,8 @@ const lineItems = [
 
 const loadingOverview = ref(false)
 const loadingPackages = ref(false)
-const downloading = ref(false)
+const downloadStartPending = ref(false)
+const kernelDownloadStopRequestPending = ref(false)
 const installing = ref(false)
 const rebooting = ref(false)
 const cleanupLoading = ref(false)
@@ -464,6 +488,11 @@ const cleanupHasScanned = ref(false)
 const downloadProgress = ref<KernelDownloadProgress>({
   id: '',
   status: 'missing',
+  state: 'idle',
+  phase: '',
+  canCancel: false,
+  stopRequested: false,
+  deadlineExceeded: false,
   percent: 0,
   approximate: false,
   downloadedBytes: 0,
@@ -472,6 +501,53 @@ const downloadProgress = ref<KernelDownloadProgress>({
   downloadedCount: 0,
   totalCount: 0,
   error: '',
+  startedAt: 0,
+  updatedAt: 0,
+  deadlineAt: 0,
+  finishedAt: 0,
+})
+
+const kernelDownloadTaskActive = computed(() => (
+  ['queued', 'running', 'stopping'].includes(downloadProgress.value.state)
+  || (downloadProgress.value.state === '' && downloadProgress.value.status === 'running')
+))
+const kernelDownloadTaskStopping = computed(() => (
+  kernelDownloadTaskActive.value
+  && (downloadProgress.value.stopRequested || downloadProgress.value.state === 'stopping')
+))
+const kernelDownloadTaskApplying = computed(() => (
+  kernelDownloadTaskActive.value
+  && !kernelDownloadTaskStopping.value
+  && downloadProgress.value.canCancel === false
+))
+const downloading = computed(() => downloadStartPending.value || kernelDownloadTaskActive.value)
+const hasKernelDownloadProgress = computed(() => (
+  downloadStartPending.value
+  || (downloadProgress.value.id !== '' && downloadProgress.value.status !== 'missing')
+))
+const kernelDownloadButtonText = computed(() => {
+  if (downloadStartPending.value) return '正在提交'
+  if (kernelDownloadStopRequestPending.value || kernelDownloadTaskStopping.value) return '正在停止'
+  if (kernelDownloadTaskActive.value) return downloadProgress.value.canCancel ? '停止' : '正在应用'
+  return t('kernelManager.download')
+})
+const kernelDownloadProgressColor = computed(() => {
+  if (downloadProgress.value.state === 'success' || downloadProgress.value.status === 'success') return 'success'
+  if (['error', 'cancelled', 'timed_out'].includes(downloadProgress.value.state) || downloadProgress.value.status === 'error') return 'error'
+  return 'primary'
+})
+const kernelDownloadStatusText = computed(() => {
+  const state = downloadProgress.value.state
+  const phase = downloadProgress.value.phase
+  if (downloadStartPending.value) return '正在提交内核下载任务'
+  if (kernelDownloadTaskStopping.value) return '正在停止内核下载任务'
+  if (kernelDownloadTaskApplying.value) return phase ? `正在应用：${phase}` : '正在应用内核下载结果'
+  if (kernelDownloadTaskActive.value) return phase ? `正在下载：${phase}` : '正在下载内核包'
+  if (state === 'success' || downloadProgress.value.status === 'success') return '内核包下载完成'
+  if (state === 'cancelled') return '内核包下载已停止，临时文件已清理'
+  if (state === 'timed_out') return '内核包下载超时，临时文件已清理'
+  if (state === 'error' || downloadProgress.value.status === 'error') return '内核包下载失败'
+  return phase || '内核下载状态'
 })
 
 const feedback = ref<{ type: 'success' | 'warning' | 'error' | 'info'; message: string }>({
@@ -669,6 +745,11 @@ const formatMiB = (value: number) => {
 const normalizeKernelDownloadProgress = (raw: any): KernelDownloadProgress => ({
   id: String(raw?.id ?? '').trim(),
   status: String(raw?.status ?? '').trim().toLowerCase() || 'missing',
+  state: String(raw?.state ?? '').trim().toLowerCase() || 'idle',
+  phase: String(raw?.phase ?? '').trim(),
+  canCancel: raw?.canCancel === true,
+  stopRequested: raw?.stopRequested === true,
+  deadlineExceeded: raw?.deadlineExceeded === true,
   percent: Number.isFinite(Number(raw?.percent)) ? Number(raw.percent) : 0,
   approximate: raw?.approximate === true,
   downloadedBytes: Number.isFinite(Number(raw?.downloadedBytes)) ? Math.max(0, Number(raw.downloadedBytes)) : 0,
@@ -677,12 +758,21 @@ const normalizeKernelDownloadProgress = (raw: any): KernelDownloadProgress => ({
   downloadedCount: Number.isFinite(Number(raw?.downloadedCount)) ? Math.max(0, Number(raw.downloadedCount)) : 0,
   totalCount: Number.isFinite(Number(raw?.totalCount)) ? Math.max(0, Number(raw.totalCount)) : 0,
   error: String(raw?.error ?? '').trim(),
+  startedAt: Number(raw?.startedAt) || 0,
+  updatedAt: Number(raw?.updatedAt) || 0,
+  deadlineAt: Number(raw?.deadlineAt) || 0,
+  finishedAt: Number(raw?.finishedAt) || 0,
 })
 
 const resetDownloadProgress = () => {
   downloadProgress.value = {
     id: '',
     status: 'missing',
+    state: 'idle',
+    phase: '',
+    canCancel: false,
+    stopRequested: false,
+    deadlineExceeded: false,
     percent: 0,
     approximate: false,
     downloadedBytes: 0,
@@ -691,6 +781,10 @@ const resetDownloadProgress = () => {
     downloadedCount: 0,
     totalCount: 0,
     error: '',
+    startedAt: 0,
+    updatedAt: 0,
+    deadlineAt: 0,
+    finishedAt: 0,
   }
 }
 
@@ -1045,17 +1139,56 @@ const autoCleanupKernelPackages = async () => {
   }
 }
 
-const makeDownloadSessionId = () => {
-  const randomPart = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-    ? crypto.randomUUID()
-    : `${Date.now()}-${Math.random().toString(16).slice(2)}`
-  return `kernel-download-${randomPart}`
-}
-
 const stopDownloadProgressPolling = () => {
   if (downloadProgressTimerId.value != null) {
     window.clearInterval(downloadProgressTimerId.value)
     downloadProgressTimerId.value = null
+  }
+}
+
+const isTerminalKernelDownload = (progress: KernelDownloadProgress) => (
+  ['success', 'error', 'cancelled', 'timed_out'].includes(progress.state)
+  || ['success', 'error'].includes(progress.status)
+  || (progress.id !== '' && progress.status === 'missing')
+)
+
+let completedKernelDownloadTaskID = ''
+
+const completeKernelDownloadTask = async (progress: KernelDownloadProgress) => {
+  if (!progress.id || completedKernelDownloadTaskID === progress.id) return
+  completedKernelDownloadTaskID = progress.id
+  kernelDownloadStopRequestPending.value = false
+  if (progress.state === 'success' || progress.status === 'success') {
+    const count = Math.max(0, progress.downloadedCount)
+    setFeedback('success', t('kernelManager.downloadDone', { count }))
+    await Promise.all([
+      loadRuntimeOverview(),
+      loadOverview(),
+    ])
+    return
+  }
+  if (progress.state === 'cancelled') {
+    setFeedback('info', '内核包下载已停止，未完成的临时文件已清理')
+    return
+  }
+  if (progress.state === 'timed_out') {
+    setFeedback('warning', '内核包下载超过 20 分钟，已停止并清理临时文件')
+    return
+  }
+  if (progress.error) {
+    setFeedback('error', progress.error)
+  }
+}
+
+const applyKernelDownloadProgress = (raw: any) => {
+  const nextProgress = normalizeKernelDownloadProgress(raw)
+  downloadProgress.value = nextProgress
+  if (nextProgress.id !== '') {
+    downloadProgressSessionId.value = nextProgress.id
+  }
+  if (isTerminalKernelDownload(nextProgress)) {
+    stopDownloadProgressPolling()
+    void completeKernelDownloadTask(nextProgress)
   }
 }
 
@@ -1066,14 +1199,7 @@ const pollDownloadProgress = async (): Promise<void> => {
   const request = (async () => {
     const msg = await HttpUtils.get('api/kernel-download-progress', { id: sessionId }, { silentAuthCheck: true })
     if (!msg.success || sessionId !== downloadProgressSessionId.value.trim()) return
-    const nextProgress = normalizeKernelDownloadProgress(msg.obj)
-    if (nextProgress.status === 'missing' && downloading.value) {
-      return
-    }
-    downloadProgress.value = nextProgress
-    if (downloadProgress.value.status === 'success' || downloadProgress.value.status === 'error' || downloadProgress.value.status === 'missing') {
-      stopDownloadProgressPolling()
-    }
+    applyKernelDownloadProgress(msg.obj)
   })()
   downloadProgressRequest = request
   try {
@@ -1088,24 +1214,35 @@ const pollDownloadProgress = async (): Promise<void> => {
 const startDownloadProgressPolling = (sessionId: string) => {
   stopDownloadProgressPolling()
   downloadProgressSessionId.value = sessionId.trim()
-  if (!downloadProgressSessionId.value) return
+  if (!downloadProgressSessionId.value || !props.active || (typeof document !== 'undefined' && document.visibilityState !== 'visible')) return
   downloadProgressTimerId.value = window.setInterval(() => {
     void pollDownloadProgress()
   }, 800)
   void pollDownloadProgress()
 }
 
+const recoverKernelDownloadTask = async (): Promise<boolean> => {
+  const msg = await HttpUtils.get('api/kernel-download-progress', {}, { silentAuthCheck: true })
+  if (!msg.success || !msg.obj) return false
+  const nextProgress = normalizeKernelDownloadProgress(msg.obj)
+  if (nextProgress.id === '' || nextProgress.state === 'idle' || nextProgress.status === 'missing') return false
+  applyKernelDownloadProgress(nextProgress)
+  if (kernelDownloadTaskActive.value) {
+    startDownloadProgressPolling(nextProgress.id)
+  }
+  return true
+}
+
 const handleVisibilityChange = () => {
   if (document.visibilityState === 'visible') {
-    if (downloadProgressSessionId.value) {
-      startDownloadProgressPolling(downloadProgressSessionId.value)
-    }
+    if (!props.active) return
+    void recoverKernelDownloadTask()
     return
   }
   stopDownloadProgressPolling()
 }
 
-const buildSelectionFormData = (downloadSessionId = '') => {
+const buildSelectionFormData = () => {
   const formData = new FormData()
   if (selectedProvider.value) {
     formData.append('provider', selectedProvider.value)
@@ -1115,14 +1252,11 @@ const buildSelectionFormData = (downloadSessionId = '') => {
     formData.append('arch', selectedArch.value)
   }
   formData.append('version', selectedVersion.value)
-  if (downloadSessionId.trim()) {
-    formData.append('downloadSessionId', downloadSessionId.trim())
-  }
   return formData
 }
 
 const downloadPackages = async () => {
-  if (!canDownload.value) return
+  if (!canDownload.value || kernelDownloadTaskActive.value || downloadStartPending.value) return
   const confirmed = await confirm({
     message: t('kernelManager.downloadConfirm'),
     severity: 'info',
@@ -1130,34 +1264,54 @@ const downloadPackages = async () => {
   })
   if (!confirmed || !canDownload.value) return
   clearFeedback()
-  const sessionId = makeDownloadSessionId()
   resetDownloadProgress()
-  downloadProgress.value.id = sessionId
-  downloadProgress.value.status = 'running'
-  downloadProgressSessionId.value = sessionId
-  downloading.value = true
-  startDownloadProgressPolling(sessionId)
+  completedKernelDownloadTaskID = ''
+  downloadStartPending.value = true
   try {
-    const msg = await HttpUtils.post('api/kernel-download', buildSelectionFormData(sessionId), { timeout: kernelDownloadRequestTimeout })
-    if (msg.success && msg.obj?.sessionId) {
-      const normalizedSessionId = String(msg.obj.sessionId).trim()
-      if (normalizedSessionId && normalizedSessionId !== downloadProgressSessionId.value) {
-        startDownloadProgressPolling(normalizedSessionId)
+    const msg = await HttpUtils.post('api/kernel-download', buildSelectionFormData(), { timeout: kernelDownloadRequestTimeout })
+    if (msg.success && msg.obj) {
+      applyKernelDownloadProgress(msg.obj)
+      if (downloadProgress.value.id) {
+        startDownloadProgressPolling(downloadProgress.value.id)
       }
+      return
     }
-    await pollDownloadProgress()
-    if (msg.success) {
-      const count = Array.isArray(msg.obj?.downloaded) ? msg.obj.downloaded.length : 0
-      downloadDirectory.value = String(msg.obj?.directory ?? downloadDirectory.value)
-      await loadRuntimeOverview()
-      await loadOverview()
-      setFeedback('success', t('kernelManager.downloadDone', { count }))
-    } else {
+    const recovered = await recoverKernelDownloadTask()
+    if (!recovered) {
       setFeedback('error', String(msg.msg || t('kernelManager.downloadFailed')))
     }
+  } catch (error: any) {
+    const recovered = await recoverKernelDownloadTask()
+    if (!recovered) {
+      setFeedback('error', String(error?.message || t('kernelManager.downloadFailed')))
+    }
   } finally {
-    stopDownloadProgressPolling()
-    downloading.value = false
+    downloadStartPending.value = false
+  }
+}
+
+const stopKernelDownload = async () => {
+  const id = downloadProgress.value.id.trim()
+  if (!id || !downloadProgress.value.canCancel || kernelDownloadStopRequestPending.value) return
+  kernelDownloadStopRequestPending.value = true
+  downloadProgress.value = {
+    ...downloadProgress.value,
+    state: 'stopping',
+    phase: 'stopping',
+    canCancel: false,
+    stopRequested: true,
+  }
+  try {
+    const msg = await HttpUtils.post('api/kernel-download-stop', { id }, { silentAuthCheck: true })
+    if (msg.success && msg.obj) {
+      applyKernelDownloadProgress(msg.obj)
+    }
+  } catch {
+    // 状态轮询会确认已经受理但响应丢失的停止请求。
+  } finally {
+    if (kernelDownloadTaskActive.value) {
+      startDownloadProgressPolling(id)
+    }
   }
 }
 
@@ -1359,6 +1513,17 @@ onMounted(() => {
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', handleVisibilityChange)
   }
+  if (props.active) {
+    void recoverKernelDownloadTask()
+  }
+})
+
+watch(() => props.active, (active) => {
+  if (active) {
+    void recoverKernelDownloadTask()
+    return
+  }
+  stopDownloadProgressPolling()
 })
 
 onBeforeUnmount(() => {
@@ -1488,20 +1653,20 @@ onBeforeUnmount(() => {
   color: #fff !important;
 }
 
-.kernel-download-loader {
-  display: inline-flex;
+.kernel-download-progress {
   width: 100%;
   min-width: 0;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
+  padding: 12px;
+  border: 1px solid rgba(59, 130, 246, 0.26);
+  border-radius: 6px;
 }
 
-.kernel-download-loader__text {
-  min-width: 0;
-  white-space: nowrap;
-  font-size: 12px;
-  letter-spacing: 0.1px;
-  color: #fff;
+.kernel-download-progress__status,
+.kernel-download-progress__detail {
+  overflow-wrap: anywhere;
+}
+
+.kernel-download-progress__detail {
+  min-height: 18px;
 }
 </style>
