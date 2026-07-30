@@ -712,6 +712,9 @@ func (s *SettingService) GetAllSetting() (*map[string]string, error) {
 		return nil, err
 	}
 	allSetting["timeLocation"] = timeLocation
+	if err := s.ensureSubscriptionInitialState(); err != nil {
+		return nil, err
+	}
 
 	// Due to security principles
 	delete(allSetting, "secret")

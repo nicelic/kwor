@@ -13,6 +13,20 @@ type SettingsState struct {
 	Revision uint64 `json:"revision" gorm:"not null;default:1"`
 }
 
+// SubscriptionInitialState keeps the immutable subscription-page values from
+// the first installation. It is separate from Settings so normal edits never
+// replace the reset baseline.
+type SubscriptionInitialState struct {
+	Id                    uint   `json:"id" gorm:"primaryKey;autoIncrement:false"`
+	JSONExtension         string `json:"jsonExtension" gorm:"type:text;not null"`
+	ClashExtension        string `json:"clashExtension" gorm:"type:text;not null"`
+	ServerTLSStoreEnabled string `json:"serverTlsStoreEnabled" gorm:"not null"`
+	ServerTLSStore        string `json:"serverTlsStore" gorm:"not null"`
+	ClientTLSStoreEnabled string `json:"clientTlsStoreEnabled" gorm:"not null"`
+	ClientTLSStore        string `json:"clientTlsStore" gorm:"not null"`
+	BaselineVersion       uint   `json:"baselineVersion" gorm:"not null;default:1"`
+}
+
 type Tls struct {
 	Id                  uint            `json:"id" form:"id" gorm:"primaryKey;autoIncrement"`
 	Name                string          `json:"name" form:"name"`

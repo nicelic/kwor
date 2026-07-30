@@ -1208,13 +1208,33 @@ function normalizeSubJsonClashApiDetour(parsed: any) {
 export const SubJsonExtMixin = {
   created(this: any) {
 	this._probeAbortController = new AbortController()
+    this._dirtyTrackingBaseline = null
+    this._dirtyTrackingReady = false
+    this._dirtyTrackingPending = false
+    this._dirtyTrackingTimer = null
+    this._dirtyTrackingPreserveInitial = this._dirty === true
     this.captureRuleRowsValidationSnapshot(this.ruleRows)
+  },
+  mounted(this: any) {
+    this.$nextTick(() => {
+      this._dirtyTrackingReady = true
+      this.refreshDirtyTrackingBaseline()
+    })
   },
   beforeUnmount(this: any) {
 	this.autoMatchRunToken = (this.autoMatchRunToken || 0) + 1
 	this._probeAbortController?.abort()
+    if (this._dirtyTrackingTimer != null && typeof window !== 'undefined') {
+      window.clearTimeout(this._dirtyTrackingTimer)
+    }
   },
   watch: {
+    subJsonExt: {
+      handler(this: any) {
+        this.refreshDirtyTrackingBaseline()
+      },
+      deep: true,
+    },
     'settings.subJsonExt': {
       handler(this: any, v: string) {
 		const raw = typeof v === 'string' ? v : ''
@@ -1361,6 +1381,53 @@ export const SubJsonExtMixin = {
 
   },
   methods: {
+	getDirtyTrackingSnapshot(this: any): string {
+	  try {
+		return JSON.stringify(this.subJsonExt || {})
+	  } catch {
+		return ''
+	  }
+	},
+	refreshDirtyTrackingBaseline(this: any) {
+	  if (!this._dirtyTrackingReady || this._dirtyTrackingPending || this._dirty === true || this._resetRequested === true || this._dirtyTrackingPreserveInitial) return
+	  this._dirtyTrackingBaseline = this.getDirtyTrackingSnapshot()
+	},
+	syncDirtyStateFromUi(this: any) {
+	  if (!this._dirtyTrackingReady || this._resetRequested === true || this._dirtyTrackingPreserveInitial) return
+	  const snapshot = this.getDirtyTrackingSnapshot()
+	  if (this._dirtyTrackingBaseline == null) {
+		this._dirtyTrackingBaseline = snapshot
+		return
+	  }
+	  const dirty = snapshot !== this._dirtyTrackingBaseline
+	  if (this._dirty === dirty) return
+	  this._dirty = dirty
+	  this.$emit?.('dirty-change', dirty)
+	},
+	scheduleDirtyStateCheck(this: any) {
+	  if (!this._dirtyTrackingReady) return
+	  this._dirtyTrackingPending = true
+	  const complete = () => {
+		this._dirtyTrackingTimer = null
+		this.$nextTick(() => {
+		  this._dirtyTrackingPending = false
+		  this.syncDirtyStateFromUi()
+		})
+	  }
+	  if (this._dirtyTrackingTimer != null && typeof window !== 'undefined') {
+		window.clearTimeout(this._dirtyTrackingTimer)
+	  }
+	  if (typeof window === 'undefined') {
+		complete()
+		return
+	  }
+	  this._dirtyTrackingTimer = window.setTimeout(complete, 0)
+	},
+	onFormValueChange(this: any) {
+	  this._resetRequested = false
+	  this._editorSourcePending = false
+	  this.scheduleDirtyStateCheck()
+	},
 	markUserDirty(this: any) {
 	  const wasDirty = this._dirty === true
 	  this._dirty = true
@@ -1546,15 +1613,9 @@ export const SubJsonExtMixin = {
         }
       }
 
-	  let canonical: any = {}
-	  try {
-		canonical = JSON.parse(String(this.canonicalDefault || '{}'))
-	  } catch {
-		canonical = {}
-	  }
-	  this.subJsonExt = canonical
-	  this.settings.subJsonExt = String(this.canonicalDefault || '')
-	  this._rawSource = this.settings.subJsonExt
+	  this.subJsonExt = {}
+	  this.settings.subJsonExt = ''
+	  this._rawSource = ''
 	  this._parseError = ''
 	  this._dirty = true
 	  this._resetRequested = true
@@ -1585,7 +1646,6 @@ export const SubJsonExtMixin = {
         normalizeSubJsonDns(result)
 		normalizeDefaultDomainResolver(result)
 		normalizeTunPlatform(result)
-		this.markUserDirty()
 		this._parseError = ''
 		this._resetRequested = false
 		this._editorSourcePending = true
@@ -1599,6 +1659,7 @@ export const SubJsonExtMixin = {
 		this._rawSource = normalized
 		this.settings.subJsonExt = normalized
         this.enableEditor = false
+		this.scheduleDirtyStateCheck()
       } catch (e) {
         push.warning({
           title: i18n.global.t('error'),

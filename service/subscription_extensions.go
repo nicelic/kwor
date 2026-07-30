@@ -72,6 +72,19 @@ dns:
     - "*.lan"
     - localhost
     - "*.local"
+sniffer:
+  enable: true
+  sniff:
+    HTTP:
+      ports:
+        - 1-65535
+    TLS:
+      ports:
+        - 1-65535
+    QUIC:
+      ports:
+        - 1-65535
+  override-destination: true
 rules:
   - GEOIP,Private,DIRECT
   - MATCH,节点选择
@@ -99,7 +112,7 @@ const canonicalSubJSONExtension = `{
       "users": []
     }
   ],
-  "route_final": "漏网之鱼",
+  "route_final": "节点选择",
   "latency_test_url": "http://www.gstatic.com/generate_204",
   "latency_test_interval": "10m",
   "latency_tolerance": 50,
@@ -107,9 +120,9 @@ const canonicalSubJSONExtension = `{
     "ruleSetSource": "karingx_github",
     "ruleRows": [],
     "dnsRouteRows": [],
-    "updateMethod": "全球直连",
+    "updateMethod": "节点选择",
     "updateInterval": "1d",
-    "routeFinal": "漏网之鱼",
+    "routeFinal": "节点选择",
     "latencyTestUrl": "http://www.gstatic.com/generate_204",
     "latencyTestInterval": "10m",
     "latencyTolerance": "50",
@@ -125,13 +138,15 @@ const canonicalSubClashExtension = SubscriptionClashBaseConfig + `_uiConfig:
   clashRuleRows: []
   clashDnsPolicyRows: []
   clashDnsSuffixRows: []
-  updateMethod: 全球直连
+  noResolveGlobal: true
+  updateMethod: 节点选择
   updateInterval: 1d
   routeFinal: 节点选择
   latencyTestUrl: http://www.gstatic.com/generate_204
   latencyTestInterval: 180s
   latencyTolerance: "50"
-  enableSniff: false
+  enableSniff: true
+  snifferOverrideDestination: true
   enableRejectQuic: false
   rejectUdpPortsInput: ""
 `

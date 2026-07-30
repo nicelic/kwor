@@ -24,7 +24,7 @@ func TestCanonicalSubscriptionExtensionDefaults(t *testing.T) {
 		t.Fatalf("canonical JSON inbound types = %#v", inbounds)
 	}
 	jsonUI := jsonExtension["_uiConfig"].(map[string]interface{})
-	if jsonUI["enableSniff"] != false || jsonUI["enableHijackDns"] != false || jsonUI["latencyTestInterval"] != "10m" {
+	if jsonExtension["route_final"] != "节点选择" || jsonUI["updateMethod"] != "节点选择" || jsonUI["routeFinal"] != "节点选择" || jsonUI["enableSniff"] != false || jsonUI["enableHijackDns"] != false || jsonUI["latencyTestInterval"] != "10m" {
 		t.Fatalf("canonical JSON UI defaults = %#v", jsonUI)
 	}
 	if value, ok := toInt(json.Number("73")); !ok || value != 73 {
@@ -41,11 +41,12 @@ func TestCanonicalSubscriptionExtensionDefaults(t *testing.T) {
 	if tun["enable"] != true || dns["enable"] != true {
 		t.Fatalf("canonical Clash TUN/DNS defaults: tun=%#v dns=%#v", tun, dns)
 	}
-	if clashUI["enableSniff"] != false || clashUI["latencyTestInterval"] != "180s" {
+	if clashUI["noResolveGlobal"] != true || clashUI["updateMethod"] != "节点选择" || clashUI["routeFinal"] != "节点选择" || clashUI["enableSniff"] != true || clashUI["snifferOverrideDestination"] != true || clashUI["latencyTestInterval"] != "180s" {
 		t.Fatalf("canonical Clash UI defaults = %#v", clashUI)
 	}
-	if _, exists := clashExtension["sniffer"]; exists {
-		t.Fatalf("canonical Clash extension unexpectedly emits sniffer: %#v", clashExtension["sniffer"])
+	sniffer, ok := clashExtension["sniffer"].(map[string]interface{})
+	if !ok || sniffer["enable"] != true || sniffer["override-destination"] != true {
+		t.Fatalf("canonical Clash sniffer defaults = %#v", clashExtension["sniffer"])
 	}
 }
 

@@ -8,46 +8,46 @@
     @close="enableEditor = false"
     @save="saveEditor"
     />
-	<v-card @input.capture="markUserDirty" @change.capture="markUserDirty">
+	<v-card @input.capture="onFormValueChange" @change.capture="onFormValueChange">
 	  <v-alert v-if="parseError" type="error" variant="tonal" density="compact" class="mb-4">
 	    {{ parseError }}
 	  </v-alert>
     <!-- Basic settings: mixed port, LAN access, external controller, log level -->
     <v-row>
       <v-col cols="12" sm="6" md="3" lg="2">
-        <v-text-field type="number" v-model.number="mixedPort" min="1" max="65535" :label="$t('setting.mixedPort')" hide-details></v-text-field>
+        <v-text-field type="number" v-model.number="mixedPort" min="1" max="65535" :label="$t('setting.mixedPort')" hide-details @update:model-value="onFormValueChange"></v-text-field>
       </v-col>
       <v-col cols="12" sm="6" md="3" lg="2">
-        <v-switch color="primary" v-model="allowLan" :label="$t('types.ts.allowLanAccess')" hide-details />
+        <v-switch color="primary" v-model="allowLan" :label="$t('types.ts.allowLanAccess')" hide-details  @update:model-value="onFormValueChange"/>
       </v-col>
     </v-row>
     <v-row>
       <v-col cols="12" sm="6" md="3" lg="2">
-        <v-text-field v-model="externalController" :label="$t('basic.exp.extController')" hide-details></v-text-field>
+        <v-text-field v-model="externalController" :label="$t('basic.exp.extController')" hide-details @update:model-value="onFormValueChange"></v-text-field>
       </v-col>
       <v-col cols="12" sm="6" md="3" lg="2">
-        <v-select v-model="logLevel" :items="clashLogLevels" :label="$t('basic.log.title') + ' - ' + $t('basic.log.level')" hide-details></v-select>
+        <v-select v-model="logLevel" :items="clashLogLevels" :label="$t('basic.log.title') + ' - ' + $t('basic.log.level')" hide-details @update:model-value="onFormValueChange"></v-select>
       </v-col>
     </v-row>
 
     <!-- mihomo-specific settings -->
     <v-row>
       <v-col cols="12" sm="4" md="2" lg="2">
-		<v-switch v-model="unifiedDelay" color="primary" :label="$t('subscriptionEditor.unifiedDelay')" hide-details />
+		<v-switch v-model="unifiedDelay" color="primary" :label="$t('subscriptionEditor.unifiedDelay')" hide-details  @update:model-value="onFormValueChange"/>
       </v-col>
       <v-col cols="12" sm="4" md="2" lg="2">
-		<v-switch v-model="tcpConcurrent" color="primary" :label="$t('subscriptionEditor.tcpConcurrent')" hide-details />
+		<v-switch v-model="tcpConcurrent" color="primary" :label="$t('subscriptionEditor.tcpConcurrent')" hide-details  @update:model-value="onFormValueChange"/>
       </v-col>
       <v-col cols="12" sm="4" md="3" lg="2">
-		<v-select v-model="findProcessMode" :items="findProcessModeOptions" :label="$t('subscriptionEditor.processMatchMode')" hide-details></v-select>
+		<v-select v-model="findProcessMode" :items="findProcessModeOptions" :label="$t('subscriptionEditor.processMatchMode')" hide-details @update:model-value="onFormValueChange"></v-select>
       </v-col>
     </v-row>
     <v-row>
       <v-col cols="12" sm="4" md="2" lg="2">
-		<v-switch v-model="storeSelected" color="primary" :label="$t('subscriptionEditor.storeSelected')" hide-details />
+		<v-switch v-model="storeSelected" color="primary" :label="$t('subscriptionEditor.storeSelected')" hide-details  @update:model-value="onFormValueChange"/>
       </v-col>
       <v-col cols="12" sm="4" md="2" lg="2">
-		<v-switch v-model="storeFakeIp" color="primary" :label="$t('subscriptionEditor.storeFakeIp')" hide-details />
+		<v-switch v-model="storeFakeIp" color="primary" :label="$t('subscriptionEditor.storeFakeIp')" hide-details  @update:model-value="onFormValueChange"/>
       </v-col>
       <v-col cols="12" sm="4" md="2" lg="2" v-if="dnsEnabled && dnsEnhancedMode === 'fake-ip'">
         <v-text-field
@@ -55,28 +55,28 @@
           :label="$t('subscriptionEditor.fakeIpTtlLabel')"
           :placeholder="$t('subscriptionEditor.fakeIpTtlPlaceholder')"
           hide-details
-        ></v-text-field>
+         @update:model-value="onFormValueChange"></v-text-field>
       </v-col>
     </v-row>
 
     <!-- TUN settings -->
     <v-row>
       <v-col cols="12" sm="4" md="2" lg="2">
-        <v-switch v-model="tunEnabled" color="primary" :label="$t('setting.tun')" hide-details />
+        <v-switch v-model="tunEnabled" color="primary" :label="$t('setting.tun')" hide-details  @update:model-value="onFormValueChange"/>
       </v-col>
       <v-col cols="12" sm="4" md="2" lg="2" v-if="tunEnabled">
-		<v-switch v-model="tunAutoRoute" color="primary" :label="$t('subscriptionEditor.autoRoute')" hide-details />
+		<v-switch v-model="tunAutoRoute" color="primary" :label="$t('subscriptionEditor.autoRoute')" hide-details  @update:model-value="onFormValueChange"/>
       </v-col>
       <v-col cols="12" sm="4" md="2" lg="2" v-if="tunEnabled && tunAutoRoute">
-		<v-switch v-model="tunStrictRoute" color="primary" :label="$t('subscriptionEditor.strictRoute')" hide-details />
+		<v-switch v-model="tunStrictRoute" color="primary" :label="$t('subscriptionEditor.strictRoute')" hide-details  @update:model-value="onFormValueChange"/>
       </v-col>
     </v-row>
     <v-row v-if="tunEnabled">
       <v-col cols="12" sm="6" md="3" lg="2">
-		<v-select v-model="tunStack" :items="tunStackOptions" :label="$t('subscriptionEditor.tunMode')" hide-details></v-select>
+		<v-select v-model="tunStack" :items="tunStackOptions" :label="$t('subscriptionEditor.tunMode')" hide-details @update:model-value="onFormValueChange"></v-select>
       </v-col>
       <v-col cols="12" sm="6" md="3" lg="2">
-        <v-text-field type="number" v-model.number="tunMtu" hide-details label="MTU"></v-text-field>
+        <v-text-field type="number" v-model.number="tunMtu" hide-details label="MTU" @update:model-value="onFormValueChange"></v-text-field>
       </v-col>
     </v-row>
     <v-row v-if="tunEnabled">
@@ -86,7 +86,7 @@
           :items="optionalBoolOptions"
 		  :label="$t('subscriptionEditor.autoDetectInterface')"
           hide-details
-        ></v-select>
+         @update:model-value="onFormValueChange"></v-select>
       </v-col>
     </v-row>
     <v-row v-if="tunEnabled">
@@ -96,7 +96,7 @@
           :items="optionalBoolOptions"
 		  :label="$t('subscriptionEditor.recvmsgx')"
           hide-details
-        ></v-select>
+         @update:model-value="onFormValueChange"></v-select>
       </v-col>
     </v-row>
     <v-row v-if="tunEnabled">
@@ -106,7 +106,7 @@
           :items="optionalBoolOptions"
 		  :label="$t('subscriptionEditor.sendmsgx')"
           hide-details
-        ></v-select>
+         @update:model-value="onFormValueChange"></v-select>
       </v-col>
     </v-row>
     <v-row v-if="tunEnabled">
@@ -121,7 +121,7 @@
           clearable
           hide-details
           placeholder="198.18.0.1/30"
-        ></v-combobox>
+         @update:model-value="onFormValueChange"></v-combobox>
       </v-col>
       <v-col cols="12" sm="6" md="4" lg="3">
         <v-combobox
@@ -134,7 +134,7 @@
           clearable
           hide-details
           placeholder="fdfe:dcba:9876::1/126"
-        ></v-combobox>
+         @update:model-value="onFormValueChange"></v-combobox>
       </v-col>
     </v-row>
     <v-row>
@@ -144,26 +144,26 @@
           :items="optionalBoolOptions"
 		  :label="$t('subscriptionEditor.globalIpv6')"
           hide-details
-        ></v-select>
+         @update:model-value="onFormValueChange"></v-select>
       </v-col>
     </v-row>
 
     <!-- DNS settings -->
     <v-row>
       <v-col cols="12" sm="4" md="2" lg="2">
-        <v-switch v-model="dnsEnabled" color="primary" :label="$t('pages.dns')" hide-details />
+        <v-switch v-model="dnsEnabled" color="primary" :label="$t('pages.dns')" hide-details  @update:model-value="onFormValueChange"/>
       </v-col>
       <v-col cols="12" sm="4" md="2" lg="2" v-if="dnsEnabled">
-        <v-switch v-model="dnsIpv6" color="primary" label="DNS_IPv6" hide-details />
+        <v-switch v-model="dnsIpv6" color="primary" label="DNS_IPv6" hide-details  @update:model-value="onFormValueChange"/>
       </v-col>
       <v-col cols="12" sm="4" md="2" lg="2" v-if="dnsEnabled">
-        <v-switch v-model="dnsPreferH3" color="primary" label="prefer-h3" hide-details />
+        <v-switch v-model="dnsPreferH3" color="primary" label="prefer-h3" hide-details  @update:model-value="onFormValueChange"/>
       </v-col>
     </v-row>
     <template v-if="dnsEnabled">
       <v-row>
         <v-col cols="12" sm="6" md="3" lg="2">
-		  <v-select v-model="dnsEnhancedMode" :items="enhancedModeOptions" :label="$t('subscriptionEditor.enhancedMode')" hide-details></v-select>
+		  <v-select v-model="dnsEnhancedMode" :items="enhancedModeOptions" :label="$t('subscriptionEditor.enhancedMode')" hide-details @update:model-value="onFormValueChange"></v-select>
         </v-col>
         <v-col cols="12" sm="6" md="3" lg="2" v-if="dnsEnhancedMode === 'fake-ip'">
           <v-combobox
@@ -173,7 +173,7 @@
             clearable
             hide-details
             placeholder="198.18.0.1/15"
-          ></v-combobox>
+           @update:model-value="onFormValueChange"></v-combobox>
         </v-col>
         <v-col cols="12" sm="6" md="3" lg="2" v-if="dnsEnhancedMode === 'fake-ip'">
           <v-combobox
@@ -183,7 +183,7 @@
             clearable
             hide-details
             placeholder="fc00::/18"
-          ></v-combobox>
+           @update:model-value="onFormValueChange"></v-combobox>
         </v-col>
         <v-col cols="12" sm="6" md="3" lg="2" v-if="dnsEnhancedMode === 'fake-ip' && dnsIpv6">
           <v-text-field
@@ -193,36 +193,36 @@
             label="ipv6-timeout"
             placeholder="100"
             hide-details
-          ></v-text-field>
+           @update:model-value="onFormValueChange"></v-text-field>
         </v-col>
       </v-row>
       <v-row>
         <v-col cols="12" sm="6" md="4">
-          <v-combobox v-model="dnsDirectNameserver" :items="clashDirectNameserverOptions" label="(direct-nameserver)" multiple chips closable-chips hide-details></v-combobox>
+          <v-combobox v-model="dnsDirectNameserver" :items="clashDirectNameserverOptions" label="(direct-nameserver)" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>
         </v-col>
         <v-col cols="12" sm="6" md="4" v-if="dnsDirectNameserver.length > 0">
-          <v-switch v-model="dnsDirectNameserverFollowPolicy" color="primary" label="direct-nameserver-follow-policy" hide-details />
+          <v-switch v-model="dnsDirectNameserverFollowPolicy" color="primary" label="direct-nameserver-follow-policy" hide-details  @update:model-value="onFormValueChange"/>
         </v-col>
       </v-row>
       <v-row>
         <v-col cols="12" sm="6" md="4">
-          <v-combobox v-model="dnsProxyServerNameserver" :items="clashProxyServerNameserverOptions" label="(proxy-server-nameserver)" multiple chips closable-chips hide-details></v-combobox>
+          <v-combobox v-model="dnsProxyServerNameserver" :items="clashProxyServerNameserverOptions" label="(proxy-server-nameserver)" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>
         </v-col>
       </v-row>
       <v-row>
         <v-col cols="12" sm="6" md="4">
-          <v-combobox v-model="dnsNameserver" :items="clashNameserverOptions" label="(nameserver)" multiple chips closable-chips hide-details></v-combobox>
+          <v-combobox v-model="dnsNameserver" :items="clashNameserverOptions" label="(nameserver)" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>
         </v-col>
         <v-col cols="12" sm="6" md="4">
-          <v-combobox v-model="dnsFallback" :items="clashFallbackOptions" label="(fallback)" multiple chips closable-chips hide-details></v-combobox>
+          <v-combobox v-model="dnsFallback" :items="clashFallbackOptions" label="(fallback)" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>
         </v-col>
       </v-row>
       <v-row>
         <v-col cols="12" sm="6" md="4">
-          <v-combobox v-model="dnsDefaultNameserver" :items="clashDefaultNameserverOptions" label="(default-nameserver)" multiple chips closable-chips hide-details></v-combobox>
+          <v-combobox v-model="dnsDefaultNameserver" :items="clashDefaultNameserverOptions" label="(default-nameserver)" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>
         </v-col>
         <v-col cols="12" sm="6" md="4" v-if="dnsEnhancedMode === 'fake-ip'">
-		  <v-combobox v-model="dnsFakeIpFilter" :items="clashFakeIpFilterDefaults" :label="$t('subscriptionEditor.fakeIpFilter')" multiple chips closable-chips hide-details></v-combobox>
+		  <v-combobox v-model="dnsFakeIpFilter" :items="clashFakeIpFilterDefaults" :label="$t('subscriptionEditor.fakeIpFilter')" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>
         </v-col>
       </v-row>
       <v-row>
@@ -232,7 +232,7 @@
             :items="dnsGeoipBoolOptions"
             label="fallback-filter.geoip"
             hide-details
-          ></v-select>
+           @update:model-value="onFormValueChange"></v-select>
         </v-col>
         <v-col cols="12" sm="6" md="4">
           <v-combobox
@@ -241,7 +241,7 @@
             label="fallback-filter.geoip-code"
             hide-details
             clearable
-          ></v-combobox>
+           @update:model-value="onFormValueChange"></v-combobox>
         </v-col>
       </v-row>
       <v-row>
@@ -254,7 +254,7 @@
             chips
             closable-chips
             hide-details
-          ></v-combobox>
+           @update:model-value="onFormValueChange"></v-combobox>
         </v-col>
       </v-row>
       <v-row>
@@ -267,7 +267,7 @@
             chips
             closable-chips
             hide-details
-          ></v-combobox>
+           @update:model-value="onFormValueChange"></v-combobox>
         </v-col>
       </v-row>
       <v-row
@@ -285,7 +285,7 @@
             closable-chips
             clearable
             hide-details
-          ></v-select>
+           @update:model-value="onFormValueChange"></v-select>
         </v-col>
         <v-col cols="12" sm="6" md="4">
           <v-select
@@ -297,7 +297,7 @@
             closable-chips
             clearable
             hide-details
-          ></v-select>
+           @update:model-value="onFormValueChange"></v-select>
         </v-col>
 		<v-col cols="12" class="subscription-row-actions">
           <div class="d-flex align-center justify-end ga-1">
@@ -309,7 +309,7 @@
               size="small"
               variant="text"
               :disabled="dnsSuffixIdx === 0"
-			  @click="markUserDirty(); moveClashDnsSuffixRow(dnsSuffixIdx, -1)"
+			  @click="onFormValueChange(); moveClashDnsSuffixRow(dnsSuffixIdx, -1)"
             ></v-btn>
             <v-btn
               icon="mdi-arrow-down"
@@ -319,7 +319,7 @@
               size="small"
               variant="text"
               :disabled="dnsSuffixIdx >= clashDnsSuffixRows.length - 1"
-			  @click="markUserDirty(); moveClashDnsSuffixRow(dnsSuffixIdx, 1)"
+			  @click="onFormValueChange(); moveClashDnsSuffixRow(dnsSuffixIdx, 1)"
             ></v-btn>
             <v-btn
               icon="mdi-plus"
@@ -328,7 +328,7 @@
 			  :aria-label="$t('subscriptionEditor.add')"
               size="small"
               variant="text"
-			  @click="markUserDirty(); insertClashDnsSuffixRow(dnsSuffixIdx)"
+			  @click="onFormValueChange(); insertClashDnsSuffixRow(dnsSuffixIdx)"
             ></v-btn>
             <v-btn
               v-if="canDeleteClashDnsSuffixRow(dnsSuffixIdx)"
@@ -338,7 +338,7 @@
 			  :aria-label="$t('subscriptionEditor.remove')"
               size="small"
               variant="text"
-			  @click="markUserDirty(); removeClashDnsSuffixRow(dnsSuffixIdx)"
+			  @click="onFormValueChange(); removeClashDnsSuffixRow(dnsSuffixIdx)"
             ></v-btn>
           </div>
         </v-col>
@@ -354,7 +354,7 @@
             :items="clashDnsPolicyMatchTypeOptions"
 			:label="$t('subscriptionEditor.ruleKind')"
             hide-details
-          ></v-select>
+           @update:model-value="onFormValueChange"></v-select>
         </v-col>
         <v-col cols="12" sm="8" md="4">
           <v-combobox
@@ -366,7 +366,7 @@
             chips
             closable-chips
             hide-details
-          ></v-combobox>
+           @update:model-value="onFormValueChange"></v-combobox>
           <v-select
             v-else
             v-model="dnsPolicyRow.values"
@@ -376,7 +376,7 @@
             chips
             closable-chips
             hide-details
-          ></v-select>
+           @update:model-value="onFormValueChange"></v-select>
         </v-col>
         <v-col cols="12" sm="4" md="2">
           <v-select
@@ -384,7 +384,7 @@
             :items="clashDnsPolicyRouteOptions"
 			:label="$t('subscriptionEditor.dnsRoute')"
             hide-details
-          ></v-select>
+           @update:model-value="onFormValueChange"></v-select>
         </v-col>
 		<v-col cols="12" class="subscription-row-actions">
           <div class="d-flex align-center justify-end ga-1">
@@ -396,7 +396,7 @@
               size="small"
               variant="text"
               :disabled="dnsPolicyIdx === 0"
-			  @click="markUserDirty(); moveClashDnsPolicyRow(dnsPolicyIdx, -1)"
+			  @click="onFormValueChange(); moveClashDnsPolicyRow(dnsPolicyIdx, -1)"
             ></v-btn>
             <v-btn
               icon="mdi-arrow-down"
@@ -406,7 +406,7 @@
               size="small"
               variant="text"
               :disabled="dnsPolicyIdx >= clashDnsPolicyRows.length - 1"
-			  @click="markUserDirty(); moveClashDnsPolicyRow(dnsPolicyIdx, 1)"
+			  @click="onFormValueChange(); moveClashDnsPolicyRow(dnsPolicyIdx, 1)"
             ></v-btn>
             <v-btn
               icon="mdi-plus"
@@ -415,7 +415,7 @@
 			  :aria-label="$t('subscriptionEditor.add')"
               size="small"
               variant="text"
-			  @click="markUserDirty(); insertClashDnsPolicyRow(dnsPolicyIdx)"
+			  @click="onFormValueChange(); insertClashDnsPolicyRow(dnsPolicyIdx)"
             ></v-btn>
             <v-btn
               v-if="canDeleteClashDnsPolicyRow(dnsPolicyIdx)"
@@ -425,7 +425,7 @@
 			  :aria-label="$t('subscriptionEditor.remove')"
               size="small"
               variant="text"
-			  @click="markUserDirty(); removeClashDnsPolicyRow(dnsPolicyIdx)"
+			  @click="onFormValueChange(); removeClashDnsPolicyRow(dnsPolicyIdx)"
             ></v-btn>
           </div>
         </v-col>
@@ -442,14 +442,14 @@
           multiple
           hide-details
           :label="$t('setting.excludePkg')"
-        ></v-combobox>
+         @update:model-value="onFormValueChange"></v-combobox>
       </v-col>
     </v-row>
 
     <!-- Rule set source -->
     <v-row>
       <v-col cols="12" sm="6" md="3">
-		<v-select v-model="ruleSetSource" :items="clashRuleSetSourceOptions" :label="$t('subscriptionEditor.globalRuleSetSource')" hide-details></v-select>
+		<v-select v-model="ruleSetSource" :items="clashRuleSetSourceOptions" :label="$t('subscriptionEditor.globalRuleSetSource')" hide-details @update:model-value="onFormValueChange"></v-select>
       </v-col>
     </v-row>
 
@@ -467,7 +467,7 @@
           :persistent-hint="idx === 0"
           hide-details="auto"
           :placeholder="$t('subscriptionEditor.exampleCN')"
-        ></v-text-field>
+         @update:model-value="onFormValueChange"></v-text-field>
       </v-col>
       <v-col cols="12" sm="3" md="2">
         <v-select
@@ -475,7 +475,7 @@
           :items="clashRuleKindOptions"
 		  :label="$t('subscriptionEditor.ruleKind')"
           hide-details
-        ></v-select>
+         @update:model-value="onFormValueChange"></v-select>
       </v-col>
       <v-col cols="12" sm="3" md="2">
         <v-select
@@ -484,14 +484,14 @@
           :items="clashDomainIpTypes"
 		  :label="idx === 0 ? $t('subscriptionEditor.customMatchType') : $t('subscriptionEditor.matchType')"
           hide-details
-        ></v-select>
+         @update:model-value="onFormValueChange"></v-select>
         <v-select
           v-else
           v-model="row.ruleSetScope"
           :items="clashRuleSetScopeOptions"
 		  :label="$t('subscriptionEditor.ruleSetScope')"
           hide-details
-        ></v-select>
+         @update:model-value="onFormValueChange"></v-select>
       </v-col>
       <v-col cols="12" sm="3" md="2" v-if="row.kind === 'ruleset'">
         <v-select
@@ -499,7 +499,7 @@
 		  :items="getClashRuleSetSourceOverrideOptions(row.ruleSetScope)"
 		  :label="$t('subscriptionEditor.ruleSetSource')"
           hide-details
-        ></v-select>
+         @update:model-value="onFormValueChange"></v-select>
       </v-col>
       <v-col cols="12" sm="6" md="4">
         <v-combobox
@@ -510,7 +510,7 @@
           multiple
           chips
           closable-chips
-        ></v-combobox>
+         @update:model-value="onFormValueChange"></v-combobox>
       </v-col>
       <v-col cols="12" sm="4" md="2">
         <v-select
@@ -519,7 +519,7 @@
 		  :label="row.name && row.name.trim() ? $t('subscriptionEditor.routeDisabledByName') : $t('subscriptionEditor.route')"
           :disabled="Boolean(row.name && row.name.trim())"
           hide-details
-        ></v-select>
+         @update:model-value="onFormValueChange"></v-select>
       </v-col>
       <v-col cols="12" sm="4" md="2">
         <v-select
@@ -528,7 +528,7 @@
           label="no-resolve"
           :disabled="isClashRowNoResolveDisabled(row)"
           hide-details
-          @update:modelValue="setClashRowNoResolve(row, $event)"
+		  @update:modelValue="setClashRowNoResolve(row, $event); onFormValueChange()"
         ></v-select>
       </v-col>
 	  <v-col cols="12" class="subscription-row-actions">
@@ -541,7 +541,7 @@
             size="small"
             variant="text"
             :disabled="idx === 0"
-			@click="markUserDirty(); moveClashRuleRow(idx, -1)"
+			@click="onFormValueChange(); moveClashRuleRow(idx, -1)"
           ></v-btn>
           <v-btn
             icon="mdi-arrow-down"
@@ -551,7 +551,7 @@
             size="small"
             variant="text"
             :disabled="idx >= clashRuleRows.length - 1"
-			@click="markUserDirty(); moveClashRuleRow(idx, 1)"
+			@click="onFormValueChange(); moveClashRuleRow(idx, 1)"
           ></v-btn>
           <v-btn
             icon="mdi-plus"
@@ -560,7 +560,7 @@
 			:aria-label="$t('subscriptionEditor.add')"
             size="small"
             variant="text"
-			@click="markUserDirty(); insertClashRuleRow(idx)"
+			@click="onFormValueChange(); insertClashRuleRow(idx)"
           ></v-btn>
           <v-btn
             v-if="canDeleteClashRuleRow(idx)"
@@ -570,7 +570,7 @@
 			:aria-label="$t('subscriptionEditor.remove')"
             size="small"
             variant="text"
-			@click="markUserDirty(); removeClashRuleRow(idx)"
+			@click="onFormValueChange(); removeClashRuleRow(idx)"
           ></v-btn>
         </div>
       </v-col>
@@ -579,10 +579,10 @@
     <!-- Update method and interval -->
     <v-row>
       <v-col cols="12" sm="3" md="2">
-		<v-select v-model="updateMethod" :items="clashUpdateMethodOptions" :label="$t('subscriptionEditor.updateMethod')" hide-details></v-select>
+		<v-select v-model="updateMethod" :items="clashUpdateMethodOptions" :label="$t('subscriptionEditor.updateMethod')" hide-details @update:model-value="onFormValueChange"></v-select>
       </v-col>
       <v-col cols="12" sm="3" md="2">
-		<v-text-field v-model="updateInterval" :label="$t('subscriptionEditor.updateInterval')" hide-details placeholder="1d"></v-text-field>
+		<v-text-field v-model="updateInterval" :label="$t('subscriptionEditor.updateInterval')" hide-details placeholder="1d" @update:model-value="onFormValueChange"></v-text-field>
       </v-col>
       <v-col cols="12" sm="3" md="2">
         <v-select
@@ -590,21 +590,21 @@
           :items="optionalBoolOptions"
 		  :label="$t('subscriptionEditor.globalNoResolve')"
           hide-details
-        ></v-select>
+         @update:model-value="onFormValueChange"></v-select>
       </v-col>
     </v-row>
 
     <!-- Final route outbound -->
     <v-row>
       <v-col cols="12" sm="3" md="2">
-		<v-select v-model="routeFinal" :items="clashRouteFinalOptions" :label="$t('subscriptionEditor.routeFinal')" hide-details></v-select>
+		<v-select v-model="routeFinal" :items="clashRouteFinalOptions" :label="$t('subscriptionEditor.routeFinal')" hide-details @update:model-value="onFormValueChange"></v-select>
       </v-col>
     </v-row>
 
     <!-- Latency test -->
     <v-row>
       <v-col cols="12" sm="6" md="6">
-		<v-combobox v-model="latencyTestUrl" :items="clashLatencyTestUrlOptions" :label="$t('subscriptionEditor.latencyUrl')" hide-details></v-combobox>
+		<v-combobox v-model="latencyTestUrl" :items="clashLatencyTestUrlOptions" :label="$t('subscriptionEditor.latencyUrl')" hide-details @update:model-value="onFormValueChange"></v-combobox>
       </v-col>
     </v-row>
     <v-row>
@@ -617,7 +617,7 @@
           persistent-hint
           :error-messages="latencyTestIntervalError ? [latencyTestIntervalError] : []"
           :placeholder="$t('subscriptionEditor.clashIntervalPlaceholder')"
-        ></v-text-field>
+         @update:model-value="onFormValueChange"></v-text-field>
       </v-col>
       <v-col cols="12" sm="6" md="3">
         <v-text-field
@@ -628,17 +628,17 @@
           persistent-hint
           :error-messages="latencyToleranceError ? [latencyToleranceError] : []"
           :placeholder="$t('subscriptionEditor.tolerancePlaceholder')"
-        ></v-text-field>
+         @update:model-value="onFormValueChange"></v-text-field>
       </v-col>
     </v-row>
 
     <!-- Sniffer toggle -->
     <v-row>
       <v-col cols="12" sm="6" md="3" lg="2">
-		<v-switch v-model="enableSniff" color="primary" :label="$t('subscriptionEditor.sniffer')" hide-details />
+		<v-switch v-model="enableSniff" color="primary" :label="$t('subscriptionEditor.sniffer')" hide-details  @update:model-value="onFormValueChange"/>
       </v-col>
       <v-col cols="12" sm="6" md="3" lg="2">
-		<v-switch v-model="enableRejectQuic" color="primary" :label="$t('subscriptionEditor.rejectQuicPorts')" hide-details />
+		<v-switch v-model="enableRejectQuic" color="primary" :label="$t('subscriptionEditor.rejectQuicPorts')" hide-details  @update:model-value="onFormValueChange"/>
       </v-col>
     </v-row>
     <v-row>
@@ -651,7 +651,7 @@
           persistent-hint
           :error-messages="rejectUdpPortsInputError ? [rejectUdpPortsInputError] : []"
           :placeholder="$t('subscriptionEditor.udpPortsPlaceholder')"
-        ></v-text-field>
+         @update:model-value="onFormValueChange"></v-text-field>
       </v-col>
     </v-row>
     <v-row v-if="enableSniff">
@@ -661,7 +661,7 @@
           :items="optionalBoolOptions"
           label="override-destination"
           hide-details
-        ></v-select>
+         @update:model-value="onFormValueChange"></v-select>
       </v-col>
     </v-row>
     <v-row v-if="enableSniff">
@@ -673,7 +673,7 @@
           :hint="$t('subscriptionEditor.forceDnsMappingHint')"
           persistent-hint
           hide-details="auto"
-        ></v-select>
+         @update:model-value="onFormValueChange"></v-select>
       </v-col>
     </v-row>
     <v-row v-if="enableSniff">
@@ -683,7 +683,7 @@
           :items="optionalBoolOptions"
 		  :label="$t('subscriptionEditor.parsePureIp')"
           hide-details
-        ></v-select>
+         @update:model-value="onFormValueChange"></v-select>
       </v-col>
     </v-row>
 
@@ -694,7 +694,7 @@
           :items="optionalBoolOptions"
           label="use-system-hosts"
           hide-details
-        ></v-select>
+         @update:model-value="onFormValueChange"></v-select>
       </v-col>
     </v-row>
 
@@ -705,7 +705,7 @@
           :items="optionalBoolOptions"
           label="use-hosts"
           hide-details
-        ></v-select>
+         @update:model-value="onFormValueChange"></v-select>
       </v-col>
     </v-row>
 
@@ -721,7 +721,7 @@
           chips
           closable-chips
           hide-details
-        ></v-combobox>
+         @update:model-value="onFormValueChange"></v-combobox>
       </v-col>
     </v-row>
 
@@ -732,7 +732,7 @@
           color="primary"
           label="mihomo_keep-alive"
           hide-details
-        />
+         @update:model-value="onFormValueChange"/>
       </v-col>
     </v-row>
 
@@ -743,7 +743,7 @@
           :items="dnsGeoipBoolOptions"
           label="disable-keep-alive"
           hide-details
-        ></v-select>
+         @update:model-value="onFormValueChange"></v-select>
       </v-col>
     </v-row>
 
@@ -755,7 +755,7 @@
           min="0"
           label="keep-alive-idle"
           hide-details
-        ></v-text-field>
+         @update:model-value="onFormValueChange"></v-text-field>
       </v-col>
     </v-row>
 
@@ -767,7 +767,7 @@
           min="0"
           label="keep-alive-interval"
           hide-details
-        ></v-text-field>
+         @update:model-value="onFormValueChange"></v-text-field>
       </v-col>
     </v-row>
 
@@ -845,14 +845,14 @@ export default {
 
       // Clash rule rows (independent from JSON sub rule rows).
       ruleSetSource: 'metacubex_cdn' as string,
-      clashNoResolveGlobal: null as boolean | null,
+      clashNoResolveGlobal: true as boolean | null,
       resolvedRuleSetUrls: {} as Record<string, { url: string; source: string }>,
       ruleSetResolutionRunToken: 0,
       clashRuleRows: [
 		{ id: 'clash-rule-initial', kind: 'custom', name: '', customType: 'DOMAIN-KEYWORD', ruleSetScope: 'domain', ruleSetSourceOverride: null as string | null, route: 'REJECT', noResolve: true, values: [] as string[] },
 	  ] as Array<{ id: string; kind: string; name: string; customType: string; ruleSetScope: string; ruleSetSourceOverride: string | null; route: string; noResolve: boolean; values: string[] }>,
       clashDnsPolicyRows: [
-		{ id: 'clash-dns-policy-initial', matchType: 'geosite', routeTarget: 'nameserver', values: [] as string[] },
+        { id: 'clash-dns-policy-initial', matchType: 'rule-set', routeTarget: 'nameserver', values: [] as string[] },
 	  ] as Array<{ id: string; matchType: string; routeTarget: string; values: string[] }>,
       clashDnsSuffixRows: [
 		{ id: 'clash-dns-suffix-initial', targets: [] as string[], selections: [] as string[] },
@@ -896,7 +896,7 @@ export default {
 		{ title: this.$t('subscriptionEditor.directRoute'), value: 'DIRECT' },
 		{ title: this.$t('subscriptionEditor.proxyRoute'), value: 'Proxy' },
       ],
-      updateMethod: '全球直连' as string,
+      updateMethod: '节点选择' as string,
       updateInterval: '1d' as string,
       routeFinal: '节点选择' as string,
 
@@ -911,7 +911,7 @@ export default {
 
       // Feature toggles.
       enableSniff: true,
-      snifferOverrideDestination: null as boolean | null,
+      snifferOverrideDestination: true as boolean | null,
       snifferForceDnsMapping: null as boolean | null,
       snifferParsePureIp: null as boolean | null,
       enableRejectQuic: false,

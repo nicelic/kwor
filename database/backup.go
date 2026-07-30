@@ -151,6 +151,7 @@ func GetDb(exclude string) ([]byte, error) {
 	err = backupDb.AutoMigrate(
 		&model.Setting{},
 		&model.SettingsState{},
+		&model.SubscriptionInitialState{},
 		// ACME/DNS account state and certificate inventory are all database
 		// source data. Keep them together in the lightweight database export as
 		// well as the full archive backup.
@@ -199,6 +200,7 @@ func GetDb(exclude string) ([]byte, error) {
 	copySteps := []func() error{
 		func() error { return copyBackupTable[model.Setting](db, backupDb) },
 		func() error { return copyBackupTable[model.SettingsState](db, backupDb) },
+		func() error { return copyBackupTable[model.SubscriptionInitialState](db, backupDb) },
 		func() error { return copyBackupTable[model.AcmeAccount](db, backupDb) },
 		func() error { return copyBackupTable[model.AcmeDNSAccount](db, backupDb) },
 		func() error { return copyBackupTable[model.CertificateRecord](db, backupDb) },

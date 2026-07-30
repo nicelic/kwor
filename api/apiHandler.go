@@ -68,6 +68,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.Save(c, loginUser)
 	case "settings-patch":
 		a.ApiService.SaveSettingsPatch(c, loginUser)
+	case "subscription-initial-reset":
+		a.ApiService.ResetSubscriptionToInitialState(c, loginUser)
 	case "subscription-ruleset-probe":
 		a.ApiService.ProbeSubscriptionRuleSets(c)
 	case "restartApp":

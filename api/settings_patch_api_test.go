@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -82,6 +83,58 @@ func TestSettingsPatchCASUpsertNoopAndCompactAudit(t *testing.T) {
 	conflictObject, ok := conflict.Obj.(map[string]interface{})
 	if !ok || conflictObject["code"] != "revision_conflict" || conflictObject["currentRevision"] != float64(3) {
 		t.Fatalf("unexpected conflict response: %#v", conflict.Obj)
+	}
+}
+
+func TestSubscriptionInitialResetAPIRestoresClashInstallState(t *testing.T) {
+	setupSettingsPatchAPITestDB(t)
+	apiService := &ApiService{}
+	snapshot, err := apiService.SettingService.GetSettingsSnapshot(false)
+	if err != nil {
+		t.Fatalf("load settings snapshot: %v", err)
+	}
+
+	_, changeResponse := performSettingsPatchJSONPost(t, apiService.SaveSettingsPatch, `{"expectedRevision":`+strconv.FormatUint(snapshot.Revision, 10)+`,"changes":{"subClashExt":"tun:\\n  enable: true\\n"}}`)
+	if !changeResponse.Success {
+		t.Fatalf("save Clash test state: %s", changeResponse.Msg)
+	}
+	changed := decodeSettingsPatchResult(t, changeResponse.Obj)
+
+	_, resetResponse := performSettingsPatchJSONPost(t, apiService.ResetSubscriptionToInitialState, `{"expectedRevision":`+strconv.FormatUint(changed.Revision, 10)+`,"kind":"clash"}`)
+	if !resetResponse.Success {
+		t.Fatalf("reset Clash installation state: %s", resetResponse.Msg)
+	}
+	encoded, err := json.Marshal(resetResponse.Obj)
+	if err != nil {
+		t.Fatalf("encode reset response: %v", err)
+	}
+	var reset service.SubscriptionInitialResetResult
+	if err := json.Unmarshal(encoded, &reset); err != nil {
+		t.Fatalf("decode reset response: %v", err)
+	}
+	if reset.Kind != "clash" || reset.Values["subClashExt"] != "" || reset.Revision != changed.Revision+1 {
+		t.Fatalf("unexpected reset response: %#v", reset)
+	}
+
+	var setting model.Setting
+	if err := database.GetDB().Where("key = ?", "subClashExt").First(&setting).Error; err != nil || setting.Value != "" {
+		t.Fatalf("Clash installation state was not restored: setting=%#v err=%v", setting, err)
+	}
+
+	_, noopResponse := performSettingsPatchJSONPost(t, apiService.ResetSubscriptionToInitialState, `{"expectedRevision":`+strconv.FormatUint(reset.Revision, 10)+`,"kind":"clash"}`)
+	if !noopResponse.Success {
+		t.Fatalf("repeat Clash reset failed: %s", noopResponse.Msg)
+	}
+	encoded, err = json.Marshal(noopResponse.Obj)
+	if err != nil {
+		t.Fatalf("encode repeat reset response: %v", err)
+	}
+	var noop service.SubscriptionInitialResetResult
+	if err := json.Unmarshal(encoded, &noop); err != nil {
+		t.Fatalf("decode repeat reset response: %v", err)
+	}
+	if noop.ChangedKeys == nil || len(noop.ChangedKeys) != 0 || noop.Revision != reset.Revision {
+		t.Fatalf("unexpected no-op reset response: %#v", noop)
 	}
 }
 

@@ -1480,7 +1480,7 @@ function normalizeClashDnsPolicyValues(matchType: ClashDnsPolicyMatchType, input
 function createDefaultClashDnsPolicyRow(routeTarget: ClashDnsPolicyRouteTarget = 'nameserver', id?: string): ClashDnsPolicyRow {
   return {
 	id: id || stableClashRowId(null, 'clash-dns-policy'),
-    matchType: 'geosite',
+    matchType: 'rule-set',
     routeTarget,
     values: [],
   }
@@ -1814,13 +1814,33 @@ function buildLegacyClashRuleRows(config: any): ClashRuleRow[] {
 export const SubClashExtMixin = {
   created(this: any) {
 	this._probeAbortController = new AbortController()
+    this._dirtyTrackingBaseline = null
+    this._dirtyTrackingReady = false
+    this._dirtyTrackingPending = false
+    this._dirtyTrackingTimer = null
+    this._dirtyTrackingPreserveInitial = this._dirty === true
     this.captureClashRuleRowsValidationSnapshot(this.clashRuleRows)
+  },
+  mounted(this: any) {
+    this.$nextTick(() => {
+      this._dirtyTrackingReady = true
+      this.refreshDirtyTrackingBaseline()
+    })
   },
   beforeUnmount(this: any) {
 	this.ruleSetResolutionRunToken = (this.ruleSetResolutionRunToken || 0) + 1
 	this._probeAbortController?.abort()
+    if (this._dirtyTrackingTimer != null && typeof window !== 'undefined') {
+      window.clearTimeout(this._dirtyTrackingTimer)
+    }
   },
   watch: {
+    metaJson: {
+      handler(this: any) {
+        this.refreshDirtyTrackingBaseline()
+      },
+      deep: true,
+    },
     'settings.subClashExt': {
       handler(this: any, v: string) {
 		const raw = typeof v === 'string' ? v : ''
@@ -2193,6 +2213,53 @@ export const SubClashExtMixin = {
   },
 
   methods: {
+	getDirtyTrackingSnapshot(this: any): string {
+	  try {
+		return JSON.stringify(this.metaJson || {})
+	  } catch {
+		return ''
+	  }
+	},
+	refreshDirtyTrackingBaseline(this: any) {
+	  if (!this._dirtyTrackingReady || this._dirtyTrackingPending || this._dirty === true || this._resetRequested === true || this._dirtyTrackingPreserveInitial) return
+	  this._dirtyTrackingBaseline = this.getDirtyTrackingSnapshot()
+	},
+	syncDirtyStateFromUi(this: any) {
+	  if (!this._dirtyTrackingReady || this._resetRequested === true || this._dirtyTrackingPreserveInitial) return
+	  const snapshot = this.getDirtyTrackingSnapshot()
+	  if (this._dirtyTrackingBaseline == null) {
+		this._dirtyTrackingBaseline = snapshot
+		return
+	  }
+	  const dirty = snapshot !== this._dirtyTrackingBaseline
+	  if (this._dirty === dirty) return
+	  this._dirty = dirty
+	  this.$emit?.('dirty-change', dirty)
+	},
+	scheduleDirtyStateCheck(this: any) {
+	  if (!this._dirtyTrackingReady) return
+	  this._dirtyTrackingPending = true
+	  const complete = () => {
+		this._dirtyTrackingTimer = null
+		this.$nextTick(() => {
+		  this._dirtyTrackingPending = false
+		  this.syncDirtyStateFromUi()
+		})
+	  }
+	  if (this._dirtyTrackingTimer != null && typeof window !== 'undefined') {
+		window.clearTimeout(this._dirtyTrackingTimer)
+	  }
+	  if (typeof window === 'undefined') {
+		complete()
+		return
+	  }
+	  this._dirtyTrackingTimer = window.setTimeout(complete, 0)
+	},
+	onFormValueChange(this: any) {
+	  this._resetRequested = false
+	  this._editorSourcePending = false
+	  this.scheduleDirtyStateCheck()
+	},
 	markUserDirty(this: any) {
 	  const wasDirty = this._dirty === true
 	  this._dirty = true
@@ -2298,14 +2365,9 @@ export const SubClashExtMixin = {
         }
       }
 
-	  try {
-		const document = yaml.parseDocument(String(this.canonicalDefault || '{}'), { uniqueKeys: true })
-		this.metaJson = document.errors.length > 0 ? {} : (document.toJS() ?? {})
-	  } catch {
-		this.metaJson = {}
-	  }
-	  this.settings.subClashExt = String(this.canonicalDefault || '')
-	  this._rawSource = this.settings.subClashExt
+	  this.metaJson = {}
+	  this.settings.subClashExt = ''
+	  this._rawSource = ''
 	  this._parseError = ''
 	  this._dirty = true
 	  this._resetRequested = true
@@ -2330,7 +2392,6 @@ export const SubClashExtMixin = {
           })
 		  return
 		}
-		this.markUserDirty()
 		this._parseError = ''
 		this._resetRequested = false
 		this._editorSourcePending = true
@@ -2340,6 +2401,7 @@ export const SubClashExtMixin = {
 		this._rawSource = normalized
 		this.settings.subClashExt = normalized
         this.enableEditor = false
+		this.scheduleDirtyStateCheck()
       } catch (_e) {
         push.error({
           message: i18n.global.t('failed') + ': ' + i18n.global.t('error.invalidData'),

@@ -46,8 +46,8 @@
           <v-card-text>{{ resetDialogMessage }}</v-card-text>
           <v-card-actions>
             <v-spacer></v-spacer>
-			<v-btn variant="text" @click="closeResetDialog">{{ $t('actions.close') }}</v-btn>
-			<v-btn color="error" variant="outlined" @click="confirmResetSubPage">{{ $t('subscriptionEditor.resetConfirm') }}</v-btn>
+			<v-btn variant="text" :disabled="loading" @click="closeResetDialog">{{ $t('actions.close') }}</v-btn>
+			<v-btn color="error" variant="outlined" :loading="loading" :disabled="loading" @click="confirmResetSubPage">{{ $t('subscriptionEditor.resetConfirm') }}</v-btn>
           </v-card-actions>
         </v-card>
       </v-dialog>
@@ -651,7 +651,7 @@
 <script lang="ts" setup>
 import { useLocale } from 'vuetify'
 import { i18n, languages } from '@/locales'
-import { Ref, computed, defineAsyncComponent, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { Ref, computed, defineAsyncComponent, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import HttpUtils, { type Msg } from '@/plugins/httputil'
 import router from '@/router'
 import { FindDiff } from '@/plugins/utils'
@@ -695,6 +695,14 @@ type SubscriptionSettingsSnapshot = {
 	value: string
 	default: string
 	ruleSetSources: RuleSetSourceEntry[]
+}
+
+type SubscriptionInitialResetResult = {
+	revision: number
+	kind: 'json' | 'clash'
+	changedKeys: string[]
+	values: Record<string, string>
+	warnings?: string[]
 }
 
 const settingsLoadState = ref<SettingsLoadState>('idle')
@@ -1194,7 +1202,10 @@ const loadSubscriptionDraft = async (target: 'json' | 'clash', retryAfterRevisio
 		return false
 	}
 
-	const value = snapshot.value.trim() ? snapshot.value : snapshot.default
+	// Empty extension text is the persisted first-installation state. Do not
+	// replace it with the current code template, or a reset cannot reproduce
+	// the page and editor state from the first installation.
+	const value = snapshot.value
 	if (target === 'json') {
 		settingsDefaults.value.jsonExt = snapshot.default
 		ruleSetSources.value.json = [...snapshot.ruleSetSources]
@@ -1220,6 +1231,45 @@ const loadSubscriptionDraft = async (target: 'json' | 'clash', retryAfterRevisio
 const retrySubscriptionDraft = (target: 'json' | 'clash') => {
 	setSubscriptionDraftLoadState(target, 'idle')
 	void loadSubscriptionDraft(target)
+}
+
+const isSubscriptionInitialResetResult = (value: unknown, kind: 'json' | 'clash'): value is SubscriptionInitialResetResult => {
+	if (!isSettingsPayload(value)) return false
+	const result = value as Record<string, any>
+	if (!Number.isInteger(result.revision) || result.revision < 1 || result.kind !== kind || !Array.isArray(result.changedKeys) || !isSettingsPayload(result.values)) {
+		return false
+	}
+	const requiredKeys = kind === 'json'
+		? ['subJsonExt', 'serverTlsStoreEnabled', 'serverTlsStore', 'clientTlsStoreEnabled', 'clientTlsStore']
+		: ['subClashExt']
+	return requiredKeys.every(key => typeof result.values[key] === 'string')
+}
+
+const applySubscriptionInitialReset = (target: 'json' | 'clash', result: SubscriptionInitialResetResult) => {
+	settingsRevision.value = result.revision
+	if (target === 'json') {
+		for (const key of ['serverTlsStoreEnabled', 'serverTlsStore', 'clientTlsStoreEnabled', 'clientTlsStore']) {
+			const value = String(result.values[key])
+			settings.value[key] = value
+			oldSettings.value[key] = value
+		}
+		const value = String(result.values.subJsonExt)
+		subJsonDraftValue.value = value
+		subJsonDraftSettings.value = { ...settings.value, subJsonExt: value }
+		subJsonDraftDirty.value = false
+		subJsonDraftError.value = ''
+		subJsonResetPending.value = false
+		setSubscriptionDraftLoadState('json', 'ready')
+	} else {
+		const value = String(result.values.subClashExt)
+		subClashDraftValue.value = value
+		subClashDraftSettings.value = { subClashExt: value }
+		subClashDraftDirty.value = false
+		subClashDraftError.value = ''
+		subClashResetPending.value = false
+		setSubscriptionDraftLoadState('clash', 'ready')
+	}
+	subscriptionDraftGeneration.value += 1
 }
 
 const loadSystemTimeZone = async (settingsRequestSequence?: number): Promise<boolean> => {
@@ -1911,11 +1961,11 @@ type SubscriptionSerializeResult = {
 }
 
 const onSubJsonDirtyChange = (dirty: boolean) => {
-	if (dirty) subJsonDraftDirty.value = true
+	subJsonDraftDirty.value = dirty
 }
 
 const onSubClashDirtyChange = (dirty: boolean) => {
-	if (dirty) subClashDraftDirty.value = true
+	subClashDraftDirty.value = dirty
 }
 
 const persistSubscriptionDraft = (target: 'json' | 'clash', requireValid = false): boolean => {
@@ -2145,30 +2195,57 @@ const closeResetDialog = () => {
 }
 
 const confirmResetSubPage = async () => {
-  if (!hasVerifiedSettings.value) return
-  if (resetTarget.value === 'json') {
-    subJsonExtRef.value?.resetSubJsonPage?.()
-  } else if (resetTarget.value === 'clash') {
-    subClashExtRef.value?.resetSubClashPage?.()
-  }
-
-  await nextTick()
-
-  if (resetTarget.value === 'json') {
-    push.success({
-      title: i18n.global.t('success'),
-      duration: 4000,
-	  message: i18n.global.t('subscriptionEditor.resetJsonSuccess'),
-    })
-  } else if (resetTarget.value === 'clash') {
-    push.success({
-      title: i18n.global.t('success'),
-      duration: 4000,
-	  message: i18n.global.t('subscriptionEditor.resetClashSuccess'),
-    })
-  }
-
-  closeResetDialog()
+	const target = resetTarget.value
+	if (!hasVerifiedSettings.value || !target || loading.value) return
+	loading.value = true
+	try {
+		const msg = await HttpUtils.post('api/subscription-initial-reset', {
+			kind: target,
+			expectedRevision: settingsRevision.value,
+		}, {
+			headers: { 'Content-Type': 'application/json' },
+			timeout: 30000,
+			silentErrorToast: true,
+		})
+		if (msg.success && isSubscriptionInitialResetResult(msg.obj, target)) {
+			applySubscriptionInitialReset(target, msg.obj)
+			const warnings = Array.isArray(msg.obj.warnings) ? msg.obj.warnings.map(String) : []
+			push.success({
+				title: i18n.global.t('success'),
+				duration: 5000,
+				message: target === 'json'
+					? i18n.global.t('subscriptionEditor.resetJsonSuccess')
+					: i18n.global.t('subscriptionEditor.resetClashSuccess'),
+			})
+			if (warnings.length > 0) {
+				push.warning({
+					title: i18n.global.t('subscriptionEditor.settingsSavedWithWarnings'),
+					duration: 8000,
+					message: warnings.join('; '),
+				})
+			}
+			closeResetDialog()
+			return
+		}
+		if (msg.obj?.code === 'revision_conflict') {
+			closeResetDialog()
+			await loadData()
+			await loadSystemTimeZone()
+			push.warning({
+				title: i18n.global.t('subscriptionEditor.revisionConflictTitle'),
+				duration: 7000,
+				message: i18n.global.t('subscriptionEditor.revisionConflictMessage'),
+			})
+			return
+		}
+		push.error({
+			title: i18n.global.t('failed'),
+			duration: 6000,
+			message: msg.msg || i18n.global.t('subscriptionEditor.settingsSaveFailed'),
+		})
+	} finally {
+		loading.value = false
+	}
 }
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))

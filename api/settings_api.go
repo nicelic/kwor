@@ -21,6 +21,11 @@ type settingsPatchAPIRequest struct {
 	ConfirmTrafficHistoryClear bool              `json:"confirmTrafficHistoryClear"`
 }
 
+type subscriptionInitialResetAPIRequest struct {
+	ExpectedRevision uint64 `json:"expectedRevision"`
+	Kind             string `json:"kind"`
+}
+
 var settingsSystemTimeZoneSaveMu sync.Mutex
 
 func (a *ApiService) GetSettingsSnapshot(c *gin.Context) {
@@ -48,6 +53,20 @@ func (a *ApiService) SaveSettingsPatch(c *gin.Context, actor string) {
 		request.ConfirmTrafficHistoryClear,
 		actor,
 	)
+	if err != nil {
+		writeSettingsPatchError(c, err)
+		return
+	}
+	jsonObj(c, result, nil)
+}
+
+func (a *ApiService) ResetSubscriptionToInitialState(c *gin.Context, actor string) {
+	request := subscriptionInitialResetAPIRequest{}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	result, err := a.ConfigService.ResetSubscriptionToInitialState(request.Kind, request.ExpectedRevision, actor)
 	if err != nil {
 		writeSettingsPatchError(c, err)
 		return

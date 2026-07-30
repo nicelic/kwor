@@ -23,6 +23,7 @@ type SettingsPatchRequest struct {
 	ExpectedRevision           uint64            `json:"expectedRevision"`
 	Changes                    map[string]string `json:"changes"`
 	ConfirmTrafficHistoryClear bool              `json:"confirmTrafficHistoryClear"`
+	AuditAction                string            `json:"-"`
 	// ForceRevision is used for host-level settings that have no row in the
 	// settings table, currently the Linux system timezone. It stays internal so
 	// clients cannot bypass normal change detection.
@@ -95,6 +96,9 @@ func (s *SettingService) GetSettingsSnapshot(includeExtensions ...bool) (*Settin
 	if err := s.ensureSettingsSnapshotDefaults(); err != nil {
 		return nil, err
 	}
+	if err := s.ensureSubscriptionInitialState(); err != nil {
+		return nil, err
+	}
 	db := database.GetDB()
 	if db == nil {
 		return nil, common.NewError("database is not ready")
@@ -150,6 +154,9 @@ func (s *SettingService) GetSubscriptionSettingsSnapshot(kind string) (*Subscrip
 		return nil, common.NewError("订阅扩展类型必须是 json 或 clash")
 	}
 	if err := s.ensureSettingsSnapshotDefaults(); err != nil {
+		return nil, err
+	}
+	if err := s.ensureSubscriptionInitialState(); err != nil {
 		return nil, err
 	}
 	db := database.GetDB()
@@ -320,11 +327,15 @@ func (s *SettingService) ApplySettingsPatch(request SettingsPatchRequest, actor 
 			result.StatsCleared = true
 		}
 		if len(keys) > 0 {
+			action := strings.TrimSpace(request.AuditAction)
+			if action == "" {
+				action = "patch"
+			}
 			if err := recordChange(tx, model.Changes{
 				DateTime: time.Now().Unix(),
 				Actor:    actor,
 				Key:      "settings",
-				Action:   "patch",
+				Action:   action,
 				Obj:      buildSettingsPatchAudit(current, changed, keys),
 			}); err != nil {
 				return err

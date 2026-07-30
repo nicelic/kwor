@@ -135,6 +135,7 @@ func InitDB(dbPath string) error {
 	err = db.AutoMigrate(
 		&model.Setting{},
 		&model.SettingsState{},
+		&model.SubscriptionInitialState{},
 		&model.SystemPlatform{},
 		&model.PanelCertificate{},
 		&model.SelfSignedAuthority{},
