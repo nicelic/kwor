@@ -840,8 +840,13 @@ const normalizeKernelOverview = (raw: any): KernelOverview => ({
 
 const loadRuntimeOverview = async () => {
   const stopLoading = beginOverviewLoading()
+  let requestCancelled = false
   try {
     const msg = await HttpUtils.get('api/kernel-overview', { provider: 'xanmod' })
+    if (msg.failureKind === 'cancelled') {
+      requestCancelled = true
+      return
+    }
     if (msg.success && msg.obj) {
       runtimeOverview.value = normalizeKernelOverview(msg.obj)
     } else {
@@ -853,7 +858,9 @@ const loadRuntimeOverview = async () => {
   } catch {
     runtimeOverview.value = createEmptyKernelOverview()
   } finally {
-    runtimeChecked.value = true
+    if (!requestCancelled) {
+      runtimeChecked.value = true
+    }
     stopLoading()
   }
 }
@@ -1199,10 +1206,8 @@ const completeKernelDownloadTask = async (progress: KernelDownloadProgress, allo
     if (progress.state === 'success' || progress.status === 'success') {
       const count = Math.max(0, progress.downloadedCount)
       showTransientDownloadFeedback('success', t('kernelManager.downloadDone', { count }))
-      await Promise.all([
-        loadRuntimeOverview(),
-        loadOverview(),
-      ])
+      await loadRuntimeOverview()
+      await loadOverview()
       return
     }
     if (progress.state === 'cancelled') {
