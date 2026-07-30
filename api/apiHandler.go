@@ -39,10 +39,16 @@ func (a *APIHandler) initRouter(g *gin.RouterGroup) {
 }
 
 func (a *APIHandler) postHandler(c *gin.Context) {
-	loginUser := GetLoginUser(c)
 	action := c.Param("postAction")
+	// The activity endpoint performs its own single validation and refresh. A
+	// preliminary GetLoginUser call could consume an expired record and hide the
+	// useful user_idle_timeout/page_inactive_timeout reason from the response.
+	loginUser := ""
+	if action != "session" {
+		loginUser = GetLoginUser(c)
+	}
 	applyAPIRequestBodyLimit(c, action)
-	if action != "login" && action != "panel-uninstall" {
+	if action != "login" && action != "panel-uninstall" && action != "session" {
 		operation, err := service.BeginKworInProcessOperation("api-post-" + action)
 		if err != nil {
 			jsonMsg(c, "failed", common.NewError("卸载停工状态拒绝当前写请求: ", err))
@@ -54,6 +60,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 	switch action {
 	case "login":
 		a.ApiService.Login(c)
+	case "session":
+		a.ApiService.SessionActivity(c)
 	case "changePass":
 		a.ApiService.ChangePass(c)
 	case "save":

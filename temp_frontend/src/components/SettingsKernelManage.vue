@@ -357,6 +357,7 @@
 <script setup lang="ts">
 import HttpUtils from '@/plugins/httputil'
 import { confirm } from '@/plugins/confirm'
+import router from '@/router'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { Ref } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -1376,7 +1377,12 @@ const startReconnectPolling = () => {
         window.location.reload()
         return
       }
-      if (body.msg === 'Invalid login') return
+      if (body.failureKind === 'api') {
+        clearReconnectTimer()
+        rebootOverlay.value = false
+        await router.replace('/login')
+        return
+      }
     } catch {
       // wait for service to come back
     }

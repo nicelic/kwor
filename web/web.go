@@ -140,6 +140,13 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 
 	store := newSessionCookieStore(secret)
 	engine.Use(sessions.Sessions(sessionCookieName(secret), store))
+	// Older panel releases used the fixed "kwor" Cookie name. It cannot
+	// authenticate against the instance-scoped store above, and is explicitly
+	// expired when it is still presented so it cannot interfere with a new login.
+	engine.Use(func(c *gin.Context) {
+		api.ClearLegacyLoginSessionCookie(c)
+		c.Next()
+	})
 
 	engine.Use(func(c *gin.Context) {
 		uri := c.Request.URL.Path
@@ -289,7 +296,6 @@ func (s *Server) Start() (err error) {
 		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 15 * time.Second,
 		WriteTimeout:      20 * time.Second,
-		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    64 << 10,
 		ConnState:         s.trackTLSConn,
 	}

@@ -653,6 +653,7 @@ import { useLocale } from 'vuetify'
 import { i18n, languages } from '@/locales'
 import { Ref, computed, defineAsyncComponent, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import HttpUtils, { type Msg } from '@/plugins/httputil'
+import router from '@/router'
 import { FindDiff } from '@/plugins/utils'
 import { formatPanelDateTime, refreshPanelTimeContext } from '@/plugins/panelTime'
 import { confirm } from '@/plugins/confirm'
@@ -1828,6 +1829,13 @@ const startPanelReconnectPolling = () => {
         HttpUtils.get('api/session', {}, { silentAuthCheck: true }),
         HttpUtils.get('api/panel-update-status', {}, { silentAuthCheck: true }),
       ])
+
+      if (!sessionMsg.success && sessionMsg.failureKind === 'api') {
+        clearPanelReconnectTimer()
+        panelRestartOverlay.value = false
+        await router.replace('/login')
+        return
+      }
 
       if (sessionMsg.success && statusMsg.success) {
         const nextStatus = statusMsg.obj ?? null

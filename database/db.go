@@ -156,6 +156,7 @@ func InitDB(dbPath string) error {
 		&model.Endpoint{},
 		&model.User{},
 		&model.Tokens{},
+		&model.LoginSession{},
 		&model.Stats{},
 		&model.InboundTrafficState{},
 		&model.ClientPortLimitState{},

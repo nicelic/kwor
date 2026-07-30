@@ -166,7 +166,6 @@ func (s *Server) Start() (err error) {
 		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 15 * time.Second,
 		WriteTimeout:      20 * time.Second,
-		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    64 << 10,
 		ConnState:         s.trackTLSConn,
 	}

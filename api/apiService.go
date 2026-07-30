@@ -2800,17 +2800,17 @@ func (a *ApiService) Login(c *gin.Context) {
 		return
 	}
 
-	sessionMaxAge, err := a.SettingService.GetSessionMaxAge()
+	idleLimitMinutes, err := a.SettingService.GetSessionMaxAge()
 	if err != nil {
-		logger.Infof("Unable to get session's max age from DB")
+		logger.Warning("load login session idle limit failed; disable idle limit for this login: ", err)
+		idleLimitMinutes = 0
 	}
-
-	err = SetLoginUser(c, loginUser, sessionMaxAge)
-	if err == nil {
-		logger.Info("user ", loginUser, " login success")
-	} else {
-		logger.Warning("login failed: ", err)
+	if err := SetLoginUser(c, loginUser, idleLimitMinutes); err != nil {
+		logger.Warning("login session cookie write failed: ", err)
+		jsonMsg(c, "", err)
+		return
 	}
+	logger.Info("user ", loginUser, " login success")
 
 	warning := strings.TrimSpace(service.GetLoginWarning())
 	if warning == "" {
@@ -2823,7 +2823,31 @@ func (a *ApiService) Login(c *gin.Context) {
 }
 
 func (a *ApiService) Session(c *gin.Context) {
-	pureJsonMsg(c, IsLogin(c), "")
+	a.writeSessionStatus(c, false)
+}
+
+// SessionActivity records a real browser interaction. Ordinary session probes,
+// polling, and background keepalive deliberately call Session instead.
+func (a *ApiService) SessionActivity(c *gin.Context) {
+	a.writeSessionStatus(c, true)
+}
+
+func (a *ApiService) writeSessionStatus(c *gin.Context, userActivity bool) {
+	status, valid, reason, err := RefreshLoginSession(c, userActivity)
+	if valid {
+		jsonObj(c, status, nil)
+		return
+	}
+	if err != nil {
+		logger.Warningf("login session refresh failed: reason=%s remote=%s error=%v", reason, getRemoteIp(c), err)
+	} else {
+		logger.Infof("login session rejected: reason=%s remote=%s", reason, getRemoteIp(c))
+	}
+	c.JSON(http.StatusOK, Msg{
+		Success: false,
+		Msg:     "Invalid login",
+		Obj:     map[string]string{"reason": reason},
+	})
 }
 
 func (a *ApiService) ChangePass(c *gin.Context) {

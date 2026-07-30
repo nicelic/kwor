@@ -55,6 +55,7 @@
 <script lang="ts" setup>
 import api from '@/plugins/api'
 import HttpUtils from '@/plugins/httputil'
+import router from '@/router'
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { i18n } from '@/locales'
 import { push } from 'notivue'
@@ -124,7 +125,10 @@ const startReconnectPolling = () => {
         window.location.reload()
         return
       }
-      if (body.msg === 'Invalid login') {
+      if (body.failureKind === 'api') {
+        clearReconnectTimer()
+        clearOverlay()
+        await router.replace('/login')
         return
       }
     } catch {

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/alireza0/s-ui/api"
 	"github.com/alireza0/s-ui/config"
 	"github.com/alireza0/s-ui/cronjob"
 	"github.com/alireza0/s-ui/database"
@@ -52,6 +53,9 @@ func (a *APP) Init() error {
 		if err := database.ApplyPendingDBRestore(); err != nil {
 			return err
 		}
+	}
+	if err := api.InitializeLoginSessionStore(); err != nil {
+		return err
 	}
 	if _, err := service.RefreshSystemPlatform(); err != nil {
 		return err
@@ -333,6 +337,9 @@ func (a *APP) RestartApp() {
 		logger.Error("prepare panel-only restart failed:", err)
 		return
 	}
+	// A full panel restart is an explicit authentication boundary. TLS listener
+	// reloads use web.Server.Restart directly and intentionally skip this reset.
+	api.InvalidateAllLoginSessions("panel_restart")
 	a.Stop()
 	restoreApplied := false
 
@@ -352,6 +359,9 @@ func (a *APP) RestartApp() {
 			return
 		}
 		restoreApplied = true
+	}
+	if err := api.InitializeLoginSessionStore(); err != nil {
+		logger.Error("reset persisted login sessions after panel restart failed:", err)
 	}
 
 	if restoreApplied {
