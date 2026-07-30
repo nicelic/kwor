@@ -10,7 +10,9 @@ import (
 	"gorm.io/gorm"
 )
 
-const subscriptionInitialBaselineVersion = 1
+// Bump this only when an earlier reset baseline must be repaired. This affects
+// the reset source only; it must never rewrite the user's current settings.
+const subscriptionInitialBaselineVersion = 2
 
 type SubscriptionInitialResetResult struct {
 	Revision    uint64            `json:"revision"`
@@ -31,6 +33,16 @@ func defaultSubscriptionInitialState() model.SubscriptionInitialState {
 		ClientTLSStore:        "chrome",
 		BaselineVersion:       subscriptionInitialBaselineVersion,
 	}
+}
+
+func subscriptionInitialStateMatchesCurrentDefaults(state model.SubscriptionInitialState) bool {
+	expected := defaultSubscriptionInitialState()
+	return state.JSONExtension == expected.JSONExtension &&
+		state.ClashExtension == expected.ClashExtension &&
+		state.ServerTLSStoreEnabled == expected.ServerTLSStoreEnabled &&
+		state.ServerTLSStore == expected.ServerTLSStore &&
+		state.ClientTLSStoreEnabled == expected.ClientTLSStoreEnabled &&
+		state.ClientTLSStore == expected.ClientTLSStore
 }
 
 // ensureSubscriptionInitialState creates an immutable baseline without
@@ -61,6 +73,16 @@ func ensureSubscriptionInitialState(tx *gorm.DB) (model.SubscriptionInitialState
 	}
 	if err != nil {
 		return model.SubscriptionInitialState{}, err
+	}
+	if state.BaselineVersion < subscriptionInitialBaselineVersion ||
+		(state.BaselineVersion == subscriptionInitialBaselineVersion && !subscriptionInitialStateMatchesCurrentDefaults(state)) {
+		// Repair only the separate reset record. A current-version record with
+		// different content is invalid because this table has no user-editable
+		// path; existing saved subscription settings must remain untouched.
+		state = defaultSubscriptionInitialState()
+		if err := tx.Save(&state).Error; err != nil {
+			return model.SubscriptionInitialState{}, err
+		}
 	}
 	return state, nil
 }

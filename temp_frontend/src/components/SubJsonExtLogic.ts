@@ -1449,6 +1449,17 @@ export const SubJsonExtMixin = {
 	  if (this._parseError) {
 		return { ok: false, dirty: true, value: this._rawSource || '', error: this._parseError }
 	  }
+	  if (Object.keys(this.subJsonExt || {}).length === 0) {
+		const requiresEmptyWrite = String(this._rawSource || '').trim() !== ''
+		this.settings.subJsonExt = ''
+		this._rawSource = ''
+		this._editorSourcePending = false
+		if (!requiresEmptyWrite) {
+		  this._dirty = false
+		  this.$emit?.('dirty-change', false)
+		}
+		return { ok: true, dirty: requiresEmptyWrite, value: '' }
+	  }
 	  if (this._editorSourcePending === true) {
 		const validationError = this.validateSubscriptionForm?.()
 		let value = ''

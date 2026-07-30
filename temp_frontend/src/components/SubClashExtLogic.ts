@@ -2281,6 +2281,17 @@ export const SubClashExtMixin = {
 	  if (this._parseError) {
 		return { ok: false, dirty: true, value: this._rawSource || '', error: this._parseError }
 	  }
+	  if (!this.metaJson || Object.keys(this.metaJson).length === 0) {
+		const requiresEmptyWrite = String(this._rawSource || '').trim() !== ''
+		this.settings.subClashExt = ''
+		this._rawSource = ''
+		this._editorSourcePending = false
+		if (!requiresEmptyWrite) {
+		  this._dirty = false
+		  this.$emit?.('dirty-change', false)
+		}
+		return { ok: true, dirty: requiresEmptyWrite, value: '' }
+	  }
 	  if (this._editorSourcePending === true) {
 		const validationError = this.validateSubscriptionForm?.()
 		let value = ''
@@ -2321,7 +2332,7 @@ export const SubClashExtMixin = {
 	  if (this.latencyTestIntervalError) return this.latencyTestIntervalError
 	  if (this.latencyToleranceError) return this.latencyToleranceError
 	  if (this.rejectUdpPortsInputError) return this.rejectUdpPortsInputError
-	  const mixedPort = Number(this.metaJson?.['mixed-port'])
+	  const mixedPort = Number(this.mixedPort)
 	  if (!Number.isInteger(mixedPort) || mixedPort < 1 || mixedPort > 65535) {
 		return String(i18n.global.t('subscriptionEditor.mixedPortInvalid'))
 	  }
