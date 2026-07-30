@@ -16,6 +16,7 @@ import (
 
 	"github.com/alireza0/s-ui/config"
 	"github.com/alireza0/s-ui/database"
+	"github.com/alireza0/s-ui/database/model"
 )
 
 func TestExtractNetSFFilesJSON(t *testing.T) {
@@ -370,6 +371,142 @@ func TestNormalizeKernelPurgeTargetsAndCommand(t *testing.T) {
 	}
 }
 
+func TestKernelPurgeNeedsNoninteractiveFrontend(t *testing.T) {
+	tests := []struct {
+		name         string
+		systemFamily string
+		current      string
+		targets      []string
+		want         bool
+	}{
+		{
+			name:         "current debian image",
+			systemFamily: "debian",
+			current:      "6.12.57+deb13-amd64",
+			targets:      []string{"linux-image-6.12.57+deb13-amd64"},
+			want:         true,
+		},
+		{
+			name:         "ubuntu family uses debian policy",
+			systemFamily: "Debian",
+			current:      "6.8.0-90-generic",
+			targets:      []string{"linux-headers-6.8.0-90-generic", "linux-image-6.8.0-90-generic"},
+			want:         true,
+		},
+		{
+			name:         "noncurrent image",
+			systemFamily: "debian",
+			current:      "6.12.57+deb13-amd64",
+			targets:      []string{"linux-image-6.1.81-bbrplus"},
+			want:         false,
+		},
+		{
+			name:         "current headers only",
+			systemFamily: "debian",
+			current:      "6.12.57+deb13-amd64",
+			targets:      []string{"linux-headers-6.12.57+deb13-amd64"},
+			want:         false,
+		},
+		{
+			name:         "non debian family",
+			systemFamily: "rhel",
+			current:      "6.12.57+deb13-amd64",
+			targets:      []string{"linux-image-6.12.57+deb13-amd64"},
+			want:         false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := kernelPurgeNeedsNoninteractiveFrontend(tt.systemFamily, tt.current, tt.targets); got != tt.want {
+				t.Fatalf("kernelPurgeNeedsNoninteractiveFrontend() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRunKernelPrivilegedNoninteractiveCommandUsesExplicitFrontend(t *testing.T) {
+	oldLookPath := kernelLookPath
+	oldRun := kernelRunCommandWithTimeout
+	oldGeteuid := kernelGeteuid
+	defer func() {
+		kernelLookPath = oldLookPath
+		kernelRunCommandWithTimeout = oldRun
+		kernelGeteuid = oldGeteuid
+	}()
+
+	tests := []struct {
+		name        string
+		euid        int
+		wantCommand string
+		wantArgs    []string
+	}{
+		{
+			name:        "root",
+			euid:        0,
+			wantCommand: "/usr/bin/env",
+			wantArgs: []string{
+				kernelDebianNoninteractiveFrontend,
+				"/usr/bin/apt-get",
+				"purge",
+				"-y",
+				"linux-image-6.12.57+deb13-amd64",
+			},
+		},
+		{
+			name:        "passwordless sudo",
+			euid:        1000,
+			wantCommand: "/usr/bin/sudo",
+			wantArgs: []string{
+				"-n",
+				"/usr/bin/env",
+				kernelDebianNoninteractiveFrontend,
+				"/usr/bin/apt-get",
+				"purge",
+				"-y",
+				"linux-image-6.12.57+deb13-amd64",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kernelGeteuid = func() int { return tt.euid }
+			kernelLookPath = func(file string) (string, error) {
+				switch file {
+				case "env":
+					return "/usr/bin/env", nil
+				case "sudo":
+					return "/usr/bin/sudo", nil
+				default:
+					return "", fmt.Errorf("unexpected lookup: %s", file)
+				}
+			}
+			var gotCommand string
+			var gotArgs []string
+			kernelRunCommandWithTimeout = func(_ time.Duration, command string, args ...string) error {
+				gotCommand = command
+				gotArgs = append([]string(nil), args...)
+				return nil
+			}
+
+			err := runKernelPrivilegedNoninteractiveCommand(
+				time.Minute,
+				"/usr/bin/apt-get",
+				"purge",
+				"-y",
+				"linux-image-6.12.57+deb13-amd64",
+			)
+			if err != nil {
+				t.Fatalf("runKernelPrivilegedNoninteractiveCommand returned error: %v", err)
+			}
+			if gotCommand != tt.wantCommand || strings.Join(gotArgs, "\x00") != strings.Join(tt.wantArgs, "\x00") {
+				t.Fatalf("unexpected invocation: %q %#v, want %q %#v", gotCommand, gotArgs, tt.wantCommand, tt.wantArgs)
+			}
+		})
+	}
+}
+
 func TestValidateKernelPurgeTargetsFromScanRejectsUnscannedPackage(t *testing.T) {
 	entries := []kernelSelectionEntry{
 		{Name: "linux-image-6.18.27-x64v3-xanmod1", Status: "install"},
@@ -582,12 +719,14 @@ func TestPurgePackagesFailureStillRunsSystemCleanup(t *testing.T) {
 	oldEnsure := kernelEnsureCleanupRuntime
 	oldResolveApt := kernelResolveAptCommand
 	oldRunPrivileged := kernelRunPrivilegedCommand
+	oldGetPlatform := kernelGetSystemPlatform
 	oldRunCleanup := kernelRunSystemCleanup
 	oldRunCommandOutput := kernelRunCommandOutput
 	defer func() {
 		kernelEnsureCleanupRuntime = oldEnsure
 		kernelResolveAptCommand = oldResolveApt
 		kernelRunPrivilegedCommand = oldRunPrivileged
+		kernelGetSystemPlatform = oldGetPlatform
 		kernelRunSystemCleanup = oldRunCleanup
 		kernelRunCommandOutput = oldRunCommandOutput
 	}()
@@ -595,6 +734,9 @@ func TestPurgePackagesFailureStillRunsSystemCleanup(t *testing.T) {
 	kernelEnsureCleanupRuntime = func() error { return nil }
 	kernelResolveAptCommand = func() (string, error) {
 		return "/usr/bin/apt-get", nil
+	}
+	kernelGetSystemPlatform = func() (*model.SystemPlatform, error) {
+		return &model.SystemPlatform{SystemFamily: "debian", KernelRelease: "6.18.29-x64v3-xanmod1"}, nil
 	}
 	kernelRunCommandOutput = func(timeout time.Duration, command string, args ...string) (string, error) {
 		if command == "dpkg" {
@@ -639,6 +781,78 @@ linux-headers-6.18.29-x64v3-xanmod1            install
 	}
 	if result.SystemCleanupSummary != "system cleanup completed" {
 		t.Fatalf("unexpected cleanup summary: %q", result.SystemCleanupSummary)
+	}
+}
+
+func TestPurgePackagesUsesNoninteractiveRunnerForCurrentDebianImage(t *testing.T) {
+	oldEnsure := kernelEnsureCleanupRuntime
+	oldResolveApt := kernelResolveAptCommand
+	oldRunPrivileged := kernelRunPrivilegedCommand
+	oldRunNoninteractive := kernelRunPrivilegedNoninteractiveCommand
+	oldGetPlatform := kernelGetSystemPlatform
+	oldRunCleanup := kernelRunSystemCleanup
+	oldRunCommandOutput := kernelRunCommandOutput
+	defer func() {
+		kernelEnsureCleanupRuntime = oldEnsure
+		kernelResolveAptCommand = oldResolveApt
+		kernelRunPrivilegedCommand = oldRunPrivileged
+		kernelRunPrivilegedNoninteractiveCommand = oldRunNoninteractive
+		kernelGetSystemPlatform = oldGetPlatform
+		kernelRunSystemCleanup = oldRunCleanup
+		kernelRunCommandOutput = oldRunCommandOutput
+	}()
+
+	const runningImage = "linux-image-6.12.57+deb13-amd64"
+	kernelEnsureCleanupRuntime = func() error { return nil }
+	kernelResolveAptCommand = func() (string, error) {
+		return "/usr/bin/apt-get", nil
+	}
+	kernelGetSystemPlatform = func() (*model.SystemPlatform, error) {
+		return &model.SystemPlatform{
+			OS:            "linux",
+			SystemFamily:  "debian",
+			KernelRelease: "6.12.57+deb13-amd64",
+		}, nil
+	}
+	kernelRunCommandOutput = func(_ time.Duration, command string, _ ...string) (string, error) {
+		if command != "dpkg" {
+			return "", fmt.Errorf("unexpected command: %s", command)
+		}
+		return `
+linux-image-6.12.57+deb13-amd64              install
+linux-headers-6.12.57+deb13-amd64            install
+linux-image-6.1.81-bbrplus                   install
+linux-headers-6.1.81-bbrplus                 install
+`, nil
+	}
+	standardRunnerCalled := false
+	kernelRunPrivilegedCommand = func(_ time.Duration, _ string, _ ...string) error {
+		standardRunnerCalled = true
+		return nil
+	}
+	var gotCommand string
+	var gotArgs []string
+	kernelRunPrivilegedNoninteractiveCommand = func(_ time.Duration, command string, args ...string) error {
+		gotCommand = command
+		gotArgs = append([]string(nil), args...)
+		return nil
+	}
+	kernelRunSystemCleanup = func() *kernelSystemCleanupReport {
+		return &kernelSystemCleanupReport{Done: true, Summary: "system cleanup completed"}
+	}
+
+	result, err := (&KernelManagerService{}).PurgePackages([]string{runningImage})
+	if err != nil {
+		t.Fatalf("PurgePackages returned error: %v", err)
+	}
+	if standardRunnerCalled {
+		t.Fatal("expected current Debian image purge to bypass the standard runner")
+	}
+	if gotCommand != "/usr/bin/apt-get" || strings.Join(gotArgs, "\x00") != strings.Join([]string{"purge", "-y", runningImage}, "\x00") {
+		t.Fatalf("unexpected noninteractive purge invocation: %q %#v", gotCommand, gotArgs)
+	}
+	if len(result.Succeeded) != 1 || result.Succeeded[0] != runningImage {
+		t.Fatalf("unexpected purge result: %#v", result)
 	}
 }
 

@@ -853,7 +853,7 @@ const settings = ref<Record<string, string>>({
   subAssignedCertificateRecordID: '0',
   subAssignedCertificateRecordIDs: '[]',
   subUpdates: '12',
-  subEncode: 'true',
+  subEncode: 'false',
   subShowInfo: 'false',
   subURI: '',
   serverTlsStoreEnabled: 'true',

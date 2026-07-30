@@ -1629,7 +1629,7 @@ export default {
     },
     optionTlsStore: {
       get(): boolean { return this.outTls.tls_store != undefined },
-      set(v:boolean) { this.tls.client.tls_store = v ? 'mozilla' : undefined }
+      set(v:boolean) { this.tls.client.tls_store = v ? 'chrome' : undefined }
     },
     optionFP: {
       get(): boolean { return this.outTls.utls != undefined },

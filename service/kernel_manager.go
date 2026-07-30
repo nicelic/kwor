@@ -46,12 +46,13 @@ var (
 type KernelManagerService struct{}
 
 const (
-	kernelProviderXanMod                    = "xanmod"
-	kernelProviderBBRPlus                   = "bbrplus"
-	kernelFailedCleanupDirName              = ".failed-cleanup"
-	kernelDownloadProgressTTL               = 30 * time.Minute
-	kernelUnknownPackageSizeEstimate  int64 = 50 * 1024 * 1024
-	kernelSourceForgeResponseMaxBytes int64 = 8 * 1024 * 1024
+	kernelProviderXanMod                     = "xanmod"
+	kernelProviderBBRPlus                    = "bbrplus"
+	kernelFailedCleanupDirName               = ".failed-cleanup"
+	kernelDownloadProgressTTL                = 30 * time.Minute
+	kernelUnknownPackageSizeEstimate   int64 = 50 * 1024 * 1024
+	kernelSourceForgeResponseMaxBytes  int64 = 8 * 1024 * 1024
+	kernelDebianNoninteractiveFrontend       = "DEBIAN_FRONTEND=noninteractive"
 )
 
 var kernelFailedDownloadCleanupDelay = 5 * time.Second
@@ -379,11 +380,14 @@ const kernelDownloadedMarkerSettingKey = "kernelDownloadedMarker"
 var kernelResolveAptCommand = resolveKernelAptCommand
 var kernelRunSystemCleanup = runKernelStrictSystemCleanup
 var kernelRunPrivilegedCommand = runKernelPrivilegedCommand
+var kernelRunPrivilegedNoninteractiveCommand = runKernelPrivilegedNoninteractiveCommand
 var kernelEnsureRuntimeSupported = ensureKernelRuntimeSupported
 var kernelEnsureCleanupRuntime = ensureKernelLinuxRuntime
 var kernelLookPath = exec.LookPath
 var kernelRunCommandOutput = runKernelCommandOutput
 var kernelRunCommandWithTimeout = runKernelCommandWithTimeout
+var kernelGetSystemPlatform = GetSystemPlatform
+var kernelGeteuid = os.Geteuid
 
 type kernelSystemCleanupReport struct {
 	Done     bool
@@ -1768,6 +1772,13 @@ func (s *KernelManagerService) purgePackagesLocked(packages []string) (result *K
 		result.Failed = append(result.Failed, targets...)
 		return result, err
 	}
+	platform, platformErr := kernelGetSystemPlatform()
+	if platformErr != nil {
+		err = fmt.Errorf("load system platform before kernel purge failed: %w", platformErr)
+		result.Message = "purge failed"
+		result.Failed = append(result.Failed, targets...)
+		return result, err
+	}
 
 	aptCommand, resolveErr := kernelResolveAptCommand()
 	if resolveErr != nil {
@@ -1787,7 +1798,11 @@ func (s *KernelManagerService) purgePackagesLocked(packages []string) (result *K
 	}
 
 	cleanupStarted = true
-	if err = kernelRunPrivilegedCommand(40*time.Minute, commandArgs[0], commandArgs[1:]...); err != nil {
+	runPurge := kernelRunPrivilegedCommand
+	if kernelPurgeNeedsNoninteractiveFrontend(platform.SystemFamily, platform.KernelRelease, targets) {
+		runPurge = kernelRunPrivilegedNoninteractiveCommand
+	}
+	if err = runPurge(40*time.Minute, commandArgs[0], commandArgs[1:]...); err != nil {
 		err = fmt.Errorf("kernel purge command failed: %w", err)
 		result.Message = "purge failed"
 		result.Failed = append(result.Failed, targets...)
@@ -2138,6 +2153,38 @@ func runKernelPrivilegedCommand(timeout time.Duration, command string, args ...s
 		}
 	}
 	return kernelRunCommandWithTimeout(timeout, command, args...)
+}
+
+// runKernelPrivilegedNoninteractiveCommand is used only for the Debian
+// linux-check-removal path after the panel has already accepted a manual purge
+// request for the running image. Running env through sudo keeps the explicit
+// DEBIAN_FRONTEND assignment intact even when sudo resets inherited variables.
+func runKernelPrivilegedNoninteractiveCommand(timeout time.Duration, command string, args ...string) error {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return fmt.Errorf("command is empty")
+	}
+
+	envPath, err := kernelLookPath("env")
+	if err != nil || strings.TrimSpace(envPath) == "" {
+		if err != nil {
+			return fmt.Errorf("env command not found: %w", err)
+		}
+		return fmt.Errorf("env command not found")
+	}
+
+	envArgs := make([]string, 0, len(args)+2)
+	envArgs = append(envArgs, kernelDebianNoninteractiveFrontend, command)
+	envArgs = append(envArgs, args...)
+	if kernelGeteuid() != 0 {
+		if sudoPath, sudoErr := kernelLookPath("sudo"); sudoErr == nil && strings.TrimSpace(sudoPath) != "" {
+			sudoArgs := make([]string, 0, len(envArgs)+2)
+			sudoArgs = append(sudoArgs, "-n", envPath)
+			sudoArgs = append(sudoArgs, envArgs...)
+			return kernelRunCommandWithTimeout(timeout, sudoPath, sudoArgs...)
+		}
+	}
+	return kernelRunCommandWithTimeout(timeout, envPath, envArgs...)
 }
 
 func (s *KernelManagerService) removeKernelDownloadPath(targetPath string) error {
@@ -2641,6 +2688,31 @@ func buildKernelPurgeCommand(aptCommand string, packages []string) []string {
 	args = append(args, aptCommand, "purge", "-y")
 	args = append(args, packages...)
 	return args
+}
+
+// kernelPurgeNeedsNoninteractiveFrontend only bypasses Debian's running-kernel
+// prompt for an explicitly selected, currently running image package. It is
+// not a general prompt-answering policy for APT or other package managers.
+func kernelPurgeNeedsNoninteractiveFrontend(systemFamily, currentKernel string, targets []string) bool {
+	if !strings.EqualFold(strings.TrimSpace(systemFamily), "debian") {
+		return false
+	}
+	currentKernel = strings.TrimSpace(currentKernel)
+	if currentKernel == "" {
+		return false
+	}
+
+	for _, target := range targets {
+		name := strings.TrimSpace(target)
+		if !strings.HasPrefix(strings.ToLower(name), "linux-image-") {
+			continue
+		}
+		kernelID := strings.TrimSpace(name[len("linux-image-"):])
+		if strings.EqualFold(kernelID, currentKernel) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeKernelPurgeTargets(packages []string) ([]string, error) {
