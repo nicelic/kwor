@@ -49,7 +49,9 @@ const (
 	kernelProviderXanMod                     = "xanmod"
 	kernelProviderBBRPlus                    = "bbrplus"
 	kernelFailedCleanupDirName               = ".failed-cleanup"
+	kernelManagedDownloadTaskDeadline        = 60 * time.Minute
 	kernelDownloadProgressTTL                = 30 * time.Minute
+	kernelInstallStatusTTL                   = 30 * time.Minute
 	kernelUnknownPackageSizeEstimate   int64 = 50 * 1024 * 1024
 	kernelSourceForgeResponseMaxBytes  int64 = 8 * 1024 * 1024
 	kernelDebianNoninteractiveFrontend       = "DEBIAN_FRONTEND=noninteractive"
@@ -58,9 +60,12 @@ const (
 var kernelFailedDownloadCleanupDelay = 5 * time.Second
 
 var kernelDownloadProgressStore = newKernelDownloadProgressStore()
+var kernelInstallStatusStore = newKernelInstallStatusStore()
 var kernelDownloadCleanupStore = newKernelDownloadCleanupScheduler()
 var kernelOperationMu sync.Mutex
-var kernelDownloadTaskManager = NewManagedDownloadTaskManager("kernel package download")
+var kernelDownloadTaskManager = NewManagedDownloadTaskManagerWithOptions("kernel package download", ManagedDownloadTaskManagerOptions{
+	Deadline: kernelManagedDownloadTaskDeadline,
+})
 
 var bbrplusVersionDisplayPriority = map[string]int{
 	"6.1.81-bbrplus": 0,
@@ -308,6 +313,33 @@ type KernelInstallResult struct {
 	SystemCleanupSummary  string   `json:"systemCleanupSummary,omitempty"`
 }
 
+type KernelInstallStatus struct {
+	Active                bool     `json:"active"`
+	State                 string   `json:"state"`
+	Installing            bool     `json:"installing"`
+	Verified              bool     `json:"verified"`
+	Installed             bool     `json:"installed"`
+	NeedsReboot           bool     `json:"needsReboot"`
+	Command               string   `json:"command,omitempty"`
+	TargetPackages        []string `json:"targetPackages,omitempty"`
+	PinnedKernel          string   `json:"pinnedKernel,omitempty"`
+	PinnedUpdated         bool     `json:"pinnedUpdated"`
+	CleanupDone           bool     `json:"cleanupDone"`
+	CleanupWarning        string   `json:"cleanupWarning,omitempty"`
+	SystemCleanupDone     bool     `json:"systemCleanupDone"`
+	SystemCleanupWarnings []string `json:"systemCleanupWarnings,omitempty"`
+	SystemCleanupSummary  string   `json:"systemCleanupSummary,omitempty"`
+	Error                 string   `json:"error,omitempty"`
+	StartedAt             int64    `json:"startedAt"`
+	UpdatedAt             int64    `json:"updatedAt"`
+	FinishedAt            int64    `json:"finishedAt,omitempty"`
+}
+
+type kernelInstallStatusSnapshotStore struct {
+	mu       sync.Mutex
+	snapshot *KernelInstallStatus
+}
+
 type KernelCleanupPackageItem struct {
 	Name            string `json:"name"`
 	Status          string `json:"status"`
@@ -383,10 +415,11 @@ var kernelRunPrivilegedCommand = runKernelPrivilegedCommand
 var kernelRunPrivilegedNoninteractiveCommand = runKernelPrivilegedNoninteractiveCommand
 var kernelEnsureRuntimeSupported = ensureKernelRuntimeSupported
 var kernelEnsureCleanupRuntime = ensureKernelLinuxRuntime
+var kernelEnsureRebootRuntime = ensureKernelLinuxRuntime
 var kernelLookPath = exec.LookPath
 var kernelRunCommandOutput = runKernelCommandOutput
 var kernelRunCommandWithTimeout = runKernelCommandWithTimeout
-var kernelGetSystemPlatform = GetSystemPlatform
+var kernelGetSystemPlatform = GetSystemPlatformOrDetect
 var kernelGeteuid = os.Geteuid
 
 type kernelSystemCleanupReport struct {
@@ -474,6 +507,10 @@ func newKernelDownloadCleanupScheduler() *kernelDownloadCleanupScheduler {
 	return &kernelDownloadCleanupScheduler{
 		states: make(map[string]*kernelDownloadCleanupState),
 	}
+}
+
+func newKernelInstallStatusStore() *kernelInstallStatusSnapshotStore {
+	return &kernelInstallStatusSnapshotStore{}
 }
 
 func (s *kernelDownloadCleanupScheduler) markRunning(key string) {
@@ -593,6 +630,110 @@ func (s *kernelDownloadCleanupScheduler) scheduleFailedCleanup(key string, delay
 		delete(s.states, trimmed)
 	})
 	s.mu.Unlock()
+}
+
+func (s *kernelInstallStatusSnapshotStore) start() {
+	now := time.Now().Unix()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snapshot = &KernelInstallStatus{
+		Active:     true,
+		State:      "running",
+		Installing: true,
+		StartedAt:  now,
+		UpdatedAt:  now,
+	}
+}
+
+func (s *kernelInstallStatusSnapshotStore) setCommandAndTargets(command string, targetPackages []string) {
+	now := time.Now().Unix()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.snapshot == nil {
+		s.snapshot = &KernelInstallStatus{
+			State:      "running",
+			Installing: true,
+			StartedAt:  now,
+		}
+	}
+	s.snapshot.Active = true
+	s.snapshot.State = "running"
+	s.snapshot.Installing = true
+	s.snapshot.Command = strings.TrimSpace(command)
+	s.snapshot.TargetPackages = append([]string(nil), targetPackages...)
+	s.snapshot.UpdatedAt = now
+	if s.snapshot.StartedAt == 0 {
+		s.snapshot.StartedAt = now
+	}
+}
+
+func (s *kernelInstallStatusSnapshotStore) finish(result *KernelInstallResult, err error) {
+	now := time.Now().Unix()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.snapshot == nil {
+		s.snapshot = &KernelInstallStatus{
+			StartedAt: now,
+		}
+	}
+
+	s.snapshot.Active = false
+	s.snapshot.Installing = false
+	s.snapshot.UpdatedAt = now
+	s.snapshot.FinishedAt = now
+	if result != nil {
+		s.snapshot.Installed = result.Installed
+		s.snapshot.Verified = result.Installed
+		s.snapshot.NeedsReboot = result.NeedsReboot
+		if strings.TrimSpace(result.Command) != "" {
+			s.snapshot.Command = strings.TrimSpace(result.Command)
+		}
+		if len(result.InstalledPackage) > 0 {
+			s.snapshot.TargetPackages = append([]string(nil), result.InstalledPackage...)
+		}
+		s.snapshot.PinnedKernel = strings.TrimSpace(result.PinnedKernel)
+		s.snapshot.PinnedUpdated = result.PinnedUpdated
+		s.snapshot.CleanupDone = result.CleanupDone
+		s.snapshot.CleanupWarning = strings.TrimSpace(result.CleanupWarning)
+		s.snapshot.SystemCleanupDone = result.SystemCleanupDone
+		s.snapshot.SystemCleanupWarnings = append([]string(nil), result.SystemCleanupWarnings...)
+		s.snapshot.SystemCleanupSummary = strings.TrimSpace(result.SystemCleanupSummary)
+	}
+	if err != nil {
+		s.snapshot.State = "error"
+		s.snapshot.Error = strings.TrimSpace(err.Error())
+		return
+	}
+	s.snapshot.State = "success"
+	s.snapshot.Error = ""
+}
+
+func (s *kernelInstallStatusSnapshotStore) snapshotStatus() *KernelInstallStatus {
+	now := time.Now().Unix()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.snapshot == nil {
+		return &KernelInstallStatus{
+			State:     "missing",
+			StartedAt: now,
+			UpdatedAt: now,
+		}
+	}
+	if !s.snapshot.Active {
+		ttlSeconds := int64(kernelInstallStatusTTL / time.Second)
+		if now-s.snapshot.UpdatedAt > ttlSeconds {
+			s.snapshot = nil
+			return &KernelInstallStatus{
+				State:     "missing",
+				StartedAt: now,
+				UpdatedAt: now,
+			}
+		}
+	}
+	clone := *s.snapshot
+	clone.TargetPackages = append([]string(nil), s.snapshot.TargetPackages...)
+	clone.SystemCleanupWarnings = append([]string(nil), s.snapshot.SystemCleanupWarnings...)
+	return &clone
 }
 
 func (s *kernelDownloadProgressSessionStore) start(id string, totalCount int) *kernelDownloadProgressSession {
@@ -1358,6 +1499,10 @@ func (s *KernelManagerService) GetManagedDownloadProgress(id string) *KernelDown
 	return applyManagedTaskToKernelProgress(s.GetDownloadProgress(progressID), task)
 }
 
+func (s *KernelManagerService) GetInstallStatus() *KernelInstallStatus {
+	return kernelInstallStatusStore.snapshotStatus()
+}
+
 func (s *KernelManagerService) StartManagedDownloadPackages(provider, line, version, arch string) (*KernelDownloadProgress, error) {
 	fingerprint := strings.Join([]string{strings.TrimSpace(provider), strings.TrimSpace(line), strings.TrimSpace(version), strings.TrimSpace(arch)}, "|")
 	handle, status, created, err := kernelDownloadTaskManager.Start("kernel-download", fingerprint)
@@ -1985,6 +2130,15 @@ func (s *KernelManagerService) installDownloadedPackagesLocked(provider, line, v
 		NeedsReboot:      kernelRebootHintRequired(),
 		InstalledPackage: []string{},
 	}
+	statusStarted := false
+	defer func() {
+		if !statusStarted {
+			return
+		}
+		kernelInstallStatusStore.finish(result, err)
+	}()
+	kernelInstallStatusStore.start()
+	statusStarted = true
 	defer func() {
 		systemCleanup := kernelRunSystemCleanup()
 		if result != nil {
@@ -2027,6 +2181,7 @@ func (s *KernelManagerService) installDownloadedPackagesLocked(provider, line, v
 	headersPackage := kernelDebPackageName(headersDeb)
 	result.Command = strings.Join(commandArgs, " ")
 	result.InstalledPackage = []string{imagePackage, headersPackage}
+	kernelInstallStatusStore.setCommandAndTargets(result.Command, result.InstalledPackage)
 
 	if err = kernelRunCommandWithTimeout(40*time.Minute, commandArgs[0], commandArgs[1:]...); err != nil {
 		err = fmt.Errorf("kernel package install failed: %w", err)
@@ -2236,20 +2391,10 @@ func (s *KernelManagerService) RebootSystem() error {
 	}
 	defer release()
 
-	if err := ensureKernelLinuxRuntime(); err != nil {
+	if err := kernelEnsureRebootRuntime(); err != nil {
 		return err
 	}
-
-	rebootPath, err := kernelLookPath("reboot")
-	if err != nil {
-		return fmt.Errorf("reboot command not found: %w", err)
-	}
-
-	sudoPath, _ := kernelLookPath("sudo")
-	if os.Geteuid() != 0 && strings.TrimSpace(sudoPath) != "" {
-		return kernelRunCommandWithTimeout(12*time.Second, sudoPath, "-n", rebootPath)
-	}
-	return kernelRunCommandWithTimeout(12*time.Second, rebootPath)
+	return kernelScheduleRebootWorkerFn()
 }
 
 func (s *KernelManagerService) resolveKernelArchDirectory(provider, line, version, arch string) (string, error) {
@@ -3118,7 +3263,7 @@ func extractKernelArchLevel(rawName string) string {
 }
 
 func ensureKernelLinuxRuntime() error {
-	platform, err := GetSystemPlatform()
+	platform, err := kernelGetSystemPlatform()
 	if err != nil {
 		return fmt.Errorf("load system platform failed: %w", err)
 	}
@@ -3129,7 +3274,7 @@ func ensureKernelLinuxRuntime() error {
 }
 
 func ensureKernelRuntimeSupported() error {
-	platform, err := GetSystemPlatform()
+	platform, err := kernelGetSystemPlatform()
 	if err != nil {
 		return fmt.Errorf("load system platform failed: %w", err)
 	}

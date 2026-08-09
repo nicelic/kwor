@@ -37,13 +37,19 @@ const (
 	managedCoreConfigMaterializeTTL = 10 * time.Second
 	singboxConfigCheckTimeout       = 8 * time.Second
 
-	coreAutoCheckEnabledKey       = "coreAutoCheckEnabled"
-	coreAutoCheckIntervalHoursKey = "coreAutoCheckIntervalHours"
-	coreAutoCheckLastAtKey        = "coreAutoCheckLastAt"
-	coreAutoCheckLatestStableKey  = "coreAutoCheckLatestStable"
-	coreAutoCheckLatestAlphaKey   = "coreAutoCheckLatestAlpha"
-	coreAutoCheckPendingStableKey = "coreAutoCheckPendingStable"
-	coreAutoCheckPendingAlphaKey  = "coreAutoCheckPendingAlpha"
+	coreAutoCheckEnabledKey        = "coreAutoCheckEnabled"
+	coreAutoCheckIntervalHoursKey  = "coreAutoCheckIntervalHours"
+	coreAutoCheckLastAtKey         = "coreAutoCheckLastAt"
+	coreAutoCheckLatestStableKey   = "coreAutoCheckLatestStable"
+	coreAutoCheckLatestAlphaKey    = "coreAutoCheckLatestAlpha"
+	coreAutoCheckPendingStableKey  = "coreAutoCheckPendingStable"
+	coreAutoCheckPendingAlphaKey   = "coreAutoCheckPendingAlpha"
+	coreAutoUpdateEnabledKey       = "coreAutoUpdateEnabled"
+	coreAutoUpdateLastAttemptKey   = "coreAutoUpdateLastAttemptAt"
+	coreAutoUpdateLastSuccessKey   = "coreAutoUpdateLastSuccessAt"
+	coreAutoUpdateErrorKey         = "coreAutoUpdateError"
+	coreAutoUpdateErrorAtKey       = "coreAutoUpdateErrorAt"
+	coreAutoUpdateDisableReasonKey = "coreAutoUpdateDisableReason"
 )
 
 var legacySingboxSystemdNames = []string{
@@ -168,6 +174,7 @@ type SingboxCoreInfo struct {
 	Platform           string                        `json:"platform"`
 	RuntimeMode        string                        `json:"runtimeMode,omitempty"`
 	InstalledTarget    SingboxCoreDownloadTarget     `json:"installedTarget,omitempty"`
+	InstalledChannel   string                        `json:"installedChannel,omitempty"`
 	DownloadPreference SingboxCoreDownloadPreference `json:"downloadPreference"`
 }
 
@@ -199,15 +206,22 @@ type SingboxCoreDownloadTarget struct {
 }
 
 type SingboxCoreUpdateInfo struct {
-	Enabled       bool   `json:"enabled"`
-	IntervalHours int    `json:"intervalHours"`
-	LastCheckedAt int64  `json:"lastCheckedAt"`
-	LatestStable  string `json:"latestStable"`
-	LatestAlpha   string `json:"latestAlpha"`
-	PendingStable string `json:"pendingStable"`
-	PendingAlpha  string `json:"pendingAlpha"`
-	HasUpdate     bool   `json:"hasUpdate"`
-	UpdateCount   int    `json:"updateCount"`
+	Enabled                 bool   `json:"enabled"`
+	IntervalHours           int    `json:"intervalHours"`
+	LastCheckedAt           int64  `json:"lastCheckedAt"`
+	LatestStable            string `json:"latestStable"`
+	LatestAlpha             string `json:"latestAlpha"`
+	PendingStable           string `json:"pendingStable"`
+	PendingAlpha            string `json:"pendingAlpha"`
+	HasUpdate               bool   `json:"hasUpdate"`
+	UpdateCount             int    `json:"updateCount"`
+	AutoUpdateEnabled       bool   `json:"autoUpdateEnabled"`
+	AutoUpdateDisabled      bool   `json:"autoUpdateDisabled"`
+	AutoUpdateDisableReason string `json:"autoUpdateDisableReason"`
+	AutoUpdateLastAttemptAt int64  `json:"autoUpdateLastAttemptAt"`
+	AutoUpdateLastSuccessAt int64  `json:"autoUpdateLastSuccessAt"`
+	AutoUpdateError         string `json:"autoUpdateError"`
+	AutoUpdateErrorAt       int64  `json:"autoUpdateErrorAt"`
 }
 
 func (s *CoreManagerService) getCoreDir() string {
@@ -384,18 +398,24 @@ func (s *CoreManagerService) GetCoreStatus() (*SingboxCoreInfo, error) {
 
 	binPath := s.getCoreBinPath()
 	if !IsSystemPlatformWindows() {
-		inspection := inspectManagedLinuxCoreBinary(binPath, "sing-box", func(statInfo os.FileInfo, forceRefresh bool) (string, string) {
-			return s.getCachedLocalVersion(binPath, statInfo, forceRefresh)
-		})
+		inspection := s.inspectManagedLocalSingboxBinary(binPath)
 		info.Installed = inspection.Installed
 		info.Compatible = inspection.Compatible
 		info.LocalVersion = inspection.Version
 		info.VersionInfo = inspection.VersionInfo
 		if inspection.Architecture != "" {
-			info.InstalledTarget = SingboxCoreDownloadTarget{OS: "linux", Arch: inspection.Architecture}
+			info.InstalledTarget = SingboxCoreDownloadTarget{
+				OS:   "linux",
+				Arch: inspection.Architecture,
+				Libc: inspection.Libc,
+			}
+		}
+		if channel := strings.TrimSpace(inspection.Channel); channel != "" {
+			info.InstalledChannel = channel
 		}
 		if !inspection.Installed {
 			clearCoreLocalVersionCache(binPath)
+			clearSingboxCoreLocalTargetCache(binPath)
 		}
 	} else if statInfo, err := os.Stat(binPath); err == nil {
 		info.Installed = true
@@ -406,8 +426,10 @@ func (s *CoreManagerService) GetCoreStatus() (*SingboxCoreInfo, error) {
 			installedTarget = inferSingboxTargetFromPlatform(info.Platform)
 		}
 		info.InstalledTarget = mergeSingboxInstalledTargetWithPreference(installedTarget, info.DownloadPreference.Target)
+		info.InstalledChannel = detectSingboxInstalledChannel(info.LocalVersion, info.VersionInfo)
 	} else {
 		clearCoreLocalVersionCache(binPath)
+		clearSingboxCoreLocalTargetCache(binPath)
 	}
 
 	info.Running = s.isRunning()
@@ -670,6 +692,7 @@ func (s *CoreManagerService) GetRemoteVersionsPage(channel string, page int, per
 
 func pickSingboxAssetFromAssets(version string, assets []GitHubAsset, target SingboxCoreDownloadTarget) (GitHubAsset, bool) {
 	version = strings.TrimPrefix(strings.TrimSpace(version), "v")
+	explicitLibc := strings.TrimSpace(target.Libc) != ""
 	normalizedTarget := target
 	if normalizedTarget.OS == "" {
 		normalizedTarget.OS = GetSystemPlatformOS()
@@ -678,9 +701,8 @@ func pickSingboxAssetFromAssets(version string, assets []GitHubAsset, target Sin
 		normalizedTarget.Arch = GetSystemPlatformArchitecture()
 	}
 	normalizedTarget = (&CoreManagerService{}).normalizeDownloadTarget(normalizedTarget)
-	ext := coreArchiveExtForOS(normalizedTarget.OS)
 
-	for _, candidateName := range buildCoreAssetCandidates(version, normalizedTarget) {
+	for _, candidateName := range buildCoreAssetCandidates(version, normalizedTarget, explicitLibc) {
 		for _, asset := range assets {
 			if asset.Name == candidateName {
 				return asset, true
@@ -688,6 +710,11 @@ func pickSingboxAssetFromAssets(version string, assets []GitHubAsset, target Sin
 		}
 	}
 
+	if explicitLibc {
+		return GitHubAsset{}, false
+	}
+
+	ext := coreArchiveExtForOS(normalizedTarget.OS)
 	for _, asset := range assets {
 		if assetMatchesDownloadTarget(asset, normalizedTarget, ext) {
 			return asset, true
@@ -703,6 +730,7 @@ func (s *CoreManagerService) getDownloadAsset(version string, target SingboxCore
 
 func (s *CoreManagerService) getDownloadAssetContext(ctx context.Context, version string, target SingboxCoreDownloadTarget) (string, error) {
 	apiURL := fmt.Sprintf("https://api.github.com/repos/SagerNet/sing-box/releases/tags/%s", version)
+	explicitLibc := strings.TrimSpace(target.Libc) != ""
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
@@ -733,9 +761,8 @@ func (s *CoreManagerService) getDownloadAssetContext(ctx context.Context, versio
 
 	ver := strings.TrimPrefix(release.TagName, "v")
 	normalizedTarget := s.normalizeDownloadTarget(target)
-	ext := coreArchiveExtForOS(normalizedTarget.OS)
 
-	for _, candidateName := range buildCoreAssetCandidates(ver, normalizedTarget) {
+	for _, candidateName := range buildCoreAssetCandidates(ver, normalizedTarget, explicitLibc) {
 		for _, asset := range release.Assets {
 			if asset.Name == candidateName {
 				return asset.BrowserDownloadURL, nil
@@ -743,9 +770,12 @@ func (s *CoreManagerService) getDownloadAssetContext(ctx context.Context, versio
 		}
 	}
 
-	for _, asset := range release.Assets {
-		if assetMatchesDownloadTarget(asset, normalizedTarget, ext) {
-			return asset.BrowserDownloadURL, nil
+	if !explicitLibc {
+		ext := coreArchiveExtForOS(normalizedTarget.OS)
+		for _, asset := range release.Assets {
+			if assetMatchesDownloadTarget(asset, normalizedTarget, ext) {
+				return asset.BrowserDownloadURL, nil
+			}
 		}
 	}
 
@@ -788,7 +818,7 @@ func coreArchiveExtForOS(goos string) string {
 	return ".tar.gz"
 }
 
-func buildCoreAssetCandidates(version string, target SingboxCoreDownloadTarget) []string {
+func buildCoreAssetCandidates(version string, target SingboxCoreDownloadTarget, strictLibc bool) []string {
 	ext := coreArchiveExtForOS(target.OS)
 	candidates := make([]string, 0, 3)
 	appendUnique := func(name string) {
@@ -807,7 +837,9 @@ func buildCoreAssetCandidates(version string, target SingboxCoreDownloadTarget) 
 		switch target.Libc {
 		case "glibc", "musl":
 			appendUnique(fmt.Sprintf("sing-box-%s-linux-%s-%s%s", version, target.Arch, target.Libc, ext))
-			appendUnique(fmt.Sprintf("sing-box-%s-linux-%s%s", version, target.Arch, ext))
+			if !strictLibc {
+				appendUnique(fmt.Sprintf("sing-box-%s-linux-%s%s", version, target.Arch, ext))
+			}
 		case "universal":
 			appendUnique(fmt.Sprintf("sing-box-%s-linux-%s%s", version, target.Arch, ext))
 		default:
@@ -959,7 +991,7 @@ func (s *CoreManagerService) downloadCoreWithContext(operationContext context.Co
 		failProgress(coreDownloadStageDownloading, err)
 		return "", err
 	}
-	downloadURL, err := s.getDownloadAssetContext(operationContext, version, normalizedTarget)
+	downloadURL, err := s.getDownloadAssetContext(operationContext, version, target)
 	if err != nil {
 		failProgress(coreDownloadStageDownloading, err)
 		return "", err
@@ -1098,6 +1130,9 @@ func (s *CoreManagerService) downloadCoreWithContext(operationContext context.Co
 	logger.Info("sing-box 下载完成, 版本: ", localVersion)
 	if err := s.SaveDownloadTarget(normalizedTarget); err != nil {
 		logger.Warning("failed to save core download preference: ", err)
+	}
+	if clearErr := s.ClearCoreAutoUpdateDisableReason(); clearErr != nil {
+		logger.Warning("clear sing-box auto update disable reason after download failed: ", clearErr)
 	}
 
 	if wasRunning {
@@ -1427,6 +1462,11 @@ func (s *CoreManagerService) DeleteCore() error {
 
 	s.isStarted = false
 	s.coreCmd = nil
+	clearCoreLocalVersionCache(binPath)
+	clearSingboxCoreLocalTargetCache(binPath)
+	if disableErr := s.DisableCoreAutoUpdate("本地未安装 sing-box 内核"); disableErr != nil {
+		logger.Warning("disable sing-box auto update after core delete failed: ", disableErr)
+	}
 	return nil
 }
 
@@ -2083,15 +2123,41 @@ func (s *CoreManagerService) buildSingboxCoreUpdateInfo() (*SingboxCoreUpdateInf
 	if err != nil {
 		return nil, err
 	}
+	autoUpdateState, err := s.getCoreAutoUpdateState()
+	if err != nil {
+		return nil, err
+	}
+	status, statusErr := s.GetCoreStatus()
+	if statusErr == nil {
+		pendingStable, pendingAlpha = selectSingboxPendingUpdateForChannel(status, pendingStable, pendingAlpha)
+	} else {
+		pendingStable = ""
+		pendingAlpha = ""
+	}
 
 	info := &SingboxCoreUpdateInfo{
-		Enabled:       enabled,
-		IntervalHours: intervalHours,
-		LastCheckedAt: lastCheckedAt,
-		LatestStable:  latestStable,
-		LatestAlpha:   latestAlpha,
-		PendingStable: pendingStable,
-		PendingAlpha:  pendingAlpha,
+		Enabled:                 enabled,
+		IntervalHours:           intervalHours,
+		LastCheckedAt:           lastCheckedAt,
+		LatestStable:            latestStable,
+		LatestAlpha:             latestAlpha,
+		PendingStable:           pendingStable,
+		PendingAlpha:            pendingAlpha,
+		AutoUpdateEnabled:       autoUpdateState.Enabled,
+		AutoUpdateLastAttemptAt: autoUpdateState.LastAttemptAt,
+		AutoUpdateLastSuccessAt: autoUpdateState.LastSuccessAt,
+		AutoUpdateError:         autoUpdateState.Error,
+		AutoUpdateErrorAt:       autoUpdateState.ErrorAt,
+	}
+	if statusErr == nil {
+		info.AutoUpdateDisabled = singboxShouldDisableAutoUpdateInUI(autoUpdateState.Enabled, status)
+		if info.AutoUpdateDisabled {
+			if autoUpdateState.DisableReason != "" {
+				info.AutoUpdateDisableReason = autoUpdateState.DisableReason
+			} else {
+				info.AutoUpdateDisableReason = singboxAutoUpdateReadinessReason(status)
+			}
+		}
 	}
 	if pendingStable != "" {
 		info.UpdateCount++
@@ -2104,7 +2170,7 @@ func (s *CoreManagerService) buildSingboxCoreUpdateInfo() (*SingboxCoreUpdateInf
 }
 
 // SetCoreAutoCheckSettings updates auto-check switch and check interval (hours).
-func (s *CoreManagerService) SetCoreAutoCheckSettings(enabled bool, intervalHours int) error {
+func (s *CoreManagerService) SetCoreAutoCheckSettings(enabled bool, intervalHours int, hasAutoUpdate bool, autoUpdateEnabled bool) error {
 	if intervalHours <= 0 {
 		intervalHours = 12
 	}
@@ -2113,11 +2179,34 @@ func (s *CoreManagerService) SetCoreAutoCheckSettings(enabled bool, intervalHour
 	defer coreAutoCheckMu.Unlock()
 
 	settingSvc := &SettingService{}
+	prevAutoUpdateEnabled, err := settingSvc.getBool(coreAutoUpdateEnabledKey)
+	if err != nil {
+		return err
+	}
 	if err := settingSvc.setString(coreAutoCheckEnabledKey, strconv.FormatBool(enabled)); err != nil {
 		return err
 	}
 	if err := settingSvc.setString(coreAutoCheckIntervalHoursKey, strconv.Itoa(intervalHours)); err != nil {
 		return err
+	}
+	if hasAutoUpdate {
+		if autoUpdateEnabled && !prevAutoUpdateEnabled {
+			status, err := s.GetCoreStatus()
+			if err != nil {
+				return err
+			}
+			if reason := singboxAutoUpdateReadinessReason(status); reason != "" {
+				return fmt.Errorf("%s", reason)
+			}
+		}
+		if err := s.setCoreAutoUpdateEnabledLocked(settingSvc, autoUpdateEnabled); err != nil {
+			return err
+		}
+		if autoUpdateEnabled {
+			if err := s.clearCoreAutoUpdateDisableReasonLocked(settingSvc); err != nil {
+				return err
+			}
+		}
 	}
 
 	if !enabled {
@@ -2520,6 +2609,9 @@ func (s *CoreManagerService) downloadCoreFromURLWithContext(operationContext con
 	binPath := filepath.Join(coreDir, binName)
 	localVersion, _ := s.getLocalVersion(binPath)
 	logger.Info("custom core download complete, version: ", localVersion)
+	if clearErr := s.ClearCoreAutoUpdateDisableReason(); clearErr != nil {
+		logger.Warning("clear sing-box auto update disable reason after custom download failed: ", clearErr)
+	}
 
 	if wasRunning {
 		SetCoreDownloadProgressStage(sessionID, coreDownloadStageStarting)

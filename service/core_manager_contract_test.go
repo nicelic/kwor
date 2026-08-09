@@ -42,9 +42,10 @@ func TestCoreManagerContracts(t *testing.T) {
 
 	t.Run("status JSON contracts are independent", func(t *testing.T) {
 		singboxJSON, err := json.Marshal(SingboxCoreInfo{
-			Installed:       true,
-			Compatible:      true,
-			InstalledTarget: SingboxCoreDownloadTarget{OS: "linux", Arch: "amd64", Libc: "glibc"},
+			Installed:        true,
+			Compatible:       true,
+			InstalledTarget:  SingboxCoreDownloadTarget{OS: "linux", Arch: "amd64", Libc: "glibc"},
+			InstalledChannel: singboxReleaseChannelAlpha,
 			DownloadPreference: SingboxCoreDownloadPreference{
 				Target: SingboxCoreDownloadTarget{OS: "linux", Arch: "amd64", Libc: "musl"},
 			},
@@ -58,11 +59,15 @@ func TestCoreManagerContracts(t *testing.T) {
 		if !strings.Contains(string(singboxJSON), `"installed":true`) || !strings.Contains(string(singboxJSON), `"compatible":true`) {
 			t.Fatalf("sing-box status lost installed/compatible fields: %s", singboxJSON)
 		}
+		if !strings.Contains(string(singboxJSON), `"installedChannel":"alpha"`) {
+			t.Fatalf("sing-box status lost installed channel: %s", singboxJSON)
+		}
 
 		mihomoJSON, err := json.Marshal(MihomoCoreInfo{
-			Installed:       true,
-			Compatible:      false,
-			InstalledTarget: MihomoCoreDownloadTarget{OS: "linux", Arch: "amd64", Amd64Level: "v2"},
+			Installed:        true,
+			Compatible:       false,
+			InstalledTarget:  MihomoCoreDownloadTarget{OS: "linux", Arch: "amd64", Amd64Level: "v2"},
+			InstalledChannel: mihomoReleaseChannelAlpha,
 			DownloadPreference: MihomoCoreDownloadPreference{
 				Target: MihomoCoreDownloadTarget{OS: "linux", Arch: "amd64", Amd64Level: "v3"},
 			},
@@ -74,6 +79,9 @@ func TestCoreManagerContracts(t *testing.T) {
 			!strings.Contains(string(mihomoJSON), `"amd64Level":"v3"`) {
 			t.Fatalf("Mihomo status lost AMD64 levels: %s", mihomoJSON)
 		}
+		if !strings.Contains(string(mihomoJSON), `"installedChannel":"alpha"`) {
+			t.Fatalf("Mihomo status lost installed channel: %s", mihomoJSON)
+		}
 		if !strings.Contains(string(mihomoJSON), `"installed":true`) || !strings.Contains(string(mihomoJSON), `"compatible":false`) {
 			t.Fatalf("Mihomo status lost installed/compatible fields: %s", mihomoJSON)
 		}
@@ -84,6 +92,21 @@ func TestCoreManagerContracts(t *testing.T) {
 		}
 		if strings.Contains(string(undetectedJSON), `"arch":"amd64"`) {
 			t.Fatalf("undetected status fabricated a host architecture: %s", undetectedJSON)
+		}
+	})
+
+	t.Run("Mihomo status preference backfills missing runtime target fields", func(t *testing.T) {
+		svc := &MihomoCoreManagerService{}
+		normalized := svc.normalizeStatusDownloadPreference(MihomoCoreDownloadPreference{
+			Target:    MihomoCoreDownloadTarget{Arch: "amd64"},
+			CustomURL: " https://example.com/mihomo.gz ",
+		})
+		wantTarget := svc.normalizeDownloadTarget(MihomoCoreDownloadTarget{Arch: "amd64"})
+		if normalized.Target != wantTarget {
+			t.Fatalf("normalized Mihomo target mismatch: got=%+v want=%+v", normalized.Target, wantTarget)
+		}
+		if normalized.CustomURL != "https://example.com/mihomo.gz" {
+			t.Fatalf("normalized Mihomo custom URL mismatch: %q", normalized.CustomURL)
 		}
 	})
 }
@@ -113,6 +136,22 @@ func TestCoreAssetSelectionContracts(t *testing.T) {
 		}
 	})
 
+	t.Run("sing-box explicit libc does not fall back", func(t *testing.T) {
+		assets := []GitHubAsset{
+			{Name: "sing-box-1.14.0-linux-amd64.tar.gz"},
+		}
+		if _, ok := pickSingboxAssetFromAssets("v1.14.0", assets, SingboxCoreDownloadTarget{
+			OS: "linux", Arch: "amd64", Libc: "glibc",
+		}); ok {
+			t.Fatal("explicit glibc target unexpectedly fell back to universal asset")
+		}
+		if _, ok := pickSingboxAssetFromAssets("v1.14.0", assets, SingboxCoreDownloadTarget{
+			OS: "linux", Arch: "amd64", Libc: "musl",
+		}); ok {
+			t.Fatal("explicit musl target unexpectedly fell back to universal asset")
+		}
+	})
+
 	t.Run("Mihomo AMD64 levels", func(t *testing.T) {
 		assets := []GitHubAsset{
 			{Name: "mihomo-linux-amd64-v1-v1.19.10.gz"},
@@ -126,6 +165,85 @@ func TestCoreAssetSelectionContracts(t *testing.T) {
 			want := "mihomo-linux-amd64-" + level + "-v1.19.10.gz"
 			if !ok || asset.Name != want {
 				t.Fatalf("level=%s: got=%q ok=%v want=%q", level, asset.Name, ok, want)
+			}
+		}
+	})
+
+	t.Run("Mihomo explicit AMD64 level does not fall back", func(t *testing.T) {
+		assets := []GitHubAsset{
+			{Name: "mihomo-linux-amd64-v1-v1.19.10.gz"},
+			{Name: "mihomo-linux-amd64-v1.19.10.gz"},
+		}
+		if _, ok := pickMihomoAssetFromAssets(assets, MihomoCoreDownloadTarget{
+			OS: "linux", Arch: "amd64", Amd64Level: "v2",
+		}); ok {
+			t.Fatal("explicit v2 target unexpectedly fell back to a non-v2 Mihomo asset")
+		}
+		if _, ok := pickMihomoAssetFromAssets(assets, MihomoCoreDownloadTarget{
+			OS: "linux", Arch: "amd64", Amd64Level: "v3",
+		}); ok {
+			t.Fatal("explicit v3 target unexpectedly fell back to a non-v3 Mihomo asset")
+		}
+	})
+
+	t.Run("sing-box update info exposes auto update fields", func(t *testing.T) {
+		payload, err := json.Marshal(SingboxCoreUpdateInfo{
+			Enabled:                 true,
+			IntervalHours:           12,
+			AutoUpdateEnabled:       true,
+			AutoUpdateDisabled:      true,
+			AutoUpdateDisableReason: "本地未安装 sing-box 内核",
+			AutoUpdateLastAttemptAt: 100,
+			AutoUpdateLastSuccessAt: 200,
+			AutoUpdateError:         "下载失败",
+			AutoUpdateErrorAt:       300,
+		})
+		if err != nil {
+			t.Fatalf("marshal sing-box update info: %v", err)
+		}
+		jsonText := string(payload)
+		for _, fragment := range []string{
+			`"autoUpdateEnabled":true`,
+			`"autoUpdateDisabled":true`,
+			`"autoUpdateDisableReason":"本地未安装 sing-box 内核"`,
+			`"autoUpdateLastAttemptAt":100`,
+			`"autoUpdateLastSuccessAt":200`,
+			`"autoUpdateError":"下载失败"`,
+			`"autoUpdateErrorAt":300`,
+		} {
+			if !strings.Contains(jsonText, fragment) {
+				t.Fatalf("sing-box update info lost field %s: %s", fragment, jsonText)
+			}
+		}
+	})
+
+	t.Run("Mihomo update info exposes auto update fields", func(t *testing.T) {
+		payload, err := json.Marshal(MihomoCoreUpdateInfo{
+			Enabled:                 true,
+			IntervalHours:           12,
+			AutoUpdateEnabled:       true,
+			AutoUpdateDisabled:      true,
+			AutoUpdateDisableReason: "missing local Mihomo core",
+			AutoUpdateLastAttemptAt: 101,
+			AutoUpdateLastSuccessAt: 202,
+			AutoUpdateError:         "download failed",
+			AutoUpdateErrorAt:       303,
+		})
+		if err != nil {
+			t.Fatalf("marshal Mihomo update info: %v", err)
+		}
+		jsonText := string(payload)
+		for _, fragment := range []string{
+			`"autoUpdateEnabled":true`,
+			`"autoUpdateDisabled":true`,
+			`"autoUpdateDisableReason":"missing local Mihomo core"`,
+			`"autoUpdateLastAttemptAt":101`,
+			`"autoUpdateLastSuccessAt":202`,
+			`"autoUpdateError":"download failed"`,
+			`"autoUpdateErrorAt":303`,
+		} {
+			if !strings.Contains(jsonText, fragment) {
+				t.Fatalf("Mihomo update info lost field %s: %s", fragment, jsonText)
 			}
 		}
 	})

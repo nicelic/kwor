@@ -33,6 +33,29 @@ func TestManagedDownloadTaskManagerRepeatedStartAndBusyRequest(t *testing.T) {
 	first.FinishSuccess("completed")
 }
 
+func TestManagedDownloadTaskManagerUsesConfiguredDeadline(t *testing.T) {
+	customDeadline := 45 * time.Minute
+	manager := NewManagedDownloadTaskManagerWithOptions("test download", ManagedDownloadTaskManagerOptions{
+		Deadline: customDeadline,
+	})
+
+	before := time.Now()
+	handle, status, created, err := manager.Start("test-download", "one")
+	after := time.Now()
+	if err != nil || !created || handle == nil {
+		t.Fatalf("start task: created=%v handle=%v err=%v", created, handle, err)
+	}
+
+	deadlineAt := time.Unix(status.DeadlineAt, 0)
+	minExpected := before.Add(customDeadline - 2*time.Second)
+	maxExpected := after.Add(customDeadline + 2*time.Second)
+	if deadlineAt.Before(minExpected) || deadlineAt.After(maxExpected) {
+		t.Fatalf("unexpected custom deadline: got=%s expected between %s and %s", deadlineAt, minExpected, maxExpected)
+	}
+
+	handle.FinishCancelled("cancelled")
+}
+
 func TestManagedDownloadTaskManagerStopAndWorkerCleanup(t *testing.T) {
 	manager := NewManagedDownloadTaskManager("test download")
 	handle, _, created, err := manager.Start("test-download", "one")

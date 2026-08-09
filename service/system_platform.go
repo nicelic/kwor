@@ -89,6 +89,18 @@ func GetSystemPlatform() (*model.SystemPlatform, error) {
 	return platform, nil
 }
 
+// GetSystemPlatformOrDetect returns the in-memory startup snapshot when the
+// panel process has already initialized it. Internal detached helpers that run
+// in a fresh process may not have that snapshot yet, so they fall back to a
+// one-time direct detection that stays centralized in this file.
+func GetSystemPlatformOrDetect() (*model.SystemPlatform, error) {
+	platform, err := GetSystemPlatform()
+	if err == nil && platform != nil {
+		return platform, nil
+	}
+	return detectSystemPlatform(), nil
+}
+
 func setSystemPlatformSnapshot(platform *model.SystemPlatform) {
 	systemPlatformSnapshot.mu.Lock()
 	systemPlatformSnapshot.value = cloneSystemPlatform(platform)

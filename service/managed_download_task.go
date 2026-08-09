@@ -60,21 +60,42 @@ type ManagedDownloadTaskHandle struct {
 	id      string
 }
 
+type ManagedDownloadTaskManagerOptions struct {
+	Deadline time.Duration
+}
+
 // ManagedDownloadTaskManager keeps one active task per resource. Completed
 // snapshots remain queryable briefly so a refreshed browser can show a result.
 type ManagedDownloadTaskManager struct {
 	mu       sync.Mutex
 	name     string
+	deadline time.Duration
 	tasks    map[string]*managedDownloadTask
 	activeID string
 	latestID string
 }
 
 func NewManagedDownloadTaskManager(name string) *ManagedDownloadTaskManager {
-	return &ManagedDownloadTaskManager{
-		name:  strings.TrimSpace(name),
-		tasks: make(map[string]*managedDownloadTask),
+	return NewManagedDownloadTaskManagerWithOptions(name, ManagedDownloadTaskManagerOptions{})
+}
+
+func NewManagedDownloadTaskManagerWithOptions(name string, options ManagedDownloadTaskManagerOptions) *ManagedDownloadTaskManager {
+	deadline := options.Deadline
+	if deadline <= 0 {
+		deadline = managedDownloadTaskDeadline
 	}
+	return &ManagedDownloadTaskManager{
+		name:     strings.TrimSpace(name),
+		deadline: deadline,
+		tasks:    make(map[string]*managedDownloadTask),
+	}
+}
+
+func (m *ManagedDownloadTaskManager) taskDeadline() time.Duration {
+	if m == nil || m.deadline <= 0 {
+		return managedDownloadTaskDeadline
+	}
+	return m.deadline
 }
 
 // Start either creates a task or returns the equivalent active task. A caller
@@ -105,6 +126,7 @@ func (m *ManagedDownloadTaskManager) Start(operationKind string, fingerprint str
 	}
 	ctx, cancel := context.WithCancel(operationContext)
 	now := time.Now()
+	deadline := m.taskDeadline()
 	task := &managedDownloadTask{
 		fingerprint: fingerprint,
 		ctx:         ctx,
@@ -117,10 +139,10 @@ func (m *ManagedDownloadTaskManager) Start(operationKind string, fingerprint str
 			CanCancel:  true,
 			StartedAt:  now.Unix(),
 			UpdatedAt:  now.Unix(),
-			DeadlineAt: now.Add(managedDownloadTaskDeadline).Unix(),
+			DeadlineAt: now.Add(deadline).Unix(),
 		},
 	}
-	task.deadline = time.AfterFunc(managedDownloadTaskDeadline, func() {
+	task.deadline = time.AfterFunc(deadline, func() {
 		m.requestStop(task.status.ID, true)
 	})
 	m.tasks[task.status.ID] = task

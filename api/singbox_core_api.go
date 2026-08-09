@@ -31,6 +31,13 @@ type singboxCorePreferenceRequest struct {
 	HasLibc   bool
 }
 
+type singboxCoreUpdateSettingsRequest struct {
+	Enabled         bool
+	IntervalHours   int
+	AutoUpdate      bool
+	HasAutoUpdate   bool
+}
+
 func parseSingboxCoreVersionWindowQuery(c *gin.Context) singboxCoreVersionRequest {
 	channel, offset, limit := parseCoreVersionWindowPagination(c)
 	return singboxCoreVersionRequest{
@@ -76,6 +83,24 @@ func parseSingboxCorePreferenceRequest(c *gin.Context) singboxCorePreferenceRequ
 	}
 }
 
+func parseSingboxCoreUpdateSettingsRequest(c *gin.Context) (singboxCoreUpdateSettingsRequest, error) {
+	enabledRaw := strings.TrimSpace(c.Request.FormValue("enabled"))
+	enabled := strings.EqualFold(enabledRaw, "true") || enabledRaw == "1"
+	intervalHours, err := parseCoreIntervalHours(c.Request.FormValue("interval"))
+	if err != nil {
+		return singboxCoreUpdateSettingsRequest{}, err
+	}
+	autoUpdateRaw := strings.TrimSpace(c.Request.FormValue("auto_update_enabled"))
+	_, hasAutoUpdate := c.Request.Form["auto_update_enabled"]
+	autoUpdateEnabled := strings.EqualFold(autoUpdateRaw, "true") || autoUpdateRaw == "1"
+	return singboxCoreUpdateSettingsRequest{
+		Enabled:       enabled,
+		IntervalHours: intervalHours,
+		AutoUpdate:    autoUpdateEnabled,
+		HasAutoUpdate: hasAutoUpdate,
+	}, nil
+}
+
 func (a *ApiService) GetCoreManagerStatus(c *gin.Context) {
 	info, err := a.coreManagerService().GetCoreStatus()
 	if err != nil {
@@ -106,18 +131,16 @@ func (a *ApiService) GetCoreUpdateInfo(c *gin.Context) {
 }
 
 func (a *ApiService) SaveCoreUpdateSettings(c *gin.Context) {
-	enabledRaw := strings.TrimSpace(c.Request.FormValue("enabled"))
-	enabled := strings.EqualFold(enabledRaw, "true") || enabledRaw == "1"
-	intervalHours, err := parseCoreIntervalHours(c.Request.FormValue("interval"))
+	request, err := parseSingboxCoreUpdateSettingsRequest(c)
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
 	}
-	if err = a.coreManagerService().SetCoreAutoCheckSettings(enabled, intervalHours); err != nil {
+	if err = a.coreManagerService().SetCoreAutoCheckSettings(request.Enabled, request.IntervalHours, request.HasAutoUpdate, request.AutoUpdate); err != nil {
 		jsonMsg(c, "", err)
 		return
 	}
-	if enabled {
+	if request.Enabled {
 		if checkErr := a.coreManagerService().CheckAndMarkCoreUpdates(true); checkErr != nil {
 			logger.Warning("check core updates after settings update failed: ", checkErr)
 		}
@@ -132,6 +155,19 @@ func (a *ApiService) SaveCoreUpdateSettings(c *gin.Context) {
 
 func (a *ApiService) AckCoreUpdateNotice(c *gin.Context) {
 	if err := a.coreManagerService().ClearCoreUpdatePending(); err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	info, err := a.coreManagerService().GetSingboxCoreUpdateInfo(false)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, info, nil)
+}
+
+func (a *ApiService) AckCoreAutoUpdateError(c *gin.Context) {
+	if err := a.coreManagerService().ClearCoreAutoUpdateError(); err != nil {
 		jsonMsg(c, "", err)
 		return
 	}

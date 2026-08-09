@@ -695,15 +695,29 @@ const normalizePathInput = (value: string, allowEmpty: boolean) => {
   return `/${trimmed}`
 }
 
-const normalizeListTextInput = (value: string) => splitInputTokens(value).join(', ')
+const reverseProxyAddressProtocolPrefixRE = /^https?:\/\//i
+
+const stripReverseProxyAddressProtocolPrefix = (value: string) => value.trim().replace(reverseProxyAddressProtocolPrefixRE, '')
+
+const normalizeListTextInput = (
+  value: string,
+  options: {
+    stripHttpProtocolPrefix?: boolean
+  } = {},
+) => splitInputTokens(value)
+  .map((item) => options.stripHttpProtocolPrefix ? stripReverseProxyAddressProtocolPrefix(item) : item.trim())
+  .filter(item => item !== '')
+  .join(', ')
 
 const trimReverseProxyRuleFormText = (form: ReverseProxyRuleForm) => {
   form.name = form.name.trim()
   form.dnsAllowedCidrsText = normalizeListTextInput(form.dnsAllowedCidrsText)
-  form.hostsText = normalizeListTextInput(form.hostsText)
+  form.hostsText = normalizeListTextInput(form.hostsText, { stripHttpProtocolPrefix: true })
   form.pathPrefix = form.pathPrefix.trim()
-  form.targetAddressesText = normalizeListTextInput(form.targetAddressesText)
+  form.listenDnsPath = form.listenDnsPath.trim()
+  form.targetAddressesText = normalizeListTextInput(form.targetAddressesText, { stripHttpProtocolPrefix: true })
   form.targetPath = form.targetPath.trim()
+  form.targetDnsPath = form.targetDnsPath.trim()
   form.fallbackDnsUpstreams = form.fallbackDnsUpstreams.replace(/\r\n?/g, '\n').trim()
   form.ednsCustomIp = form.ednsCustomIp.trim()
   form.remark = form.remark.trim()
@@ -955,9 +969,9 @@ export const buildReverseProxyPayload = (
   certificates: ReverseProxyCertificateOption[] = [],
 ) => {
   const name = form.name.trim()
-  const hostsText = normalizeListTextInput(form.hostsText)
+  const hostsText = normalizeListTextInput(form.hostsText, { stripHttpProtocolPrefix: true })
   const pathPrefix = form.pathPrefix.trim()
-  const targetAddressesText = normalizeListTextInput(form.targetAddressesText)
+  const targetAddressesText = normalizeListTextInput(form.targetAddressesText, { stripHttpProtocolPrefix: true })
   const targetPath = form.targetPath.trim()
   const listenDnsPath = form.listenDnsPath.trim()
   const targetDnsPath = form.targetDnsPath.trim()
@@ -1281,10 +1295,14 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     normalizeEDNSCustomIPInForm(editingRule.value)
   }
 
-  const saveRule = async () => {
-    if (saving.value || actionsDisabled.value) return
+  const normalizeRuleTextInputs = () => {
     trimReverseProxyRuleFormText(editingRule.value)
     normalizeEDNSCustomIPInForm(editingRule.value)
+  }
+
+  const saveRule = async () => {
+    if (saving.value || actionsDisabled.value) return
+    normalizeRuleTextInputs()
     if (protocolIsDNS(editingRule.value.listenProtocol) !== protocolIsDNS(editingRule.value.targetProtocol)) {
       push.warning({ duration: 4000, message: reverseProxyCopy.dnsProtocolPairRequired })
       return
@@ -1843,6 +1861,7 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     changeListenProtocol,
     changeTargetProtocol,
     normalizeCustomEDNSInput,
+    normalizeRuleTextInputs,
     saveRule,
     removeRule,
     toggleRule,

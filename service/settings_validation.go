@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	maxSessionMaxAgeMinutes = 365 * 24 * 60
+	maxSessionMaxAgeMinutes = sessionMaxAgeMaxMinutes
 	maxTrafficAgeDays       = 36500
 	maxSubUpdatesHours      = 365 * 24
 )

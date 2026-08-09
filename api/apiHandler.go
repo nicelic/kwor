@@ -42,7 +42,7 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 	action := c.Param("postAction")
 	// The activity endpoint performs its own single validation and refresh. A
 	// preliminary GetLoginUser call could consume an expired record and hide the
-	// useful user_idle_timeout/page_inactive_timeout reason from the response.
+	// useful session_timeout reason from the response.
 	loginUser := ""
 	if action != "session" {
 		loginUser = GetLoginUser(c)
@@ -110,6 +110,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.SaveCoreUpdateSettings(c)
 	case "core-update-ack":
 		a.ApiService.AckCoreUpdateNotice(c)
+	case "core-auto-update-error-ack":
+		a.ApiService.AckCoreAutoUpdateError(c)
 	case "core-download-preference":
 		a.ApiService.SaveCoreDownloadPreference(c)
 	case "core-download-stop":
@@ -128,6 +130,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.SaveMihomoCoreUpdateSettings(c)
 	case "mihomo-core-update-ack":
 		a.ApiService.AckMihomoCoreUpdateNotice(c)
+	case "mihomo-core-auto-update-error-ack":
+		a.ApiService.AckMihomoCoreAutoUpdateError(c)
 	case "mihomo-core-download-preference":
 		a.ApiService.SaveMihomoCoreDownloadPreference(c)
 	case "mihomo-core-download-stop":
@@ -415,6 +419,8 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetKernelCleanupScan(c)
 	case "kernel-download-progress":
 		a.ApiService.GetKernelDownloadProgress(c)
+	case "kernel-install-status":
+		a.ApiService.GetKernelInstallStatus(c)
 	case "system-log-optimization-overview":
 		a.ApiService.GetSystemLogOptimizationOverview(c)
 	case "system-sysctl-optimization-overview":

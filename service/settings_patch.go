@@ -503,6 +503,17 @@ func normalizeSettingsPatchChanges(changes map[string]string) (map[string]string
 		}
 		result[key] = normalized
 	}
+	if unit, exists := result["sessionMaxAgeUnit"]; exists {
+		normalizedUnit := normalizeSessionMaxAgeUnit(unit)
+		if normalizedUnit == "" {
+			return nil, common.NewError("sessionMaxAgeUnit 必须是 m、h 或 d")
+		}
+		result["sessionMaxAgeUnit"] = normalizedUnit
+	}
+	if rawMinutes, exists := result["sessionMaxAge"]; exists && strings.TrimSpace(rawMinutes) == "0" {
+		result["sessionMaxAge"] = strconv.Itoa(EffectiveSessionMaxAgeMinutes(0))
+		result["sessionMaxAgeUnit"] = defaultSessionMaxAgeUnit
+	}
 	return result, nil
 }
 
@@ -525,6 +536,12 @@ func normalizeGenericSettingValue(key string, value string) (string, error) {
 		normalized := normalizeCertificateStoreValue(value)
 		if normalized == "" {
 			normalized = "chrome"
+		}
+		return normalized, nil
+	case "sessionMaxAgeUnit":
+		normalized := normalizeSessionMaxAgeUnit(value)
+		if normalized == "" {
+			return "", common.NewError("sessionMaxAgeUnit 必须是 m、h 或 d")
 		}
 		return normalized, nil
 	case "webPath":

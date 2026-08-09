@@ -106,4 +106,40 @@ func TestCoreRequestContracts(t *testing.T) {
 			t.Fatalf("Mihomo preference lost AMD64 level: %+v", mihomoRequest)
 		}
 	})
+
+	t.Run("sing-box update settings parse auto update switch", func(t *testing.T) {
+		form := url.Values{
+			"enabled":             {"true"},
+			"interval":            {"6"},
+			"auto_update_enabled": {"1"},
+		}
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest("POST", "/", strings.NewReader(form.Encode()))
+		ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request, err := parseSingboxCoreUpdateSettingsRequest(ctx)
+		if err != nil {
+			t.Fatalf("parse sing-box update settings: %v", err)
+		}
+		if !request.Enabled || request.IntervalHours != 6 || !request.HasAutoUpdate || !request.AutoUpdate {
+			t.Fatalf("unexpected sing-box update settings request: %+v", request)
+		}
+	})
+
+	t.Run("Mihomo update settings parse auto update switch", func(t *testing.T) {
+		form := url.Values{
+			"enabled":             {"true"},
+			"interval":            {"8"},
+			"auto_update_enabled": {"true"},
+		}
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest("POST", "/", strings.NewReader(form.Encode()))
+		ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request, err := parseMihomoCoreUpdateSettingsRequest(ctx)
+		if err != nil {
+			t.Fatalf("parse Mihomo update settings: %v", err)
+		}
+		if !request.Enabled || request.IntervalHours != 8 || !request.HasAutoUpdate || !request.AutoUpdate {
+			t.Fatalf("unexpected Mihomo update settings request: %+v", request)
+		}
+	})
 }

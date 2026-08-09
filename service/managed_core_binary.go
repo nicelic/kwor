@@ -1,6 +1,7 @@
 package service
 
 import (
+	"debug/elf"
 	"encoding/binary"
 	"io"
 	"os"
@@ -20,6 +21,9 @@ type managedCoreBinaryInspection struct {
 	Installed    bool
 	Compatible   bool
 	Architecture string
+	Libc         string
+	Amd64Level   string
+	Channel      string
 	Version      string
 	VersionInfo  string
 }
@@ -46,6 +50,7 @@ func inspectManagedLinuxCoreBinary(binPath string, expectedIdentity string, prob
 		return inspection
 	}
 	inspection.Architecture = architecture
+	inspection.Libc = detectManagedLinuxELFLibc(binPath)
 	if architecture != GetSystemPlatformArchitecture() {
 		return inspection
 	}
@@ -107,4 +112,37 @@ func readManagedLinuxELFArchitecture(binPath string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func detectManagedLinuxELFLibc(binPath string) string {
+	file, err := elf.Open(binPath)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	for _, prog := range file.Progs {
+		if prog == nil || prog.Type != elf.PT_INTERP || prog.Filesz == 0 {
+			continue
+		}
+		data := make([]byte, prog.Filesz)
+		if _, err := prog.ReadAt(data, 0); err != nil {
+			return ""
+		}
+		interpreter := strings.TrimRight(string(data), "\x00")
+		if interpreter == "" {
+			return ""
+		}
+		lower := strings.ToLower(interpreter)
+		switch {
+		case strings.Contains(lower, "musl"):
+			return "musl"
+		case strings.Contains(lower, "ld-linux"), strings.Contains(lower, "glibc"), strings.Contains(lower, "gnu"):
+			return "glibc"
+		default:
+			return ""
+		}
+	}
+
+	return "universal"
 }

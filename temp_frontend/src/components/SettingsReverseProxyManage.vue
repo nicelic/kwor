@@ -243,6 +243,7 @@
               v-model="searchText"
               :label="reverseProxyCopy.search"
               prepend-inner-icon="mdi-magnify"
+              @blur="searchText = searchText.trim()"
               clearable
               hide-details />
           </v-col>
@@ -495,12 +496,14 @@
               <v-text-field
                 v-model="editingRule.name"
                 :label="reverseProxyCopy.name"
+                @blur="normalizeRuleTextInputs"
                 hide-details />
             </v-col>
             <v-col cols="12" md="8">
               <v-text-field
                 v-model="editingRule.remark"
                 :label="reverseProxyCopy.remark"
+                @blur="normalizeRuleTextInputs"
                 hide-details />
             </v-col>
           </v-row>
@@ -527,6 +530,7 @@
                       v-model="editingRule.hostsText"
                       :label="reverseProxyCopy.hosts"
                       :placeholder="reverseProxyCopy.hostsPlaceholder"
+                      @blur="normalizeRuleTextInputs"
                       hide-details />
                     <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.listenIpLocalHint }}</div>
                   </v-col>
@@ -553,6 +557,7 @@
                     <v-text-field
                       v-model="editingRule.pathPrefix"
                       :label="reverseProxyCopy.pathPrefix"
+                      @blur="normalizeRuleTextInputs"
                       placeholder="留空 / 或 /88999"
                       hide-details />
                     <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.pathPrefixStrictHint }}</div>
@@ -562,6 +567,7 @@
                       v-model="editingRule.listenDnsPath"
                       :label="reverseProxyCopy.listenDnsPath"
                       placeholder="/dns-query"
+                      @blur="normalizeRuleTextInputs"
                       hide-details />
                   </v-col>
                   <template v-if="listenIsDNS">
@@ -571,6 +577,7 @@
                         v-model="editingRule.dnsAllowedCidrsText"
                         :label="reverseProxyCopy.dnsAllowedCidrs"
                         placeholder="192.0.2.0/24, 2001:db8::/32"
+                        @blur="normalizeRuleTextInputs"
                         hide-details />
                       <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.dnsAllowedCidrsHint }}</div>
                     </v-col>
@@ -615,7 +622,7 @@
                       v-model="editingRule.ednsCustomIp"
                       :label="reverseProxyCopy.ednsCustomIp"
                       placeholder="14.119.184.1"
-                      @blur="normalizeCustomEDNSInput"
+                      @blur="normalizeRuleTextInputs"
                       hide-details />
                   </v-col>
                   <v-col v-if="listenIsDNS && editingRule.ednsEnabled && editingRule.ednsMode === 'auto'" cols="12" lg="12">
@@ -687,6 +694,7 @@
                       v-model="editingRule.targetAddressesText"
                       :label="reverseProxyCopy.targetAddresses"
                       :placeholder="reverseProxyCopy.targetAddressesPlaceholder"
+                      @blur="normalizeRuleTextInputs"
                       hide-details />
                   </v-col>
                   <v-col cols="12" md="6" lg="12">
@@ -741,6 +749,7 @@
                       v-model="editingRule.targetPath"
                       :label="reverseProxyCopy.targetPath"
                       placeholder="/image-001"
+                      @blur="normalizeRuleTextInputs"
                       hide-details />
                     <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.targetPathRewriteHint }}</div>
                   </v-col>
@@ -749,6 +758,7 @@
                       v-model="editingRule.targetDnsPath"
                       :label="reverseProxyCopy.targetDnsPath"
                       placeholder="/dns-query"
+                      @blur="normalizeRuleTextInputs"
                       hide-details />
                   </v-col>
                   <v-col v-if="targetIsDNS" cols="12" lg="12">
@@ -767,6 +777,7 @@
                       :label="reverseProxyCopy.fallbackDnsUpstreams"
                       placeholder="tls://1.1.1.1"
                       rows="3"
+                      @blur="normalizeRuleTextInputs"
                       hide-details />
                     <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.fallbackDnsUpstreamsHint }}</div>
                   </v-col>
@@ -1116,7 +1127,7 @@ const {
   openRuleDialog,
   changeListenProtocol,
   changeTargetProtocol,
-  normalizeCustomEDNSInput,
+  normalizeRuleTextInputs,
   saveRule,
   removeRule,
   toggleRule,

@@ -31,6 +31,13 @@ type mihomoCorePreferenceRequest struct {
 	HasAMD64Level bool
 }
 
+type mihomoCoreUpdateSettingsRequest struct {
+	Enabled       bool
+	IntervalHours int
+	AutoUpdate    bool
+	HasAutoUpdate bool
+}
+
 func parseMihomoCoreVersionWindowQuery(c *gin.Context) mihomoCoreVersionRequest {
 	channel, offset, limit := parseCoreVersionWindowPagination(c)
 	return mihomoCoreVersionRequest{
@@ -76,6 +83,24 @@ func parseMihomoCorePreferenceRequest(c *gin.Context) mihomoCorePreferenceReques
 	}
 }
 
+func parseMihomoCoreUpdateSettingsRequest(c *gin.Context) (mihomoCoreUpdateSettingsRequest, error) {
+	enabledRaw := strings.TrimSpace(c.Request.FormValue("enabled"))
+	enabled := strings.EqualFold(enabledRaw, "true") || enabledRaw == "1"
+	intervalHours, err := parseCoreIntervalHours(c.Request.FormValue("interval"))
+	if err != nil {
+		return mihomoCoreUpdateSettingsRequest{}, err
+	}
+	autoUpdateRaw := strings.TrimSpace(c.Request.FormValue("auto_update_enabled"))
+	_, hasAutoUpdate := c.Request.Form["auto_update_enabled"]
+	autoUpdateEnabled := strings.EqualFold(autoUpdateRaw, "true") || autoUpdateRaw == "1"
+	return mihomoCoreUpdateSettingsRequest{
+		Enabled:       enabled,
+		IntervalHours: intervalHours,
+		AutoUpdate:    autoUpdateEnabled,
+		HasAutoUpdate: hasAutoUpdate,
+	}, nil
+}
+
 func (a *ApiService) GetMihomoCoreManagerStatus(c *gin.Context) {
 	info, err := a.mihomoCoreManagerService().GetCoreStatus()
 	if err != nil {
@@ -106,21 +131,32 @@ func (a *ApiService) GetMihomoCoreUpdateInfo(c *gin.Context) {
 }
 
 func (a *ApiService) SaveMihomoCoreUpdateSettings(c *gin.Context) {
-	enabledRaw := strings.TrimSpace(c.Request.FormValue("enabled"))
-	enabled := strings.EqualFold(enabledRaw, "true") || enabledRaw == "1"
-	intervalHours, err := parseCoreIntervalHours(c.Request.FormValue("interval"))
+	request, err := parseMihomoCoreUpdateSettingsRequest(c)
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
 	}
-	if err = a.mihomoCoreManagerService().SetCoreAutoCheckSettings(enabled, intervalHours); err != nil {
+	if err = a.mihomoCoreManagerService().SetCoreAutoCheckSettings(request.Enabled, request.IntervalHours, request.HasAutoUpdate, request.AutoUpdate); err != nil {
 		jsonMsg(c, "", err)
 		return
 	}
-	if enabled {
+	if request.Enabled {
 		if checkErr := a.mihomoCoreManagerService().CheckAndMarkCoreUpdates(true); checkErr != nil {
 			logger.Warning("check mihomo core updates after settings update failed: ", checkErr)
 		}
+	}
+	info, err := a.mihomoCoreManagerService().GetMihomoCoreUpdateInfo(false)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, info, nil)
+}
+
+func (a *ApiService) AckMihomoCoreAutoUpdateError(c *gin.Context) {
+	if err := a.mihomoCoreManagerService().ClearCoreAutoUpdateError(); err != nil {
+		jsonMsg(c, "", err)
+		return
 	}
 	info, err := a.mihomoCoreManagerService().GetMihomoCoreUpdateInfo(false)
 	if err != nil {

@@ -27,6 +27,12 @@ func TestSettingsPatchCASUpsertNoopAndCompactAudit(t *testing.T) {
 	if snapshot.Revision != 1 || snapshot.Defaults.JSONExt == "" || snapshot.Defaults.ClashExt == "" {
 		t.Fatalf("unexpected snapshot: %#v", snapshot)
 	}
+	if snapshot.Values["subEncode"] != "true" {
+		t.Fatalf("expected subEncode default to be enabled, got %q", snapshot.Values["subEncode"])
+	}
+	if snapshot.Values["subShowInfo"] != "true" {
+		t.Fatalf("expected subShowInfo default to be enabled, got %q", snapshot.Values["subShowInfo"])
+	}
 
 	if err := database.GetDB().Where("key = ?", "subURI").Delete(&model.Setting{}).Error; err != nil {
 		t.Fatalf("delete setting row: %v", err)
@@ -186,6 +192,29 @@ func TestSettingsPatchRequiresTrafficHistoryClearConfirmation(t *testing.T) {
 	}
 }
 
+func TestSettingsPatchNormalizesZeroSessionAgeToSeventyTwoHours(t *testing.T) {
+	setupSettingsPatchAPITestDB(t)
+	_, response := performSettingsPatchJSONPost(t, (&ApiService{}).SaveSettingsPatch, `{"expectedRevision":1,"changes":{"sessionMaxAge":"0"}}`)
+	if !response.Success {
+		t.Fatalf("session age zero normalization failed: %#v", response)
+	}
+	snapshot, err := (&service.SettingService{}).GetSettingsSnapshot()
+	if err != nil {
+		t.Fatalf("load normalized settings snapshot: %v", err)
+	}
+	if snapshot.Values["sessionMaxAge"] != "4320" || snapshot.Values["sessionMaxAgeUnit"] != "d" {
+		t.Fatalf("unexpected normalized session age values: %#v", snapshot.Values)
+	}
+}
+
+func TestSettingsPatchRejectsInvalidSessionAgeUnit(t *testing.T) {
+	setupSettingsPatchAPITestDB(t)
+	_, response := performSettingsPatchJSONPost(t, (&ApiService{}).SaveSettingsPatch, `{"expectedRevision":1,"changes":{"sessionMaxAge":"60","sessionMaxAgeUnit":"x"}}`)
+	if response.Success || !strings.Contains(response.Msg, "sessionMaxAgeUnit") {
+		t.Fatalf("invalid session age unit was accepted: %#v", response)
+	}
+}
+
 func TestCompactAndSubscriptionSettingsSnapshotsShareAtomicRevision(t *testing.T) {
 	setupSettingsPatchAPITestDB(t)
 	settingService := &service.SettingService{}
@@ -281,6 +310,14 @@ func TestSettingsSnapshotPairsValuesWithRevisionDuringConcurrentPatches(t *testi
 func TestSubscriptionRuntimeSettingsCacheInvalidatesAfterPatch(t *testing.T) {
 	setupSettingsPatchAPITestDB(t)
 	settingService := &service.SettingService{}
+	encodeEnabled, err := settingService.GetSubEncode()
+	if err != nil || !encodeEnabled {
+		t.Fatalf("load cached subscription base64 setting: value=%v err=%v", encodeEnabled, err)
+	}
+	showInfoEnabled, err := settingService.GetSubShowInfo()
+	if err != nil || !showInfoEnabled {
+		t.Fatalf("load cached subscription client info setting: value=%v err=%v", showInfoEnabled, err)
+	}
 	before, err := settingService.GetSubUpdates()
 	if err != nil || before != 12 {
 		t.Fatalf("load cached subscription update interval: value=%d err=%v", before, err)

@@ -2609,6 +2609,11 @@ func (a *ApiService) GetKernelDownloadProgress(c *gin.Context) {
 	jsonObj(c, progress, nil)
 }
 
+func (a *ApiService) GetKernelInstallStatus(c *gin.Context) {
+	status := a.KernelManagerService.GetInstallStatus()
+	jsonObj(c, status, nil)
+}
+
 func (a *ApiService) StopKernelDownload(c *gin.Context) {
 	req := struct {
 		ID *string `json:"id" form:"id"`
@@ -2800,12 +2805,12 @@ func (a *ApiService) Login(c *gin.Context) {
 		return
 	}
 
-	idleLimitMinutes, err := a.SettingService.GetSessionMaxAge()
+	sessionMaxAgeMinutes, err := a.SettingService.GetSessionMaxAge()
 	if err != nil {
-		logger.Warning("load login session idle limit failed; disable idle limit for this login: ", err)
-		idleLimitMinutes = 0
+		logger.Warning("load login session timeout failed; fallback to default timeout for this login: ", err)
+		sessionMaxAgeMinutes = 0
 	}
-	if err := SetLoginUser(c, loginUser, idleLimitMinutes); err != nil {
+	if err := SetLoginUser(c, loginUser, sessionMaxAgeMinutes); err != nil {
 		logger.Warning("login session cookie write failed: ", err)
 		jsonMsg(c, "", err)
 		return
@@ -2826,8 +2831,8 @@ func (a *ApiService) Session(c *gin.Context) {
 	a.writeSessionStatus(c, false)
 }
 
-// SessionActivity records a real browser interaction. Ordinary session probes,
-// polling, and background keepalive deliberately call Session instead.
+// SessionActivity is kept as a compatibility alias of the same refresh path as
+// Session. Frontend keepalive and legacy callers can both use it safely.
 func (a *ApiService) SessionActivity(c *gin.Context) {
 	a.writeSessionStatus(c, true)
 }

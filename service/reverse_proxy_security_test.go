@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -84,6 +85,29 @@ func TestReverseProxyJSONPayloadDefaultsTLSVerificationWhenOmitted(t *testing.T)
 	explicitlyDisabled := decode(`{"name":"tls-disabled","enabled":true,"listenProtocol":"http","listenPort":18080,"targetProtocol":"https","targetAddresses":"upstream.example","targetPort":443,"ipStrategy":"prefer_ipv4","upstreamTlsVerify":false}`)
 	if explicitlyDisabled.upstreamTLSVerify {
 		t.Fatal("explicit upstreamTlsVerify=false must remain disabled")
+	}
+}
+
+func TestReverseProxyNormalizePayloadStripsHTTPPrefixFromHostAndTargetInputs(t *testing.T) {
+	normalized, err := (&ReverseProxyService{}).normalizeRulePayload(ReverseProxyRulePayload{
+		Name:            "strip-http-prefix",
+		Enabled:         true,
+		ListenProtocol:  reverseProxyProtocolHTTP,
+		ListenPort:      18080,
+		Hosts:           " https://Example.com , http://*.Example.com ",
+		TargetProtocol:  reverseProxyProtocolHTTP,
+		TargetAddresses: " https://UPSTREAM.example , http://[2001:db8::1] ",
+		TargetPort:      18081,
+		IPStrategy:      reverseProxyIPStrategyPreferIPv4,
+	})
+	if err != nil {
+		t.Fatalf("normalize reverse proxy payload failed: %v", err)
+	}
+	if !reflect.DeepEqual(normalized.hosts, []string{"example.com", "*.example.com"}) {
+		t.Fatalf("normalized hosts mismatch: %#v", normalized.hosts)
+	}
+	if !reflect.DeepEqual(normalized.targetAddresses, []string{"upstream.example", "2001:db8::1"}) {
+		t.Fatalf("normalized target addresses mismatch: %#v", normalized.targetAddresses)
 	}
 }
 

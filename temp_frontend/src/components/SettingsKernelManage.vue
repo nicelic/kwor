@@ -342,7 +342,7 @@
       </v-card-text>
     </v-card>
 
-    <v-overlay :model-value="rebootOverlay" class="align-center justify-center" persistent>
+    <v-overlay :model-value="rebootOverlay" class="align-center justify-center" persistent :z-index="3200">
       <v-card width="380" rounded="lg">
         <v-card-text class="text-center py-8">
           <v-progress-circular indeterminate size="52" width="5" color="primary" class="mb-4" />
@@ -357,7 +357,6 @@
 <script setup lang="ts">
 import HttpUtils from '@/plugins/httputil'
 import { confirm } from '@/plugins/confirm'
-import router from '@/router'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { Ref } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -411,6 +410,28 @@ type KernelDownloadProgress = {
   finishedAt: number
 }
 
+type KernelInstallStatus = {
+  active: boolean
+  state: string
+  installing: boolean
+  verified: boolean
+  installed: boolean
+  needsReboot: boolean
+  command: string
+  targetPackages: string[]
+  pinnedKernel: string
+  pinnedUpdated: boolean
+  cleanupDone: boolean
+  cleanupWarning: string
+  systemCleanupDone: boolean
+  systemCleanupWarnings: string[]
+  systemCleanupSummary: string
+  error: string
+  startedAt: number
+  updatedAt: number
+  finishedAt: number
+}
+
 type KernelSystemCleanupInfo = {
   done: boolean
   warnings: string[]
@@ -443,7 +464,7 @@ const loadingOverview = ref(false)
 const loadingPackages = ref(false)
 const downloadStartPending = ref(false)
 const kernelDownloadStopRequestPending = ref(false)
-const installing = ref(false)
+const installStartPending = ref(false)
 const rebooting = ref(false)
 const cleanupLoading = ref(false)
 const cleanupPurging = ref(false)
@@ -453,6 +474,8 @@ const reconnectTimerId = ref<number | null>(null)
 const downloadProgressSessionId = ref('')
 const downloadProgressTimerId = ref<number | null>(null)
 let downloadProgressRequest: Promise<void> | null = null
+const installStatusTimerId = ref<number | null>(null)
+let installStatusRequest: Promise<void> | null = null
 const provider = ref('')
 const kernelSelectionHydrating = ref(false)
 const selectedLine = ref('')
@@ -473,9 +496,32 @@ const createEmptyKernelOverview = (): KernelOverview => ({
   downloadedArch: '',
 })
 
+const createEmptyKernelInstallStatus = (): KernelInstallStatus => ({
+  active: false,
+  state: 'missing',
+  installing: false,
+  verified: false,
+  installed: false,
+  needsReboot: false,
+  command: '',
+  targetPackages: [],
+  pinnedKernel: '',
+  pinnedUpdated: false,
+  cleanupDone: false,
+  cleanupWarning: '',
+  systemCleanupDone: false,
+  systemCleanupWarnings: [],
+  systemCleanupSummary: '',
+  error: '',
+  startedAt: 0,
+  updatedAt: 0,
+  finishedAt: 0,
+})
+
 const overview = ref<KernelOverview>(createEmptyKernelOverview())
 const runtimeOverview = ref<KernelOverview>(createEmptyKernelOverview())
 const runtimeChecked = ref(false)
+const installStatus = ref<KernelInstallStatus>(createEmptyKernelInstallStatus())
 
 const versionItems = ref<KernelVersionItem[]>([])
 const archItems = ref<KernelArchItem[]>([])
@@ -508,10 +554,18 @@ const downloadProgress = ref<KernelDownloadProgress>({
   finishedAt: 0,
 })
 
-const kernelDownloadTaskActive = computed(() => (
-  ['queued', 'running', 'stopping'].includes(downloadProgress.value.state)
-  || (downloadProgress.value.state === '' && downloadProgress.value.status === 'running')
+const isActiveKernelDownloadProgress = (progress: KernelDownloadProgress) => (
+  ['queued', 'running', 'stopping'].includes(progress.state)
+  || (progress.state === '' && progress.status === 'running')
+)
+
+const kernelInstallTaskActive = computed(() => (
+  installStatus.value.active
+  || installStatus.value.installing
+  || installStatus.value.state === 'running'
 ))
+const installing = computed(() => installStartPending.value || kernelInstallTaskActive.value)
+const kernelDownloadTaskActive = computed(() => isActiveKernelDownloadProgress(downloadProgress.value))
 const kernelDownloadTaskStopping = computed(() => (
   kernelDownloadTaskActive.value
   && (downloadProgress.value.stopRequested || downloadProgress.value.state === 'stopping')
@@ -756,6 +810,34 @@ const applyKernelSuccessFeedback = (
   setFeedback(baseType, baseMessage)
 }
 
+const resolveKernelInstallFeedback = (raw: any) => {
+  const installed = raw?.installed === true
+  const needsReboot = raw?.needsReboot === true
+  const pinnedUpdated = raw?.pinnedUpdated === true
+  const pinnedKernel = String(raw?.pinnedKernel ?? '').trim()
+  if (installed) {
+    if (pinnedUpdated && pinnedKernel) {
+      return {
+        message: t('kernelManager.installDonePinned', { kernel: pinnedKernel }),
+        type: 'success' as const,
+      }
+    }
+    return {
+      message: needsReboot ? t('kernelManager.installDoneNeedReboot') : t('kernelManager.installDone'),
+      type: 'success' as const,
+    }
+  }
+  return {
+    message: t('kernelManager.installUnverified'),
+    type: 'warning' as const,
+  }
+}
+
+const applyKernelInstallFeedback = (raw: any) => {
+  const resolved = resolveKernelInstallFeedback(raw)
+  applyKernelSuccessFeedback(resolved.message, raw, resolved.type)
+}
+
 const formatMiB = (value: number) => {
   const bytes = Number.isFinite(value) ? Math.max(0, value) : 0
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
@@ -783,7 +865,39 @@ const normalizeKernelDownloadProgress = (raw: any): KernelDownloadProgress => ({
   finishedAt: Number(raw?.finishedAt) || 0,
 })
 
+const normalizeKernelInstallStatus = (raw: any): KernelInstallStatus => ({
+  active: raw?.active === true,
+  state: String(raw?.state ?? '').trim().toLowerCase() || 'missing',
+  installing: raw?.installing === true,
+  verified: raw?.verified === true,
+  installed: raw?.installed === true,
+  needsReboot: raw?.needsReboot === true,
+  command: String(raw?.command ?? '').trim(),
+  targetPackages: Array.isArray(raw?.targetPackages)
+    ? raw.targetPackages
+      .map((item: unknown) => String(item ?? '').trim())
+      .filter((item: string) => item.length > 0)
+    : [],
+  pinnedKernel: String(raw?.pinnedKernel ?? '').trim(),
+  pinnedUpdated: raw?.pinnedUpdated === true,
+  cleanupDone: raw?.cleanupDone === true,
+  cleanupWarning: String(raw?.cleanupWarning ?? '').trim(),
+  systemCleanupDone: raw?.systemCleanupDone === true,
+  systemCleanupWarnings: Array.isArray(raw?.systemCleanupWarnings)
+    ? raw.systemCleanupWarnings
+      .map((item: unknown) => String(item ?? '').trim())
+      .filter((item: string) => item.length > 0)
+    : [],
+  systemCleanupSummary: String(raw?.systemCleanupSummary ?? '').trim(),
+  error: String(raw?.error ?? '').trim(),
+  startedAt: Number(raw?.startedAt) || 0,
+  updatedAt: Number(raw?.updatedAt) || 0,
+  finishedAt: Number(raw?.finishedAt) || 0,
+})
+
 const resetDownloadProgress = () => {
+  completedKernelDownloadTaskID = ''
+  observedKernelDownloadTaskID = ''
   downloadProgress.value = {
     id: '',
     status: 'missing',
@@ -807,6 +921,10 @@ const resetDownloadProgress = () => {
   }
 }
 
+const resetInstallStatus = () => {
+  installStatus.value = createEmptyKernelInstallStatus()
+}
+
 const resetKernelSelection = (nextProvider: string) => {
   selectedLine.value = ''
   selectedVersion.value = ''
@@ -822,6 +940,7 @@ const resetKernelSelection = (nextProvider: string) => {
   cleanupHasScanned.value = false
   resetCleanupSelection()
   resetDownloadProgress()
+  resetInstallStatus()
 }
 
 const normalizeKernelOverview = (raw: any): KernelOverview => ({
@@ -1172,18 +1291,42 @@ const stopDownloadProgressPolling = () => {
   }
 }
 
+const stopInstallStatusPolling = () => {
+  if (installStatusTimerId.value != null) {
+    window.clearInterval(installStatusTimerId.value)
+    installStatusTimerId.value = null
+  }
+}
+
 const isTerminalKernelDownload = (progress: KernelDownloadProgress) => (
   ['success', 'error', 'cancelled', 'timed_out'].includes(progress.state)
   || ['success', 'error'].includes(progress.status)
   || (progress.id !== '' && progress.status === 'missing')
 )
 
+const isTerminalKernelInstall = (status: KernelInstallStatus) => (
+  !status.active
+  && !status.installing
+  && ['success', 'error'].includes(status.state)
+)
+
+const buildKernelInstallStatusKey = (status: KernelInstallStatus) => (
+  `${status.state}:${status.startedAt}:${status.finishedAt}:${status.updatedAt}`
+)
+
 let completedKernelDownloadTaskID = ''
+let completedKernelInstallStatusKey = ''
+let observedKernelDownloadTaskID = ''
+
+const shouldAllowRecoveredKernelDownloadTerminal = (progress: KernelDownloadProgress) => {
+  const id = progress.id.trim()
+  if (id === '' || !isTerminalKernelDownload(progress)) {
+    return false
+  }
+  return id === observedKernelDownloadTaskID || id === downloadProgress.value.id.trim()
+}
 
 const clearCompletedKernelDownloadTask = (id: string) => {
-  if (downloadProgress.value.id === id && isTerminalKernelDownload(downloadProgress.value)) {
-    resetDownloadProgress()
-  }
   if (downloadProgressSessionId.value === id) {
     downloadProgressSessionId.value = ''
   }
@@ -1197,6 +1340,9 @@ const completeKernelDownloadTask = async (progress: KernelDownloadProgress, allo
     return
   }
   if (!allowTerminal) {
+    if (downloadProgress.value.id === progress.id && isTerminalKernelDownload(downloadProgress.value)) {
+      resetDownloadProgress()
+    }
     clearCompletedKernelDownloadTask(progress.id)
     return
   }
@@ -1215,7 +1361,7 @@ const completeKernelDownloadTask = async (progress: KernelDownloadProgress, allo
       return
     }
     if (progress.state === 'timed_out') {
-      showTransientDownloadFeedback('warning', '内核包下载超过 20 分钟，已停止并清理临时文件')
+      showTransientDownloadFeedback('warning', '内核包下载已超时，未完成的临时文件已清理')
       return
     }
     showTransientDownloadFeedback('error', progress.error || t('kernelManager.downloadFailed'), 5500)
@@ -1224,8 +1370,32 @@ const completeKernelDownloadTask = async (progress: KernelDownloadProgress, allo
   }
 }
 
+const completeKernelInstallStatus = async (status: KernelInstallStatus, allowTerminal = true) => {
+  if (!isTerminalKernelInstall(status)) return
+  const snapshotKey = buildKernelInstallStatusKey(status)
+  if (!snapshotKey) return
+  if (completedKernelInstallStatusKey === snapshotKey) {
+    return
+  }
+  completedKernelInstallStatusKey = snapshotKey
+  if (!allowTerminal) {
+    return
+  }
+  if (status.state === 'success') {
+    applyKernelInstallFeedback(status)
+    await loadRuntimeOverview()
+    await loadOverview()
+    await scanCleanupPackages()
+    return
+  }
+  setFeedback('error', status.error || t('kernelManager.installFailed'))
+}
+
 const applyKernelDownloadProgress = (raw: any, allowTerminal = true) => {
   const nextProgress = normalizeKernelDownloadProgress(raw)
+  if (isActiveKernelDownloadProgress(nextProgress) && nextProgress.id !== '') {
+    observedKernelDownloadTaskID = nextProgress.id
+  }
   downloadProgress.value = nextProgress
   if (nextProgress.id !== '') {
     downloadProgressSessionId.value = nextProgress.id
@@ -1233,6 +1403,18 @@ const applyKernelDownloadProgress = (raw: any, allowTerminal = true) => {
   if (isTerminalKernelDownload(nextProgress)) {
     stopDownloadProgressPolling()
     void completeKernelDownloadTask(nextProgress, allowTerminal)
+  }
+}
+
+const applyKernelInstallStatus = (raw: any, allowTerminal = true) => {
+  const nextStatus = normalizeKernelInstallStatus(raw)
+  installStatus.value = nextStatus
+  if (kernelInstallTaskActive.value) {
+    completedKernelInstallStatusKey = ''
+  }
+  if (isTerminalKernelInstall(nextStatus)) {
+    stopInstallStatusPolling()
+    void completeKernelInstallStatus(nextStatus, allowTerminal)
   }
 }
 
@@ -1255,6 +1437,23 @@ const pollDownloadProgress = async (): Promise<void> => {
   }
 }
 
+const pollInstallStatus = async (): Promise<void> => {
+  if (installStatusRequest) return installStatusRequest
+  const request = (async () => {
+    const msg = await HttpUtils.get('api/kernel-install-status', {}, { silentAuthCheck: true, silentErrorToast: true })
+    if (!msg.success || !msg.obj) return
+    applyKernelInstallStatus(msg.obj)
+  })()
+  installStatusRequest = request
+  try {
+    await request
+  } finally {
+    if (installStatusRequest === request) {
+      installStatusRequest = null
+    }
+  }
+}
+
 const startDownloadProgressPolling = (sessionId: string) => {
   stopDownloadProgressPolling()
   downloadProgressSessionId.value = sessionId.trim()
@@ -1265,16 +1464,43 @@ const startDownloadProgressPolling = (sessionId: string) => {
   void pollDownloadProgress()
 }
 
+const startInstallStatusPolling = () => {
+  stopInstallStatusPolling()
+  if (!props.active || (typeof document !== 'undefined' && document.visibilityState !== 'visible')) return
+  installStatusTimerId.value = window.setInterval(() => {
+    void pollInstallStatus()
+  }, 1000)
+  void pollInstallStatus()
+}
+
 const recoverKernelDownloadTask = async (allowTerminal = false): Promise<boolean> => {
   const msg = await HttpUtils.get('api/kernel-download-progress', {}, { silentAuthCheck: true })
   if (!msg.success || !msg.obj) return false
   const nextProgress = normalizeKernelDownloadProgress(msg.obj)
   if (nextProgress.id === '' || nextProgress.state === 'idle' || nextProgress.status === 'missing') return false
   const terminal = isTerminalKernelDownload(nextProgress)
-  applyKernelDownloadProgress(nextProgress, allowTerminal)
-  if (terminal) return allowTerminal
+  const resolvedAllowTerminal = allowTerminal || shouldAllowRecoveredKernelDownloadTerminal(nextProgress)
+  applyKernelDownloadProgress(nextProgress, resolvedAllowTerminal)
+  if (terminal) return resolvedAllowTerminal
   if (kernelDownloadTaskActive.value) {
     startDownloadProgressPolling(nextProgress.id)
+  }
+  return true
+}
+
+const recoverKernelInstallStatus = async (allowTerminal = false): Promise<boolean> => {
+  const msg = await HttpUtils.get('api/kernel-install-status', {}, { silentAuthCheck: true, silentErrorToast: true })
+  if (!msg.success || !msg.obj) return false
+  const nextStatus = normalizeKernelInstallStatus(msg.obj)
+  if (!nextStatus.active && !nextStatus.installing && nextStatus.state === 'missing') {
+    resetInstallStatus()
+    return false
+  }
+  const terminal = isTerminalKernelInstall(nextStatus)
+  applyKernelInstallStatus(nextStatus, allowTerminal)
+  if (terminal) return allowTerminal
+  if (kernelInstallTaskActive.value) {
+    startInstallStatusPolling()
   }
   return true
 }
@@ -1283,9 +1509,11 @@ const handleVisibilityChange = () => {
   if (document.visibilityState === 'visible') {
     if (!props.active) return
     void recoverKernelDownloadTask()
+    void recoverKernelInstallStatus()
     return
   }
   stopDownloadProgressPolling()
+  stopInstallStatusPolling()
 }
 
 const buildSelectionFormData = () => {
@@ -1322,12 +1550,12 @@ const downloadPackages = async () => {
       }
       return
     }
-    const recovered = await recoverKernelDownloadTask()
+    const recovered = await recoverKernelDownloadTask(true)
     if (!recovered) {
       setFeedback('error', String(msg.msg || t('kernelManager.downloadFailed')))
     }
   } catch (error: any) {
-    const recovered = await recoverKernelDownloadTask()
+    const recovered = await recoverKernelDownloadTask(true)
     if (!recovered) {
       setFeedback('error', String(error?.message || t('kernelManager.downloadFailed')))
     }
@@ -1370,35 +1598,29 @@ const installPackages = async () => {
   })
   if (!confirmed || !canInstall.value) return
   clearFeedback()
-  installing.value = true
+  resetInstallStatus()
+  completedKernelInstallStatusKey = ''
+  installStartPending.value = true
   try {
     const msg = await HttpUtils.post('api/kernel-install', {}, { timeout: kernelPackageOperationTimeout })
     if (msg.success) {
-      const installed = msg.obj?.installed === true
-      const needsReboot = msg.obj?.needsReboot === true
-      const pinnedUpdated = msg.obj?.pinnedUpdated === true
-      const pinnedKernel = String(msg.obj?.pinnedKernel ?? '').trim()
-      let successText = ''
-      let successType: 'success' | 'warning' = 'success'
-      if (installed) {
-        if (pinnedUpdated && pinnedKernel) {
-          successText = t('kernelManager.installDonePinned', { kernel: pinnedKernel })
-        } else {
-          successText = needsReboot ? t('kernelManager.installDoneNeedReboot') : t('kernelManager.installDone')
-        }
-      } else {
-        successText = t('kernelManager.installUnverified')
-        successType = 'warning'
-      }
-      applyKernelSuccessFeedback(successText, msg.obj, successType)
+      applyKernelInstallFeedback(msg.obj)
       await loadRuntimeOverview()
       await loadOverview()
       await scanCleanupPackages()
-    } else {
+      return
+    }
+    const recovered = await recoverKernelInstallStatus(true)
+    if (!recovered) {
       setFeedback('error', String(msg.msg || t('kernelManager.installFailed')))
     }
+  } catch (error: any) {
+    const recovered = await recoverKernelInstallStatus(true)
+    if (!recovered) {
+      setFeedback('error', String(error?.message || t('kernelManager.installFailed')))
+    }
   } finally {
-    installing.value = false
+    installStartPending.value = false
   }
 }
 
@@ -1423,9 +1645,7 @@ const startReconnectPolling = () => {
         return
       }
       if (body.failureKind === 'api') {
-        clearReconnectTimer()
-        rebootOverlay.value = false
-        await router.replace('/login')
+        window.location.reload()
         return
       }
     } catch {
@@ -1566,19 +1786,23 @@ onMounted(() => {
   }
   if (props.active) {
     void recoverKernelDownloadTask()
+    void recoverKernelInstallStatus()
   }
 })
 
 watch(() => props.active, (active) => {
   if (active) {
     void recoverKernelDownloadTask()
+    void recoverKernelInstallStatus()
     return
   }
   stopDownloadProgressPolling()
+  stopInstallStatusPolling()
 })
 
 onBeforeUnmount(() => {
   stopDownloadProgressPolling()
+  stopInstallStatusPolling()
   clearReconnectTimer()
   if (downloadFeedbackTimer != null) {
     window.clearTimeout(downloadFeedbackTimer)

@@ -58,7 +58,7 @@ const mihomoNamespaceApi: NamespaceApiConfig = {
   showCoreControlsOnInbounds: true,
   core: {
     modalButtonLabel: 'coreManager.mihomoTitle',
-    supportsPrereleaseChannel: false,
+    supportsPrereleaseChannel: true,
     statusEndpoint: 'api/mihomo-core-status',
     progressEndpoint: 'api/mihomo-core-download-progress',
     updateInfoEndpoint: 'api/mihomo-core-update-info',

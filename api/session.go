@@ -16,6 +16,7 @@ import (
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/logger"
+	"github.com/alireza0/s-ui/service"
 
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
@@ -26,25 +27,18 @@ const (
 	loginSessionToken            = "LOGIN_SESSION_TOKEN"
 	legacyLoginSessionCookieName = "kwor"
 
-	// The page-presence lease is separate from the configurable user-operation
-	// idle limit. A visible page renews this lease every minute; a hidden or
-	// closed page stops renewing it and loses the cookie after ten minutes.
-	loginSessionLifetime            = 10 * time.Minute
-	loginSessionCookieMaxAge        = int(loginSessionLifetime / time.Second)
-	loginSessionCleanupInterval     = time.Minute
-	loginSessionTokenBytes          = 32
-	maxInMemoryLoginSessions        = 25
-	maxLoginSessionIdleLimitMinutes = 365 * 24 * 60
-	loginSessionVersionFallback     = "unknown"
-	loginSessionReasonMissing       = "missing_or_legacy_cookie"
-	loginSessionReasonVersion       = "version_mismatch"
-	loginSessionReasonPageInactive  = "page_inactive_timeout"
-	loginSessionReasonUserIdle      = "user_idle_timeout"
-	loginSessionReasonRestarted     = "panel_restarted"
-	loginSessionReasonLiveMissing   = "live_session_missing"
-	loginSessionReasonLiveChanged   = "live_session_mismatch"
-	loginSessionReasonStoreFailed   = "session_store_unavailable"
-	loginSessionReasonWriteFailed   = "cookie_write_failed"
+	loginSessionCleanupInterval   = time.Minute
+	loginSessionTokenBytes        = 32
+	maxInMemoryLoginSessions      = 25
+	loginSessionVersionFallback   = "unknown"
+	loginSessionReasonMissing     = "missing_or_legacy_cookie"
+	loginSessionReasonVersion     = "version_mismatch"
+	loginSessionReasonTimeout     = "session_timeout"
+	loginSessionReasonRestarted   = "panel_restarted"
+	loginSessionReasonLiveMissing = "live_session_missing"
+	loginSessionReasonLiveChanged = "live_session_mismatch"
+	loginSessionReasonStoreFailed = "session_store_unavailable"
+	loginSessionReasonWriteFailed = "cookie_write_failed"
 )
 
 type loginSessionRecord struct {
@@ -72,6 +66,7 @@ type loginSessionValidation struct {
 }
 
 type loginSessionStatus struct {
+	DeadlineAt     int64 `json:"deadlineAt,omitempty"`
 	IdleDeadlineAt int64 `json:"idleDeadlineAt,omitempty"`
 }
 
@@ -149,7 +144,7 @@ func isPanelLoginTransportAllowed(c *gin.Context) bool {
 
 // SetLoginUser creates an opaque 256-bit token. The browser Cookie contains
 // only that token; the username and every policy field stay server-side.
-func SetLoginUser(c *gin.Context, userName string, idleLimitMinutes int) error {
+func SetLoginUser(c *gin.Context, userName string, sessionMaxAgeMinutes int) error {
 	if c == nil {
 		return fmt.Errorf("login session context is nil")
 	}
@@ -166,14 +161,16 @@ func SetLoginUser(c *gin.Context, userName string, idleLimitMinutes int) error {
 	}
 
 	now := loginSessionNow().Truncate(time.Second)
-	if _, err := storeLoginSession(
+	effectiveSessionMinutes := normalizeStoredSessionTimeoutMinutes(sessionMaxAgeMinutes)
+	record, err := storeLoginSession(
 		tokenHash,
 		userName,
 		currentLoginSessionVersion(),
-		loginSessionExpiry(now),
+		loginSessionExpiry(now, effectiveSessionMinutes),
 		now,
-		normalizeLoginSessionIdleLimit(idleLimitMinutes),
-	); err != nil {
+		effectiveSessionMinutes,
+	)
+	if err != nil {
 		return err
 	}
 
@@ -181,7 +178,7 @@ func SetLoginUser(c *gin.Context, userName string, idleLimitMinutes int) error {
 	// ensures legacy LOGIN_USER/version/epoch values cannot survive a login.
 	s.Clear()
 	s.Set(loginSessionToken, token)
-	s.Options(sessionCookieOptions(c))
+	s.Options(sessionCookieOptions(c, loginSessionCookieMaxAgeSecondsForRecord(record, now)))
 	if err := s.Save(); err != nil {
 		removeLoginSession(tokenHash)
 		return err
@@ -192,10 +189,9 @@ func SetLoginUser(c *gin.Context, userName string, idleLimitMinutes int) error {
 	return nil
 }
 
-// RefreshLoginSession renews the page-presence lease. Only the explicit
-// activity endpoint passes userActivity=true, so periodic polling and Cookie
-// keepalive can never extend the configurable user-operation idle limit.
-func RefreshLoginSession(c *gin.Context, userActivity bool) (loginSessionStatus, bool, string, error) {
+// RefreshLoginSession renews the unified session timeout. The POST activity
+// endpoint is kept only as a compatibility alias of the same refresh path.
+func RefreshLoginSession(c *gin.Context, _ bool) (loginSessionStatus, bool, string, error) {
 	validation := validateLoginSession(c)
 	if !validation.valid() {
 		clearSessionCookie(c)
@@ -205,9 +201,7 @@ func RefreshLoginSession(c *gin.Context, userActivity bool) (loginSessionStatus,
 	now := loginSessionNow().Truncate(time.Second)
 	record, refreshed, reason, err := refreshLoginSession(
 		validation.tokenHash,
-		loginSessionExpiry(now),
 		now,
-		userActivity,
 	)
 	if !refreshed {
 		clearSessionCookie(c)
@@ -217,7 +211,7 @@ func RefreshLoginSession(c *gin.Context, userActivity bool) (loginSessionStatus,
 	s := sessions.Default(c)
 	s.Clear()
 	s.Set(loginSessionToken, validation.token)
-	s.Options(sessionCookieOptions(c))
+	s.Options(sessionCookieOptions(c, loginSessionCookieMaxAgeSecondsForRecord(record, now)))
 	if err := s.Save(); err != nil {
 		removeLoginSession(validation.tokenHash)
 		clearSessionCookie(c)
@@ -286,7 +280,7 @@ func clearSessionCookie(c *gin.Context) {
 	}
 	s := sessions.Default(c)
 	s.Clear()
-	options := sessionCookieOptions(c)
+	options := sessionCookieOptions(c, 0)
 	options.MaxAge = -1
 	s.Options(options)
 	_ = s.Save()
@@ -303,7 +297,7 @@ func ClearLegacyLoginSessionCookie(c *gin.Context) {
 	if _, err := c.Request.Cookie(legacyLoginSessionCookieName); err != nil {
 		return
 	}
-	options := sessionCookieOptions(c)
+	options := sessionCookieOptions(c, 0)
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     legacyLoginSessionCookieName,
 		Value:    "",
@@ -316,20 +310,23 @@ func ClearLegacyLoginSessionCookie(c *gin.Context) {
 	})
 }
 
-func sessionCookieOptions(c *gin.Context) sessions.Options {
+func sessionCookieOptions(c *gin.Context, maxAgeSeconds int) sessions.Options {
+	if maxAgeSeconds <= 0 {
+		maxAgeSeconds = SessionCookieCodecMaxAgeSeconds()
+	}
 	return sessions.Options{
 		Path:     "/",
-		MaxAge:   loginSessionCookieMaxAge,
+		MaxAge:   maxAgeSeconds,
 		Secure:   !isLocalDebugHTTPRequest(c),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	}
 }
 
-// SessionCookieCodecMaxAgeSeconds bounds securecookie decoding to the same
-// ten-minute page-presence lifetime enforced by the browser cookie.
+// SessionCookieCodecMaxAgeSeconds bounds securecookie decoding to the maximum
+// supported session timeout.
 func SessionCookieCodecMaxAgeSeconds() int {
-	return loginSessionCookieMaxAge
+	return normalizeStoredSessionTimeoutMinutes(0) * 60
 }
 
 func validateLoginSession(c *gin.Context) loginSessionValidation {
@@ -361,31 +358,42 @@ func validateLoginSession(c *gin.Context) loginSessionValidation {
 	}
 }
 
-func loginSessionExpiry(now time.Time) time.Time {
-	return now.Add(loginSessionLifetime)
+func loginSessionExpiry(now time.Time, sessionMaxAgeMinutes int) time.Time {
+	return now.Add(time.Duration(normalizeStoredSessionTimeoutMinutes(sessionMaxAgeMinutes)) * time.Minute)
 }
 
-func loginSessionIdleDeadline(lastActivityAt time.Time, idleLimitMinutes int) time.Time {
-	return lastActivityAt.Add(time.Duration(idleLimitMinutes) * time.Minute)
+func currentLoginSessionTimeoutMinutes(fallback int) int {
+	if database.GetDB() == nil {
+		return normalizeStoredSessionTimeoutMinutes(fallback)
+	}
+	minutes, err := (&service.SettingService{}).GetEffectiveSessionMaxAgeMinutes()
+	if err == nil {
+		return minutes
+	}
+	return normalizeStoredSessionTimeoutMinutes(fallback)
 }
 
-func normalizeLoginSessionIdleLimit(value int) int {
-	if value <= 0 {
-		return 0
-	}
-	if value > maxLoginSessionIdleLimitMinutes {
-		return maxLoginSessionIdleLimitMinutes
-	}
-	return value
+func normalizeStoredSessionTimeoutMinutes(value int) int {
+	return service.EffectiveSessionMaxAgeMinutes(value)
 }
 
 func loginSessionStatusFromRecord(record loginSessionRecord) loginSessionStatus {
-	if record.idleLimitMinutes <= 0 {
+	if !record.expiresAt.After(time.Unix(0, 0)) {
 		return loginSessionStatus{}
 	}
+	deadlineAt := record.expiresAt.Unix()
 	return loginSessionStatus{
-		IdleDeadlineAt: loginSessionIdleDeadline(record.lastActivityAt, record.idleLimitMinutes).Unix(),
+		DeadlineAt:     deadlineAt,
+		IdleDeadlineAt: deadlineAt,
 	}
+}
+
+func loginSessionCookieMaxAgeSecondsForRecord(record loginSessionRecord, now time.Time) int {
+	maxAgeSeconds := int(record.expiresAt.Sub(now).Seconds())
+	if maxAgeSeconds <= 0 {
+		return 1
+	}
+	return maxAgeSeconds
 }
 
 func currentLoginSessionVersion() string {
@@ -450,7 +458,7 @@ func storeLoginSession(tokenHash string, userName string, version string, expire
 	return record, nil
 }
 
-func refreshLoginSession(tokenHash string, expiresAt time.Time, now time.Time, userActivity bool) (loginSessionRecord, bool, string, error) {
+func refreshLoginSession(tokenHash string, now time.Time) (loginSessionRecord, bool, string, error) {
 	loginSessionRegistry.Lock()
 	defer loginSessionRegistry.Unlock()
 	record, storage, reason, err := loadLoginSessionLocked(tokenHash, now)
@@ -461,10 +469,9 @@ func refreshLoginSession(tokenHash string, expiresAt time.Time, now time.Time, u
 		return loginSessionRecord{}, false, reason, nil
 	}
 
-	record.expiresAt = expiresAt
-	if userActivity {
-		record.lastActivityAt = now
-	}
+	record.idleLimitMinutes = currentLoginSessionTimeoutMinutes(record.idleLimitMinutes)
+	record.expiresAt = loginSessionExpiry(now, record.idleLimitMinutes)
+	record.lastActivityAt = now
 	if storage == loginSessionStorageMemory {
 		loginSessionRegistry.sessions[tokenHash] = record
 	} else if err := updatePersistedLoginSessionLocked(tokenHash, record); err != nil {
@@ -526,10 +533,7 @@ func loginSessionRecordReasonLocked(record loginSessionRecord, now time.Time) st
 		return loginSessionReasonRestarted
 	}
 	if !record.expiresAt.After(now) {
-		return loginSessionReasonPageInactive
-	}
-	if record.idleLimitMinutes > 0 && !loginSessionIdleDeadline(record.lastActivityAt, record.idleLimitMinutes).After(now) {
-		return loginSessionReasonUserIdle
+		return loginSessionReasonTimeout
 	}
 	return ""
 }
@@ -572,8 +576,9 @@ func updatePersistedLoginSessionLocked(tokenHash string, record loginSessionReco
 		return fmt.Errorf("login session database is unavailable")
 	}
 	result := db.Model(&model.LoginSession{}).Where("token_hash = ?", tokenHash).Updates(map[string]interface{}{
-		"expires_at":       record.expiresAt,
-		"last_activity_at": record.lastActivityAt,
+		"expires_at":         record.expiresAt,
+		"last_activity_at":   record.lastActivityAt,
+		"idle_limit_minutes": record.idleLimitMinutes,
 	})
 	if result.Error != nil {
 		return result.Error
@@ -624,11 +629,7 @@ func prunePersistedLoginSessionsLocked(now time.Time) error {
 	if db == nil {
 		return nil
 	}
-	if err := db.Where("expires_at <= ? OR version <> ? OR epoch <> ?", now, currentLoginSessionVersion(), loginSessionRegistry.epoch).
-		Delete(&model.LoginSession{}).Error; err != nil {
-		return err
-	}
-	return db.Where("idle_limit_minutes > 0 AND julianday(last_activity_at) <= julianday(?) - (idle_limit_minutes / 1440.0)", now).
+	return db.Where("expires_at <= ? OR version <> ? OR epoch <> ?", now, currentLoginSessionVersion(), loginSessionRegistry.epoch).
 		Delete(&model.LoginSession{}).Error
 }
 
@@ -680,6 +681,6 @@ func loginSessionRecordFromModel(persisted model.LoginSession) loginSessionRecor
 		epoch:            persisted.Epoch,
 		expiresAt:        persisted.ExpiresAt,
 		lastActivityAt:   persisted.LastActivityAt,
-		idleLimitMinutes: normalizeLoginSessionIdleLimit(persisted.IdleLimitMinutes),
+		idleLimitMinutes: normalizeStoredSessionTimeoutMinutes(persisted.IdleLimitMinutes),
 	}
 }

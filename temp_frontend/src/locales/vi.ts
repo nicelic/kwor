@@ -208,6 +208,7 @@ export default {
     sslCert: "Đường dẫn chứng chỉ SSL",
     webUri: "URI bảng điều khiển",
     sessionAge: "Tuổi tối đa của phiên",
+    sessionAgeHint: "0 nghĩa là 72 giờ và sau khi lưu sẽ hiển thị thành 3 ngày.",
     trafficAge: "Thời gian lưu biểu đồ lịch sử lưu lượng",
     trafficAgeHint: "Chỉ ảnh hưởng đến biểu đồ lịch sử lưu lượng trên các trang như inbound, outbound và người dùng. Đặt 0 sẽ tắt các biểu đồ này và xóa lịch sử hiện có, nhưng không ảnh hưởng đến lưu lượng thời gian thực ở trang chủ, giới hạn/hết hạn người dùng hoặc tổng quan lưu lượng trong Traffic Management.",
     timeLoc: "Vị trí múi giờ",

@@ -90,14 +90,27 @@
               <v-text-field v-model="settings.webURI" :label="$t('setting.webUri')" hide-details></v-text-field>
             </v-col>
             <v-col cols="12" sm="6" md="4">
-              <v-text-field
-                type="number"
-                v-model="settings.sessionMaxAge"
-                min="0"
-                :label="$t('setting.sessionAge')"
-                :suffix="$t('date.m')"
-                hide-details
-              ></v-text-field>
+              <v-row no-gutters>
+                <v-col cols="7">
+                  <v-text-field
+                    type="number"
+                    v-model="settings.sessionMaxAge"
+                    min="0"
+                    :label="$t('setting.sessionAge')"
+                    hide-details
+                  ></v-text-field>
+                </v-col>
+                <v-col cols="5">
+                  <v-select
+                    v-model="settings.sessionMaxAgeUnit"
+                    :items="sessionAgeUnitItems"
+                    hide-details
+                    density="comfortable"
+                    variant="outlined"
+                  ></v-select>
+                </v-col>
+              </v-row>
+              <div class="text-caption text-medium-emphasis mt-1">{{ $t('setting.sessionAgeHint') }}</div>
             </v-col>
             <v-col cols="12" sm="6" md="4">
               <v-text-field
@@ -816,6 +829,8 @@ type SystemTimeZoneStatus = {
   reason?: string
 }
 
+type SessionAgeUnit = 'm' | 'h' | 'd'
+
 const panelStatusLoading = ref(false)
 const panelRemoteLoading = ref(false)
 const panelLoadingMoreVersions = ref(false)
@@ -852,6 +867,7 @@ const settings = ref<Record<string, string>>({
   panelAssignedCertificateRecordID: '0',
   panelAssignedCertificateRecordIDs: '[]',
   sessionMaxAge: '0',
+  sessionMaxAgeUnit: 'd',
   trafficAge: '30',
   timeLocation: 'UTC',
   subListen: '',
@@ -861,8 +877,8 @@ const settings = ref<Record<string, string>>({
   subAssignedCertificateRecordID: '0',
   subAssignedCertificateRecordIDs: '[]',
   subUpdates: '12',
-  subEncode: 'false',
-  subShowInfo: 'false',
+  subEncode: 'true',
+  subShowInfo: 'true',
   subURI: '',
   serverTlsStoreEnabled: 'true',
   serverTlsStore: 'chrome',
@@ -881,6 +897,8 @@ const systemTimeZoneLoadError = ref('')
 const DEFAULT_WEB_PORT = '8888'
 const DEFAULT_SUB_PORT = '22780'
 const DEFAULT_TIME_LOCATION = 'UTC'
+const SESSION_MAX_AGE_MAX_MINUTES = 72 * 60
+const SESSION_MAX_AGE_DEFAULT_UNIT: SessionAgeUnit = 'd'
 const SETTINGS_SAVE_KEYS = [
   'webListen',
   'webDomain',
@@ -888,6 +906,7 @@ const SETTINGS_SAVE_KEYS = [
   'webPath',
   'webURI',
   'sessionMaxAge',
+  'sessionMaxAgeUnit',
   'trafficAge',
   'timeLocation',
   'subListen',
@@ -905,6 +924,85 @@ const SETTINGS_SAVE_KEYS = [
   'subJsonExt',
   'subClashExt',
 ] as const
+
+const normalizeSessionAgeUnit = (value: unknown): SessionAgeUnit | '' => {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (normalized === 'm' || normalized === 'h' || normalized === 'd') {
+    return normalized
+  }
+  return ''
+}
+
+const sessionAgeUnitFactor = (unit: SessionAgeUnit) => {
+  switch (unit) {
+    case 'd':
+      return 24 * 60
+    case 'h':
+      return 60
+    default:
+      return 1
+  }
+}
+
+const deriveSessionAgeDisplay = (minutesValue: unknown, preferredUnit: unknown): { value: string; unit: SessionAgeUnit } => {
+  const rawValue = String(minutesValue ?? '').trim()
+  if (!/^\d+$/.test(rawValue)) {
+    return { value: '3', unit: SESSION_MAX_AGE_DEFAULT_UNIT }
+  }
+  const parsedValue = Number.parseInt(rawValue, 10)
+  if (!Number.isSafeInteger(parsedValue) || parsedValue <= 0) {
+    return { value: '3', unit: SESSION_MAX_AGE_DEFAULT_UNIT }
+  }
+  const effectiveMinutes = Math.min(parsedValue, SESSION_MAX_AGE_MAX_MINUTES)
+  const normalizedPreferred = normalizeSessionAgeUnit(preferredUnit)
+  if (normalizedPreferred) {
+    const factor = sessionAgeUnitFactor(normalizedPreferred)
+    const displayValue = effectiveMinutes / factor
+    if (Number.isInteger(displayValue) && displayValue >= 1) {
+      return { value: String(displayValue), unit: normalizedPreferred }
+    }
+  }
+  if (effectiveMinutes % (24 * 60) === 0) {
+    return { value: String(effectiveMinutes / (24 * 60)), unit: 'd' }
+  }
+  if (effectiveMinutes % 60 === 0) {
+    return { value: String(effectiveMinutes / 60), unit: 'h' }
+  }
+  return { value: String(effectiveMinutes), unit: 'm' }
+}
+
+const buildSessionAgeSaveFields = (displayValue: unknown, displayUnit: unknown) => {
+  const rawValue = String(displayValue ?? '').trim()
+  const normalizedUnit = normalizeSessionAgeUnit(displayUnit) || SESSION_MAX_AGE_DEFAULT_UNIT
+  if (/^\d+$/.test(rawValue)) {
+    const parsedValue = Number.parseInt(rawValue, 10)
+    if (Number.isSafeInteger(parsedValue) && parsedValue >= 0) {
+      if (parsedValue === 0) {
+        return {
+          sessionMaxAge: String(SESSION_MAX_AGE_MAX_MINUTES),
+          sessionMaxAgeUnit: SESSION_MAX_AGE_DEFAULT_UNIT,
+        }
+      }
+      return {
+        sessionMaxAge: String(parsedValue * sessionAgeUnitFactor(normalizedUnit)),
+        sessionMaxAgeUnit: normalizedUnit,
+      }
+    }
+  }
+  return {
+    sessionMaxAge: rawValue,
+    sessionMaxAgeUnit: normalizedUnit,
+  }
+}
+
+const sessionAgeUnitItems = computed(() => {
+  void locale.current.value
+  return [
+    { title: i18n.global.t('date.m'), value: 'm' },
+    { title: i18n.global.t('date.h'), value: 'h' },
+    { title: i18n.global.t('date.d'), value: 'd' },
+  ]
+})
 
 const timeZoneHeaderKeys: Record<string, string> = {
   '推荐国家 / 地区': 'setting.timeZoneRecommended',
@@ -1114,6 +1212,7 @@ const retryLoadData = () => {
 
 const setData = (snapshot: SettingsSnapshot) => {
 	const data = snapshot.values
+  const sessionAgeDisplay = deriveSessionAgeDisplay(data?.sessionMaxAge, data?.sessionMaxAgeUnit)
   const rawPanelTimeLocation = String(data?.timeLocation ?? '').trim()
   const panelTimeLocation = normalizeTimeLocationValue(rawPanelTimeLocation)
   // 有效但不在固定列表中的数据库时区仍由后端使用；界面必须保持为空，
@@ -1121,6 +1220,8 @@ const setData = (snapshot: SettingsSnapshot) => {
   hiddenPanelTimeLocation.value = panelTimeLocation === '' ? rawPanelTimeLocation : ''
   const normalized = {
     ...data,
+    sessionMaxAge: sessionAgeDisplay.value,
+    sessionMaxAgeUnit: sessionAgeDisplay.unit,
     timeLocation: panelTimeLocation,
   }
 	settings.value = {
@@ -2063,11 +2164,12 @@ const save = async () => {
 	  }
 	}
 	const normalizedSettings = buildSettingsSavePayload(settings.value)
+	const previousNormalizedSettings = buildSettingsSavePayload(oldSettings.value)
 	const changes: Record<string, string> = {}
 	for (const key of SETTINGS_SAVE_KEYS) {
 	  if (key === 'subJsonExt' || key === 'subClashExt') continue
 	  const nextValue = String(normalizedSettings[key] ?? '')
-	  const previousValue = String(oldSettings.value[key] ?? '')
+	  const previousValue = String(previousNormalizedSettings[key] ?? '')
 	  if (nextValue !== previousValue) changes[key] = nextValue
 	}
 	if (subJsonDraftDirty.value) changes.subJsonExt = subJsonDraftValue.value
@@ -2077,7 +2179,7 @@ const save = async () => {
 	  : ''
 	if (Object.keys(changes).length === 0 && requestedSystemTimeLocation === '') return
 	const clearingTrafficHistory = String(normalizedSettings.trafficAge ?? '').trim() === '0'
-	  && String(oldSettings.value.trafficAge ?? '').trim() !== '0'
+	  && String(previousNormalizedSettings.trafficAge ?? '').trim() !== '0'
 	if (clearingTrafficHistory) {
 	  const confirmed = await confirm({
 		severity: 'danger',
@@ -2135,6 +2237,7 @@ const save = async () => {
 	  if (tab.value === 't3') await loadSubscriptionDraft('json')
 	  if (tab.value === 't4') await loadSubscriptionDraft('clash')
       await Promise.all([
+        refreshSessionTimeoutLease(),
         refreshPanelTimeContext(),
         loadSystemTimeZone(),
       ])
@@ -2312,6 +2415,17 @@ const maybeRedirectToHttps = async (nextSettings: any, previousSettings: any) =>
   window.location.replace(url)
 }
 
+const refreshSessionTimeoutLease = async () => {
+  const msg = await HttpUtils.get('api/session', {}, {
+    silentAuthCheck: true,
+    silentErrorToast: true,
+    timeout: 10000,
+  })
+  if (!msg.success && msg.failureKind === 'api') {
+    await router.replace('/login')
+  }
+}
+
 const buildURL = (host: string, port: string, isTLS: boolean, path: string) => {
   if (!host || host.length === 0) host = window.location.hostname
   if (!port || port.length === 0) port = window.location.port
@@ -2349,6 +2463,9 @@ const buildSettingsSavePayload = (value: Record<string, any>) => {
   const payload = Object.fromEntries(
     SETTINGS_SAVE_KEYS.map(key => [key, value[key]]),
   ) as Record<string, any>
+  const sessionAgeFields = buildSessionAgeSaveFields(payload.sessionMaxAge, payload.sessionMaxAgeUnit)
+  payload.sessionMaxAge = sessionAgeFields.sessionMaxAge
+  payload.sessionMaxAgeUnit = sessionAgeFields.sessionMaxAgeUnit
   const visiblePanelTimeLocation = normalizeTimeLocationValue(payload.timeLocation)
   payload.timeLocation = visiblePanelTimeLocation || hiddenPanelTimeLocation.value || DEFAULT_TIME_LOCATION
   return payload

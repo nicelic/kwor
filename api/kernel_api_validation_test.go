@@ -125,6 +125,13 @@ func TestKernelAPIValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("install status returns current or missing snapshot", func(t *testing.T) {
+		rec, msg := performKernelAPIGet(t, svc.GetKernelInstallStatus, "/api/kernel-install-status")
+		if !msg.Success || rec.Code != 200 {
+			t.Fatalf("unexpected response: code=%d msg=%q", rec.Code, msg.Msg)
+		}
+	})
+
 	t.Run("download stop rejects unknown id", func(t *testing.T) {
 		rec, msg := performKernelAPIPostJSON(t, svc.StopKernelDownload, `{"id":"kernel-unknown-task"}`)
 		if msg.Success {

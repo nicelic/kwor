@@ -30,6 +30,7 @@ type sessionAPIResponse struct {
 	Msg     string `json:"msg"`
 	Obj     struct {
 		Reason         string `json:"reason"`
+		DeadlineAt     int64  `json:"deadlineAt"`
 		IdleDeadlineAt int64  `json:"idleDeadlineAt"`
 	} `json:"obj"`
 }
@@ -82,14 +83,14 @@ func isolateLoginSessionState(t *testing.T) *loginSessionTestState {
 	return state
 }
 
-func newLoginSessionTestRouter(t *testing.T, idleLimitMinutes int) (*gin.Engine, sessions.Store) {
+func newLoginSessionTestRouter(t *testing.T, sessionMaxAgeMinutes int) (*gin.Engine, sessions.Store) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	store := cookie.NewStore([]byte("session-test-secret"))
 	router := gin.New()
 	router.Use(sessions.Sessions("kwor", store))
 	router.GET("/login", func(c *gin.Context) {
-		if err := SetLoginUser(c, "tester", idleLimitMinutes); err != nil {
+		if err := SetLoginUser(c, "tester", sessionMaxAgeMinutes); err != nil {
 			c.String(http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -153,7 +154,7 @@ func writeSessionCookie(t *testing.T, store sessions.Store, values map[interface
 		for key, value := range values {
 			s.Set(key, value)
 		}
-		s.Options(sessionCookieOptions(c))
+		s.Options(sessionCookieOptions(c, 0))
 		if err := s.Save(); err != nil {
 			c.String(http.StatusInternalServerError, err.Error())
 			return
@@ -193,7 +194,7 @@ func inMemoryLoginSessionCount() int {
 	return len(loginSessionRegistry.sessions)
 }
 
-func createStoredLoginSession(t *testing.T, state *loginSessionTestState, userName string, idleLimitMinutes int) (string, string) {
+func createStoredLoginSession(t *testing.T, state *loginSessionTestState, userName string, sessionMaxAgeMinutes int) (string, string) {
 	t.Helper()
 	token, err := newLoginSessionToken()
 	if err != nil {
@@ -203,13 +204,14 @@ func createStoredLoginSession(t *testing.T, state *loginSessionTestState, userNa
 	if !ok {
 		t.Fatal("generated login token did not produce a valid hash")
 	}
+	effectiveSessionMinutes := normalizeStoredSessionTimeoutMinutes(sessionMaxAgeMinutes)
 	if _, err := storeLoginSession(
 		tokenHash,
 		userName,
 		currentLoginSessionVersion(),
-		loginSessionExpiry(state.now),
+		loginSessionExpiry(state.now, effectiveSessionMinutes),
 		state.now,
-		normalizeLoginSessionIdleLimit(idleLimitMinutes),
+		effectiveSessionMinutes,
 	); err != nil {
 		t.Fatalf("store login session: %v", err)
 	}
@@ -247,16 +249,16 @@ func persistedLoginSessionCount(t *testing.T) int64 {
 	return count
 }
 
-func TestSessionCookieOptionsAreSecureAndFixedToTenMinutes(t *testing.T) {
-	options := sessionCookieOptions(nil)
+func TestSessionCookieOptionsAreSecureAndBoundedToSeventyTwoHours(t *testing.T) {
+	options := sessionCookieOptions(nil, 0)
 	if !options.Secure || !options.HttpOnly || options.SameSite != http.SameSiteLaxMode {
 		t.Fatalf("unexpected session cookie security options: %#v", options)
 	}
-	if options.MaxAge != 10*60 {
-		t.Fatalf("session max age = %d, want %d", options.MaxAge, 10*60)
+	if options.MaxAge != 72*60*60 {
+		t.Fatalf("session max age = %d, want %d", options.MaxAge, 72*60*60)
 	}
-	if codecMaxAge := SessionCookieCodecMaxAgeSeconds(); codecMaxAge != 10*60 {
-		t.Fatalf("session cookie codec max age = %d, want %d", codecMaxAge, 10*60)
+	if codecMaxAge := SessionCookieCodecMaxAgeSeconds(); codecMaxAge != 72*60*60 {
+		t.Fatalf("session cookie codec max age = %d, want %d", codecMaxAge, 72*60*60)
 	}
 }
 
@@ -272,7 +274,7 @@ func TestLocalDebugHTTPWhitelistAllowsLoopbackOnly(t *testing.T) {
 		if !isPanelLoginTransportAllowed(ctx) {
 			t.Fatalf("loopback address %q must be allowed in local debug mode", remoteAddr)
 		}
-		if options := sessionCookieOptions(ctx); options.Secure {
+		if options := sessionCookieOptions(ctx, 0); options.Secure {
 			t.Fatalf("loopback address %q must receive an HTTP-compatible session cookie", remoteAddr)
 		}
 	}
@@ -285,7 +287,7 @@ func TestLocalDebugHTTPWhitelistAllowsLoopbackOnly(t *testing.T) {
 	if isPanelLoginTransportAllowed(ctx) {
 		t.Fatal("non-loopback address must not be allowed in local debug mode")
 	}
-	if options := sessionCookieOptions(ctx); !options.Secure {
+	if options := sessionCookieOptions(ctx, 0); !options.Secure {
 		t.Fatal("non-loopback address must retain a secure session cookie")
 	}
 }
@@ -322,7 +324,7 @@ func TestLoginCookieContainsOnlyOpaqueRandomToken(t *testing.T) {
 	}
 
 	sessionCookie := responseSessionCookie(t, recorder)
-	if !sessionCookie.Secure || !sessionCookie.HttpOnly || sessionCookie.SameSite != http.SameSiteLaxMode || sessionCookie.MaxAge != loginSessionCookieMaxAge {
+	if !sessionCookie.Secure || !sessionCookie.HttpOnly || sessionCookie.SameSite != http.SameSiteLaxMode || sessionCookie.MaxAge != SessionCookieCodecMaxAgeSeconds() {
 		t.Fatalf("unexpected opaque login cookie options: %#v", sessionCookie)
 	}
 	values := decodeSessionCookieValues(t, store, sessionCookie)
@@ -366,37 +368,7 @@ func TestFixedLegacyCookieNameIsDeletedWhenPresented(t *testing.T) {
 	}
 }
 
-func TestVisiblePageKeepaliveRenewsTenMinuteSessionLease(t *testing.T) {
-	state := isolateLoginSessionState(t)
-	router, _ := newLoginSessionTestRouter(t, 0)
-	sessionCookie := loginSessionCookie(t, router)
-
-	state.now = state.now.Add(9 * time.Minute)
-	refreshRecorder, refreshResponse := requestSession(t, router, http.MethodGet, sessionCookie)
-	if !refreshResponse.Success {
-		t.Fatalf("keepalive rejected active session: %#v", refreshResponse)
-	}
-	renewedCookie := responseSessionCookie(t, refreshRecorder)
-	if renewedCookie.MaxAge != 10*60 {
-		t.Fatalf("renewed cookie MaxAge=%d, want %d", renewedCookie.MaxAge, 10*60)
-	}
-
-	state.now = state.now.Add(9 * time.Minute)
-	secondRefreshRecorder, secondRefreshResponse := requestSession(t, router, http.MethodGet, renewedCookie)
-	if !secondRefreshResponse.Success {
-		t.Fatalf("second keepalive rejected active session: %#v", secondRefreshResponse)
-	}
-	renewedCookie = responseSessionCookie(t, secondRefreshRecorder)
-
-	state.now = state.now.Add(loginSessionLifetime + time.Second)
-	expiredRecorder, expiredResponse := requestSession(t, router, http.MethodGet, renewedCookie)
-	if expiredResponse.Success || expiredResponse.Obj.Reason != loginSessionReasonPageInactive {
-		t.Fatalf("inactive page response=%#v, want reason=%q", expiredResponse, loginSessionReasonPageInactive)
-	}
-	assertDeletedSessionCookie(t, expiredRecorder)
-}
-
-func TestUserIdleLimitDoesNotTreatKeepaliveAsActivity(t *testing.T) {
+func TestConfiguredSessionKeepaliveRenewsConfiguredLease(t *testing.T) {
 	state := isolateLoginSessionState(t)
 	start := state.now
 	router, _ := newLoginSessionTestRouter(t, 1)
@@ -407,19 +379,30 @@ func TestUserIdleLimitDoesNotTreatKeepaliveAsActivity(t *testing.T) {
 	if !refreshResponse.Success {
 		t.Fatalf("keepalive rejected active session: %#v", refreshResponse)
 	}
-	if want := start.Add(time.Minute).Unix(); refreshResponse.Obj.IdleDeadlineAt != want {
-		t.Fatalf("keepalive idle deadline=%d, want %d", refreshResponse.Obj.IdleDeadlineAt, want)
+	if want := state.now.Add(time.Minute).Unix(); refreshResponse.Obj.DeadlineAt != want || refreshResponse.Obj.IdleDeadlineAt != want {
+		t.Fatalf("keepalive deadline=%d/%d, want %d", refreshResponse.Obj.DeadlineAt, refreshResponse.Obj.IdleDeadlineAt, want)
+	}
+	renewedCookie := responseSessionCookie(t, refreshRecorder)
+	if renewedCookie.MaxAge != 60 {
+		t.Fatalf("renewed cookie MaxAge=%d, want %d", renewedCookie.MaxAge, 60)
 	}
 
-	state.now = start.Add(time.Minute + time.Second)
-	idleRecorder, idleResponse := requestSession(t, router, http.MethodGet, responseSessionCookie(t, refreshRecorder))
-	if idleResponse.Success || idleResponse.Obj.Reason != loginSessionReasonUserIdle {
-		t.Fatalf("idle timeout response=%#v, want reason=%q", idleResponse, loginSessionReasonUserIdle)
+	state.now = start.Add(80 * time.Second)
+	secondRefreshRecorder, secondRefreshResponse := requestSession(t, router, http.MethodGet, renewedCookie)
+	if !secondRefreshResponse.Success {
+		t.Fatalf("second keepalive rejected active session: %#v", secondRefreshResponse)
 	}
-	assertDeletedSessionCookie(t, idleRecorder)
+	renewedCookie = responseSessionCookie(t, secondRefreshRecorder)
+
+	state.now = start.Add(141 * time.Second)
+	expiredRecorder, expiredResponse := requestSession(t, router, http.MethodGet, renewedCookie)
+	if expiredResponse.Success || expiredResponse.Obj.Reason != loginSessionReasonTimeout {
+		t.Fatalf("expired keepalive response=%#v, want reason=%q", expiredResponse, loginSessionReasonTimeout)
+	}
+	assertDeletedSessionCookie(t, expiredRecorder)
 }
 
-func TestSessionActivityRoutePreservesUserIdleTimeoutReason(t *testing.T) {
+func TestSessionActivityRoutePreservesSessionTimeoutReason(t *testing.T) {
 	state := isolateLoginSessionState(t)
 	start := state.now
 	gin.SetMode(gin.TestMode)
@@ -447,32 +430,35 @@ func TestSessionActivityRoutePreservesUserIdleTimeoutReason(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode activity route response: %v; body=%q", err, recorder.Body.String())
 	}
-	if response.Success || response.Msg != "Invalid login" || response.Obj.Reason != loginSessionReasonUserIdle {
-		t.Fatalf("activity route idle response=%#v, want reason=%q", response, loginSessionReasonUserIdle)
+	if response.Success || response.Msg != "Invalid login" || response.Obj.Reason != loginSessionReasonTimeout {
+		t.Fatalf("activity route timeout response=%#v, want reason=%q", response, loginSessionReasonTimeout)
 	}
 	assertDeletedSessionCookie(t, recorder)
 }
 
-func TestZeroUserIdleLimitAllowsIndefiniteVisibleKeepalive(t *testing.T) {
+func TestZeroSessionMaxAgeUsesSeventyTwoHourLease(t *testing.T) {
 	state := isolateLoginSessionState(t)
 	start := state.now
 	router, _ := newLoginSessionTestRouter(t, 0)
 	sessionCookie := loginSessionCookie(t, router)
 
-	for iteration := 1; iteration <= 8; iteration++ {
-		state.now = start.Add(time.Duration(iteration) * 9 * time.Minute)
+	for iteration := 1; iteration <= 3; iteration++ {
+		state.now = start.Add(time.Duration(iteration) * 36 * time.Hour)
 		recorder, response := requestSession(t, router, http.MethodGet, sessionCookie)
 		if !response.Success {
 			t.Fatalf("keepalive %d rejected zero-limit session: %#v", iteration, response)
 		}
-		if response.Obj.IdleDeadlineAt != 0 {
-			t.Fatalf("zero idle limit returned deadline %d", response.Obj.IdleDeadlineAt)
+		if want := state.now.Add(72 * time.Hour).Unix(); response.Obj.DeadlineAt != want || response.Obj.IdleDeadlineAt != want {
+			t.Fatalf("72-hour keepalive deadline=%d/%d, want %d", response.Obj.DeadlineAt, response.Obj.IdleDeadlineAt, want)
 		}
 		sessionCookie = responseSessionCookie(t, recorder)
+		if sessionCookie.MaxAge != 72*60*60 {
+			t.Fatalf("zero session max age cookie MaxAge=%d, want %d", sessionCookie.MaxAge, 72*60*60)
+		}
 	}
 }
 
-func TestExplicitUserActivityExtendsConfiguredIdleDeadline(t *testing.T) {
+func TestSessionActivityCompatibilityRefreshesUnifiedDeadline(t *testing.T) {
 	state := isolateLoginSessionState(t)
 	start := state.now
 	router, _ := newLoginSessionTestRouter(t, 1)
@@ -481,16 +467,16 @@ func TestExplicitUserActivityExtendsConfiguredIdleDeadline(t *testing.T) {
 	state.now = start.Add(50 * time.Second)
 	activityRecorder, activityResponse := requestSession(t, router, http.MethodPost, sessionCookie)
 	if !activityResponse.Success {
-		t.Fatalf("activity refresh rejected session: %#v", activityResponse)
+		t.Fatalf("compatibility POST refresh rejected session: %#v", activityResponse)
 	}
-	if want := state.now.Add(time.Minute).Unix(); activityResponse.Obj.IdleDeadlineAt != want {
-		t.Fatalf("activity idle deadline=%d, want %d", activityResponse.Obj.IdleDeadlineAt, want)
+	if want := state.now.Add(time.Minute).Unix(); activityResponse.Obj.DeadlineAt != want || activityResponse.Obj.IdleDeadlineAt != want {
+		t.Fatalf("compatibility POST deadline=%d/%d, want %d", activityResponse.Obj.DeadlineAt, activityResponse.Obj.IdleDeadlineAt, want)
 	}
 
-	state.now = start.Add(time.Minute + 10*time.Second)
+	state.now = start.Add(100 * time.Second)
 	_, followupResponse := requestSession(t, router, http.MethodGet, responseSessionCookie(t, activityRecorder))
 	if !followupResponse.Success {
-		t.Fatalf("activity did not extend idle deadline: %#v", followupResponse)
+		t.Fatalf("compatibility POST did not renew session timeout: %#v", followupResponse)
 	}
 }
 
@@ -509,7 +495,7 @@ func TestLegacyCookieFormatIsRejectedAndDeleted(t *testing.T) {
 		userName:       "tester",
 		version:        currentLoginSessionVersion(),
 		epoch:          loginSessionRegistry.epoch,
-		expiresAt:      loginSessionExpiry(state.now),
+		expiresAt:      loginSessionExpiry(state.now, 0),
 		lastActivityAt: state.now,
 	}
 	loginSessionRegistry.Unlock()
@@ -668,7 +654,7 @@ func TestLoginSessionDatabaseOverflowPromotesAndRecycles(t *testing.T) {
 	loginSessionRegistry.Lock()
 	delete(loginSessionRegistry.sessions, hashes[0])
 	loginSessionRegistry.Unlock()
-	if _, refreshed, reason, err := refreshLoginSession(hashes[maxInMemoryLoginSessions], loginSessionExpiry(state.now), state.now, false); err != nil || !refreshed || reason != "" {
+	if _, refreshed, reason, err := refreshLoginSession(hashes[maxInMemoryLoginSessions], state.now); err != nil || !refreshed || reason != "" {
 		t.Fatalf("promote overflow session refreshed=%v reason=%q err=%v", refreshed, reason, err)
 	}
 	if got := inMemoryLoginSessionCount(); got != maxInMemoryLoginSessions {
@@ -705,18 +691,17 @@ func TestLoginSessionDatabaseOverflowPromotesAndRecycles(t *testing.T) {
 			lastActivityAt: state.now,
 		},
 		{
-			userName:         "idle",
-			version:          currentLoginSessionVersion(),
-			epoch:            loginSessionRegistry.epoch,
-			expiresAt:        loginSessionExpiry(state.now),
-			lastActivityAt:   state.now.Add(-time.Minute - time.Second),
-			idleLimitMinutes: 1,
-		},
-		{
 			userName:       "old-epoch",
 			version:        currentLoginSessionVersion(),
 			epoch:          "expired-live-epoch",
-			expiresAt:      loginSessionExpiry(state.now),
+			expiresAt:      loginSessionExpiry(state.now, 0),
+			lastActivityAt: state.now,
+		},
+		{
+			userName:       "old-version",
+			version:        "1.6.0",
+			epoch:          loginSessionRegistry.epoch,
+			expiresAt:      loginSessionExpiry(state.now, 0),
 			lastActivityAt: state.now,
 		},
 	} {

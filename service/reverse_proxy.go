@@ -3252,12 +3252,27 @@ const (
 	reverseProxyTokenModeTarget
 )
 
+func normalizeReverseProxyTokenInput(token string, mode int) string {
+	token = strings.TrimSpace(token)
+	switch mode {
+	case reverseProxyTokenModeServerName, reverseProxyTokenModeListenName, reverseProxyTokenModeHost, reverseProxyTokenModeTarget:
+		lower := strings.ToLower(token)
+		switch {
+		case strings.HasPrefix(lower, "http://"):
+			token = token[len("http://"):]
+		case strings.HasPrefix(lower, "https://"):
+			token = token[len("https://"):]
+		}
+	}
+	return strings.TrimSpace(token)
+}
+
 func normalizeReverseProxyTokens(raw string, mode int) ([]string, error) {
 	fields := splitReverseProxyTokenFields(raw)
 	seen := make(map[string]struct{}, len(fields))
 	result := make([]string, 0, len(fields))
 	for _, field := range fields {
-		token := strings.TrimSpace(field)
+		token := normalizeReverseProxyTokenInput(field, mode)
 		if reverseProxyTokenHasExplicitPort(token) {
 			switch mode {
 			case reverseProxyTokenModeTarget:

@@ -136,3 +136,9 @@ func (s *MihomoCoreManagerService) SaveCustomDownloadURL(downloadURL string) err
 		preference.CustomURL = downloadURL
 	})
 }
+
+func (s *MihomoCoreManagerService) normalizeStatusDownloadPreference(preference MihomoCoreDownloadPreference) MihomoCoreDownloadPreference {
+	preference = normalizeMihomoDownloadPreference(preference)
+	preference.Target = s.normalizeDownloadTarget(preference.Target)
+	return preference
+}

@@ -34,19 +34,27 @@ type MihomoCoreInfo struct {
 	Platform           string                       `json:"platform"`
 	RuntimeMode        string                       `json:"runtimeMode,omitempty"`
 	InstalledTarget    MihomoCoreDownloadTarget     `json:"installedTarget,omitempty"`
+	InstalledChannel   string                       `json:"installedChannel,omitempty"`
 	DownloadPreference MihomoCoreDownloadPreference `json:"downloadPreference"`
 }
 
 type MihomoCoreUpdateInfo struct {
-	Enabled       bool   `json:"enabled"`
-	IntervalHours int    `json:"intervalHours"`
-	LastCheckedAt int64  `json:"lastCheckedAt"`
-	LatestStable  string `json:"latestStable"`
-	LatestAlpha   string `json:"latestAlpha"`
-	PendingStable string `json:"pendingStable"`
-	PendingAlpha  string `json:"pendingAlpha"`
-	HasUpdate     bool   `json:"hasUpdate"`
-	UpdateCount   int    `json:"updateCount"`
+	Enabled                 bool   `json:"enabled"`
+	IntervalHours           int    `json:"intervalHours"`
+	LastCheckedAt           int64  `json:"lastCheckedAt"`
+	LatestStable            string `json:"latestStable"`
+	LatestAlpha             string `json:"latestAlpha"`
+	PendingStable           string `json:"pendingStable"`
+	PendingAlpha            string `json:"pendingAlpha"`
+	HasUpdate               bool   `json:"hasUpdate"`
+	UpdateCount             int    `json:"updateCount"`
+	AutoUpdateEnabled       bool   `json:"autoUpdateEnabled"`
+	AutoUpdateDisabled      bool   `json:"autoUpdateDisabled"`
+	AutoUpdateDisableReason string `json:"autoUpdateDisableReason"`
+	AutoUpdateLastAttemptAt int64  `json:"autoUpdateLastAttemptAt"`
+	AutoUpdateLastSuccessAt int64  `json:"autoUpdateLastSuccessAt"`
+	AutoUpdateError         string `json:"autoUpdateError"`
+	AutoUpdateErrorAt       int64  `json:"autoUpdateErrorAt"`
 }
 
 type MihomoCoreVersionItem struct {
@@ -140,13 +148,19 @@ type MihomoCoreManagerService struct {
 const (
 	mihomoSystemdName = "kwor-mihomo"
 
-	mihomoCoreAutoCheckEnabledKey       = "mihomoCoreAutoCheckEnabled"
-	mihomoCoreAutoCheckIntervalHoursKey = "mihomoCoreAutoCheckIntervalHours"
-	mihomoCoreAutoCheckLastAtKey        = "mihomoCoreAutoCheckLastAt"
-	mihomoCoreAutoCheckLatestStableKey  = "mihomoCoreAutoCheckLatestStable"
-	mihomoCoreAutoCheckLatestAlphaKey   = "mihomoCoreAutoCheckLatestAlpha"
-	mihomoCoreAutoCheckPendingStableKey = "mihomoCoreAutoCheckPendingStable"
-	mihomoCoreAutoCheckPendingAlphaKey  = "mihomoCoreAutoCheckPendingAlpha"
+	mihomoCoreAutoCheckEnabledKey        = "mihomoCoreAutoCheckEnabled"
+	mihomoCoreAutoCheckIntervalHoursKey  = "mihomoCoreAutoCheckIntervalHours"
+	mihomoCoreAutoCheckLastAtKey         = "mihomoCoreAutoCheckLastAt"
+	mihomoCoreAutoCheckLatestStableKey   = "mihomoCoreAutoCheckLatestStable"
+	mihomoCoreAutoCheckLatestAlphaKey    = "mihomoCoreAutoCheckLatestAlpha"
+	mihomoCoreAutoCheckPendingStableKey  = "mihomoCoreAutoCheckPendingStable"
+	mihomoCoreAutoCheckPendingAlphaKey   = "mihomoCoreAutoCheckPendingAlpha"
+	mihomoCoreAutoUpdateEnabledKey       = "mihomoCoreAutoUpdateEnabled"
+	mihomoCoreAutoUpdateLastAttemptKey   = "mihomoCoreAutoUpdateLastAttemptAt"
+	mihomoCoreAutoUpdateLastSuccessKey   = "mihomoCoreAutoUpdateLastSuccessAt"
+	mihomoCoreAutoUpdateErrorKey         = "mihomoCoreAutoUpdateError"
+	mihomoCoreAutoUpdateErrorAtKey       = "mihomoCoreAutoUpdateErrorAt"
+	mihomoCoreAutoUpdateDisableReasonKey = "mihomoCoreAutoUpdateDisableReason"
 )
 
 var (
@@ -371,29 +385,32 @@ func (s *MihomoCoreManagerService) GetCoreStatus() (*MihomoCoreInfo, error) {
 	}
 	info.RuntimeMode = string(getManagedCoreRuntimeMode())
 	if preference, err := s.GetDownloadPreference(); err == nil {
-		info.DownloadPreference = preference
+		info.DownloadPreference = s.normalizeStatusDownloadPreference(preference)
 	} else {
 		logger.Warning("failed to load mihomo download preference: ", err)
 	}
 
 	binPath := s.getCoreBinPath()
 	if !IsSystemPlatformWindows() {
-		inspection := inspectManagedLinuxCoreBinary(binPath, "mihomo", func(statInfo os.FileInfo, forceRefresh bool) (string, string) {
-			return s.getCachedLocalVersion(binPath, statInfo, forceRefresh)
-		})
+		inspection := s.inspectManagedLocalMihomoBinary(binPath)
 		info.Installed = inspection.Installed
 		info.Compatible = inspection.Compatible
 		info.LocalVersion = inspection.Version
 		info.VersionInfo = inspection.VersionInfo
 		if inspection.Architecture != "" {
-			installedTarget := MihomoCoreDownloadTarget{OS: "linux", Arch: inspection.Architecture}
-			if installedTarget.Arch == "amd64" {
-				installedTarget.Amd64Level = inferMihomoInstalledAMD64Level(binPath, inspection.VersionInfo)
+			installedTarget := MihomoCoreDownloadTarget{
+				OS:         "linux",
+				Arch:       inspection.Architecture,
+				Amd64Level: inspection.Amd64Level,
 			}
-			info.InstalledTarget = installedTarget
+			info.InstalledTarget = mergeMihomoInstalledTargetWithPreference(installedTarget, info.DownloadPreference.Target)
+		}
+		if channel := strings.TrimSpace(inspection.Channel); channel != "" {
+			info.InstalledChannel = channel
 		}
 		if !inspection.Installed {
 			clearMihomoLocalVersionCache(binPath)
+			clearMihomoCoreLocalTargetCache(binPath)
 		}
 	} else if statInfo, err := os.Stat(binPath); err == nil {
 		info.Installed = true
@@ -407,8 +424,13 @@ func (s *MihomoCoreManagerService) GetCoreStatus() (*MihomoCoreInfo, error) {
 			installedTarget.Amd64Level = inferMihomoInstalledAMD64Level(binPath, info.VersionInfo)
 		}
 		info.InstalledTarget = mergeMihomoInstalledTargetWithPreference(installedTarget, info.DownloadPreference.Target)
+		info.InstalledChannel = detectMihomoInstalledChannel(info.LocalVersion, info.VersionInfo)
+		if info.InstalledChannel == "" {
+			info.InstalledChannel = inferMihomoInstalledChannelFromBuildInfo(binPath)
+		}
 	} else {
 		clearMihomoLocalVersionCache(binPath)
+		clearMihomoCoreLocalTargetCache(binPath)
 	}
 
 	info.Running = s.isRunning()
@@ -436,6 +458,7 @@ func pickMihomoAssetFromAssets(assets []GitHubAsset, target MihomoCoreDownloadTa
 	if normalizedTarget.OS == "windows" {
 		preferredExts = []string{".zip", ".tar.gz", ".tgz", ".gz", ".tar.xz", ".txz"}
 	}
+	requireExactAMD64Level := normalizedTarget.Arch == "amd64" && normalizedTarget.Amd64Level != ""
 
 	type scoredAsset struct {
 		asset GitHubAsset
@@ -444,6 +467,9 @@ func pickMihomoAssetFromAssets(assets []GitHubAsset, target MihomoCoreDownloadTa
 
 	candidates := make([]scoredAsset, 0, len(assets))
 	for _, asset := range assets {
+		if requireExactAMD64Level && !mihomoAssetMatchesAMD64LevelExactly(asset.Name, normalizedTarget.Amd64Level) {
+			continue
+		}
 		score := (&MihomoCoreManagerService{}).scoreAssetName(asset.Name, preferredExts, normalizedTarget)
 		if score < 1500 {
 			continue
@@ -464,7 +490,12 @@ func pickMihomoAssetFromAssets(assets []GitHubAsset, target MihomoCoreDownloadTa
 }
 
 func (s *MihomoCoreManagerService) GetRemoteVersionsWindow(channel string, offset int, limit int, target MihomoCoreDownloadTarget) (*MihomoCoreVersionListResponse, error) {
-	channel = "stable"
+	channel = strings.ToLower(strings.TrimSpace(channel))
+	switch channel {
+	case "stable", "alpha":
+	default:
+		channel = "stable"
+	}
 	offset, limit = normalizeCoreVersionWindow(offset, limit)
 	filterTarget := hasMihomoCoreDownloadTargetFilter(target)
 	if filterTarget {
@@ -611,6 +642,28 @@ func hasMihomoToken(tokens []string, expected string) bool {
 		}
 	}
 	return false
+}
+
+func mihomoAssetMatchesAMD64LevelExactly(name string, level string) bool {
+	level = normalizeMihomoAMD64Level(level)
+	if level == "" {
+		return true
+	}
+	tokens := splitMihomoAssetTokens(name)
+	hasV1 := hasMihomoToken(tokens, "v1")
+	hasV2 := hasMihomoToken(tokens, "v2")
+	hasV3 := hasMihomoToken(tokens, "v3")
+	hasCompatible := hasMihomoToken(tokens, "compatible")
+	switch level {
+	case "v1":
+		return (hasV1 || hasCompatible) && !hasV2 && !hasV3
+	case "v2":
+		return hasV2 && !hasV1 && !hasV3 && !hasCompatible
+	case "v3":
+		return hasV3 && !hasV1 && !hasV2 && !hasCompatible
+	default:
+		return false
+	}
 }
 
 func inferMihomoAmd64LevelFromVersionInfo(versionInfo string) string {
@@ -1068,6 +1121,9 @@ func (s *MihomoCoreManagerService) downloadCoreWithContext(operationContext cont
 	if err := s.SaveDownloadTarget(normalizedTarget); err != nil {
 		logger.Warning("failed to save mihomo download preference: ", err)
 	}
+	if clearErr := s.ClearCoreAutoUpdateDisableReason(); clearErr != nil {
+		logger.Warning("clear Mihomo auto update disable reason after download failed: ", clearErr)
+	}
 
 	if wasRunning {
 		SetCoreDownloadProgressStage(sessionID, coreDownloadStageStarting)
@@ -1286,6 +1342,9 @@ func (s *MihomoCoreManagerService) downloadCoreFromURLWithContext(operationConte
 
 	binPath := filepath.Join(coreDir, binName)
 	localVersion, _ := s.getLocalVersion(binPath)
+	if clearErr := s.ClearCoreAutoUpdateDisableReason(); clearErr != nil {
+		logger.Warning("clear Mihomo auto update disable reason after custom download failed: ", clearErr)
+	}
 	if wasRunning {
 		SetCoreDownloadProgressStage(sessionID, coreDownloadStageStarting)
 		if err = s.startCoreLocked(); err != nil {
@@ -1521,6 +1580,11 @@ func (s *MihomoCoreManagerService) DeleteCore() error {
 
 	s.isStarted = false
 	s.coreCmd = nil
+	clearMihomoLocalVersionCache(binPath)
+	clearMihomoCoreLocalTargetCache(binPath)
+	if disableErr := s.DisableCoreAutoUpdate("本地未安装 Mihomo 内核"); disableErr != nil {
+		logger.Warning("disable Mihomo auto update after core delete failed: ", disableErr)
+	}
 	return nil
 }
 
@@ -1995,28 +2059,65 @@ func (s *MihomoCoreManagerService) buildMihomoCoreUpdateInfo() (*MihomoCoreUpdat
 	if err != nil {
 		return nil, err
 	}
+	latestAlpha, err := settingSvc.getString(mihomoCoreAutoCheckLatestAlphaKey)
+	if err != nil {
+		return nil, err
+	}
 	pendingStable, err := settingSvc.getString(mihomoCoreAutoCheckPendingStableKey)
 	if err != nil {
 		return nil, err
 	}
+	pendingAlpha, err := settingSvc.getString(mihomoCoreAutoCheckPendingAlphaKey)
+	if err != nil {
+		return nil, err
+	}
+	autoUpdateState, err := s.getCoreAutoUpdateState()
+	if err != nil {
+		return nil, err
+	}
+	status, statusErr := s.GetCoreStatus()
+	if statusErr == nil {
+		pendingStable, pendingAlpha = selectMihomoPendingUpdateForChannel(status, pendingStable, pendingAlpha)
+	} else {
+		pendingStable = ""
+		pendingAlpha = ""
+	}
 
 	info := &MihomoCoreUpdateInfo{
-		Enabled:       enabled,
-		IntervalHours: intervalHours,
-		LastCheckedAt: lastCheckedAt,
-		LatestStable:  latestStable,
-		LatestAlpha:   "",
-		PendingStable: pendingStable,
-		PendingAlpha:  "",
+		Enabled:                 enabled,
+		IntervalHours:           intervalHours,
+		LastCheckedAt:           lastCheckedAt,
+		LatestStable:            latestStable,
+		LatestAlpha:             latestAlpha,
+		PendingStable:           pendingStable,
+		PendingAlpha:            pendingAlpha,
+		AutoUpdateEnabled:       autoUpdateState.Enabled,
+		AutoUpdateLastAttemptAt: autoUpdateState.LastAttemptAt,
+		AutoUpdateLastSuccessAt: autoUpdateState.LastSuccessAt,
+		AutoUpdateError:         autoUpdateState.Error,
+		AutoUpdateErrorAt:       autoUpdateState.ErrorAt,
+	}
+	if statusErr == nil {
+		info.AutoUpdateDisabled = mihomoShouldDisableAutoUpdateInUI(autoUpdateState.Enabled, status)
+		if info.AutoUpdateDisabled {
+			if autoUpdateState.DisableReason != "" {
+				info.AutoUpdateDisableReason = autoUpdateState.DisableReason
+			} else {
+				info.AutoUpdateDisableReason = mihomoAutoUpdateReadinessReason(status)
+			}
+		}
 	}
 	if pendingStable != "" {
+		info.UpdateCount++
+	}
+	if pendingAlpha != "" {
 		info.UpdateCount++
 	}
 	info.HasUpdate = info.UpdateCount > 0
 	return info, nil
 }
 
-func (s *MihomoCoreManagerService) SetCoreAutoCheckSettings(enabled bool, intervalHours int) error {
+func (s *MihomoCoreManagerService) SetCoreAutoCheckSettings(enabled bool, intervalHours int, hasAutoUpdate bool, autoUpdateEnabled bool) error {
 	if intervalHours <= 0 {
 		intervalHours = 12
 	}
@@ -2025,20 +2126,40 @@ func (s *MihomoCoreManagerService) SetCoreAutoCheckSettings(enabled bool, interv
 	defer mihomoCoreAutoCheckMu.Unlock()
 
 	settingSvc := &SettingService{}
+	prevAutoUpdateEnabled, err := settingSvc.getBool(mihomoCoreAutoUpdateEnabledKey)
+	if err != nil {
+		return err
+	}
 	if err := settingSvc.setString(mihomoCoreAutoCheckEnabledKey, strconv.FormatBool(enabled)); err != nil {
 		return err
 	}
 	if err := settingSvc.setString(mihomoCoreAutoCheckIntervalHoursKey, strconv.Itoa(intervalHours)); err != nil {
 		return err
 	}
-	if err := settingSvc.setString(mihomoCoreAutoCheckPendingAlphaKey, ""); err != nil {
-		return err
-	}
-	if err := settingSvc.setString(mihomoCoreAutoCheckLatestAlphaKey, ""); err != nil {
-		return err
+	if hasAutoUpdate {
+		if autoUpdateEnabled && !prevAutoUpdateEnabled {
+			status, err := s.GetCoreStatus()
+			if err != nil {
+				return err
+			}
+			if reason := mihomoAutoUpdateReadinessReason(status); reason != "" {
+				return fmt.Errorf("%s", reason)
+			}
+		}
+		if err := s.setCoreAutoUpdateEnabledLocked(settingSvc, autoUpdateEnabled); err != nil {
+			return err
+		}
+		if autoUpdateEnabled {
+			if err := s.clearCoreAutoUpdateDisableReasonLocked(settingSvc); err != nil {
+				return err
+			}
+		}
 	}
 	if !enabled {
 		if err := settingSvc.setString(mihomoCoreAutoCheckPendingStableKey, ""); err != nil {
+			return err
+		}
+		if err := settingSvc.setString(mihomoCoreAutoCheckPendingAlphaKey, ""); err != nil {
 			return err
 		}
 	}
@@ -2054,9 +2175,6 @@ func (s *MihomoCoreManagerService) ClearCoreUpdatePending() error {
 		return err
 	}
 	if err := settingSvc.setString(mihomoCoreAutoCheckPendingAlphaKey, ""); err != nil {
-		return err
-	}
-	if err := settingSvc.setString(mihomoCoreAutoCheckLatestAlphaKey, ""); err != nil {
 		return err
 	}
 	return nil
@@ -2146,8 +2264,16 @@ func (s *MihomoCoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
 	if err != nil {
 		return err
 	}
+	latestAlpha, err := s.fetchLatestAlphaTag(client)
+	if err != nil {
+		return err
+	}
 	settingSvc := &SettingService{}
 	prevStable, err := settingSvc.getString(mihomoCoreAutoCheckLatestStableKey)
+	if err != nil {
+		return err
+	}
+	prevAlpha, err := settingSvc.getString(mihomoCoreAutoCheckLatestAlphaKey)
 	if err != nil {
 		return err
 	}
@@ -2155,7 +2281,7 @@ func (s *MihomoCoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
 	if err = settingSvc.setString(mihomoCoreAutoCheckLastAtKey, strconv.FormatInt(now, 10)); err != nil {
 		return err
 	}
-	if latestStable != "" && latestStable != prevStable {
+	if latestStable != prevStable {
 		if err = settingSvc.setString(mihomoCoreAutoCheckLatestStableKey, latestStable); err != nil {
 			return err
 		}
@@ -2163,11 +2289,13 @@ func (s *MihomoCoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
 			return err
 		}
 	}
-	if err = settingSvc.setString(mihomoCoreAutoCheckLatestAlphaKey, ""); err != nil {
-		return err
-	}
-	if err = settingSvc.setString(mihomoCoreAutoCheckPendingAlphaKey, ""); err != nil {
-		return err
+	if latestAlpha != prevAlpha {
+		if err = settingSvc.setString(mihomoCoreAutoCheckLatestAlphaKey, latestAlpha); err != nil {
+			return err
+		}
+		if err = settingSvc.setString(mihomoCoreAutoCheckPendingAlphaKey, latestAlpha); err != nil {
+			return err
+		}
 	}
 	return nil
 }

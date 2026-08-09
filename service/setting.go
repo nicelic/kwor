@@ -156,6 +156,11 @@ var supportedTimeLocationSet = func() map[string]struct{} {
 	return set
 }()
 
+const (
+	sessionMaxAgeMaxMinutes  = 72 * 60
+	defaultSessionMaxAgeUnit = "d"
+)
+
 var supportedTimeLocationLowerMap = func() map[string]string {
 	set := make(map[string]string, len(supportedTimeLocations))
 	for _, value := range supportedTimeLocations {
@@ -201,6 +206,7 @@ var defaultValueMap = map[string]string{
 	"webPath":                           "/app/",
 	"webURI":                            "",
 	"sessionMaxAge":                     "0",
+	"sessionMaxAgeUnit":                 defaultSessionMaxAgeUnit,
 	"trafficAge":                        "30",
 	"trafficOverviewLimitGiB":           "0",
 	"trafficOverviewEnabled":            "true",
@@ -249,8 +255,8 @@ var defaultValueMap = map[string]string{
 	"subAssignedCertificateRecordID":    "0",
 	"subAssignedCertificateRecordIDs":   "[]",
 	"subUpdates":                        "12",
-	"subEncode":                         "false",
-	"subShowInfo":                       "false",
+	"subEncode":                         "true",
+	"subShowInfo":                       "true",
 	"subURI":                            "",
 	"serverTlsStoreEnabled":             "true",
 	"serverTlsStore":                    "chrome",
@@ -266,6 +272,12 @@ var defaultValueMap = map[string]string{
 	"coreAutoCheckLatestAlpha":          "",
 	"coreAutoCheckPendingStable":        "",
 	"coreAutoCheckPendingAlpha":         "",
+	"coreAutoUpdateEnabled":             "false",
+	"coreAutoUpdateLastAttemptAt":       "0",
+	"coreAutoUpdateLastSuccessAt":       "0",
+	"coreAutoUpdateError":               "",
+	"coreAutoUpdateErrorAt":             "0",
+	"coreAutoUpdateDisableReason":       "",
 	"coreDownloadPreference":            "{}",
 	"mihomoCoreAutoCheckEnabled":        "false",
 	"mihomoCoreAutoCheckIntervalHours":  "12",
@@ -274,6 +286,12 @@ var defaultValueMap = map[string]string{
 	"mihomoCoreAutoCheckLatestAlpha":    "",
 	"mihomoCoreAutoCheckPendingStable":  "",
 	"mihomoCoreAutoCheckPendingAlpha":   "",
+	"mihomoCoreAutoUpdateEnabled":       "false",
+	"mihomoCoreAutoUpdateLastAttemptAt": "0",
+	"mihomoCoreAutoUpdateLastSuccessAt": "0",
+	"mihomoCoreAutoUpdateError":         "",
+	"mihomoCoreAutoUpdateErrorAt":       "0",
+	"mihomoCoreAutoUpdateDisableReason": "",
 	"mihomoCoreDownloadPreference":      "{}",
 	"subGroupAutoUpdateEnabled":         "false",
 	"subGroupAutoUpdateIntervalMinutes": "5",
@@ -294,6 +312,7 @@ var genericSettingsSaveKeys = map[string]struct{}{
 	"webPath":               {},
 	"webURI":                {},
 	"sessionMaxAge":         {},
+	"sessionMaxAgeUnit":     {},
 	"trafficAge":            {},
 	"timeLocation":          {},
 	"subListen":             {},
@@ -466,6 +485,29 @@ func normalizeTimeLocationSettingValue(raw string, fallback string) string {
 		return normalized
 	}
 	return defaultValueMap["timeLocation"]
+}
+
+func normalizeSessionMaxAgeUnit(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "m":
+		return "m"
+	case "h":
+		return "h"
+	case "d":
+		return "d"
+	default:
+		return ""
+	}
+}
+
+func EffectiveSessionMaxAgeMinutes(value int) int {
+	if value <= 0 {
+		return sessionMaxAgeMaxMinutes
+	}
+	if value > sessionMaxAgeMaxMinutes {
+		return sessionMaxAgeMaxMinutes
+	}
+	return value
 }
 
 func generateRandomSubPath() string {
@@ -1026,6 +1068,14 @@ func (s *SettingService) GetSecret() ([]byte, error) {
 
 func (s *SettingService) GetSessionMaxAge() (int, error) {
 	return s.getInt("sessionMaxAge")
+}
+
+func (s *SettingService) GetEffectiveSessionMaxAgeMinutes() (int, error) {
+	value, err := s.GetSessionMaxAge()
+	if err != nil {
+		return 0, err
+	}
+	return EffectiveSessionMaxAgeMinutes(value), nil
 }
 
 func (s *SettingService) GetTrafficAge() (int, error) {

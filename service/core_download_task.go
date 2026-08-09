@@ -132,6 +132,50 @@ func StopManagedCoreDownload(coreName string, id string) (*CoreDownloadProgress,
 	return progress, err
 }
 
+func (s *CoreManagerService) executeManagedSingboxCoreDownloadTask(handle *ManagedDownloadTaskHandle, version string, target SingboxCoreDownloadTarget, customURL string, afterSuccess func()) error {
+	if handle == nil {
+		return fmt.Errorf("sing-box core download task handle is nil")
+	}
+	registerCoreDownloadTask(handle)
+	defer unregisterCoreDownloadTask(handle)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicErr := fmt.Errorf("sing-box core download task panicked: %v", recovered)
+			logger.Error(panicErr)
+			handle.FinishError("failed", panicErr)
+		}
+	}()
+	if !handle.MarkRunning("preparing") {
+		handle.FinishCancelled("cancelled")
+		return context.Canceled
+	}
+	ctx := handle.Context()
+	var downloadErr error
+	if customURL != "" {
+		_, downloadErr = s.downloadCoreFromURLWithContext(ctx, customURL, handle.ID())
+	} else {
+		_, downloadErr = s.downloadCoreWithContext(ctx, version, target, handle.ID())
+	}
+	if downloadErr != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			handle.FinishCancelled("cancelled")
+		} else {
+			handle.FinishError("failed", downloadErr)
+		}
+		return downloadErr
+	}
+	if customURL != "" {
+		if saveErr := s.SaveCustomDownloadURL(customURL); saveErr != nil {
+			logger.Warning("save core custom download url failed: ", saveErr)
+		}
+	}
+	if afterSuccess != nil {
+		afterSuccess()
+	}
+	handle.FinishSuccess(coreDownloadStageCompleted)
+	return nil
+}
+
 func (s *CoreManagerService) StartManagedCoreDownload(version string, target SingboxCoreDownloadTarget, customURL string, afterSuccess func()) (*CoreDownloadProgress, error) {
 	version = strings.TrimSpace(version)
 	customURL = strings.TrimSpace(customURL)
@@ -147,47 +191,53 @@ func (s *CoreManagerService) StartManagedCoreDownload(version string, target Sin
 		return applyManagedTaskToCoreProgress(GetCoreDownloadProgress(status.ID), "sing-box", status), nil
 	}
 	go func() {
-		registerCoreDownloadTask(handle)
-		defer unregisterCoreDownloadTask(handle)
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				panicErr := fmt.Errorf("sing-box core download task panicked: %v", recovered)
-				logger.Error(panicErr)
-				handle.FinishError("failed", panicErr)
-			}
-		}()
-		if !handle.MarkRunning("preparing") {
-			handle.FinishCancelled("cancelled")
-			return
-		}
-		ctx := handle.Context()
-		var localVersion string
-		var downloadErr error
-		if customURL != "" {
-			localVersion, downloadErr = s.downloadCoreFromURLWithContext(ctx, customURL, handle.ID())
-		} else {
-			localVersion, downloadErr = s.downloadCoreWithContext(ctx, version, target, handle.ID())
-		}
-		if downloadErr != nil {
-			if errors.Is(ctx.Err(), context.Canceled) {
-				handle.FinishCancelled("cancelled")
-			} else {
-				handle.FinishError("failed", downloadErr)
-			}
-			return
-		}
-		if customURL != "" {
-			if saveErr := s.SaveCustomDownloadURL(customURL); saveErr != nil {
-				logger.Warning("save core custom download url failed: ", saveErr)
-			}
-		}
-		if afterSuccess != nil {
-			afterSuccess()
-		}
-		_ = localVersion
-		handle.FinishSuccess(coreDownloadStageCompleted)
+		_ = s.executeManagedSingboxCoreDownloadTask(handle, version, target, customURL, afterSuccess)
 	}()
 	return applyManagedTaskToCoreProgress(GetCoreDownloadProgress(status.ID), "sing-box", status), nil
+}
+
+func (s *MihomoCoreManagerService) executeManagedMihomoCoreDownloadTask(handle *ManagedDownloadTaskHandle, version string, target MihomoCoreDownloadTarget, customURL string, afterSuccess func()) error {
+	if handle == nil {
+		return fmt.Errorf("mihomo core download task handle is nil")
+	}
+	registerCoreDownloadTask(handle)
+	defer unregisterCoreDownloadTask(handle)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicErr := fmt.Errorf("mihomo core download task panicked: %v", recovered)
+			logger.Error(panicErr)
+			handle.FinishError("failed", panicErr)
+		}
+	}()
+	if !handle.MarkRunning("preparing") {
+		handle.FinishCancelled("cancelled")
+		return context.Canceled
+	}
+	ctx := handle.Context()
+	var downloadErr error
+	if customURL != "" {
+		_, downloadErr = s.downloadCoreFromURLWithContext(ctx, customURL, handle.ID())
+	} else {
+		_, downloadErr = s.downloadCoreWithContext(ctx, version, target, handle.ID())
+	}
+	if downloadErr != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			handle.FinishCancelled("cancelled")
+		} else {
+			handle.FinishError("failed", downloadErr)
+		}
+		return downloadErr
+	}
+	if customURL != "" {
+		if saveErr := s.SaveCustomDownloadURL(customURL); saveErr != nil {
+			logger.Warning("save mihomo custom download url failed: ", saveErr)
+		}
+	}
+	if afterSuccess != nil {
+		afterSuccess()
+	}
+	handle.FinishSuccess(coreDownloadStageCompleted)
+	return nil
 }
 
 func (s *MihomoCoreManagerService) StartManagedCoreDownload(version string, target MihomoCoreDownloadTarget, customURL string, afterSuccess func()) (*CoreDownloadProgress, error) {
@@ -205,45 +255,7 @@ func (s *MihomoCoreManagerService) StartManagedCoreDownload(version string, targ
 		return applyManagedTaskToCoreProgress(GetCoreDownloadProgress(status.ID), "mihomo", status), nil
 	}
 	go func() {
-		registerCoreDownloadTask(handle)
-		defer unregisterCoreDownloadTask(handle)
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				panicErr := fmt.Errorf("mihomo core download task panicked: %v", recovered)
-				logger.Error(panicErr)
-				handle.FinishError("failed", panicErr)
-			}
-		}()
-		if !handle.MarkRunning("preparing") {
-			handle.FinishCancelled("cancelled")
-			return
-		}
-		ctx := handle.Context()
-		var localVersion string
-		var downloadErr error
-		if customURL != "" {
-			localVersion, downloadErr = s.downloadCoreFromURLWithContext(ctx, customURL, handle.ID())
-		} else {
-			localVersion, downloadErr = s.downloadCoreWithContext(ctx, version, target, handle.ID())
-		}
-		if downloadErr != nil {
-			if errors.Is(ctx.Err(), context.Canceled) {
-				handle.FinishCancelled("cancelled")
-			} else {
-				handle.FinishError("failed", downloadErr)
-			}
-			return
-		}
-		if customURL != "" {
-			if saveErr := s.SaveCustomDownloadURL(customURL); saveErr != nil {
-				logger.Warning("save mihomo custom download url failed: ", saveErr)
-			}
-		}
-		if afterSuccess != nil {
-			afterSuccess()
-		}
-		_ = localVersion
-		handle.FinishSuccess(coreDownloadStageCompleted)
+		_ = s.executeManagedMihomoCoreDownloadTask(handle, version, target, customURL, afterSuccess)
 	}()
 	return applyManagedTaskToCoreProgress(GetCoreDownloadProgress(status.ID), "mihomo", status), nil
 }

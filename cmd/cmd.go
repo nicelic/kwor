@@ -921,6 +921,19 @@ func ParseCmd() {
 			fmt.Printf("[kwor] cleanup core config failed: %v\n", err)
 			os.Exit(1)
 		}
+	case "kernel-reboot-worker":
+		if !isInternalSystemdCommandAllowed() {
+			printUnsupportedSubcommand(os.Args[1])
+			os.Exit(2)
+		}
+		if len(os.Args) != 3 {
+			fmt.Printf("usage: kwor kernel-reboot-worker %s\n", service.KernelRebootConfirmedArgument)
+			os.Exit(2)
+		}
+		if err := service.RunKernelRebootWorker(os.Args[2]); err != nil {
+			fmt.Printf("[kwor] kernel reboot worker failed: %v\n", err)
+			os.Exit(1)
+		}
 	case "docker-bootstrap":
 		handleDockerBootstrap()
 	case "start":

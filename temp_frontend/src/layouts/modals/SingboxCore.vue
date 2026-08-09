@@ -76,7 +76,7 @@
           </v-chip>
 
           <v-chip
-            v-if="installed && compatible && installedTargetLabel"
+            v-if="installed && installedTargetLabel"
             variant="outlined"
             color="primary"
             size="small"
@@ -285,7 +285,7 @@
         <v-row v-if="showLinuxArchSelector" class="mt-3">
           <v-col cols="12">
             <div class="text-caption text-medium-emphasis mb-2">
-              {{ t('coreManager.linuxArchitecture') }}
+              {{ archSelectorLabel }}
             </div>
             <v-btn-toggle
               v-model="selectedLinuxArch"
@@ -357,6 +357,35 @@
           </v-col>
         </v-row>
 
+        <v-row align="center" class="mt-1">
+          <v-col cols="12" sm="7">
+            <v-switch
+              v-model="autoUpdateEnabled"
+              color="primary"
+              density="compact"
+              hide-details
+              :label="t('coreManager.enableAutoUpdate')"
+              :disabled="autoUpdateSwitchDisabled"
+            ></v-switch>
+          </v-col>
+          <v-col cols="12" sm="5">
+            <div class="text-caption text-medium-emphasis core-auto-update-meta">
+              {{ t('coreManager.autoUpdateLastAttempt', { time: autoUpdateLastAttemptDisplay || t('coreManager.never') }) }}
+            </div>
+            <div class="text-caption text-medium-emphasis core-auto-update-meta">
+              {{ t('coreManager.autoUpdateLastSuccess', { time: autoUpdateLastSuccessDisplay || t('coreManager.never') }) }}
+            </div>
+          </v-col>
+        </v-row>
+
+        <v-row v-if="autoUpdateDisabledReasonText" class="mt-1">
+          <v-col cols="12">
+            <div class="text-caption text-warning core-auto-update-reason">
+              {{ autoUpdateDisabledReasonText }}
+            </div>
+          </v-col>
+        </v-row>
+
         <v-row class="mt-1" align="center">
           <v-col cols="12" class="d-flex align-center flex-wrap" style="gap: 8px">
             <v-chip variant="outlined" size="small" color="success" label>
@@ -381,6 +410,18 @@
           @click:close="ackCoreUpdateNotice"
         >
           {{ pendingUpdateText }}
+        </v-alert>
+
+        <v-alert
+          v-if="autoUpdateErrorText"
+          type="error"
+          variant="tonal"
+          density="compact"
+          class="mt-2"
+          closable
+          @click:close="ackCoreAutoUpdateError"
+        >
+          {{ autoUpdateErrorText }}
         </v-alert>
 
         <v-divider class="my-6"></v-divider>
@@ -543,7 +584,6 @@ const singboxCore = {
 } as const
 const supportsPrereleaseChannel = computed(() => true)
 const showLinuxArchSelector = computed(() => true)
-const showLinuxLibcSelector = computed(() => true)
 
 const statusLoading = ref(false)
 const localVersion = ref('')
@@ -552,6 +592,7 @@ const platform = ref('')
 const coreRunning = ref(false)
 const installed = ref(false)
 const compatible = ref(false)
+const installedChannel = ref<'stable' | 'alpha' | ''>('')
 
 const remoteLoading = ref(false)
 const remoteLoaded = ref(false)
@@ -574,6 +615,22 @@ type CoreDownloadTarget = {
   libc?: string
 }
 const installedTarget = ref<CoreDownloadTarget | null>(null)
+type RuntimeTargetOS = 'linux' | 'windows' | ''
+const runtimeTargetOS = computed<RuntimeTargetOS>(() => {
+  const installedOS = String(installedTarget.value?.os ?? '').trim().toLowerCase()
+  if (installedOS === 'linux' || installedOS === 'windows') {
+    return installedOS
+  }
+  const platformText = String(platform.value ?? '').trim().toLowerCase()
+  if (platformText.startsWith('windows/')) {
+    return 'windows'
+  }
+  if (platformText.startsWith('linux/')) {
+    return 'linux'
+  }
+  return ''
+})
+const showLinuxLibcSelector = computed(() => runtimeTargetOS.value === 'linux')
 type CoreDownloadPreference = {
   target?: CoreDownloadTarget
   customUrl?: string
@@ -606,6 +663,13 @@ const latestAlphaVersion = ref('')
 const pendingStableVersion = ref('')
 const pendingAlphaVersion = ref('')
 const lastCheckedAt = ref(0)
+const autoUpdateEnabled = ref(false)
+const autoUpdateDisabled = ref(false)
+const autoUpdateDisableReason = ref('')
+const autoUpdateLastAttemptAt = ref(0)
+const autoUpdateLastSuccessAt = ref(0)
+const autoUpdateError = ref('')
+const autoUpdateErrorAt = ref(0)
 
 type CoreDownloadProgress = {
   id: string
@@ -704,7 +768,7 @@ const selectedLinuxPackageLabel = computed(() => {
   if (!selectedLinuxArch.value) {
     return t('coreManager.notDetected')
   }
-  const parts = ['linux', selectedLinuxArch.value]
+  const parts: string[] = [runtimeTargetOS.value || 'linux', selectedLinuxArch.value]
   if (showLinuxLibcSelector.value) {
     parts.push(selectedLinuxLibc.value === 'universal'
       ? 'universal'
@@ -712,6 +776,11 @@ const selectedLinuxPackageLabel = computed(() => {
   }
   return parts.join('/')
 })
+const archSelectorLabel = computed(() => (
+  runtimeTargetOS.value === 'windows'
+    ? t('coreManager.targetArchitecture')
+    : t('coreManager.linuxArchitecture')
+))
 const downloadingVersionLabel = computed(() => (
   downloadingVersion.value === 'custom'
     ? t('coreManager.customBuild')
@@ -829,6 +898,28 @@ const lastCheckedAtDisplay = computed(() => {
   }
   return formatPanelDateTime(lastCheckedAt.value * 1000)
 })
+const autoUpdateLastAttemptDisplay = computed(() => (
+  autoUpdateLastAttemptAt.value > 0 ? formatPanelDateTime(autoUpdateLastAttemptAt.value * 1000) : ''
+))
+const autoUpdateLastSuccessDisplay = computed(() => (
+  autoUpdateLastSuccessAt.value > 0 ? formatPanelDateTime(autoUpdateLastSuccessAt.value * 1000) : ''
+))
+const autoUpdateSwitchDisabled = computed(() => (
+  autoCheckSaving.value || autoUpdateDisabled.value
+))
+const autoUpdateDisabledReasonText = computed(() => (
+  autoUpdateDisabled.value ? autoUpdateDisableReason.value.trim() : ''
+))
+const autoUpdateErrorText = computed(() => {
+  const message = autoUpdateError.value.trim()
+  if (!message) {
+    return ''
+  }
+  if (autoUpdateErrorAt.value > 0) {
+    return `${message} (${formatPanelDateTime(autoUpdateErrorAt.value * 1000)})`
+  }
+  return message
+})
 
 const customUrlPlaceholder = computed(() => `https://github.com/.../${singboxCore.coreName}-xxx.tar.gz`)
 
@@ -853,7 +944,9 @@ const getVersionTargetQuery = () => {
     if (!selectedLinuxArch.value) {
       return query
     }
-    query.target_os = 'linux'
+    if (runtimeTargetOS.value) {
+      query.target_os = runtimeTargetOS.value
+    }
     query.target_arch = selectedLinuxArch.value
     if (showLinuxLibcSelector.value && selectedLinuxLibc.value) {
       query.target_libc = selectedLinuxLibc.value
@@ -892,6 +985,24 @@ const normalizeLinuxLibc = (value: unknown): OptionalLinuxLibcValue => {
   return null
 }
 
+const normalizeInstalledChannel = (value: unknown): 'stable' | 'alpha' | '' => {
+  if (value === 'stable' || value === 'alpha') {
+    return value
+  }
+  return ''
+}
+
+const inferLinuxArchFromPlatform = (value: unknown): OptionalLinuxArchValue => {
+  const platformText = String(value ?? '').trim().toLowerCase()
+  if (platformText.endsWith('/amd64')) {
+    return 'amd64'
+  }
+  if (platformText.endsWith('/arm64')) {
+    return 'arm64'
+  }
+  return null
+}
+
 const clearLinuxTargetSelection = () => {
   selectedLinuxArch.value = null
   selectedLinuxLibc.value = null
@@ -904,6 +1015,19 @@ const applyTargetSelection = (target: CoreDownloadTarget | undefined | null) => 
   }
   selectedLinuxArch.value = normalizeLinuxArch(target.arch)
   selectedLinuxLibc.value = normalizeLinuxLibc(target.libc)
+}
+
+const applyDefaultTargetSelection = () => {
+  if (!selectedLinuxArch.value) {
+    selectedLinuxArch.value = inferLinuxArchFromPlatform(platform.value)
+  }
+  if (showLinuxLibcSelector.value && !selectedLinuxLibc.value) {
+    selectedLinuxLibc.value = 'glibc'
+    return
+  }
+  if (!showLinuxLibcSelector.value) {
+    selectedLinuxLibc.value = null
+  }
 }
 
 const readLegacyLinuxTargetPreference = (): LinuxTargetPreference | null => {
@@ -923,7 +1047,9 @@ const readLegacyLinuxTargetPreference = (): LinuxTargetPreference | null => {
 const buildCurrentDownloadPreference = (): CoreDownloadPreference => {
   const target: CoreDownloadTarget = {}
   if (showLinuxArchSelector.value && selectedLinuxArch.value) {
-    target.os = 'linux'
+    if (runtimeTargetOS.value) {
+      target.os = runtimeTargetOS.value
+    }
     target.arch = selectedLinuxArch.value
     if (showLinuxLibcSelector.value && selectedLinuxLibc.value) {
       target.libc = selectedLinuxLibc.value
@@ -971,17 +1097,22 @@ const applyStatusDownloadState = (status: any) => {
       customDownloadURL.value = legacyPreference.customUrl
     }
   }
-  const installedTarget = status?.compatible === true
-    ? status?.installedTarget as CoreDownloadTarget | undefined
-    : undefined
+  installedChannel.value = normalizeInstalledChannel(status?.installedChannel)
+  if (installedChannel.value) {
+    selectedChannel.value = installedChannel.value
+  } else if (versionList.value.length === 0 && !remoteLoaded.value) {
+    selectedChannel.value = 'stable'
+  }
+  const installedTarget = status?.installedTarget as CoreDownloadTarget | undefined
   if (installedTarget && (installedTarget.arch || installedTarget.os)) {
     applyTargetSelection(installedTarget)
     return
   }
-  if (status?.installed === true && status?.compatible !== true) {
+  if (status?.installed === true && status?.compatible !== true && (selectedLinuxArch.value || selectedLinuxLibc.value)) {
     return
   }
   clearLinuxTargetSelection()
+  applyDefaultTargetSelection()
 }
 
 const saveDownloadPreference = async (includeTarget = false) => {
@@ -1016,6 +1147,9 @@ watch(
   (newValue) => {
     dialogVisible.value = newValue
     if (newValue) {
+      resetRemoteVersions()
+      selectedChannel.value = 'stable'
+      clearLinuxTargetSelection()
       if (downloadProgressSessionId.value) {
         startDownloadProgressPolling(downloadProgressSessionId.value)
       }
@@ -1283,6 +1417,7 @@ const loadCoreStatus = async () => {
       coreRunning.value = data.obj.running === true
       platform.value = data.obj.platform || ''
       installedTarget.value = data.obj.installedTarget || null
+      installedChannel.value = normalizeInstalledChannel(data.obj.installedChannel)
       applyStatusDownloadState(data.obj)
     }
   } catch (error) {
@@ -1373,6 +1508,13 @@ const applyCoreUpdateInfo = (info: any) => {
   pendingStableVersion.value = info.pendingStable || ''
   pendingAlphaVersion.value = supportsPrereleaseChannel.value ? (info.pendingAlpha || '') : ''
   lastCheckedAt.value = Number(info.lastCheckedAt || 0)
+  autoUpdateEnabled.value = info.autoUpdateEnabled === true
+  autoUpdateDisabled.value = info.autoUpdateDisabled === true
+  autoUpdateDisableReason.value = String(info.autoUpdateDisableReason || '')
+  autoUpdateLastAttemptAt.value = Number(info.autoUpdateLastAttemptAt || 0)
+  autoUpdateLastSuccessAt.value = Number(info.autoUpdateLastSuccessAt || 0)
+  autoUpdateError.value = String(info.autoUpdateError || '')
+  autoUpdateErrorAt.value = Number(info.autoUpdateErrorAt || 0)
 }
 
 const loadCoreUpdateInfo = async (forceCheck: boolean) => {
@@ -1415,6 +1557,7 @@ const saveAutoCheckSettings = async () => {
     const data = await HttpUtils.post(singboxCore.updateSettingsEndpoint, {
       enabled: autoCheckEnabled.value ? 'true' : 'false',
       interval: String(intervalHours ?? 12),
+      auto_update_enabled: autoUpdateEnabled.value ? 'true' : 'false',
     })
     if (data.success && data.obj) {
       applyCoreUpdateInfo(data.obj)
@@ -1444,6 +1587,19 @@ const ackCoreUpdateNotice = async () => {
     }
   } catch (error) {
     console.error('Failed to acknowledge core update notice:', error)
+  }
+}
+
+const ackCoreAutoUpdateError = async () => {
+  autoUpdateError.value = ''
+  autoUpdateErrorAt.value = 0
+  try {
+    const data = await HttpUtils.post('api/core-auto-update-error-ack', {})
+    if (data.success && data.obj) {
+      applyCoreUpdateInfo(data.obj)
+    }
+  } catch (error) {
+    console.error('Failed to acknowledge core auto update error:', error)
   }
 }
 
@@ -1487,7 +1643,9 @@ const downloadCore = async () => {
   const formData = new FormData()
   formData.append('version', selectedVersion.value)
   if (showLinuxArchSelector.value && selectedLinuxArch.value) {
-    formData.append('target_os', 'linux')
+    if (runtimeTargetOS.value) {
+      formData.append('target_os', runtimeTargetOS.value)
+    }
     formData.append('target_arch', selectedLinuxArch.value)
   }
   if (showLinuxLibcSelector.value && selectedLinuxLibc.value) {
@@ -1699,6 +1857,14 @@ onBeforeUnmount(() => {
 .core-status-chip :deep(.v-chip__content) {
   padding-block: 6px;
   white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.core-auto-update-meta {
+  overflow-wrap: anywhere;
+}
+
+.core-auto-update-reason {
   overflow-wrap: anywhere;
 }
 

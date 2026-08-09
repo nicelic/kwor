@@ -130,18 +130,13 @@ const router = createRouter({
 let intervalId: any
 let dataPollingEnabled = false
 let globalDataRefreshPromise: Promise<void> | null = null
-const sessionKeepaliveIntervalMs = 60_000
-const sessionActivityThrottleMs = 30_000
-const maxBrowserTimerDelayMs = 2_147_483_647
+const sessionKeepaliveFallbackIntervalMs = 30_000
+const sessionKeepaliveMinIntervalMs = 15_000
+const sessionKeepaliveMaxIntervalMs = 60_000
 let sessionKeepaliveEnabled = false
 let sessionLifecycleGeneration = 0
 let sessionKeepaliveTimerId: number | undefined
-let sessionIdleTimerId: number | undefined
-let sessionIdleDeadlineAt: number | null = null
-let sessionActivityTimerId: number | undefined
-let lastSessionActivitySentAt = 0
-let sessionActivityPending = false
-let sessionActivityRequest: Promise<void> | null = null
+let sessionDeadlineAt: number | null = null
 let sessionKeepaliveRedirecting = false
 
 const stopDataInterval = () => {
@@ -178,7 +173,7 @@ const syncDataInterval = () => {
 type SessionProbeState = 'authenticated' | 'unauthenticated' | 'unreachable'
 type SessionProbeResult = {
   state: SessionProbeState
-  idleDeadlineAt: number | null
+  deadlineAt: number | null
 }
 
 let lastSessionConnectionWarningAt = 0
@@ -187,8 +182,9 @@ let sessionProbeGeneration = -1
 
 const delaySessionRetry = () => new Promise<void>(resolve => window.setTimeout(resolve, 400))
 
-const readSessionIdleDeadline = (message: { obj?: unknown }): number | null => {
-  const rawSeconds = Number((message.obj as { idleDeadlineAt?: unknown } | null)?.idleDeadlineAt ?? 0)
+const readSessionDeadline = (message: { obj?: unknown }): number | null => {
+  const payload = (message.obj as { deadlineAt?: unknown; idleDeadlineAt?: unknown } | null) ?? null
+  const rawSeconds = Number(payload?.deadlineAt ?? payload?.idleDeadlineAt ?? 0)
   if (!Number.isFinite(rawSeconds) || rawSeconds <= 0) return null
   return Math.floor(rawSeconds * 1000)
 }
@@ -201,14 +197,14 @@ const probeSession = (): Promise<SessionProbeResult> => {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const msg = await HttpUtils.get('api/session', {}, { silentAuthCheck: true, timeout: 10000 })
       if (msg.success) {
-        return { state: 'authenticated', idleDeadlineAt: readSessionIdleDeadline(msg) }
+        return { state: 'authenticated', deadlineAt: readSessionDeadline(msg) }
       }
       if (msg.failureKind === 'api') {
-        return { state: 'unauthenticated', idleDeadlineAt: null }
+        return { state: 'unauthenticated', deadlineAt: null }
       }
       if (attempt === 0) await delaySessionRetry()
     }
-    return { state: 'unreachable', idleDeadlineAt: null }
+    return { state: 'unreachable', deadlineAt: null }
   })()
   sessionProbePromise = request
   sessionProbeGeneration = probeGeneration
@@ -240,24 +236,20 @@ const stopSessionKeepalive = () => {
 
 const isPageVisible = () => typeof document === 'undefined' || document.visibilityState === 'visible'
 
-const stopSessionIdleTimer = () => {
-  if (sessionIdleTimerId == null) return
-  window.clearTimeout(sessionIdleTimerId)
-  sessionIdleTimerId = undefined
-}
-
-const stopSessionActivityTimer = () => {
-  if (sessionActivityTimerId == null) return
-  window.clearTimeout(sessionActivityTimerId)
-  sessionActivityTimerId = undefined
-}
-
 const scheduleSessionKeepalive = () => {
   if (!sessionKeepaliveEnabled || !isPageVisible() || sessionKeepaliveTimerId != null) return
+  let delay = sessionKeepaliveFallbackIntervalMs
+  if (sessionDeadlineAt != null) {
+    const remainingMs = Math.max(0, sessionDeadlineAt - panelNow().getTime())
+    delay = Math.max(
+      sessionKeepaliveMinIntervalMs,
+      Math.min(sessionKeepaliveMaxIntervalMs, Math.floor(remainingMs / 2)),
+    )
+  }
   sessionKeepaliveTimerId = window.setTimeout(() => {
     sessionKeepaliveTimerId = undefined
     void runSessionKeepalive()
-  }, sessionKeepaliveIntervalMs)
+  }, delay)
 }
 
 const syncSessionKeepalive = () => {
@@ -268,32 +260,10 @@ const syncSessionKeepalive = () => {
   scheduleSessionKeepalive()
 }
 
-const syncSessionIdleTimer = () => {
-  if (!sessionKeepaliveEnabled || !isPageVisible() || sessionIdleDeadlineAt == null) {
-    stopSessionIdleTimer()
-    return
-  }
-  if (sessionIdleTimerId != null) return
-  const remainingMs = Math.max(0, sessionIdleDeadlineAt - panelNow().getTime())
-  sessionIdleTimerId = window.setTimeout(() => {
-    sessionIdleTimerId = undefined
-    void runSessionKeepalive()
-  }, Math.min(remainingMs, maxBrowserTimerDelayMs))
-}
-
-const updateSessionIdleDeadline = (idleDeadlineAt: number | null) => {
-  sessionIdleDeadlineAt = idleDeadlineAt
-  stopSessionIdleTimer()
-  syncSessionIdleTimer()
-}
-
-const scheduleSessionActivity = () => {
-  if (!sessionKeepaliveEnabled || !isPageVisible() || !sessionActivityPending || sessionActivityRequest || sessionActivityTimerId != null) return
-  const delay = Math.max(0, sessionActivityThrottleMs - (Date.now() - lastSessionActivitySentAt))
-  sessionActivityTimerId = window.setTimeout(() => {
-    sessionActivityTimerId = undefined
-    void runSessionActivity()
-  }, delay)
+const updateSessionDeadline = (deadlineAt: number | null) => {
+  sessionDeadlineAt = deadlineAt
+  stopSessionKeepalive()
+  syncSessionKeepalive()
 }
 
 const stopAuthenticatedPolling = () => {
@@ -302,12 +272,7 @@ const stopAuthenticatedPolling = () => {
   stopDataInterval()
   sessionKeepaliveEnabled = false
   stopSessionKeepalive()
-  stopSessionIdleTimer()
-  stopSessionActivityTimer()
-  sessionIdleDeadlineAt = null
-  lastSessionActivitySentAt = 0
-  sessionActivityPending = false
-  sessionActivityRequest = null
+  sessionDeadlineAt = null
   clearPanelTimeContext()
 }
 
@@ -335,9 +300,7 @@ const runSessionKeepalive = async () => {
   const session = await probeSession()
   if (lifecycleGeneration !== sessionLifecycleGeneration || !sessionKeepaliveEnabled) return
   if (session.state === 'authenticated') {
-    updateSessionIdleDeadline(session.idleDeadlineAt)
-    syncSessionKeepalive()
-    scheduleSessionActivity()
+    updateSessionDeadline(session.deadlineAt)
     return
   }
   if (session.state === 'unreachable') {
@@ -348,79 +311,22 @@ const runSessionKeepalive = async () => {
   await redirectToLoginAfterSessionExpiry()
 }
 
-const runSessionActivity = () => {
-  if (!sessionKeepaliveEnabled || !isPageVisible() || !sessionActivityPending || sessionActivityRequest) return
-  const lifecycleGeneration = sessionLifecycleGeneration
-  const waitMs = sessionActivityThrottleMs - (Date.now() - lastSessionActivitySentAt)
-  if (waitMs > 0) {
-    scheduleSessionActivity()
-    return
-  }
-
-  sessionActivityPending = false
-  lastSessionActivitySentAt = Date.now()
-  const request = (async () => {
-    const msg = await HttpUtils.post('api/session', {}, {
-      silentAuthCheck: true,
-      silentErrorToast: true,
-      timeout: 10000,
-    })
-    if (lifecycleGeneration !== sessionLifecycleGeneration || !sessionKeepaliveEnabled) return
-    if (msg.success) {
-      updateSessionIdleDeadline(readSessionIdleDeadline(msg))
-      return
-    }
-    if (msg.failureKind === 'api') {
-      await redirectToLoginAfterSessionExpiry()
-      return
-    }
-    // A response can be lost after the server has accepted the activity. Retrying
-    // later is safe and keeps a temporary network failure from becoming a logout.
-    sessionActivityPending = true
-  })()
-  sessionActivityRequest = request
-  void request.finally(() => {
-    if (sessionActivityRequest === request) {
-      sessionActivityRequest = null
-      if (lifecycleGeneration === sessionLifecycleGeneration) {
-        scheduleSessionActivity()
-      }
-    }
-  })
-}
-
-const recordUserSessionActivity = () => {
-  if (!sessionKeepaliveEnabled || !isPageVisible()) return
-  sessionActivityPending = true
-  scheduleSessionActivity()
-}
-
 const handleVisibilityChange = () => {
   syncDataInterval()
   if (!isPageVisible()) {
     syncSessionKeepalive()
-    syncSessionIdleTimer()
-    stopSessionActivityTimer()
     return
   }
   if (sessionKeepaliveEnabled) {
     stopSessionKeepalive()
     void runSessionKeepalive()
-    scheduleSessionActivity()
     return
   }
   syncSessionKeepalive()
-  syncSessionIdleTimer()
 }
 
 if (typeof document !== 'undefined') {
   document.addEventListener('visibilitychange', handleVisibilityChange)
-}
-
-if (typeof window !== 'undefined') {
-  for (const eventName of ['pointerdown', 'keydown', 'touchstart', 'wheel', 'scroll']) {
-    window.addEventListener(eventName, recordUserSessionActivity, { passive: true })
-  }
 }
 
 router.beforeEach(async (to) => {
@@ -462,10 +368,7 @@ router.beforeEach(async (to) => {
     dataPollingEnabled = !to.matched.some(record => record.meta.skipGlobalDataPolling)
     syncDataInterval()
     startAuthenticatedPolling()
-    updateSessionIdleDeadline(session.idleDeadlineAt)
-    syncSessionKeepalive()
-    syncSessionIdleTimer()
-    scheduleSessionActivity()
+    updateSessionDeadline(session.deadlineAt)
   }
 
   return true

@@ -92,7 +92,9 @@ func (c *CronJob) Start(loc *time.Location, trafficAge int) error {
 	statsJob := c.wrapNonOverlappingJob("stats", NewStatsJob(trafficAge > 0))
 	depleteJob := c.wrapNonOverlappingJob("client deplete", NewDepleteJob())
 	checkCoreJob := c.wrapNonOverlappingJob("sing-box core update check", NewCheckCoreJob())
+	autoUpdateCoreJob := c.wrapNonOverlappingJob("sing-box core auto update", NewAutoUpdateCoreJob())
 	checkMihomoCoreJob := c.wrapNonOverlappingJob("mihomo core update check", NewCheckMihomoCoreJob())
+	autoUpdateMihomoCoreJob := c.wrapNonOverlappingJob("mihomo core auto update", NewAutoUpdateMihomoCoreJob())
 	subGroupAutoUpdateJob := c.wrapNonOverlappingJob("subscription group auto-update", NewSubGroupAutoUpdateJob())
 	delStatsJob := c.wrapNonOverlappingJob("delete old stats", NewDelStatsJob())
 	register := func(schedule string, job cron.Job, name string) {
@@ -113,7 +115,9 @@ func (c *CronJob) Start(loc *time.Location, trafficAge int) error {
 	register("@daily", delStatsJob, "delete old stats")
 	// Auto-check core updates based on the configured interval.
 	register("@every 1m", checkCoreJob, "sing-box core update check")
+	register("0 0 4 * * *", autoUpdateCoreJob, "sing-box core auto update")
 	register("@every 1m", checkMihomoCoreJob, "mihomo core update check")
+	register("0 0 4 * * *", autoUpdateMihomoCoreJob, "mihomo core auto update")
 	register("@every 1m", subGroupAutoUpdateJob, "subscription group auto-update")
 	register("@every 10m", acmeAutoRenew, "ACME auto-renew")
 	register("@every 1m", certificateCoreRestart, "certificate Core restart")

@@ -1158,6 +1158,208 @@ func TestInstallDownloadedKernelRequiresCompletedDownloadMarker(t *testing.T) {
 	}
 }
 
+func prepareKernelInstallStatusTestDownload(t *testing.T) (string, string) {
+	t.Helper()
+
+	kernelRoot := filepath.Join(config.GetDataDir(), "kernel")
+	_ = os.RemoveAll(kernelRoot)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(kernelRoot)
+	})
+
+	version := "6.18.41-status-xanmod1"
+	downloadDir := filepath.Join(kernelRoot, "lts", version, "x64v2")
+	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
+		t.Fatalf("create install status download directory failed: %v", err)
+	}
+
+	imagePath := filepath.Join(downloadDir, "linux-image-"+version+"_1_amd64.deb")
+	headersPath := filepath.Join(downloadDir, "linux-headers-"+version+"_1_amd64.deb")
+	if err := os.WriteFile(imagePath, []byte("i"), 0o644); err != nil {
+		t.Fatalf("write install status image package failed: %v", err)
+	}
+	if err := os.WriteFile(headersPath, []byte("h"), 0o644); err != nil {
+		t.Fatalf("write install status headers package failed: %v", err)
+	}
+
+	svc := &KernelManagerService{}
+	if err := svc.saveDownloadedMarker(kernelDownloadedMarker{
+		Provider:  kernelProviderXanMod,
+		Line:      "lts",
+		Version:   version,
+		Arch:      "x64v2",
+		Directory: downloadDir,
+	}); err != nil {
+		t.Fatalf("save install status marker failed: %v", err)
+	}
+
+	return kernelDebPackageName(imagePath), kernelDebPackageName(headersPath)
+}
+
+func TestKernelInstallStatusTracksRunningAndSuccess(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "kernel-install-status-success.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("init db failed: %v", err)
+	}
+	if sqlDB, err := database.GetDB().DB(); err == nil && sqlDB != nil {
+		t.Cleanup(func() {
+			_ = sqlDB.Close()
+		})
+	}
+
+	imagePackage, headersPackage := prepareKernelInstallStatusTestDownload(t)
+
+	oldStore := kernelInstallStatusStore
+	oldEnsureRuntime := kernelEnsureRuntimeSupported
+	oldLookPath := kernelLookPath
+	oldRun := kernelRunCommandWithTimeout
+	oldOutput := kernelRunCommandOutput
+	oldCleanup := kernelRunSystemCleanup
+	defer func() {
+		kernelInstallStatusStore = oldStore
+		kernelEnsureRuntimeSupported = oldEnsureRuntime
+		kernelLookPath = oldLookPath
+		kernelRunCommandWithTimeout = oldRun
+		kernelRunCommandOutput = oldOutput
+		kernelRunSystemCleanup = oldCleanup
+	}()
+
+	kernelInstallStatusStore = newKernelInstallStatusStore()
+	kernelEnsureRuntimeSupported = func() error { return nil }
+	kernelLookPath = func(file string) (string, error) {
+		switch file {
+		case "dpkg":
+			return "/usr/bin/dpkg", nil
+		case "sudo":
+			return "", fmt.Errorf("sudo not available")
+		default:
+			return "", fmt.Errorf("unexpected lookup: %s", file)
+		}
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	kernelRunCommandWithTimeout = func(_ time.Duration, command string, args ...string) error {
+		if strings.TrimSpace(command) != "/usr/bin/dpkg" {
+			return fmt.Errorf("unexpected command: %s", command)
+		}
+		close(started)
+		<-release
+		return nil
+	}
+	kernelRunCommandOutput = func(_ time.Duration, command string, args ...string) (string, error) {
+		if strings.TrimSpace(command) != "dpkg-query" {
+			return "", fmt.Errorf("unexpected output command: %s", command)
+		}
+		if len(args) == 0 {
+			return "", fmt.Errorf("missing dpkg-query arguments")
+		}
+		pkg := strings.TrimSpace(args[len(args)-1])
+		if pkg != imagePackage && pkg != headersPackage {
+			return "", fmt.Errorf("unexpected package query: %s", pkg)
+		}
+		return "install ok installed", nil
+	}
+	kernelRunSystemCleanup = func() *kernelSystemCleanupReport {
+		return &kernelSystemCleanupReport{Done: true, Summary: "system cleanup completed"}
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := (&KernelManagerService{}).InstallDownloadedKernel()
+		done <- err
+	}()
+
+	<-started
+	running := (&KernelManagerService{}).GetInstallStatus()
+	if running == nil || !running.Active || !running.Installing || running.State != "running" {
+		t.Fatalf("expected running install status, got %#v", running)
+	}
+	if strings.Join(running.TargetPackages, "\x00") != strings.Join([]string{imagePackage, headersPackage}, "\x00") {
+		t.Fatalf("unexpected running target packages: %#v", running.TargetPackages)
+	}
+	if !strings.Contains(running.Command, "/usr/bin/dpkg -i") {
+		t.Fatalf("expected running command to include dpkg install, got %q", running.Command)
+	}
+
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("install downloaded kernel returned error: %v", err)
+	}
+
+	finalStatus := (&KernelManagerService{}).GetInstallStatus()
+	if finalStatus == nil || finalStatus.Active || finalStatus.Installing || finalStatus.State != "success" {
+		t.Fatalf("expected successful terminal install status, got %#v", finalStatus)
+	}
+	if !finalStatus.Verified || !finalStatus.Installed {
+		t.Fatalf("expected successful install verification, got %#v", finalStatus)
+	}
+	if finalStatus.Error != "" {
+		t.Fatalf("expected empty terminal error, got %q", finalStatus.Error)
+	}
+}
+
+func TestKernelInstallStatusTracksFailure(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "kernel-install-status-failure.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("init db failed: %v", err)
+	}
+	if sqlDB, err := database.GetDB().DB(); err == nil && sqlDB != nil {
+		t.Cleanup(func() {
+			_ = sqlDB.Close()
+		})
+	}
+
+	imagePackage, headersPackage := prepareKernelInstallStatusTestDownload(t)
+
+	oldStore := kernelInstallStatusStore
+	oldEnsureRuntime := kernelEnsureRuntimeSupported
+	oldLookPath := kernelLookPath
+	oldRun := kernelRunCommandWithTimeout
+	oldCleanup := kernelRunSystemCleanup
+	defer func() {
+		kernelInstallStatusStore = oldStore
+		kernelEnsureRuntimeSupported = oldEnsureRuntime
+		kernelLookPath = oldLookPath
+		kernelRunCommandWithTimeout = oldRun
+		kernelRunSystemCleanup = oldCleanup
+	}()
+
+	kernelInstallStatusStore = newKernelInstallStatusStore()
+	kernelEnsureRuntimeSupported = func() error { return nil }
+	kernelLookPath = func(file string) (string, error) {
+		switch file {
+		case "dpkg":
+			return "/usr/bin/dpkg", nil
+		case "sudo":
+			return "", fmt.Errorf("sudo not available")
+		default:
+			return "", fmt.Errorf("unexpected lookup: %s", file)
+		}
+	}
+	kernelRunCommandWithTimeout = func(_ time.Duration, command string, args ...string) error {
+		return errors.New("dpkg install failed")
+	}
+	kernelRunSystemCleanup = func() *kernelSystemCleanupReport {
+		return &kernelSystemCleanupReport{Done: true, Summary: "system cleanup completed"}
+	}
+
+	_, err := (&KernelManagerService{}).InstallDownloadedKernel()
+	if err == nil || !strings.Contains(err.Error(), "kernel package install failed") {
+		t.Fatalf("expected install failure, got %v", err)
+	}
+
+	status := (&KernelManagerService{}).GetInstallStatus()
+	if status == nil || status.Active || status.Installing || status.State != "error" {
+		t.Fatalf("expected failed terminal install status, got %#v", status)
+	}
+	if strings.Join(status.TargetPackages, "\x00") != strings.Join([]string{imagePackage, headersPackage}, "\x00") {
+		t.Fatalf("unexpected failed target packages: %#v", status.TargetPackages)
+	}
+	if !strings.Contains(status.Error, "kernel package install failed") {
+		t.Fatalf("expected failure status to preserve error, got %q", status.Error)
+	}
+}
+
 func TestGetDownloadedKernelStatusRejectsMarkerOutsideKernelDownloadRoot(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "kernel-outside-marker.db")
 	if err := database.InitDB(dbPath); err != nil {
