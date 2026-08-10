@@ -1,8 +1,8 @@
 import api from './api'
 import { i18n } from '@/locales'
-import router from '@/router'
 import axios from 'axios'
 import { push } from 'notivue'
+import { requestLoginNavigation } from './sessionNavigation'
 
 export interface Msg {
   success: boolean
@@ -53,10 +53,30 @@ function _handleMsg(msg: any, options: HttpRequestOptions = {}): void {
   }
 }
 
+let logoutPromise: Promise<void> | null = null
+
 export const logout = async () => {
-  const response = await HttpUtils.get('api/logout')
-  if(response.success){
-    router.push('/login')
+  if (logoutPromise) return logoutPromise
+
+  const operation = (async () => {
+    try {
+      await HttpUtils.get('api/logout', {}, {
+        silentAuthCheck: true,
+        silentErrorToast: true,
+        timeout: 5000,
+      })
+    } finally {
+      await requestLoginNavigation()
+    }
+  })()
+
+  logoutPromise = operation
+  try {
+    await operation
+  } finally {
+    if (logoutPromise === operation) {
+      logoutPromise = null
+    }
   }
 }
 

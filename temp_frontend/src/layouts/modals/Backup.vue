@@ -55,7 +55,7 @@
 <script lang="ts" setup>
 import api from '@/plugins/api'
 import HttpUtils from '@/plugins/httputil'
-import router from '@/router'
+import { reloadToLogin } from '@/plugins/sessionNavigation'
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { i18n } from '@/locales'
 import { push } from 'notivue'
@@ -128,7 +128,7 @@ const startReconnectPolling = () => {
       if (body.failureKind === 'api') {
         clearReconnectTimer()
         clearOverlay()
-        await router.replace('/login')
+        reloadToLogin()
         return
       }
     } catch {
@@ -267,5 +267,6 @@ watch(
 
 onBeforeUnmount(() => {
   clearReconnectTimer()
+  clearOverlay()
 })
 </script>

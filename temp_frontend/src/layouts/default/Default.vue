@@ -1,9 +1,7 @@
 <template>
-  <v-app style="overflow: auto;">
-    <drawer :isMobile="isMobile" :displayDrawer="displayDrawer" @toggleDrawer="toggleDrawer" />
-    <default-bar :isMobile="isMobile" @toggleDrawer="toggleDrawer" />
-    <default-view />
-  </v-app>
+  <drawer :isMobile="isMobile" :displayDrawer="displayDrawer" @toggleDrawer="toggleDrawer" />
+  <default-bar :isMobile="isMobile" @toggleDrawer="toggleDrawer" />
+  <default-view />
 </template>
 
 <script lang="ts" setup>

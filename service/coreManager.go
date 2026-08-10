@@ -155,6 +155,7 @@ type GitHubRelease struct {
 	Assets      []GitHubAsset `json:"assets"`
 	PublishedAt string        `json:"published_at"`
 	CreatedAt   string        `json:"created_at"`
+	UpdatedAt   string        `json:"updated_at"`
 }
 
 // GitHubAsset GitHub Release 资源
@@ -243,9 +244,26 @@ func (s *CoreManagerService) getConfigPath() string {
 	return GetSingboxConfigPath()
 }
 
-func (s *CoreManagerService) regenerateRuntimeConfig() {
+// refreshManagedCoreOwnershipIfPresent adopts the fixed SSH-managed binary
+// path on first status read. It records ownership without scanning archives or
+// neighboring filenames, and status must remain readable if the manifest is
+// unavailable or cannot be updated.
+func (s *CoreManagerService) refreshManagedCoreOwnershipIfPresent(binPath string) {
+	if !IsSystemPlatformLinux() {
+		return
+	}
+	statInfo, err := os.Stat(binPath)
+	if err != nil || !statInfo.Mode().IsRegular() {
+		return
+	}
+	if err := RegisterManagedCoreHostOwnership("singbox", binPath, singboxSystemdName); err != nil {
+		logger.Warning("failed to adopt sing-box core ownership: ", err)
+	}
+}
+
+func (s *CoreManagerService) regenerateRuntimeConfig() error {
 	configService := NewConfigService()
-	NewProManagerService(configService).SaveInboundJson()
+	return NewProManagerService(configService).RegenerateCoreConfig()
 }
 
 func (s *CoreManagerService) getPlatformInfo() string {
@@ -420,13 +438,16 @@ func (s *CoreManagerService) GetCoreStatus() (*SingboxCoreInfo, error) {
 	} else if statInfo, err := os.Stat(binPath); err == nil {
 		info.Installed = true
 		info.LocalVersion, info.VersionInfo = s.getCachedLocalVersion(binPath, statInfo, false)
-		info.Compatible = info.LocalVersion != "" && managedCoreVersionOutputMatches(info.VersionInfo, "sing-box")
+		info.Compatible = info.LocalVersion != "" && singboxManagedIdentityMatches(info.VersionInfo)
 		installedTarget := inferSingboxTargetFromGoBuildInfo(binPath)
 		if installedTarget.OS == "" && installedTarget.Arch == "" {
 			installedTarget = inferSingboxTargetFromPlatform(info.Platform)
 		}
 		info.InstalledTarget = mergeSingboxInstalledTargetWithPreference(installedTarget, info.DownloadPreference.Target)
 		info.InstalledChannel = detectSingboxInstalledChannel(info.LocalVersion, info.VersionInfo)
+		if info.InstalledChannel == "" {
+			info.InstalledChannel = inferSingboxInstalledChannelFromBuildInfo(binPath)
+		}
 	} else {
 		clearCoreLocalVersionCache(binPath)
 		clearSingboxCoreLocalTargetCache(binPath)
@@ -437,18 +458,19 @@ func (s *CoreManagerService) GetCoreStatus() (*SingboxCoreInfo, error) {
 }
 
 func (s *CoreManagerService) getLocalVersion(binPath string) (string, string) {
-	output, err := runCommandOutputInDirWithTimeout(coreVersionCommandTimeout, filepath.Dir(binPath), binPath, "version")
-	if err != nil {
-		logger.Warning("Failed to get sing-box version: ", err)
-		return "", ""
+	for _, args := range [][]string{{"version"}, {"-v"}} {
+		output, err := runCommandOutputInDirWithTimeout(coreVersionCommandTimeout, filepath.Dir(binPath), binPath, args...)
+		if err != nil {
+			continue
+		}
+		outputStr := strings.TrimSpace(string(output))
+		if outputStr == "" {
+			continue
+		}
+		return extractSingboxVersionFromOutput(outputStr), outputStr
 	}
-	outputStr := strings.TrimSpace(string(output))
-	parts := strings.Fields(outputStr)
-	version := ""
-	if len(parts) >= 3 {
-		version = parts[2]
-	}
-	return version, outputStr
+	logger.Warning("Failed to get sing-box version")
+	return "", ""
 }
 
 func (s *CoreManagerService) getCachedLocalVersion(binPath string, statInfo os.FileInfo, forceRefresh bool) (string, string) {
@@ -470,6 +492,7 @@ func (s *CoreManagerService) GetRemoteVersions(channel string) (*SingboxCoreVers
 }
 
 func (s *CoreManagerService) GetRemoteVersionsWindow(channel string, offset int, limit int, target SingboxCoreDownloadTarget) (*SingboxCoreVersionListResponse, error) {
+	channel = normalizeSingboxReleaseChannel(channel)
 	offset, limit = normalizeCoreVersionWindow(offset, limit)
 	filterTarget := hasSingboxCoreDownloadTargetFilter(target)
 	if filterTarget {
@@ -554,6 +577,7 @@ func (s *CoreManagerService) GetRemoteVersionsWindow(channel string, offset int,
 }
 
 func shouldIncludeRelease(channel string, prerelease bool) bool {
+	channel = normalizeSingboxReleaseChannel(channel)
 	if channel == "stable" {
 		return !prerelease
 	}
@@ -561,6 +585,15 @@ func shouldIncludeRelease(channel string, prerelease bool) bool {
 		return prerelease
 	}
 	return true
+}
+
+func normalizeSingboxReleaseChannel(channel string) string {
+	switch strings.ToLower(strings.TrimSpace(channel)) {
+	case singboxReleaseChannelAlpha:
+		return singboxReleaseChannelAlpha
+	default:
+		return singboxReleaseChannelStable
+	}
 }
 
 func normalizeCoreVersionWindow(offset int, limit int) (int, int) {
@@ -1299,7 +1332,9 @@ func (s *CoreManagerService) StartCore() (err error) {
 		return fmt.Errorf("内核文件无法在当前系统执行，请确认下载的架构与系统匹配（当前 %s/%s）", GetSystemPlatformOS(), GetSystemPlatformArchitecture())
 	}
 
-	s.regenerateRuntimeConfig()
+	if err := s.regenerateRuntimeConfig(); err != nil {
+		return err
+	}
 	configPath := s.getConfigPath()
 	configExists, err := ManagedRuntimeFileExists(configPath)
 	if err != nil {
@@ -1354,7 +1389,9 @@ func (s *CoreManagerService) startCoreLocked() error {
 		return fmt.Errorf("内核文件无法在当前系统执行，请确认下载的架构与系统匹配（当前 %s/%s）", GetSystemPlatformOS(), GetSystemPlatformArchitecture())
 	}
 
-	s.regenerateRuntimeConfig()
+	if err := s.regenerateRuntimeConfig(); err != nil {
+		return err
+	}
 	configPath := s.getConfigPath()
 	configExists, err := ManagedRuntimeFileExists(configPath)
 	if err != nil {
@@ -1496,7 +1533,9 @@ func (s *CoreManagerService) RestartCore() (err error) {
 	}
 
 	if IsSystemPlatformLinux() && !shouldUseDirectManagedCoreRuntime() && s.isSingboxSystemdActive() {
-		s.regenerateRuntimeConfig()
+		if err := s.regenerateRuntimeConfig(); err != nil {
+			return err
+		}
 		configPath := s.getConfigPath()
 		configExists, err := ManagedRuntimeFileExists(configPath)
 		if err != nil {
@@ -1560,10 +1599,15 @@ func (s *CoreManagerService) RestartCore() (err error) {
 		return nil
 	}
 
-	// 非 systemd 场景或 Windows：先停再启
-	s.stopCoreInternal()
+	// 非 systemd 场景或 Windows：先生成目标配置，避免生成失败时把
+	// 当前可用 Core 停掉后再暴露一个不可恢复的空窗。
+	if err := s.regenerateRuntimeConfig(); err != nil {
+		return err
+	}
+	if err := s.stopCoreInternal(); err != nil {
+		return err
+	}
 	time.Sleep(1 * time.Second)
-	s.regenerateRuntimeConfig()
 
 	if _, err := os.Stat(binPath); os.IsNotExist(err) {
 		return fmt.Errorf("内核文件不存在")
@@ -1638,6 +1682,10 @@ func (s *CoreManagerService) isRunning() bool {
 	}
 
 	if IsSystemPlatformLinux() && shouldUseDirectManagedCoreRuntime() && isManagedCoreProcessRunningByBinaryPath(s.getCoreBinPath()) {
+		s.isStarted = true
+		return true
+	}
+	if IsSystemPlatformWindows() && isManagedCoreProcessRunningByBinaryPath(s.getCoreBinPath()) {
 		s.isStarted = true
 		return true
 	}
@@ -1831,8 +1879,12 @@ func (s *CoreManagerService) stopCoreLinuxFull() error {
 	// 先通过 systemd 停止
 	if s.isSingboxSystemdActive() {
 		if err := runSystemctlCommand("stop", singboxSystemdName); err != nil {
-			logger.Warning("systemctl stop ", singboxSystemdName, " 失败: ", err)
+			return fmt.Errorf("failed to stop sing-box systemd service: %v", err)
 		} else {
+			time.Sleep(300 * time.Millisecond)
+			if s.isSingboxSystemdActive() {
+				return fmt.Errorf("sing-box systemd service is still active after stop request")
+			}
 			logger.Info("sing-box 已通过 systemd 停止")
 		}
 	}
@@ -1840,7 +1892,9 @@ func (s *CoreManagerService) stopCoreLinuxFull() error {
 	// 如果还有直接启动的进程，也停掉
 	if s.coreCmd != nil && s.coreCmd.Process != nil {
 		pid := s.coreCmd.Process.Pid
-		_ = s.coreCmd.Process.Signal(os.Interrupt)
+		if signalErr := s.coreCmd.Process.Signal(os.Interrupt); signalErr != nil && s.isProcessAlive(pid) {
+			return fmt.Errorf("failed to interrupt sing-box process %d: %v", pid, signalErr)
+		}
 		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) {
 			if !s.isProcessAlive(pid) {
@@ -1849,7 +1903,12 @@ func (s *CoreManagerService) stopCoreLinuxFull() error {
 			time.Sleep(120 * time.Millisecond)
 		}
 		if s.isProcessAlive(pid) {
-			_ = s.coreCmd.Process.Kill()
+			if killErr := s.coreCmd.Process.Kill(); killErr != nil {
+				return fmt.Errorf("failed to kill sing-box process %d: %v", pid, killErr)
+			}
+		}
+		if s.isProcessAlive(pid) {
+			return fmt.Errorf("sing-box process %d is still alive after stop request", pid)
 		}
 	}
 
@@ -1937,6 +1996,15 @@ func (s *CoreManagerService) stopCoreInternal() error {
 		s.stderr = nil
 		logger.Info("sing-box 内核已停止")
 		return nil
+	}
+
+	// After a panel restart Windows has no in-memory exec.Cmd for an existing
+	// managed sing-box.exe. Find and terminate only the exact managed path so
+	// Stop/Delete cannot report success while the old Core still owns ports.
+	if IsSystemPlatformWindows() {
+		if err := terminateManagedCoreProcessesByBinaryPath(s.getCoreBinPath(), 5*time.Second); err != nil {
+			return fmt.Errorf("failed to stop sing-box managed Windows process: %v", err)
+		}
 	}
 
 	s.isStarted = false
@@ -2329,10 +2397,7 @@ func (s *CoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
 	if err != nil {
 		return err
 	}
-	latestAlpha, err := s.fetchLatestAlphaTag(client)
-	if err != nil {
-		return err
-	}
+	latestAlpha, alphaErr := s.fetchLatestAlphaTag(client)
 
 	settingSvc := &SettingService{}
 	prevStable, err := settingSvc.getString(coreAutoCheckLatestStableKey)
@@ -2348,7 +2413,7 @@ func (s *CoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
 		return err
 	}
 
-	if latestStable != "" && latestStable != prevStable {
+	if latestStable != prevStable {
 		if err = settingSvc.setString(coreAutoCheckLatestStableKey, latestStable); err != nil {
 			return err
 		}
@@ -2357,13 +2422,16 @@ func (s *CoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
 		}
 	}
 
-	if latestAlpha != "" && latestAlpha != prevAlpha {
+	if alphaErr == nil && latestAlpha != prevAlpha {
 		if err = settingSvc.setString(coreAutoCheckLatestAlphaKey, latestAlpha); err != nil {
 			return err
 		}
 		if err = settingSvc.setString(coreAutoCheckPendingAlphaKey, latestAlpha); err != nil {
 			return err
 		}
+	}
+	if alphaErr != nil {
+		logger.Warning("check latest sing-box prerelease failed; keep the previous Alpha state: ", alphaErr)
 	}
 
 	return nil
@@ -2372,6 +2440,7 @@ func (s *CoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
 // GetRemoteVersionsAll fetches release versions across multiple pages.
 // This keeps old versions (e.g. 1.11.x) available instead of only the latest page.
 func (s *CoreManagerService) GetRemoteVersionsAll(channel string) (*SingboxCoreVersionListResponse, error) {
+	channel = normalizeSingboxReleaseChannel(channel)
 	const (
 		perPage  = 100
 		maxPages = 20
@@ -2745,7 +2814,7 @@ func (s *CoreManagerService) validateCoreBinary(binPath string) bool {
 	if err != nil {
 		return false
 	}
-	return managedCoreVersionOutputMatches(string(output), "sing-box")
+	return extractSingboxVersionFromOutput(string(output)) != "" && singboxManagedIdentityMatches(string(output))
 }
 
 func CheckSingboxRuntimeConfig(binPath, configPath, workDir string) error {

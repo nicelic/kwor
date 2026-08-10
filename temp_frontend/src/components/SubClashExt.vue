@@ -912,9 +912,9 @@ export default {
       // Feature toggles.
       enableSniff: true,
       snifferOverrideDestination: true as boolean | null,
-      snifferForceDnsMapping: null as boolean | null,
-      snifferParsePureIp: null as boolean | null,
-      enableRejectQuic: false,
+      snifferForceDnsMapping: true as boolean | null,
+      snifferParsePureIp: true as boolean | null,
+      enableRejectQuic: true,
       rejectUdpPortsInput: '' as string,
 
       // TUN excluded packages.

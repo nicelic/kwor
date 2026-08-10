@@ -105,16 +105,11 @@ func inferMihomoTargetFromGoBuildInfo(binPath string) MihomoCoreDownloadTarget {
 	return normalizeMihomoDownloadPreferenceTarget(target)
 }
 
-func mergeMihomoInstalledTargetWithPreference(installed MihomoCoreDownloadTarget, preferenceTarget MihomoCoreDownloadTarget) MihomoCoreDownloadTarget {
-	installed = normalizeMihomoDownloadPreferenceTarget(installed)
-	preferenceTarget = normalizeMihomoDownloadPreferenceTarget(preferenceTarget)
-	if installed.OS == "" && installed.Arch == "" {
-		return MihomoCoreDownloadTarget{}
-	}
-	if installed.Amd64Level == "" && installed.OS == preferenceTarget.OS && installed.Arch == "amd64" && preferenceTarget.Arch == "amd64" {
-		installed.Amd64Level = preferenceTarget.Amd64Level
-	}
-	return installed
+// normalizeMihomoInstalledTarget keeps status derived from the executable
+// independent from the user's next-download preference. A stale preference
+// must never make an unknown AMD64 level appear safe for automatic updates.
+func normalizeMihomoInstalledTarget(target MihomoCoreDownloadTarget) MihomoCoreDownloadTarget {
+	return normalizeMihomoDownloadPreferenceTarget(target)
 }
 
 func (s *MihomoCoreManagerService) GetDownloadPreference() (MihomoCoreDownloadPreference, error) {

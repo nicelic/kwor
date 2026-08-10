@@ -82,26 +82,79 @@ func clearSingboxCoreLocalTargetCache(binPath string) {
 }
 
 func singboxManagedIdentityMatches(versionInfo string) bool {
-	return managedCoreVersionOutputMatches(versionInfo, "sing-box")
+	for _, field := range strings.Fields(strings.ToLower(versionInfo)) {
+		field = strings.Trim(field, "\"'()[]{}:,;")
+		if field == "sing-box" {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeSingboxVersionTag(value string) string {
 	return normalizeAcmeVersionTag(value)
 }
 
+func isLikelySingboxVersionTag(value string) bool {
+	normalized := strings.TrimSpace(value)
+	if normalized == "" {
+		return false
+	}
+	if normalized[0] == 'v' || normalized[0] == 'V' {
+		normalized = strings.TrimSpace(normalized[1:])
+	}
+	if normalized == "" || normalized[0] < '0' || normalized[0] > '9' {
+		return false
+	}
+	return isLikelySemverTag(value)
+}
+
+// extractSingboxVersionFromOutput only accepts the version attached to a
+// sing-box version line. This avoids accidentally treating later build
+// metadata, such as a Go toolchain version, as the Core version.
+func extractSingboxVersionFromOutput(output string) string {
+	for _, line := range strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(strings.ToLower(line), "sing-box ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		for index, field := range fields {
+			if !strings.EqualFold(strings.Trim(field, "\"'()[]{}"), "version") || index+1 >= len(fields) {
+				continue
+			}
+			candidate := strings.Trim(fields[index+1], "\"'(),;[]{}")
+			if !isLikelySingboxVersionTag(candidate) {
+				continue
+			}
+			return candidate
+		}
+	}
+	return ""
+}
+
 func detectSingboxInstalledChannelFromVersion(version string) string {
 	normalized := strings.ToLower(normalizeSingboxVersionTag(strings.TrimSpace(version)))
-	if normalized == "" {
+	if !isLikelySingboxVersionTag(normalized) {
 		return ""
 	}
 	switch {
 	case strings.Contains(normalized, "alpha"),
 		strings.Contains(normalized, "beta"),
-		strings.Contains(normalized, "rc"):
+		strings.Contains(normalized, "rc"),
+		isSingboxPrereleaseVersion(normalized):
 		return singboxReleaseChannelAlpha
 	default:
 		return singboxReleaseChannelStable
 	}
+}
+
+func isSingboxPrereleaseVersion(version string) bool {
+	version = strings.TrimSpace(strings.SplitN(version, "+", 2)[0])
+	if !isLikelySemverTag(version) {
+		return false
+	}
+	return strings.Contains(version, "-")
 }
 
 func detectSingboxInstalledChannel(version string, versionInfo string) string {
@@ -151,7 +204,12 @@ func (s *CoreManagerService) inspectManagedLocalSingboxBinary(binPath string) ma
 		if cached.compatible {
 			inspection.Version, inspection.VersionInfo = s.getCachedLocalVersion(binPath, statInfo, false)
 			inspection.Compatible = inspection.Version != "" && singboxManagedIdentityMatches(inspection.VersionInfo)
-			inspection.Channel = detectSingboxInstalledChannel(inspection.Version, inspection.VersionInfo)
+			if channel := detectSingboxInstalledChannel(inspection.Version, inspection.VersionInfo); channel != "" {
+				inspection.Channel = channel
+			}
+			if inspection.Channel == "" {
+				inspection.Channel = inferSingboxInstalledChannelFromBuildInfo(binPath)
+			}
 		}
 		return inspection
 	}
@@ -159,6 +217,7 @@ func (s *CoreManagerService) inspectManagedLocalSingboxBinary(binPath string) ma
 	inspection := inspectManagedLinuxCoreBinary(binPath, "sing-box", func(statInfo os.FileInfo, forceRefresh bool) (string, string) {
 		return s.getCachedLocalVersion(binPath, statInfo, forceRefresh)
 	})
+	inspection.Compatible = inspection.Compatible && singboxManagedIdentityMatches(inspection.VersionInfo)
 	inspection.Channel = detectSingboxInstalledChannel(inspection.Version, inspection.VersionInfo)
 	if inspection.Channel == "" {
 		inspection.Channel = inferSingboxInstalledChannelFromBuildInfo(binPath)
@@ -166,6 +225,7 @@ func (s *CoreManagerService) inspectManagedLocalSingboxBinary(binPath string) ma
 	finalStat, finalErr := os.Stat(binPath)
 	if finalErr == nil {
 		setSingboxCoreLocalTargetCache(binPath, finalStat.ModTime(), finalStat.Size(), finalStat.Mode().Perm(), inspection)
+		s.refreshManagedCoreOwnershipIfPresent(binPath)
 	}
 	return inspection
 }

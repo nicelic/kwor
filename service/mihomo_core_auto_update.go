@@ -183,6 +183,16 @@ func mihomoRemoteVersionIsNewer(remoteVersion string, localVersion string) bool 
 	if remoteVersion == "" || localVersion == "" {
 		return false
 	}
+	remoteRolling := isMihomoRollingVersion(remoteVersion)
+	localRolling := isMihomoRollingVersion(localVersion)
+	if remoteRolling || localRolling {
+		if !remoteRolling || !localRolling ||
+			!isMihomoResolvedRollingVersion(remoteVersion) ||
+			!isMihomoResolvedRollingVersion(localVersion) {
+			return false
+		}
+		return !strings.EqualFold(remoteVersion, localVersion)
+	}
 	return compareSemverLikeTags(remoteVersion, localVersion) > 0
 }
 
@@ -203,18 +213,20 @@ func selectMihomoPendingUpdateForChannel(status *MihomoCoreInfo, pendingStable s
 	return "", ""
 }
 
-func (s *MihomoCoreManagerService) resolveAutoUpdateTargetVersion(status *MihomoCoreInfo) (string, error) {
+func (s *MihomoCoreManagerService) resolveAutoUpdateTarget(status *MihomoCoreInfo) (string, string, error) {
 	if status == nil {
-		return "", fmt.Errorf("本地内核状态不可用")
+		return "", "", fmt.Errorf("本地内核状态不可用")
 	}
 	client := &http.Client{Timeout: 30 * time.Second}
 	switch strings.TrimSpace(status.InstalledChannel) {
 	case mihomoReleaseChannelStable:
-		return s.fetchLatestStableTag(client)
+		tag, err := s.fetchLatestStableTag(client)
+		return tag, tag, err
 	case mihomoReleaseChannelAlpha:
-		return s.fetchLatestAlphaTag(client)
+		release, identity, err := s.fetchLatestAlphaRelease(client)
+		return strings.TrimSpace(release.TagName), identity, err
 	default:
-		return "", fmt.Errorf("无法识别本地内核版本频道")
+		return "", "", fmt.Errorf("无法识别本地内核版本频道")
 	}
 }
 
@@ -226,11 +238,11 @@ func (s *MihomoCoreManagerService) runMihomoAutoUpdateAttempt(ctx context.Contex
 	if reason := mihomoAutoUpdateReadinessReason(status); reason != "" {
 		return false, fmt.Errorf("%s", reason)
 	}
-	targetVersion, err := s.resolveAutoUpdateTargetVersion(status)
+	targetVersion, targetIdentity, err := s.resolveAutoUpdateTarget(status)
 	if err != nil {
 		return false, err
 	}
-	if !mihomoRemoteVersionIsNewer(targetVersion, status.LocalVersion) {
+	if !mihomoRemoteVersionIsNewer(targetIdentity, status.LocalVersion) {
 		return false, nil
 	}
 	target := MihomoCoreDownloadTarget{

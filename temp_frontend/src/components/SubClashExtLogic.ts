@@ -3828,6 +3828,9 @@ export const SubClashExtMixin = {
     },
     dnsUseSystemHosts: {
       get(this: any) {
+        if (String(this._rawSource || '').trim() === '' && !this.metaJson['dns']) {
+          return false
+        }
         return normalizeOptionalBoolean(this.metaJson['dns']?.['use-system-hosts'])
       },
       set(this: any, v: boolean | null) {

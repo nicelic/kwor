@@ -206,7 +206,7 @@ for /d %%D in ("%CD%\.release-work-*") do set "SOURCE_EXCLUDE_DIRS=!SOURCE_EXCLU
 for /d %%D in ("%CD%\.shadowquic-build-*") do set "SOURCE_EXCLUDE_DIRS=!SOURCE_EXCLUDE_DIRS! "%%~fD""
 robocopy "%CD%" "%SOURCE_STAGE%" /E /COPY:DAT /DCOPY:DAT /R:1 /W:1 ^
     /XD !SOURCE_EXCLUDE_DIRS! ^
-    /XF "*.exe" "*.tar.gz" "*.zip" "kwor" "sui" "main" >nul
+    /XF "*.exe" "*.tar.gz" "*.zip" "gcm-diagnose.log" "kwor" "sui" "main" >nul
 set "ROBOCOPY_EXIT=!ERRORLEVEL!"
 endlocal & set "ROBOCOPY_EXIT=%ROBOCOPY_EXIT%"
 if %ROBOCOPY_EXIT% GEQ 8 (

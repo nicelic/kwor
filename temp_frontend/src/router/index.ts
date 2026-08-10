@@ -8,6 +8,7 @@ import { cancelConfirm } from '@/plugins/confirm'
 import { clearPanelTimeContext, ensurePanelTimeContext, panelNow } from '@/plugins/panelTime'
 import { i18n } from '@/locales'
 import { push } from 'notivue'
+import { registerLoginNavigator, requestLoginNavigation } from '@/plugins/sessionNavigation'
 
 const routes = [
   {
@@ -125,6 +126,12 @@ const routes = [
 const router = createRouter({
   history: createWebHistory(panelBaseURL),
   routes,
+})
+
+registerLoginNavigator(async () => {
+  if (router.currentRoute.value.path !== '/login') {
+    await router.replace('/login')
+  }
 })
 
 let intervalId: any
@@ -288,7 +295,7 @@ const redirectToLoginAfterSessionExpiry = async () => {
   if (sessionKeepaliveRedirecting) return
   sessionKeepaliveRedirecting = true
   try {
-    await router.replace('/login')
+    await requestLoginNavigation()
   } finally {
     sessionKeepaliveRedirecting = false
   }

@@ -253,7 +253,7 @@ export const defaultClashConfig: Record<string, any> = {
     "enable": true,
     "force-dns-mapping": true,
     "parse-pure-ip": true,
-    "override-destination": false,
+    "override-destination": true,
     "sniff": {
       "HTTP": { "ports": ["1-65535"] },
       "TLS": { "ports": ["1-65535"] },
@@ -264,8 +264,7 @@ export const defaultClashConfig: Record<string, any> = {
     "enable": true,
     "ipv6": false,
     "prefer-h3": false,
-    "use-system-hosts": true,
-    "use-hosts": true,
+    "use-system-hosts": false,
     "enhanced-mode": "fake-ip",
     "fake-ip-range": defaultFakeIpRange,
     "fake-ip-range6": defaultFakeIpRange6,

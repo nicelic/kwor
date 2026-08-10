@@ -221,7 +221,7 @@
               color="primary"
               variant="flat"
               :prepend-icon="coreDownloadTaskActive ? (coreDownloadTaskApplying ? 'mdi-progress-wrench' : 'mdi-stop') : 'mdi-download'"
-              :disabled="coreDownloadTaskStopping || coreDownloadTaskApplying || (!coreDownloadTaskActive && (!canDownloadSelectedVersion || downloading))"
+              :disabled="coreDownloadTaskStopping || coreDownloadTaskApplying || startingCore || stoppingCore || restartingCore || deletingCore || (!coreDownloadTaskActive && (!canDownloadSelectedVersion || downloading))"
               @click="coreDownloadTaskActive ? stopCoreDownload() : downloadCore()"
             >
               {{ coreDownloadTaskActive ? coreDownloadStopLabel : t('coreManager.download') }}
@@ -274,7 +274,7 @@
               color="secondary"
               variant="flat"
               prepend-icon="mdi-link-variant-plus"
-              :disabled="coreDownloadTaskActive || !canDownloadCustom || downloading"
+              :disabled="coreDownloadTaskActive || startingCore || stoppingCore || restartingCore || deletingCore || !canDownloadCustom || downloading"
               @click="downloadCoreFromCustomURL"
             >
               {{ t('coreManager.customDownload') }}
@@ -453,7 +453,7 @@
                   variant="flat"
                   size="small"
                   prepend-icon="mdi-play"
-                  :disabled="coreDownloadTaskActive || coreRunning || !coreReady"
+                  :disabled="coreDownloadTaskActive || coreRunning || !coreReady || startingCore || stoppingCore || restartingCore || deletingCore"
                   :loading="startingCore"
                   @click="startCore"
                 >
@@ -464,7 +464,7 @@
                   variant="flat"
                   size="small"
                   prepend-icon="mdi-stop"
-                  :disabled="coreDownloadTaskActive || !coreRunning"
+                  :disabled="coreDownloadTaskActive || !coreRunning || startingCore || stoppingCore || restartingCore || deletingCore"
                   :loading="stoppingCore"
                   @click="stopCore"
                 >
@@ -475,7 +475,7 @@
                   variant="flat"
                   size="small"
                   prepend-icon="mdi-restart"
-                  :disabled="coreDownloadTaskActive || !coreRunning || !coreReady"
+                  :disabled="coreDownloadTaskActive || !coreRunning || !coreReady || startingCore || stoppingCore || restartingCore || deletingCore"
                   :loading="restartingCore"
                   @click="restartCore"
                 >
@@ -1108,6 +1108,12 @@ const applyStatusDownloadState = (status: any) => {
     applyTargetSelection(installedTarget)
     return
   }
+  const preferredTarget = status?.downloadPreference?.target as CoreDownloadTarget | undefined
+  if (preferredTarget && (preferredTarget.arch || preferredTarget.os || preferredTarget.libc)) {
+    applyTargetSelection(preferredTarget)
+    applyDefaultTargetSelection()
+    return
+  }
   if (status?.installed === true && status?.compatible !== true && (selectedLinuxArch.value || selectedLinuxLibc.value)) {
     return
   }
@@ -1153,7 +1159,9 @@ watch(
       if (downloadProgressSessionId.value) {
         startDownloadProgressPolling(downloadProgressSessionId.value)
       }
-      void recoverCoreDownloadTask()
+      if (!downloadProgress.value.id || !isTerminalCoreDownload(downloadProgress.value)) {
+        void recoverCoreDownloadTask()
+      }
       void refreshAll()
     }
   },
@@ -1252,8 +1260,8 @@ const showTransientDownloadFeedback = (type: 'success' | 'error' | 'info', messa
   }, duration)
 }
 
-const clearCompletedCoreDownloadTask = (id: string) => {
-  if (downloadProgress.value.id === id && isTerminalCoreDownload(downloadProgress.value)) {
+const clearCompletedCoreDownloadTask = (id: string, clearTerminalProgress = false) => {
+  if (clearTerminalProgress && downloadProgress.value.id === id && isTerminalCoreDownload(downloadProgress.value)) {
     resetDownloadProgress()
   }
   if (downloadProgressSessionId.value === id) {
@@ -1289,7 +1297,7 @@ const completeCoreDownloadTask = async (progress: CoreDownloadProgress, allowTer
     return
   }
   if (!allowTerminal) {
-    clearCompletedCoreDownloadTask(progress.id)
+    clearCompletedCoreDownloadTask(progress.id, true)
     return
   }
   completedDownloadTaskId = progress.id
@@ -1379,7 +1387,9 @@ const handleVisibilityChange = () => {
     if (dialogVisible.value && downloadProgressSessionId.value) {
       startDownloadProgressPolling(downloadProgressSessionId.value)
     }
-    void recoverCoreDownloadTask()
+    if (!downloadProgress.value.id || !isTerminalCoreDownload(downloadProgress.value)) {
+      void recoverCoreDownloadTask()
+    }
     return
   }
   stopDownloadProgressPolling()

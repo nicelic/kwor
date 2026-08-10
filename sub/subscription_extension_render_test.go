@@ -35,18 +35,118 @@ func TestCanonicalSubscriptionExtensionDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse canonical Clash extension: %v", err)
 	}
+	if err := service.ValidateSubClashExtension(clashExtension); err != nil {
+		t.Fatalf("validate canonical Clash extension: %v", err)
+	}
 	tun := clashExtension["tun"].(map[string]interface{})
 	dns := clashExtension["dns"].(map[string]interface{})
 	clashUI := clashExtension["_uiConfig"].(map[string]interface{})
 	if tun["enable"] != true || dns["enable"] != true {
 		t.Fatalf("canonical Clash TUN/DNS defaults: tun=%#v dns=%#v", tun, dns)
 	}
-	if clashUI["noResolveGlobal"] != true || clashUI["updateMethod"] != "节点选择" || clashUI["routeFinal"] != "节点选择" || clashUI["enableSniff"] != true || clashUI["snifferOverrideDestination"] != true || clashUI["latencyTestInterval"] != "180s" {
+	if clashUI["noResolveGlobal"] != true || clashUI["updateMethod"] != "节点选择" || clashUI["routeFinal"] != "节点选择" || clashUI["enableSniff"] != true || clashUI["snifferOverrideDestination"] != true || clashUI["snifferForceDnsMapping"] != true || clashUI["snifferParsePureIp"] != true || clashUI["enableRejectQuic"] != true || clashUI["latencyTestInterval"] != "180s" {
 		t.Fatalf("canonical Clash UI defaults = %#v", clashUI)
 	}
 	sniffer, ok := clashExtension["sniffer"].(map[string]interface{})
-	if !ok || sniffer["enable"] != true || sniffer["override-destination"] != true {
+	if !ok || sniffer["enable"] != true || sniffer["override-destination"] != true || sniffer["force-dns-mapping"] != true || sniffer["parse-pure-ip"] != true {
 		t.Fatalf("canonical Clash sniffer defaults = %#v", clashExtension["sniffer"])
+	}
+	if dns["use-system-hosts"] != false {
+		t.Fatalf("canonical Clash use-system-hosts default = %#v", dns["use-system-hosts"])
+	}
+	if _, exists := dns["use-hosts"]; exists {
+		t.Fatalf("canonical Clash use-hosts must remain unspecified: %#v", dns["use-hosts"])
+	}
+	rules, ok := clashExtension["rules"].([]interface{})
+	if !ok {
+		t.Fatalf("canonical Clash rules = %#v", clashExtension["rules"])
+	}
+	expectedRejectQuicRules := map[string]bool{
+		"AND,((NETWORK,UDP),(DST-PORT,80)),REJECT":   true,
+		"AND,((NETWORK,UDP),(DST-PORT,443)),REJECT":  true,
+		"AND,((NETWORK,UDP),(DST-PORT,2443)),REJECT": true,
+		"AND,((NETWORK,UDP),(DST-PORT,4443)),REJECT": true,
+		"AND,((NETWORK,UDP),(DST-PORT,6443)),REJECT": true,
+		"AND,((NETWORK,UDP),(DST-PORT,8080)),REJECT": true,
+		"AND,((NETWORK,UDP),(DST-PORT,8081)),REJECT": true,
+		"AND,((NETWORK,UDP),(DST-PORT,8443)),REJECT": true,
+	}
+	for _, value := range rules {
+		if rule, ok := value.(string); ok {
+			delete(expectedRejectQuicRules, rule)
+		}
+	}
+	if len(expectedRejectQuicRules) != 0 {
+		t.Fatalf("canonical Clash missing QUIC UDP reject rules: %#v", expectedRejectQuicRules)
+	}
+}
+
+func TestExplicitClashExtensionOptionsAreNotRestored(t *testing.T) {
+	extension, err := service.ParseSubClashExtension(`mixed-port: 7890
+dns:
+  enable: true
+  use-system-hosts: true
+  use-hosts: false
+  default-nameserver:
+    - udp://223.5.5.5
+  nameserver:
+    - "udp://8.8.8.8#节点选择"
+sniffer:
+  enable: false
+  force-dns-mapping: false
+  parse-pure-ip: false
+  override-destination: false
+rules:
+  - MATCH,节点选择
+_uiConfig:
+  enableRejectQuic: false
+`)
+	if err != nil {
+		t.Fatalf("parse explicitly disabled Clash extension: %v", err)
+	}
+	if err := service.ValidateSubClashExtension(extension); err != nil {
+		t.Fatalf("validate explicitly disabled Clash extension: %v", err)
+	}
+
+	rendered, err := renderMergedClashSubscription(extension, map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("render explicitly disabled Clash extension: %v", err)
+	}
+	root := map[string]interface{}{}
+	if err := yaml.Unmarshal([]byte(rendered), &root); err != nil {
+		t.Fatalf("decode explicitly disabled Clash extension: %v", err)
+	}
+
+	sniffer, ok := root["sniffer"].(map[string]interface{})
+	if !ok || sniffer["enable"] != false {
+		t.Fatalf("disabled sniffer was changed during render: %#v", root["sniffer"])
+	}
+	if sniffer["force-dns-mapping"] != false || sniffer["parse-pure-ip"] != false || sniffer["override-destination"] != false {
+		t.Fatalf("explicit sniffer options were changed during render: %#v", sniffer)
+	}
+	dns, ok := root["dns"].(map[string]interface{})
+	if !ok || dns["use-system-hosts"] != true || dns["use-hosts"] != false {
+		t.Fatalf("explicit DNS host options were changed during render: %#v", root["dns"])
+	}
+	rules, ok := root["rules"].([]interface{})
+	if !ok {
+		t.Fatalf("explicitly disabled Clash rules = %#v", root["rules"])
+	}
+	for _, blockedRule := range []string{
+		"AND,((NETWORK,UDP),(DST-PORT,80)),REJECT",
+		"AND,((NETWORK,UDP),(DST-PORT,443)),REJECT",
+		"AND,((NETWORK,UDP),(DST-PORT,2443)),REJECT",
+		"AND,((NETWORK,UDP),(DST-PORT,4443)),REJECT",
+		"AND,((NETWORK,UDP),(DST-PORT,6443)),REJECT",
+		"AND,((NETWORK,UDP),(DST-PORT,8080)),REJECT",
+		"AND,((NETWORK,UDP),(DST-PORT,8081)),REJECT",
+		"AND,((NETWORK,UDP),(DST-PORT,8443)),REJECT",
+	} {
+		for _, value := range rules {
+			if rule, ok := value.(string); ok && rule == blockedRule {
+				t.Fatalf("disabled Clash extension unexpectedly restored %q", blockedRule)
+			}
+		}
 	}
 }
 

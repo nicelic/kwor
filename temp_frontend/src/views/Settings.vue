@@ -91,7 +91,7 @@
             </v-col>
             <v-col cols="12" sm="6" md="4">
               <v-row no-gutters>
-                <v-col cols="7">
+                <v-col cols="9">
                   <v-text-field
                     type="number"
                     v-model="settings.sessionMaxAge"
@@ -100,13 +100,11 @@
                     hide-details
                   ></v-text-field>
                 </v-col>
-                <v-col cols="5">
+                <v-col cols="3">
                   <v-select
                     v-model="settings.sessionMaxAgeUnit"
                     :items="sessionAgeUnitItems"
                     hide-details
-                    density="comfortable"
-                    variant="outlined"
                   ></v-select>
                 </v-col>
               </v-row>
@@ -132,8 +130,6 @@
                 item-props="props"
                 :label="$t('setting.panelTimeLoc')"
                 hide-details
-                density="comfortable"
-                variant="outlined"
                 :menu-props="{ maxHeight: 360 }"
               ></v-select>
               <div v-if="hiddenPanelTimeLocation" class="text-caption text-warning mt-1">
@@ -150,8 +146,6 @@
                 item-props="props"
                 :label="$t('setting.systemTimeLoc')"
                 hide-details
-                density="comfortable"
-                variant="outlined"
                 :menu-props="{ maxHeight: 360 }"
                 :disabled="systemTimeZoneLoadState === 'loading' || systemTimeZoneLoadState === 'error'"
                 @update:model-value="onSystemTimeLocationSelected"
@@ -666,7 +660,7 @@ import { useLocale } from 'vuetify'
 import { i18n, languages } from '@/locales'
 import { Ref, computed, defineAsyncComponent, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import HttpUtils, { type Msg } from '@/plugins/httputil'
-import router from '@/router'
+import { reloadToLogin, requestLoginNavigation } from '@/plugins/sessionNavigation'
 import { FindDiff } from '@/plugins/utils'
 import { formatPanelDateTime, refreshPanelTimeContext } from '@/plugins/panelTime'
 import { confirm } from '@/plugins/confirm'
@@ -1984,7 +1978,7 @@ const startPanelReconnectPolling = () => {
       if (!sessionMsg.success && sessionMsg.failureKind === 'api') {
         clearPanelReconnectTimer()
         panelRestartOverlay.value = false
-        await router.replace('/login')
+        reloadToLogin()
         return
       }
 
@@ -2130,12 +2124,12 @@ onBeforeUnmount(() => {
   clearPanelReconnectTimer()
   clearPanelUninstallStatusTimer()
   clearPanelUpdateTaskPolling()
+  panelRestartOverlay.value = false
+  panelUninstallOverlay.value = false
   if (typeof document !== 'undefined') {
     document.removeEventListener('visibilitychange', handlePanelUpdateTaskVisibilityChange)
   }
-  if (settingsRequestWasLoading) {
-    loading.value = false
-  }
+  if (settingsRequestWasLoading || loading.value) loading.value = false
 })
 
 const save = async () => {
@@ -2422,7 +2416,7 @@ const refreshSessionTimeoutLease = async () => {
     timeout: 10000,
   })
   if (!msg.success && msg.failureKind === 'api') {
-    await router.replace('/login')
+    await requestLoginNavigation()
   }
 }
 

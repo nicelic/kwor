@@ -159,13 +159,46 @@ func singboxShouldDisableAutoUpdateInUI(enabled bool, status *SingboxCoreInfo) b
 	return singboxAutoUpdateReadinessReason(status) != ""
 }
 
+func singboxShouldDisableAutoUpdateOnError(reason string) bool {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return false
+	}
+	for _, fragment := range []string{
+		"当前平台不支持 sing-box 自动更新",
+		"本地未安装 sing-box 内核",
+		"本地内核不兼容",
+		"无法识别本地内核架构",
+		"无法识别本地内核包类型",
+		"无法识别本地内核版本频道",
+	} {
+		if strings.Contains(reason, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
 func singboxRemoteVersionIsNewer(remoteVersion string, localVersion string) bool {
-	remoteVersion = normalizeSingboxVersionTag(remoteVersion)
-	localVersion = normalizeSingboxVersionTag(localVersion)
+	remoteVersion = normalizeSingboxComparableVersion(remoteVersion)
+	localVersion = normalizeSingboxComparableVersion(localVersion)
 	if remoteVersion == "" || localVersion == "" {
 		return false
 	}
 	return compareSemverLikeTags(remoteVersion, localVersion) > 0
+}
+
+// normalizeSingboxComparableVersion retains prerelease identifiers but drops
+// SemVer build metadata, which does not participate in version precedence.
+func normalizeSingboxComparableVersion(value string) string {
+	normalized := normalizeSingboxVersionTag(value)
+	if buildMetadataIndex := strings.Index(normalized, "+"); buildMetadataIndex >= 0 {
+		normalized = normalized[:buildMetadataIndex]
+	}
+	if !isLikelySingboxVersionTag(normalized) {
+		return ""
+	}
+	return normalized
 }
 
 func selectSingboxPendingUpdateForChannel(status *SingboxCoreInfo, pendingStable string, pendingAlpha string) (string, string) {
@@ -350,8 +383,7 @@ func (s *CoreManagerService) RunScheduledAutoUpdate() error {
 		return nil
 	}
 	reasonText := strings.TrimSpace(lastErr.Error())
-	shouldDisable := strings.Contains(reasonText, "本地未安装 sing-box 内核") ||
-		strings.Contains(reasonText, "无法识别本地内核")
+	shouldDisable := singboxShouldDisableAutoUpdateOnError(reasonText)
 	coreAutoCheckMu.Lock()
 	defer coreAutoCheckMu.Unlock()
 	if err := s.setCoreAutoUpdateErrorLocked(settingSvc, reasonText, now); err != nil {

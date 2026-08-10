@@ -186,6 +186,33 @@ func TestCoreAssetSelectionContracts(t *testing.T) {
 		}
 	})
 
+	t.Run("Mihomo rolling assets keep the requested AMD64 level", func(t *testing.T) {
+		assets := []GitHubAsset{
+			{Name: "mihomo-linux-amd64-compatible-alpha-cf98d2d.gz"},
+			{Name: "mihomo-linux-amd64-v1-alpha-cf98d2d.gz"},
+			{Name: "mihomo-linux-amd64-v1-go123-alpha-cf98d2d.gz"},
+			{Name: "mihomo-linux-amd64-v2-alpha-cf98d2d.gz"},
+			{Name: "mihomo-linux-amd64-v2-go123-alpha-cf98d2d.gz"},
+			{Name: "mihomo-linux-amd64-v3-alpha-cf98d2d.gz"},
+			{Name: "mihomo-linux-amd64-v3-go123-alpha-cf98d2d.gz"},
+		}
+		for _, test := range []struct {
+			level string
+			want  string
+		}{
+			{level: "v1", want: "mihomo-linux-amd64-v1-alpha-cf98d2d.gz"},
+			{level: "v2", want: "mihomo-linux-amd64-v2-alpha-cf98d2d.gz"},
+			{level: "v3", want: "mihomo-linux-amd64-v3-alpha-cf98d2d.gz"},
+		} {
+			asset, ok := pickMihomoAssetFromAssets(assets, MihomoCoreDownloadTarget{
+				OS: "linux", Arch: "amd64", Amd64Level: test.level,
+			})
+			if !ok || asset.Name != test.want {
+				t.Fatalf("level=%s: got=%q ok=%v want=%q", test.level, asset.Name, ok, test.want)
+			}
+		}
+	})
+
 	t.Run("sing-box update info exposes auto update fields", func(t *testing.T) {
 		payload, err := json.Marshal(SingboxCoreUpdateInfo{
 			Enabled:                 true,

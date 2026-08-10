@@ -1,5 +1,5 @@
 <template>
-    <v-container class="fill-height" style="margin-top: 100px;">
+    <v-container class="fill-height login-page">
       <v-row justify="center" align="center">
         <v-col cols="12" sm="8" md="4">
           <v-card>
@@ -117,4 +117,13 @@ const isActiveTheme = (th: string) => {
   return current == th
 }
 </script>
+
+<style scoped>
+.login-page {
+  box-sizing: border-box;
+  min-height: 100%;
+  padding-top: 32px;
+  padding-bottom: 32px;
+}
+</style>
   

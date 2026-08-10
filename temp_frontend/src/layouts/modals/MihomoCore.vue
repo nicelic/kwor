@@ -714,7 +714,7 @@ const downloadProgress = ref<CoreDownloadProgress>({
 
 const versionItems = computed(() => {
   return versionList.value.map((item) => ({
-    title: (item.tag_name || item.tagName || item.name || '').replace(/^v/, ''),
+    title: (item.version || item.tag_name || item.tagName || item.name || '').replace(/^v/, ''),
     value: item.tag_name || item.tagName || '',
     prerelease: item.prerelease === true,
     assetName: item.asset_name || '',
@@ -748,7 +748,7 @@ const latestRemoteVersion = computed(() => {
     return ''
   }
   const current = versionList.value[0]
-  return (current.tag_name || current.tagName || '').replace(/^v/, '')
+  return (current.version || current.tag_name || current.tagName || '').replace(/^v/, '')
 })
 const remoteVersionLabel = computed(() => {
   if (remoteLoading.value) {

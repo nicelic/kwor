@@ -54,6 +54,7 @@ tun:
 dns:
   enable: true
   ipv6: false
+  use-system-hosts: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/15
   default-nameserver:
@@ -74,6 +75,8 @@ dns:
     - "*.local"
 sniffer:
   enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
   sniff:
     HTTP:
       ports:
@@ -86,6 +89,14 @@ sniffer:
         - 1-65535
   override-destination: true
 rules:
+  - AND,((NETWORK,UDP),(DST-PORT,80)),REJECT
+  - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT
+  - AND,((NETWORK,UDP),(DST-PORT,2443)),REJECT
+  - AND,((NETWORK,UDP),(DST-PORT,4443)),REJECT
+  - AND,((NETWORK,UDP),(DST-PORT,6443)),REJECT
+  - AND,((NETWORK,UDP),(DST-PORT,8080)),REJECT
+  - AND,((NETWORK,UDP),(DST-PORT,8081)),REJECT
+  - AND,((NETWORK,UDP),(DST-PORT,8443)),REJECT
   - GEOIP,Private,DIRECT
   - MATCH,节点选择
 `
@@ -147,7 +158,9 @@ const canonicalSubClashExtension = SubscriptionClashBaseConfig + `_uiConfig:
   latencyTolerance: "50"
   enableSniff: true
   snifferOverrideDestination: true
-  enableRejectQuic: false
+  snifferForceDnsMapping: true
+  snifferParsePureIp: true
+  enableRejectQuic: true
   rejectUdpPortsInput: ""
 `
 

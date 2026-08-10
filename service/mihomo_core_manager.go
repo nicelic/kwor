@@ -59,6 +59,7 @@ type MihomoCoreUpdateInfo struct {
 
 type MihomoCoreVersionItem struct {
 	TagName     string `json:"tag_name"`
+	Version     string `json:"version,omitempty"`
 	Name        string `json:"name"`
 	Prerelease  bool   `json:"prerelease"`
 	PublishedAt string `json:"published_at"`
@@ -170,9 +171,14 @@ var (
 		"s-ui-mihomo",
 		"sui-mihomo",
 	}
-	mihomoCoreAutoCheckMu sync.Mutex
-	mihomoVersionRe       = regexp.MustCompile(`v?\d+\.\d+\.\d+(?:[-+._A-Za-z0-9]+)?`)
+	mihomoCoreAutoCheckMu       sync.Mutex
+	mihomoVersionOutputRe       = regexp.MustCompile(`(?im)^\s*Mihomo\s+Meta\s+([^\s]+)`)
+	mihomoVersionFallbackRe     = regexp.MustCompile(`(?i)\bmihomo(?:\s+(?:meta|version))?[\s:=]+((?:v?\d+\.\d+\.\d+(?:[-+._A-Za-z0-9]+)?)|(?:(?:alpha|beta|rc)-[0-9A-Za-z][0-9A-Za-z._+-]*))\b`)
+	mihomoRollingVersionRe      = regexp.MustCompile(`(?i)^(?:(?:alpha|beta|rc)-[0-9A-Za-z][0-9A-Za-z._+-]*|(?:alpha|beta|rc)@[0-9T:Z.+-]+|prerelease-(?:alpha|beta|rc)(?:[-._][0-9A-Za-z._+-]+)?)$`)
+	mihomoRollingAssetVersionRe = regexp.MustCompile(`(?i)(?:^|-)((?:alpha|beta|rc)-[0-9A-Za-z]+)(?:-|\.|$)`)
 )
+
+const mihomoReleaseVersionMaxBytes int64 = 64 * 1024
 
 type mihomoLocalVersionCacheEntry struct {
 	expiresAt   time.Time
@@ -329,11 +335,132 @@ func getMihomoServiceFilePath() string {
 	return getSystemdServiceFilePathByName(mihomoSystemdName)
 }
 
+func isMihomoRollingVersion(version string) bool {
+	return mihomoRollingVersionRe.MatchString(strings.TrimSpace(version))
+}
+
+func isMihomoResolvedRollingVersion(version string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(version))
+	if !isMihomoRollingVersion(normalized) {
+		return false
+	}
+	return !strings.Contains(normalized, "@") && !strings.HasPrefix(normalized, "prerelease-")
+}
+
+func mihomoRollingReleaseKind(release GitHubRelease) string {
+	text := strings.ToLower(strings.TrimSpace(release.TagName + " " + release.Name))
+	switch {
+	case strings.Contains(text, "beta"):
+		return "beta"
+	case strings.Contains(text, "rc"):
+		return "rc"
+	default:
+		return "alpha"
+	}
+}
+
+func normalizeMihomoDetectedVersion(value string) string {
+	value = strings.TrimSpace(strings.Trim(value, "\"'()[]{}"))
+	if value == "" {
+		return ""
+	}
+	if fields := strings.Fields(value); len(fields) > 0 {
+		value = strings.TrimSpace(strings.Trim(fields[0], "\"'()[]{}"))
+	}
+	if isLikelySemverTag(value) || isMihomoRollingVersion(value) {
+		return value
+	}
+	return ""
+}
+
+func extractMihomoVersion(output string) string {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return ""
+	}
+
+	if match := mihomoVersionOutputRe.FindStringSubmatch(output); len(match) > 1 {
+		return normalizeMihomoDetectedVersion(match[1])
+	}
+
+	if !strings.Contains(strings.ToLower(output), "mihomo") {
+		return ""
+	}
+	if match := mihomoVersionFallbackRe.FindStringSubmatch(output); len(match) > 1 {
+		return normalizeMihomoDetectedVersion(match[1])
+	}
+	return ""
+}
+
+func extractMihomoRollingVersionFromAssetName(name string) string {
+	if match := mihomoRollingAssetVersionRe.FindStringSubmatch(strings.TrimSpace(name)); len(match) > 1 {
+		return strings.TrimSpace(match[1])
+	}
+	return ""
+}
+
+func mihomoReleaseVersionIdentity(release GitHubRelease) string {
+	if !release.Prerelease {
+		return strings.TrimSpace(release.TagName)
+	}
+
+	for _, asset := range release.Assets {
+		if version := extractMihomoRollingVersionFromAssetName(asset.Name); version != "" {
+			return version
+		}
+	}
+
+	if updatedAt := strings.TrimSpace(release.UpdatedAt); updatedAt != "" {
+		return mihomoRollingReleaseKind(release) + "@" + updatedAt
+	}
+	return strings.TrimSpace(release.TagName)
+}
+
+func (s *MihomoCoreManagerService) fetchMihomoReleaseVersion(client *http.Client, release GitHubRelease) (string, error) {
+	if client == nil {
+		return "", fmt.Errorf("mihomo release client is nil")
+	}
+	var versionURL string
+	for _, asset := range release.Assets {
+		if strings.EqualFold(strings.TrimSpace(asset.Name), "version.txt") {
+			versionURL = strings.TrimSpace(asset.BrowserDownloadURL)
+			break
+		}
+	}
+	if versionURL == "" {
+		return "", fmt.Errorf("mihomo release version asset is missing")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, versionURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "kwor")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request mihomo release version failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("mihomo release version API returned %d", resp.StatusCode)
+	}
+	body, err := readBoundedHTTPResponseBody(resp.Body, mihomoReleaseVersionMaxBytes)
+	if err != nil {
+		return "", err
+	}
+	version := normalizeMihomoDetectedVersion(string(body))
+	if version == "" {
+		return "", fmt.Errorf("mihomo release version is invalid")
+	}
+	return version, nil
+}
+
 func (s *MihomoCoreManagerService) getLocalVersion(binPath string) (string, string) {
 	commands := [][]string{
 		{"-v"},
 		{"version"},
 	}
+	var fallbackOutput string
 	for _, args := range commands {
 		output, err := runCommandOutputInDirWithTimeout(coreVersionCommandTimeout, filepath.Dir(binPath), binPath, args...)
 		if err != nil {
@@ -343,12 +470,14 @@ func (s *MihomoCoreManagerService) getLocalVersion(binPath string) (string, stri
 		if outputStr == "" {
 			continue
 		}
-		if match := mihomoVersionRe.FindString(outputStr); match != "" {
+		if match := extractMihomoVersion(outputStr); match != "" {
 			return match, outputStr
 		}
-		return "", outputStr
+		if fallbackOutput == "" {
+			fallbackOutput = outputStr
+		}
 	}
-	return "", ""
+	return "", fallbackOutput
 }
 
 func (s *MihomoCoreManagerService) getCachedLocalVersion(binPath string, statInfo os.FileInfo, forceRefresh bool) (string, string) {
@@ -403,7 +532,7 @@ func (s *MihomoCoreManagerService) GetCoreStatus() (*MihomoCoreInfo, error) {
 				Arch:       inspection.Architecture,
 				Amd64Level: inspection.Amd64Level,
 			}
-			info.InstalledTarget = mergeMihomoInstalledTargetWithPreference(installedTarget, info.DownloadPreference.Target)
+			info.InstalledTarget = normalizeMihomoInstalledTarget(installedTarget)
 		}
 		if channel := strings.TrimSpace(inspection.Channel); channel != "" {
 			info.InstalledChannel = channel
@@ -423,7 +552,7 @@ func (s *MihomoCoreManagerService) GetCoreStatus() (*MihomoCoreInfo, error) {
 		if installedTarget.Arch == "amd64" {
 			installedTarget.Amd64Level = inferMihomoInstalledAMD64Level(binPath, info.VersionInfo)
 		}
-		info.InstalledTarget = mergeMihomoInstalledTargetWithPreference(installedTarget, info.DownloadPreference.Target)
+		info.InstalledTarget = normalizeMihomoInstalledTarget(installedTarget)
 		info.InstalledChannel = detectMihomoInstalledChannel(info.LocalVersion, info.VersionInfo)
 		if info.InstalledChannel == "" {
 			info.InstalledChannel = inferMihomoInstalledChannelFromBuildInfo(binPath)
@@ -453,7 +582,7 @@ func (s *MihomoCoreManagerService) GetRemoteVersionsPage(channel string, page in
 }
 
 func pickMihomoAssetFromAssets(assets []GitHubAsset, target MihomoCoreDownloadTarget) (GitHubAsset, bool) {
-	normalizedTarget := (&MihomoCoreManagerService{}).normalizeDownloadTarget(target)
+	normalizedTarget := (&MihomoCoreManagerService{}).normalizeMihomoVersionFilterTarget(target)
 	preferredExts := []string{".gz", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".zip"}
 	if normalizedTarget.OS == "windows" {
 		preferredExts = []string{".zip", ".tar.gz", ".tgz", ".gz", ".tar.xz", ".txz"}
@@ -499,7 +628,7 @@ func (s *MihomoCoreManagerService) GetRemoteVersionsWindow(channel string, offse
 	offset, limit = normalizeCoreVersionWindow(offset, limit)
 	filterTarget := hasMihomoCoreDownloadTargetFilter(target)
 	if filterTarget {
-		target = s.normalizeDownloadTarget(target)
+		target = s.normalizeMihomoVersionFilterTarget(target)
 	}
 
 	cacheKey := mihomoCoreVersionCacheKey("MetaCubeX/mihomo", channel, offset, limit, target, filterTarget)
@@ -556,6 +685,7 @@ func (s *MihomoCoreManagerService) GetRemoteVersionsWindow(channel string, offse
 
 			result.Versions = append(result.Versions, MihomoCoreVersionItem{
 				TagName:     r.TagName,
+				Version:     mihomoReleaseVersionIdentity(r),
 				Name:        r.Name,
 				Prerelease:  r.Prerelease,
 				PublishedAt: r.PublishedAt,
@@ -747,9 +877,6 @@ func (s *MihomoCoreManagerService) scoreAssetName(name string, preferredExts []s
 
 	if target.Arch == "amd64" {
 		level := normalizeMihomoAMD64Level(target.Amd64Level)
-		if level == "" {
-			level = "v3"
-		}
 		hasV1 := hasMihomoToken(tokens, "v1")
 		hasV2 := hasMihomoToken(tokens, "v2")
 		hasV3 := hasMihomoToken(tokens, "v3")
@@ -775,7 +902,7 @@ func (s *MihomoCoreManagerService) scoreAssetName(name string, preferredExts []s
 			if hasV1 || hasCompatible || hasV3 {
 				score -= 600
 			}
-		default: // v3
+		case "v3":
 			if hasV3 {
 				score += 500
 			} else if isPlainAmd64 {
@@ -810,6 +937,18 @@ func (s *MihomoCoreManagerService) normalizeDownloadTarget(target MihomoCoreDown
 			normalized.Amd64Level = inferMihomoHostAMD64Level()
 		}
 	} else {
+		normalized.Amd64Level = ""
+	}
+	return normalized
+}
+
+// normalizeMihomoVersionFilterTarget keeps an omitted AMD64 level omitted.
+// Version-list filtering may show all levels; an actual download still goes
+// through normalizeDownloadTarget and receives a concrete runtime target.
+func (s *MihomoCoreManagerService) normalizeMihomoVersionFilterTarget(target MihomoCoreDownloadTarget) MihomoCoreDownloadTarget {
+	hadAMD64Level := strings.TrimSpace(target.Amd64Level) != ""
+	normalized := s.normalizeDownloadTarget(target)
+	if normalized.Arch == "amd64" && !hadAMD64Level {
 		normalized.Amd64Level = ""
 	}
 	return normalized
@@ -1682,6 +1821,10 @@ func (s *MihomoCoreManagerService) isRunning() bool {
 		s.isStarted = true
 		return true
 	}
+	if IsSystemPlatformWindows() && isManagedCoreProcessRunningByBinaryPath(s.getCoreBinPath()) {
+		s.isStarted = true
+		return true
+	}
 	return false
 }
 
@@ -1883,6 +2026,15 @@ func (s *MihomoCoreManagerService) stopCoreInternal() error {
 		}
 		if managedCoreProcessPIDAlive(pid) {
 			return fmt.Errorf("mihomo process %d is still alive after stop request", pid)
+		}
+	}
+
+	// The panel can be restarted while a managed mihomo.exe remains running.
+	// In that case coreCmd is unavailable, so stop the exact managed binary
+	// path rather than falsely treating the runtime as already stopped.
+	if IsSystemPlatformWindows() {
+		if err := terminateManagedCoreProcessesByBinaryPath(s.getCoreBinPath(), 5*time.Second); err != nil {
+			return fmt.Errorf("failed to stop mihomo managed Windows process: %v", err)
 		}
 	}
 
@@ -2213,7 +2365,7 @@ func (s *MihomoCoreManagerService) fetchLatestStableTag(client *http.Client) (st
 	return strings.TrimSpace(release.TagName), nil
 }
 
-func (s *MihomoCoreManagerService) fetchLatestAlphaTag(client *http.Client) (string, error) {
+func (s *MihomoCoreManagerService) fetchLatestAlphaRelease(client *http.Client) (GitHubRelease, string, error) {
 	const (
 		perPage  = coreReleaseGitHubPerPage
 		maxPages = 3
@@ -2222,21 +2374,25 @@ func (s *MihomoCoreManagerService) fetchLatestAlphaTag(client *http.Client) (str
 	for page := 1; page <= maxPages; page++ {
 		releases, err := s.fetchGitHubReleasePage(client, page, perPage)
 		if err != nil {
-			return "", err
+			return GitHubRelease{}, "", err
 		}
 		if len(releases) == 0 {
 			break
 		}
 		for _, release := range releases {
 			if release.Prerelease {
-				return strings.TrimSpace(release.TagName), nil
+				identity := mihomoReleaseVersionIdentity(release)
+				if version, versionErr := s.fetchMihomoReleaseVersion(client, release); versionErr == nil {
+					identity = version
+				}
+				return release, identity, nil
 			}
 		}
 		if len(releases) < perPage {
 			break
 		}
 	}
-	return "", nil
+	return GitHubRelease{}, "", fmt.Errorf("no Mihomo prerelease release found")
 }
 
 func (s *MihomoCoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
@@ -2264,10 +2420,7 @@ func (s *MihomoCoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
 	if err != nil {
 		return err
 	}
-	latestAlpha, err := s.fetchLatestAlphaTag(client)
-	if err != nil {
-		return err
-	}
+	_, latestAlpha, alphaErr := s.fetchLatestAlphaRelease(client)
 	settingSvc := &SettingService{}
 	prevStable, err := settingSvc.getString(mihomoCoreAutoCheckLatestStableKey)
 	if err != nil {
@@ -2289,13 +2442,16 @@ func (s *MihomoCoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
 			return err
 		}
 	}
-	if latestAlpha != prevAlpha {
+	if alphaErr == nil && latestAlpha != prevAlpha {
 		if err = settingSvc.setString(mihomoCoreAutoCheckLatestAlphaKey, latestAlpha); err != nil {
 			return err
 		}
 		if err = settingSvc.setString(mihomoCoreAutoCheckPendingAlphaKey, latestAlpha); err != nil {
 			return err
 		}
+	}
+	if alphaErr != nil {
+		logger.Warning("check latest Mihomo prerelease failed; keep the previous Alpha state: ", alphaErr)
 	}
 	return nil
 }
