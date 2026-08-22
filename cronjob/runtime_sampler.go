@@ -296,7 +296,13 @@ func (s *RuntimeSampler) runTask(name string, task func()) {
 	if task == nil {
 		return
 	}
+	started := time.Now()
 	defer func() {
+		service.RecordRuntimePerformance(service.RuntimePerformanceSample{
+			Task:       name,
+			StartedAt:  started.Unix(),
+			DurationMs: time.Since(started).Milliseconds(),
+		})
 		if recovered := recover(); recovered != nil {
 			logger.Error("runtime sampler task panicked: ", name, ": ", recovered)
 		}

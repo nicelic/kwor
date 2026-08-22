@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/alireza0/s-ui/database"
@@ -130,43 +129,5 @@ func TestNormalizeSubscriptionGroupOutboundTagsRejectsOversizedGroup(t *testing.
 
 	if _, err := normalizeSubscriptionGroupOutboundTags(string(raw)); err == nil {
 		t.Fatalf("expected group larger than %d nodes to be rejected", SubscriptionGroupMaxOutbounds)
-	}
-}
-
-func TestSubGroupAutoUpdateOverLimitDoesNotAdvanceLastRunAt(t *testing.T) {
-	openSubGroupOrderTestDB(t)
-
-	settings := &SettingService{}
-	if err := settings.SaveSubGroupAutoUpdateSettings(true, 1); err != nil {
-		t.Fatalf("enable subgroup auto-update failed: %v", err)
-	}
-
-	db := database.GetDB()
-	groups := make([]model.SubGroup, subGroupAutoUpdateMaxGroups+1)
-	for index := range groups {
-		groups[index] = model.SubGroup{
-			Name:            fmt.Sprintf("auto-update-%d", index),
-			Outbounds:       "[]",
-			SubscriptionUrl: "https://example.test/subscription",
-		}
-	}
-	if err := db.Create(&groups).Error; err != nil {
-		t.Fatalf("create auto-update groups failed: %v", err)
-	}
-
-	err := (&SubGroupService{}).RunAutoUpdate()
-	if err == nil {
-		t.Fatalf("expected more than %d active groups to be rejected", subGroupAutoUpdateMaxGroups)
-	}
-	if !strings.Contains(err.Error(), "exceeds") {
-		t.Fatalf("unexpected auto-update limit error: %v", err)
-	}
-
-	_, _, lastAt, err := settings.GetSubGroupAutoUpdateSettings()
-	if err != nil {
-		t.Fatalf("read auto-update settings failed: %v", err)
-	}
-	if lastAt != 0 {
-		t.Fatalf("last run timestamp advanced despite rejected run: %d", lastAt)
 	}
 }

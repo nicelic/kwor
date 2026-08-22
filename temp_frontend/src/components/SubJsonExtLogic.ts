@@ -24,13 +24,17 @@ import {
 const tlsStoreValues = ['system', 'mozilla', 'chrome', 'none']
 const QUIXOTICHEART_GITHUB_SOURCE = 'quixoticheart_github'
 const SINGBOX_ALLOWED_RULE_SET_EXTENSIONS = new Set(['.srs', '.json'])
-const SUBSCRIPTION_EXTENSION_MAX_BYTES = 4 * 1024 * 1024
+const SUBSCRIPTION_EXTENSION_MAX_BYTES = 100 * 1024 * 1024
 const SUBSCRIPTION_RULE_SET_PROBE_DEBOUNCE_MS = 160
 const SUBSCRIPTION_RULE_SET_PROBE_BATCH_SIZE = 32
-const SUBSCRIPTION_UI_MAX_RULE_ROWS = 64
-const SUBSCRIPTION_UI_MAX_DNS_ROUTE_ROWS = 32
-const SUBSCRIPTION_UI_MAX_VALUES_PER_ROW = 128
-const SUBSCRIPTION_UI_MAX_VALUE_LENGTH = 2048
+const SUBSCRIPTION_UI_MAX_RULE_ROWS = 800
+const SUBSCRIPTION_UI_MAX_DNS_ROUTE_ROWS = 800
+const SUBSCRIPTION_UI_MAX_VALUES_PER_ROW = 800
+const SUBSCRIPTION_UI_MAX_VALUE_LENGTH = 100 * 1024 * 1024
+
+function subscriptionUIValueByteLength(value: string): number {
+  return new TextEncoder().encode(value).length
+}
 
 export function jsonSubscriptionDNSUsesPath(value: unknown): boolean {
   const type = typeof value === 'string' ? value.trim().toLowerCase() : ''
@@ -483,7 +487,7 @@ function normalizeCustomRuleValues(input: any): string[] {
 
 function hasSubscriptionUIValueBoundsError(values: any): boolean {
   if (!Array.isArray(values) || values.length > SUBSCRIPTION_UI_MAX_VALUES_PER_ROW) return true
-  return values.some((item) => typeof item === 'string' && item.length > SUBSCRIPTION_UI_MAX_VALUE_LENGTH)
+  return values.some((item) => typeof item === 'string' && subscriptionUIValueByteLength(item) > SUBSCRIPTION_UI_MAX_VALUE_LENGTH)
 }
 
 function hasSubscriptionUIRowBoundsError(ruleRows: any, dnsRouteRows: any): boolean {
@@ -496,9 +500,9 @@ function hasSubscriptionUIRowBoundsError(ruleRows: any, dnsRouteRows: any): bool
 function hasRawSubscriptionUIValueBoundsError(values: any): boolean {
   if (Array.isArray(values)) {
     if (values.length > SUBSCRIPTION_UI_MAX_VALUES_PER_ROW) return true
-    return values.some((item) => typeof item === 'string' && item.length > SUBSCRIPTION_UI_MAX_VALUE_LENGTH)
+    return values.some((item) => typeof item === 'string' && subscriptionUIValueByteLength(item) > SUBSCRIPTION_UI_MAX_VALUE_LENGTH)
   }
-  return typeof values === 'string' && values.length > SUBSCRIPTION_UI_MAX_VALUE_LENGTH
+  return typeof values === 'string' && subscriptionUIValueByteLength(values) > SUBSCRIPTION_UI_MAX_VALUE_LENGTH
 }
 
 function hasSubscriptionUIConfigBoundsError(config: any, dnsRules: any): boolean {

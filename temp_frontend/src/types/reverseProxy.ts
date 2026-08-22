@@ -16,6 +16,8 @@ export type ReverseProxyRule = {
   listenProtocol: 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
   listenProtocolAlias?: 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp' | ''
   listenPort: number
+  listenCompressionEnabled: boolean
+  listenCompressionAlgorithms: string[]
   hosts: string[]
   pathPrefix: string
   listenDnsPath?: string
@@ -23,6 +25,8 @@ export type ReverseProxyRule = {
   targetProtocolAlias?: 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp' | ''
   targetAddresses: string[]
   targetPort: number
+  targetCompressionEnabled: boolean
+  targetCompressionAlgorithms: string[]
   targetPath: string
   targetDnsPath?: string
   fallbackDnsUpstreams: string
@@ -72,12 +76,16 @@ export type ReverseProxyRuleForm = {
   enabled: boolean
   listenProtocol: 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
   listenPort: number
+  listenCompressionEnabled: boolean
+  listenCompressionAlgorithms: string[]
   hostsText: string
   pathPrefix: string
   listenDnsPath: string
   targetProtocol: 'http' | 'https' | 'h2' | 'h3' | 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
   targetAddressesText: string
   targetPort: number
+  targetCompressionEnabled: boolean
+  targetCompressionAlgorithms: string[]
   targetPath: string
   targetDnsPath: string
   fallbackDnsUpstreams: string

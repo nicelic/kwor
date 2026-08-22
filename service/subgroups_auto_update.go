@@ -29,7 +29,6 @@ const (
 
 	subGroupAutoUpdateSourceTimeout = 10 * time.Second
 	subGroupAutoUpdateRetryCount    = 1
-	subGroupAutoUpdateMaxGroups     = 32
 )
 
 type SubGroupAutoUpdateInfo struct {
@@ -200,15 +199,6 @@ func (s *SubGroupService) RunAutoUpdate() error {
 	groups, err := s.GetAllForAutoUpdate()
 	if err != nil {
 		return err
-	}
-	activeGroups := 0
-	for _, group := range groups {
-		if subGroupSupportsAutoUpdate(group) {
-			activeGroups++
-		}
-	}
-	if activeGroups > subGroupAutoUpdateMaxGroups {
-		return fmt.Errorf("subscription auto-update has %d active groups, which exceeds the %d group limit", activeGroups, subGroupAutoUpdateMaxGroups)
 	}
 	if err := settingSvc.SetSubGroupAutoUpdateLastAt(now); err != nil {
 		return err

@@ -16,6 +16,10 @@ type HTTPResponseOptions struct {
 	Level   int
 	Enabled bool
 	MinSize int64
+	// AllowedAlgorithms limits local response negotiation. A nil value preserves
+	// the historical all-algorithm behavior; a non-nil empty value allows only
+	// identity. Callers can disable compression entirely with Enabled=false.
+	AllowedAlgorithms []Algorithm
 }
 
 // HTTPResponseWriter compresses eligible response bodies after the upstream
@@ -27,6 +31,7 @@ type HTTPResponseWriter struct {
 	level             int
 	minSize           int64
 	enabled           bool
+	allowedAlgorithms []Algorithm
 	headerSent        bool
 	statusSet         bool
 	status            int
@@ -48,12 +53,17 @@ func NewHTTPResponseWriter(writer http.ResponseWriter, options HTTPResponseOptio
 	if minSize == 0 && options.MinSize == 0 {
 		// An explicit zero is useful for DoH, so keep it unchanged.
 	}
+	var allowedAlgorithms []Algorithm
+	if options.AllowedAlgorithms != nil {
+		allowedAlgorithms = append([]Algorithm{}, options.AllowedAlgorithms...)
+	}
 	return &HTTPResponseWriter{
-		ResponseWriter: writer,
-		request:        options.Request,
-		level:          options.Level,
-		minSize:        minSize,
-		enabled:        options.Enabled,
+		ResponseWriter:    writer,
+		request:           options.Request,
+		level:             options.Level,
+		minSize:           minSize,
+		enabled:           options.Enabled,
+		allowedAlgorithms: allowedAlgorithms,
 	}
 }
 
@@ -346,7 +356,7 @@ func (w *HTTPResponseWriter) selectAlgorithm(status int) Algorithm {
 		return AlgorithmIdentity
 	}
 	acceptHeader := strings.Join(request.Header.Values("Accept-Encoding"), ",")
-	algorithm, acceptable := SelectEncoding(acceptHeader)
+	algorithm, acceptable := SelectEncodingWithAllowed(acceptHeader, w.allowedAlgorithms)
 	identityAllowed := IdentityAcceptable(acceptHeader)
 	if !acceptable {
 		w.negotiationFailed = true

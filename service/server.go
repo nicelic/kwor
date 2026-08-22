@@ -101,22 +101,22 @@ func (s *ServerService) GetStatus(request string) *map[string]interface{} {
 	for _, req := range requests {
 		switch req {
 		case "cpu":
-			status["cpu"] = s.GetCpuPercent()
+			status["cpu"] = cachedDashboardMetric("cpu", func() interface{} { return s.GetCpuPercent() })
 		case "mem":
-			status["mem"] = s.GetMemInfo()
+			status["mem"] = cachedDashboardMetric("mem", func() interface{} { return s.GetMemInfo() })
 		case "dsk":
-			status["dsk"] = s.GetDiskInfo()
+			status["dsk"] = cachedDashboardMetric("dsk", func() interface{} { return s.GetDiskInfo() })
 		case "dio":
-			status["dio"] = s.GetDiskIO()
+			status["dio"] = cachedDashboardMetric("dio", func() interface{} { return s.GetDiskIO() })
 		case "swp":
-			status["swp"] = s.GetSwapInfo()
+			status["swp"] = cachedDashboardMetric("swp", func() interface{} { return s.GetSwapInfo() })
 		case "net":
-			status["net"] = s.GetNetInfo()
+			status["net"] = cachedDashboardMetric("net", func() interface{} { return s.GetNetInfo() })
 		case "sys":
-			status["uptime"] = s.GetUptime()
-			status["sys"] = s.GetSystemInfo()
+			status["uptime"] = cachedDashboardMetric("uptime", func() interface{} { return s.GetUptime() })
+			status["sys"] = cachedDashboardMetric("sys", func() interface{} { return s.GetSystemInfo() })
 		case "sbd":
-			status["sbd"] = s.GetSingboxInfo()
+			status["sbd"] = cachedDashboardMetric("sbd", func() interface{} { return s.GetSingboxInfo() })
 		}
 	}
 	return &status

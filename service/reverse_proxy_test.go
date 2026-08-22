@@ -5686,8 +5686,9 @@ func TestReverseProxyRewritesAbsoluteOriginsToListenerHost(t *testing.T) {
 	}
 }
 
-func TestReverseProxyAPIPassthroughPreservesResponseBodyAndUsesProjectAcceptEncoding(t *testing.T) {
+func TestReverseProxyAPIPassthroughPreservesResponseBodyAndCallerAcceptEncoding(t *testing.T) {
 	openReverseProxyTestDB(t)
+	listenCompressionEnabled := false
 
 	svc := &ReverseProxyService{}
 	t.Cleanup(func() {
@@ -5706,9 +5707,10 @@ func TestReverseProxyAPIPassthroughPreservesResponseBodyAndUsesProjectAcceptEnco
 	listenPort := reserveReverseProxyTestPort(t)
 
 	if err := svc.UpsertRule(ReverseProxyRulePayload{
-		Name:           "api-passthrough-body",
-		Enabled:        true,
-		ListenProtocol: reverseProxyProtocolHTTP,
+		Name:                     "api-passthrough-body",
+		Enabled:                  true,
+		ListenProtocol:           reverseProxyProtocolHTTP,
+		ListenCompressionEnabled: &listenCompressionEnabled,
 
 		ListenPort:      listenPort,
 		Hosts:           "example.com",
@@ -5750,11 +5752,135 @@ func TestReverseProxyAPIPassthroughPreservesResponseBodyAndUsesProjectAcceptEnco
 
 	select {
 	case got := <-acceptEncoding:
-		if got != compressionalgorithm.UpstreamAcceptEncoding() {
-			t.Fatalf("expected upstream accept-encoding to use project priority, got %q", got)
+		if got != "gzip" {
+			t.Fatalf("expected upstream accept-encoding to preserve caller value, got %q", got)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for upstream accept-encoding")
+	}
+}
+
+func TestReverseProxyAPIPassthroughPreservesZstdRequestBodyAndSSE(t *testing.T) {
+	openReverseProxyTestDB(t)
+
+	svc := &ReverseProxyService{}
+	t.Cleanup(func() {
+		_ = svc.StopRuntime()
+	})
+
+	type observedRequest struct {
+		contentEncoding string
+		contentLength   int64
+		acceptEncoding  string
+		body            []byte
+	}
+	observed := make(chan observedRequest, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		observed <- observedRequest{
+			contentEncoding: r.Header.Get("Content-Encoding"),
+			contentLength:   r.ContentLength,
+			acceptEncoding:  r.Header.Get("Accept-Encoding"),
+			body:            body,
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "upstream is not flushable", http.StatusInternalServerError)
+			return
+		}
+		_, _ = io.WriteString(w, "data: response.created\n\n")
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	upstreamHost, upstreamPort := splitReverseProxyTestServerAddress(t, upstream.URL)
+	listenPort := reserveReverseProxyTestPort(t)
+	if err := svc.UpsertRule(ReverseProxyRulePayload{
+		Name:            "api-passthrough-zstd-sse",
+		Enabled:         true,
+		ListenProtocol:  reverseProxyProtocolHTTP,
+		ListenPort:      listenPort,
+		PathPrefix:      "/backend-api/codex",
+		Hosts:           "example.com",
+		TargetProtocol:  reverseProxyProtocolHTTP,
+		TargetAddresses: upstreamHost,
+		TargetPort:      upstreamPort,
+		IPStrategy:      reverseProxyIPStrategyPreferIPv4,
+		ApiPassthrough:  true,
+	}); err != nil {
+		t.Fatalf("upsert api passthrough zstd rule failed: %v", err)
+	}
+
+	payload := []byte(`{"model":"gpt-test","input":[{"role":"user","content":"hello"}]}`)
+	var compressed bytes.Buffer
+	encoder, err := compressionalgorithm.NewEncoder(&compressed, compressionalgorithm.AlgorithmZstd, compressionalgorithm.DefaultLevel)
+	if err != nil {
+		t.Fatalf("create zstd encoder failed: %v", err)
+	}
+	if _, err := encoder.Write(payload); err != nil {
+		t.Fatalf("compress zstd request body failed: %v", err)
+	}
+	if err := encoder.Close(); err != nil {
+		t.Fatalf("close zstd encoder failed: %v", err)
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{Proxy: nil, DisableCompression: true},
+		Timeout:   15 * time.Second,
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+strconv.Itoa(listenPort)+"/backend-api/codex/v1/responses", bytes.NewReader(compressed.Bytes()))
+	if err != nil {
+		t.Fatalf("build api passthrough zstd request failed: %v", err)
+	}
+	req.Host = "example.com"
+	req.ContentLength = int64(compressed.Len())
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "zstd")
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("api passthrough zstd request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read api passthrough zstd SSE failed: %v", err)
+	}
+	if string(responseBody) != "data: response.created\n\n" {
+		t.Fatalf("unexpected SSE response body: %q", string(responseBody))
+	}
+
+	select {
+	case got := <-observed:
+		if got.contentEncoding != "zstd" {
+			t.Fatalf("upstream Content-Encoding = %q, want zstd", got.contentEncoding)
+		}
+		if got.contentLength != int64(compressed.Len()) {
+			t.Fatalf("upstream Content-Length = %d, want %d", got.contentLength, compressed.Len())
+		}
+		if got.acceptEncoding != "" {
+			t.Fatalf("upstream Accept-Encoding = %q, want caller omission preserved", got.acceptEncoding)
+		}
+		decoded, err := compressionalgorithm.NewDecoder(io.NopCloser(bytes.NewReader(got.body)), "zstd", 0)
+		if err != nil {
+			t.Fatalf("create upstream zstd decoder failed: %v", err)
+		}
+		decodedBody, err := io.ReadAll(decoded)
+		_ = decoded.Close()
+		if err != nil {
+			t.Fatalf("decode upstream zstd request body failed: %v", err)
+		}
+		if !bytes.Equal(decodedBody, payload) {
+			t.Fatalf("upstream decoded request body changed: got %q, want %q", decodedBody, payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for upstream zstd request")
 	}
 }
 

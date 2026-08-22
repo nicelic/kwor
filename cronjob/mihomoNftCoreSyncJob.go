@@ -14,13 +14,15 @@ type MihomoNftCoreSyncJob struct {
 	service.MihomoClientRateLimitService
 	service.MihomoClientPortBlockService
 
-	mu                sync.Mutex
-	initialized       bool
-	lastRunning       bool
-	lastIntegrityScan time.Time
-	lastRecoverAt     time.Time
-	recoverRetryAfter time.Duration
-	runningSince      time.Time
+	mu                    sync.Mutex
+	initialized           bool
+	lastRunning           bool
+	lastIntegrityScan     time.Time
+	lastFullIntegrityScan time.Time
+	fullIntegrityRetry    bool
+	lastRecoverAt         time.Time
+	recoverRetryAfter     time.Duration
+	runningSince          time.Time
 }
 
 const (
@@ -93,14 +95,34 @@ func (s *MihomoNftCoreSyncJob) run(forceIntegrity bool) {
 	} else if running {
 		now := time.Now()
 		if forceIntegrity || s.lastIntegrityScan.IsZero() || now.Sub(s.lastIntegrityScan) >= mihomoNftIntegrityScanInterval {
-			if err := s.MihomoNftTrafficService.EnsureRuleIntegrityWhenRunning(); err != nil {
-				logger.Warning("mihomo nft rule integrity scan failed: ", err)
+			full := forceIntegrity || s.fullIntegrityRetry || s.lastFullIntegrityScan.IsZero() || now.Sub(s.lastFullIntegrityScan) >= nftFullIntegrityScanInterval
+			if !full && !s.MihomoNftTrafficService.IsNftTableReady() {
+				full = true
 			}
-			if err := s.MihomoClientRateLimitService.EnsureRuleIntegrityWhenRunning(); err != nil {
-				logger.Warning("mihomo client rate limit nft integrity scan failed: ", err)
-			}
-			if err := s.MihomoClientPortBlockService.EnsureRuleIntegrityWhenRunning(); err != nil {
-				logger.Warning("mihomo client block nft integrity scan failed: ", err)
+			if full {
+				fullErr := error(nil)
+				if err := s.MihomoNftTrafficService.EnsureRuleIntegrityWhenRunning(); err != nil {
+					logger.Warning("mihomo nft rule integrity scan failed: ", err)
+					fullErr = err
+				}
+				if err := s.MihomoClientRateLimitService.EnsureRuleIntegrityWhenRunning(); err != nil {
+					logger.Warning("mihomo client rate limit nft integrity scan failed: ", err)
+					if fullErr == nil {
+						fullErr = err
+					}
+				}
+				if err := s.MihomoClientPortBlockService.EnsureRuleIntegrityWhenRunning(); err != nil {
+					logger.Warning("mihomo client block nft integrity scan failed: ", err)
+					if fullErr == nil {
+						fullErr = err
+					}
+				}
+				if fullErr == nil {
+					s.lastFullIntegrityScan = now
+					s.fullIntegrityRetry = false
+				} else {
+					s.fullIntegrityRetry = true
+				}
 			}
 			s.lastIntegrityScan = now
 		}

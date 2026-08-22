@@ -311,6 +311,13 @@ func WithNftReadSnapshot(fn func()) {
 	fn()
 }
 
+func nftReadSnapshotActive() bool {
+	nftReadSnapshotCache.Lock()
+	active := nftReadSnapshotCache.depth > 0
+	nftReadSnapshotCache.Unlock()
+	return active
+}
+
 func invalidateNftReadSnapshotCache() {
 	nftReadSnapshotCache.Lock()
 	nftReadSnapshotCache.generation++
@@ -2034,7 +2041,7 @@ func getChainRuleBytesByHandles(chain string, handles []int) (map[int]int64, err
 	if len(wanted) == 0 {
 		return map[int]int64{}, nil
 	}
-	if GetNftablesCapabilities().SupportsJSON {
+	if GetNftablesCapabilities().SupportsJSON && !nftReadSnapshotActive() {
 		out, err := runNft("-j", "list", "chain", nftFamily, nftTable, chain)
 		if err == nil {
 			values, parseErr := getChainRuleBytesByHandlesFromJSON(out, chain, wanted)

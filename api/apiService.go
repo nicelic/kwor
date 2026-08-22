@@ -814,6 +814,20 @@ func (a *ApiService) GetDashboardRuntime(c *gin.Context) {
 	jsonObj(c, result, nil)
 }
 
+func (a *ApiService) GetRuntimePerformance(c *gin.Context) {
+	limit, err := strconv.Atoi(strings.TrimSpace(c.Query("limit")))
+	if err != nil || limit <= 0 {
+		limit = 128
+	}
+	if limit > 256 {
+		limit = 256
+	}
+	jsonObj(c, gin.H{
+		"samples": service.GetRuntimePerformance(limit),
+		"summary": service.GetRuntimePerformanceSummary(),
+	}, nil)
+}
+
 func (a *ApiService) GetTrafficOverview(c *gin.Context) {
 	overview, err := a.TrafficOverviewService.GetTrafficOverview()
 	if err != nil {

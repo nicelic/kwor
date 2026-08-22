@@ -118,14 +118,17 @@ func (c *CronJob) Start(loc *time.Location, trafficAge int) error {
 	register("@every 5m", panelCertificateBalanceSync, "panel certificate-balance sync")
 	register("@daily", delStatsJob, "delete old stats")
 	// Auto-check core updates based on the configured interval.
-	register("@every 1m", checkCoreJob, "sing-box core update check")
+	// Keep the one-minute cadence while spreading remote checks and filesystem
+	// work across the minute. This avoids colliding with the sampler's journal
+	// flush and with each other on small hosts.
+	register("7 * * * * *", checkCoreJob, "sing-box core update check")
 	register("0 0 4 * * *", autoUpdateCoreJob, "sing-box core auto update")
-	register("@every 1m", checkMihomoCoreJob, "mihomo core update check")
+	register("17 * * * * *", checkMihomoCoreJob, "mihomo core update check")
 	register("0 0 4 * * *", autoUpdateMihomoCoreJob, "mihomo core auto update")
-	register("@every 1m", subGroupAutoUpdateJob, "subscription group auto-update")
+	register("53 * * * * *", subGroupAutoUpdateJob, "subscription group auto-update")
 	register("@every 10m", acmeAutoRenew, "ACME auto-renew")
-	register("@every 1m", certificateCoreRestart, "certificate Core restart")
-	register("@every 1m", tlsPathSync, "TLS path sync")
+	register("41 * * * * *", certificateCoreRestart, "certificate Core restart")
+	register("29 * * * * *", tlsPathSync, "TLS path sync")
 
 	c.mu.Lock()
 	previous := c.cron

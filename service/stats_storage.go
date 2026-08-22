@@ -333,8 +333,46 @@ func upsertStatsTrafficBatch(tx *gorm.DB, samples []model.Stats) error {
 	// The caller owns the active transaction and has already prepared the
 	// history schema. Re-entering EnsureHistoryStorageReady here would try to
 	// borrow the single SQLite connection while tx is holding it.
+	if tx == nil || len(samples) == 0 {
+		return nil
+	}
+
+	valid := make([]model.Stats, 0, len(samples))
 	for _, sample := range samples {
-		if err := upsertStatsTraffic(tx, sample); err != nil {
+		resource := normalizeStatsResource(sample.Resource)
+		tag := strings.TrimSpace(sample.Tag)
+		if resource == "" || tag == "" || sample.Traffic <= 0 {
+			continue
+		}
+		sample.Resource = resource
+		sample.Tag = tag
+		sample.DateTime = statsBucketStart(sample.DateTime)
+		valid = append(valid, sample)
+	}
+	if len(valid) == 0 {
+		return nil
+	}
+
+	// Keep each statement comfortably below SQLite's default variable limit
+	// (five parameters per row). The surrounding transaction still makes the
+	// whole flush atomic, while reducing parse/bind/Exec overhead substantially.
+	const rowsPerInsert = 100
+	for start := 0; start < len(valid); start += rowsPerInsert {
+		end := start + rowsPerInsert
+		if end > len(valid) {
+			end = len(valid)
+		}
+		values := make([]string, 0, end-start)
+		args := make([]interface{}, 0, (end-start)*5)
+		for _, sample := range valid[start:end] {
+			values = append(values, "(?, ?, ?, ?, ?)")
+			args = append(args, sample.DateTime, sample.Resource, sample.Tag, sample.Direction, sample.Traffic)
+		}
+		query := fmt.Sprintf(`INSERT INTO stats (date_time, resource, tag, direction, traffic)
+			VALUES %s
+			ON CONFLICT(date_time, resource, tag, direction) DO UPDATE SET
+				traffic = traffic + excluded.traffic`, strings.Join(values, ","))
+		if err := tx.Exec(query, args...).Error; err != nil {
 			return err
 		}
 	}
@@ -402,12 +440,12 @@ func queryStatsHistory(resource string, tag string, limitHours int) ([]model.Sta
 	if err := db.Raw(query, args...).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
-	_, pending := runtimeTrafficStats.snapshotPending()
+	pending := runtimeTrafficStats.snapshotPendingForQuery(resource, tag, startUnix, bucketSeconds)
 	return mergePendingTrafficRuntimeStatsWithSamples(rows, pending, resource, tag, startUnix, bucketSeconds), nil
 }
 
 func mergePendingTrafficRuntimeStats(rows []model.Stats, resource string, tag string, startUnix int64, bucketSeconds int64) []model.Stats {
-	_, pending := runtimeTrafficStats.snapshotPending()
+	pending := runtimeTrafficStats.snapshotPendingForQuery(resource, tag, startUnix, bucketSeconds)
 	return mergePendingTrafficRuntimeStatsWithSamples(rows, pending, resource, tag, startUnix, bucketSeconds)
 }
 

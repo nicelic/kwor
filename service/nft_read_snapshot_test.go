@@ -262,3 +262,43 @@ func TestWithNftReadSnapshotBoundsEmptyEntries(t *testing.T) {
 		}
 	})
 }
+
+func TestWithNftReadSnapshotSharesChainOutputBetweenIntegrityAndCounters(t *testing.T) {
+	originalRunNft := runNftFn
+	originalSupported := nftSupportedFn
+	defer func() {
+		runNftFn = originalRunNft
+		nftSupportedFn = originalSupported
+		invalidateNftReadSnapshotCache()
+	}()
+
+	nftSupportedFn = func() bool { return true }
+	var calls atomic.Int32
+	runNftFn = func(args ...string) ([]byte, error) {
+		calls.Add(1)
+		return []byte(`
+tcp dport 443 counter packets 2 bytes 321 comment "kwor-inbound:sample" # handle 31
+`), nil
+	}
+
+	WithNftReadSnapshot(func() {
+		values, err := getChainRuleBytesByHandles(nftChainIn, []int{31})
+		if err != nil {
+			t.Fatalf("read nft counter from sampler snapshot failed: %v", err)
+		}
+		if values[31] != 321 {
+			t.Fatalf("snapshot counter = %d, want 321", values[31])
+		}
+		rules, err := listRuleCommentsByPrefix(nftChainIn, "kwor-inbound:")
+		if err != nil {
+			t.Fatalf("read nft integrity comments from sampler snapshot failed: %v", err)
+		}
+		if len(rules) != 1 || rules[0].handle != 31 {
+			t.Fatalf("snapshot rules = %#v, want one handle 31", rules)
+		}
+	})
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("counter and integrity reads used %d nft commands, want one shared chain snapshot", got)
+	}
+}

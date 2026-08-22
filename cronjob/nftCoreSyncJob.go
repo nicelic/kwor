@@ -17,14 +17,17 @@ type NftCoreSyncJob struct {
 	service.ClientRateLimitService
 	service.ClientPortBlockService
 
-	mu                sync.Mutex
-	initialized       bool
-	lastRunning       bool
-	lastIntegrityScan time.Time
-	lastRecoverAt     time.Time
+	mu                    sync.Mutex
+	initialized           bool
+	lastRunning           bool
+	lastIntegrityScan     time.Time
+	lastFullIntegrityScan time.Time
+	fullIntegrityRetry    bool
+	lastRecoverAt         time.Time
 }
 
 const nftIntegrityScanInterval = 15 * time.Second
+const nftFullIntegrityScanInterval = time.Minute
 const managedCoreAutoRecoverRetryInterval = 15 * time.Second
 
 func NewNftCoreSyncJob() *NftCoreSyncJob {
@@ -82,14 +85,40 @@ func (s *NftCoreSyncJob) run(forceIntegrity bool) {
 	} else if running {
 		now := time.Now()
 		if forceIntegrity || s.lastIntegrityScan.IsZero() || now.Sub(s.lastIntegrityScan) >= nftIntegrityScanInterval {
-			if err := s.NftTrafficService.EnsureRuleIntegrityWhenRunning(); err != nil {
-				logger.Warning("nft rule integrity scan failed: ", err)
+			// Keep the 15-second safety poll, but only pay for a full ruleset
+			// walk after a runtime/config wake, a missing base table, or once per
+			// minute. Stable installations used to parse every rule three times
+			// every 15 seconds.
+			full := forceIntegrity || s.fullIntegrityRetry || s.lastFullIntegrityScan.IsZero() || now.Sub(s.lastFullIntegrityScan) >= nftFullIntegrityScanInterval
+			if !full && !s.NftTrafficService.IsNftTableReady() {
+				full = true
 			}
-			if err := s.ClientRateLimitService.EnsureRuleIntegrityWhenRunning(); err != nil {
-				logger.Warning("client rate limit nft integrity scan failed: ", err)
-			}
-			if err := s.ClientPortBlockService.EnsureRuleIntegrityWhenRunning(); err != nil {
-				logger.Warning("client block nft integrity scan failed: ", err)
+			if full {
+				fullErr := error(nil)
+				if err := s.NftTrafficService.EnsureRuleIntegrityWhenRunning(); err != nil {
+					logger.Warning("nft rule integrity scan failed: ", err)
+					fullErr = err
+				}
+				if err := s.ClientRateLimitService.EnsureRuleIntegrityWhenRunning(); err != nil {
+					logger.Warning("client rate limit nft integrity scan failed: ", err)
+					if fullErr == nil {
+						fullErr = err
+					}
+				}
+				if err := s.ClientPortBlockService.EnsureRuleIntegrityWhenRunning(); err != nil {
+					logger.Warning("client block nft integrity scan failed: ", err)
+					if fullErr == nil {
+						fullErr = err
+					}
+				}
+				if fullErr == nil {
+					s.lastFullIntegrityScan = now
+					s.fullIntegrityRetry = false
+				} else {
+					// Do not let a recent successful timestamp suppress the next
+					// repair attempt after a transient failure.
+					s.fullIntegrityRetry = true
+				}
 			}
 			s.lastIntegrityScan = now
 		}

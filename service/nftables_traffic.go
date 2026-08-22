@@ -3,10 +3,13 @@ package service
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alireza0/s-ui/database"
@@ -14,6 +17,7 @@ import (
 	"github.com/alireza0/s-ui/logger"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // NftTrafficService manages nftables-based port traffic monitoring.
@@ -29,6 +33,17 @@ import (
 //     to forward hop port UDP traffic to listen_port.
 //   - Counter rules still monitor listen_port only (REDIRECT rewrites dport before filter/input).
 type NftTrafficService struct{}
+
+// A full client-binding repair is needed only for legacy state or after a
+// failed targeted sync. Normal client/inbound saves already queue an exact
+// post-commit binding update, so repeating a full client JSON scan on every
+// traffic delta only burns CPU and SQLite time.
+var defaultClientBindingRepairNeeded atomic.Bool
+
+func init() {
+	defaultClientBindingRepairNeeded.Store(true)
+	database.RegisterDBResetHook(func() { defaultClientBindingRepairNeeded.Store(true) })
+}
 
 type inboundCounterSnapshot struct {
 	inBytes  int64
@@ -652,6 +667,7 @@ func (s *NftTrafficService) QueueSyncClientBindings(tx *gorm.DB, clientId uint, 
 	ids := append([]uint(nil), inboundIds...)
 	return QueueManagedRuntimeHook(tx, func() error {
 		if err := s.SyncClientBindings(database.GetDB(), clientId, ids); err != nil {
+			defaultClientBindingRepairNeeded.Store(true)
 			logger.Warning("failed to sync client traffic bindings for client id ", clientId, ": ", err)
 		}
 		return nil
@@ -1085,6 +1101,13 @@ func (s *NftTrafficService) collectAndSaveTraffic(saveTrafficOverride *bool) (bo
 	historySamples := make([]model.Stats, 0, len(samples)*2)
 	inboundOnlineSet := make(map[string]struct{})
 	for _, sample := range samples {
+		// A batch snapshot contains every managed inbound, but only counter or
+		// handle changes need a SQLite write. Updating unchanged rows every ten
+		// seconds needlessly dirties the database and extends the single-connection
+		// transaction.
+		if !sample.stateChanged {
+			continue
+		}
 		result := tx.Model(&model.InboundTrafficState{}).
 			Where("id = ? AND tag = ? AND port = ? AND in_handle = ? AND out_handle = ? AND redirect_handle = ? AND in_bytes = ? AND out_bytes = ?",
 				sample.state.Id,
@@ -1323,9 +1346,18 @@ func (s *NftTrafficService) writeClientStats(tx *gorm.DB, deltas []inboundDelta,
 		deltaMap[deltas[i].inboundId] = &deltas[i]
 	}
 
-	// Get all active client bindings
+	// Only bindings for inbounds that changed in this sampling round can
+	// contribute traffic. Querying every active binding made the hot path scale
+	// with the total client topology even when one inbound was the only one
+	// carrying traffic.
+	inboundIDs := make([]uint, 0, len(deltaMap))
+	for inboundID := range deltaMap {
+		inboundIDs = append(inboundIDs, inboundID)
+	}
+	sort.Slice(inboundIDs, func(i, j int) bool { return inboundIDs[i] < inboundIDs[j] })
+
 	var bindings []model.ClientInboundTrafficState
-	if err := tx.Where("active = ?", true).Find(&bindings).Error; err != nil {
+	if err := tx.Where("active = ? AND inbound_id IN ?", true, inboundIDs).Find(&bindings).Error; err != nil {
 		return nil, err
 	}
 
@@ -1363,6 +1395,7 @@ func (s *NftTrafficService) writeClientStats(tx *gorm.DB, deltas []inboundDelta,
 		downTotal int64
 	}
 	clientAggs := make(map[uint]*clientAgg)
+	changedBindings := make([]model.ClientInboundTrafficState, 0, len(bindings))
 
 	for i := range bindings {
 		b := &bindings[i]
@@ -1385,14 +1418,17 @@ func (s *NftTrafficService) writeClientStats(tx *gorm.DB, deltas []inboundDelta,
 		b.LastInBytes = d.currentIn
 		b.LastOutBytes = d.currentOut
 		b.UpdatedAt = time.Now()
-		if err := tx.Save(b).Error; err != nil {
-			return nil, err
-		}
+		changedBindings = append(changedBindings, *b)
+	}
+	if err := saveClientInboundTrafficBindingsBatch(tx, changedBindings); err != nil {
+		return nil, err
 	}
 
 	userOnlineSet := make(map[string]struct{}, len(clientAggs))
 
 	// Write client Stats records and update client up/down
+	upDeltas := make(map[uint]int64)
+	downDeltas := make(map[uint]int64)
 	for clientId, agg := range clientAggs {
 		name, ok := clientNames[clientId]
 		if !ok {
@@ -1414,10 +1450,7 @@ func (s *NftTrafficService) writeClientStats(tx *gorm.DB, deltas []inboundDelta,
 				})
 			}
 			// Update client.up
-			if err := tx.Model(&model.Client{}).Where("id = ?", clientId).
-				UpdateColumn("up", gorm.Expr("up + ?", agg.upTotal)).Error; err != nil {
-				return nil, err
-			}
+			upDeltas[clientId] = agg.upTotal
 		}
 		if agg.downTotal > 0 {
 			if saveTraffic {
@@ -1430,18 +1463,74 @@ func (s *NftTrafficService) writeClientStats(tx *gorm.DB, deltas []inboundDelta,
 				})
 			}
 			// Update client.down
-			if err := tx.Model(&model.Client{}).Where("id = ?", clientId).
-				UpdateColumn("down", gorm.Expr("down + ?", agg.downTotal)).Error; err != nil {
-				return nil, err
-			}
+			downDeltas[clientId] = agg.downTotal
 		}
+	}
+	if err := applyClientTrafficDeltasBatch(tx, upDeltas, downDeltas); err != nil {
+		return nil, err
 	}
 
 	return tagsFromSet(userOnlineSet), nil
 }
 
+func saveClientInboundTrafficBindingsBatch(tx *gorm.DB, bindings []model.ClientInboundTrafficState) error {
+	if tx == nil || len(bindings) == 0 {
+		return nil
+	}
+	return tx.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"client_id", "inbound_id", "active", "last_in_bytes", "last_out_bytes",
+			"used_in_bytes", "used_out_bytes", "updated_at",
+		}),
+	}).Create(&bindings).Error
+}
+
+func applyClientTrafficDeltasBatch(tx *gorm.DB, up map[uint]int64, down map[uint]int64) error {
+	if tx == nil {
+		return nil
+	}
+	if err := applyClientTrafficDeltaColumn(tx, "up", up); err != nil {
+		return err
+	}
+	return applyClientTrafficDeltaColumn(tx, "down", down)
+}
+
+func applyClientTrafficDeltaColumn(tx *gorm.DB, column string, deltas map[uint]int64) error {
+	if len(deltas) == 0 {
+		return nil
+	}
+	keys := make([]uint, 0, len(deltas))
+	for id, delta := range deltas {
+		if id > 0 && delta > 0 {
+			keys = append(keys, id)
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	args := make([]interface{}, 0, len(keys)*3)
+	caseSQL := "CASE id"
+	placeholders := make([]string, 0, len(keys))
+	for _, id := range keys {
+		caseSQL += " WHEN ? THEN ?"
+		args = append(args, id, deltas[id])
+		placeholders = append(placeholders, "?")
+	}
+	caseSQL += " ELSE 0 END"
+	for _, id := range keys {
+		args = append(args, id)
+	}
+	query := fmt.Sprintf("UPDATE clients SET %s = %s + %s WHERE id IN (%s)", column, column, caseSQL, strings.Join(placeholders, ","))
+	return tx.Exec(query, args...).Error
+}
+
 func (s *NftTrafficService) ensureClientBindings(tx *gorm.DB, snapshots map[uint]inboundCounterSnapshot) error {
 	if tx == nil {
+		return nil
+	}
+	if !defaultClientBindingRepairNeeded.Load() {
 		return nil
 	}
 
@@ -1461,7 +1550,7 @@ func (s *NftTrafficService) ensureClientBindings(tx *gorm.DB, snapshots map[uint
 			return err
 		}
 	}
-
+	defaultClientBindingRepairNeeded.Store(false)
 	return nil
 }
 

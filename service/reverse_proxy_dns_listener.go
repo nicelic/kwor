@@ -425,12 +425,23 @@ func (h *reverseProxyDNSRuleHandler) serveDoHRule(writer http.ResponseWriter, re
 		http.Error(writer, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
 	}
+	h.mu.RLock()
+	route := h.routesByRule[ruleID]
+	h.mu.RUnlock()
+	var rule *model.ReverseProxyRule
+	if route != nil {
+		rule = route.rule
+	}
+	listenCompressionEnabled, listenCompressionAlgorithms := reverseProxyListenCompressionOptions(rule)
+	if !listenCompressionEnabled {
+		request.Header.Del("Accept-Encoding")
+	}
 	wire, err := reverseProxyDNSReadDoHMessage(writer, request)
 	if err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, compressionalgorithm.ErrUnsupportedEncoding) {
 			status = http.StatusUnsupportedMediaType
-			writer.Header().Set("Accept-Encoding", compressionalgorithm.UpstreamAcceptEncoding())
+			setReverseProxyAcceptEncoding(writer.Header(), reverseProxyListenAcceptEncoding(rule))
 		}
 		http.Error(writer, err.Error(), status)
 		return
@@ -455,10 +466,11 @@ func (h *reverseProxyDNSRuleHandler) serveDoHRule(writer http.ResponseWriter, re
 	writer.Header().Set("Content-Type", "application/dns-message")
 	writer.Header().Set("Cache-Control", "no-store")
 	compressedWriter := compressionalgorithm.NewHTTPResponseWriter(writer, compressionalgorithm.HTTPResponseOptions{
-		Request: request,
-		Level:   reverseProxyCompressionLevel,
-		Enabled: true,
-		MinSize: 0,
+		Request:           request,
+		Level:             reverseProxyCompressionLevel,
+		Enabled:           listenCompressionEnabled,
+		MinSize:           0,
+		AllowedAlgorithms: listenCompressionAlgorithms,
 	})
 	defer compressedWriter.Close()
 	compressedWriter.WriteHeader(http.StatusOK)

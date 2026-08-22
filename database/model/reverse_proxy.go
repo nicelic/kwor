@@ -16,26 +16,33 @@ type ReverseProxyRule struct {
 	ListenProtocol      string `json:"listenProtocol" gorm:"size:16;not null;default:'http';index"`
 	ListenProtocolAlias string `json:"listenProtocolAlias" gorm:"column:listen_protocol_alias;size:16;not null;default:''"`
 	ListenPort          int    `json:"listenPort" gorm:"not null;default:0;index"`
+	// Compression settings are scoped independently to the local response
+	// negotiation and the target request header. The algorithm lists are JSON
+	// arrays stored as text so old SQLite rows can be upgraded in place.
+	ListenCompressionEnabled    bool   `json:"listenCompressionEnabled" gorm:"column:listen_compression_enabled;not null;default:true"`
+	ListenCompressionAlgorithms string `json:"listenCompressionAlgorithms" gorm:"column:listen_compression_algorithms;type:text;not null;default:''"`
 
 	HostList      string `json:"hostList" gorm:"type:text;not null;default:''"`
 	PathPrefix    string `json:"pathPrefix" gorm:"size:1024;not null;default:'/'"`
 	ListenDNSPath string `json:"listenDnsPath" gorm:"column:listen_dns_path;size:1024;not null;default:''"`
 
-	TargetProtocol            string `json:"targetProtocol" gorm:"size:16;not null;default:'http'"`
-	TargetProtocolAlias       string `json:"targetProtocolAlias" gorm:"column:target_protocol_alias;size:16;not null;default:''"`
-	TargetAddresses           string `json:"targetAddresses" gorm:"type:text;not null;default:''"`
-	TargetPort                int    `json:"targetPort" gorm:"not null;default:0"`
-	TargetPath                string `json:"targetPath" gorm:"size:1024;not null;default:''"`
-	TargetDNSPath             string `json:"targetDnsPath" gorm:"column:target_dns_path;size:1024;not null;default:''"`
-	FallbackDNSUpstreams      string `json:"fallbackDnsUpstreams" gorm:"column:fallback_dns_upstreams;type:text;not null;default:''"`
-	DNSUpstreamTimeoutSeconds int    `json:"dnsUpstreamTimeoutSeconds" gorm:"column:dns_upstream_timeout_seconds;not null;default:12"`
-	DNSCacheEnabled           bool   `json:"dnsCacheEnabled" gorm:"column:dns_cache_enabled;not null;default:false"`
-	DNSCacheSizeBytes         int    `json:"dnsCacheSizeBytes" gorm:"column:dns_cache_size_bytes;not null;default:4194304"`
-	DNSCacheMinTTL            int    `json:"dnsCacheMinTtl" gorm:"column:dns_cache_min_ttl;not null;default:0"`
-	DNSCacheMaxTTL            int    `json:"dnsCacheMaxTtl" gorm:"column:dns_cache_max_ttl;not null;default:0"`
-	DNSAllowedCIDRs           string `json:"dnsAllowedCidrs" gorm:"column:dns_allowed_cidrs;type:text;not null;default:''"`
-	DNSRateLimitQPS           int    `json:"dnsRateLimitQps" gorm:"column:dns_rate_limit_qps;not null;default:50"`
-	DNSMaxConcurrentQueries   int    `json:"dnsMaxConcurrentQueries" gorm:"column:dns_max_concurrent_queries;not null;default:128"`
+	TargetProtocol              string `json:"targetProtocol" gorm:"size:16;not null;default:'http'"`
+	TargetProtocolAlias         string `json:"targetProtocolAlias" gorm:"column:target_protocol_alias;size:16;not null;default:''"`
+	TargetAddresses             string `json:"targetAddresses" gorm:"type:text;not null;default:''"`
+	TargetPort                  int    `json:"targetPort" gorm:"not null;default:0"`
+	TargetCompressionEnabled    bool   `json:"targetCompressionEnabled" gorm:"column:target_compression_enabled;not null;default:true"`
+	TargetCompressionAlgorithms string `json:"targetCompressionAlgorithms" gorm:"column:target_compression_algorithms;type:text;not null;default:''"`
+	TargetPath                  string `json:"targetPath" gorm:"size:1024;not null;default:''"`
+	TargetDNSPath               string `json:"targetDnsPath" gorm:"column:target_dns_path;size:1024;not null;default:''"`
+	FallbackDNSUpstreams        string `json:"fallbackDnsUpstreams" gorm:"column:fallback_dns_upstreams;type:text;not null;default:''"`
+	DNSUpstreamTimeoutSeconds   int    `json:"dnsUpstreamTimeoutSeconds" gorm:"column:dns_upstream_timeout_seconds;not null;default:12"`
+	DNSCacheEnabled             bool   `json:"dnsCacheEnabled" gorm:"column:dns_cache_enabled;not null;default:false"`
+	DNSCacheSizeBytes           int    `json:"dnsCacheSizeBytes" gorm:"column:dns_cache_size_bytes;not null;default:4194304"`
+	DNSCacheMinTTL              int    `json:"dnsCacheMinTtl" gorm:"column:dns_cache_min_ttl;not null;default:0"`
+	DNSCacheMaxTTL              int    `json:"dnsCacheMaxTtl" gorm:"column:dns_cache_max_ttl;not null;default:0"`
+	DNSAllowedCIDRs             string `json:"dnsAllowedCidrs" gorm:"column:dns_allowed_cidrs;type:text;not null;default:''"`
+	DNSRateLimitQPS             int    `json:"dnsRateLimitQps" gorm:"column:dns_rate_limit_qps;not null;default:50"`
+	DNSMaxConcurrentQueries     int    `json:"dnsMaxConcurrentQueries" gorm:"column:dns_max_concurrent_queries;not null;default:128"`
 
 	EDNSEnabled            bool   `json:"ednsEnabled" gorm:"column:edns_enabled;not null;default:false"`
 	EDNSMode               string `json:"ednsMode" gorm:"column:edns_mode;size:32;not null;default:'auto'"`

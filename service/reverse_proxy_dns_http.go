@@ -31,13 +31,14 @@ import (
 // this project needs the target connection to negotiate and decode the same
 // content codings as the ordinary reverse proxy.
 type reverseProxyDNSCompressedHTTPUpstream struct {
-	address *url.URL
-	client  *http.Client
-	closeFn func()
-	once    sync.Once
+	address        *url.URL
+	client         *http.Client
+	acceptEncoding string
+	closeFn        func()
+	once           sync.Once
 }
 
-func newReverseProxyDNSCompressedHTTPUpstream(address string, opts *dnsupstream.Options, http3Only bool) (*reverseProxyDNSCompressedHTTPUpstream, error) {
+func newReverseProxyDNSCompressedHTTPUpstream(address string, opts *dnsupstream.Options, http3Only bool, acceptEncoding ...string) (*reverseProxyDNSCompressedHTTPUpstream, error) {
 	parsed, err := url.Parse(address)
 	if err != nil || parsed == nil || parsed.Hostname() == "" {
 		return nil, fmt.Errorf("invalid dns http upstream address: %s", address)
@@ -61,7 +62,11 @@ func newReverseProxyDNSCompressedHTTPUpstream(address string, opts *dnsupstream.
 	}
 	lookup := reverseProxyDNSHTTPLookupFunc(opts)
 	tlsConfig := reverseProxyDNSHTTPUpstreamTLSConfig(parsed, opts, http3Only)
-	result := &reverseProxyDNSCompressedHTTPUpstream{address: parsed}
+	encoding := compressionalgorithm.UpstreamAcceptEncoding()
+	if len(acceptEncoding) > 0 {
+		encoding = strings.TrimSpace(acceptEncoding[0])
+	}
+	result := &reverseProxyDNSCompressedHTTPUpstream{address: parsed, acceptEncoding: encoding}
 	timeout := opts.Timeout
 	if http3Only {
 		transport := &http3.Transport{
@@ -216,7 +221,7 @@ func (u *reverseProxyDNSCompressedHTTPUpstream) Exchange(req *dns.Msg) (*dns.Msg
 		return nil, fmt.Errorf("creating dns http request: %w", err)
 	}
 	httpReq.Header.Set("Accept", "application/dns-message")
-	httpReq.Header.Set("Accept-Encoding", compressionalgorithm.UpstreamAcceptEncoding())
+	setReverseProxyAcceptEncoding(httpReq.Header, u.acceptEncoding)
 	httpReq.Header.Set("User-Agent", "")
 	httpResp, err := u.client.Do(httpReq)
 	if err != nil {
@@ -271,7 +276,7 @@ var _ dnsupstream.Upstream = (*reverseProxyDNSCompressedHTTPUpstream)(nil)
 // documented fallback syntax while replacing HTTPS/H3 entries with the
 // compression-aware project upstream.  This keeps domain-specific fallback
 // routing and exclusion rules intact.
-func buildReverseProxyDNSCompressedFallbackUpstreamConfig(lines []string, opts *dnsupstream.Options) (*dnsproxy.UpstreamConfig, error) {
+func buildReverseProxyDNSCompressedFallbackUpstreamConfig(lines []string, opts *dnsupstream.Options, acceptEncoding ...string) (*dnsproxy.UpstreamConfig, error) {
 	if opts == nil {
 		opts = &dnsupstream.Options{}
 	}
@@ -323,7 +328,7 @@ func buildReverseProxyDNSCompressedFallbackUpstreamConfig(lines []string, opts *
 			}
 			upstream := upstreamIndex[address]
 			if upstream == nil {
-				upstream, err = reverseProxyDNSAddressToUpstream(address, opts)
+				upstream, err = reverseProxyDNSAddressToUpstream(address, opts, acceptEncoding...)
 				if err != nil {
 					closeConfig()
 					return nil, fmt.Errorf("line %d upstream %q: %w", index, address, err)
@@ -357,14 +362,14 @@ func buildReverseProxyDNSCompressedFallbackUpstreamConfig(lines []string, opts *
 	return config, nil
 }
 
-func reverseProxyDNSAddressToUpstream(address string, opts *dnsupstream.Options) (dnsupstream.Upstream, error) {
+func reverseProxyDNSAddressToUpstream(address string, opts *dnsupstream.Options, acceptEncoding ...string) (dnsupstream.Upstream, error) {
 	parsed, err := url.Parse(address)
 	if err == nil && parsed != nil {
 		switch strings.ToLower(parsed.Scheme) {
 		case "https":
-			return newReverseProxyDNSCompressedHTTPUpstream(address, opts.Clone(), false)
+			return newReverseProxyDNSCompressedHTTPUpstream(address, opts.Clone(), false, acceptEncoding...)
 		case "h3":
-			return newReverseProxyDNSCompressedHTTPUpstream(address, opts.Clone(), true)
+			return newReverseProxyDNSCompressedHTTPUpstream(address, opts.Clone(), true, acceptEncoding...)
 		}
 	}
 	return dnsupstream.AddressToUpstream(address, opts.Clone())

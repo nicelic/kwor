@@ -45,3 +45,40 @@ func TestNormalizeSubJSONExtensionCanonicalizesDNSHTTPPaths(t *testing.T) {
 		t.Fatalf("DoT path must be removed: %#v", byTag["dot"])
 	}
 }
+
+func TestSubscriptionResourceBounds(t *testing.T) {
+	makeRows := func(count int) []interface{} {
+		rows := make([]interface{}, count)
+		for index := range rows {
+			rows[index] = map[string]interface{}{"values": []interface{}{"example.com"}}
+		}
+		return rows
+	}
+
+	jsonRoot := map[string]interface{}{
+		"_uiConfig": map[string]interface{}{
+			"ruleRows": makeRows(SubscriptionJSONMaxEditorRuleRows),
+		},
+	}
+	if err := ValidateSubJSONExtension(jsonRoot); err != nil {
+		t.Fatalf("JSON resource limit should include %d rows: %v", SubscriptionJSONMaxEditorRuleRows, err)
+	}
+	jsonRoot["_uiConfig"].(map[string]interface{})["ruleRows"] = makeRows(SubscriptionJSONMaxEditorRuleRows + 1)
+	if err := ValidateSubJSONExtension(jsonRoot); err == nil {
+		t.Fatalf("JSON resource limit accepted %d rows", SubscriptionJSONMaxEditorRuleRows+1)
+	}
+
+	clashRoot := map[string]interface{}{
+		"_uiConfig": map[string]interface{}{
+			"clashRuleRows": makeRows(SubscriptionClashMaxEditorRuleRows),
+		},
+		"rules": makeRows(SubscriptionClashMaxRules),
+	}
+	if err := ValidateSubClashExtension(clashRoot); err != nil {
+		t.Fatalf("Clash resource limits should allow 800 editor rows and 2048 rules: %v", err)
+	}
+	clashRoot["rules"] = makeRows(SubscriptionClashMaxRules + 1)
+	if err := ValidateSubClashExtension(clashRoot); err == nil {
+		t.Fatalf("Clash rules limit accepted %d rules", SubscriptionClashMaxRules+1)
+	}
+}

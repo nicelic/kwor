@@ -1007,6 +1007,8 @@ func reverseProxyDNSRouteRuntimeStateKey(row *model.ReverseProxyRule) string {
 		normalizeReverseProxyProtocolAlias(row.TargetProtocolAlias, row.TargetProtocol),
 		row.TargetAddresses,
 		fmt.Sprintf("%d", row.TargetPort),
+		fmt.Sprintf("%t", row.TargetCompressionEnabled),
+		row.TargetCompressionAlgorithms,
 		normalizeReverseProxyDNSPath(row.TargetDNSPath),
 		row.FallbackDNSUpstreams,
 		fmt.Sprintf("%d", reverseProxyDNSUpstreamTimeoutSeconds(row.DNSUpstreamTimeoutSeconds)),
@@ -1025,6 +1027,8 @@ func reverseProxyDNSRouteRuntimeStateKey(row *model.ReverseProxyRule) string {
 		fmt.Sprintf("%t", row.DisableIPv6Answer),
 		strings.ToLower(strings.TrimSpace(row.IPStrategy)),
 		fmt.Sprintf("%t", row.UpstreamTLSVerify),
+		fmt.Sprintf("%t", row.ListenCompressionEnabled),
+		row.ListenCompressionAlgorithms,
 		reverseProxyDNSCacheResourceStateKey(row),
 	}, "\x1f")
 }
@@ -1374,7 +1378,7 @@ func buildReverseProxyDNSRoute(row *model.ReverseProxyRule) (*reverseProxyDNSRou
 		}
 		var ups dnsupstream.Upstream
 		if targetAlias == reverseProxyDNSProtocolDoH || targetAlias == reverseProxyDNSProtocolDoHH3 {
-			ups, err = newReverseProxyDNSCompressedHTTPUpstream(address, opts.Clone(), targetAlias == reverseProxyDNSProtocolDoHH3)
+			ups, err = newReverseProxyDNSCompressedHTTPUpstream(address, opts.Clone(), targetAlias == reverseProxyDNSProtocolDoHH3, reverseProxyTargetAcceptEncoding(row))
 		} else {
 			ups, err = dnsupstream.AddressToUpstream(address, opts.Clone())
 		}
@@ -1588,7 +1592,7 @@ func buildReverseProxyDNSFallbackUpstreamConfig(row *model.ReverseProxyRule) (*d
 	if len(lines) == 0 {
 		return nil, nil
 	}
-	config, err := buildReverseProxyDNSCompressedFallbackUpstreamConfig(lines, buildReverseProxyDNSFallbackUpstreamOptions(row))
+	config, err := buildReverseProxyDNSCompressedFallbackUpstreamConfig(lines, buildReverseProxyDNSFallbackUpstreamOptions(row), reverseProxyTargetAcceptEncoding(row))
 	if err != nil {
 		if config != nil {
 			_ = config.Close()

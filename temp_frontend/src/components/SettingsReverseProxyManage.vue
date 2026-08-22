@@ -562,6 +562,31 @@
                       hide-details />
                     <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.pathPrefixStrictHint }}</div>
                   </v-col>
+                  <v-col v-if="listenCompressionVisible" cols="12" lg="12">
+                    <div class="rp-compression-control">
+                      <div class="rp-panel__section-title">{{ reverseProxyCopy.compressionAlgorithms }}</div>
+                      <div class="text-caption text-medium-emphasis mb-2">{{ reverseProxyCopy.compressionHint }}</div>
+                      <div class="rp-compression-options">
+                        <v-checkbox
+                          :model-value="!editingRule.listenCompressionEnabled"
+                          :label="reverseProxyCopy.compressionDisabled"
+                          color="primary"
+                          density="compact"
+                          hide-details
+                          @update:modelValue="(value) => editingRule.listenCompressionEnabled = !Boolean(value)" />
+                        <v-checkbox
+                          v-for="item in reverseProxyCompressionItems"
+                          :key="`listen-compression-${item.value}`"
+                          v-model="editingRule.listenCompressionAlgorithms"
+                          :value="item.value"
+                          :label="item.title"
+                          color="primary"
+                          density="compact"
+                          hide-details
+                          :disabled="!editingRule.listenCompressionEnabled" />
+                      </div>
+                    </div>
+                  </v-col>
                   <v-col v-if="listenIsDNS && (editingRule.listenProtocol === 'dns_doh' || editingRule.listenProtocol === 'dns_doh3')" cols="12" lg="12">
                     <v-text-field
                       v-model="editingRule.listenDnsPath"
@@ -705,6 +730,31 @@
                       max="65535"
                       :label="reverseProxyCopy.targetPort"
                       hide-details />
+                  </v-col>
+                  <v-col v-if="targetCompressionVisible" cols="12" lg="12">
+                    <div class="rp-compression-control">
+                      <div class="rp-panel__section-title">{{ reverseProxyCopy.compressionAlgorithms }}</div>
+                      <div class="text-caption text-medium-emphasis mb-2">{{ reverseProxyCopy.compressionHint }}</div>
+                      <div class="rp-compression-options">
+                        <v-checkbox
+                          :model-value="!editingRule.targetCompressionEnabled"
+                          :label="reverseProxyCopy.compressionDisabled"
+                          color="primary"
+                          density="compact"
+                          hide-details
+                          @update:modelValue="(value) => editingRule.targetCompressionEnabled = !Boolean(value)" />
+                        <v-checkbox
+                          v-for="item in reverseProxyCompressionItems"
+                          :key="`target-compression-${item.value}`"
+                          v-model="editingRule.targetCompressionAlgorithms"
+                          :value="item.value"
+                          :label="item.title"
+                          color="primary"
+                          density="compact"
+                          hide-details
+                          :disabled="!editingRule.targetCompressionEnabled" />
+                      </div>
+                    </div>
                   </v-col>
                   <v-col v-if="!targetIsDNS" cols="12" lg="12">
                     <v-text-field
@@ -1077,6 +1127,7 @@ import {
   listenMatchDisplay,
   protocolItems,
   protocolLabel,
+  reverseProxyCompressionItems,
   reverseProxyCopy,
   reverseProxyHeaders,
   runtimeStatusLabel,
@@ -1121,6 +1172,8 @@ const {
   listenIsDNS,
   listenIsPlainDNS,
   targetIsDNS,
+  listenCompressionVisible,
+  targetCompressionVisible,
   targetVersionConfigurable,
   listenCanAdvertiseHTTP3,
   hasPreviewProtocol,
@@ -1477,6 +1530,29 @@ const {
 	font-size: 13px;
 	font-weight: 600;
 	color: rgba(226, 232, 240, 0.94);
+}
+
+.rp-compression-control {
+  margin-top: 4px;
+  padding: 12px 14px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.24);
+}
+
+.rp-compression-options {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.rp-compression-options :deep(.v-selection-control) {
+  min-height: 32px;
+}
+
+.rp-compression-options :deep(.v-label) {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .rp-actions {

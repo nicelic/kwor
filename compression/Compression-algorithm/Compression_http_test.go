@@ -233,6 +233,33 @@ func TestHTTPResponseWriterCompressesAndSetsVary(t *testing.T) {
 	}
 }
 
+func TestHTTPResponseWriterEmptyAllowedAlgorithmsUsesIdentity(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
+	request.Header.Set("Accept-Encoding", "zstd, gzip")
+	recorder := httptest.NewRecorder()
+	recorder.Header().Set("Content-Type", "application/json")
+	writer := NewHTTPResponseWriter(recorder, HTTPResponseOptions{
+		Request:           request,
+		Enabled:           true,
+		MinSize:           0,
+		Level:             DefaultLevel,
+		AllowedAlgorithms: []Algorithm{},
+	})
+	body := strings.Repeat(`{"ok":true}`, 32)
+	if _, err := writer.Write([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := recorder.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding = %q, want identity", got)
+	}
+	if got := recorder.Body.String(); got != body {
+		t.Fatalf("body = %q, want original body", got)
+	}
+}
+
 func TestHTTPResponseWriterIgnoresPositiveQMagnitude(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
 	request.Header.Set("Accept-Encoding", "zstd;q=0.00001, br;q=1, gzip;q=0.8")

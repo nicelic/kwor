@@ -11,17 +11,17 @@ import {
   CLASH_RULE_SET_NAME_OPTIONS_BY_SOURCE,
 } from './SubClashExtConstants'
 
-const SUBSCRIPTION_EXTENSION_MAX_BYTES = 1 * 1024 * 1024
+const SUBSCRIPTION_EXTENSION_MAX_BYTES = 100 * 1024 * 1024
 const CLASH_LATENCY_TEST_MIN_INTERVAL_SECONDS = 30
 const CLASH_RULE_PROVIDER_MIN_INTERVAL_SECONDS = 60 * 60
 const CLASH_REGENERATION_DEBOUNCE_MS = 80
 const CLASH_RULE_SET_PROBE_DEBOUNCE_MS = 100
 const CLASH_RULE_SET_PROBE_BATCH_SIZE = 32
-const CLASH_MAX_RULE_PROVIDERS = 128
-const CLASH_MAX_RULE_ROWS = 64
-const CLASH_MAX_DNS_POLICY_ROWS = 64
-const CLASH_MAX_DNS_SUFFIX_ROWS = 32
-const CLASH_MAX_VALUES_PER_ROW = 24
+const CLASH_MAX_RULE_PROVIDERS = 800
+const CLASH_MAX_RULE_ROWS = 800
+const CLASH_MAX_DNS_POLICY_ROWS = 800
+const CLASH_MAX_DNS_SUFFIX_ROWS = 800
+const CLASH_MAX_VALUES_PER_ROW = 800
 
 const CLASH_ALLOWED_RULE_SET_EXTENSIONS = new Set(['.mrs', '.yaml', '.yml', '.txt', '.list'])
 
@@ -774,7 +774,7 @@ type ClashRuleSetProbeBatchEntry = {
 
 function hasClashRowValueBoundsError(values: any): boolean {
   if (!Array.isArray(values) || values.length > CLASH_MAX_VALUES_PER_ROW) return true
-  return values.some((item: any) => typeof item === 'string' && item.length > 2048)
+  return values.some((item: any) => typeof item === 'string' && new TextEncoder().encode(item).length > SUBSCRIPTION_EXTENSION_MAX_BYTES)
 }
 
 function hasClashEditorBoundsError(config: any): boolean {

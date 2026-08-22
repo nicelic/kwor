@@ -433,7 +433,7 @@ const qrcodeGroupName = ref('')
 // 刷新订阅状态
 const refreshingGroup = ref('')
 const refreshResultDialog = ref(false)
-const refreshResultPreviewLimit = 80
+const refreshResultPreviewLimit = 200
 type SubscriptionRefreshResult = {
   added: string[]
   removed: string[]

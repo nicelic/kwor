@@ -3,9 +3,11 @@ package service
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alireza0/s-ui/database"
@@ -13,9 +15,17 @@ import (
 	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/util"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type MihomoNftTrafficService struct{}
+
+var mihomoClientBindingRepairNeeded atomic.Bool
+
+func init() {
+	mihomoClientBindingRepairNeeded.Store(true)
+	database.RegisterDBResetHook(func() { mihomoClientBindingRepairNeeded.Store(true) })
+}
 
 type mihomoInboundTrafficSample struct {
 	state                  model.MihomoInboundRedirectState
@@ -610,6 +620,7 @@ func (s *MihomoNftTrafficService) QueueSyncClientBindings(tx *gorm.DB, clientID 
 	ids := append([]uint(nil), inboundIDs...)
 	return QueueManagedRuntimeHook(tx, func() error {
 		if err := s.SyncClientBindings(database.GetDB(), clientID, ids); err != nil {
+			mihomoClientBindingRepairNeeded.Store(true)
 			logger.Warning("failed to sync mihomo client traffic bindings for client id ", clientID, ": ", err)
 		}
 		return nil
@@ -1072,6 +1083,9 @@ func (s *MihomoNftTrafficService) collectAndSaveTrafficLocked(saveTrafficOverrid
 	historySamples := make([]model.Stats, 0, len(samples)*2)
 	inboundOnlineSet := make(map[string]struct{})
 	for _, sample := range samples {
+		if !sample.stateChanged {
+			continue
+		}
 		result := tx.Model(&model.MihomoInboundRedirectState{}).
 			Where("id = ? AND tag = ? AND port = ? AND port_hop_range = ? AND in_handle = ? AND out_handle = ? AND redirect_handle = ? AND in_bytes = ? AND out_bytes = ?",
 				sample.state.Id,
@@ -1306,8 +1320,17 @@ func (s *MihomoNftTrafficService) writeClientStats(tx *gorm.DB, deltas []inbound
 		deltaMap[deltas[i].inboundId] = &deltas[i]
 	}
 
+	// Restrict the binding read to inbounds that actually changed in this
+	// sampling round. This keeps Mihomo traffic cost proportional to the
+	// affected topology instead of every active client binding.
+	inboundIDs := make([]uint, 0, len(deltaMap))
+	for inboundID := range deltaMap {
+		inboundIDs = append(inboundIDs, inboundID)
+	}
+	sort.Slice(inboundIDs, func(i, j int) bool { return inboundIDs[i] < inboundIDs[j] })
+
 	var bindings []model.MihomoClientInboundTrafficState
-	if err := tx.Where("active = ?", true).Find(&bindings).Error; err != nil {
+	if err := tx.Where("active = ? AND inbound_id IN ?", true, inboundIDs).Find(&bindings).Error; err != nil {
 		return nil, err
 	}
 	if len(bindings) == 0 {
@@ -1340,6 +1363,7 @@ func (s *MihomoNftTrafficService) writeClientStats(tx *gorm.DB, deltas []inbound
 		downTotal int64
 	}
 	aggs := make(map[uint]*clientAgg)
+	changedBindings := make([]model.MihomoClientInboundTrafficState, 0, len(bindings))
 
 	for i := range bindings {
 		b := &bindings[i]
@@ -1361,12 +1385,15 @@ func (s *MihomoNftTrafficService) writeClientStats(tx *gorm.DB, deltas []inbound
 		b.LastInBytes = delta.currentIn
 		b.LastOutBytes = delta.currentOut
 		b.UpdatedAt = time.Now()
-		if err := tx.Save(b).Error; err != nil {
-			return nil, err
-		}
+		changedBindings = append(changedBindings, *b)
+	}
+	if err := saveMihomoClientInboundTrafficBindingsBatch(tx, changedBindings); err != nil {
+		return nil, err
 	}
 
 	userOnlineSet := make(map[string]struct{}, len(aggs))
+	upDeltas := make(map[uint]int64)
+	downDeltas := make(map[uint]int64)
 	for clientID, agg := range aggs {
 		name := strings.TrimSpace(clientNames[clientID])
 		if name == "" {
@@ -1383,10 +1410,7 @@ func (s *MihomoNftTrafficService) writeClientStats(tx *gorm.DB, deltas []inbound
 					Traffic:   agg.upTotal,
 				})
 			}
-			if err := tx.Model(&model.MihomoClient{}).Where("id = ?", clientID).
-				UpdateColumn("up", gorm.Expr("up + ?", agg.upTotal)).Error; err != nil {
-				return nil, err
-			}
+			upDeltas[clientID] = agg.upTotal
 		}
 
 		if agg.downTotal > 0 {
@@ -1399,22 +1423,78 @@ func (s *MihomoNftTrafficService) writeClientStats(tx *gorm.DB, deltas []inbound
 					Traffic:   agg.downTotal,
 				})
 			}
-			if err := tx.Model(&model.MihomoClient{}).Where("id = ?", clientID).
-				UpdateColumn("down", gorm.Expr("down + ?", agg.downTotal)).Error; err != nil {
-				return nil, err
-			}
+			downDeltas[clientID] = agg.downTotal
 		}
 
 		if agg.upTotal > 0 || agg.downTotal > 0 {
 			userOnlineSet[name] = struct{}{}
 		}
 	}
+	if err := applyMihomoClientTrafficDeltasBatch(tx, upDeltas, downDeltas); err != nil {
+		return nil, err
+	}
 
 	return tagsFromSet(userOnlineSet), nil
 }
 
+func saveMihomoClientInboundTrafficBindingsBatch(tx *gorm.DB, bindings []model.MihomoClientInboundTrafficState) error {
+	if tx == nil || len(bindings) == 0 {
+		return nil
+	}
+	return tx.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"client_id", "inbound_id", "active", "last_in_bytes", "last_out_bytes",
+			"used_in_bytes", "used_out_bytes", "updated_at",
+		}),
+	}).Create(&bindings).Error
+}
+
+func applyMihomoClientTrafficDeltasBatch(tx *gorm.DB, up map[uint]int64, down map[uint]int64) error {
+	if tx == nil {
+		return nil
+	}
+	if err := applyMihomoClientTrafficDeltaColumn(tx, "up", up); err != nil {
+		return err
+	}
+	return applyMihomoClientTrafficDeltaColumn(tx, "down", down)
+}
+
+func applyMihomoClientTrafficDeltaColumn(tx *gorm.DB, column string, deltas map[uint]int64) error {
+	if len(deltas) == 0 {
+		return nil
+	}
+	keys := make([]uint, 0, len(deltas))
+	for id, delta := range deltas {
+		if id > 0 && delta > 0 {
+			keys = append(keys, id)
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	args := make([]interface{}, 0, len(keys)*3)
+	caseSQL := "CASE id"
+	placeholders := make([]string, 0, len(keys))
+	for _, id := range keys {
+		caseSQL += " WHEN ? THEN ?"
+		args = append(args, id, deltas[id])
+		placeholders = append(placeholders, "?")
+	}
+	caseSQL += " ELSE 0 END"
+	for _, id := range keys {
+		args = append(args, id)
+	}
+	query := fmt.Sprintf("UPDATE mihomo_clients SET %s = %s + %s WHERE id IN (%s)", column, column, caseSQL, strings.Join(placeholders, ","))
+	return tx.Exec(query, args...).Error
+}
+
 func (s *MihomoNftTrafficService) ensureClientBindings(tx *gorm.DB, snapshots map[uint]inboundCounterSnapshot) error {
 	if tx == nil {
+		return nil
+	}
+	if !mihomoClientBindingRepairNeeded.Load() {
 		return nil
 	}
 
@@ -1434,7 +1514,7 @@ func (s *MihomoNftTrafficService) ensureClientBindings(tx *gorm.DB, snapshots ma
 			return err
 		}
 	}
-
+	mihomoClientBindingRepairNeeded.Store(false)
 	return nil
 }
 

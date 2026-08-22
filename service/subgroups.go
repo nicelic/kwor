@@ -23,8 +23,8 @@ type SubGroupService struct{}
 
 const subOutboundSourceSubGroup = "subgroup"
 
-const SubscriptionGroupMaxOutbounds = 512
-const subscriptionImportMaxNodes = 512
+const SubscriptionGroupMaxOutbounds = 4096
+const subscriptionImportMaxNodes = 4096
 
 type subGroupReorderRequest struct {
 	IDs []uint `json:"ids"`
@@ -462,7 +462,7 @@ func isProxyOutbound(outbound map[string]interface{}) bool {
 	return !nonProxyTypes[typeVal]
 }
 
-const subscriptionImportMaxResponseBytes = 16 * 1024 * 1024
+const subscriptionImportMaxResponseBytes = 100 * 1024 * 1024
 
 // fetchSubscriptionJSON downloads content from subscription URL.
 func fetchSubscriptionJSON(url string, allowInsecure bool) ([]byte, error) {

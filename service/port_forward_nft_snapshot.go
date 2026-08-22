@@ -46,6 +46,57 @@ func loadPortForwardNftSnapshot() (portForwardNftSnapshot, error) {
 	return snapshot, nil
 }
 
+// loadPortForwardCounterBytes reads the same owned tables as the full snapshot
+// but only extracts counter values. The 15-second sampler uses this cheap path
+// between full integrity checks; comments and chain topology are parsed only
+// on the slower verification path.
+func loadPortForwardCounterBytes() (map[string]int64, error) {
+	result := make(map[string]int64)
+	for _, family := range append([]string{nftFamily}, nftCompatibilityNatFamilies()...) {
+		out, err := runNft("list", "table", family, portForwardNftTable)
+		if err != nil {
+			if portForwardNftObjectMissing(err) {
+				continue
+			}
+			return nil, err
+		}
+		for _, match := range portForwardCounterBlockRe.FindAllStringSubmatch(string(out), -1) {
+			if len(match) != 4 {
+				continue
+			}
+			if value, parseErr := strconv.ParseInt(match[3], 10, 64); parseErr == nil {
+				// Native named counters are globally unique. Assigning rather
+				// than adding also prevents a stale inline compatibility rule
+				// from being counted a second time during a layout transition.
+				result[match[1]] = value
+			}
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			comment, ok := extractRuleComment(line)
+			if !ok {
+				continue
+			}
+			match := portForwardInlineCounterCommentRe.FindStringSubmatch(comment)
+			if len(match) != 3 {
+				continue
+			}
+			counterMatch := nftCounterBytesRe.FindStringSubmatch(line)
+			if len(counterMatch) != 2 {
+				continue
+			}
+			ruleID, ruleErr := strconv.ParseUint(match[1], 10, 64)
+			bytes, bytesErr := strconv.ParseInt(counterMatch[1], 10, 64)
+			if ruleErr == nil && bytesErr == nil && ruleID > 0 {
+				counterName := portForwardCounterName(uint(ruleID), match[2])
+				if _, hasNamedCounter := result[counterName]; !hasNamedCounter {
+					result[counterName] += bytes
+				}
+			}
+		}
+	}
+	return result, nil
+}
+
 func parsePortForwardNftTableSnapshot(out []byte) portForwardNftTableSnapshot {
 	result := portForwardNftTableSnapshot{
 		known:         true,
@@ -92,7 +143,9 @@ func parsePortForwardNftTableSnapshot(out []byte) portForwardNftTableSnapshot {
 					bytes, bytesErr := strconv.ParseInt(counterMatch[1], 10, 64)
 					if ruleErr == nil && bytesErr == nil && ruleID > 0 {
 						counterName := portForwardCounterName(uint(ruleID), match[2])
-						result.counters[counterName] += bytes
+						if _, hasNamedCounter := result.counters[counterName]; !hasNamedCounter {
+							result.counters[counterName] += bytes
+						}
 					}
 				}
 			}

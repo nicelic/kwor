@@ -85,6 +85,33 @@ func TestGetCpuPercentHandlesEmptyProbeResult(t *testing.T) {
 	}
 }
 
+func TestCachedDashboardMetricReleasesSingleFlightAfterPanic(t *testing.T) {
+	dashboardMetricCache.Lock()
+	dashboardMetricCache.entries = make(map[string]dashboardMetricCacheEntry)
+	dashboardMetricCache.inflight = make(map[string]chan struct{})
+	dashboardMetricCache.Unlock()
+
+	var calls atomic.Int32
+	first := cachedDashboardMetric("panic-fixture", func() interface{} {
+		calls.Add(1)
+		panic("fixture metric panic")
+	})
+	if first != nil {
+		t.Fatalf("panic probe result = %#v, want nil", first)
+	}
+
+	second := cachedDashboardMetric("panic-fixture", func() interface{} {
+		calls.Add(1)
+		return "recovered"
+	})
+	if second != "recovered" {
+		t.Fatalf("metric after panic = %#v, want recovered value", second)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("metric probe calls = %d, want 2", got)
+	}
+}
+
 func TestSystemctlUnitIsActiveCoalescesAndInvalidates(t *testing.T) {
 	original := systemctlUnitIsActiveFn
 	invalidateSystemdUnitActiveCache()

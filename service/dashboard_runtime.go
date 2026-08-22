@@ -14,6 +14,20 @@ import (
 // five-second refresh into an effective ten-second host probe.
 const dashboardRuntimeCacheTTL = 4 * time.Second
 
+type dashboardMetricCacheEntry struct {
+	expiresAt time.Time
+	value     interface{}
+}
+
+var dashboardMetricCache = struct {
+	sync.Mutex
+	entries  map[string]dashboardMetricCacheEntry
+	inflight map[string]chan struct{}
+}{
+	entries:  make(map[string]dashboardMetricCacheEntry),
+	inflight: make(map[string]chan struct{}),
+}
+
 type dashboardRuntimeCacheState struct {
 	sync.Mutex
 	generation uint64
@@ -36,6 +50,14 @@ var dashboardRuntimeCache = dashboardRuntimeCacheState{
 // dialog may inspect binaries and download preferences, while the dashboard
 // only needs a cached runtime view.
 func (s *ServerService) GetDashboardRuntime(request string) map[string]interface{} {
+	started := time.Now()
+	defer func() {
+		RecordRuntimePerformance(RuntimePerformanceSample{
+			Task:       "dashboard-runtime",
+			StartedAt:  started.Unix(),
+			DurationMs: time.Since(started).Milliseconds(),
+		})
+	}()
 	request = normalizeDashboardRuntimeRequest(request)
 	for {
 		now := time.Now()
@@ -78,6 +100,57 @@ func InvalidateDashboardRuntimeCache() {
 	dashboardRuntimeCache.generation++
 	dashboardRuntimeCache.entries = make(map[string]dashboardRuntimeCacheEntry)
 	dashboardRuntimeCache.Unlock()
+	dashboardMetricCache.Lock()
+	dashboardMetricCache.entries = make(map[string]dashboardMetricCacheEntry)
+	dashboardMetricCache.Unlock()
+}
+
+func cachedDashboardMetric(key string, collect func() interface{}) interface{} {
+	if key == "" || collect == nil {
+		return nil
+	}
+	for {
+		now := time.Now()
+		dashboardMetricCache.Lock()
+		if cached, ok := dashboardMetricCache.entries[key]; ok && now.Before(cached.expiresAt) {
+			value := cloneDashboardRuntimeValue(cached.value)
+			dashboardMetricCache.Unlock()
+			return value
+		}
+		if done := dashboardMetricCache.inflight[key]; done != nil {
+			dashboardMetricCache.Unlock()
+			<-done
+			continue
+		}
+		done := make(chan struct{})
+		dashboardMetricCache.inflight[key] = done
+		dashboardMetricCache.Unlock()
+
+		value, recovered := collectDashboardMetricSafely(collect)
+		dashboardMetricCache.Lock()
+		delete(dashboardMetricCache.inflight, key)
+		if recovered == nil {
+			dashboardMetricCache.entries[key] = dashboardMetricCacheEntry{
+				expiresAt: time.Now().Add(dashboardRuntimeCacheTTL),
+				value:     cloneDashboardRuntimeValue(value),
+			}
+		}
+		close(done)
+		dashboardMetricCache.Unlock()
+		if recovered != nil {
+			logger.Warning("dashboard metric probe panicked: ", recovered)
+		}
+		return value
+	}
+}
+
+// collectDashboardMetricSafely prevents a failed optional probe from leaving
+// all later dashboard callers waiting on an abandoned single-flight channel.
+func collectDashboardMetricSafely(collect func() interface{}) (value interface{}, recovered interface{}) {
+	defer func() {
+		recovered = recover()
+	}()
+	return collect(), nil
 }
 
 func normalizeDashboardRuntimeRequest(request string) string {

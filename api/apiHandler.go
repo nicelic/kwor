@@ -433,6 +433,8 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetStatus(c)
 	case "dashboard-runtime":
 		a.ApiService.GetDashboardRuntime(c)
+	case "runtime-performance":
+		a.ApiService.GetRuntimePerformance(c)
 	case "traffic-overview":
 		a.ApiService.GetTrafficOverview(c)
 	case "traffic-overview-vnstat-versions":

@@ -123,51 +123,55 @@ type ReverseProxyService struct {
 }
 
 type ReverseProxyRulePayload struct {
-	ExpectedRevision           *uint64 `json:"expectedRevision"`
-	ID                         uint    `json:"id"`
-	Name                       string  `json:"name"`
-	Enabled                    bool    `json:"enabled"`
-	ListenProtocol             string  `json:"listenProtocol"`
-	ListenProtocolAlias        string  `json:"listenProtocolAlias"`
-	ListenPort                 int     `json:"listenPort"`
-	Hosts                      string  `json:"hosts"`
-	PathPrefix                 string  `json:"pathPrefix"`
-	ListenDNSPath              string  `json:"listenDnsPath"`
-	TargetProtocol             string  `json:"targetProtocol"`
-	TargetProtocolAlias        string  `json:"targetProtocolAlias"`
-	TargetAddresses            string  `json:"targetAddresses"`
-	TargetPort                 int     `json:"targetPort"`
-	TargetPath                 string  `json:"targetPath"`
-	TargetDNSPath              string  `json:"targetDnsPath"`
-	FallbackDNSUpstreams       string  `json:"fallbackDnsUpstreams"`
-	DNSUpstreamTimeoutSeconds  *int    `json:"dnsUpstreamTimeoutSeconds"`
-	DNSCacheEnabled            bool    `json:"dnsCacheEnabled"`
-	DNSCacheSizeBytes          *int    `json:"dnsCacheSizeBytes"`
-	DNSCacheMinTTL             int     `json:"dnsCacheMinTtl"`
-	DNSCacheMaxTTL             int     `json:"dnsCacheMaxTtl"`
-	EDNSEnabled                bool    `json:"ednsEnabled"`
-	EDNSMode                   string  `json:"ednsMode"`
-	EDNSCustomIP               string  `json:"ednsCustomIp"`
-	EDNSClientSubnetPolicy     string  `json:"ednsClientSubnetPolicy"`
-	DisableIPv4Answer          bool    `json:"disableIpv4Answer"`
-	DisableIPv6Answer          bool    `json:"disableIpv6Answer"`
-	CertificateRecordIDs       []uint  `json:"certificateRecordIds"`
-	CertificateRecordID        uint    `json:"certificateRecordId"`
-	ListenHTTPVersionStrategy  string  `json:"listenHttpVersionStrategy"`
-	IPStrategy                 string  `json:"ipStrategy"`
-	HTTPVersionStrategy        string  `json:"httpVersionStrategy"`
-	UpstreamTLSVerify          bool    `json:"upstreamTlsVerify"`
-	DNSAllowedCIDRs            string  `json:"dnsAllowedCidrs"`
-	DNSRateLimitQPS            *int    `json:"dnsRateLimitQps"`
-	DNSMaxConcurrentQueries    *int    `json:"dnsMaxConcurrentQueries"`
-	MaxConcurrentConnections   *int    `json:"maxConcurrentConnections"`
-	MaxConcurrentRequests      *int    `json:"maxConcurrentRequests"`
-	UpstreamMaxConnections     *int    `json:"upstreamMaxConnections"`
-	UpstreamMaxIdleConnections *int    `json:"upstreamMaxIdleConnections"`
-	MemoryLimitBytes           *int64  `json:"memoryLimitBytes"`
-	ApiPassthrough             bool    `json:"apiPassthrough"`
-	AdvertiseHTTP3             bool    `json:"advertiseHttp3"`
-	Remark                     string  `json:"remark"`
+	ExpectedRevision            *uint64  `json:"expectedRevision"`
+	ID                          uint     `json:"id"`
+	Name                        string   `json:"name"`
+	Enabled                     bool     `json:"enabled"`
+	ListenProtocol              string   `json:"listenProtocol"`
+	ListenProtocolAlias         string   `json:"listenProtocolAlias"`
+	ListenPort                  int      `json:"listenPort"`
+	ListenCompressionEnabled    *bool    `json:"listenCompressionEnabled"`
+	ListenCompressionAlgorithms []string `json:"listenCompressionAlgorithms"`
+	Hosts                       string   `json:"hosts"`
+	PathPrefix                  string   `json:"pathPrefix"`
+	ListenDNSPath               string   `json:"listenDnsPath"`
+	TargetProtocol              string   `json:"targetProtocol"`
+	TargetProtocolAlias         string   `json:"targetProtocolAlias"`
+	TargetAddresses             string   `json:"targetAddresses"`
+	TargetPort                  int      `json:"targetPort"`
+	TargetCompressionEnabled    *bool    `json:"targetCompressionEnabled"`
+	TargetCompressionAlgorithms []string `json:"targetCompressionAlgorithms"`
+	TargetPath                  string   `json:"targetPath"`
+	TargetDNSPath               string   `json:"targetDnsPath"`
+	FallbackDNSUpstreams        string   `json:"fallbackDnsUpstreams"`
+	DNSUpstreamTimeoutSeconds   *int     `json:"dnsUpstreamTimeoutSeconds"`
+	DNSCacheEnabled             bool     `json:"dnsCacheEnabled"`
+	DNSCacheSizeBytes           *int     `json:"dnsCacheSizeBytes"`
+	DNSCacheMinTTL              int      `json:"dnsCacheMinTtl"`
+	DNSCacheMaxTTL              int      `json:"dnsCacheMaxTtl"`
+	EDNSEnabled                 bool     `json:"ednsEnabled"`
+	EDNSMode                    string   `json:"ednsMode"`
+	EDNSCustomIP                string   `json:"ednsCustomIp"`
+	EDNSClientSubnetPolicy      string   `json:"ednsClientSubnetPolicy"`
+	DisableIPv4Answer           bool     `json:"disableIpv4Answer"`
+	DisableIPv6Answer           bool     `json:"disableIpv6Answer"`
+	CertificateRecordIDs        []uint   `json:"certificateRecordIds"`
+	CertificateRecordID         uint     `json:"certificateRecordId"`
+	ListenHTTPVersionStrategy   string   `json:"listenHttpVersionStrategy"`
+	IPStrategy                  string   `json:"ipStrategy"`
+	HTTPVersionStrategy         string   `json:"httpVersionStrategy"`
+	UpstreamTLSVerify           bool     `json:"upstreamTlsVerify"`
+	DNSAllowedCIDRs             string   `json:"dnsAllowedCidrs"`
+	DNSRateLimitQPS             *int     `json:"dnsRateLimitQps"`
+	DNSMaxConcurrentQueries     *int     `json:"dnsMaxConcurrentQueries"`
+	MaxConcurrentConnections    *int     `json:"maxConcurrentConnections"`
+	MaxConcurrentRequests       *int     `json:"maxConcurrentRequests"`
+	UpstreamMaxConnections      *int     `json:"upstreamMaxConnections"`
+	UpstreamMaxIdleConnections  *int     `json:"upstreamMaxIdleConnections"`
+	MemoryLimitBytes            *int64   `json:"memoryLimitBytes"`
+	ApiPassthrough              bool     `json:"apiPassthrough"`
+	AdvertiseHTTP3              bool     `json:"advertiseHttp3"`
+	Remark                      string   `json:"remark"`
 
 	// These flags preserve JSON omission semantics while keeping direct Go
 	// callers compatible with the established bool payload field.
@@ -193,6 +197,12 @@ func (p *ReverseProxyRulePayload) UnmarshalJSON(data []byte) error {
 	p.upstreamTLSVerifyDecoded = true
 	_, p.upstreamTLSVerifySet = fields["upstreamTlsVerify"]
 	return nil
+}
+
+func reverseProxyPayloadCompressionEnabled(value *bool) bool {
+	// Omitted fields are legacy payloads and must retain the historical
+	// all-algorithm behavior. An explicit false is the new "关闭" choice.
+	return value == nil || *value
 }
 
 type ReverseProxyRuleReorderPayload struct {
@@ -239,62 +249,66 @@ type ReverseProxyCertificateOption struct {
 }
 
 type ReverseProxyRuleView struct {
-	ID                         uint                                       `json:"id"`
-	DisplayID                  uint64                                     `json:"displayId"`
-	ListOrder                  int64                                      `json:"listOrder"`
-	Name                       string                                     `json:"name"`
-	Enabled                    bool                                       `json:"enabled"`
-	ListenProtocol             string                                     `json:"listenProtocol"`
-	ListenProtocolAlias        string                                     `json:"listenProtocolAlias"`
-	ListenPort                 int                                        `json:"listenPort"`
-	Hosts                      []string                                   `json:"hosts"`
-	PathPrefix                 string                                     `json:"pathPrefix"`
-	ListenDNSPath              string                                     `json:"listenDnsPath"`
-	TargetProtocol             string                                     `json:"targetProtocol"`
-	TargetProtocolAlias        string                                     `json:"targetProtocolAlias"`
-	TargetAddresses            []string                                   `json:"targetAddresses"`
-	TargetPort                 int                                        `json:"targetPort"`
-	TargetPath                 string                                     `json:"targetPath"`
-	TargetDNSPath              string                                     `json:"targetDnsPath"`
-	FallbackDNSUpstreams       string                                     `json:"fallbackDnsUpstreams"`
-	DNSUpstreamTimeoutSeconds  int                                        `json:"dnsUpstreamTimeoutSeconds"`
-	DNSCacheEnabled            bool                                       `json:"dnsCacheEnabled"`
-	DNSCacheSizeBytes          int                                        `json:"dnsCacheSizeBytes"`
-	DNSCacheMinTTL             int                                        `json:"dnsCacheMinTtl"`
-	DNSCacheMaxTTL             int                                        `json:"dnsCacheMaxTtl"`
-	DNSAllowedCIDRs            []string                                   `json:"dnsAllowedCidrs"`
-	DNSRateLimitQPS            int                                        `json:"dnsRateLimitQps"`
-	DNSMaxConcurrentQueries    int                                        `json:"dnsMaxConcurrentQueries"`
-	EDNSEnabled                bool                                       `json:"ednsEnabled"`
-	EDNSMode                   string                                     `json:"ednsMode"`
-	EDNSCustomIP               string                                     `json:"ednsCustomIp"`
-	EDNSClientSubnetPolicy     string                                     `json:"ednsClientSubnetPolicy"`
-	DisableIPv4Answer          bool                                       `json:"disableIpv4Answer"`
-	DisableIPv6Answer          bool                                       `json:"disableIpv6Answer"`
-	CertificateRecordIDs       []uint                                     `json:"certificateRecordIds"`
-	CertificateRecordID        uint                                       `json:"certificateRecordId"`
-	CertificateLabel           string                                     `json:"certificateLabel"`
-	CertificateLabels          []string                                   `json:"certificateLabels"`
-	ListenHTTPVersionStrategy  string                                     `json:"listenHttpVersionStrategy"`
-	IPStrategy                 string                                     `json:"ipStrategy"`
-	HTTPVersionStrategy        string                                     `json:"httpVersionStrategy"`
-	UpstreamTLSVerify          bool                                       `json:"upstreamTlsVerify"`
-	MaxConcurrentConnections   int                                        `json:"maxConcurrentConnections"`
-	MaxConcurrentRequests      int                                        `json:"maxConcurrentRequests"`
-	UpstreamMaxConnections     int                                        `json:"upstreamMaxConnections"`
-	UpstreamMaxIdleConnections int                                        `json:"upstreamMaxIdleConnections"`
-	MemoryLimitBytes           int64                                      `json:"memoryLimitBytes"`
-	ApiPassthrough             bool                                       `json:"apiPassthrough"`
-	AdvertiseHTTP3             bool                                       `json:"advertiseHttp3"`
-	Remark                     string                                     `json:"remark"`
-	LastError                  string                                     `json:"lastError"`
-	RuntimeStatus              string                                     `json:"runtimeStatus"`
-	LocalConnectionCount       int                                        `json:"localConnectionCount"`
-	UpstreamConnectionCount    int                                        `json:"upstreamConnectionCount"`
-	CertificateHints           []string                                   `json:"certificateHints,omitempty"`
-	CertificateBalance         []ReverseProxyCertificateBalanceDiagnostic `json:"certificateBalance,omitempty"`
-	UpdatedAt                  int64                                      `json:"updatedAt"`
-	CreatedAt                  int64                                      `json:"createdAt"`
+	ID                          uint                                       `json:"id"`
+	DisplayID                   uint64                                     `json:"displayId"`
+	ListOrder                   int64                                      `json:"listOrder"`
+	Name                        string                                     `json:"name"`
+	Enabled                     bool                                       `json:"enabled"`
+	ListenProtocol              string                                     `json:"listenProtocol"`
+	ListenProtocolAlias         string                                     `json:"listenProtocolAlias"`
+	ListenPort                  int                                        `json:"listenPort"`
+	ListenCompressionEnabled    bool                                       `json:"listenCompressionEnabled"`
+	ListenCompressionAlgorithms []string                                   `json:"listenCompressionAlgorithms"`
+	Hosts                       []string                                   `json:"hosts"`
+	PathPrefix                  string                                     `json:"pathPrefix"`
+	ListenDNSPath               string                                     `json:"listenDnsPath"`
+	TargetProtocol              string                                     `json:"targetProtocol"`
+	TargetProtocolAlias         string                                     `json:"targetProtocolAlias"`
+	TargetAddresses             []string                                   `json:"targetAddresses"`
+	TargetPort                  int                                        `json:"targetPort"`
+	TargetCompressionEnabled    bool                                       `json:"targetCompressionEnabled"`
+	TargetCompressionAlgorithms []string                                   `json:"targetCompressionAlgorithms"`
+	TargetPath                  string                                     `json:"targetPath"`
+	TargetDNSPath               string                                     `json:"targetDnsPath"`
+	FallbackDNSUpstreams        string                                     `json:"fallbackDnsUpstreams"`
+	DNSUpstreamTimeoutSeconds   int                                        `json:"dnsUpstreamTimeoutSeconds"`
+	DNSCacheEnabled             bool                                       `json:"dnsCacheEnabled"`
+	DNSCacheSizeBytes           int                                        `json:"dnsCacheSizeBytes"`
+	DNSCacheMinTTL              int                                        `json:"dnsCacheMinTtl"`
+	DNSCacheMaxTTL              int                                        `json:"dnsCacheMaxTtl"`
+	DNSAllowedCIDRs             []string                                   `json:"dnsAllowedCidrs"`
+	DNSRateLimitQPS             int                                        `json:"dnsRateLimitQps"`
+	DNSMaxConcurrentQueries     int                                        `json:"dnsMaxConcurrentQueries"`
+	EDNSEnabled                 bool                                       `json:"ednsEnabled"`
+	EDNSMode                    string                                     `json:"ednsMode"`
+	EDNSCustomIP                string                                     `json:"ednsCustomIp"`
+	EDNSClientSubnetPolicy      string                                     `json:"ednsClientSubnetPolicy"`
+	DisableIPv4Answer           bool                                       `json:"disableIpv4Answer"`
+	DisableIPv6Answer           bool                                       `json:"disableIpv6Answer"`
+	CertificateRecordIDs        []uint                                     `json:"certificateRecordIds"`
+	CertificateRecordID         uint                                       `json:"certificateRecordId"`
+	CertificateLabel            string                                     `json:"certificateLabel"`
+	CertificateLabels           []string                                   `json:"certificateLabels"`
+	ListenHTTPVersionStrategy   string                                     `json:"listenHttpVersionStrategy"`
+	IPStrategy                  string                                     `json:"ipStrategy"`
+	HTTPVersionStrategy         string                                     `json:"httpVersionStrategy"`
+	UpstreamTLSVerify           bool                                       `json:"upstreamTlsVerify"`
+	MaxConcurrentConnections    int                                        `json:"maxConcurrentConnections"`
+	MaxConcurrentRequests       int                                        `json:"maxConcurrentRequests"`
+	UpstreamMaxConnections      int                                        `json:"upstreamMaxConnections"`
+	UpstreamMaxIdleConnections  int                                        `json:"upstreamMaxIdleConnections"`
+	MemoryLimitBytes            int64                                      `json:"memoryLimitBytes"`
+	ApiPassthrough              bool                                       `json:"apiPassthrough"`
+	AdvertiseHTTP3              bool                                       `json:"advertiseHttp3"`
+	Remark                      string                                     `json:"remark"`
+	LastError                   string                                     `json:"lastError"`
+	RuntimeStatus               string                                     `json:"runtimeStatus"`
+	LocalConnectionCount        int                                        `json:"localConnectionCount"`
+	UpstreamConnectionCount     int                                        `json:"upstreamConnectionCount"`
+	CertificateHints            []string                                   `json:"certificateHints,omitempty"`
+	CertificateBalance          []ReverseProxyCertificateBalanceDiagnostic `json:"certificateBalance,omitempty"`
+	UpdatedAt                   int64                                      `json:"updatedAt"`
+	CreatedAt                   int64                                      `json:"createdAt"`
 }
 
 type ReverseProxyOverview struct {
@@ -319,50 +333,54 @@ type reverseProxyLoadedConfiguration struct {
 }
 
 type reverseProxyNormalizedRule struct {
-	id                         uint
-	name                       string
-	enabled                    bool
-	listenProtocol             string
-	listenProtocolAlias        string
-	listenPort                 int
-	hosts                      []string
-	pathPrefix                 string
-	listenDNSPath              string
-	targetProtocol             string
-	targetProtocolAlias        string
-	targetAddresses            []string
-	targetPort                 int
-	targetPath                 string
-	targetDNSPath              string
-	fallbackDNSUpstreams       string
-	dnsUpstreamTimeoutSeconds  int
-	dnsCacheEnabled            bool
-	dnsCacheSizeBytes          int
-	dnsCacheMinTTL             int
-	dnsCacheMaxTTL             int
-	dnsAllowedCIDRs            []string
-	dnsRateLimitQPS            int
-	dnsMaxConcurrentQueries    int
-	ednsEnabled                bool
-	ednsMode                   string
-	ednsCustomIP               string
-	ednsClientSubnetPolicy     string
-	disableIPv4Answer          bool
-	disableIPv6Answer          bool
-	certificateRecordIDs       []uint
-	certificateRecordID        uint
-	listenHTTPVersionStrategy  string
-	ipStrategy                 string
-	httpVersionStrategy        string
-	upstreamTLSVerify          bool
-	maxConcurrentConnections   int
-	maxConcurrentRequests      int
-	upstreamMaxConnections     int
-	upstreamMaxIdleConnections int
-	memoryLimitBytes           int64
-	apiPassthrough             bool
-	advertiseHTTP3             bool
-	remark                     string
+	id                          uint
+	name                        string
+	enabled                     bool
+	listenProtocol              string
+	listenProtocolAlias         string
+	listenPort                  int
+	listenCompressionEnabled    bool
+	listenCompressionAlgorithms []string
+	hosts                       []string
+	pathPrefix                  string
+	listenDNSPath               string
+	targetProtocol              string
+	targetProtocolAlias         string
+	targetAddresses             []string
+	targetPort                  int
+	targetCompressionEnabled    bool
+	targetCompressionAlgorithms []string
+	targetPath                  string
+	targetDNSPath               string
+	fallbackDNSUpstreams        string
+	dnsUpstreamTimeoutSeconds   int
+	dnsCacheEnabled             bool
+	dnsCacheSizeBytes           int
+	dnsCacheMinTTL              int
+	dnsCacheMaxTTL              int
+	dnsAllowedCIDRs             []string
+	dnsRateLimitQPS             int
+	dnsMaxConcurrentQueries     int
+	ednsEnabled                 bool
+	ednsMode                    string
+	ednsCustomIP                string
+	ednsClientSubnetPolicy      string
+	disableIPv4Answer           bool
+	disableIPv6Answer           bool
+	certificateRecordIDs        []uint
+	certificateRecordID         uint
+	listenHTTPVersionStrategy   string
+	ipStrategy                  string
+	httpVersionStrategy         string
+	upstreamTLSVerify           bool
+	maxConcurrentConnections    int
+	maxConcurrentRequests       int
+	upstreamMaxConnections      int
+	upstreamMaxIdleConnections  int
+	memoryLimitBytes            int64
+	apiPassthrough              bool
+	advertiseHTTP3              bool
+	remark                      string
 }
 
 type reverseProxyMismatchEntry struct {
@@ -461,44 +479,48 @@ type reverseProxyRuleRuntimeState struct {
 }
 
 type reverseProxyRenderRule struct {
-	ID                         uint                                 `json:"id"`
-	ListOrder                  int64                                `json:"listOrder"`
-	Enabled                    bool                                 `json:"enabled"`
-	ListenProtocol             string                               `json:"listenProtocol"`
-	ListenProtocolAlias        string                               `json:"listenProtocolAlias"`
-	ListenHTTPVersionStrategy  string                               `json:"listenHttpVersionStrategy"`
-	ListenPort                 int                                  `json:"listenPort"`
-	Hosts                      []string                             `json:"hosts"`
-	PathPrefix                 string                               `json:"pathPrefix"`
-	ListenDNSPath              string                               `json:"listenDnsPath"`
-	TargetProtocol             string                               `json:"targetProtocol"`
-	TargetProtocolAlias        string                               `json:"targetProtocolAlias"`
-	TargetAddresses            []string                             `json:"targetAddresses"`
-	TargetPort                 int                                  `json:"targetPort"`
-	TargetPath                 string                               `json:"targetPath"`
-	TargetDNSPath              string                               `json:"targetDnsPath"`
-	AdvertiseHTTP3             bool                                 `json:"advertiseHttp3"`
-	EDNSEnabled                bool                                 `json:"ednsEnabled"`
-	EDNSMode                   string                               `json:"ednsMode"`
-	EDNSCustomIP               string                               `json:"ednsCustomIp"`
-	EDNSClientSubnetPolicy     string                               `json:"ednsClientSubnetPolicy"`
-	DisableIPv4Answer          bool                                 `json:"disableIpv4Answer"`
-	DisableIPv6Answer          bool                                 `json:"disableIpv6Answer"`
-	DNSAllowedCIDRs            []string                             `json:"dnsAllowedCidrs"`
-	DNSRateLimitQPS            int                                  `json:"dnsRateLimitQps"`
-	DNSMaxConcurrentQueries    int                                  `json:"dnsMaxConcurrentQueries"`
-	DNSRuntimeState            string                               `json:"dnsRuntimeState,omitempty"`
-	CertificateRecordIDs       []uint                               `json:"certificateRecordIds,omitempty"`
-	CertificateStates          []reverseProxyRenderCertificateState `json:"certificateStates,omitempty"`
-	IPStrategy                 string                               `json:"ipStrategy"`
-	HTTPVersionStrategy        string                               `json:"httpVersionStrategy"`
-	UpstreamTLSVerify          bool                                 `json:"upstreamTlsVerify"`
-	MaxConcurrentConnections   int                                  `json:"maxConcurrentConnections"`
-	MaxConcurrentRequests      int                                  `json:"maxConcurrentRequests"`
-	UpstreamMaxConnections     int                                  `json:"upstreamMaxConnections"`
-	UpstreamMaxIdleConnections int                                  `json:"upstreamMaxIdleConnections"`
-	MemoryLimitBytes           int64                                `json:"memoryLimitBytes"`
-	ApiPassthrough             bool                                 `json:"apiPassthrough"`
+	ID                          uint                                 `json:"id"`
+	ListOrder                   int64                                `json:"listOrder"`
+	Enabled                     bool                                 `json:"enabled"`
+	ListenProtocol              string                               `json:"listenProtocol"`
+	ListenProtocolAlias         string                               `json:"listenProtocolAlias"`
+	ListenHTTPVersionStrategy   string                               `json:"listenHttpVersionStrategy"`
+	ListenPort                  int                                  `json:"listenPort"`
+	ListenCompressionEnabled    bool                                 `json:"listenCompressionEnabled"`
+	ListenCompressionAlgorithms []string                             `json:"listenCompressionAlgorithms"`
+	Hosts                       []string                             `json:"hosts"`
+	PathPrefix                  string                               `json:"pathPrefix"`
+	ListenDNSPath               string                               `json:"listenDnsPath"`
+	TargetProtocol              string                               `json:"targetProtocol"`
+	TargetProtocolAlias         string                               `json:"targetProtocolAlias"`
+	TargetAddresses             []string                             `json:"targetAddresses"`
+	TargetPort                  int                                  `json:"targetPort"`
+	TargetCompressionEnabled    bool                                 `json:"targetCompressionEnabled"`
+	TargetCompressionAlgorithms []string                             `json:"targetCompressionAlgorithms"`
+	TargetPath                  string                               `json:"targetPath"`
+	TargetDNSPath               string                               `json:"targetDnsPath"`
+	AdvertiseHTTP3              bool                                 `json:"advertiseHttp3"`
+	EDNSEnabled                 bool                                 `json:"ednsEnabled"`
+	EDNSMode                    string                               `json:"ednsMode"`
+	EDNSCustomIP                string                               `json:"ednsCustomIp"`
+	EDNSClientSubnetPolicy      string                               `json:"ednsClientSubnetPolicy"`
+	DisableIPv4Answer           bool                                 `json:"disableIpv4Answer"`
+	DisableIPv6Answer           bool                                 `json:"disableIpv6Answer"`
+	DNSAllowedCIDRs             []string                             `json:"dnsAllowedCidrs"`
+	DNSRateLimitQPS             int                                  `json:"dnsRateLimitQps"`
+	DNSMaxConcurrentQueries     int                                  `json:"dnsMaxConcurrentQueries"`
+	DNSRuntimeState             string                               `json:"dnsRuntimeState,omitempty"`
+	CertificateRecordIDs        []uint                               `json:"certificateRecordIds,omitempty"`
+	CertificateStates           []reverseProxyRenderCertificateState `json:"certificateStates,omitempty"`
+	IPStrategy                  string                               `json:"ipStrategy"`
+	HTTPVersionStrategy         string                               `json:"httpVersionStrategy"`
+	UpstreamTLSVerify           bool                                 `json:"upstreamTlsVerify"`
+	MaxConcurrentConnections    int                                  `json:"maxConcurrentConnections"`
+	MaxConcurrentRequests       int                                  `json:"maxConcurrentRequests"`
+	UpstreamMaxConnections      int                                  `json:"upstreamMaxConnections"`
+	UpstreamMaxIdleConnections  int                                  `json:"upstreamMaxIdleConnections"`
+	MemoryLimitBytes            int64                                `json:"memoryLimitBytes"`
+	ApiPassthrough              bool                                 `json:"apiPassthrough"`
 }
 
 type reverseProxyRenderCertificateState struct {
@@ -1083,53 +1105,59 @@ func reverseProxyRulePayloadFromModel(row *model.ReverseProxyRule, enabled bool)
 	upstreamConnections := row.UpstreamMaxConnections
 	upstreamIdleConnections := row.UpstreamMaxIdleConnections
 	memoryLimit := row.MemoryLimitBytes
+	listenCompressionEnabled, listenCompressionAlgorithms := reverseProxyCompressionSettingsFromModel(row.ListenCompressionEnabled, row.ListenCompressionAlgorithms)
+	targetCompressionEnabled, targetCompressionAlgorithms := reverseProxyCompressionSettingsFromModel(row.TargetCompressionEnabled, row.TargetCompressionAlgorithms)
 	payload := ReverseProxyRulePayload{
-		ID:                         row.Id,
-		Name:                       row.Name,
-		Enabled:                    enabled,
-		ListenProtocol:             row.ListenProtocol,
-		ListenProtocolAlias:        row.ListenProtocolAlias,
-		ListenPort:                 row.ListenPort,
-		Hosts:                      strings.Join(reverseProxyRuleServerNames(row), ", "),
-		PathPrefix:                 row.PathPrefix,
-		ListenDNSPath:              row.ListenDNSPath,
-		TargetProtocol:             row.TargetProtocol,
-		TargetProtocolAlias:        row.TargetProtocolAlias,
-		TargetAddresses:            strings.Join(decodeReverseProxyList(row.TargetAddresses), ", "),
-		TargetPort:                 row.TargetPort,
-		TargetPath:                 row.TargetPath,
-		TargetDNSPath:              row.TargetDNSPath,
-		FallbackDNSUpstreams:       row.FallbackDNSUpstreams,
-		DNSUpstreamTimeoutSeconds:  &dnsTimeout,
-		DNSCacheEnabled:            row.DNSCacheEnabled,
-		DNSCacheSizeBytes:          &dnsCacheSize,
-		DNSCacheMinTTL:             row.DNSCacheMinTTL,
-		DNSCacheMaxTTL:             row.DNSCacheMaxTTL,
-		EDNSEnabled:                row.EDNSEnabled,
-		EDNSMode:                   row.EDNSMode,
-		EDNSCustomIP:               row.EDNSCustomIP,
-		EDNSClientSubnetPolicy:     row.EDNSClientSubnetPolicy,
-		DisableIPv4Answer:          row.DisableIPv4Answer,
-		DisableIPv6Answer:          row.DisableIPv6Answer,
-		CertificateRecordIDs:       reverseProxyRuleCertificateIDs(row),
-		CertificateRecordID:        row.CertificateRecordID,
-		ListenHTTPVersionStrategy:  row.ListenHTTPVersionStrategy,
-		IPStrategy:                 row.IPStrategy,
-		HTTPVersionStrategy:        row.HTTPVersionStrategy,
-		UpstreamTLSVerify:          row.UpstreamTLSVerify,
-		DNSAllowedCIDRs:            strings.Join(decodeReverseProxyList(row.DNSAllowedCIDRs), ", "),
-		DNSRateLimitQPS:            &dnsRateLimit,
-		DNSMaxConcurrentQueries:    &dnsConcurrent,
-		MaxConcurrentConnections:   &maxConnections,
-		MaxConcurrentRequests:      &maxRequests,
-		UpstreamMaxConnections:     &upstreamConnections,
-		UpstreamMaxIdleConnections: &upstreamIdleConnections,
-		MemoryLimitBytes:           &memoryLimit,
-		ApiPassthrough:             row.ApiPassthrough,
-		AdvertiseHTTP3:             row.AdvertiseHTTP3,
-		Remark:                     row.Remark,
-		upstreamTLSVerifySet:       true,
-		upstreamTLSVerifyDecoded:   true,
+		ID:                          row.Id,
+		Name:                        row.Name,
+		Enabled:                     enabled,
+		ListenProtocol:              row.ListenProtocol,
+		ListenProtocolAlias:         row.ListenProtocolAlias,
+		ListenPort:                  row.ListenPort,
+		ListenCompressionEnabled:    &listenCompressionEnabled,
+		ListenCompressionAlgorithms: listenCompressionAlgorithms,
+		Hosts:                       strings.Join(reverseProxyRuleServerNames(row), ", "),
+		PathPrefix:                  row.PathPrefix,
+		ListenDNSPath:               row.ListenDNSPath,
+		TargetProtocol:              row.TargetProtocol,
+		TargetProtocolAlias:         row.TargetProtocolAlias,
+		TargetAddresses:             strings.Join(decodeReverseProxyList(row.TargetAddresses), ", "),
+		TargetPort:                  row.TargetPort,
+		TargetCompressionEnabled:    &targetCompressionEnabled,
+		TargetCompressionAlgorithms: targetCompressionAlgorithms,
+		TargetPath:                  row.TargetPath,
+		TargetDNSPath:               row.TargetDNSPath,
+		FallbackDNSUpstreams:        row.FallbackDNSUpstreams,
+		DNSUpstreamTimeoutSeconds:   &dnsTimeout,
+		DNSCacheEnabled:             row.DNSCacheEnabled,
+		DNSCacheSizeBytes:           &dnsCacheSize,
+		DNSCacheMinTTL:              row.DNSCacheMinTTL,
+		DNSCacheMaxTTL:              row.DNSCacheMaxTTL,
+		EDNSEnabled:                 row.EDNSEnabled,
+		EDNSMode:                    row.EDNSMode,
+		EDNSCustomIP:                row.EDNSCustomIP,
+		EDNSClientSubnetPolicy:      row.EDNSClientSubnetPolicy,
+		DisableIPv4Answer:           row.DisableIPv4Answer,
+		DisableIPv6Answer:           row.DisableIPv6Answer,
+		CertificateRecordIDs:        reverseProxyRuleCertificateIDs(row),
+		CertificateRecordID:         row.CertificateRecordID,
+		ListenHTTPVersionStrategy:   row.ListenHTTPVersionStrategy,
+		IPStrategy:                  row.IPStrategy,
+		HTTPVersionStrategy:         row.HTTPVersionStrategy,
+		UpstreamTLSVerify:           row.UpstreamTLSVerify,
+		DNSAllowedCIDRs:             strings.Join(decodeReverseProxyList(row.DNSAllowedCIDRs), ", "),
+		DNSRateLimitQPS:             &dnsRateLimit,
+		DNSMaxConcurrentQueries:     &dnsConcurrent,
+		MaxConcurrentConnections:    &maxConnections,
+		MaxConcurrentRequests:       &maxRequests,
+		UpstreamMaxConnections:      &upstreamConnections,
+		UpstreamMaxIdleConnections:  &upstreamIdleConnections,
+		MemoryLimitBytes:            &memoryLimit,
+		ApiPassthrough:              row.ApiPassthrough,
+		AdvertiseHTTP3:              row.AdvertiseHTTP3,
+		Remark:                      row.Remark,
+		upstreamTLSVerifySet:        true,
+		upstreamTLSVerifyDecoded:    true,
 	}
 	return payload
 }
@@ -1374,6 +1402,8 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 		row.ListenProtocol = normalized.listenProtocol
 		row.ListenProtocolAlias = normalized.listenProtocolAlias
 		row.ListenPort = normalized.listenPort
+		row.ListenCompressionEnabled = normalized.listenCompressionEnabled
+		row.ListenCompressionAlgorithms = reverseProxyCompressionStorageValue(normalized.listenCompressionEnabled, normalized.listenCompressionAlgorithms)
 		row.HostList = encodeReverseProxyList(normalized.hosts)
 		row.PathPrefix = normalized.pathPrefix
 		row.ListenDNSPath = normalized.listenDNSPath
@@ -1381,6 +1411,8 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 		row.TargetProtocolAlias = normalized.targetProtocolAlias
 		row.TargetAddresses = encodeReverseProxyList(normalized.targetAddresses)
 		row.TargetPort = normalized.targetPort
+		row.TargetCompressionEnabled = normalized.targetCompressionEnabled
+		row.TargetCompressionAlgorithms = reverseProxyCompressionStorageValue(normalized.targetCompressionEnabled, normalized.targetCompressionAlgorithms)
 		row.TargetPath = normalized.targetPath
 		row.TargetDNSPath = normalized.targetDNSPath
 		row.FallbackDNSUpstreams = normalized.fallbackDNSUpstreams
@@ -1964,21 +1996,37 @@ func buildReverseProxyRuleView(row *model.ReverseProxyRule, certMap map[uint]Rev
 	hosts := reverseProxyRuleServerNames(row)
 	certIDs := reverseProxyRuleCertificateIDs(row)
 	view = ReverseProxyRuleView{
-		ID:                         row.Id,
-		DisplayID:                  row.DisplayID,
-		ListOrder:                  row.ListOrder,
-		Name:                       strings.TrimSpace(row.Name),
-		Enabled:                    row.Enabled,
-		ListenProtocol:             strings.TrimSpace(row.ListenProtocol),
-		ListenProtocolAlias:        strings.TrimSpace(row.ListenProtocolAlias),
-		ListenPort:                 row.ListenPort,
-		Hosts:                      hosts,
-		PathPrefix:                 strings.TrimSpace(row.PathPrefix),
-		ListenDNSPath:              strings.TrimSpace(row.ListenDNSPath),
-		TargetProtocol:             strings.TrimSpace(row.TargetProtocol),
-		TargetProtocolAlias:        strings.TrimSpace(row.TargetProtocolAlias),
-		TargetAddresses:            decodeReverseProxyList(row.TargetAddresses),
-		TargetPort:                 row.TargetPort,
+		ID:                  row.Id,
+		DisplayID:           row.DisplayID,
+		ListOrder:           row.ListOrder,
+		Name:                strings.TrimSpace(row.Name),
+		Enabled:             row.Enabled,
+		ListenProtocol:      strings.TrimSpace(row.ListenProtocol),
+		ListenProtocolAlias: strings.TrimSpace(row.ListenProtocolAlias),
+		ListenPort:          row.ListenPort,
+		ListenCompressionEnabled: func() bool {
+			enabled, _ := reverseProxyCompressionSettingsFromModel(row.ListenCompressionEnabled, row.ListenCompressionAlgorithms)
+			return enabled
+		}(),
+		ListenCompressionAlgorithms: func() []string {
+			_, values := reverseProxyCompressionSettingsFromModel(row.ListenCompressionEnabled, row.ListenCompressionAlgorithms)
+			return values
+		}(),
+		Hosts:               hosts,
+		PathPrefix:          strings.TrimSpace(row.PathPrefix),
+		ListenDNSPath:       strings.TrimSpace(row.ListenDNSPath),
+		TargetProtocol:      strings.TrimSpace(row.TargetProtocol),
+		TargetProtocolAlias: strings.TrimSpace(row.TargetProtocolAlias),
+		TargetAddresses:     decodeReverseProxyList(row.TargetAddresses),
+		TargetPort:          row.TargetPort,
+		TargetCompressionEnabled: func() bool {
+			enabled, _ := reverseProxyCompressionSettingsFromModel(row.TargetCompressionEnabled, row.TargetCompressionAlgorithms)
+			return enabled
+		}(),
+		TargetCompressionAlgorithms: func() []string {
+			_, values := reverseProxyCompressionSettingsFromModel(row.TargetCompressionEnabled, row.TargetCompressionAlgorithms)
+			return values
+		}(),
 		TargetPath:                 strings.TrimSpace(row.TargetPath),
 		TargetDNSPath:              strings.TrimSpace(row.TargetDNSPath),
 		FallbackDNSUpstreams:       strings.TrimSpace(row.FallbackDNSUpstreams),
@@ -2062,6 +2110,8 @@ func reverseProxyRulePersistenceMap(row *model.ReverseProxyRule) map[string]inte
 		"listen_protocol":               row.ListenProtocol,
 		"listen_protocol_alias":         row.ListenProtocolAlias,
 		"listen_port":                   row.ListenPort,
+		"listen_compression_enabled":    row.ListenCompressionEnabled,
+		"listen_compression_algorithms": row.ListenCompressionAlgorithms,
 		"host_list":                     row.HostList,
 		"path_prefix":                   row.PathPrefix,
 		"listen_dns_path":               row.ListenDNSPath,
@@ -2069,6 +2119,8 @@ func reverseProxyRulePersistenceMap(row *model.ReverseProxyRule) map[string]inte
 		"target_protocol_alias":         row.TargetProtocolAlias,
 		"target_addresses":              row.TargetAddresses,
 		"target_port":                   row.TargetPort,
+		"target_compression_enabled":    row.TargetCompressionEnabled,
+		"target_compression_algorithms": row.TargetCompressionAlgorithms,
 		"target_path":                   row.TargetPath,
 		"target_dns_path":               row.TargetDNSPath,
 		"fallback_dns_upstreams":        row.FallbackDNSUpstreams,
@@ -2233,31 +2285,51 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 	listenNameInput := strings.TrimSpace(payload.Hosts)
 	listenProtocolAliasInput := strings.ToLower(strings.TrimSpace(payload.ListenProtocolAlias))
 	targetProtocolAliasInput := strings.ToLower(strings.TrimSpace(payload.TargetProtocolAlias))
+	listenCompressionEnabled := reverseProxyPayloadCompressionEnabled(payload.ListenCompressionEnabled)
+	listenCompressionAlgorithms, compressionErr := normalizeReverseProxyCompressionAlgorithms(payload.ListenCompressionAlgorithms)
+	if compressionErr != nil {
+		return reverseProxyNormalizedRule{}, compressionErr
+	}
+	targetCompressionEnabled := reverseProxyPayloadCompressionEnabled(payload.TargetCompressionEnabled)
+	targetCompressionAlgorithms, compressionErr := normalizeReverseProxyCompressionAlgorithms(payload.TargetCompressionAlgorithms)
+	if compressionErr != nil {
+		return reverseProxyNormalizedRule{}, compressionErr
+	}
+	if !listenCompressionEnabled {
+		listenCompressionAlgorithms = []string{}
+	}
+	if !targetCompressionEnabled {
+		targetCompressionAlgorithms = []string{}
+	}
 	normalized := reverseProxyNormalizedRule{
-		id:                         payload.ID,
-		name:                       strings.TrimSpace(payload.Name),
-		enabled:                    payload.Enabled,
-		listenPort:                 payload.ListenPort,
-		targetPort:                 payload.TargetPort,
-		maxConcurrentConnections:   maxConcurrentConnections,
-		maxConcurrentRequests:      maxConcurrentRequests,
-		upstreamMaxConnections:     upstreamMaxConnections,
-		upstreamMaxIdleConnections: upstreamMaxIdleConnections,
-		memoryLimitBytes:           memoryLimitBytes,
-		apiPassthrough:             payload.ApiPassthrough,
-		advertiseHTTP3:             payload.AdvertiseHTTP3,
-		remark:                     strings.TrimSpace(payload.Remark),
-		fallbackDNSUpstreams:       normalizeReverseProxyDNSUpstreamsText(payload.FallbackDNSUpstreams),
-		dnsUpstreamTimeoutSeconds:  dnsUpstreamTimeoutSeconds,
-		dnsCacheEnabled:            payload.DNSCacheEnabled,
-		dnsCacheSizeBytes:          dnsCacheSizeBytes,
-		dnsCacheMinTTL:             payload.DNSCacheMinTTL,
-		dnsCacheMaxTTL:             payload.DNSCacheMaxTTL,
-		dnsRateLimitQPS:            dnsRateLimitQPS,
-		dnsMaxConcurrentQueries:    dnsMaxConcurrentQueries,
-		ednsEnabled:                payload.EDNSEnabled,
-		disableIPv4Answer:          payload.DisableIPv4Answer,
-		disableIPv6Answer:          payload.DisableIPv6Answer,
+		id:                          payload.ID,
+		name:                        strings.TrimSpace(payload.Name),
+		enabled:                     payload.Enabled,
+		listenPort:                  payload.ListenPort,
+		listenCompressionEnabled:    listenCompressionEnabled,
+		listenCompressionAlgorithms: listenCompressionAlgorithms,
+		targetPort:                  payload.TargetPort,
+		targetCompressionEnabled:    targetCompressionEnabled,
+		targetCompressionAlgorithms: targetCompressionAlgorithms,
+		maxConcurrentConnections:    maxConcurrentConnections,
+		maxConcurrentRequests:       maxConcurrentRequests,
+		upstreamMaxConnections:      upstreamMaxConnections,
+		upstreamMaxIdleConnections:  upstreamMaxIdleConnections,
+		memoryLimitBytes:            memoryLimitBytes,
+		apiPassthrough:              payload.ApiPassthrough,
+		advertiseHTTP3:              payload.AdvertiseHTTP3,
+		remark:                      strings.TrimSpace(payload.Remark),
+		fallbackDNSUpstreams:        normalizeReverseProxyDNSUpstreamsText(payload.FallbackDNSUpstreams),
+		dnsUpstreamTimeoutSeconds:   dnsUpstreamTimeoutSeconds,
+		dnsCacheEnabled:             payload.DNSCacheEnabled,
+		dnsCacheSizeBytes:           dnsCacheSizeBytes,
+		dnsCacheMinTTL:              payload.DNSCacheMinTTL,
+		dnsCacheMaxTTL:              payload.DNSCacheMaxTTL,
+		dnsRateLimitQPS:             dnsRateLimitQPS,
+		dnsMaxConcurrentQueries:     dnsMaxConcurrentQueries,
+		ednsEnabled:                 payload.EDNSEnabled,
+		disableIPv4Answer:           payload.DisableIPv4Answer,
+		disableIPv6Answer:           payload.DisableIPv6Answer,
 	}
 	if normalized.name == "" {
 		normalized.name = buildReverseProxyDefaultName(payload.ListenProtocol, listenNameInput, payload.ListenPort, payload.PathPrefix)
@@ -2278,6 +2350,14 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 	normalized.targetProtocol = targetProtocol
 	normalized.listenProtocolAlias = normalizeReverseProxyProtocolAlias(listenProtocolAliasInput, listenProtocolInput)
 	normalized.targetProtocolAlias = normalizeReverseProxyProtocolAlias(targetProtocolAliasInput, targetProtocolInput)
+	if !reverseProxyProtocolSupportsCompression(normalized.listenProtocol, normalized.listenProtocolAlias) {
+		normalized.listenCompressionEnabled = false
+		normalized.listenCompressionAlgorithms = []string{}
+	}
+	if !reverseProxyProtocolSupportsCompression(normalized.targetProtocol, normalized.targetProtocolAlias) {
+		normalized.targetCompressionEnabled = false
+		normalized.targetCompressionAlgorithms = []string{}
+	}
 	normalized.listenDNSPath = normalizeReverseProxyDNSPath(payload.ListenDNSPath)
 	normalized.targetDNSPath = normalizeReverseProxyDNSPath(payload.TargetDNSPath)
 	if normalized.listenDNSPath == "" {
@@ -4860,19 +4940,35 @@ func computeReverseProxyRenderKeyWithCertificateState(rows []model.ReverseProxyR
 			}
 		}
 		snapshot = append(snapshot, reverseProxyRenderRule{
-			ID:                     row.Id,
-			ListOrder:              row.ListOrder,
-			Enabled:                row.Enabled,
-			ListenProtocol:         listenProtocol,
-			ListenProtocolAlias:    listenAlias,
-			ListenPort:             row.ListenPort,
-			Hosts:                  reverseProxyRuleServerNames(&row),
-			PathPrefix:             normalizeReverseProxyPath(row.PathPrefix, false),
-			ListenDNSPath:          normalizeReverseProxyDNSPath(row.ListenDNSPath),
-			TargetProtocol:         targetProtocol,
-			TargetProtocolAlias:    targetAlias,
-			TargetAddresses:        decodeReverseProxyList(row.TargetAddresses),
-			TargetPort:             row.TargetPort,
+			ID:                  row.Id,
+			ListOrder:           row.ListOrder,
+			Enabled:             row.Enabled,
+			ListenProtocol:      listenProtocol,
+			ListenProtocolAlias: listenAlias,
+			ListenPort:          row.ListenPort,
+			ListenCompressionEnabled: func() bool {
+				enabled, _ := reverseProxyCompressionSettingsFromModel(row.ListenCompressionEnabled, row.ListenCompressionAlgorithms)
+				return enabled
+			}(),
+			ListenCompressionAlgorithms: func() []string {
+				_, values := reverseProxyCompressionSettingsFromModel(row.ListenCompressionEnabled, row.ListenCompressionAlgorithms)
+				return values
+			}(),
+			Hosts:               reverseProxyRuleServerNames(&row),
+			PathPrefix:          normalizeReverseProxyPath(row.PathPrefix, false),
+			ListenDNSPath:       normalizeReverseProxyDNSPath(row.ListenDNSPath),
+			TargetProtocol:      targetProtocol,
+			TargetProtocolAlias: targetAlias,
+			TargetAddresses:     decodeReverseProxyList(row.TargetAddresses),
+			TargetPort:          row.TargetPort,
+			TargetCompressionEnabled: func() bool {
+				enabled, _ := reverseProxyCompressionSettingsFromModel(row.TargetCompressionEnabled, row.TargetCompressionAlgorithms)
+				return enabled
+			}(),
+			TargetCompressionAlgorithms: func() []string {
+				_, values := reverseProxyCompressionSettingsFromModel(row.TargetCompressionEnabled, row.TargetCompressionAlgorithms)
+				return values
+			}(),
 			TargetPath:             normalizeReverseProxyPath(row.TargetPath, false),
 			TargetDNSPath:          normalizeReverseProxyDNSPath(row.TargetDNSPath),
 			AdvertiseHTTP3:         row.AdvertiseHTTP3,
@@ -7673,19 +7769,9 @@ func reverseProxyApplyBoundedBodyReplacements(body []byte, replacements []revers
 }
 
 func (g *reverseProxyListenerGroup) forwardRequest(w http.ResponseWriter, r *http.Request, rule *model.ReverseProxyRule, altSvc string) {
-	if decoded, err := reverseProxyPrepareRequestCompression(r, reverseProxyEffectiveRuleMemoryLimit(rule)); err != nil {
-		status := http.StatusBadRequest
-		if errors.Is(err, compressionalgorithm.ErrUnsupportedEncoding) {
-			status = http.StatusUnsupportedMediaType
-			// RFC 7694 uses Accept-Encoding on a 415 response to tell the
-			// client which request content codings this endpoint accepts.
-			w.Header().Set("Accept-Encoding", compressionalgorithm.UpstreamAcceptEncoding())
-		}
-		http.Error(w, http.StatusText(status), status)
-		return
-	} else if decoded {
-		defer r.Body.Close()
-	}
+	// Keep the incoming HTTP entity opaque.  Compression is a representation
+	// negotiation concern; it must not silently consume or rebuild request
+	// bodies before the URL-only proxy transformation is applied.
 	targetURL, transportBundle, err := g.buildUpstream(rule, r.Context())
 	if err != nil {
 		reverseProxyRuntime.reportRuleState(rule.Id, "upstream_error", err.Error())
@@ -7762,12 +7848,18 @@ func (g *reverseProxyListenerGroup) forwardRequest(w http.ResponseWriter, r *htt
 		} {
 			req.Header.Del(header)
 		}
-		if bodyRewriteEnabled || req.Method == http.MethodHead || req.Header.Get("Range") != "" || reverseProxyIsWebSocketUpgradeRequest(r) {
-			req.Header.Set("Accept-Encoding", "identity")
+		targetAcceptEncoding := reverseProxyTargetAcceptEncoding(rule)
+		if rule.ApiPassthrough {
+			// API passthrough preserves the caller's representation contract.
+			// The request body and its Content-Encoding are forwarded unchanged.
+		} else if bodyRewriteEnabled || req.Method == http.MethodHead || req.Header.Get("Range") != "" || reverseProxyIsWebSocketUpgradeRequest(r) {
+			if targetAcceptEncoding == "" {
+				req.Header.Del("Accept-Encoding")
+			} else {
+				req.Header.Set("Accept-Encoding", "identity")
+			}
 		} else {
-			// API passthrough skips body rewriting, but target-side content
-			// negotiation still follows the project's fixed algorithm order.
-			req.Header.Set("Accept-Encoding", compressionalgorithm.UpstreamAcceptEncoding())
+			setReverseProxyAcceptEncoding(req.Header, targetAcceptEncoding)
 		}
 		forwardedScheme := reverseProxyRequestScheme(r, rule.ListenProtocol)
 		clientIP := extractRemoteIP(r.RemoteAddr)
@@ -7780,11 +7872,16 @@ func (g *reverseProxyListenerGroup) forwardRequest(w http.ResponseWriter, r *htt
 		// after Director returns.  Setting it here would duplicate that address.
 	}
 	reverseProxyRuntime.reportRuleState(rule.Id, "running", "")
+	listenCompressionEnabled, _ := reverseProxyListenCompressionOptions(rule)
 	compressedWriter := compressionalgorithm.NewHTTPResponseWriter(w, compressionalgorithm.HTTPResponseOptions{
 		Request: r,
 		Level:   reverseProxyCompressionLevel,
-		Enabled: true,
+		Enabled: listenCompressionEnabled,
 		MinSize: compressionalgorithm.DefaultMinimumResponseSize,
+		AllowedAlgorithms: func() []compressionalgorithm.Algorithm {
+			_, values := reverseProxyListenCompressionOptions(rule)
+			return values
+		}(),
 	})
 	defer compressedWriter.Close()
 	proxy.ServeHTTP(compressedWriter, r)

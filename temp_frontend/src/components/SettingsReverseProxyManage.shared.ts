@@ -59,6 +59,16 @@ export const reverseProxyCopy = {
   targetProtocol: '目标协议',
   targetAddresses: '目标地址/域名',
   targetAddressesPlaceholder: '1.1.1.1, example.com, 2606:4700:4700::1111',
+  compressionEnabled: '启用压缩算法请求头',
+  compressionAlgorithms: '压缩算法',
+  compressionHint: '仅控制 Accept-Encoding 请求头的生成，不改变后台支持的解码和编码能力。关闭后不生成此请求头。',
+  compressionDisabled: '关闭',
+  compressionZstd: 'zstd',
+  compressionS2: 's2',
+  compressionSnappy: 'snappy',
+  compressionBr: 'br',
+  compressionDeflate: 'deflate',
+  compressionGzip: 'gzip',
   targetPort: '目标端口',
   targetPath: '目标基础路径',
   targetDnsPath: '目标 DNS URL 路径',
@@ -204,6 +214,17 @@ export const reverseProxyCopy = {
   runtimeHint: '当请求没有命中任何规则时，HTTP 返回 404；HTTPS 的 SNI 或 Host 不匹配返回 421。',
   pathPrefixStrictHint: '填写 888 会保存为 /888；只有 /888 或 /888/后续目标路径会命中，/8888 不会命中。',
 }
+
+export const reverseProxyCompressionItems = [
+  { title: reverseProxyCopy.compressionZstd, value: 'zstd' },
+  { title: reverseProxyCopy.compressionS2, value: 's2' },
+  { title: reverseProxyCopy.compressionSnappy, value: 'snappy' },
+  { title: reverseProxyCopy.compressionBr, value: 'br' },
+  { title: reverseProxyCopy.compressionDeflate, value: 'deflate' },
+  { title: reverseProxyCopy.compressionGzip, value: 'gzip' },
+] as const
+
+const reverseProxyCompressionOrder = reverseProxyCompressionItems.map(item => item.value)
 export const reverseProxyHeaders = [
   { title: 'ID', key: 'displayId', sortable: false, width: 72 },
   { title: reverseProxyCopy.orderLabel, key: 'listOrder', sortable: false, width: 72 },
@@ -304,12 +325,16 @@ export const createEmptyReverseProxyRuleForm = (): ReverseProxyRuleForm => ({
   enabled: true,
   listenProtocol: 'http',
   listenPort: 80,
+  listenCompressionEnabled: true,
+  listenCompressionAlgorithms: [...reverseProxyCompressionOrder],
   hostsText: '',
   pathPrefix: '',
   listenDnsPath: '/dns-query',
   targetProtocol: 'http',
   targetAddressesText: '',
   targetPort: 80,
+  targetCompressionEnabled: true,
+  targetCompressionAlgorithms: [...reverseProxyCompressionOrder],
   targetPath: '',
   targetDnsPath: '/dns-query',
   fallbackDnsUpstreams: '',
@@ -361,6 +386,22 @@ const asString = (value: unknown, fallback = '') => {
   if (typeof value === 'string') return value
   if (value == null) return fallback
   return String(value)
+}
+
+const normalizeCompressionAlgorithms = (value: unknown) => {
+  if (!Array.isArray(value)) return [...reverseProxyCompressionOrder]
+  const selected = new Set(value.map(item => asString(item).trim().toLowerCase()))
+  return reverseProxyCompressionOrder.filter(item => selected.has(item))
+}
+
+const protocolSupportsCompression = (value: string) => {
+  const normalized = value.trim().toLowerCase()
+  return normalized === 'http'
+    || normalized === 'https'
+    || normalized === 'h2'
+    || normalized === 'h3'
+    || normalized === 'dns_doh'
+    || normalized === 'dns_doh3'
 }
 
 const asBoolean = (value: unknown, fallback = false) => {
@@ -501,12 +542,16 @@ const normalizeRule = (value: unknown): ReverseProxyRule => {
     enabled: asBoolean(item.enabled, true),
     listenProtocol: deriveListenProtocolForForm(listenProtocolRaw, listenHttpVersionStrategy, listenProtocolAliasRaw),
     listenPort: asNumber(item.listenPort),
+    listenCompressionEnabled: asBoolean(item.listenCompressionEnabled, true),
+    listenCompressionAlgorithms: normalizeCompressionAlgorithms(item.listenCompressionAlgorithms),
     hosts: normalizeStringList(item.hosts),
     pathPrefix: asString(item.pathPrefix),
     listenDnsPath: asString(item.listenDnsPath),
     targetProtocol: deriveTargetProtocolForForm(targetProtocolRaw, httpVersionStrategy, targetProtocolAliasRaw),
     targetAddresses: normalizeStringList(item.targetAddresses),
     targetPort: asNumber(item.targetPort),
+    targetCompressionEnabled: asBoolean(item.targetCompressionEnabled, true),
+    targetCompressionAlgorithms: normalizeCompressionAlgorithms(item.targetCompressionAlgorithms),
     targetPath: asString(item.targetPath),
     targetDnsPath: asString(item.targetDnsPath),
     fallbackDnsUpstreams: asString(item.fallbackDnsUpstreams),
@@ -924,12 +969,16 @@ export const mapRuleToForm = (rule?: ReverseProxyRule): ReverseProxyRuleForm => 
     enabled: rule?.enabled ?? true,
     listenProtocol,
     listenPort: rule?.listenPort ?? 80,
+    listenCompressionEnabled: rule?.listenCompressionEnabled ?? true,
+    listenCompressionAlgorithms: normalizeCompressionAlgorithms(rule?.listenCompressionAlgorithms),
     hostsText: normalizeStringList(rule?.hosts ?? []).join(', '),
     pathPrefix: rule?.pathPrefix ?? '',
     listenDnsPath: rule?.listenDnsPath ?? (dnsProtocolUsesPath(listenProtocol) ? '/dns-query' : ''),
     targetProtocol,
     targetAddressesText: (rule?.targetAddresses ?? []).join(', '),
     targetPort: rule?.targetPort ?? 80,
+    targetCompressionEnabled: rule?.targetCompressionEnabled ?? true,
+    targetCompressionAlgorithms: normalizeCompressionAlgorithms(rule?.targetCompressionAlgorithms),
     targetPath: rule?.targetPath ?? '',
     targetDnsPath: rule?.targetDnsPath ?? (dnsProtocolUsesPath(targetProtocol) ? '/dns-query' : ''),
     fallbackDnsUpstreams: rule?.fallbackDnsUpstreams ?? '',
@@ -1007,6 +1056,10 @@ export const buildReverseProxyPayload = (
     normalizeNumberList(form.certificateRecordIds),
     certificates,
   )
+  const listenCompressionSupported = protocolSupportsCompression(form.listenProtocol)
+  const targetCompressionSupported = protocolSupportsCompression(form.targetProtocol)
+  const listenCompressionEnabled = listenCompressionSupported && form.listenCompressionEnabled !== false
+  const targetCompressionEnabled = targetCompressionSupported && form.targetCompressionEnabled !== false
   return {
     id: form.id,
     name,
@@ -1014,6 +1067,10 @@ export const buildReverseProxyPayload = (
     listenProtocol: listenProtocol.listenProtocol,
     listenProtocolAlias: listenProtocol.listenProtocolAlias || listenProtocolAlias,
     listenPort: asNumber(form.listenPort),
+    listenCompressionEnabled,
+    listenCompressionAlgorithms: listenCompressionEnabled
+      ? normalizeCompressionAlgorithms(form.listenCompressionAlgorithms)
+      : [],
     hosts: (!protocolIsDNS(form.listenProtocol) || protocolNeedsCertificates(form.listenProtocol)) ? listenNames.join(', ') : '',
     pathPrefix: normalizePathInput(pathPrefix, true),
     listenDnsPath: dnsProtocolUsesPath(form.listenProtocol) ? normalizePathInput(listenDnsPath, true) : '',
@@ -1021,6 +1078,10 @@ export const buildReverseProxyPayload = (
     targetProtocolAlias: targetProtocol.targetProtocolAlias || targetProtocolAlias,
     targetAddresses: targetAddressesText,
     targetPort: asNumber(form.targetPort),
+    targetCompressionEnabled,
+    targetCompressionAlgorithms: targetCompressionEnabled
+      ? normalizeCompressionAlgorithms(form.targetCompressionAlgorithms)
+      : [],
     targetPath: normalizePathInput(targetPath, true),
     targetDnsPath: dnsProtocolUsesPath(form.targetProtocol) ? normalizePathInput(targetDnsPath, true) : '',
     fallbackDnsUpstreams: protocolIsDNS(form.listenProtocol) && protocolIsDNS(form.targetProtocol) ? fallbackDnsUpstreams : '',
@@ -1643,6 +1704,8 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   const listenIsDNS = computed(() => protocolIsDNS(editingRule.value.listenProtocol))
   const listenIsPlainDNS = computed(() => editingRule.value.listenProtocol === 'dns_udp' || editingRule.value.listenProtocol === 'dns_tcp')
   const targetIsDNS = computed(() => protocolIsDNS(editingRule.value.targetProtocol))
+  const listenCompressionVisible = computed(() => protocolSupportsCompression(editingRule.value.listenProtocol))
+  const targetCompressionVisible = computed(() => protocolSupportsCompression(editingRule.value.targetProtocol))
   const hasPreviewProtocol = computed(() => {
     return false
   })
@@ -1727,10 +1790,17 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     const value = nextValue.trim().toLowerCase()
     const previous = editingRule.value.listenProtocol
     if (!value || value === previous) return
+    const enteringCompressionSupportedProtocol = !protocolSupportsCompression(previous) && protocolSupportsCompression(value)
     const previousPort = defaultProtocolPort(previous)
     const shouldApplyDefaultPort = !editingRule.value.listenPort || editingRule.value.listenPort === previousPort
     editingRule.value.listenProtocol = value as ReverseProxyRuleForm['listenProtocol']
     editingRule.value.listenHttpVersionStrategy = mapListenProtocolToBackend(value).listenHttpVersionStrategy
+    if (enteringCompressionSupportedProtocol
+      && !editingRule.value.listenCompressionEnabled
+      && editingRule.value.listenCompressionAlgorithms.length === 0) {
+      editingRule.value.listenCompressionEnabled = true
+      editingRule.value.listenCompressionAlgorithms = [...reverseProxyCompressionOrder]
+    }
     if (protocolIsDNS(value)) {
       editingRule.value.pathPrefix = ''
       editingRule.value.apiPassthrough = true
@@ -1788,9 +1858,16 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     const value = nextValue.trim().toLowerCase()
     const previous = editingRule.value.targetProtocol
     if (!value || value === previous) return
+    const enteringCompressionSupportedProtocol = !protocolSupportsCompression(previous) && protocolSupportsCompression(value)
     const previousPort = defaultProtocolPort(previous)
     const shouldApplyDefaultPort = !editingRule.value.targetPort || editingRule.value.targetPort === previousPort
     editingRule.value.targetProtocol = value as ReverseProxyRuleForm['targetProtocol']
+    if (enteringCompressionSupportedProtocol
+      && !editingRule.value.targetCompressionEnabled
+      && editingRule.value.targetCompressionAlgorithms.length === 0) {
+      editingRule.value.targetCompressionEnabled = true
+      editingRule.value.targetCompressionAlgorithms = [...reverseProxyCompressionOrder]
+    }
     if (protocolIsDNS(value)) {
       editingRule.value.httpVersionStrategy = ''
       editingRule.value.upstreamTlsVerify = protocolIsTLS(value)
@@ -1890,6 +1967,8 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     listenIsDNS,
     listenIsPlainDNS,
     targetIsDNS,
+    listenCompressionVisible,
+    targetCompressionVisible,
     targetVersionConfigurable,
     listenCanAdvertiseHTTP3,
     hasPreviewProtocol,

@@ -17,20 +17,24 @@ import (
 )
 
 const (
-	// Subscription extensions are parsed and rendered for every uncached
-	// subscription request. Keep the stored source small enough that a burst of
-	// different subscription requests cannot create an excessive heap peak.
-	SubscriptionExtensionMaxBytes      = 4 * 1024 * 1024
-	SubscriptionClashExtensionMaxBytes = 1 * 1024 * 1024
+	// Both extension sources are parsed and rendered on demand. Keep an
+	// explicit 100 MiB UTF-8 bound so large historical rule sets can render.
+	SubscriptionExtensionMaxBytes      = 100 * 1024 * 1024
+	SubscriptionClashExtensionMaxBytes = 100 * 1024 * 1024
 
 	SubscriptionClashLatencyTestMinIntervalSeconds  = 30
 	SubscriptionClashRuleProviderMinIntervalSeconds = 60 * 60
-	SubscriptionClashMaxRuleProviders               = 128
+	SubscriptionClashMaxRuleProviders               = 800
 	SubscriptionClashMaxRules                       = 2048
-	SubscriptionClashMaxEditorRuleRows              = 64
-	SubscriptionClashMaxEditorRowValues             = 24
-	SubscriptionClashMaxEditorDNSRows               = 64
-	SubscriptionClashMaxEditorDNSSuffixRows         = 32
+	SubscriptionClashMaxEditorRuleRows              = 800
+	SubscriptionClashMaxEditorRowValues             = 800
+	SubscriptionClashMaxEditorDNSRows               = 800
+	SubscriptionClashMaxEditorDNSSuffixRows         = 800
+
+	SubscriptionJSONMaxEditorRuleRows   = 800
+	SubscriptionJSONMaxEditorDNSRows    = 800
+	SubscriptionJSONMaxEditorRowValues  = 800
+	SubscriptionJSONMaxEditorValueBytes = 100 * 1024 * 1024
 )
 
 const SubscriptionJSONBaseConfig = `{
@@ -460,10 +464,76 @@ func validateSubJSONExtension(root map[string]interface{}) error {
 			return err
 		}
 	}
+	if err := validateJSONEditorResourceBounds(root["_uiConfig"]); err != nil {
+		return err
+	}
 	if err := validateUIRuleSetSources(root["_uiConfig"], "ruleRows", "json", "ruleSetSource"); err != nil {
 		return err
 	}
 	return validateUIRuleNameConflicts(root["_uiConfig"], "ruleRows")
+}
+
+func validateJSONEditorResourceBounds(raw interface{}) error {
+	ui, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	if err := validateJSONEditorRows(ui, "ruleRows", SubscriptionJSONMaxEditorRuleRows); err != nil {
+		return err
+	}
+	if err := validateJSONEditorRows(ui, "customRuleRows", SubscriptionJSONMaxEditorRuleRows); err != nil {
+		return err
+	}
+	return validateJSONEditorRows(ui, "dnsRouteRows", SubscriptionJSONMaxEditorDNSRows)
+}
+
+func validateJSONEditorRows(ui map[string]interface{}, key string, maximumRows int) error {
+	rawRows, exists := ui[key]
+	if !exists {
+		return nil
+	}
+	rows, ok := rawRows.([]interface{})
+	if !ok {
+		return nil
+	}
+	if len(rows) > maximumRows {
+		return common.NewErrorf("JSON _uiConfig.%s 最多允许 %d 行", key, maximumRows)
+	}
+	for index, rawRow := range rows {
+		row, ok := rawRow.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		for _, valueKey := range []string{"values", "ruleSet", "rule_set"} {
+			rawValues, exists := row[valueKey]
+			if !exists {
+				continue
+			}
+			if err := validateJSONEditorValues(rawValues, fmt.Sprintf("JSON _uiConfig.%s[%d].%s", key, index, valueKey)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateJSONEditorValues(raw interface{}, label string) error {
+	values, ok := raw.([]interface{})
+	if !ok {
+		if value, isString := raw.(string); isString && len([]byte(value)) > SubscriptionJSONMaxEditorValueBytes {
+			return common.NewErrorf("%s 超过 %d 字节限制", label, SubscriptionJSONMaxEditorValueBytes)
+		}
+		return nil
+	}
+	if len(values) > SubscriptionJSONMaxEditorRowValues {
+		return common.NewErrorf("%s 最多允许 %d 项", label, SubscriptionJSONMaxEditorRowValues)
+	}
+	for index, value := range values {
+		if text, isString := value.(string); isString && len([]byte(text)) > SubscriptionJSONMaxEditorValueBytes {
+			return common.NewErrorf("%s[%d] 超过 %d 字节限制", label, index, SubscriptionJSONMaxEditorValueBytes)
+		}
+	}
+	return nil
 }
 
 func validateSubJSONDNSServers(dns map[string]interface{}) error {

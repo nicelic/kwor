@@ -1,6 +1,7 @@
 package service
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -28,16 +29,35 @@ const (
 	trafficRuntimeJournalMaxBytes        = 9 * 1024 * 1024
 	trafficRuntimeJournalFilename        = "kwor-traffic-runtime.v1.json"
 	trafficRuntimeJournalBackupSuffix    = ".bak"
+	trafficRuntimeArchiveFilename        = "kwor-traffic-runtime.v2.jsonl"
+	trafficRuntimeArchiveRotateBytes     = 16 * 1024 * 1024
+	trafficRuntimeArchiveFlushBytes      = 64 * 1024
+	trafficRuntimeArchiveFlushInterval   = time.Minute
 	trafficRuntimeJournalMetaTable       = "traffic_runtime_journal_meta"
 	trafficRuntimeJournalCheckpointTable = "traffic_runtime_journal_checkpoints"
 	trafficRuntimeJournalStagingTable    = "traffic_runtime_journal_staging"
+	trafficRuntimeJournalEntryTable      = "traffic_runtime_journal_entries"
+	trafficRuntimeJournalPendingLimit    = 16384
+	// The entry table is part of the crash-recovery path, so it must remain
+	// bounded even when a later SQLite flush keeps failing.  The in-memory tail
+	// limit alone is not enough because one committed sample creates one durable
+	// row before the next flush attempt.
+	trafficRuntimeJournalEntryMaxRows    = 4096
+	trafficRuntimeJournalEntryMaxBytes   = 16 * 1024 * 1024
+	trafficRuntimeArchiveMaxPendingBytes = 512 * 1024
+	trafficRuntimeArchiveKeyTable        = "traffic_runtime_archive_keys"
 )
 
 var errTrafficRuntimeJournalTooLarge = errors.New("traffic runtime journal exceeds its bounded capacity")
 var errTrafficRuntimeJournalStageCorrupt = errors.New("traffic runtime journal staging record is corrupt")
+var errTrafficRuntimeJournalEntryCapacity = errors.New("traffic runtime journal entry table is full")
 
 var trafficRuntimeJournalPathFn = func() string {
 	return filepath.Join(filepath.Dir(config.GetDBPath()), trafficRuntimeJournalFilename)
+}
+
+var trafficRuntimeArchivePathFn = func() string {
+	return filepath.Join(filepath.Dir(config.GetDBPath()), trafficRuntimeArchiveFilename)
 }
 
 var quarantineTrafficRuntimeJournalFilesFn = quarantineTrafficRuntimeJournalFiles
@@ -53,13 +73,20 @@ type trafficRuntimeJournalPayload struct {
 type trafficRuntimeStatsJournal struct {
 	initMu sync.Mutex
 
-	mu          sync.Mutex
-	initialized bool
-	generation  string
-	checkpoint  uint64
-	sequence    uint64
-	version     uint64
-	pending     map[string]model.Stats
+	mu                   sync.Mutex
+	initialized          bool
+	generation           string
+	archiveKey           string
+	checkpoint           uint64
+	sequence             uint64
+	version              uint64
+	pending              map[string]model.Stats
+	archivePending       []trafficRuntimeArchiveRecord
+	archiveBytes         int
+	archiveInFlightBytes int
+	archiveLastFlush     time.Time
+	archiveFlushing      bool
+	archiveDropWarned    bool
 }
 
 var runtimeTrafficStats = &trafficRuntimeStatsJournal{
@@ -77,6 +104,19 @@ type trafficRuntimeJournalStage struct {
 	raw      []byte
 	pending  map[string]model.Stats
 	flushNow bool
+	samples  []model.Stats
+}
+
+// trafficRuntimeArchiveRecord is an optional long-lived, append-only audit
+// record. It deliberately carries an opaque entity token instead of a tag.
+// SQLite staging remains the recovery authority for unflushed traffic.
+type trafficRuntimeArchiveRecord struct {
+	Sequence  uint64 `json:"seq"`
+	DateTime  int64  `json:"t"`
+	Namespace string `json:"ns"`
+	Entity    string `json:"e"`
+	Direction bool   `json:"d"`
+	Traffic   int64  `json:"v"`
 }
 
 func lockTrafficRuntimeJournalTransaction() func() {
@@ -186,6 +226,16 @@ func stageTrafficRuntimeStatsForTransaction(tx *gorm.DB, samples []model.Stats) 
 		return nil, nil
 	}
 	if err := persistTrafficRuntimeJournalStage(tx, stage); err != nil {
+		if errors.Is(err, errTrafficRuntimeJournalEntryCapacity) {
+			// The journal is optional once the counter-baseline transaction is
+			// already open.  Write this bounded batch directly to stats rather
+			// than allowing durable recovery rows to grow without limit while a
+			// later flush is failing.
+			if fallbackErr := upsertStatsTrafficBatch(tx, samples); fallbackErr != nil {
+				return nil, fmt.Errorf("traffic runtime journal is full; synchronous history fallback failed: %w", fallbackErr)
+			}
+			return nil, nil
+		}
 		discardStagedTrafficRuntimeStats(stage)
 		return nil, err
 	}
@@ -219,7 +269,10 @@ func FlushTrafficRuntimeJournal() error {
 func QuarantineTrafficRuntimeJournalBeforeDatabaseRestore() error {
 	unlock := lockTrafficRuntimeJournalTransaction()
 	defer unlock()
-	return quarantineTrafficRuntimeJournalFilesFn()
+	return errors.Join(
+		quarantineTrafficRuntimeJournalFilesFn(),
+		quarantineTrafficRuntimeArchiveFiles(),
+	)
 }
 
 // InvalidateTrafficRuntimeJournalForDatabaseRestore removes the old database's
@@ -234,7 +287,10 @@ func InvalidateTrafficRuntimeJournalForDatabaseRestore() error {
 	// sidecar can never become valid merely because file quarantine was delayed
 	// or failed. The file is still quarantined on a best-effort basis below.
 	rotateErr := runtimeTrafficStats.rotateGenerationForDatabaseRestore()
-	quarantineErr := quarantineTrafficRuntimeJournalFilesFn()
+	quarantineErr := errors.Join(
+		quarantineTrafficRuntimeJournalFilesFn(),
+		quarantineTrafficRuntimeArchiveFiles(),
+	)
 	return errors.Join(rotateErr, quarantineErr)
 }
 
@@ -248,12 +304,19 @@ func (s *trafficRuntimeStatsJournal) resetForDatabaseReloadLocked() {
 	s.initMu.Lock()
 	s.initialized = false
 	s.generation = ""
+	s.archiveKey = ""
 	s.checkpoint = 0
 	s.sequence = 0
 	s.initMu.Unlock()
 
 	s.mu.Lock()
 	s.pending = make(map[string]model.Stats)
+	s.archivePending = nil
+	s.archiveBytes = 0
+	s.archiveInFlightBytes = 0
+	s.archiveLastFlush = time.Time{}
+	s.archiveFlushing = false
+	s.archiveDropWarned = false
 	s.version++
 	s.mu.Unlock()
 }
@@ -289,6 +352,20 @@ func (s *trafficRuntimeStatsJournal) ensureReady() error {
 	)`, trafficRuntimeJournalStagingTable)).Error; err != nil {
 		return err
 	}
+	if err := db.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		generation TEXT NOT NULL,
+		sequence INTEGER NOT NULL,
+		payload BLOB NOT NULL,
+		PRIMARY KEY (generation, sequence)
+	)`, trafficRuntimeJournalEntryTable)).Error; err != nil {
+		return err
+	}
+	if err := db.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		archive_key TEXT NOT NULL
+	)`, trafficRuntimeArchiveKeyTable)).Error; err != nil {
+		return err
+	}
 
 	var generation string
 	if err := db.Raw(fmt.Sprintf("SELECT generation FROM %s WHERE id = 1", trafficRuntimeJournalMetaTable)).Scan(&generation).Error; err != nil {
@@ -305,12 +382,28 @@ func (s *trafficRuntimeStatsJournal) ensureReady() error {
 			return err
 		}
 	}
+	var archiveKey string
+	if err := db.Raw(fmt.Sprintf("SELECT archive_key FROM %s WHERE id = 1", trafficRuntimeArchiveKeyTable)).Scan(&archiveKey).Error; err != nil {
+		return err
+	}
+	if strings.TrimSpace(archiveKey) == "" {
+		key, err := newTrafficRuntimeJournalGeneration()
+		if err != nil {
+			return err
+		}
+		archiveKey = key
+		if err := db.Exec(fmt.Sprintf(`INSERT INTO %s (id, archive_key) VALUES (1, ?)
+			ON CONFLICT(id) DO UPDATE SET archive_key = excluded.archive_key`, trafficRuntimeArchiveKeyTable), archiveKey).Error; err != nil {
+			return err
+		}
+	}
 
 	var checkpoint uint64
 	if err := db.Raw(fmt.Sprintf("SELECT sequence FROM %s WHERE id = 1", trafficRuntimeJournalCheckpointTable)).Scan(&checkpoint).Error; err != nil {
 		return err
 	}
 	s.generation = generation
+	s.archiveKey = archiveKey
 	s.checkpoint = checkpoint
 	s.sequence = checkpoint
 	s.initialized = true
@@ -321,6 +414,15 @@ func (s *trafficRuntimeStatsJournal) restore() error {
 	db := database.GetDB()
 	if db == nil {
 		return fmt.Errorf("traffic runtime journal database is not initialized")
+	}
+
+	if restored, err := s.restoreIncrementalEntries(db); err != nil {
+		return err
+	} else if restored {
+		// v2 entries are the committed recovery authority. Any remaining v1
+		// mirrors belong to an older write strategy and must never be replayed
+		// alongside the same SQLite tail.
+		return quarantineTrafficRuntimeJournalFiles()
 	}
 
 	staged, hasStaged, stagedErr := readTrafficRuntimeJournalStage(db)
@@ -430,11 +532,21 @@ func persistTrafficRuntimeJournalStage(tx *gorm.DB, stage *trafficRuntimeJournal
 	if stage == nil || len(stage.raw) == 0 || len(stage.raw) > trafficRuntimeJournalMaxBytes {
 		return errTrafficRuntimeJournalTooLarge
 	}
-	return tx.Exec(fmt.Sprintf(`INSERT INTO %s (id, generation, sequence, payload) VALUES (1, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			generation = excluded.generation,
-			sequence = excluded.sequence,
-			payload = excluded.payload`, trafficRuntimeJournalStagingTable),
+	var usage struct {
+		Rows  int64 `gorm:"column:rows"`
+		Bytes int64 `gorm:"column:bytes"`
+	}
+	if err := tx.Raw(fmt.Sprintf(`SELECT COUNT(*) AS rows,
+		COALESCE(SUM(length(payload)), 0) AS bytes
+		FROM %s WHERE generation = ?`, trafficRuntimeJournalEntryTable), stage.payload.Generation).Scan(&usage).Error; err != nil {
+		return err
+	}
+	if usage.Rows >= trafficRuntimeJournalEntryMaxRows ||
+		usage.Bytes > int64(trafficRuntimeJournalEntryMaxBytes)-int64(len(stage.raw)) {
+		return errTrafficRuntimeJournalEntryCapacity
+	}
+	return tx.Exec(fmt.Sprintf(`INSERT INTO %s (generation, sequence, payload) VALUES (?, ?, ?)
+		ON CONFLICT(generation, sequence) DO UPDATE SET payload = excluded.payload`, trafficRuntimeJournalEntryTable),
 		stage.payload.Generation,
 		stage.payload.Sequence,
 		stage.raw,
@@ -445,7 +557,10 @@ func deleteAllTrafficRuntimeJournalStages(db *gorm.DB) error {
 	if db == nil {
 		return fmt.Errorf("traffic runtime journal database is not initialized")
 	}
-	return db.Exec(fmt.Sprintf("DELETE FROM %s", trafficRuntimeJournalStagingTable)).Error
+	return errors.Join(
+		db.Exec(fmt.Sprintf("DELETE FROM %s", trafficRuntimeJournalStagingTable)).Error,
+		db.Exec(fmt.Sprintf("DELETE FROM %s", trafficRuntimeJournalEntryTable)).Error,
+	)
 }
 
 func readTrafficRuntimeJournalStage(db *gorm.DB) (trafficRuntimeJournalStagingRecord, bool, error) {
@@ -490,7 +605,12 @@ func (s *trafficRuntimeStatsJournal) clearStagingForDatabaseRestore() error {
 	if db == nil {
 		return fmt.Errorf("traffic runtime journal database is not initialized")
 	}
-	return db.Exec(fmt.Sprintf("DELETE FROM %s", trafficRuntimeJournalStagingTable)).Error
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(fmt.Sprintf("DELETE FROM %s", trafficRuntimeJournalStagingTable)).Error; err != nil {
+			return err
+		}
+		return tx.Exec(fmt.Sprintf("DELETE FROM %s", trafficRuntimeJournalEntryTable)).Error
+	})
 }
 
 // rotateGenerationForDatabaseRestore creates a fresh accounting generation in
@@ -516,7 +636,10 @@ func (s *trafficRuntimeStatsJournal) rotateGenerationForDatabaseRestore() error 
 		if err := tx.Exec(fmt.Sprintf("INSERT INTO %s (id, sequence) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET sequence = 0", trafficRuntimeJournalCheckpointTable)).Error; err != nil {
 			return err
 		}
-		return tx.Exec(fmt.Sprintf("DELETE FROM %s", trafficRuntimeJournalStagingTable)).Error
+		if err := tx.Exec(fmt.Sprintf("DELETE FROM %s", trafficRuntimeJournalStagingTable)).Error; err != nil {
+			return err
+		}
+		return tx.Exec(fmt.Sprintf("DELETE FROM %s", trafficRuntimeJournalEntryTable)).Error
 	}); err != nil {
 		return err
 	}
@@ -528,9 +651,111 @@ func (s *trafficRuntimeStatsJournal) rotateGenerationForDatabaseRestore() error 
 	s.initMu.Unlock()
 	s.mu.Lock()
 	s.pending = make(map[string]model.Stats)
+	s.archivePending = nil
+	s.archiveBytes = 0
+	s.archiveInFlightBytes = 0
+	s.archiveLastFlush = time.Time{}
+	s.archiveFlushing = false
+	s.archiveDropWarned = false
 	s.version++
 	s.mu.Unlock()
 	return nil
+}
+
+type trafficRuntimeJournalEntry struct {
+	Generation string
+	Sequence   uint64
+	Payload    []byte
+}
+
+// restoreIncrementalEntries restores v2's append-only SQLite tail. Unlike the
+// legacy singleton snapshot, each committed sampling transaction contributes a
+// small independent payload, so startup never needs a sidecar file to decide
+// whether a counter delta was committed.
+func (s *trafficRuntimeStatsJournal) restoreIncrementalEntries(db *gorm.DB) (bool, error) {
+	if db == nil {
+		return false, fmt.Errorf("traffic runtime journal database is not initialized")
+	}
+	s.initMu.Lock()
+	generation := s.generation
+	checkpoint := s.checkpoint
+	s.initMu.Unlock()
+	if err := db.Exec(
+		fmt.Sprintf("DELETE FROM %s WHERE generation = ? AND sequence <= ?", trafficRuntimeJournalEntryTable),
+		generation,
+		checkpoint,
+	).Error; err != nil {
+		return false, err
+	}
+	entries := make([]trafficRuntimeJournalEntry, 0)
+	if err := db.Raw(fmt.Sprintf(`SELECT generation, sequence, payload FROM %s
+		WHERE generation = ? AND sequence > ? ORDER BY sequence ASC`, trafficRuntimeJournalEntryTable), generation, checkpoint).Scan(&entries).Error; err != nil {
+		return false, err
+	}
+	if len(entries) == 0 {
+		return false, nil
+	}
+	pending := make(map[string]model.Stats)
+	sequence := checkpoint
+	hadEntries := len(entries) > 0
+	for _, entry := range entries {
+		if entry.Sequence > sequence && entry.Sequence-sequence > 1 {
+			// Entries are independently recoverable, but a gap means at least one
+			// committed tail record is missing or was quarantined. Keep restoring
+			// later valid records while making the potential accounting loss
+			// explicit instead of silently treating the sequence as contiguous.
+			logger.Warning("traffic runtime journal sequence gap before ", entry.Sequence, "; previous sequence ", sequence)
+		}
+		if entry.Sequence <= sequence || len(entry.Payload) == 0 || len(entry.Payload) > trafficRuntimeJournalMaxBytes {
+			if err := deleteTrafficRuntimeJournalEntry(db, entry.Generation, entry.Sequence); err != nil {
+				return false, fmt.Errorf("discard invalid traffic runtime journal entry %d: %w", entry.Sequence, err)
+			}
+			logger.Warning("discarded invalid traffic runtime journal entry sequence ", entry.Sequence)
+			continue
+		}
+		var samples []model.Stats
+		if err := json.Unmarshal(entry.Payload, &samples); err != nil {
+			if deleteErr := deleteTrafficRuntimeJournalEntry(db, entry.Generation, entry.Sequence); deleteErr != nil {
+				return false, fmt.Errorf("discard corrupt traffic runtime journal entry %d: %w", entry.Sequence, deleteErr)
+			}
+			logger.Warning("discarded corrupt traffic runtime journal entry sequence ", entry.Sequence, ": ", err)
+			continue
+		}
+		accepted := false
+		for _, sample := range samples {
+			if addTrafficRuntimePendingStat(pending, sample) {
+				accepted = true
+			}
+		}
+		if !accepted {
+			if err := deleteTrafficRuntimeJournalEntry(db, entry.Generation, entry.Sequence); err != nil {
+				return false, fmt.Errorf("discard empty traffic runtime journal entry %d: %w", entry.Sequence, err)
+			}
+			logger.Warning("discarded empty traffic runtime journal entry sequence ", entry.Sequence)
+			continue
+		}
+		sequence = entry.Sequence
+	}
+	if !hadEntries {
+		return false, nil
+	}
+	s.mu.Lock()
+	s.pending = pending
+	s.sequence = sequence
+	s.version++
+	s.mu.Unlock()
+	return true, nil
+}
+
+func deleteTrafficRuntimeJournalEntry(db *gorm.DB, generation string, sequence uint64) error {
+	if db == nil {
+		return fmt.Errorf("traffic runtime journal database is not initialized")
+	}
+	return db.Exec(
+		fmt.Sprintf("DELETE FROM %s WHERE generation = ? AND sequence = ?", trafficRuntimeJournalEntryTable),
+		generation,
+		sequence,
+	).Error
 }
 
 func quarantineInvalidTrafficRuntimeJournalFiles(paths []string) error {
@@ -550,32 +775,27 @@ func (s *trafficRuntimeStatsJournal) stage(samples []model.Stats) (*trafficRunti
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	candidate := cloneTrafficRuntimePendingStats(s.pending)
-	accepted := false
-	for _, sample := range samples {
-		if addTrafficRuntimePendingStat(candidate, sample) {
-			accepted = true
-		}
-	}
+	acceptedSamples := compactTrafficRuntimeSamples(samples)
+	accepted := len(acceptedSamples) > 0
 	if !accepted {
 		return nil, nil
 	}
 	sequence := s.sequence + 1
-	payload, raw, err := s.payloadForPendingLocked(candidate, sequence)
+	s.initMu.Lock()
+	generation := s.generation
+	s.initMu.Unlock()
+	raw, err := json.Marshal(acceptedSamples)
 	if err != nil {
 		return nil, err
 	}
 	if len(raw) > trafficRuntimeJournalMaxBytes {
 		return nil, errTrafficRuntimeJournalTooLarge
 	}
-	if err := writeTrafficRuntimeJournalFile(raw); err != nil {
-		return nil, err
-	}
 	return &trafficRuntimeJournalStage{
-		payload:  payload,
+		payload:  trafficRuntimeJournalPayload{Schema: trafficRuntimeJournalSchema, Generation: generation, Sequence: sequence},
 		raw:      raw,
-		pending:  candidate,
-		flushNow: len(raw) >= trafficRuntimeJournalFlushThreshold,
+		flushNow: len(s.pending)+len(acceptedSamples) >= trafficRuntimeJournalPendingLimit,
+		samples:  acceptedSamples,
 	}, nil
 }
 
@@ -584,25 +804,16 @@ func (s *trafficRuntimeStatsJournal) commitStage(stage *trafficRuntimeJournalSta
 		return
 	}
 	s.mu.Lock()
-	s.pending = stage.pending
+	for _, sample := range stage.samples {
+		s.addPendingLocked(sample)
+	}
 	s.sequence = stage.payload.Sequence
+	s.queueArchiveLocked(stage.samples, stage.payload.Sequence)
 	s.version++
 	s.mu.Unlock()
 }
 
 func (s *trafficRuntimeStatsJournal) abortStage() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.pending) == 0 {
-		return removeTrafficRuntimeJournalFiles()
-	}
-	_, raw, err := s.payloadLocked()
-	if err != nil {
-		return err
-	}
-	if err := writeTrafficRuntimeJournalFile(raw); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -623,9 +834,9 @@ func (s *trafficRuntimeStatsJournal) flush() error {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if len(s.pending) == 0 {
-		return nil
+		s.mu.Unlock()
+		return s.flushArchive(true)
 	}
 
 	sequence := s.sequence
@@ -635,6 +846,7 @@ func (s *trafficRuntimeStatsJournal) flush() error {
 	s.initMu.Unlock()
 	db := database.GetDB()
 	if db == nil {
+		s.mu.Unlock()
 		return fmt.Errorf("traffic runtime journal database is not initialized")
 	}
 	if err := db.Transaction(func(tx *gorm.DB) error {
@@ -643,7 +855,10 @@ func (s *trafficRuntimeStatsJournal) flush() error {
 			return err
 		}
 		if applied >= sequence {
-			return deleteTrafficRuntimeJournalStage(tx, generation, sequence)
+			if err := deleteTrafficRuntimeJournalStage(tx, generation, sequence); err != nil {
+				return err
+			}
+			return tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE generation = ? AND sequence <= ?", trafficRuntimeJournalEntryTable), generation, sequence).Error
 		}
 		if err := upsertStatsTrafficBatch(tx, samples); err != nil {
 			return err
@@ -655,8 +870,12 @@ func (s *trafficRuntimeStatsJournal) flush() error {
 		).Error; err != nil {
 			return err
 		}
-		return deleteTrafficRuntimeJournalStage(tx, generation, sequence)
+		if err := deleteTrafficRuntimeJournalStage(tx, generation, sequence); err != nil {
+			return err
+		}
+		return tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE generation = ? AND sequence <= ?", trafficRuntimeJournalEntryTable), generation, sequence).Error
 	}); err != nil {
+		s.mu.Unlock()
 		return err
 	}
 
@@ -667,7 +886,20 @@ func (s *trafficRuntimeStatsJournal) flush() error {
 		s.checkpoint = sequence
 	}
 	s.initMu.Unlock()
-	return removeTrafficRuntimeJournalFiles()
+	s.mu.Unlock()
+	archiveErr := s.flushArchive(true)
+	removeErr := removeTrafficRuntimeJournalFiles()
+	return errors.Join(archiveErr, removeErr)
+}
+
+func compactTrafficRuntimeSamples(samples []model.Stats) []model.Stats {
+	compact := make(map[string]model.Stats, len(samples))
+	for _, sample := range samples {
+		if !addTrafficRuntimePendingStat(compact, sample) {
+			continue
+		}
+	}
+	return sortedTrafficRuntimePendingStats(compact)
 }
 
 func (s *trafficRuntimeStatsJournal) addPendingLocked(sample model.Stats) {
@@ -795,6 +1027,171 @@ func trafficRuntimeJournalPath() string {
 	return trafficRuntimeJournalPathFn()
 }
 
+func trafficRuntimeArchivePath() string {
+	return trafficRuntimeArchivePathFn()
+}
+
+func (s *trafficRuntimeStatsJournal) queueArchiveLocked(samples []model.Stats, sequence uint64) {
+	if len(samples) == 0 {
+		return
+	}
+	for _, sample := range samples {
+		record := trafficRuntimeArchiveRecord{
+			Sequence:  sequence,
+			DateTime:  sample.DateTime,
+			Namespace: trafficRuntimeArchiveNamespace(sample.Resource),
+			Entity:    s.archiveEntityTokenLocked(sample.Resource, sample.Tag),
+			Direction: sample.Direction,
+			Traffic:   sample.Traffic,
+		}
+		if record.Namespace == "" || record.Entity == "" || record.Traffic <= 0 {
+			continue
+		}
+		raw, err := json.Marshal(record)
+		if err != nil {
+			continue
+		}
+		if s.archiveInFlightBytes+s.archiveBytes+len(raw)+1 > trafficRuntimeArchiveMaxPendingBytes {
+			if !s.archiveDropWarned {
+				logger.Warning("traffic runtime archive queue reached its bounded capacity; dropping optional archive records until the next successful flush")
+				s.archiveDropWarned = true
+			}
+			continue
+		}
+		s.archivePending = append(s.archivePending, record)
+		s.archiveBytes += len(raw) + 1
+	}
+}
+
+func trafficRuntimeArchiveNamespace(resource string) string {
+	switch normalizeStatsResource(resource) {
+	case "client":
+		return "singbox_client"
+	case "inbound":
+		return "singbox_inbound"
+	case "mihomo_client":
+		return "mihomo_client"
+	case "mihomo_inbound":
+		return "mihomo_inbound"
+	default:
+		return ""
+	}
+}
+
+func (s *trafficRuntimeStatsJournal) archiveEntityTokenLocked(resource string, tag string) string {
+	s.initMu.Lock()
+	key := s.archiveKey
+	s.initMu.Unlock()
+	namespace := trafficRuntimeArchiveNamespace(resource)
+	if key == "" || namespace == "" || strings.TrimSpace(tag) == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, []byte(key))
+	_, _ = io.WriteString(mac, namespace)
+	_, _ = io.WriteString(mac, "\x00")
+	_, _ = io.WriteString(mac, strings.TrimSpace(tag))
+	return hex.EncodeToString(mac.Sum(nil)[:12])
+}
+
+func (s *trafficRuntimeStatsJournal) flushArchive(force bool) error {
+	s.mu.Lock()
+	if len(s.archivePending) == 0 || s.archiveFlushing ||
+		(!force && s.archiveBytes < trafficRuntimeArchiveFlushBytes && time.Since(s.archiveLastFlush) < trafficRuntimeArchiveFlushInterval) {
+		s.mu.Unlock()
+		return nil
+	}
+	records := append([]trafficRuntimeArchiveRecord(nil), s.archivePending...)
+	queuedBytes := s.archiveBytes
+	s.archivePending = nil
+	s.archiveBytes = 0
+	s.archiveInFlightBytes = queuedBytes
+	s.archiveFlushing = true
+	s.mu.Unlock()
+
+	err := appendTrafficRuntimeArchive(records)
+	s.mu.Lock()
+	s.archiveFlushing = false
+	s.archiveInFlightBytes = 0
+	if err != nil {
+		// Preserve sequence order when a newly committed sample arrived while
+		// the disk write was in flight. The archive is optional, but losing its
+		// in-memory tail before the bounded retry path runs would be needless.
+		s.archivePending = append(records, s.archivePending...)
+		s.archiveBytes += queuedBytes
+		for s.archiveBytes > trafficRuntimeArchiveMaxPendingBytes && len(s.archivePending) > 0 {
+			last := s.archivePending[len(s.archivePending)-1]
+			s.archivePending = s.archivePending[:len(s.archivePending)-1]
+			if raw, marshalErr := json.Marshal(last); marshalErr == nil {
+				s.archiveBytes -= len(raw) + 1
+			}
+		}
+		s.mu.Unlock()
+		return err
+	}
+	s.archiveLastFlush = time.Now()
+	s.archiveDropWarned = false
+	s.mu.Unlock()
+	return nil
+}
+
+func appendTrafficRuntimeArchive(records []trafficRuntimeArchiveRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+	path := trafficRuntimeArchivePath()
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("traffic runtime archive path must not be a symbolic link")
+	}
+	archiveBytes := 0
+	for _, record := range records {
+		raw, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		archiveBytes += len(raw) + 1
+	}
+	if info, err := os.Stat(path); err == nil && info.Size()+int64(archiveBytes) > trafficRuntimeArchiveRotateBytes {
+		previous := path + ".1"
+		if info, statErr := os.Lstat(previous); statErr == nil && info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("traffic runtime archive rotation path must not be a symbolic link")
+		}
+		_ = os.Remove(previous)
+		if err := os.Rename(path, previous); err != nil {
+			return err
+		}
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return err
+	}
+	for _, record := range records {
+		raw, marshalErr := json.Marshal(record)
+		if marshalErr != nil {
+			continue
+		}
+		if _, err := file.Write(append(raw, '\n')); err != nil {
+			_ = file.Close()
+			return err
+		}
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func readTrafficRuntimeJournalFile() (trafficRuntimeJournalPayload, string, error) {
 	result, err := readTrafficRuntimeJournalFileDetailed()
 	return result.payload, result.sourcePath, err
@@ -842,6 +1239,16 @@ func readTrafficRuntimeJournalFileDetailed() (trafficRuntimeJournalReadResult, e
 func quarantineTrafficRuntimeJournalFiles() error {
 	var errs []error
 	for _, path := range []string{trafficRuntimeJournalPath(), trafficRuntimeJournalPath() + trafficRuntimeJournalBackupSuffix} {
+		if err := quarantineTrafficRuntimeJournalFile(path); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func quarantineTrafficRuntimeArchiveFiles() error {
+	var errs []error
+	for _, path := range []string{trafficRuntimeArchivePath(), trafficRuntimeArchivePath() + ".1"} {
 		if err := quarantineTrafficRuntimeJournalFile(path); err != nil {
 			errs = append(errs, err)
 		}
@@ -1005,8 +1412,7 @@ func newTrafficRuntimeJournalGeneration() (string, error) {
 func pendingTrafficRuntimeStatsForQuery(resource string, tag string, startUnix int64, bucketSeconds int64) []model.Stats {
 	unlock := lockTrafficRuntimeJournalTransaction()
 	defer unlock()
-	_, samples := runtimeTrafficStats.snapshotPending()
-	return pendingTrafficRuntimeStatsFromSamples(samples, resource, tag, startUnix, bucketSeconds)
+	return runtimeTrafficStats.snapshotPendingForQuery(resource, tag, startUnix, bucketSeconds)
 }
 
 func (s *trafficRuntimeStatsJournal) currentVersion() uint64 {
@@ -1019,6 +1425,40 @@ func (s *trafficRuntimeStatsJournal) snapshotPending() (uint64, []model.Stats) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.version, s.sortedPendingLocked()
+}
+
+// snapshotPendingForQuery filters while holding the journal lock so a history
+// request does not allocate and sort every unflushed client/inbound bucket just
+// to return one entity's timeline.
+func (s *trafficRuntimeStatsJournal) snapshotPendingForQuery(resource string, tag string, startUnix int64, bucketSeconds int64) []model.Stats {
+	resource = normalizeStatsResource(resource)
+	tag = strings.TrimSpace(tag)
+	if resource == "" || tag == "" || bucketSeconds <= 0 {
+		return nil
+	}
+	allowed := make(map[string]struct{}, len(statsQueryResources(resource)))
+	for _, candidate := range statsQueryResources(resource) {
+		allowed[normalizeStatsResource(candidate)] = struct{}{}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	combined := make(map[string]model.Stats)
+	for _, sample := range s.pending {
+		if _, ok := allowed[normalizeStatsResource(sample.Resource)]; !ok || sample.Tag != tag || sample.DateTime < startUnix {
+			continue
+		}
+		sample.DateTime = (sample.DateTime / bucketSeconds) * bucketSeconds
+		sample.Resource = resource
+		key := fmt.Sprintf("%d\x00%t", sample.DateTime, sample.Direction)
+		if current, exists := combined[key]; exists {
+			current.Traffic += sample.Traffic
+			combined[key] = current
+			continue
+		}
+		combined[key] = sample
+	}
+	return sortedPendingTrafficStats(combined)
 }
 
 func pendingTrafficRuntimeStatsFromSamples(samples []model.Stats, resource string, tag string, startUnix int64, bucketSeconds int64) []model.Stats {
@@ -1047,8 +1487,12 @@ func pendingTrafficRuntimeStatsFromSamples(samples []model.Stats, resource strin
 		}
 		combined[key] = sample
 	}
-	result := make([]model.Stats, 0, len(combined))
-	for _, sample := range combined {
+	return sortedPendingTrafficStats(combined)
+}
+
+func sortedPendingTrafficStats(samples map[string]model.Stats) []model.Stats {
+	result := make([]model.Stats, 0, len(samples))
+	for _, sample := range samples {
 		result = append(result, sample)
 	}
 	sort.Slice(result, func(i, j int) bool {

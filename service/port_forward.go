@@ -62,6 +62,7 @@ var (
 		lastLayout          string
 		lastReconcile       time.Time
 		lastActiveRuleCount int
+		lastFullVerify      time.Time
 		warnings            []string
 		nftSnapshot         *portForwardNftSnapshot
 		lastError           string
@@ -982,6 +983,7 @@ func (s *PortForwardService) CleanupOnShutdown() {
 	portForwardState.lastLayout = ""
 	portForwardState.lastReconcile = time.Time{}
 	portForwardState.lastActiveRuleCount = 0
+	portForwardState.lastFullVerify = time.Time{}
 	portForwardState.warnings = nil
 	portForwardState.lastError = ""
 	portForwardState.nftSnapshot = nil
@@ -1034,13 +1036,12 @@ func (s *PortForwardService) renderLocked(force bool) error {
 	// Read each owned table once before any redraw. The same snapshot supplies
 	// persistent traffic deltas and the integrity decision below, and keeps nft
 	// command execution outside the SQLite transaction used by the sampler.
-	snapshot, snapshotErr := loadPortForwardNftSnapshot()
-	if snapshotErr != nil {
+	counterBytes, counterErr := loadPortForwardCounterBytes()
+	if counterErr != nil {
 		portForwardState.nftSnapshot = nil
-		return snapshotErr
+		return counterErr
 	}
-	portForwardState.nftSnapshot = &snapshot
-	trafficRuntime, err := syncPortForwardTrafficStateRows(rows, readPortForwardCounterBytesFromSnapshot(snapshot), PanelNow())
+	trafficRuntime, err := syncPortForwardTrafficStateRows(rows, counterBytes, PanelNow())
 	if err != nil {
 		return err
 	}
@@ -1055,7 +1056,21 @@ func (s *PortForwardService) renderLocked(force bool) error {
 		}
 	}
 
+	fullVerify := force || portForwardState.lastFullVerify.IsZero() || time.Since(portForwardState.lastFullVerify) >= portForwardIdleVerifyInterval
+	if !force && layout == portForwardState.lastLayout && hash == portForwardState.lastRenderHash && !fullVerify {
+		return nil
+	}
+	var snapshot portForwardNftSnapshot
+	hasSnapshot := false
 	if !force && layout == portForwardState.lastLayout && hash == portForwardState.lastRenderHash {
+		var snapshotErr error
+		snapshot, snapshotErr = loadPortForwardNftSnapshot()
+		if snapshotErr != nil {
+			portForwardState.nftSnapshot = nil
+			return snapshotErr
+		}
+		hasSnapshot = true
+		portForwardState.nftSnapshot = &snapshot
 		if snapshot.renderIntactWithTrafficBlocks(activeRows, loadPortForwardLimitStateMap(), trafficBlocks) {
 			// A prior restore can fail after the tables were already removed.
 			// Keep retrying that host-local cleanup even when the empty nft
@@ -1065,8 +1080,23 @@ func (s *PortForwardService) renderLocked(force bool) error {
 					return err
 				}
 			}
+			portForwardState.lastFullVerify = time.Now()
 			return nil
 		}
+	}
+
+	// A configuration or traffic-block change requires a full snapshot before
+	// deciding whether to redraw. This is less frequent than the counter-only
+	// path above, but remains immediate after mutations.
+	if !hasSnapshot {
+		var snapshotErr error
+		snapshot, snapshotErr = loadPortForwardNftSnapshot()
+		if snapshotErr != nil {
+			portForwardState.nftSnapshot = nil
+			return snapshotErr
+		}
+		hasSnapshot = true
+		portForwardState.nftSnapshot = &snapshot
 	}
 
 	if portForwardLayoutMigrationRequired(portForwardState.lastLayout, layout) {
@@ -1094,6 +1124,7 @@ func (s *PortForwardService) renderLocked(force bool) error {
 		portForwardState.lastRenderHash = hash
 		portForwardState.lastLayout = layout
 		portForwardState.lastActiveRuleCount = 0
+		portForwardState.lastFullVerify = time.Now()
 		return nil
 	}
 
@@ -1118,6 +1149,7 @@ func (s *PortForwardService) renderLocked(force bool) error {
 	portForwardState.lastRenderHash = computePortForwardRenderHashWithTrafficBlocks(rows, trafficBlocks)
 	portForwardState.lastLayout = layout
 	portForwardState.lastActiveRuleCount = len(activeRows)
+	portForwardState.lastFullVerify = time.Now()
 	return nil
 }
 

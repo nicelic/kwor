@@ -25,10 +25,10 @@ const apiTLSCertificateRequestMaxBytes int64 = 4 * 1024 * 1024
 const apiSingboxRuntimeRetryRequestMaxBytes int64 = 4 * 1024
 
 // Settings may carry both subscription extensions. Each field is capped at
-// 4 MiB after JSON decoding, while quotes, slashes and newlines can expand the
-// encoded request body. Keep a bounded 16 MiB envelope for settings writes;
+// 100 MiB after JSON decoding, while quotes, slashes and newlines can expand
+// the encoded request body. Keep a bounded envelope for settings writes;
 // all other API actions retain the 8 MiB default.
-const apiSettingsRequestMaxBytes int64 = 20 * 1024 * 1024
+const apiSettingsRequestMaxBytes int64 = 512 * 1024 * 1024
 
 func applyAPIRequestBodyLimit(c *gin.Context, action string) {
 	if c == nil || c.Request == nil || c.Request.Body == nil {

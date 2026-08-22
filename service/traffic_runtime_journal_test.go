@@ -1,7 +1,7 @@
 package service
 
 import (
-	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -28,10 +28,14 @@ func setupTrafficRuntimeJournalTest(t *testing.T) string {
 	previousPathFn := trafficRuntimeJournalPathFn
 	journalPath := filepath.Join(filepath.Dir(dbPath), trafficRuntimeJournalFilename)
 	trafficRuntimeJournalPathFn = func() string { return journalPath }
+	previousArchivePathFn := trafficRuntimeArchivePathFn
+	archivePath := filepath.Join(filepath.Dir(dbPath), trafficRuntimeArchiveFilename)
+	trafficRuntimeArchivePathFn = func() string { return archivePath }
 	resetHistoryStorageState()
 	runtimeTrafficStats.resetForDatabaseReload()
 	t.Cleanup(func() {
 		trafficRuntimeJournalPathFn = previousPathFn
+		trafficRuntimeArchivePathFn = previousArchivePathFn
 		runtimeTrafficStats.resetForDatabaseReload()
 		resetHistoryStorageState()
 	})
@@ -48,8 +52,15 @@ func TestTrafficRuntimeJournalMergesPendingAndFlushes(t *testing.T) {
 	if err := StageTrafficRuntimeStats(samples); err != nil {
 		t.Fatalf("stage samples failed: %v", err)
 	}
-	if _, err := os.Stat(journalPath); err != nil {
-		t.Fatalf("journal sidecar was not written: %v", err)
+	if _, err := os.Stat(journalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("v2 journal unexpectedly wrote the legacy sidecar: %v", err)
+	}
+	var entries int64
+	if err := database.GetDB().Table(trafficRuntimeJournalEntryTable).Count(&entries).Error; err != nil {
+		t.Fatalf("count incremental journal entries failed: %v", err)
+	}
+	if entries != 1 {
+		t.Fatalf("incremental journal entries = %d, want 1", entries)
 	}
 
 	rows, err := queryStatsHistory("client", "alice", 1)
@@ -63,8 +74,18 @@ func TestTrafficRuntimeJournalMergesPendingAndFlushes(t *testing.T) {
 	if err := FlushTrafficRuntimeJournal(); err != nil {
 		t.Fatalf("flush journal failed: %v", err)
 	}
-	if _, err := os.Stat(journalPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("flushed journal sidecar still exists: %v", err)
+	if err := database.GetDB().Table(trafficRuntimeJournalEntryTable).Count(&entries).Error; err != nil {
+		t.Fatalf("count flushed incremental journal entries failed: %v", err)
+	}
+	if entries != 0 {
+		t.Fatalf("flushed incremental journal entries = %d, want 0", entries)
+	}
+	archiveRaw, err := os.ReadFile(trafficRuntimeArchivePath())
+	if err != nil {
+		t.Fatalf("read anonymous archive failed: %v", err)
+	}
+	if strings.Contains(string(archiveRaw), "alice") {
+		t.Fatalf("anonymous archive leaked a raw tag: %s", archiveRaw)
 	}
 	rows, err = queryStatsHistory("client", "alice", 1)
 	if err != nil {
@@ -76,20 +97,28 @@ func TestTrafficRuntimeJournalMergesPendingAndFlushes(t *testing.T) {
 }
 
 func TestTrafficRuntimeJournalCheckpointPreventsReplay(t *testing.T) {
-	journalPath := setupTrafficRuntimeJournalTest(t)
+	setupTrafficRuntimeJournalTest(t)
 	sample := model.Stats{DateTime: time.Now().Unix(), Resource: "client", Tag: "checkpoint", Direction: false, Traffic: 17}
 	if err := StageTrafficRuntimeStats([]model.Stats{sample}); err != nil {
 		t.Fatalf("stage sample failed: %v", err)
 	}
-	raw, err := os.ReadFile(journalPath)
-	if err != nil {
-		t.Fatalf("read staged journal failed: %v", err)
+	type entryFixture struct {
+		Generation string
+		Sequence   uint64
+		Payload    []byte
+	}
+	entry := entryFixture{}
+	if err := database.GetDB().Table(trafficRuntimeJournalEntryTable).Select("generation, sequence, payload").Scan(&entry).Error; err != nil {
+		t.Fatalf("read staged incremental entry failed: %v", err)
 	}
 	if err := FlushTrafficRuntimeJournal(); err != nil {
 		t.Fatalf("flush journal failed: %v", err)
 	}
-	if err := os.WriteFile(journalPath, raw, 0o600); err != nil {
-		t.Fatalf("restore committed sidecar fixture failed: %v", err)
+	if err := database.GetDB().Exec(
+		fmt.Sprintf("INSERT INTO %s (generation, sequence, payload) VALUES (?, ?, ?)", trafficRuntimeJournalEntryTable),
+		entry.Generation, entry.Sequence, entry.Payload,
+	).Error; err != nil {
+		t.Fatalf("restore committed incremental entry fixture failed: %v", err)
 	}
 
 	runtimeTrafficStats.resetForDatabaseReload()
@@ -103,22 +132,21 @@ func TestTrafficRuntimeJournalCheckpointPreventsReplay(t *testing.T) {
 	if len(rows) != 1 || rows[0].Traffic != 17 {
 		t.Fatalf("checkpoint replay changed stats: %#v", rows)
 	}
-	if _, err := os.Stat(journalPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("already-applied sidecar was not removed: %v", err)
+	var entries int64
+	if err := database.GetDB().Table(trafficRuntimeJournalEntryTable).Count(&entries).Error; err != nil {
+		t.Fatalf("count stale entries after restore failed: %v", err)
+	}
+	if entries != 0 {
+		t.Fatalf("already-applied entry was not removed: %d remain", entries)
 	}
 }
 
 func TestTrafficRuntimeJournalRestoresCommittedSQLiteStageWhenMirrorIsMissing(t *testing.T) {
-	journalPath := setupTrafficRuntimeJournalTest(t)
+	setupTrafficRuntimeJournalTest(t)
 	sample := model.Stats{DateTime: time.Now().Unix(), Resource: "client", Tag: "committed-stage", Direction: true, Traffic: 23}
 	if err := StageTrafficRuntimeStats([]model.Stats{sample}); err != nil {
 		t.Fatalf("stage committed sample failed: %v", err)
 	}
-	if err := os.Remove(journalPath); err != nil {
-		t.Fatalf("remove primary mirror fixture failed: %v", err)
-	}
-	_ = os.Remove(journalPath + trafficRuntimeJournalBackupSuffix)
-
 	runtimeTrafficStats.resetForDatabaseReload()
 	if err := PrepareTrafficRuntimeJournalOnStartup(); err != nil {
 		t.Fatalf("restore committed sqlite stage failed: %v", err)
@@ -133,7 +161,7 @@ func TestTrafficRuntimeJournalRestoresCommittedSQLiteStageWhenMirrorIsMissing(t 
 }
 
 func TestTrafficRuntimeJournalDoesNotReplayPreCommitMirror(t *testing.T) {
-	journalPath := setupTrafficRuntimeJournalTest(t)
+	setupTrafficRuntimeJournalTest(t)
 	if err := runtimeTrafficStats.ensureReady(); err != nil {
 		t.Fatalf("prepare journal metadata failed: %v", err)
 	}
@@ -163,9 +191,6 @@ func TestTrafficRuntimeJournalDoesNotReplayPreCommitMirror(t *testing.T) {
 	}
 	unlock()
 
-	if _, err := os.Stat(journalPath); err != nil {
-		t.Fatalf("pre-commit mirror was not written: %v", err)
-	}
 	runtimeTrafficStats.resetForDatabaseReload()
 	if err := PrepareTrafficRuntimeJournalOnStartup(); err != nil {
 		t.Fatalf("recover pre-commit mirror failed: %v", err)
@@ -177,77 +202,82 @@ func TestTrafficRuntimeJournalDoesNotReplayPreCommitMirror(t *testing.T) {
 	if len(rows) != 0 {
 		t.Fatalf("pre-commit mirror was replayed: %#v", rows)
 	}
-	invalidFiles, err := filepath.Glob(journalPath + ".invalid-*")
-	if err != nil || len(invalidFiles) == 0 {
-		t.Fatalf("pre-commit mirror was not quarantined: files=%v err=%v", invalidFiles, err)
+	var entries int64
+	if err := database.GetDB().Table(trafficRuntimeJournalEntryTable).Count(&entries).Error; err != nil {
+		t.Fatalf("count rolled-back entries failed: %v", err)
+	}
+	if entries != 0 {
+		t.Fatalf("rolled-back entry remained durable: %d rows", entries)
 	}
 }
 
-func TestTrafficRuntimeJournalRestoresLastValidBackupAfterPrimaryDamage(t *testing.T) {
-	journalPath := setupTrafficRuntimeJournalTest(t)
-	first := model.Stats{DateTime: time.Now().Unix(), Resource: "client", Tag: "backup", Direction: true, Traffic: 11}
-	second := model.Stats{DateTime: time.Now().Unix(), Resource: "client", Tag: "backup", Direction: true, Traffic: 5}
+func TestTrafficRuntimeJournalRestoresMultipleIncrementalEntries(t *testing.T) {
+	setupTrafficRuntimeJournalTest(t)
+	first := model.Stats{DateTime: time.Now().Unix(), Resource: "client", Tag: "incremental", Direction: true, Traffic: 11}
+	second := model.Stats{DateTime: time.Now().Unix(), Resource: "client", Tag: "incremental", Direction: true, Traffic: 5}
 	if err := StageTrafficRuntimeStats([]model.Stats{first}); err != nil {
-		t.Fatalf("stage first backup sample failed: %v", err)
+		t.Fatalf("stage first incremental sample failed: %v", err)
 	}
 	if err := StageTrafficRuntimeStats([]model.Stats{second}); err != nil {
-		t.Fatalf("stage second backup sample failed: %v", err)
-	}
-	if _, err := os.Stat(journalPath + trafficRuntimeJournalBackupSuffix); err != nil {
-		t.Fatalf("journal backup was not retained: %v", err)
-	}
-	if err := os.WriteFile(journalPath, []byte("damaged-primary"), 0o600); err != nil {
-		t.Fatalf("damage primary fixture failed: %v", err)
+		t.Fatalf("stage second incremental sample failed: %v", err)
 	}
 
 	runtimeTrafficStats.resetForDatabaseReload()
 	if err := PrepareTrafficRuntimeJournalOnStartup(); err != nil {
-		t.Fatalf("recover from backup failed: %v", err)
+		t.Fatalf("restore incremental entries failed: %v", err)
 	}
-	rows, err := queryStatsHistory("client", "backup", 1)
+	rows, err := queryStatsHistory("client", "incremental", 1)
 	if err != nil {
-		t.Fatalf("query backup-restored stats failed: %v", err)
+		t.Fatalf("query restored incremental stats failed: %v", err)
 	}
 	if len(rows) != 1 || rows[0].Traffic != 16 {
-		t.Fatalf("staging restore stats = %#v, want one 16-byte row", rows)
+		t.Fatalf("incremental restore stats = %#v, want one 16-byte row", rows)
 	}
-	invalidFiles, err := filepath.Glob(journalPath + ".invalid-*")
-	if err != nil || len(invalidFiles) == 0 {
-		t.Fatalf("damaged primary was not quarantined: files=%v err=%v", invalidFiles, err)
+	var entries int64
+	if err := database.GetDB().Table(trafficRuntimeJournalEntryTable).Count(&entries).Error; err != nil {
+		t.Fatalf("count restored incremental entries failed: %v", err)
+	}
+	if entries != 0 {
+		t.Fatalf("flushed incremental entries = %d, want 0", entries)
 	}
 }
 
-func TestTrafficRuntimeJournalDoesNotReplaceValidBackupWithCorruptPrimary(t *testing.T) {
-	journalPath := setupTrafficRuntimeJournalTest(t)
-	if err := StageTrafficRuntimeStats([]model.Stats{{
-		DateTime: time.Now().Unix(), Resource: "client", Tag: "backup-preserve", Direction: true, Traffic: 11,
-	}}); err != nil {
-		t.Fatalf("stage initial backup sample failed: %v", err)
+func TestTrafficRuntimeJournalDiscardsCorruptIncrementalEntry(t *testing.T) {
+	setupTrafficRuntimeJournalTest(t)
+	if err := runtimeTrafficStats.ensureReady(); err != nil {
+		t.Fatalf("prepare journal metadata failed: %v", err)
 	}
-	if err := StageTrafficRuntimeStats([]model.Stats{{
-		DateTime: time.Now().Unix(), Resource: "client", Tag: "backup-preserve", Direction: true, Traffic: 5,
-	}}); err != nil {
-		t.Fatalf("stage backup sample failed: %v", err)
-	}
-	validBackup, err := os.ReadFile(journalPath + trafficRuntimeJournalBackupSuffix)
+	runtimeTrafficStats.initMu.Lock()
+	generation := runtimeTrafficStats.generation
+	runtimeTrafficStats.initMu.Unlock()
+	validPayload, err := json.Marshal([]model.Stats{{
+		DateTime: time.Now().Unix(), Resource: "client", Tag: "valid-after-corrupt", Direction: true, Traffic: 13,
+	}})
 	if err != nil {
-		t.Fatalf("read valid backup fixture failed: %v", err)
+		t.Fatalf("marshal valid incremental payload failed: %v", err)
 	}
-	if err := os.WriteFile(journalPath, []byte("corrupt-primary"), 0o600); err != nil {
-		t.Fatalf("damage primary fixture failed: %v", err)
+	if err := database.GetDB().Exec(
+		fmt.Sprintf("INSERT INTO %s (generation, sequence, payload) VALUES (?, ?, ?), (?, ?, ?)", trafficRuntimeJournalEntryTable),
+		generation, 1, []byte("{corrupt-entry"), generation, 2, validPayload,
+	).Error; err != nil {
+		t.Fatalf("insert incremental fixtures failed: %v", err)
 	}
-
-	if err := StageTrafficRuntimeStats([]model.Stats{{
-		DateTime: time.Now().Unix(), Resource: "client", Tag: "backup-preserve", Direction: true, Traffic: 3,
-	}}); err != nil {
-		t.Fatalf("stage after primary damage failed: %v", err)
+	if err := PrepareTrafficRuntimeJournalOnStartup(); err != nil {
+		t.Fatalf("restore after corrupt incremental entry failed: %v", err)
 	}
-	gotBackup, err := os.ReadFile(journalPath + trafficRuntimeJournalBackupSuffix)
+	rows, err := queryStatsHistory("client", "valid-after-corrupt", 1)
 	if err != nil {
-		t.Fatalf("read preserved backup failed: %v", err)
+		t.Fatalf("query valid entry after corrupt entry failed: %v", err)
 	}
-	if !bytes.Equal(gotBackup, validBackup) {
-		t.Fatalf("valid backup was replaced by damaged primary")
+	if len(rows) != 1 || rows[0].Traffic != 13 {
+		t.Fatalf("valid entry after corruption = %#v, want one 13-byte row", rows)
+	}
+	var entries int64
+	if err := database.GetDB().Table(trafficRuntimeJournalEntryTable).Count(&entries).Error; err != nil {
+		t.Fatalf("count entries after corruption cleanup failed: %v", err)
+	}
+	if entries != 0 {
+		t.Fatalf("corrupt or flushed entries remain: %d", entries)
 	}
 }
 
@@ -300,10 +330,12 @@ func TestTrafficRuntimeJournalDiscardsCorruptSQLiteStage(t *testing.T) {
 
 func TestTrafficRuntimeJournalQuarantinesOldMirrorBeforeDatabaseRestore(t *testing.T) {
 	journalPath := setupTrafficRuntimeJournalTest(t)
-	if err := StageTrafficRuntimeStats([]model.Stats{{
-		DateTime: time.Now().Unix(), Resource: "client", Tag: "before-restore", Direction: true, Traffic: 7,
-	}}); err != nil {
-		t.Fatalf("stage restore mirror failed: %v", err)
+	archivePath := trafficRuntimeArchivePath()
+	if err := os.WriteFile(journalPath, []byte("legacy mirror"), 0o600); err != nil {
+		t.Fatalf("write legacy mirror fixture failed: %v", err)
+	}
+	if err := os.WriteFile(archivePath, []byte("{\"seq\":1}\n"), 0o600); err != nil {
+		t.Fatalf("write archive fixture failed: %v", err)
 	}
 	if err := QuarantineTrafficRuntimeJournalBeforeDatabaseRestore(); err != nil {
 		t.Fatalf("quarantine before restore failed: %v", err)
@@ -311,9 +343,16 @@ func TestTrafficRuntimeJournalQuarantinesOldMirrorBeforeDatabaseRestore(t *testi
 	if _, err := os.Stat(journalPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("old primary mirror still exists after restore quarantine: %v", err)
 	}
+	if _, err := os.Stat(archivePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old anonymous archive still exists after restore quarantine: %v", err)
+	}
 	invalidFiles, err := filepath.Glob(journalPath + ".invalid-*")
 	if err != nil || len(invalidFiles) == 0 {
 		t.Fatalf("old mirror was not retained as a quarantine file: files=%v err=%v", invalidFiles, err)
+	}
+	archiveInvalidFiles, err := filepath.Glob(archivePath + ".invalid-*")
+	if err != nil || len(archiveInvalidFiles) == 0 {
+		t.Fatalf("old archive was not retained as a quarantine file: files=%v err=%v", archiveInvalidFiles, err)
 	}
 }
 
@@ -359,17 +398,27 @@ func TestTrafficRuntimeJournalQuarantinesCorruptAndWrongGenerationFiles(t *testi
 
 func TestTrafficRuntimeJournalRestoreRotatesGenerationBeforeFileQuarantine(t *testing.T) {
 	journalPath := setupTrafficRuntimeJournalTest(t)
-	sample := model.Stats{DateTime: time.Now().Unix(), Resource: "client", Tag: "restored-generation", Direction: true, Traffic: 29}
-	if err := StageTrafficRuntimeStats([]model.Stats{sample}); err != nil {
-		t.Fatalf("stage restore-generation sample failed: %v", err)
+	if err := runtimeTrafficStats.ensureReady(); err != nil {
+		t.Fatalf("prepare restore-generation metadata failed: %v", err)
 	}
-	if _, err := os.Stat(journalPath); err != nil {
-		t.Fatalf("restore-generation sidecar was not written: %v", err)
-	}
-
 	runtimeTrafficStats.initMu.Lock()
 	oldGeneration := runtimeTrafficStats.generation
 	runtimeTrafficStats.initMu.Unlock()
+	payload := trafficRuntimeJournalPayload{
+		Schema:     trafficRuntimeJournalSchema,
+		Generation: oldGeneration,
+		Sequence:   1,
+		Samples: []model.Stats{{
+			DateTime: time.Now().Unix(), Resource: "client", Tag: "restored-generation", Direction: true, Traffic: 29,
+		}},
+	}
+	raw, err := marshalTrafficRuntimeJournalPayload(payload)
+	if err != nil {
+		t.Fatalf("marshal restore-generation legacy fixture failed: %v", err)
+	}
+	if err := os.WriteFile(journalPath, raw, 0o600); err != nil {
+		t.Fatalf("write restore-generation legacy fixture failed: %v", err)
+	}
 	previousQuarantine := quarantineTrafficRuntimeJournalFilesFn
 	quarantineTrafficRuntimeJournalFilesFn = func() error {
 		return errors.New("simulated quarantine failure")
@@ -425,7 +474,7 @@ func TestTrafficRuntimeJournalCapacityFallsBackWithoutGrowingMemory(t *testing.T
 	}
 }
 
-func TestTrafficRuntimeJournalUsesCurrentTransactionFallback(t *testing.T) {
+func TestTrafficRuntimeJournalUsesSQLiteEntriesWhenLegacySidecarPathIsUnavailable(t *testing.T) {
 	journalPath := setupTrafficRuntimeJournalTest(t)
 	blockedParent := filepath.Join(filepath.Dir(journalPath), "not-a-directory")
 	if err := os.WriteFile(blockedParent, []byte("blocked"), 0o600); err != nil {
@@ -442,22 +491,26 @@ func TestTrafficRuntimeJournalUsesCurrentTransactionFallback(t *testing.T) {
 	unlock := lockTrafficRuntimeJournalTransaction()
 	tx := database.GetDB().Begin()
 	if tx.Error != nil {
+		unlock()
 		t.Fatalf("begin fallback transaction failed: %v", tx.Error)
 	}
 	sample := model.Stats{DateTime: time.Now().Unix(), Resource: "client", Tag: "fallback", Direction: true, Traffic: 9}
 	staged, err := stageTrafficRuntimeStatsForTransaction(tx, []model.Stats{sample})
 	if err != nil {
 		tx.Rollback()
+		unlock()
 		t.Fatalf("transaction fallback failed: %v", err)
 	}
-	if staged != nil {
+	if staged == nil {
 		tx.Rollback()
-		t.Fatal("sidecar unexpectedly staged through a blocked directory")
+		unlock()
+		t.Fatal("incremental SQLite entry was unexpectedly bypassed")
 	}
 	if err := tx.Commit().Error; err != nil {
 		unlock()
 		t.Fatalf("commit fallback transaction failed: %v", err)
 	}
+	commitStagedTrafficRuntimeStats(staged)
 	unlock()
 	rows, err := queryStatsHistory("client", "fallback", 1)
 	if err != nil {
