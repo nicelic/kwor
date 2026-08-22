@@ -2,7 +2,7 @@
   <div class="settings-traffic-manage">
     <v-row>
       <v-col cols="12" lg="8">
-        <v-card rounded="lg" variant="tonal" class="mb-4">
+        <v-card rounded="lg" variant="tonal" class="mb-4" :loading="loading && !hasLoaded">
           <v-card-title class="traffic-card-title">
             <div class="text-subtitle-1 font-weight-medium">vnstat {{ t('stats.graphTitle') }}</div>
             <div class="traffic-toolbar">
@@ -14,7 +14,7 @@
                 inset
                 label="流量统计"
                 :loading="togglingTraffic"
-                :disabled="loading || togglingTraffic || installingVnstat || removingVnstat || checkingVnstatUpdate"
+                :disabled="trafficOperationBusy"
                 @update:model-value="onTrafficEnabledChanged" />
               <v-chip size="small" :color="statusColor" variant="flat" class="traffic-status-chip" :class="statusChipClass">
                 {{ statusLabel }}
@@ -23,6 +23,30 @@
           </v-card-title>
           <v-divider />
           <v-card-text>
+            <v-alert
+              v-if="loadError"
+              type="error"
+              variant="tonal"
+              density="comfortable"
+              class="mb-4">
+              <div class="d-flex align-center justify-space-between flex-wrap ga-3">
+                <span>{{ loadError }}</span>
+                <v-btn variant="text" prepend-icon="mdi-refresh" :loading="loading" @click="fetchOverview(false)">
+                  重新加载
+                </v-btn>
+              </div>
+            </v-alert>
+            <v-alert
+              v-else-if="!hasLoaded"
+              type="info"
+              variant="tonal"
+              density="comfortable"
+              class="mb-4">
+              <div class="d-flex align-center ga-2">
+                <v-progress-circular indeterminate size="18" width="2" />
+                <span>正在读取流量概览</span>
+              </div>
+            </v-alert>
             <v-alert
               v-if="overview.error"
               type="warning"
@@ -75,7 +99,7 @@
                 density="comfortable"
                 hide-details
                 class="traffic-version-select"
-                :disabled="loading || togglingTraffic || installingVnstat || removingVnstat || checkingVnstatUpdate || !overview.vnstat.supported || !overview.vnstat.canManage"
+                :disabled="trafficOperationBusy || !overview.vnstat.supported || !overview.vnstat.canManage"
                 clearable />
               <div class="traffic-runtime__button-group">
                 <v-btn
@@ -92,7 +116,7 @@
                   class="traffic-runtime-btn traffic-runtime-btn--install"
                   color="primary"
                   prepend-icon="mdi-download"
-                  :disabled="loading || togglingTraffic || installingVnstat || removingVnstat || checkingVnstatUpdate || !overview.vnstat.supported || !overview.vnstat.canManage || !hasSelectedVnstatSource"
+                  :disabled="trafficOperationBusy || !overview.vnstat.supported || !overview.vnstat.canManage || !hasSelectedVnstatSource"
                   @click="installVnstat">
                   {{ vnstatInstallButtonLabel }}
                 </v-btn>
@@ -102,7 +126,7 @@
                   color="primary"
                   prepend-icon="mdi-cloud-search"
                   :loading="checkingVnstatUpdate"
-                  :disabled="loading || togglingTraffic || installingVnstat || removingVnstat || checkingVnstatUpdate || !overview.vnstat.supported || !overview.vnstat.canManage || !hasSelectedVnstatSource"
+                  :disabled="trafficOperationBusy || !overview.vnstat.supported || !overview.vnstat.canManage || !hasSelectedVnstatSource"
                   @click="checkVnstatUpdate">
                   检测更新
                 </v-btn>
@@ -112,7 +136,7 @@
                   color="error"
                   prepend-icon="mdi-delete-outline"
                   :loading="removingVnstat"
-                  :disabled="loading || togglingTraffic || installingVnstat || removingVnstat || checkingVnstatUpdate || !overview.vnstat.supported || !overview.vnstat.canManage || !overview.vnstat.managed"
+                  :disabled="trafficOperationBusy || !overview.vnstat.supported || !overview.vnstat.canManage || !overview.vnstat.managed"
                   @click="removeVnstat">
                   删除
                 </v-btn>
@@ -121,6 +145,10 @@
 			<div v-if="hasActiveVnstatInstall" class="traffic-install-progress mb-3" role="status" aria-live="polite">
               <v-progress-circular indeterminate size="18" width="2" color="primary" />
               <span>{{ vnstatInstallPhase || '正在等待 vnStat 安装任务响应' }}</span>
+            </div>
+            <div v-if="hasActiveVnstatRemoval" class="traffic-install-progress mb-3" role="status" aria-live="polite">
+              <v-progress-circular indeterminate size="18" width="2" color="error" />
+              <span>{{ vnstatRemovalPhase || '正在删除面板受管 vnStat' }}</span>
             </div>
             <div class="text-caption text-medium-emphasis mb-3">
               安装操作只会检查正在运行的非面板 vnStat 守护进程；外部目录的程序、配置和统计文件会保留。只有面板明确安装并完成凭据核验的 vnStat，才可由面板删除。
@@ -215,7 +243,7 @@
         </v-card>
       </v-col>
       <v-col cols="12" lg="4">
-          <v-card rounded="lg" variant="outlined" class="h-100">
+          <v-card rounded="lg" variant="outlined" class="h-100" :loading="loading && !hasLoaded">
             <v-card-title class="text-subtitle-1 font-weight-medium">
               {{ t('stats.usage') }} / {{ resetDayLabel }}
             </v-card-title>
@@ -227,24 +255,27 @@
               min="0"
               step="0.01"
               :label="`${t('stats.volume')} (GB)`"
+              :disabled="trafficOperationBusy"
               hide-details />
-            <div class="mt-3">
-              <DatePick
-                :expiry="resetPickerEpoch"
-                input-id="traffic-reset-day-picker"
-                picker-type="date"
-                :label-text="resetDayLabel"
-                :zero-text="disabledLabel"
-                @submit="onSubmitResetDayPicker" />
-            </div>
+            <v-select
+              v-model="resetDayInput"
+              :items="resetDayOptions"
+              item-title="title"
+              item-value="value"
+              :label="resetDayLabel"
+              density="comfortable"
+              hide-details
+              class="mt-3"
+              :disabled="trafficOperationBusy" />
             <div class="mt-3">
               <DatePick
                 :expiry="expiryPickerEpoch"
                 input-id="traffic-expiry-date-picker"
                 picker-type="date"
-                :label-text="expiryDateLabel"
-                :zero-text="disabledLabel"
-                @submit="onSubmitExpiryDatePicker" />
+              :label-text="expiryDateLabel"
+              :zero-text="disabledLabel"
+              :disabled="trafficOperationBusy"
+              @submit="onSubmitExpiryDatePicker" />
             </div>
             <div class="text-caption text-medium-emphasis mt-2">
               {{ monthlyHint }}
@@ -257,7 +288,7 @@
                 color="primary"
                 variant="tonal"
                 :loading="savingSettings"
-                :disabled="savingSettings || installingVnstat || !hasPendingSettingsChanges"
+                :disabled="trafficOperationBusy || !hasPendingSettingsChanges"
               @click="saveTrafficSettings">
               {{ t('actions.save') }}
             </v-btn>
@@ -283,7 +314,7 @@
                 color="warning"
                 variant="tonal"
                 :loading="resettingPeriod"
-                :disabled="loading || savingSettings || togglingTraffic || installingVnstat || removingVnstat || resettingPeriod || resettingTotal"
+                :disabled="trafficOperationBusy"
                 @click="confirmResetPeriodTraffic">
                 重置流量
               </v-btn>
@@ -291,7 +322,7 @@
                 color="error"
                 variant="outlined"
                 :loading="resettingTotal"
-                :disabled="loading || savingSettings || togglingTraffic || installingVnstat || removingVnstat || resettingPeriod || resettingTotal"
+                :disabled="trafficOperationBusy"
                 @click="confirmResetTotalTraffic">
                 重置总流量
               </v-btn>
@@ -410,6 +441,15 @@ type VnstatInstallJob = {
 	finishedAt: number
 }
 
+type VnstatRemovalJob = {
+  id: string
+  state: string
+  phase: string
+  error: string
+  startedAt: number
+  finishedAt: number
+}
+
 type TrafficOverviewRaw = Record<string, unknown>
 
 const props = withDefaults(defineProps<{
@@ -419,7 +459,7 @@ const props = withDefaults(defineProps<{
 })
 
 const { t } = useI18n()
-const resetDayLabel = '\u6d41\u91cf\u91cd\u7f6e\u65e5\u671f'
+const resetDayLabel = '每月流量重置日'
 const expiryDateLabel = '\u6d41\u91cf\u5230\u671f\u671f\u9650'
 const disabledLabel = '\u672a\u542f\u7528'
 const daySuffix = '\u53f7'
@@ -434,9 +474,12 @@ const disableTrafficConfirmText = '确认关闭流量统计吗？关闭期间产
 const selectVnstatSourceHint = '请先选择来源'
 
 const loading = ref(false)
+const hasLoaded = ref(false)
+const loadError = ref('')
 const savingSettings = ref(false)
 const resettingPeriod = ref(false)
 const resettingTotal = ref(false)
+const trafficActionConfirming = ref(false)
 const togglingTraffic = ref(false)
 const installingVnstat = ref(false)
 const vnstatInstallJobId = ref('')
@@ -446,6 +489,9 @@ const vnstatInstallCanCancel = ref(false)
 const vnstatStopRequestPending = ref(false)
 const vnstatInstallBeforeVersion = ref('')
 const removingVnstat = ref(false)
+const vnstatRemovalJobId = ref('')
+const vnstatRemovalPhase = ref('')
+const vnstatRemovalState = ref('idle')
 const checkingVnstatUpdate = ref(false)
 const overviewRequest = ref<Promise<Msg> | null>(null)
 const enabledInput = ref(true)
@@ -520,7 +566,6 @@ const vnstatUpdateInfo = ref<VnstatUpdateInfo>({
 
 const limitGiBInput = ref(0)
 const resetDayInput = ref(0)
-const resetPickerEpoch = ref(0)
 const expiryDateInput = ref('')
 const expiryPickerEpoch = ref(0)
 const savedLimitGiB = ref(0)
@@ -528,6 +573,10 @@ const savedResetDay = ref(0)
 const savedExpiryDate = ref('')
 let pollingTimer: number | null = null
 let vnstatInstallPollingTimer: number | null = null
+let vnstatRemovalPollingTimer: number | null = null
+let overviewAbortController: AbortController | null = null
+let overviewRequestGeneration = 0
+let vnstatVersionOptionsGeneration = 0
 
 const createIdleVnstatUpdateInfo = (status: VnstatStatus = overview.value.vnstat): VnstatUpdateInfo => ({
   supported: status.supported,
@@ -710,6 +759,18 @@ const normalizeVnstatInstallJob = (raw: unknown): VnstatInstallJob => {
   }
 }
 
+const normalizeVnstatRemovalJob = (raw: unknown): VnstatRemovalJob => {
+  const input = (raw ?? {}) as TrafficOverviewRaw
+  return {
+    id: readStringField(input, ['id'], '').trim(),
+    state: readStringField(input, ['state'], 'idle').trim().toLowerCase() || 'idle',
+    phase: readStringField(input, ['phase'], '').trim(),
+    error: readStringField(input, ['error'], '').trim(),
+    startedAt: readNumberField(input, ['startedAt', 'started_at'], 0),
+    finishedAt: readNumberField(input, ['finishedAt', 'finished_at'], 0),
+  }
+}
+
 const limitBytes = computed(() => (
   limitGiBInput.value > 0 ? limitGiBInput.value * 1024 * 1024 * 1024 : 0
 ))
@@ -749,6 +810,9 @@ const updatedAtLabel = computed(() => (
   overview.value.updatedAt > 0 ? formatPanelDateTime(overview.value.updatedAt * 1000) : '-'
 ))
 const statusLabel = computed(() => {
+  if (!hasLoaded.value) {
+    return '加载中'
+  }
   if (installingVnstat.value) {
     return '安装中'
   }
@@ -764,6 +828,7 @@ const statusLabel = computed(() => {
   return '已停止'
 })
 const statusColor = computed(() => {
+  if (!hasLoaded.value) return 'info'
   if (installingVnstat.value) return 'info'
   if (!overview.value.enabled) return 'warning'
   if (overview.value.available) return 'success'
@@ -771,6 +836,7 @@ const statusColor = computed(() => {
   return 'warning'
 })
 const statusChipClass = computed(() => {
+  if (!hasLoaded.value) return 'traffic-status-chip--loading'
   if (installingVnstat.value) return 'traffic-status-chip--installing'
   if (!overview.value.enabled) return 'traffic-status-chip--paused'
   if (overview.value.available) return 'traffic-status-chip--running'
@@ -802,6 +868,29 @@ const vnstatInstallButtonLabel = computed(() => {
 const hasActiveVnstatInstall = computed(() => (
   installingVnstat.value && ['queued', 'running', 'stopping'].includes(vnstatInstallState.value)
 ))
+const hasActiveVnstatRemoval = computed(() => (
+  removingVnstat.value && ['queued', 'running'].includes(vnstatRemovalState.value)
+))
+const trafficOperationBusy = computed(() => (
+  !hasLoaded.value
+  ||
+  loading.value
+  || savingSettings.value
+  || resettingPeriod.value
+  || resettingTotal.value
+  || trafficActionConfirming.value
+  || togglingTraffic.value
+  || installingVnstat.value
+  || removingVnstat.value
+  || checkingVnstatUpdate.value
+))
+const resetDayOptions = computed(() => [
+  { title: disabledLabel, value: 0 },
+  ...Array.from({ length: 31 }, (_, index) => ({
+    title: `${index + 1} ${daySuffix}`,
+    value: index + 1,
+  })),
+])
 const vnstatStopButtonLabel = computed(() => {
   if (vnstatStopRequestPending.value || vnstatInstallState.value === 'stopping') return '正在停止'
   return vnstatInstallCanCancel.value ? '停止' : '正在应用'
@@ -918,31 +1007,6 @@ const daysInMonth = (year: number, monthIndex: number) => (
   new Date(year, monthIndex + 1, 0).getDate()
 )
 
-const buildResetDayDisplayDate = (day: number): Date | null => {
-  const normalizedDay = normalizeResetDay(day)
-  if (normalizedDay <= 0) {
-    return null
-  }
-
-  const now = panelCalendarDateFromInstant(panelNow())
-  let year = now.getFullYear()
-  let month = now.getMonth()
-  let maxDay = daysInMonth(year, month)
-  let candidateDay = Math.min(normalizedDay, maxDay)
-  let candidate = new Date(year, month, candidateDay, 0, 0, 0, 0)
-  if (now.getTime() >= candidate.getTime()) {
-    month += 1
-    if (month > 11) {
-      month = 0
-      year += 1
-    }
-    maxDay = daysInMonth(year, month)
-    candidateDay = Math.min(normalizedDay, maxDay)
-    candidate = new Date(year, month, candidateDay, 0, 0, 0, 0)
-  }
-  return panelCalendarDateToInstant(candidate)
-}
-
 const computeResetBoundary = (day: number, year: number, month: number) => {
   const maxDay = daysInMonth(year, month)
   const effectiveDay = Math.min(day, maxDay)
@@ -963,14 +1027,6 @@ const getNextResetAt = (day: number): Date | null => {
 
   const nextMonthDate = new Date(now.getFullYear(), now.getMonth() + 1, 1, 0, 0, 0, 0)
   return panelCalendarDateToInstant(computeResetBoundary(normalizedDay, nextMonthDate.getFullYear(), nextMonthDate.getMonth()))
-}
-
-const buildPickerEpochFromResetDay = (day: number) => {
-  const next = buildResetDayDisplayDate(day)
-  if (next == null) {
-    return 0
-  }
-  return Math.floor(next.getTime() / 1000)
 }
 
 const buildPickerEpochFromExpiryDate = (value: string) => {
@@ -1031,22 +1087,6 @@ const parseEpochSeconds = (value: unknown): number | null => {
   return null
 }
 
-const onSubmitResetDayPicker = (rawValue: unknown) => {
-  const epochSeconds = parseEpochSeconds(rawValue)
-  if (epochSeconds == null) {
-    return
-  }
-
-  if (epochSeconds <= 0) {
-    resetDayInput.value = 0
-    resetPickerEpoch.value = 0
-    return
-  }
-  const selected = panelCalendarParts(epochSeconds * 1000)
-  resetDayInput.value = normalizeResetDay(selected.day)
-  resetPickerEpoch.value = epochSeconds
-}
-
 const onSubmitExpiryDatePicker = (rawValue: unknown) => {
   const epochSeconds = parseEpochSeconds(rawValue)
   if (epochSeconds == null) {
@@ -1072,7 +1112,6 @@ type ApplyOverviewOptions = {
 const syncDraftFromSavedSettings = () => {
   limitGiBInput.value = savedLimitGiB.value
   resetDayInput.value = savedResetDay.value
-  resetPickerEpoch.value = buildPickerEpochFromResetDay(savedResetDay.value)
   expiryDateInput.value = savedExpiryDate.value
   expiryPickerEpoch.value = buildPickerEpochFromExpiryDate(savedExpiryDate.value)
 }
@@ -1106,6 +1145,8 @@ const applyOverview = (raw: Partial<TrafficOverview>, options: ApplyOverviewOpti
     vnstat,
     error: readStringField(input, ['error'], ''),
   }
+  hasLoaded.value = true
+  loadError.value = ''
   enabledInput.value = overview.value.enabled
   savedLimitGiB.value = normalizedLimitGiB
   savedResetDay.value = normalizedResetDay
@@ -1141,8 +1182,17 @@ const ensureVnstatSourceSelected = () => {
 }
 
 const loadVnstatVersionOptions = async () => {
+  if (!isTrafficPageActiveAndVisible()) {
+    return
+  }
+  const generation = ++vnstatVersionOptionsGeneration
   const msg = await HttpUtils.get('api/traffic-overview-vnstat-versions')
-  if (!msg.success || !msg.obj) {
+  if (
+    generation !== vnstatVersionOptionsGeneration
+    || !isTrafficPageActiveAndVisible()
+    || !msg.success
+    || !msg.obj
+  ) {
     return
   }
   const items = normalizeVnstatVersionItems(msg.obj)
@@ -1155,17 +1205,50 @@ const loadVnstatVersionOptions = async () => {
   }
 }
 
+const isTrafficPageActiveAndVisible = () => (
+  props.active
+  && (typeof document === 'undefined' || document.visibilityState === 'visible')
+)
+
+const cancelOverviewRequest = () => {
+  overviewRequestGeneration += 1
+  overviewRequest.value = null
+  if (overviewAbortController != null) {
+    overviewAbortController.abort()
+    overviewAbortController = null
+  }
+}
+
+const invalidateVnstatVersionOptionsRequest = () => {
+  vnstatVersionOptionsGeneration += 1
+}
+
 const fetchOverview = async (silent = false) => {
+  if (!isTrafficPageActiveAndVisible()) {
+    return { success: false, msg: '', obj: null, failureKind: 'cancelled' as const }
+  }
   if (overviewRequest.value) {
     return overviewRequest.value
   }
   if (!silent) {
     loading.value = true
+    loadError.value = ''
   }
+  const controller = new AbortController()
+  const generation = ++overviewRequestGeneration
+  overviewAbortController = controller
   const request = (async () => {
-    const msg = await HttpUtils.get('api/traffic-overview')
-    if (msg.success && msg.obj) {
-      applyOverview(msg.obj as Partial<TrafficOverview>)
+    const msg = await HttpUtils.get('api/traffic-overview', {}, {
+      signal: controller.signal,
+      silentAuthCheck: silent,
+      silentErrorToast: silent,
+    })
+    if (generation === overviewRequestGeneration && isTrafficPageActiveAndVisible()) {
+      if (msg.success && msg.obj) {
+        applyOverview(msg.obj as Partial<TrafficOverview>)
+      } else if (msg.failureKind !== 'cancelled') {
+        loadError.value = msg.msg || '流量概览加载失败'
+      }
     }
     return msg
   })()
@@ -1176,6 +1259,9 @@ const fetchOverview = async (silent = false) => {
     if (overviewRequest.value === request) {
       overviewRequest.value = null
     }
+    if (overviewAbortController === controller) {
+      overviewAbortController = null
+    }
     if (!silent) {
       loading.value = false
     }
@@ -1185,24 +1271,28 @@ const fetchOverview = async (silent = false) => {
 const onTrafficEnabledChanged = async (value: boolean | null) => {
   const nextEnabled = value === true
   const previousEnabled = overview.value.enabled
+  if (!isTrafficPageActiveAndVisible() || trafficOperationBusy.value) {
+    enabledInput.value = previousEnabled
+    return
+  }
   if (!nextEnabled) {
-    const confirmed = await confirm({
-      message: disableTrafficConfirmText,
-      severity: 'warning',
-      confirmText: t('confirmDialog.actions.disable'),
-    })
+    trafficActionConfirming.value = true
+    let confirmed = false
+    try {
+      confirmed = await confirm({
+        message: disableTrafficConfirmText,
+        severity: 'warning',
+        confirmText: t('confirmDialog.actions.disable'),
+      })
+    } finally {
+      trafficActionConfirming.value = false
+    }
     if (!confirmed) {
       enabledInput.value = previousEnabled
       return
     }
   }
-  if (
-    loading.value
-    || togglingTraffic.value
-    || installingVnstat.value
-    || removingVnstat.value
-    || checkingVnstatUpdate.value
-  ) {
+  if (!isTrafficPageActiveAndVisible() || trafficOperationBusy.value) {
     enabledInput.value = overview.value.enabled
     return
   }
@@ -1261,6 +1351,9 @@ const completeVnstatInstallJob = async (job: VnstatInstallJob) => {
 
   if (job.state === 'success') {
     await fetchOverview(true)
+    if (!isTrafficPageActiveAndVisible()) {
+      return
+    }
     const afterVersion = overview.value.vnstat.version.trim()
     if (beforeVersion === '') {
       push.success({
@@ -1286,6 +1379,9 @@ const completeVnstatInstallJob = async (job: VnstatInstallJob) => {
   }
 
   await fetchOverview(true)
+  if (!isTrafficPageActiveAndVisible()) {
+    return
+  }
   if (job.state === 'cancelled' || job.state === 'timed_out') {
     push.info({
       duration: 5000,
@@ -1344,6 +1440,9 @@ const pollVnstatInstallJob = async (jobID: string) => {
 }
 
 const recoverVnstatInstallJob = async (allowTerminal = false) => {
+  if (!isTrafficPageActiveAndVisible()) {
+    return false
+  }
   const msg = await HttpUtils.get('api/traffic-overview-vnstat-install-status', {}, { silentAuthCheck: true })
   if (!msg.success || !msg.obj) {
     return false
@@ -1360,21 +1459,131 @@ const recoverVnstatInstallJob = async (allowTerminal = false) => {
   return true
 }
 
+const stopVnstatRemovalPolling = () => {
+  if (vnstatRemovalPollingTimer != null) {
+    window.clearTimeout(vnstatRemovalPollingTimer)
+    vnstatRemovalPollingTimer = null
+  }
+}
+
+const clearVnstatRemovalTask = () => {
+  stopVnstatRemovalPolling()
+  removingVnstat.value = false
+  vnstatRemovalJobId.value = ''
+  vnstatRemovalPhase.value = ''
+  vnstatRemovalState.value = 'idle'
+}
+
+const scheduleVnstatRemovalPolling = () => {
+  stopVnstatRemovalPolling()
+  if (!hasActiveVnstatRemoval.value || vnstatRemovalJobId.value === '' || !isTrafficPageActiveAndVisible()) {
+    return
+  }
+  vnstatRemovalPollingTimer = window.setTimeout(() => {
+    void pollVnstatRemovalJob(vnstatRemovalJobId.value)
+  }, 1500)
+}
+
+const completeVnstatRemovalJob = async (job: VnstatRemovalJob) => {
+  const error = job.error || job.phase
+  clearVnstatRemovalTask()
+  await fetchOverview(true)
+  if (!isTrafficPageActiveAndVisible()) {
+    return
+  }
+  if (job.state === 'success') {
+    selectedVnstatVersion.value = ''
+    vnstatUpdateInfo.value = createIdleVnstatUpdateInfo(overview.value.vnstat)
+    push.success({ duration: 3500, message: 'vnstat 已删除，流量统计数据已清理' })
+    return
+  }
+  push.warning({
+    title: 'vnStat 删除失败',
+    duration: 6500,
+    message: error || '删除任务未能完成，请检查系统日志',
+  })
+}
+
+const applyVnstatRemovalJob = async (job: VnstatRemovalJob) => {
+  if (['queued', 'running'].includes(job.state) && job.id !== '') {
+    removingVnstat.value = true
+    vnstatRemovalJobId.value = job.id
+    vnstatRemovalState.value = job.state
+    vnstatRemovalPhase.value = job.phase || '正在删除面板受管 vnStat'
+    scheduleVnstatRemovalPolling()
+    return
+  }
+  if (['success', 'error', 'cancelled', 'timed_out'].includes(job.state)) {
+    await completeVnstatRemovalJob(job)
+    return
+  }
+  clearVnstatRemovalTask()
+}
+
+const pollVnstatRemovalJob = async (jobID: string) => {
+  if (!isTrafficPageActiveAndVisible() || jobID === '' || jobID !== vnstatRemovalJobId.value) {
+    return
+  }
+  const msg = await HttpUtils.get('api/traffic-overview-vnstat-removal-status', { jobId: jobID }, {
+    silentAuthCheck: true,
+    silentErrorToast: true,
+  })
+  if (jobID !== vnstatRemovalJobId.value) {
+    return
+  }
+  if (!msg.success || !msg.obj) {
+    vnstatRemovalPhase.value = '删除任务仍在继续，正在重新连接状态'
+    scheduleVnstatRemovalPolling()
+    return
+  }
+  await applyVnstatRemovalJob(normalizeVnstatRemovalJob(msg.obj))
+}
+
+const recoverVnstatRemovalJob = async (allowTerminal = false) => {
+  if (!isTrafficPageActiveAndVisible()) {
+    return false
+  }
+  const msg = await HttpUtils.get('api/traffic-overview-vnstat-removal-status', {}, {
+    silentAuthCheck: true,
+    silentErrorToast: true,
+  })
+  if (!msg.success || !msg.obj) {
+    return false
+  }
+  const job = normalizeVnstatRemovalJob(msg.obj)
+  if (!allowTerminal && ['success', 'error', 'cancelled', 'timed_out'].includes(job.state)) {
+    return false
+  }
+  await applyVnstatRemovalJob(job)
+  return job.id !== ''
+}
+
 const installVnstat = async () => {
   const selectedSource = ensureVnstatSourceSelected()
   if (selectedSource === '') {
     return
   }
-  if (!(await confirm({
-    message: installVnstatConfirmText,
-    severity: 'warning',
-    confirmText: t('confirmDialog.actions.continue'),
-  }))) {
+  if (!isTrafficPageActiveAndVisible() || trafficOperationBusy.value) {
+    return
+  }
+  trafficActionConfirming.value = true
+  let confirmed = false
+  try {
+    confirmed = await confirm({
+      message: installVnstatConfirmText,
+      severity: 'warning',
+      confirmText: t('confirmDialog.actions.continue'),
+    })
+  } finally {
+    trafficActionConfirming.value = false
+  }
+  if (!confirmed) {
     return
   }
 
   if (
     selectedSource !== selectedVnstatVersion.value.trim()
+    || !isTrafficPageActiveAndVisible()
     || !hasSelectedVnstatSource.value
     || loading.value
     || togglingTraffic.value
@@ -1467,7 +1676,7 @@ const checkVnstatUpdate = async (silent = false) => {
   checkingVnstatUpdate.value = true
   try {
     const msg = await HttpUtils.get(`api/traffic-overview-vnstat-update-info?source=${encodeURIComponent(selectedSource)}`)
-    if (!msg.success) {
+    if (!msg.success || !msg.obj || !isTrafficPageActiveAndVisible()) {
       return
     }
     vnstatUpdateInfo.value = normalizeVnstatUpdateInfo(msg.obj)
@@ -1483,18 +1692,24 @@ const checkVnstatUpdate = async (silent = false) => {
 }
 
 const removeVnstat = async () => {
-  const confirmed = await confirm({
-    message: removeVnstatConfirmText,
-    severity: 'danger',
-    confirmText: t('confirmDialog.actions.uninstall'),
-  })
+  if (!isTrafficPageActiveAndVisible() || trafficOperationBusy.value) {
+    return
+  }
+  trafficActionConfirming.value = true
+  let confirmed = false
+  try {
+    confirmed = await confirm({
+      message: removeVnstatConfirmText,
+      severity: 'danger',
+      confirmText: t('confirmDialog.actions.uninstall'),
+    })
+  } finally {
+    trafficActionConfirming.value = false
+  }
   if (
     !confirmed
-    || loading.value
-    || togglingTraffic.value
-    || installingVnstat.value
-    || removingVnstat.value
-    || checkingVnstatUpdate.value
+    || !isTrafficPageActiveAndVisible()
+    || trafficOperationBusy.value
     || !overview.value.vnstat.supported
     || !overview.value.vnstat.canManage
     || !overview.value.vnstat.managed
@@ -1502,23 +1717,42 @@ const removeVnstat = async () => {
     return
   }
   removingVnstat.value = true
+  vnstatRemovalState.value = 'queued'
+  vnstatRemovalPhase.value = '正在提交 vnStat 删除任务'
   try {
-    const msg = await HttpUtils.post('api/traffic-overview-vnstat-remove', {})
+    const msg = await HttpUtils.post('api/traffic-overview-vnstat-remove', {}, {
+      silentAuthCheck: true,
+    })
     if (msg.success && msg.obj) {
-      applyOverview(msg.obj as Partial<TrafficOverview>, { forceSyncDraft: true })
-      push.success({
-        duration: 3500,
-        message: 'vnstat 已删除，流量统计数据已清理',
-      })
-      selectedVnstatVersion.value = ''
-      vnstatUpdateInfo.value = createIdleVnstatUpdateInfo(overview.value.vnstat)
+      await applyVnstatRemovalJob(normalizeVnstatRemovalJob(msg.obj))
+      return
     }
+    if (await recoverVnstatRemovalJob()) return
+    clearVnstatRemovalTask()
+    push.warning({
+      title: '无法启动 vnStat 删除',
+      duration: 5500,
+      message: msg.msg || '删除任务未被服务器接受，请稍后重试。',
+    })
+  } catch {
+    if (await recoverVnstatRemovalJob()) return
+    clearVnstatRemovalTask()
+    push.warning({
+      title: '无法启动 vnStat 删除',
+      duration: 5500,
+      message: '删除任务未被服务器接受，请稍后重试。',
+    })
   } finally {
-    removingVnstat.value = false
+    if (!hasActiveVnstatRemoval.value && vnstatRemovalState.value === 'queued') {
+      clearVnstatRemovalTask()
+    }
   }
 }
 
 const saveTrafficSettings = async () => {
+  if (!isTrafficPageActiveAndVisible() || trafficOperationBusy.value || !hasPendingSettingsChanges.value) {
+    return
+  }
   savingSettings.value = true
   const payload = {
     limit_gib: normalizeLimitGiB(limitGiBInput.value),
@@ -1540,13 +1774,23 @@ const saveTrafficSettings = async () => {
 }
 
 const confirmResetPeriodTraffic = async () => {
-  const confirmed = await confirm({
-    message: resetPeriodConfirmText,
-    severity: 'danger',
-    confirmText: t('confirmDialog.actions.reset'),
-  })
+  if (!isTrafficPageActiveAndVisible() || trafficOperationBusy.value) {
+    return
+  }
+  trafficActionConfirming.value = true
+  let confirmed = false
+  try {
+    confirmed = await confirm({
+      message: resetPeriodConfirmText,
+      severity: 'danger',
+      confirmText: t('confirmDialog.actions.reset'),
+    })
+  } finally {
+    trafficActionConfirming.value = false
+  }
   if (
     !confirmed
+    || !isTrafficPageActiveAndVisible()
     || loading.value
     || savingSettings.value
     || togglingTraffic.value
@@ -1569,13 +1813,23 @@ const confirmResetPeriodTraffic = async () => {
 }
 
 const confirmResetTotalTraffic = async () => {
-  const confirmed = await confirm({
-    message: resetTotalConfirmText,
-    severity: 'danger',
-    confirmText: t('confirmDialog.actions.reset'),
-  })
+  if (!isTrafficPageActiveAndVisible() || trafficOperationBusy.value) {
+    return
+  }
+  trafficActionConfirming.value = true
+  let confirmed = false
+  try {
+    confirmed = await confirm({
+      message: resetTotalConfirmText,
+      severity: 'danger',
+      confirmText: t('confirmDialog.actions.reset'),
+    })
+  } finally {
+    trafficActionConfirming.value = false
+  }
   if (
     !confirmed
+    || !isTrafficPageActiveAndVisible()
     || loading.value
     || savingSettings.value
     || togglingTraffic.value
@@ -1617,7 +1871,7 @@ const stopPolling = () => {
 
 const schedulePolling = (delay = 10000) => {
   stopPolling()
-  if (!props.active) {
+  if (!isTrafficPageActiveAndVisible()) {
     return
   }
   if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
@@ -1626,7 +1880,7 @@ const schedulePolling = (delay = 10000) => {
   pollingTimer = window.setTimeout(async () => {
     pollingTimer = null
     const msg = await fetchOverview(true)
-    schedulePolling(msg.success ? 10000 : 30000)
+    schedulePolling(msg.success ? 30000 : 60000)
   }, delay)
 }
 
@@ -1635,24 +1889,34 @@ const startPolling = () => schedulePolling()
 const handleVisibilityChange = () => {
   if (document.visibilityState === 'visible') {
     if (!props.active) return
-    void fetchOverview(true)
-    void recoverVnstatInstallJob()
+    void fetchOverview(hasLoaded.value)
+    void loadVnstatVersionOptions()
+    void recoverVnstatInstallJob(installingVnstat.value)
+    void recoverVnstatRemovalJob(removingVnstat.value)
     startPolling()
     return
   }
   stopPolling()
   stopVnstatInstallPolling()
+  stopVnstatRemovalPolling()
+  invalidateVnstatVersionOptionsRequest()
+  cancelOverviewRequest()
 }
 
 watch(() => props.active, (active) => {
   if (active) {
-    void fetchOverview(true)
-		void recoverVnstatInstallJob()
+    void fetchOverview(hasLoaded.value)
+    void loadVnstatVersionOptions()
+    void recoverVnstatInstallJob(installingVnstat.value)
+    void recoverVnstatRemovalJob(removingVnstat.value)
     startPolling()
     return
   }
   stopPolling()
   stopVnstatInstallPolling()
+  stopVnstatRemovalPolling()
+  invalidateVnstatVersionOptionsRequest()
+  cancelOverviewRequest()
 })
 
 watch(() => selectedVnstatVersion.value, (value, previousValue) => {
@@ -1665,7 +1929,8 @@ watch(() => selectedVnstatVersion.value, (value, previousValue) => {
 onMounted(() => {
   void fetchOverview()
   void loadVnstatVersionOptions()
-  void recoverVnstatInstallJob()
+  void recoverVnstatInstallJob(installingVnstat.value)
+  void recoverVnstatRemovalJob(removingVnstat.value)
   startPolling()
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', handleVisibilityChange)
@@ -1675,6 +1940,9 @@ onMounted(() => {
 onBeforeUnmount(() => {
   stopPolling()
   stopVnstatInstallPolling()
+  stopVnstatRemovalPolling()
+  invalidateVnstatVersionOptionsRequest()
+  cancelOverviewRequest()
   if (typeof document !== 'undefined') {
     document.removeEventListener('visibilitychange', handleVisibilityChange)
   }

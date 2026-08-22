@@ -59,8 +59,16 @@ func (a *APIv2Handler) postHandler(c *gin.Context) {
 	switch action {
 	case "save":
 		a.ApiService.Save(c, username)
+	case "singbox-runtime-retry":
+		a.ApiService.RetrySingboxRuntime(c, username)
 	case "settings-patch":
 		a.ApiService.SaveSettingsPatch(c, username)
+	case "singbox-route-save":
+		a.ApiService.SaveSingboxRoute(c, username)
+	case "singbox-dns-save":
+		a.ApiService.SaveSingboxDNS(c, username)
+	case "singbox-basics-save":
+		a.ApiService.SaveSingboxBasics(c, username)
 	case "subscription-initial-reset":
 		a.ApiService.ResetSubscriptionToInitialState(c, username)
 	case "subscription-ruleset-probe":
@@ -86,6 +94,15 @@ func (a *APIv2Handler) getHandler(c *gin.Context) {
 	switch action {
 	case "load":
 		a.ApiService.LoadData(c)
+	case "singbox-route-editor-context":
+		a.ApiService.GetSingboxRouteEditorContext(c)
+		return
+	case "singbox-dns-editor-context":
+		a.ApiService.GetSingboxDNSEditorContext(c)
+		return
+	case "singbox-basics-editor-context":
+		a.ApiService.GetSingboxBasicsEditorContext(c)
+		return
 	case "inbounds", "outbounds", "endpoints", "services", "tls", "clients", "config":
 		err := a.ApiService.LoadPartialData(c, []string{action})
 		if err != nil {

@@ -18,7 +18,7 @@
                 <v-btn class="pf-hero-action" variant="outlined" prepend-icon="mdi-refresh" :loading="refreshing" :disabled="mutationBusy" @click="refreshOverview">
                   {{ t('refresh') }}
                 </v-btn>
-                <v-btn class="pf-hero-action" variant="outlined" prepend-icon="mdi-plus" :disabled="mutationBusy" @click="openRuleDialog()">
+                <v-btn class="pf-hero-action" variant="outlined" prepend-icon="mdi-plus" :disabled="actionsDisabled" @click="openRuleDialog()">
                   {{ t('newRule') }}
                 </v-btn>
               </div>
@@ -74,15 +74,15 @@
             <div class="pf-side__row"><span>{{ t('totalTraffic') }}</span><strong>{{ formatTrafficGB(overview.totalTraffic) }}</strong></div>
             <div class="pf-side__row"><span>{{ t('totalUpload') }}</span><strong>{{ formatTrafficGB(overview.totalUp) }}</strong></div>
             <div class="pf-side__row"><span>{{ t('totalDownload') }}</span><strong>{{ formatTrafficGB(overview.totalDown) }}</strong></div>
-            <v-btn block variant="tonal" color="warning" prepend-icon="mdi-restart" :loading="overviewResetBusy" :disabled="mutationBusy" @click="resetOverviewTraffic">{{ t('resetOverviewTraffic') }}</v-btn>
+            <v-btn block variant="tonal" color="warning" prepend-icon="mdi-restart" :loading="overviewResetBusy" :disabled="actionsDisabled" @click="resetOverviewTraffic">{{ t('resetOverviewTraffic') }}</v-btn>
             <v-alert type="info" variant="tonal" density="comfortable" class="mt-4">{{ t('runtimeHint') }}</v-alert>
           </v-card-text>
         </v-card>
       </v-col>
     </v-row>
 
-    <v-alert v-if="loadError || overview.error" type="warning" variant="tonal" density="comfortable" class="mb-4">
-      {{ loadError || overview.error }}
+    <v-alert v-if="loadError || overview.error || runtimeError" type="warning" variant="tonal" density="comfortable" class="mb-4">
+      {{ loadError || overview.error || runtimeError }}
     </v-alert>
     <v-alert v-if="hasLoaded && !overview.available" type="info" variant="tonal" density="comfortable" class="mb-4">
       {{ t('unavailableHint') }}
@@ -134,10 +134,10 @@
           </template>
           <template #item.actions="{ item }">
             <div class="d-flex align-center justify-end ga-1">
-              <v-switch density="compact" color="success" hide-details inset :model-value="item.enabled" :loading="rowBusyId === item.id" :disabled="mutationBusy" :aria-label="t('toggleRule', { name: item.name || t('ruleFallback') })" @update:modelValue="value => toggleRule(item, Boolean(value))" />
-              <v-btn icon="mdi-restart" size="small" variant="text" color="warning" :aria-label="t('resetRuleTraffic', { name: item.name || t('ruleFallback') })" :title="t('resetTraffic')" :disabled="mutationBusy" @click="resetRuleTraffic(item)" />
-              <v-btn icon="mdi-pencil" size="small" variant="text" color="primary" :aria-label="t('edit')" :title="t('edit')" :disabled="mutationBusy" @click="openRuleDialog(item)" />
-              <v-btn icon="mdi-delete" size="small" variant="text" color="error" :aria-label="t('delete')" :title="t('delete')" :disabled="mutationBusy" @click="removeRule(item)" />
+              <v-switch density="compact" color="success" hide-details inset :model-value="item.enabled" :loading="rowBusyId === item.id" :disabled="actionsDisabled" :aria-label="t('toggleRule', { name: item.name || t('ruleFallback') })" @update:modelValue="value => toggleRule(item, Boolean(value))" />
+              <v-btn icon="mdi-restart" size="small" variant="text" color="warning" :aria-label="t('resetRuleTraffic', { name: item.name || t('ruleFallback') })" :title="t('resetTraffic')" :disabled="actionsDisabled" @click="resetRuleTraffic(item)" />
+              <v-btn icon="mdi-pencil" size="small" variant="text" color="primary" :aria-label="t('edit')" :title="t('edit')" :disabled="actionsDisabled" @click="openRuleDialog(item)" />
+              <v-btn icon="mdi-delete" size="small" variant="text" color="error" :aria-label="t('delete')" :title="t('delete')" :disabled="actionsDisabled" @click="removeRule(item)" />
             </div>
           </template>
         </v-data-table>
@@ -165,10 +165,10 @@
                 {{ t('runtimeConflictLine', { protocol: protocolLabel(conflict.protocol), port: conflict.port, bind: conflict.bindAddress, process: formatConflictOwners(conflict) }) }}
               </v-alert>
               <div class="d-flex align-center justify-end ga-1 mt-3">
-                <v-switch density="compact" color="success" hide-details inset :model-value="item.enabled" :loading="rowBusyId === item.id" :disabled="mutationBusy" :aria-label="t('toggleRule', { name: item.name || t('ruleFallback') })" @update:modelValue="value => toggleRule(item, Boolean(value))" />
-                <v-btn icon="mdi-restart" size="small" variant="text" color="warning" :aria-label="t('resetRuleTraffic', { name: item.name || t('ruleFallback') })" :title="t('resetTraffic')" :disabled="mutationBusy" @click="resetRuleTraffic(item)" />
-                <v-btn icon="mdi-pencil" size="small" variant="text" color="primary" :aria-label="t('edit')" :title="t('edit')" :disabled="mutationBusy" @click="openRuleDialog(item)" />
-                <v-btn icon="mdi-delete" size="small" variant="text" color="error" :aria-label="t('delete')" :title="t('delete')" :disabled="mutationBusy" @click="removeRule(item)" />
+                <v-switch density="compact" color="success" hide-details inset :model-value="item.enabled" :loading="rowBusyId === item.id" :disabled="actionsDisabled" :aria-label="t('toggleRule', { name: item.name || t('ruleFallback') })" @update:modelValue="value => toggleRule(item, Boolean(value))" />
+                <v-btn icon="mdi-restart" size="small" variant="text" color="warning" :aria-label="t('resetRuleTraffic', { name: item.name || t('ruleFallback') })" :title="t('resetTraffic')" :disabled="actionsDisabled" @click="resetRuleTraffic(item)" />
+                <v-btn icon="mdi-pencil" size="small" variant="text" color="primary" :aria-label="t('edit')" :title="t('edit')" :disabled="actionsDisabled" @click="openRuleDialog(item)" />
+                <v-btn icon="mdi-delete" size="small" variant="text" color="error" :aria-label="t('delete')" :title="t('delete')" :disabled="actionsDisabled" @click="removeRule(item)" />
               </div>
             </v-card-text>
           </v-card>
@@ -213,8 +213,8 @@
             <div class="pf-panel__subtitle">{{ t('trafficControlHint') }}</div>
             <v-row class="mt-1">
               <v-col cols="12" md="4"><v-text-field v-model.number="editingRule.trafficLimitGiB" type="number" min="0" step="0.01" :label="t('trafficLimitLabel')" :disabled="mutationBusy" hide-details /></v-col>
-              <v-col cols="12" md="4"><div class="pf-date-picker" :class="{ 'pf-date-picker--disabled': mutationBusy }" :aria-disabled="mutationBusy"><DatePick :expiry="ruleTrafficResetPickerEpoch" input-id="port-forward-traffic-reset-day" picker-type="date" :label-text="t('trafficResetDayLabel')" :zero-text="t('notEnabled')" @submit="submitRuleTrafficResetDay" /></div></v-col>
-              <v-col cols="12" md="4"><div class="pf-date-picker" :class="{ 'pf-date-picker--disabled': mutationBusy }" :aria-disabled="mutationBusy"><DatePick :expiry="ruleTrafficExpiryPickerEpoch" input-id="port-forward-traffic-expiry" picker-type="date" :label-text="t('trafficExpiryDateLabel')" :zero-text="t('notEnabled')" @submit="submitRuleTrafficExpiryDate" /></div></v-col>
+              <v-col cols="12" md="4"><div class="pf-date-picker" :class="{ 'pf-date-picker--disabled': mutationBusy }" :aria-disabled="mutationBusy"><DatePick :expiry="ruleTrafficResetPickerEpoch" input-id="port-forward-traffic-reset-day" picker-type="date" :label-text="t('trafficResetDayLabel')" :zero-text="t('notEnabled')" :disabled="mutationBusy" @submit="submitRuleTrafficResetDay" /></div></v-col>
+              <v-col cols="12" md="4"><div class="pf-date-picker" :class="{ 'pf-date-picker--disabled': mutationBusy }" :aria-disabled="mutationBusy"><DatePick :expiry="ruleTrafficExpiryPickerEpoch" input-id="port-forward-traffic-expiry" picker-type="date" :label-text="t('trafficExpiryDateLabel')" :zero-text="t('notEnabled')" :disabled="mutationBusy" @submit="submitRuleTrafficExpiryDate" /></div></v-col>
             </v-row>
           </div>
         </v-card-text>
@@ -243,7 +243,7 @@ import {
 const props = withDefaults(defineProps<{ active?: boolean }>(), { active: false })
 const { smAndDown } = useDisplay()
 const {
-  loading, refreshing, savingRule, mutationBusy, dialogVisible, rowBusyId, hasLoaded, loadError,
+  loading, refreshing, savingRule, mutationBusy, actionsDisabled, dialogVisible, rowBusyId, hasLoaded, loadError, runtimeError,
   searchText, familyFilter, protocolFilter, overview, editingRule, headers, familyItems,
   familyFilterItems, protocolItems, protocolFilterItems, localModeItems, lastSyncLabel,
   dialogTitle, localStartLabel, localPreviewText, formError, ruleTrafficResetPickerEpoch,

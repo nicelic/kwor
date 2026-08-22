@@ -1,22 +1,73 @@
 import HttpUtils from '@/plugins/httputil'
-import { defineStore } from 'pinia'
+import { defineStore, getActivePinia } from 'pinia'
 import { push } from 'notivue'
 import { i18n } from '@/locales'
 import { Inbound } from '@/types/inbounds'
 import { Client } from '@/types/clients'
 import { normalizeSubscriptionURI, refreshSubscriptionURI } from '@/plugins/subscriptionUri'
 
-let defaultDataLoadPromise: Promise<void> | null = null
+let defaultDataLoadPromise: Promise<boolean> | null = null
+
+const singboxRuntimeRegeneratingObjects = new Set([
+  'inbounds',
+  'outbounds',
+  'clients',
+  'services',
+  'endpoints',
+  'config',
+])
+
+export interface SingboxDNSSnapshot {
+  revision: number
+  dns: any
+  servers: any[]
+  dialTags: string[]
+  tailscaleTags: string[]
+  resolvedTags: string[]
+  clientNames: string[]
+  inboundTags: string[]
+  ruleSetTags: string[]
+}
+
+export interface SingboxDNSMutationResponse {
+  ok: boolean
+  committed: boolean
+  runtimeRefreshFailed: boolean
+  conflict: boolean
+  currentRevision?: number
+  result?: { snapshot?: SingboxDNSSnapshot, changed?: boolean }
+}
+
+export interface SingboxBasicsSnapshot {
+  revision: number
+  basics: any
+  dialTags: string[]
+  dnsServerTags: string[]
+  inboundTags: string[]
+  clientNames: string[]
+}
+
+export interface SingboxBasicsMutationResponse {
+  ok: boolean
+  committed: boolean
+  runtimeRefreshFailed: boolean
+  conflict: boolean
+  currentRevision?: number
+  result?: { revision: number, basics: any, changed: boolean }
+}
 
 const Data = defineStore('Data', {
   state: () => ({ 
     isLoadingData: false,
+    hasFullData: false,
     lastLoad: 0,
     reloadItems: localStorage.getItem("reloadItems")?.split(',')?? <string[]>[],
     subURI: "",
     subscriptionUriVerified: false,
     subscriptionUriRefreshing: false,
     subscriptionUriError: '',
+    runtimeRetryPending: false,
+    runtimeRetryBusy: false,
     enableTraffic: false,
     onlines: {inbound: <string[]>[], outbound: <string[]>[], user: <string[]>[]},
     config: <any>{},
@@ -31,30 +82,49 @@ const Data = defineStore('Data', {
     tlsConfigs: <any[]>[],
   }),
   actions: {
-    loadData(): Promise<void> {
+    loadData(force = false): Promise<boolean> {
       if (defaultDataLoadPromise) return defaultDataLoadPromise
       this.isLoadingData = true
       defaultDataLoadPromise = (async () => {
+        let loaded = false
         try {
-          const params = this.lastLoad > 0
+          const params = !force && this.hasFullData && this.lastLoad > 0
             ? { lu: this.lastLoad, light: 'true' }
             : {}
           const msg = await HttpUtils.get('api/load', params)
           if(msg.success) {
-            this.onlines = msg.obj.onlines
-            if (msg.obj.config) {
-              this.setNewData(msg.obj)
+            const data = msg.obj ?? {}
+            const hasFullSnapshot = Object.hasOwn(data, 'config')
+              && Object.hasOwn(data, 'clients')
+              && Object.hasOwn(data, 'tls')
+              && Object.hasOwn(data, 'inbounds')
+              && Object.hasOwn(data, 'outbounds')
+              && Object.hasOwn(data, 'outboundgroups')
+              && Object.hasOwn(data, 'suboutbounds')
+              && Object.hasOwn(data, 'subgroups')
+              && Object.hasOwn(data, 'endpoints')
+              && Object.hasOwn(data, 'services')
+            if (hasFullSnapshot) this.hasFullData = true
+            if (data.onlines) this.onlines = data.onlines
+            if (Object.hasOwn(data, 'config')) {
+              this.setNewData(data)
             }
+            loaded = true
           }
         } finally {
           this.isLoadingData = false
           defaultDataLoadPromise = null
         }
+        return loaded
       })()
       return defaultDataLoadPromise
     },
     setNewData(data: any) {
-      this.lastLoad = Math.floor((new Date()).getTime()/1000)
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return
+      const serverRevision = Number(data?.lastUpdate)
+      if (Number.isSafeInteger(serverRevision) && serverRevision > 0) {
+        this.lastLoad = serverRevision
+      }
       if (Object.hasOwn(data, 'subURI')) {
         const subURI = normalizeSubscriptionURI(data.subURI)
         if (subURI) {
@@ -64,16 +134,43 @@ const Data = defineStore('Data', {
         }
       }
       if (Object.hasOwn(data, 'enableTraffic')) this.enableTraffic = data.enableTraffic === true
-      if (Object.hasOwn(data, 'config')) this.config = data.config ?? {}
-      if (Object.hasOwn(data, 'clients')) this.clients = data.clients ?? []
-      if (Object.hasOwn(data, 'inbounds')) this.inbounds = data.inbounds ?? []
-      if (Object.hasOwn(data, 'outbounds')) this.outbounds = data.outbounds ?? []
-      if (Object.hasOwn(data, 'outboundgroups')) this.outboundgroups = data.outboundgroups ?? []
-      if (Object.hasOwn(data, 'suboutbounds')) this.suboutbounds = data.suboutbounds ?? []
-      if (Object.hasOwn(data, 'subgroups')) this.subgroups = data.subgroups ?? []
-      if (Object.hasOwn(data, 'services')) this.services = data.services ?? []
-      if (Object.hasOwn(data, 'endpoints')) this.endpoints = data.endpoints ?? []
-      if (Object.hasOwn(data, 'tls')) this.tlsConfigs = data.tls ?? []
+      if (Object.hasOwn(data, 'config') && data.config && typeof data.config === 'object' && !Array.isArray(data.config)) this.config = data.config
+      if (Object.hasOwn(data, 'clients')) this.clients = Array.isArray(data.clients) ? data.clients : data.clients === null ? [] : this.clients
+      if (Object.hasOwn(data, 'inbounds')) this.inbounds = Array.isArray(data.inbounds) ? data.inbounds : data.inbounds === null ? [] : this.inbounds
+      if (Object.hasOwn(data, 'outbounds')) this.outbounds = Array.isArray(data.outbounds) ? data.outbounds : data.outbounds === null ? [] : this.outbounds
+      if (Object.hasOwn(data, 'outboundgroups')) this.outboundgroups = Array.isArray(data.outboundgroups) ? data.outboundgroups : data.outboundgroups === null ? [] : this.outboundgroups
+      if (Object.hasOwn(data, 'suboutbounds')) this.suboutbounds = Array.isArray(data.suboutbounds) ? data.suboutbounds : data.suboutbounds === null ? [] : this.suboutbounds
+      if (Object.hasOwn(data, 'subgroups')) this.subgroups = Array.isArray(data.subgroups) ? data.subgroups : data.subgroups === null ? [] : this.subgroups
+      if (Object.hasOwn(data, 'services')) this.services = Array.isArray(data.services) ? data.services : data.services === null ? [] : this.services
+      if (Object.hasOwn(data, 'endpoints')) this.endpoints = Array.isArray(data.endpoints) ? data.endpoints : data.endpoints === null ? [] : this.endpoints
+      if (Object.hasOwn(data, 'tls')) this.tlsConfigs = Array.isArray(data.tls) ? data.tls : data.tls === null ? [] : this.tlsConfigs
+
+      // Subscription nodes and groups are shared by the default and Mihomo
+      // chains. Keep an already active Mihomo store current for every partial
+      // default response without mixing either chain's independent collections.
+      if (Object.hasOwn(data, 'suboutbounds') || Object.hasOwn(data, 'subgroups')) {
+        const activePinia = getActivePinia() as unknown as {
+          _s?: Map<string, unknown>
+        } | undefined
+        const mihomoData = activePinia?._s?.get('MihomoData') as {
+          suboutbounds: any[]
+          subgroups: any[]
+        } | undefined
+        if (mihomoData && Object.hasOwn(data, 'suboutbounds')) {
+          mihomoData.suboutbounds = Array.isArray(data.suboutbounds)
+            ? data.suboutbounds
+            : data.suboutbounds === null
+              ? []
+              : mihomoData.suboutbounds
+        }
+        if (mihomoData && Object.hasOwn(data, 'subgroups')) {
+          mihomoData.subgroups = Array.isArray(data.subgroups)
+            ? data.subgroups
+            : data.subgroups === null
+              ? []
+              : mihomoData.subgroups
+        }
+      }
     },
     async refreshSubscriptionURI(): Promise<boolean> {
       this.subscriptionUriRefreshing = true
@@ -92,36 +189,133 @@ const Data = defineStore('Data', {
         this.subscriptionUriRefreshing = false
       }
     },
-    async loadInbounds(ids: number[]): Promise<Inbound[]> {
-      const options = ids.length > 0 ? {id: ids.join(",")} : {}
-      const msg = await HttpUtils.get('api/inbounds', options)
-      if(msg.success) {
-        return msg.obj.inbounds
+    async loadInbounds(ids: number[], requestOptions: { signal?: AbortSignal; silentErrorToast?: boolean } = {}): Promise<Inbound[] | null> {
+      const params = ids.length > 0 ? {id: ids.join(",")} : {}
+      const msg = await HttpUtils.get('api/inbounds', params, requestOptions)
+      if(msg.success && Object.hasOwn(msg.obj ?? {}, 'inbounds')) {
+        return Array.isArray(msg.obj?.inbounds) ? msg.obj.inbounds : []
       }
-      return <Inbound[]>[]
+      return null
     },
     async loadClients(id: number): Promise<Client> {
       const options = id > 0 ? {id: id} : {}
       const msg = await HttpUtils.get('api/clients', options)
-      if(msg.success) {
-        return <Client>msg.obj.clients[0]??{}
+      if(msg.success && Object.hasOwn(msg.obj ?? {}, 'clients')) {
+        return <Client>(Array.isArray(msg.obj?.clients) ? msg.obj.clients[0] : undefined) ?? {}
       }
       return <Client>{}
     },
-    async loadSubGroups(): Promise<any[]> {
+    async loadSubGroups(): Promise<any[] | null> {
       const msg = await HttpUtils.get('api/subgroups')
-      if(msg.success) {
-        this.subgroups = msg.obj.subgroups ?? []
+      if(msg.success && Object.hasOwn(msg.obj ?? {}, 'subgroups')) {
+        this.setNewData({ subgroups: msg.obj?.subgroups })
         return this.subgroups
       }
-      return []
+      return null
     },
-    async loadOutboundGroups(): Promise<any[]> {
+    async loadOutboundGroups(): Promise<any[] | null> {
       const msg = await HttpUtils.get('api/outboundgroups')
-      if(msg.success) {
-        return msg.obj.outboundgroups ?? []
+      if(msg.success && Object.hasOwn(msg.obj ?? {}, 'outboundgroups')) {
+        this.outboundgroups = Array.isArray(msg.obj?.outboundgroups) ? msg.obj.outboundgroups : msg.obj?.outboundgroups === null ? [] : this.outboundgroups
+        return this.outboundgroups
       }
-      return []
+      return null
+    },
+    async loadSingboxDNSSnapshot(): Promise<SingboxDNSSnapshot | null> {
+      const msg = await HttpUtils.get('api/singbox-dns-editor-context')
+      if (!msg.success || !msg.obj) return null
+      return msg.obj as SingboxDNSSnapshot
+    },
+    async saveSingboxDNSMutation(payload: Record<string, unknown>): Promise<SingboxDNSMutationResponse> {
+      const msg = await HttpUtils.post('api/singbox-dns-save', payload, {
+        headers: { 'Content-Type': 'application/json' },
+      })
+      if (msg.success) {
+        const result = msg.obj?.result ?? msg.obj
+        if (payload.retryRuntime === true || result?.changed === true) this.runtimeRetryPending = false
+        return { ok: true, committed: false, runtimeRefreshFailed: false, conflict: false, result: msg.obj }
+      }
+      if (msg.obj?.committed === true) {
+        this.runtimeRetryPending = true
+        return {
+          ok: true,
+          committed: true,
+          runtimeRefreshFailed: true,
+          conflict: false,
+          result: msg.obj.result ?? msg.obj,
+        }
+      }
+      if (msg.obj?.code === 'revision_conflict') {
+        return {
+          ok: false,
+          committed: false,
+          runtimeRefreshFailed: false,
+          conflict: true,
+          currentRevision: Number(msg.obj.currentRevision ?? 0),
+        }
+      }
+      return { ok: false, committed: false, runtimeRefreshFailed: false, conflict: false }
+    },
+    async loadSingboxBasicsSnapshot(): Promise<SingboxBasicsSnapshot | null> {
+      const msg = await HttpUtils.get('api/singbox-basics-editor-context')
+      if (!msg.success || !msg.obj) return null
+      return msg.obj as SingboxBasicsSnapshot
+    },
+    async saveSingboxBasicsMutation(payload: Record<string, unknown>): Promise<SingboxBasicsMutationResponse> {
+      const msg = await HttpUtils.post('api/singbox-basics-save', payload, {
+        headers: { 'Content-Type': 'application/json' },
+      })
+      if (msg.success) {
+        const result = msg.obj?.result ?? msg.obj
+        if (payload.retryRuntime === true || result?.changed === true) this.runtimeRetryPending = false
+        return { ok: true, committed: false, runtimeRefreshFailed: false, conflict: false, result: msg.obj }
+      }
+      if (msg.obj?.committed === true) {
+        this.runtimeRetryPending = true
+        return {
+          ok: true,
+          committed: true,
+          runtimeRefreshFailed: true,
+          conflict: false,
+          result: msg.obj.result ?? msg.obj,
+        }
+      }
+      if (msg.obj?.code === 'revision_conflict') {
+        return {
+          ok: false,
+          committed: false,
+          runtimeRefreshFailed: false,
+          conflict: true,
+          currentRevision: Number(msg.obj.currentRevision ?? 0),
+        }
+      }
+      return { ok: false, committed: false, runtimeRefreshFailed: false, conflict: false }
+    },
+    setSingboxRuntimeRetryPending(pending: boolean) {
+      this.runtimeRetryPending = pending
+    },
+    async retrySingboxRuntime(notify = true): Promise<boolean> {
+      if (this.runtimeRetryBusy) return false
+      this.runtimeRetryBusy = true
+      try {
+        const msg = await HttpUtils.post('api/singbox-runtime-retry', {}, {
+          headers: { 'Content-Type': 'application/json' },
+        })
+        if (msg.success === true) {
+          this.runtimeRetryPending = false
+          if (notify) push.success({ title: i18n.global.t('success'), duration: 5000, message: '运行配置已重新生成' })
+          return true
+        }
+        this.runtimeRetryPending = true
+        if (notify) push.warning({ title: i18n.global.t('warning'), duration: 7000, message: msg.msg || '运行配置仍未刷新，请稍后重试' })
+        return false
+      } catch {
+        this.runtimeRetryPending = true
+        if (notify) push.warning({ title: i18n.global.t('warning'), duration: 7000, message: '运行配置仍未刷新，请稍后重试' })
+        return false
+      } finally {
+        this.runtimeRetryBusy = false
+      }
     },
     async save (object: string, action: string, data: any, initUsers?: number[]): Promise<boolean> {
       let postData = {
@@ -142,6 +336,38 @@ const Data = defineStore('Data', {
           message: i18n.global.t('actions.' + action) + " " + i18n.global.t('objects.' + objectName)
         })
         this.setNewData(msg.obj)
+        if (singboxRuntimeRegeneratingObjects.has(object)) this.runtimeRetryPending = false
+      } else if (msg.obj?.committed === true) {
+        let reloaded = false
+        try {
+          reloaded = await this.loadData(true)
+        } catch {
+          reloaded = false
+        }
+        if (msg.obj?.refreshFailed === true) {
+          if (singboxRuntimeRegeneratingObjects.has(object)) this.runtimeRetryPending = false
+          push.warning({
+            title: i18n.global.t('warning'),
+            duration: 7000,
+            message: reloaded ? '数据已保存，列表已重新加载。' : '数据已保存，但列表刷新失败，请稍后刷新页面。',
+          })
+          return true
+        }
+        const singboxRuntimeSave = msg.obj?.retryRuntime === true
+        if (singboxRuntimeSave && await this.retrySingboxRuntime(false)) {
+          push.success({
+            title: i18n.global.t('success'),
+            duration: 5000,
+            message: '数据已保存，运行配置已重新生成'
+          })
+          return true
+        }
+        push.warning({
+          title: i18n.global.t('warning'),
+          duration: 7000,
+          message: msg.msg || (singboxRuntimeSave ? '数据已保存，但运行配置更新失败。' : '数据已保存，但后续处理失败。')
+        })
+        return true
       }
       return msg.success
     },
@@ -161,7 +387,6 @@ const Data = defineStore('Data', {
       const newNames = new Set(names)
       const oldNames = new Set(this.clients.map((c: any) => c.name))
       const allNames = new Set([...oldNames, ...newNames])
-      console.log(oldNames, newNames, allNames)
       if (newNames.size != names.length || oldNames.size + newNames.size != allNames.size) {
         push.error({
           message: i18n.global.t('error.dplData') + ": " + i18n.global.t('client.name')

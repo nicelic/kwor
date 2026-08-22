@@ -41,7 +41,7 @@ func ensureAcmeAccountDisplayID(db *gorm.DB, entry *model.AcmeAccount) error {
 		return nil
 	}
 	rows := make([]model.AcmeAccount, 0)
-	if err := db.Where("display_id > 0 AND system = ?", false).Order("display_id ASC").Find(&rows).Error; err != nil {
+	if err := db.Select("id", "display_id").Where("display_id > 0 AND system = ?", false).Order("display_id ASC").Find(&rows).Error; err != nil {
 		return err
 	}
 	used := make(map[uint64]struct{}, len(rows))
@@ -60,7 +60,7 @@ func ensureAcmeAccountDisplayID(db *gorm.DB, entry *model.AcmeAccount) error {
 
 func repairAcmeAccountDisplayIDs(db *gorm.DB) error {
 	rows := make([]model.AcmeAccount, 0)
-	if err := db.Where("system = ?", false).Order("id ASC").Find(&rows).Error; err != nil {
+	if err := db.Select("id", "display_id").Where("system = ?", false).Order("id ASC").Find(&rows).Error; err != nil {
 		return err
 	}
 	used := make(map[uint64]struct{}, len(rows))
@@ -90,7 +90,7 @@ func repairAcmeAccountDisplayIDs(db *gorm.DB) error {
 
 func repairDNSAccountDisplayIDs(db *gorm.DB) error {
 	rows := make([]model.AcmeDNSAccount, 0)
-	if err := db.Order("id ASC").Find(&rows).Error; err != nil {
+	if err := db.Select("id", "display_id").Order("id ASC").Find(&rows).Error; err != nil {
 		return err
 	}
 	used := make(map[uint64]struct{}, len(rows))
@@ -123,7 +123,7 @@ func ensureDNSAccountDisplayID(db *gorm.DB, entry *model.AcmeDNSAccount) error {
 		return nil
 	}
 	rows := make([]model.AcmeDNSAccount, 0)
-	if err := db.Where("display_id > 0").Order("display_id ASC").Find(&rows).Error; err != nil {
+	if err := db.Select("id", "display_id").Where("display_id > 0").Order("display_id ASC").Find(&rows).Error; err != nil {
 		return err
 	}
 	used := make(map[uint64]struct{}, len(rows))

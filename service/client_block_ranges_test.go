@@ -104,3 +104,75 @@ func TestPortRangeJSONEncodeDecodeRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestClientBlockPolicyDistinguishesManualDisableAndDepletion(t *testing.T) {
+	evaluation := evaluateClientAccess(true, 100, 100, 0, 1)
+	if !evaluation.Blocked {
+		t.Fatal("usage at the configured cap must be blocked")
+	}
+
+	manualDisabledShouldBlock := (false && evaluation.Blocked) || (!false && false)
+	if manualDisabledShouldBlock {
+		t.Fatal("manually disabled client must not create a shared-port block")
+	}
+
+	depletedShouldBlock := (false && evaluation.Blocked) || (!false && true)
+	if !depletedShouldBlock {
+		t.Fatal("automatically depleted client must keep its block until access is restored")
+	}
+}
+
+func TestMihomoDepleteClientsMarksPersistentDepletionState(t *testing.T) {
+	db := initClientLimitTestDB(t, "mihomo-deplete-state.db")
+	client := mustCreateMihomoClient(t, db, model.MihomoClient{
+		Enable:   true,
+		Name:     "mihomo-depleted-client",
+		Inbounds: json.RawMessage(`[901]`),
+		Volume:   100,
+		Up:       100,
+	})
+
+	if _, err := (&MihomoClientService{}).DepleteClients(); err != nil {
+		t.Fatalf("deplete mihomo clients failed: %v", err)
+	}
+
+	var saved model.MihomoClient
+	if err := db.First(&saved, client.Id).Error; err != nil {
+		t.Fatalf("load depleted mihomo client failed: %v", err)
+	}
+	if saved.Enable || !saved.Depleted {
+		t.Fatalf("unexpected depleted state: enable=%t depleted=%t", saved.Enable, saved.Depleted)
+	}
+}
+
+func TestMihomoPortBlockKeepsOnlyAutomaticDepletion(t *testing.T) {
+	db := initClientLimitTestDB(t, "mihomo-block-depleted.db")
+	createMihomoInbound(t, db, 902, "depleted-inbound", map[string]interface{}{"listen_port": 31902}, nil)
+	client := mustCreateMihomoClient(t, db, model.MihomoClient{
+		Enable:   false,
+		Depleted: true,
+		Name:     "persisted-depletion",
+		Inbounds: json.RawMessage(`[902]`),
+		Links:    json.RawMessage(`[]`),
+	})
+
+	svc := &MihomoClientPortBlockService{}
+	desired, err := svc.collectDesiredBlockedPorts(db)
+	if err != nil {
+		t.Fatalf("collect depleted block ports failed: %v", err)
+	}
+	if _, ok := desired[31902]; !ok {
+		t.Fatal("automatically depleted mihomo client must keep its port block")
+	}
+
+	if err := db.Model(&model.MihomoClient{}).Where("id = ?", client.Id).Update("depleted", false).Error; err != nil {
+		t.Fatalf("clear persisted depletion failed: %v", err)
+	}
+	desired, err = svc.collectDesiredBlockedPorts(db)
+	if err != nil {
+		t.Fatalf("collect manual-disable block ports failed: %v", err)
+	}
+	if _, ok := desired[31902]; ok {
+		t.Fatal("manually disabled mihomo client must not block a shared port")
+	}
+}

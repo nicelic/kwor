@@ -1,67 +1,87 @@
 <template>
-  <SubOutboundVue 
-    v-model="modal.visible"
-    :visible="modal.visible"
-    :id="modal.id"
-    :data="modal.data"
-    :tags="subOutboundTags"
-    @close="closeModal"
-  />
-  <SubManagerQrCode
-    v-model="qrcode.visible"
-    :visible="qrcode.visible"
-    :tag="qrcode.tag"
-    @close="closeQrCode"
-  />
-  <Stats
-    v-model="stats.visible"
-    :visible="stats.visible"
-    :resource="stats.resource"
-    :tag="stats.tag"
-    @close="closeStats"
-  />
-  <SubGroup
-    v-model="groupModal.visible"
-    :visible="groupModal.visible"
-    @close="closeGroupModal"
-  />
-  <v-row justify="center" class="mb-3">
-    <v-col cols="12" class="d-flex justify-center flex-wrap ga-3">
-      <v-btn color="primary" size="large" min-width="96" @click="showModal(0)">{{ $t('actions.add') }}</v-btn>
-      <v-btn color="primary" size="large" min-width="96" @click="showGroupModal">{{ $t('actions.group') }}</v-btn>
-      <v-btn color="error" variant="outlined" size="large" min-width="96" @click="showClearDialog = true">清空</v-btn>
-    </v-col>
-  </v-row>
-  <v-dialog v-model="showClearDialog" max-width="460">
-    <v-card rounded="lg">
-      <v-card-title>清空订阅管理</v-card-title>
-      <v-divider></v-divider>
-      <v-card-text>
-        <v-alert type="warning" variant="tonal" class="mb-3">
-          此操作会清空订阅管理的全部节点和卡片，并清空所有分组内节点。
+  <template v-if="initializing">
+    <v-row align="center" justify="center" style="min-height: 240px;">
+      <v-col cols="12" class="text-center">
+        <v-progress-circular indeterminate color="primary" />
+        <div class="mt-3">{{ $t('loading') }}</div>
+      </v-col>
+    </v-row>
+  </template>
+  <template v-else-if="loadFailed">
+    <v-row align="center" justify="center" style="min-height: 240px;">
+      <v-col cols="12" sm="8" md="6">
+        <v-alert type="error" variant="tonal" :title="$t('failed')" class="text-center">
+          <v-btn color="primary" class="mt-2" prepend-icon="mdi-refresh" @click="initialize">
+            {{ $t('actions.update') }}
+          </v-btn>
         </v-alert>
-        <div>分组名称与分组订阅链接会保留。</div>
-      </v-card-text>
-      <v-card-actions>
-        <v-spacer></v-spacer>
-        <v-btn color="success" variant="outlined" :disabled="clearingSubManager" @click="showClearDialog = false">{{ $t('no') }}</v-btn>
-        <v-btn color="error" variant="outlined" :loading="clearingSubManager" @click="clearSubManager">{{ $t('yes') }}</v-btn>
-      </v-card-actions>
-    </v-card>
-  </v-dialog>
-  <v-row>
-    <v-col cols="12" sm="4" md="3" lg="2" v-for="(item, index) in <any[]>subOutbounds" :key="item.tag">
-      <v-card rounded="xl" elevation="5" min-width="200" :title="item.tag">
+      </v-col>
+    </v-row>
+  </template>
+  <template v-else>
+    <SubOutboundVue 
+      v-model="modal.visible"
+      :visible="modal.visible"
+      :id="modal.id"
+      :data="modal.data"
+      :tags="subOutboundTags"
+      @close="closeModal"
+    />
+    <SubManagerQrCode
+      v-model="qrcode.visible"
+      :visible="qrcode.visible"
+      :tag="qrcode.tag"
+      @close="closeQrCode"
+    />
+    <Stats
+      v-model="stats.visible"
+      :visible="stats.visible"
+      :resource="stats.resource"
+      :tag="stats.tag"
+      @close="closeStats"
+    />
+    <SubGroup
+      v-model="groupModal.visible"
+      :visible="groupModal.visible"
+      @close="closeGroupModal"
+    />
+    <v-row justify="center" class="mb-3">
+      <v-col cols="12" class="d-flex justify-center flex-wrap ga-3">
+        <v-btn color="primary" size="large" min-width="96" :disabled="subManagerWriteBusy" @click="showModal(0)">{{ $t('actions.add') }}</v-btn>
+        <v-btn color="primary" size="large" min-width="96" :disabled="subManagerWriteBusy" @click="showGroupModal">{{ $t('actions.group') }}</v-btn>
+        <v-btn color="error" variant="outlined" size="large" min-width="96" :disabled="subManagerWriteBusy" @click="showClearDialog = true">清空</v-btn>
+      </v-col>
+    </v-row>
+    <v-dialog v-model="showClearDialog" max-width="460" :persistent="clearingSubManager">
+      <v-card rounded="lg">
+        <v-card-title>清空订阅管理</v-card-title>
+        <v-divider></v-divider>
+        <v-card-text>
+          <v-alert type="warning" variant="tonal" class="mb-3">
+            此操作会清空订阅管理的全部节点和卡片，并清空所有分组内节点。
+          </v-alert>
+          <div>分组名称与分组订阅链接会保留。</div>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer></v-spacer>
+          <v-btn color="success" variant="outlined" :disabled="clearingSubManager" @click="showClearDialog = false">{{ $t('no') }}</v-btn>
+          <v-btn color="error" variant="outlined" :loading="clearingSubManager" :disabled="clearingSubManager" @click="clearSubManager">{{ $t('yes') }}</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+    <v-row>
+      <v-col cols="12" sm="4" md="3" lg="2" v-for="(item, index) in <any[]>subOutbounds" :key="item.id || `suboutbound-${index}`">
+      <v-card rounded="xl" elevation="5" min-width="200" :title="displayValue(item.tag)">
         <v-card-subtitle style="margin-top: -20px;">
           <v-row>
-            <v-col>{{ item.type }}</v-col>
+            <v-col>{{ displayValue(item.type) }}</v-col>
           </v-row>
         </v-card-subtitle>
         <v-card-text>
           <v-row>
             <v-col>{{ $t('in.addr') }}</v-col>
             <v-col>
-              {{ item.server?? '-' }}
+              {{ displayValue(item.server) }}
             </v-col>
           </v-row>
           <v-row>
@@ -73,7 +93,7 @@
           <v-row>
             <v-col>{{ $t('objects.tls') }}</v-col>
             <v-col>
-              {{ Object.hasOwn(item,'tls') ? $t(item.tls?.enabled ? 'enable' : 'disable') : '-'  }}
+              {{ tlsStatus(item) }}
             </v-col>
           </v-row>
           <v-row>
@@ -126,40 +146,42 @@
         </v-card-text>
         <v-divider></v-divider>
         <v-card-actions style="padding: 0;">
-          <v-btn icon="mdi-file-edit" @click="showModal(item.id)">
+          <v-btn icon="mdi-file-edit" :disabled="subManagerWriteBusy || !isValidOutbound(item)" @click="showModal(item.id)">
             <v-icon />
             <v-tooltip activator="parent" location="top" :text="$t('actions.edit')"></v-tooltip>
           </v-btn>
-          <v-btn icon="mdi-file-remove" style="margin-inline-start:0;" color="warning" @click="delOverlay[index] = true">
+          <v-btn icon="mdi-file-remove" style="margin-inline-start:0;" color="warning" :disabled="subManagerWriteBusy || !isValidOutbound(item)" @click="delOverlay[item.id] = true">
             <v-icon />
             <v-tooltip activator="parent" location="top" :text="$t('actions.del')"></v-tooltip>
           </v-btn>
           <v-overlay
-            v-model="delOverlay[index]"
+            v-model="delOverlay[item.id]"
             contained
+            :persistent="subManagerWriteBusy"
             class="align-center justify-center"
           >
             <v-card :title="$t('actions.del')" rounded="lg">
               <v-divider></v-divider>
               <v-card-text>{{ $t('confirm') }}</v-card-text>
               <v-card-actions>
-                <v-btn color="error" variant="outlined" @click="delSubOutbound(item.tag)">{{ $t('yes') }}</v-btn>
-                <v-btn color="success" variant="outlined" @click="delOverlay[index] = false">{{ $t('no') }}</v-btn>
+                <v-btn color="error" variant="outlined" :loading="deletingSubOutboundId === item.id" :disabled="subManagerWriteBusy" @click="delSubOutbound(item.id)">{{ $t('yes') }}</v-btn>
+                <v-btn color="success" variant="outlined" :disabled="subManagerWriteBusy" @click="delete delOverlay[item.id]">{{ $t('no') }}</v-btn>
               </v-card-actions>
             </v-card>
           </v-overlay>
-          <v-btn icon="mdi-qrcode" style="margin-inline-start:0;" @click="showQrCode(item.tag)">
+          <v-btn icon="mdi-qrcode" style="margin-inline-start:0;" :disabled="subManagerWriteBusy || !hasOutboundTag(item)" @click="showQrCode(item.tag)">
             <v-icon />
             <v-tooltip activator="parent" location="top" text="QrCode"></v-tooltip>
           </v-btn>
-          <v-btn icon="mdi-chart-line" @click="showStats(item.tag)" v-if="Data().enableTraffic">
+          <v-btn icon="mdi-chart-line" :disabled="subManagerWriteBusy || !hasOutboundTag(item)" @click="showStats(item.tag)" v-if="Data().enableTraffic">
             <v-icon />
             <v-tooltip activator="parent" location="top" :text="$t('stats.graphTitle')"></v-tooltip>
           </v-btn>
         </v-card-actions>
       </v-card>
     </v-col>
-  </v-row>
+    </v-row>
+  </template>
 </template>
 
 <script lang="ts" setup>
@@ -170,23 +192,72 @@ import SubManagerQrCode from '@/layouts/modals/SubManagerQrCode.vue'
 import Stats from '@/layouts/modals/Stats.vue'
 import SubGroup from '@/layouts/modals/SubGroup.vue'
 import { Outbound } from '@/types/outbounds'
-import { computed, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { formatServerPortDisplay } from '@/plugins/portRange'
+import { push } from 'notivue'
+import { i18n } from '@/locales'
+
+const store = Data()
+const initializing = ref(true)
+const loadFailed = ref(false)
+let componentActive = true
+
+const initialize = async () => {
+  const hadLoadedData = store.hasFullData
+  initializing.value = true
+  loadFailed.value = false
+  try {
+    const success = await store.loadData()
+    if (!componentActive) return
+    if (!success && !hadLoadedData) {
+      loadFailed.value = true
+    }
+  } catch {
+    if (componentActive && !hadLoadedData) loadFailed.value = true
+  } finally {
+    if (componentActive) initializing.value = false
+  }
+}
 
 const subOutbounds = computed((): Outbound[] => {
-  return <Outbound[]> Data().suboutbounds
+  return Array.isArray(store.suboutbounds)
+    ? store.suboutbounds.filter((item: any): item is Outbound => !!item && typeof item === 'object' && !Array.isArray(item)) as Outbound[]
+    : []
 })
 
 const subOutboundTags = computed((): string[] => {
-  return [...Data().suboutbounds?.map((o:Outbound) => o.tag), ...Data().endpoints?.map((e:any) => e.tag)]
+  const tags = [
+    ...(Array.isArray(store.suboutbounds) ? store.suboutbounds.map((o: Outbound) => normalizeText(o?.tag)) : []),
+    ...(Array.isArray(store.endpoints) ? store.endpoints.map((e: any) => normalizeText(e?.tag)) : []),
+  ]
+  return [...new Set(tags.filter((tag): tag is string => tag !== ''))]
 })
 
 const onlines = computed(() => {
-  return Data().onlines.outbound?? []
+  return Array.isArray(store.onlines?.outbound)
+    ? store.onlines.outbound.map((tag) => normalizeText(tag)).filter((tag): tag is string => tag !== '')
+    : []
 })
 
 const formatServerPort = (item: any): string => {
-  return formatServerPortDisplay(item?.server_port, item?.server_ports)
+  return displayValue(formatServerPortDisplay(item?.server_port, item?.server_ports))
+}
+
+const normalizeText = (value: unknown): string => {
+  if (value === null || value === undefined) return ''
+  const text = String(value).trim()
+  return text === '' || text.toLowerCase() === 'null' || text.toLowerCase() === 'undefined' ? '' : text
+}
+
+const displayValue = (value: unknown, fallback = '-'): string => normalizeText(value) || fallback
+
+const hasOutboundTag = (item: any): boolean => normalizeText(item?.tag) !== ''
+
+const isValidOutbound = (item: any): boolean => Number.isInteger(Number(item?.id)) && Number(item.id) > 0 && hasOutboundTag(item)
+
+const tlsStatus = (item: any): string => {
+  if (!Object.hasOwn(item ?? {}, 'tls') || !item?.tls || typeof item.tls !== 'object') return '-'
+  return i18n.global.t(item.tls.enabled === true ? 'enable' : 'disable')
 }
 
 const isSSH = (item: any): boolean => {
@@ -240,15 +311,21 @@ const modal = ref({
   data: "",
 })
 
-let delOverlay = ref(new Array<boolean>)
+const showClearDialog = ref(false)
+const clearingSubManager = ref(false)
+const delOverlay = ref<Record<number, boolean>>({})
+const deletingSubOutboundId = ref<number | null>(null)
+const subManagerWriteBusy = computed(() => clearingSubManager.value || deletingSubOutboundId.value !== null)
 
 const showModal = (id: number) => {
+  if (subManagerWriteBusy.value) return
   modal.value.id = id
   modal.value.data = id == 0 ? '' : JSON.stringify(subOutbounds.value.findLast(o => o.id == id))
   modal.value.visible = true
 }
 
 const closeModal = () => {
+  if (subManagerWriteBusy.value) return
   modal.value.visible = false
 }
 
@@ -258,6 +335,7 @@ const qrcode = ref({
 })
 
 const showQrCode = (tag: string) => {
+  if (subManagerWriteBusy.value) return
   qrcode.value.tag = tag
   qrcode.value.visible = true
 }
@@ -271,13 +349,21 @@ const stats = ref({
   tag: "",
 })
 
-const delSubOutbound = async (tag: string) => {
-  const index = subOutbounds.value.findIndex(i => i.tag == tag)
-  const success = await Data().save("suboutbounds", "del", tag)
-  if (success) delOverlay.value[index] = false
+const delSubOutbound = async (id: number) => {
+  if (subManagerWriteBusy.value) return
+  const outbound = subOutbounds.value.find((item: any) => item.id === id)
+  if (!outbound?.tag) return
+  deletingSubOutboundId.value = id
+  try {
+    const success = await Data().save("suboutbounds", "del", outbound.tag)
+    if (success) delete delOverlay.value[id]
+  } finally {
+    deletingSubOutboundId.value = null
+  }
 }
 
 const showStats = (tag: string) => {
+  if (subManagerWriteBusy.value) return
   stats.value.tag = tag
   stats.value.visible = true
 }
@@ -288,10 +374,9 @@ const closeStats = () => {
 const groupModal = ref({
   visible: false,
 })
-const showClearDialog = ref(false)
-const clearingSubManager = ref(false)
 
 const showGroupModal = () => {
+  if (subManagerWriteBusy.value) return
   groupModal.value.visible = true
 }
 
@@ -300,20 +385,32 @@ const closeGroupModal = () => {
 }
 
 const clearSubManager = async () => {
-  if (clearingSubManager.value) {
-    return
-  }
+  if (subManagerWriteBusy.value) return
   clearingSubManager.value = true
   try {
     const msg = await HttpUtils.post('api/clearSubManager', {})
-    if (msg.success && msg.obj) {
-      Data().setNewData(msg.obj)
+    if (msg.obj && (msg.success || msg.obj.committed === true)) {
+      store.setNewData(msg.obj)
       showClearDialog.value = false
+      if (msg.obj.committed === true && !msg.success) {
+        push.warning({
+          title: '订阅管理',
+          duration: 7000,
+          message: msg.msg || '订阅节点已清空，但后置运行配置校验失败。'
+        })
+      }
     }
   } finally {
     clearingSubManager.value = false
   }
 }
 
-</script>
+onMounted(() => {
+  void initialize()
+})
 
+onUnmounted(() => {
+  componentActive = false
+})
+
+</script>

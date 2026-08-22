@@ -63,11 +63,46 @@ var mihomoSubscriptionClashProxyTypes = map[string]struct{}{
 	"vmess":       {},
 }
 
+// mihomoRuntimeListenerTypes is the source of truth for protocol types that
+// Mihomo can actually materialize as server listeners. It intentionally does
+// not share the broader subscription-proxy allowlist: SSH can be a valid
+// manually configured proxy, for example, while it has no Mihomo listener
+// implementation and therefore must not be revived from a legacy inbound
+// binding.
+var mihomoRuntimeListenerTypes = map[string]struct{}{
+	"mixed":       {},
+	"socks":       {},
+	"http":        {},
+	"redirect":    {},
+	"tproxy":      {},
+	"tun":         {},
+	"snell":       {},
+	"shadowsocks": {},
+	"shadowquic":  {},
+	"vmess":       {},
+	"vless":       {},
+	"trojan":      {},
+	"anytls":      {},
+	"tuic":        {},
+	"hysteria2":   {},
+	"mieru":       {},
+	"sudoku":      {},
+	"trusttunnel": {},
+}
+
 // IsSubscriptionServerOnlyInboundType identifies listener-only protocols while
 // processing an inbound. It must not be used to reject a manually configured
 // subscription outbound with the same type.
 func IsSubscriptionServerOnlyInboundType(inboundType string) bool {
 	return normalizeSubscriptionType(inboundType) == "mixed"
+}
+
+// SupportsMihomoRuntimeListenerType reports whether a persisted Mihomo inbound
+// can become a listener in server.yaml. Keep this separate from outbound
+// subscription support: the latter also includes proxy-only protocols.
+func SupportsMihomoRuntimeListenerType(inboundType string) bool {
+	_, ok := mihomoRuntimeListenerTypes[normalizeSubscriptionType(inboundType)]
+	return ok
 }
 
 func SupportsSingboxSubscriptionOutboundType(outboundType string) bool {

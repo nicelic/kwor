@@ -30,7 +30,13 @@ func runCommandOutputInDirWithTimeout(timeout time.Duration, dir string, name st
 }
 
 func runSystemctlCommand(args ...string) error {
-	return runCommandWithTimeout(systemCommandTimeout, "systemctl", args...)
+	// A lifecycle command can change either managed core immediately. Clear the
+	// tiny is-active cache both before and after it so sampler and dashboard
+	// probes never reuse a result from the command's transition window.
+	invalidateSystemdUnitActiveCache()
+	err := runCommandWithTimeout(systemCommandTimeout, "systemctl", args...)
+	invalidateSystemdUnitActiveCache()
+	return err
 }
 
 func runSystemctlOutput(args ...string) ([]byte, error) {

@@ -17,8 +17,11 @@ const (
 	CertificateSourceSelfSigned = "self_signed"
 	CertificateSourceImported   = "imported"
 
-	certificateDisplayIDMin uint64 = 1
-	certificateDisplayIDMax uint64 = 100000000000
+	certificateDisplayIDMin       uint64 = 1
+	certificateDisplayIDMax       uint64 = 100000000000
+	certificateListDefaultPerPage        = 20
+	certificateListMaxPerPage            = 100
+	certificateMaterialMaxBytes          = 2 * 1024 * 1024
 )
 
 type CertificateRecordView struct {
@@ -80,7 +83,6 @@ type CertificateRecordView struct {
 	CreatedAt       int64  `json:"createdAt"`
 	LastError       string `json:"lastError"`
 	PostActionError string `json:"postActionError"`
-	LastOutput      string `json:"lastOutput"`
 	Status          string `json:"status"`
 	InUseByPanel    bool   `json:"inUseByPanel"`
 	InUseBySub      bool   `json:"inUseBySub"`
@@ -112,6 +114,39 @@ type CertificateMaterialView struct {
 	Fingerprint              string `json:"fingerprint"`
 	IssuedKeyAlgorithm       string `json:"issuedKeyAlgorithm"`
 	IssuedSignatureAlgorithm string `json:"issuedSignatureAlgorithm"`
+}
+
+type CertificateListResult struct {
+	Items              []CertificateRecordView `json:"items"`
+	Page               int                     `json:"page"`
+	PerPage            int                     `json:"perPage"`
+	Total              int64                   `json:"total"`
+	HasMore            bool                    `json:"hasMore"`
+	PanelAssignedCount int                     `json:"panelAssignedCount"`
+	SubAssignedCount   int                     `json:"subAssignedCount"`
+}
+
+// TLSCertificateOption is the compact certificate selector model used by the
+// TLS editor. It deliberately avoids usage aggregation and certificate
+// material so opening the selector stays proportional to the number of rows.
+type TLSCertificateOption struct {
+	ID          uint     `json:"id"`
+	DisplayID   uint64   `json:"displayId"`
+	ListOrderAt int64    `json:"listOrderAt"`
+	SourceType  string   `json:"sourceType"`
+	MainDomain  string   `json:"mainDomain"`
+	Domains     []string `json:"domains"`
+	Status      string   `json:"status"`
+}
+
+// CertificateRecordLogView is loaded only when the operator explicitly opens
+// a certificate's historical issue or renewal output.
+type CertificateRecordLogView struct {
+	Id              uint   `json:"id"`
+	MainDomain      string `json:"mainDomain"`
+	LastError       string `json:"lastError"`
+	PostActionError string `json:"postActionError"`
+	LastOutput      string `json:"lastOutput"`
 }
 
 type CertificateInventoryService struct{}
@@ -183,6 +218,101 @@ func (s *CertificateInventoryService) List() ([]CertificateRecordView, error) {
 		Find(&rows).Error; err != nil {
 		return nil, err
 	}
+	return buildCertificateRecordViews(rows)
+}
+
+func (s *CertificateInventoryService) ListTLSOptions() ([]TLSCertificateOption, error) {
+	rows := make([]model.CertificateRecord, 0)
+	if err := database.GetDB().
+		Select("id", "display_id", "list_order_at", "source_type", "main_domain", "domain_set", "last_error", "not_after").
+		Order("list_order_at DESC, id DESC").
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	result := make([]TLSCertificateOption, 0, len(rows))
+	for i := range rows {
+		row := &rows[i]
+		domains := decodeCertificateDomains(row.DomainSet)
+		if len(domains) == 0 && strings.TrimSpace(row.MainDomain) != "" {
+			domains = []string{strings.TrimSpace(row.MainDomain)}
+		}
+		result = append(result, TLSCertificateOption{
+			ID:          row.Id,
+			DisplayID:   row.DisplayID,
+			ListOrderAt: row.ListOrderAt,
+			SourceType:  strings.TrimSpace(row.SourceType),
+			MainDomain:  strings.TrimSpace(row.MainDomain),
+			Domains:     domains,
+			Status:      certificateStatus(row),
+		})
+	}
+	return result, nil
+}
+
+func (s *CertificateInventoryService) ListPage(page int, perPage int, search string) (*CertificateListResult, error) {
+	if page < 1 {
+		page = 1
+	}
+	if perPage <= 0 {
+		perPage = certificateListDefaultPerPage
+	}
+	if perPage > certificateListMaxPerPage {
+		perPage = certificateListMaxPerPage
+	}
+
+	db := database.GetDB().Model(&model.CertificateRecord{})
+	search = strings.ToLower(strings.TrimSpace(search))
+	if search != "" {
+		like := "%" + search + "%"
+		db = db.Where(
+			"LOWER(main_domain) LIKE ? OR LOWER(domain_set) LIKE ? OR LOWER(acme_account_name) LIKE ? OR LOWER(dns_account_name) LIKE ? OR LOWER(remark) LIKE ? OR LOWER(ca_server) LIKE ? OR LOWER(challenge) LIKE ? OR CAST(display_id AS TEXT) LIKE ?",
+			like, like, like, like, like, like, like, like,
+		)
+	}
+
+	total := int64(0)
+	if err := db.Count(&total).Error; err != nil {
+		return nil, err
+	}
+	if total > 0 && int64(page-1)*int64(perPage) >= total {
+		page = int((total-1)/int64(perPage)) + 1
+	}
+
+	rows := make([]model.CertificateRecord, 0, perPage)
+	if err := db.Select(certificateRecordListProjectionColumns()).
+		Order("list_order_at DESC, id DESC").
+		Limit(perPage).
+		Offset((page - 1) * perPage).
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	items, err := buildCertificateRecordViews(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	settingService := &SettingService{}
+	panelAssignedIDs, err := readAssignedCertificateRecordIDSet(settingService, PanelSelfSignedTargetPanel)
+	if err != nil {
+		return nil, err
+	}
+	subAssignedIDs, err := readAssignedCertificateRecordIDSet(settingService, PanelSelfSignedTargetSub)
+	if err != nil {
+		return nil, err
+	}
+	return &CertificateListResult{
+		Items:              items,
+		Page:               page,
+		PerPage:            perPage,
+		Total:              total,
+		HasMore:            int64(page*perPage) < total,
+		PanelAssignedCount: len(panelAssignedIDs),
+		SubAssignedCount:   len(subAssignedIDs),
+	}, nil
+}
+
+func buildCertificateRecordViews(rows []model.CertificateRecord) ([]CertificateRecordView, error) {
 	if err := hydrateCertificateAccountNames(rows); err != nil {
 		return nil, err
 	}
@@ -208,7 +338,7 @@ func certificateRecordListProjectionColumns() []string {
 		"apply_target", "push_enabled", "push_dir", "push_file_paths", "push_files", "remark", "renew_config",
 		"webroot", "dns_provider", "custom_args",
 		"fingerprint", "not_before", "not_after",
-		"last_issued_at", "last_renewed_at", "last_error", "post_action_error", "last_output",
+		"last_issued_at", "last_renewed_at", "last_error", "post_action_error",
 		"created_at", "updated_at",
 	}
 }
@@ -272,6 +402,21 @@ func (s *CertificateInventoryService) GetMaterial(id uint) (*CertificateMaterial
 	if id == 0 {
 		return nil, common.NewError("certificate id is required")
 	}
+	lengths := struct {
+		CertPEMLength      int `gorm:"column:cert_pem_length"`
+		KeyPEMLength       int `gorm:"column:key_pem_length"`
+		FullchainPEMLength int `gorm:"column:fullchain_pem_length"`
+		ChainPEMLength     int `gorm:"column:chain_pem_length"`
+	}{}
+	if err := database.GetDB().Model(&model.CertificateRecord{}).
+		Select("COALESCE(length(cert_pem), 0) AS cert_pem_length", "COALESCE(length(key_pem), 0) AS key_pem_length", "COALESCE(length(fullchain_pem), 0) AS fullchain_pem_length", "COALESCE(length(chain_pem), 0) AS chain_pem_length").
+		Where("id = ?", id).
+		First(&lengths).Error; err != nil {
+		return nil, err
+	}
+	if err := validateCertificateMaterialTotal(lengths.CertPEMLength, lengths.KeyPEMLength, lengths.FullchainPEMLength, lengths.ChainPEMLength); err != nil {
+		return nil, err
+	}
 	row := &model.CertificateRecord{}
 	if err := database.GetDB().Where("id = ?", id).First(row).Error; err != nil {
 		return nil, err
@@ -293,6 +438,23 @@ func (s *CertificateInventoryService) GetMaterial(id uint) (*CertificateMaterial
 		Fingerprint:              strings.TrimSpace(row.Fingerprint),
 		IssuedKeyAlgorithm:       issuedKeyAlgorithm,
 		IssuedSignatureAlgorithm: issuedSignatureAlgorithm,
+	}, nil
+}
+
+func (s *CertificateInventoryService) GetLog(id uint) (*CertificateRecordLogView, error) {
+	if id == 0 {
+		return nil, common.NewError("certificate id is required")
+	}
+	row := &model.CertificateRecord{}
+	if err := database.GetDB().Select("id", "main_domain", "last_error", "post_action_error", "last_output").Where("id = ?", id).First(row).Error; err != nil {
+		return nil, err
+	}
+	return &CertificateRecordLogView{
+		Id:              row.Id,
+		MainDomain:      strings.TrimSpace(row.MainDomain),
+		LastError:       strings.TrimSpace(row.LastError),
+		PostActionError: strings.TrimSpace(row.PostActionError),
+		LastOutput:      truncateAcmeStoredOutput(row.LastOutput),
 	}, nil
 }
 
@@ -347,6 +509,9 @@ func (s *CertificateInventoryService) Upsert(payload CertificateUpsertPayload) (
 	}
 	if sourceRef == "" {
 		return nil, common.NewError("source ref is required")
+	}
+	if err := validateCertificateMaterialTotal(len(payload.CertPEM), len(payload.KeyPEM), len(payload.FullchainPEM), len(payload.ChainPEM)); err != nil {
+		return nil, err
 	}
 
 	mainDomain := strings.TrimSpace(payload.MainDomain)
@@ -447,7 +612,7 @@ func (s *CertificateInventoryService) Upsert(payload CertificateUpsertPayload) (
 
 	entry.LastError = strings.TrimSpace(payload.LastError)
 	entry.PostActionError = strings.TrimSpace(payload.PostActionError)
-	entry.LastOutput = strings.TrimSpace(payload.LastOutput)
+	entry.LastOutput = truncateAcmeStoredOutput(payload.LastOutput)
 	if entry.ListOrderAt <= 0 {
 		entry.ListOrderAt = payload.ListOrderAt
 	}
@@ -472,10 +637,24 @@ func (s *CertificateInventoryService) Upsert(payload CertificateUpsertPayload) (
 	return entry, nil
 }
 
+func validateCertificateMaterialTotal(lengths ...int) error {
+	total := 0
+	for _, length := range lengths {
+		if length <= 0 {
+			continue
+		}
+		if total > certificateMaterialMaxBytes-length {
+			return common.NewError("证书材料总大小超过 2 MiB 限制")
+		}
+		total += length
+	}
+	return nil
+}
+
 func (s *CertificateInventoryService) RepairDisplayIDs() error {
 	db := database.GetDB()
 	rows := make([]model.CertificateRecord, 0)
-	if err := db.Order("id ASC").Find(&rows).Error; err != nil {
+	if err := db.Select("id", "display_id", "list_order_at", "created_at", "last_issued_at", "not_before", "updated_at").Order("id ASC").Find(&rows).Error; err != nil {
 		return err
 	}
 	if len(rows) == 0 {
@@ -771,7 +950,6 @@ func convertCertificateRecordWithUsage(entry *model.CertificateRecord, snapshot 
 		CreatedAt:       entry.CreatedAt.Unix(),
 		LastError:       strings.TrimSpace(entry.LastError),
 		PostActionError: strings.TrimSpace(entry.PostActionError),
-		LastOutput:      strings.TrimSpace(entry.LastOutput),
 		Status:          certificateStatus(entry),
 		InUseByPanel:    inUseByPanel,
 		InUseBySub:      inUseBySub,

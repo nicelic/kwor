@@ -183,10 +183,12 @@ func normalizeManagedSingboxLatencyInterval(raw string) (string, bool) {
 
 func stripMihomoSubscriptionFields(outbounds []map[string]interface{}) {
 	for _, outbound := range outbounds {
+		util.PromoteHysteria2ReceiveWindowsToSingbox(outbound)
 		delete(outbound, "mihomo_common")
 		delete(outbound, "mihomo_hy2")
 		delete(outbound, "mihomo_fast_open")
 		delete(outbound, "fast_open")
+		delete(outbound, "fast-open")
 		if tlsMap, ok := outbound["tls"].(map[string]interface{}); ok {
 			delete(tlsMap, "mihomo_use_fingerprint")
 			delete(tlsMap, "fingerprint")

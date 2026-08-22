@@ -190,14 +190,15 @@ export default {
     domains: {
       get() { return this.acme?.domain ? this.acme.domain.join(',') : "" },
       set(v: string) {
-        if(!v.endsWith(',')) {
-          this.acme.domain = v.length > 0 ? v.split(',') : []
-        }
+        this.acme.domain = v
+          .split(',')
+          .map(domain => domain.trim())
+          .filter(domain => domain.length > 0)
       }
     },
     caProvider: {
       get() { return this.acme?.provider && ['letsencrypt','zerossl'].includes(this.acme.provider) ? this.acme?.provider : '' },
-      set(v: string) { this.acme.provider = ['letsencrypt','zerossl'].includes(v) ? v : 'https://' }
+      set(v: string) { this.acme.provider = ['letsencrypt','zerossl'].includes(v) ? v : '' }
     },
     optionDir: {
       get(): boolean { return this.acme?.data_directory != undefined },
@@ -205,7 +206,11 @@ export default {
     },
     optionDefault: {
       get(): boolean { return this.acme?.default_server_name != undefined },
-      set(v:boolean) { this.acme.default_server_name = v ? this.domains.length>0 ? this.domains[0] : '' : undefined }
+      set(v:boolean) {
+        this.acme.default_server_name = v
+          ? (this.acme.domain?.find(domain => domain.trim().length > 0) ?? '')
+          : undefined
+      }
     },
     optionEmail: {
       get(): boolean { return this.acme?.email != undefined },

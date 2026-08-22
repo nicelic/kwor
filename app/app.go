@@ -412,8 +412,16 @@ func (a *APP) prepareStartupData() error {
 	if err := service.EnsureManagedCoreLayout(); err != nil {
 		return err
 	}
+	if err := service.CleanupStaleManagedCoreRuntimeWorkspacesOnStartup(); err != nil {
+		logger.Warning("cleanup stale managed Core workspaces on startup failed:", err)
+	}
 	if _, err := a.SettingService.GetAllSetting(); err != nil {
 		return err
+	}
+	if migrated, migrateErr := service.MigrateLegacySingboxDNSServers(); migrateErr != nil {
+		logger.Warning("migrate legacy sing-box DNS servers failed:", migrateErr)
+	} else if migrated {
+		logger.Info("migrated legacy sing-box DNS servers into DNS cards")
 	}
 	if migrated, migrateErr := service.MigrateLegacySingboxCoreDownloadPreference(); migrateErr != nil {
 		logger.Warning("migrate legacy sing-box core download preference failed:", migrateErr)
@@ -443,6 +451,9 @@ func (a *APP) prepareStartupData() error {
 	if syncErr := (&service.AcmeService{}).MigrateLegacyAcmeRuntimeOnStartup(); syncErr != nil {
 		logger.Warning("migrate legacy acme runtime failed:", syncErr)
 	}
+	if cleanupErr := service.CleanupStaleAcmeTempWorkspaces(); cleanupErr != nil {
+		logger.Warning("cleanup stale acme temporary workspaces failed:", cleanupErr)
+	}
 	if syncErr := (&service.AcmeService{}).EnsureOverviewRuntimeConsistency(true); syncErr != nil {
 		logger.Warning("prepare acme overview runtime consistency failed:", syncErr)
 	}
@@ -451,6 +462,12 @@ func (a *APP) prepareStartupData() error {
 	}
 	if syncErr := service.PrepareHistoryStorageOnStartup(); syncErr != nil {
 		logger.Warning("prepare history storage on startup failed:", syncErr)
+	}
+	if journalErr := service.PrepareTrafficRuntimeJournalOnStartup(); journalErr != nil {
+		// A damaged sidecar must never prevent the panel from starting. The
+		// journal loader quarantines invalid data; a transient SQLite failure is
+		// retried by the runtime sampler on its first flush pass.
+		logger.Warning("prepare traffic runtime journal on startup failed:", journalErr)
 	}
 	return nil
 }

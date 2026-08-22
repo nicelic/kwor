@@ -11,9 +11,13 @@ import (
 )
 
 type CronJob struct {
-	mu        sync.Mutex
-	cron      *cron.Cron
-	runGuards map[string]*atomic.Bool
+	lifecycleMu          sync.Mutex
+	mu                   sync.Mutex
+	cron                 *cron.Cron
+	runGuards            map[string]*atomic.Bool
+	manualRuns           sync.WaitGroup
+	runtimeSampler       *RuntimeSampler
+	runtimeSamplerPaused bool
 }
 
 type nonOverlappingJob struct {
@@ -28,6 +32,13 @@ func wrapNonOverlappingJob(name string, job cron.Job) cron.Job {
 
 func wrapNonOverlappingJobWithGuard(name string, job cron.Job, running *atomic.Bool) cron.Job {
 	return &nonOverlappingJob{name: name, job: job, running: running}
+}
+
+func stopCronSchedulerAndWait(scheduler *cron.Cron) {
+	if scheduler == nil {
+		return
+	}
+	<-scheduler.Stop().Done()
 }
 
 // wrapNonOverlappingJob keeps a guard for each job name for the lifetime of a
@@ -78,19 +89,19 @@ func NewCronJob() *CronJob {
 }
 
 func (c *CronJob) Start(loc *time.Location, trafficAge int) error {
+	if c == nil {
+		return nil
+	}
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
 	scheduler := cron.New(cron.WithLocation(loc), cron.WithSeconds())
 
-	nftCoreSync := c.wrapNonOverlappingJob("nft-core sync", NewNftCoreSyncJob())
-	mihomoNftCoreSync := c.wrapNonOverlappingJob("mihomo nft-core sync", NewMihomoNftCoreSyncJob())
 	firewallSync := c.wrapNonOverlappingJob("firewall sync", NewFirewallSyncJob())
-	portForwardSync := c.wrapNonOverlappingJob("port-forward sync", NewPortForwardSyncJob())
-	reverseProxySync := c.wrapNonOverlappingJob("reverse-proxy sync", NewReverseProxySyncJob())
 	panelCertificateBalanceSync := c.wrapNonOverlappingJob("panel certificate-balance sync", NewPanelCertificateBalanceSyncJob())
 	tlsPathSync := c.wrapNonOverlappingJob("TLS path sync", NewTLSPathSyncJob())
 	acmeAutoRenew := c.wrapNonOverlappingJob("ACME auto-renew", NewAcmeAutoRenewJob())
 	certificateCoreRestart := c.wrapNonOverlappingJob("certificate Core restart", NewCertificateCoreRestartJob())
-	statsJob := c.wrapNonOverlappingJob("stats", NewStatsJob(trafficAge > 0))
-	depleteJob := c.wrapNonOverlappingJob("client deplete", NewDepleteJob())
 	checkCoreJob := c.wrapNonOverlappingJob("sing-box core update check", NewCheckCoreJob())
 	autoUpdateCoreJob := c.wrapNonOverlappingJob("sing-box core auto update", NewAutoUpdateCoreJob())
 	checkMihomoCoreJob := c.wrapNonOverlappingJob("mihomo core update check", NewCheckMihomoCoreJob())
@@ -103,15 +114,8 @@ func (c *CronJob) Start(loc *time.Location, trafficAge int) error {
 		}
 	}
 
-	// Keep nftables lifecycle aligned with sing-box core running state.
-	register("@every 5s", nftCoreSync, "nft-core sync")
-	register("@every 5s", mihomoNftCoreSync, "mihomo nft-core sync")
-	register("@every 5s", firewallSync, "firewall sync")
-	register("@every 5s", portForwardSync, "port-forward sync")
-	register("@every 5s", reverseProxySync, "reverse-proxy sync")
+	register("@every 5m", firewallSync, "firewall sync")
 	register("@every 5m", panelCertificateBalanceSync, "panel certificate-balance sync")
-	register("@every 10s", statsJob, "stats")
-	register("@every 1m", depleteJob, "client deplete")
 	register("@daily", delStatsJob, "delete old stats")
 	// Auto-check core updates based on the configured interval.
 	register("@every 1m", checkCoreJob, "sing-box core update check")
@@ -121,25 +125,30 @@ func (c *CronJob) Start(loc *time.Location, trafficAge int) error {
 	register("@every 1m", subGroupAutoUpdateJob, "subscription group auto-update")
 	register("@every 10m", acmeAutoRenew, "ACME auto-renew")
 	register("@every 1m", certificateCoreRestart, "certificate Core restart")
-	register("@every 30s", tlsPathSync, "TLS path sync")
+	register("@every 1m", tlsPathSync, "TLS path sync")
 
 	c.mu.Lock()
 	previous := c.cron
-	c.cron = scheduler
-	if previous != nil {
-		previous.Stop()
+	if c.runtimeSampler == nil {
+		c.runtimeSampler = NewRuntimeSampler(trafficAge)
 	}
-	scheduler.Start()
+	runtimeSampler := c.runtimeSampler
 	c.mu.Unlock()
+	stopCronSchedulerAndWait(previous)
+	c.manualRuns.Wait()
 
-	go nftCoreSync.Run()
-	go mihomoNftCoreSync.Run()
-	go firewallSync.Run()
-	go portForwardSync.Run()
-	go reverseProxySync.Run()
-	go panelCertificateBalanceSync.Run()
-	go tlsPathSync.Run()
-	go acmeAutoRenew.Run()
+	c.mu.Lock()
+	c.cron = scheduler
+	c.mu.Unlock()
+	scheduler.Start()
+	service.RegisterRuntimeSamplerWake(c.WakeRuntimeSampler)
+	service.RegisterRuntimeSamplerDatabaseBarrier(c.PauseRuntimeSamplerForDatabaseRestore, c.ResumeRuntimeSamplerAfterDatabaseRestoreFailure)
+	runtimeSampler.Start()
+
+	c.runImmediateJob(firewallSync)
+	c.runImmediateJob(panelCertificateBalanceSync)
+	c.runImmediateJob(tlsPathSync)
+	c.runImmediateJob(acmeAutoRenew)
 
 	return nil
 }
@@ -148,11 +157,99 @@ func (c *CronJob) Stop() {
 	if c == nil {
 		return
 	}
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
 	c.mu.Lock()
 	scheduler := c.cron
+	runtimeSampler := c.runtimeSampler
 	c.cron = nil
 	c.mu.Unlock()
-	if scheduler != nil {
-		scheduler.Stop()
+	stopCronSchedulerAndWait(scheduler)
+	c.manualRuns.Wait()
+	if runtimeSampler != nil {
+		if err := runtimeSampler.StopAndFlush(); err != nil {
+			logger.Warning("runtime sampler shutdown flush failed: ", err)
+		}
+	}
+	c.mu.Lock()
+	c.runtimeSamplerPaused = false
+	c.mu.Unlock()
+	service.RegisterRuntimeSamplerDatabaseBarrier(nil, nil)
+	service.RegisterRuntimeSamplerWake(nil)
+}
+
+func (c *CronJob) runImmediateJob(job cron.Job) {
+	if c == nil || job == nil {
+		return
+	}
+	c.manualRuns.Add(1)
+	go func() {
+		defer c.manualRuns.Done()
+		job.Run()
+	}()
+}
+
+func (c *CronJob) WakeRuntimeSampler() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	runtimeSampler := c.runtimeSampler
+	c.mu.Unlock()
+	if runtimeSampler != nil {
+		runtimeSampler.Wake()
+	}
+}
+
+// PauseRuntimeSamplerForDatabaseRestore closes the sampler worker before a
+// database file is replaced. The paused state is remembered so a failed
+// import can resume the exact scheduler that was active before the attempt.
+func (c *CronJob) PauseRuntimeSamplerForDatabaseRestore() error {
+	if c == nil {
+		return nil
+	}
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
+	c.mu.Lock()
+	if c.runtimeSamplerPaused {
+		c.mu.Unlock()
+		return nil
+	}
+	runtimeSampler := c.runtimeSampler
+	wasActive := c.cron != nil && runtimeSampler != nil
+	c.runtimeSamplerPaused = wasActive
+	c.mu.Unlock()
+	if wasActive {
+		if err := runtimeSampler.StopAndFlush(); err != nil {
+			// StopAndFlush reports a flush failure only after the worker has
+			// already exited. Keep the paused marker so the restore-abort hook
+			// restarts that worker instead of silently leaving runtime sampling
+			// stopped after a failed database replacement.
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *CronJob) ResumeRuntimeSamplerAfterDatabaseRestoreFailure() {
+	if c == nil {
+		return
+	}
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
+	c.mu.Lock()
+	if !c.runtimeSamplerPaused {
+		c.mu.Unlock()
+		return
+	}
+	runtimeSampler := c.runtimeSampler
+	shouldResume := c.cron != nil && runtimeSampler != nil
+	c.runtimeSamplerPaused = false
+	c.mu.Unlock()
+	if shouldResume {
+		runtimeSampler.Start()
 	}
 }

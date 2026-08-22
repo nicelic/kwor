@@ -1,8 +1,11 @@
 package service
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/alireza0/s-ui/database"
@@ -26,12 +29,15 @@ func (s *MihomoInboundService) Get(ids string) (*[]map[string]interface{}, error
 func (s *MihomoInboundService) getById(ids string) (*[]map[string]interface{}, error) {
 	db := database.GetDB()
 	var inbound []model.MihomoInbound
-	var result []map[string]interface{}
+	result := make([]map[string]interface{}, 0, len(inbound))
 	err := db.Model(model.MihomoInbound{}).Where("id in ?", strings.Split(ids, ",")).Scan(&inbound).Error
 	if err != nil {
 		return nil, err
 	}
 	for _, inb := range inbound {
+		if !isSupportedMihomoInboundType(inb.Type) {
+			continue
+		}
 		inbData, err := inb.MarshalFull()
 		if err != nil {
 			return nil, err
@@ -57,8 +63,11 @@ func (s *MihomoInboundService) GetOutJsonIPs(ids string) ([]map[string]interface
 		}
 	}
 
-	var result []map[string]interface{}
+	result := make([]map[string]interface{}, 0, len(inbounds))
 	for _, inbound := range inbounds {
+		if !isSupportedMihomoInboundType(inbound.Type) {
+			continue
+		}
 		if len(inbound.OutJson) < 5 {
 			continue
 		}
@@ -88,8 +97,25 @@ func (s *MihomoInboundService) GetAll() (*[]map[string]interface{}, error) {
 		return nil, err
 	}
 
-	var data []map[string]interface{}
+	selectableInboundIDs := make([]uint, 0, len(inbounds))
 	for _, inbound := range inbounds {
+		if !isSupportedMihomoInboundType(inbound.Type) {
+			continue
+		}
+		selectableInboundIDs = append(selectableInboundIDs, inbound.Id)
+	}
+	usersByInboundID, err := loadMihomoInboundUsers(db, selectableInboundIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// The panel store distinguishes an empty list from a missing/malformed
+	// response. Keep the JSON contract stable after the last inbound is deleted.
+	data := make([]map[string]interface{}, 0, len(inbounds))
+	for _, inbound := range inbounds {
+		if !isSupportedMihomoInboundType(inbound.Type) {
+			continue
+		}
 		routeTag := deriveEffectiveMihomoInboundRouteTagFromRaw(inbound.Tag, inbound.Type, inbound.Options)
 		inbData := map[string]interface{}{
 			"id":        inbound.Id,
@@ -105,20 +131,56 @@ func (s *MihomoInboundService) GetAll() (*[]map[string]interface{}, error) {
 			}
 			inbData["listen"] = restFields["listen"]
 			inbData["listen_port"] = restFields["listen_port"]
+			if strings.EqualFold(inbound.Type, "hysteria2") {
+				if rangeValue := extractPortHopRange(inbound.Options); rangeValue != "" {
+					inbData["port_hop_range"] = rangeValue
+				}
+			}
 		}
 		userManagement := attachMihomoInboundUserManagementView(inbData, inbound)
 		if userManagement.Selectable {
-			users := []string{}
-			err = db.Raw("SELECT mihomo_clients.name FROM mihomo_clients, json_each(mihomo_clients.inbounds) as je WHERE je.value = ?", inbound.Id).Scan(&users).Error
-			if err != nil {
-				return nil, err
-			}
-			inbData["users"] = users
+			inbData["users"] = usersByInboundID[inbound.Id]
 		}
 		data = append(data, inbData)
 	}
 
 	return &data, nil
+}
+
+func loadMihomoInboundUsers(db *gorm.DB, inboundIDs []uint) (map[uint][]string, error) {
+	result := make(map[uint][]string, len(inboundIDs))
+	if db == nil || len(inboundIDs) == 0 {
+		return result, nil
+	}
+
+	type clientBindings struct {
+		Name     string
+		Inbounds json.RawMessage
+	}
+	var clients []clientBindings
+	if err := db.Model(&model.MihomoClient{}).Select("name, inbounds").Find(&clients).Error; err != nil {
+		return nil, err
+	}
+	wanted := make(map[uint]struct{}, len(inboundIDs))
+	for _, id := range inboundIDs {
+		wanted[id] = struct{}{}
+		result[id] = []string{}
+	}
+	for _, client := range clients {
+		name := strings.TrimSpace(client.Name)
+		if name == "" {
+			continue
+		}
+		for _, inboundID := range parseMihomoInboundIDs(client.Inbounds) {
+			if _, ok := wanted[inboundID]; ok {
+				result[inboundID] = append(result[inboundID], name)
+			}
+		}
+	}
+	for inboundID := range result {
+		sort.Strings(result[inboundID])
+	}
+	return result, nil
 }
 
 func (s *MihomoInboundService) Save(tx *gorm.DB, act string, data json.RawMessage, initUserIDs string, hostname string) (*InboundNftAction, error) {
@@ -130,10 +192,46 @@ func (s *MihomoInboundService) Save(tx *gorm.DB, act string, data json.RawMessag
 		if err := inbound.UnmarshalJSON(data); err != nil {
 			return nil, err
 		}
+		inbound.Type = strings.ToLower(strings.TrimSpace(inbound.Type))
+		oldTag := ""
+		if act == "new" {
+			// A copied create payload must never reuse an existing primary key.
+			// GORM Save treats a non-zero key as an update.
+			inbound.Id = 0
+		} else if act == "edit" {
+			if inbound.Id == 0 {
+				return nil, common.NewError("mihomo inbound id is required for edit")
+			}
+			if tx == nil {
+				return nil, common.NewError("mihomo inbound transaction is nil")
+			}
+			loaded := &model.MihomoInbound{}
+			if err := tx.Model(model.MihomoInbound{}).Select("id", "tag", "type", "options").Where("id = ?", inbound.Id).First(loaded).Error; err != nil {
+				return nil, err
+			}
+			if err := validateMihomoInboundTypeChangeClientBindings(tx, loaded, &inbound); err != nil {
+				return nil, err
+			}
+			oldTag = loaded.Tag
+		}
+		if strings.EqualFold(strings.TrimSpace(inbound.Type), "shadowtls") {
+			return nil, fmt.Errorf("mihomo ShadowTLS must be configured as a Shadowsocks inbound with mihomo TLS mode")
+		}
+		if isRemovedMihomoInboundType(inbound.Type) {
+			return nil, fmt.Errorf("mihomo does not support Hysteria v1 inbound")
+		}
+		if !isSupportedMihomoInboundType(inbound.Type) {
+			return nil, fmt.Errorf("mihomo does not support %s inbound", strings.TrimSpace(inbound.Type))
+		}
+		if err := validateMihomoInboundPayload(data, &inbound); err != nil {
+			return nil, err
+		}
+		if err := sanitizeMihomoHysteria2PortHop(&inbound); err != nil {
+			return nil, err
+		}
 		if _, err := sanitizeMihomoMieruInboundPortRange(&inbound); err != nil {
 			return nil, err
 		}
-		sanitizeMihomoShadowTLSInboundOptions(&inbound)
 		if err := sanitizeMihomoShadowQUICInboundOptions(&inbound); err != nil {
 			return nil, err
 		}
@@ -147,14 +245,13 @@ func (s *MihomoInboundService) Save(tx *gorm.DB, act string, data json.RawMessag
 			return nil, err
 		}
 		if inbound.TlsId > 0 {
-			if err := tx.Model(model.MihomoTls{}).Where("id = ?", inbound.TlsId).Find(&inbound.Tls).Error; err != nil {
+			if tx == nil {
+				return nil, fmt.Errorf("mihomo inbound TLS validation requires a database transaction")
+			}
+			if err := tx.Model(model.MihomoTls{}).Where("id = ?", inbound.TlsId).Take(&inbound.Tls).Error; err != nil {
 				return nil, err
 			}
-		}
-
-		oldTag := ""
-		if act == "edit" {
-			if err := tx.Model(model.MihomoInbound{}).Select("tag").Where("id = ?", inbound.Id).Find(&oldTag).Error; err != nil {
+			if err := validateMihomoInboundTLSMode(&inbound); err != nil {
 				return nil, err
 			}
 		}
@@ -175,6 +272,9 @@ func (s *MihomoInboundService) Save(tx *gorm.DB, act string, data json.RawMessag
 			return nil, err
 		}
 		if err := tx.Save(&inbound).Error; err != nil {
+			return nil, err
+		}
+		if err := validateMihomoStoredInboundReferences(tx); err != nil {
 			return nil, err
 		}
 
@@ -216,6 +316,9 @@ func (s *MihomoInboundService) Save(tx *gorm.DB, act string, data json.RawMessag
 		if err := tx.Where("tag = ?", tag).Delete(model.MihomoInbound{}).Error; err != nil {
 			return nil, err
 		}
+		if err := validateMihomoStoredInboundReferences(tx); err != nil {
+			return nil, err
+		}
 		nftAction = &InboundNftAction{
 			Kind:      "remove",
 			InboundID: id,
@@ -226,6 +329,81 @@ func (s *MihomoInboundService) Save(tx *gorm.DB, act string, data json.RawMessag
 	}
 
 	return nftAction, nil
+}
+
+// validateMihomoInboundPayload applies the final API boundary checks that
+// cannot safely be delegated to model.Inbound.UnmarshalJSON. That model uses
+// map[string]interface{} and therefore turns JSON numbers into float64; this
+// helper inspects the original raw field so values such as 443.5 can never be
+// truncated by a later toInt conversion.
+func validateMihomoInboundPayload(data json.RawMessage, inbound *model.MihomoInbound) error {
+	if inbound == nil {
+		return fmt.Errorf("mihomo inbound is required")
+	}
+
+	inbound.Tag = strings.TrimSpace(inbound.Tag)
+	if inbound.Tag == "" {
+		return fmt.Errorf("mihomo inbound tag is required")
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("invalid Mihomo inbound payload: %w", err)
+	}
+
+	portRaw, hasPort := raw["listen_port"]
+	if !strings.EqualFold(inbound.Type, "tun") && hasPort {
+		if _, err := parseStrictMihomoListenPort(portRaw); err != nil {
+			return fmt.Errorf("mihomo %s listen_port: %w", inbound.Type, err)
+		}
+	} else if !strings.EqualFold(inbound.Type, "tun") {
+		return fmt.Errorf("mihomo %s listen_port is required", inbound.Type)
+	}
+
+	if mihomoInboundRequiresTLS(inbound.Type) && inbound.TlsId == 0 {
+		return fmt.Errorf("mihomo %s inbound requires a TLS configuration", inbound.Type)
+	}
+
+	return nil
+}
+
+func mihomoInboundRequiresTLS(inboundType string) bool {
+	switch strings.ToLower(strings.TrimSpace(inboundType)) {
+	case "anytls", "hysteria2", "trusttunnel", "tuic":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseStrictMihomoListenPort(raw json.RawMessage) (int, error) {
+	value := bytes.TrimSpace(raw)
+	if len(value) == 0 || bytes.Equal(value, []byte("null")) {
+		return 0, fmt.Errorf("must be an integer between 1 and 65535")
+	}
+
+	text := string(value)
+	if value[0] == '"' {
+		var quoted string
+		if err := json.Unmarshal(value, &quoted); err != nil {
+			return 0, fmt.Errorf("must be an integer between 1 and 65535")
+		}
+		text = strings.TrimSpace(quoted)
+	}
+	if text == "" {
+		return 0, fmt.Errorf("must be an integer between 1 and 65535")
+	}
+	for _, char := range text {
+		if char < '0' || char > '9' {
+			return 0, fmt.Errorf("must be a complete decimal integer")
+		}
+	}
+
+	parsed, err := strconv.ParseUint(text, 10, 16)
+	if err != nil || parsed < 1 || parsed > 65535 {
+		return 0, fmt.Errorf("must be an integer between 1 and 65535")
+	}
+	return int(parsed), nil
 }
 
 func validateMihomoSnellInitBindings(tx *gorm.DB, inbound *model.MihomoInbound, initUserIDs []uint) error {
@@ -247,6 +425,10 @@ func (s *MihomoInboundService) UpdateOutJsons(tx *gorm.DB, inboundIDs []uint, ho
 	if err != nil {
 		return err
 	}
+	return s.updateOutJSONsForLoadedInbounds(tx, inbounds, hostname)
+}
+
+func (s *MihomoInboundService) updateOutJSONsForLoadedInbounds(tx *gorm.DB, inbounds []model.MihomoInbound, hostname string) error {
 	for _, inbound := range inbounds {
 		current := inbound
 		if err := fillMihomoOutJson(&current, effectiveOutJSONHostname(current.OutJson, hostname)); err != nil {
@@ -268,7 +450,7 @@ func (s *MihomoInboundService) GetAllConfig(db *gorm.DB) ([]json.RawMessage, err
 	}
 
 	for _, inbound := range inbounds {
-		if inbound.Type == "ssh" {
+		if !isSupportedMihomoInboundType(inbound.Type) {
 			continue
 		}
 		inboundJSON, err := inbound.MarshalJSON()
@@ -280,16 +462,7 @@ func (s *MihomoInboundService) GetAllConfig(db *gorm.DB) ([]json.RawMessage, err
 			return nil, err
 		}
 
-		if inbound.Type == "shadowtls" {
-			shadowtlsJSON, ssJSON, err := s.processShadowTLSInbound(db, inboundJSON, inbound)
-			if err != nil {
-				return nil, err
-			}
-			inboundsJSON = append(inboundsJSON, shadowtlsJSON)
-			if ssJSON != nil {
-				inboundsJSON = append(inboundsJSON, ssJSON)
-			}
-		} else if inbound.Type == "snell" {
+		if inbound.Type == "snell" {
 			snellJSON, err := s.processSnellInbound(db, inboundJSON, inbound)
 			if err != nil {
 				return nil, err
@@ -301,113 +474,6 @@ func (s *MihomoInboundService) GetAllConfig(db *gorm.DB) ([]json.RawMessage, err
 	}
 
 	return inboundsJSON, nil
-}
-
-func (s *MihomoInboundService) processShadowTLSInbound(db *gorm.DB, inboundJSON []byte, inbound *model.MihomoInbound) (json.RawMessage, json.RawMessage, error) {
-	var inboundData map[string]interface{}
-	if err := json.Unmarshal(inboundJSON, &inboundData); err != nil {
-		return nil, nil, err
-	}
-
-	ssConfig, hasSSConfig := inboundData["ss_config"].(map[string]interface{})
-	if !hasSSConfig || ssConfig == nil {
-		return inboundJSON, nil, nil
-	}
-
-	delete(inboundData, "ss_config")
-	if handshake, ok := inboundData["handshake"].(map[string]interface{}); ok && handshake != nil {
-		delete(handshake, "proxy")
-		delete(handshake, "detour")
-	}
-	delete(inboundData, "handshake_for_server_name")
-	delete(inboundData, "strict_mode")
-	delete(inboundData, "wildcard_sni")
-
-	tag, ok := inboundData["tag"].(string)
-	if !ok || tag == "" {
-		shadowtlsJSON, err := json.Marshal(inboundData)
-		if err != nil {
-			return nil, nil, err
-		}
-		return shadowtlsJSON, nil, nil
-	}
-
-	ssTag := tag + "-in"
-	inboundData["detour"] = ssTag
-
-	shadowtlsJSON, err := json.Marshal(inboundData)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	ssInbound := map[string]interface{}{
-		"type":   "shadowsocks",
-		"tag":    ssTag,
-		"listen": "127.0.0.1",
-	}
-	if method, ok := ssConfig["method"]; ok && method != nil {
-		ssInbound["method"] = method
-	}
-	if password, ok := ssConfig["password"]; ok && password != nil {
-		ssInbound["password"] = password
-	}
-	if multiplex, ok := ssConfig["multiplex"].(map[string]interface{}); ok && multiplex != nil {
-		serverMux := map[string]interface{}{}
-		if enabled, ok := multiplex["enabled"]; ok {
-			serverMux["enabled"] = enabled
-		}
-		if padding, ok := multiplex["padding"]; ok {
-			serverMux["padding"] = padding
-		}
-		if brutal, ok := multiplex["brutal"]; ok {
-			serverMux["brutal"] = brutal
-		}
-		ssInbound["multiplex"] = serverMux
-	}
-
-	ssInboundJSON, err := json.Marshal(ssInbound)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return shadowtlsJSON, ssInboundJSON, nil
-}
-
-func sanitizeMihomoShadowTLSInboundOptions(inbound *model.MihomoInbound) {
-	if inbound == nil || !strings.EqualFold(strings.TrimSpace(inbound.Type), "shadowtls") {
-		return
-	}
-	if len(inbound.Options) == 0 {
-		return
-	}
-
-	var options map[string]interface{}
-	if err := json.Unmarshal(inbound.Options, &options); err != nil || options == nil {
-		return
-	}
-
-	delete(options, "detour")
-	delete(options, "tcp_fast_open")
-	delete(options, "tcp_multi_path")
-	delete(options, "udp_fragment")
-	delete(options, "udp_timeout")
-	delete(options, "strict_mode")
-	delete(options, "wildcard_sni")
-	delete(options, "handshake_for_server_name")
-
-	if handshake, ok := options["handshake"].(map[string]interface{}); ok && handshake != nil {
-		delete(handshake, "proxy")
-		delete(handshake, "detour")
-	}
-	if ssConfig, ok := options["ss_config"].(map[string]interface{}); ok && ssConfig != nil {
-		delete(ssConfig, "network")
-	}
-
-	sanitized, err := json.Marshal(options)
-	if err != nil {
-		return
-	}
-	inbound.Options = json.RawMessage(sanitized)
 }
 
 func (s *MihomoInboundService) processSnellInbound(db *gorm.DB, inboundJSON []byte, inbound *model.MihomoInbound) (json.RawMessage, error) {
@@ -457,21 +523,27 @@ func (s *MihomoInboundService) resolveSnellSharedPSK(db *gorm.DB, inboundID uint
 		return "", fmt.Errorf("snell inbound missing id")
 	}
 
-	var users []string
-	err := db.Raw(
-		`SELECT json_extract(mihomo_clients.config, "$.snell")
-		FROM mihomo_clients
-		WHERE enable = true
-		  AND EXISTS (SELECT 1 FROM json_each(mihomo_clients.inbounds) WHERE json_each.value = ?)`,
-		inboundID,
-	).Scan(&users).Error
-	if err != nil {
+	var clients []model.MihomoClient
+	if err := db.Model(model.MihomoClient{}).
+		Select("name", "config", "inbounds").
+		Where("enable = ?", true).
+		Find(&clients).Error; err != nil {
 		return "", err
 	}
+	clients = filterMihomoClientsBoundToInboundIDs(clients, []uint{inboundID})
 
 	unique := map[string]struct{}{}
-	for _, rawUser := range users {
-		rawUser = strings.TrimSpace(rawUser)
+	for _, client := range clients {
+		rawConfig := strings.TrimSpace(string(client.Config))
+		if rawConfig == "" || strings.EqualFold(rawConfig, "null") {
+			continue
+		}
+
+		config := map[string]json.RawMessage{}
+		if err := json.Unmarshal(client.Config, &config); err != nil {
+			return "", fmt.Errorf("parse mihomo snell client %q config failed: %w", client.Name, err)
+		}
+		rawUser := strings.TrimSpace(string(config["snell"]))
 		if rawUser == "" || strings.EqualFold(rawUser, "null") {
 			continue
 		}
@@ -501,19 +573,13 @@ func (s *MihomoInboundService) resolveSnellSharedPSK(db *gorm.DB, inboundID uint
 
 func (s *MihomoInboundService) hasUser(inboundType string) bool {
 	switch inboundType {
-	case "mixed", "socks", "http", "snell", "vmess", "trojan", "naive", "hysteria", "shadowtls", "shadowquic", "tuic", "hysteria2", "vless", "anytls", "mieru", "sudoku", "trusttunnel":
+	case "mixed", "socks", "http", "snell", "vmess", "trojan", "naive", "hysteria", "shadowquic", "tuic", "hysteria2", "vless", "anytls", "mieru", "sudoku", "trusttunnel":
 		return true
 	}
 	return false
 }
 
 func (s *MihomoInboundService) fetchUsers(db *gorm.DB, inboundType string, condition string, inbound map[string]interface{}) (interface{}, error) {
-	if inboundType == "shadowtls" {
-		version, _ := inbound["version"].(float64)
-		if int(version) < 3 {
-			return nil, nil
-		}
-	}
 	if inboundType == "shadowsocks" {
 		method, _ := inbound["method"].(string)
 		if method == "2022-blake3-aes-128-gcm" {
@@ -530,6 +596,51 @@ func (s *MihomoInboundService) fetchUsers(db *gorm.DB, inboundType string, condi
 		return nil, err
 	}
 
+	return normalizeMihomoFetchedUsers(inboundType, users, inbound)
+}
+
+func (s *MihomoInboundService) fetchUsersForInbound(db *gorm.DB, inboundType string, inboundID uint, inbound map[string]interface{}) (interface{}, error) {
+	if inboundID == 0 {
+		return nil, nil
+	}
+	if inboundType == "shadowsocks" {
+		method, _ := inbound["method"].(string)
+		if method == "2022-blake3-aes-128-gcm" {
+			inboundType = "shadowsocks16"
+		}
+	}
+
+	var clients []model.MihomoClient
+	if err := db.Model(model.MihomoClient{}).
+		Select("config", "inbounds").
+		Where("enable = ?", true).
+		Find(&clients).Error; err != nil {
+		return nil, err
+	}
+	clients = filterMihomoClientsBoundToInboundIDs(clients, []uint{inboundID})
+
+	users := make([]string, 0, len(clients))
+	for _, client := range clients {
+		rawConfig := strings.TrimSpace(string(client.Config))
+		if rawConfig == "" || strings.EqualFold(rawConfig, "null") {
+			continue
+		}
+
+		config := map[string]json.RawMessage{}
+		if err := json.Unmarshal(client.Config, &config); err != nil {
+			return nil, fmt.Errorf("parse mihomo client config failed: %w", err)
+		}
+		rawUser := strings.TrimSpace(string(config[inboundType]))
+		if rawUser == "" || strings.EqualFold(rawUser, "null") {
+			continue
+		}
+		users = append(users, rawUser)
+	}
+
+	return normalizeMihomoFetchedUsers(inboundType, users, inbound)
+}
+
+func normalizeMihomoFetchedUsers(inboundType string, users []string, inbound map[string]interface{}) (interface{}, error) {
 	switch inboundType {
 	case "anytls", "hysteria2":
 		return normalizeMihomoUsersForMap(inboundType, users, []string{"username", "name"})
@@ -555,8 +666,7 @@ func (s *MihomoInboundService) addUsers(db *gorm.DB, inboundJSON []byte, inbound
 	// also prevents legacy Options or view metadata from reaching server.yaml.
 	delete(inbound, "users")
 
-	condition := fmt.Sprintf("%d IN (SELECT json_each.value FROM json_each(mihomo_clients.inbounds))", inboundID)
-	users, err := s.fetchUsers(db, inboundType, condition, inbound)
+	users, err := s.fetchUsersForInbound(db, inboundType, inboundID, inbound)
 	if err != nil {
 		return nil, err
 	}
@@ -681,19 +791,6 @@ func normalizeMihomoUsersForList(inboundType string, users []string, inbound map
 			// addition cannot accidentally reach the runtime users list.
 			user = map[string]interface{}{
 				"username": username,
-				"password": password,
-			}
-		case "shadowtls":
-			name := strings.TrimSpace(firstString(user["name"]))
-			if name == "" {
-				name = strings.TrimSpace(firstString(user["username"]))
-			}
-			password := strings.TrimSpace(firstString(user["password"]))
-			if name == "" || password == "" {
-				return nil, fmt.Errorf("mihomo shadowtls user missing name/password")
-			}
-			user = map[string]interface{}{
-				"name":     name,
 				"password": password,
 			}
 		case "trusttunnel":

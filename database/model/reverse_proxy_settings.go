@@ -29,6 +29,9 @@ type ReverseProxySettings struct {
 	QUICMaxIncomingStreams            int64  `json:"quicMaxIncomingStreams" gorm:"column:quic_max_incoming_streams;not null;default:256"`
 	DefaultUpstreamMaxIdleConnections int    `json:"defaultUpstreamMaxIdleConnections" gorm:"column:default_upstream_max_idle_connections;not null;default:32"`
 
+	// MemoryPoolBytes is an admission ceiling for reverse-proxy cache and body
+	// rewrite buffers. The 8 GiB default is intentional and is not eagerly
+	// allocated when the panel starts.
 	MemoryPoolBytes              int64 `json:"memoryPoolBytes" gorm:"column:memory_pool_bytes;not null;default:8589934592"`
 	DefaultRuleMemoryLimitBytes  int64 `json:"defaultRuleMemoryLimitBytes" gorm:"column:default_rule_memory_limit_bytes;not null;default:402653184"`
 	ResponseRewriteInputBytes    int64 `json:"responseRewriteInputBytes" gorm:"column:response_rewrite_input_bytes;not null;default:4194304"`
@@ -53,10 +56,11 @@ func DefaultReverseProxySettings() ReverseProxySettings {
 		HTTP2MaxConcurrentStreams:         250,
 		QUICMaxIncomingStreams:            256,
 		DefaultUpstreamMaxIdleConnections: 32,
-		MemoryPoolBytes:                   8 * 1024 * 1024 * 1024,
-		DefaultRuleMemoryLimitBytes:       384 * 1024 * 1024,
-		ResponseRewriteInputBytes:         4 * 1024 * 1024,
-		ResponseRewriteOutputBytes:        8 * 1024 * 1024,
-		ResponseRewriteMaxConcurrent:      32,
+		// This is a deliberate capacity limit, not an eager 8 GiB allocation.
+		MemoryPoolBytes:              8 * 1024 * 1024 * 1024,
+		DefaultRuleMemoryLimitBytes:  384 * 1024 * 1024,
+		ResponseRewriteInputBytes:    4 * 1024 * 1024,
+		ResponseRewriteOutputBytes:   8 * 1024 * 1024,
+		ResponseRewriteMaxConcurrent: 32,
 	}
 }

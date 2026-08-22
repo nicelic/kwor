@@ -114,7 +114,8 @@
           {{ feedback.message }}
         </v-alert>
 
-        <v-table density="comfortable" class="mb-4">
+            <div class="kernel-table-wrap kernel-table-wrap--packages mb-4">
+              <v-table density="comfortable">
           <thead>
             <tr>
               <th>{{ t('kernelManager.packageName') }}</th>
@@ -134,7 +135,8 @@
               <td colspan="3" class="text-center text-medium-emphasis">{{ t('noData') }}</td>
             </tr>
           </tbody>
-        </v-table>
+              </v-table>
+            </div>
 
         <v-row class="kernel-download-actions">
           <v-col cols="12" md="4">
@@ -233,6 +235,15 @@
         </div>
 
         <v-alert
+          v-if="kernelCleanupTaskActive"
+          type="info"
+          variant="tonal"
+          density="comfortable"
+          class="mb-4">
+          {{ kernelCleanupTaskStatusText }}
+        </v-alert>
+
+        <v-alert
           v-if="cleanupWarningMessage"
           type="warning"
           variant="tonal"
@@ -293,7 +304,8 @@
             @update:model-value="toggleCleanupSelectAll" />
         </div>
 
-        <v-table density="comfortable">
+        <div class="kernel-table-wrap kernel-table-wrap--cleanup">
+          <v-table density="comfortable">
           <thead>
             <tr>
               <th style="width: 56px;">{{ t('kernelManager.cleanupSelect') }}</th>
@@ -338,12 +350,13 @@
               <td colspan="5" class="text-center text-medium-emphasis">{{ t('noData') }}</td>
             </tr>
           </tbody>
-        </v-table>
+          </v-table>
+        </div>
       </v-card-text>
     </v-card>
 
     <v-overlay :model-value="rebootOverlay" class="align-center justify-center" persistent :z-index="3200">
-      <v-card width="380" rounded="lg">
+      <v-card class="kernel-reboot-dialog" width="380" rounded="lg">
         <v-card-text class="text-center py-8">
           <v-progress-circular indeterminate size="52" width="5" color="primary" class="mb-4" />
           <div class="text-subtitle-1 font-weight-medium">{{ t('kernelManager.rebootingTitle') }}</div>
@@ -438,11 +451,40 @@ type KernelSystemCleanupInfo = {
   summary: string
 }
 
+type KernelCleanupPurgeResult = {
+  requested: string[]
+  command: string
+  needsReboot: boolean
+  succeeded: string[]
+  failed: string[]
+  message: string
+  systemCleanupDone: boolean
+  systemCleanupWarnings: string[]
+  systemCleanupSummary: string
+}
+
+type KernelCleanupTaskStatus = {
+  id: string
+  state: string
+  phase: string
+  canCancel: boolean
+  stopRequested: boolean
+  deadlineExceeded: boolean
+  operation: 'purge' | 'auto' | ''
+  result: KernelCleanupPurgeResult | null
+  error: string
+  startedAt: number
+  updatedAt: number
+  deadlineAt: number
+  finishedAt: number
+}
+
 type KernelProvider = 'xanmod' | 'bbrplus'
 
 const kernelDownloadRequestTimeout = 35 * 1000
 const kernelPackageOperationTimeout = 41 * 60 * 1000
-const kernelAutoCleanupRequestTimeout = 21 * 60 * 1000
+const kernelCatalogRequestTimeout = 55 * 1000
+const kernelCleanupTaskStartTimeout = 10 * 1000
 
 const props = withDefaults(defineProps<{ active?: boolean }>(), {
   active: false,
@@ -467,8 +509,10 @@ const kernelDownloadStopRequestPending = ref(false)
 const installStartPending = ref(false)
 const rebooting = ref(false)
 const cleanupLoading = ref(false)
-const cleanupPurging = ref(false)
-const cleanupAutoPurging = ref(false)
+const cleanupTaskStartPending = ref(false)
+const cleanupTaskId = ref('')
+const cleanupTaskTimerId = ref<number | null>(null)
+let cleanupTaskRequest: Promise<void> | null = null
 const rebootOverlay = ref(false)
 const reconnectTimerId = ref<number | null>(null)
 const downloadProgressSessionId = ref('')
@@ -518,10 +562,27 @@ const createEmptyKernelInstallStatus = (): KernelInstallStatus => ({
   finishedAt: 0,
 })
 
+const createEmptyKernelCleanupTaskStatus = (): KernelCleanupTaskStatus => ({
+  id: '',
+  state: 'idle',
+  phase: '',
+  canCancel: false,
+  stopRequested: false,
+  deadlineExceeded: false,
+  operation: '',
+  result: null,
+  error: '',
+  startedAt: 0,
+  updatedAt: 0,
+  deadlineAt: 0,
+  finishedAt: 0,
+})
+
 const overview = ref<KernelOverview>(createEmptyKernelOverview())
 const runtimeOverview = ref<KernelOverview>(createEmptyKernelOverview())
 const runtimeChecked = ref(false)
 const installStatus = ref<KernelInstallStatus>(createEmptyKernelInstallStatus())
+const cleanupTaskStatus = ref<KernelCleanupTaskStatus>(createEmptyKernelCleanupTaskStatus())
 
 const versionItems = ref<KernelVersionItem[]>([])
 const archItems = ref<KernelArchItem[]>([])
@@ -563,6 +624,17 @@ const kernelInstallTaskActive = computed(() => (
   installStatus.value.active
   || installStatus.value.installing
   || installStatus.value.state === 'running'
+))
+const kernelCleanupTaskActive = computed(() => (
+  ['queued', 'running', 'stopping'].includes(cleanupTaskStatus.value.state)
+))
+const cleanupPurging = computed(() => (
+  (cleanupTaskStartPending.value && cleanupTaskStatus.value.operation === 'purge')
+  || (kernelCleanupTaskActive.value && cleanupTaskStatus.value.operation === 'purge')
+))
+const cleanupAutoPurging = computed(() => (
+  (cleanupTaskStartPending.value && cleanupTaskStatus.value.operation === 'auto')
+  || (kernelCleanupTaskActive.value && cleanupTaskStatus.value.operation === 'auto')
 ))
 const installing = computed(() => installStartPending.value || kernelInstallTaskActive.value)
 const kernelDownloadTaskActive = computed(() => isActiveKernelDownloadProgress(downloadProgress.value))
@@ -680,6 +752,8 @@ const operationBusy = computed(() => (
   installing.value ||
   rebooting.value ||
   cleanupLoading.value ||
+  cleanupTaskStartPending.value ||
+  kernelCleanupTaskActive.value ||
   cleanupPurging.value ||
   cleanupAutoPurging.value
 ))
@@ -692,10 +766,16 @@ const providerStatusText = computed(() => {
   if (!hasProvider.value) {
     return t('kernelManager.providerEmpty')
   }
+  if (loadingOverview.value) {
+    return t('kernelManager.loading')
+  }
   return overview.value.supported ? t('kernelManager.supported') : t('kernelManager.unsupported')
 })
 const providerStatusColor = computed(() => {
   if (!hasProvider.value) {
+    return 'info'
+  }
+  if (loadingOverview.value) {
     return 'info'
   }
   return overview.value.supported ? 'success' : 'warning'
@@ -734,7 +814,12 @@ const canInstall = computed(() => (
   !operationBusy.value
 ))
 const canRebootHost = computed(() => runtimeLinuxAvailable.value)
-const cleanupCurrentKernelText = computed(() => cleanupCurrentKernel.value || activeOverview.value.currentKernel || '-')
+const cleanupCurrentKernelText = computed(() => (
+  cleanupCurrentKernel.value
+  || runtimeOverview.value.currentKernel
+  || activeOverview.value.currentKernel
+  || '-'
+))
 const cleanupPinnedKernelText = computed(() => cleanupPinnedKernel.value || '-')
 const cleanupSelectedPackages = computed(() => (
   cleanupPackages.value
@@ -747,6 +832,17 @@ const cleanupSelectAllChecked = computed(() => (
 const cleanupWarningMessage = computed(() => (
   cleanupPackages.value.some(item => item.risk === 'high') ? t('kernelManager.cleanupRiskWarning') : ''
 ))
+const kernelCleanupTaskStatusText = computed(() => {
+  if (cleanupTaskStartPending.value) {
+    return t('kernelManager.cleanupTaskSubmitting')
+  }
+  if (cleanupTaskStatus.value.operation === 'auto') {
+    return cleanupTaskStatus.value.phase === 'scanning'
+      ? t('kernelManager.cleanupTaskAutoScanning')
+      : t('kernelManager.cleanupTaskAutoRunning')
+  }
+  return t('kernelManager.cleanupTaskPurgeRunning')
+})
 const downloadProgressText = computed(() => {
   const percent = Math.max(0, Math.min(100, Number(downloadProgress.value.percent) || 0))
   const percentText = `${downloadProgress.value.approximate ? '~' : ''}${percent.toFixed(1)}%`
@@ -895,6 +991,43 @@ const normalizeKernelInstallStatus = (raw: any): KernelInstallStatus => ({
   finishedAt: Number(raw?.finishedAt) || 0,
 })
 
+const normalizeStringList = (value: unknown): string[] => (
+  Array.isArray(value)
+    ? value.map(item => String(item ?? '').trim()).filter(item => item.length > 0)
+    : []
+)
+
+const normalizeKernelCleanupPurgeResult = (raw: any): KernelCleanupPurgeResult => ({
+  requested: normalizeStringList(raw?.requested),
+  command: String(raw?.command ?? '').trim(),
+  needsReboot: raw?.needsReboot === true,
+  succeeded: normalizeStringList(raw?.succeeded),
+  failed: normalizeStringList(raw?.failed),
+  message: String(raw?.message ?? '').trim(),
+  systemCleanupDone: raw?.systemCleanupDone === true,
+  systemCleanupWarnings: normalizeStringList(raw?.systemCleanupWarnings),
+  systemCleanupSummary: String(raw?.systemCleanupSummary ?? '').trim(),
+})
+
+const normalizeKernelCleanupTaskStatus = (raw: any): KernelCleanupTaskStatus => {
+  const operation = String(raw?.operation ?? '').trim().toLowerCase()
+  return {
+    id: String(raw?.id ?? '').trim(),
+    state: String(raw?.state ?? '').trim().toLowerCase() || 'idle',
+    phase: String(raw?.phase ?? '').trim(),
+    canCancel: raw?.canCancel === true,
+    stopRequested: raw?.stopRequested === true,
+    deadlineExceeded: raw?.deadlineExceeded === true,
+    operation: operation === 'purge' || operation === 'auto' ? operation : '',
+    result: raw?.result ? normalizeKernelCleanupPurgeResult(raw.result) : null,
+    error: String(raw?.error ?? '').trim(),
+    startedAt: Number(raw?.startedAt) || 0,
+    updatedAt: Number(raw?.updatedAt) || 0,
+    deadlineAt: Number(raw?.deadlineAt) || 0,
+    finishedAt: Number(raw?.finishedAt) || 0,
+  }
+}
+
 const resetDownloadProgress = () => {
   completedKernelDownloadTaskID = ''
   observedKernelDownloadTaskID = ''
@@ -923,6 +1056,11 @@ const resetDownloadProgress = () => {
 
 const resetInstallStatus = () => {
   installStatus.value = createEmptyKernelInstallStatus()
+}
+
+const resetKernelCleanupTaskStatus = () => {
+  cleanupTaskId.value = ''
+  cleanupTaskStatus.value = createEmptyKernelCleanupTaskStatus()
 }
 
 const resetKernelSelection = (nextProvider: string) => {
@@ -958,10 +1096,12 @@ const normalizeKernelOverview = (raw: any): KernelOverview => ({
 })
 
 const loadRuntimeOverview = async () => {
+  if (!isKernelManageActive()) return
   const stopLoading = beginOverviewLoading()
   let requestCancelled = false
   try {
     const msg = await HttpUtils.get('api/kernel-overview', { provider: 'xanmod' })
+    if (!isKernelManageActive()) return
     if (msg.failureKind === 'cancelled') {
       requestCancelled = true
       return
@@ -995,9 +1135,14 @@ const loadOverview = async (requestToken = beginSelectionRequest()) => {
   const stopLoading = beginOverviewLoading()
   try {
     const msg = await HttpUtils.get('api/kernel-overview', { provider: currentProvider })
-    if (!isLatestSelectionRequest(requestToken)) return
+    if (!isLatestSelectionRequest(requestToken) || !isKernelManageActive()) return
     if (msg.success && msg.obj) {
       overview.value = normalizeKernelOverview(msg.obj)
+    } else if (msg.failureKind !== 'cancelled') {
+      overview.value = {
+        ...createEmptyKernelOverview(),
+        reason: String(msg.msg ?? ''),
+      }
     }
   } finally {
     stopLoading()
@@ -1030,13 +1175,19 @@ const loadVersions = async (requestToken = beginSelectionRequest()) => {
     return
   }
   const stopLoading = beginPackageLoading()
+  if (isLatestSelectionRequest(requestToken)) {
+    versionItems.value = []
+    archItems.value = []
+    packages.value = []
+    downloadDirectory.value = ''
+  }
   try {
     const query: Record<string, string> = { provider: currentProvider }
     if (currentProvider === 'xanmod') {
       query.line = currentLine
     }
-    const msg = await HttpUtils.get('api/kernel-versions', query)
-    if (!isLatestSelectionRequest(requestToken)) return
+    const msg = await HttpUtils.get('api/kernel-versions', query, { timeout: kernelCatalogRequestTimeout })
+    if (!isLatestSelectionRequest(requestToken) || !isKernelManageActive()) return
     versionItems.value = msg.success && msg.obj?.versions ? msg.obj.versions as KernelVersionItem[] : []
     kernelSelectionHydrating.value = true
     if (!versionItems.value.some(item => item.name === selectedVersion.value)) {
@@ -1068,13 +1219,18 @@ const loadArches = async (requestToken = beginSelectionRequest()) => {
     return
   }
   const stopLoading = beginPackageLoading()
+  if (isLatestSelectionRequest(requestToken)) {
+    archItems.value = []
+    packages.value = []
+    downloadDirectory.value = ''
+  }
   try {
     const msg = await HttpUtils.get('api/kernel-arches', {
       provider: currentProvider,
       line: currentLine,
       version: currentVersion,
-    })
-    if (!isLatestSelectionRequest(requestToken)) return
+    }, { timeout: kernelCatalogRequestTimeout })
+    if (!isLatestSelectionRequest(requestToken) || !isKernelManageActive()) return
     archItems.value = msg.success && msg.obj?.arches ? msg.obj.arches as KernelArchItem[] : []
     kernelSelectionHydrating.value = true
     if (!archItems.value.some(item => item.arch === selectedArch.value)) {
@@ -1117,6 +1273,10 @@ const loadPackages = async (requestToken = beginSelectionRequest()) => {
     return
   }
   const stopLoading = beginPackageLoading()
+  if (isLatestSelectionRequest(requestToken)) {
+    packages.value = []
+    downloadDirectory.value = ''
+  }
   try {
     const query: Record<string, string> = {
       provider: currentProvider,
@@ -1126,8 +1286,8 @@ const loadPackages = async (requestToken = beginSelectionRequest()) => {
       query.line = currentLine
       query.arch = currentArch
     }
-    const msg = await HttpUtils.get('api/kernel-packages', query)
-    if (!isLatestSelectionRequest(requestToken)) return
+    const msg = await HttpUtils.get('api/kernel-packages', query, { timeout: kernelCatalogRequestTimeout })
+    if (!isLatestSelectionRequest(requestToken) || !isKernelManageActive()) return
     packages.value = msg.success && msg.obj?.packages ? msg.obj.packages as KernelPackageItem[] : []
     downloadDirectory.value = msg.success ? String(msg.obj?.directory ?? '') : ''
   } finally {
@@ -1162,6 +1322,7 @@ const applyCleanupScanResult = (obj: any) => {
 
 const scanCleanupPackages = async (needConfirm = false, requestToken?: number) => {
   const currentRequestToken = requestToken ?? beginCleanupScanRequest()
+  if (!isKernelManageActive()) return
   if (!runtimeLinuxAvailable.value) {
     if (isLatestCleanupScanRequest(currentRequestToken)) {
       cleanupPackages.value = []
@@ -1178,7 +1339,7 @@ const scanCleanupPackages = async (needConfirm = false, requestToken?: number) =
       severity: 'info',
       confirmText: t('confirmDialog.actions.scan'),
     })
-    if (!confirmed || !runtimeLinuxAvailable.value || !isLatestCleanupScanRequest(currentRequestToken)) return
+    if (!confirmed || !runtimeLinuxAvailable.value || !isLatestCleanupScanRequest(currentRequestToken) || !isKernelManageActive()) return
   }
   const stopLoading = beginCleanupLoading()
   try {
@@ -1235,24 +1396,40 @@ const purgeSelectedCleanupPackages = async () => {
     || !targets.every(target => cleanupPackages.value.some(item => item.name === target))
   ) return
 
-  cleanupPurging.value = true
+  clearFeedback()
+  resetKernelCleanupTaskStatus()
+  cleanupTaskStatus.value = {
+    ...cleanupTaskStatus.value,
+    operation: 'purge',
+  }
+  cleanupTaskStartPending.value = true
   try {
     const msg = await HttpUtils.post('api/kernel-cleanup-purge', { packages: targets }, {
       headers: {
         'Content-Type': 'application/json',
       },
-      timeout: kernelPackageOperationTimeout,
+      timeout: kernelCleanupTaskStartTimeout,
     })
-    if (msg.success) {
-      applyKernelSuccessFeedback(t('kernelManager.cleanupPurgeDone', { count: targets.length }), msg.obj)
-      await loadRuntimeOverview()
-      await loadOverview()
-      await scanCleanupPackages()
-    } else {
+    if (msg.success && msg.obj) {
+      applyKernelCleanupTaskStatus(msg.obj, true)
+      if (kernelCleanupTaskActive.value) {
+        startKernelCleanupTaskPolling(cleanupTaskStatus.value.id)
+      }
+      return
+    }
+    if (!isKernelManageActive()) return
+    const recovered = await recoverKernelCleanupTask(true)
+    if (!recovered) {
       setFeedback('error', String(msg.msg || t('kernelManager.cleanupPurgeFailed')))
     }
+  } catch (error: any) {
+    if (!isKernelManageActive()) return
+    const recovered = await recoverKernelCleanupTask(true)
+    if (!recovered) {
+      setFeedback('error', String(error?.message || t('kernelManager.cleanupPurgeFailed')))
+    }
   } finally {
-    cleanupPurging.value = false
+    cleanupTaskStartPending.value = false
   }
 }
 
@@ -1267,34 +1444,55 @@ const autoCleanupKernelPackages = async () => {
   })
   if (!confirmed || !canManageKernelCleanup.value || operationBusy.value || !cleanupHasScanned.value) return
 
-  cleanupAutoPurging.value = true
+  clearFeedback()
+  resetKernelCleanupTaskStatus()
+  cleanupTaskStatus.value = {
+    ...cleanupTaskStatus.value,
+    operation: 'auto',
+  }
+  cleanupTaskStartPending.value = true
   try {
-    const msg = await HttpUtils.post('api/kernel-cleanup-auto', {}, { timeout: kernelAutoCleanupRequestTimeout })
-    if (msg.success) {
-      const count = Array.isArray(msg.obj?.requested) ? msg.obj.requested.length : 0
-      applyKernelSuccessFeedback(t('kernelManager.cleanupAutoDone', { count }), msg.obj)
-      await loadRuntimeOverview()
-      await loadOverview()
-      await scanCleanupPackages()
-    } else {
+    const msg = await HttpUtils.post('api/kernel-cleanup-auto', {}, { timeout: kernelCleanupTaskStartTimeout })
+    if (msg.success && msg.obj) {
+      applyKernelCleanupTaskStatus(msg.obj, true)
+      if (kernelCleanupTaskActive.value) {
+        startKernelCleanupTaskPolling(cleanupTaskStatus.value.id)
+      }
+      return
+    }
+    const recovered = await recoverKernelCleanupTask(true)
+    if (!recovered) {
       setFeedback('error', String(msg.msg || t('kernelManager.cleanupAutoFailed')))
     }
+  } catch (error: any) {
+    if (!isKernelManageActive()) return
+    const recovered = await recoverKernelCleanupTask(true)
+    if (!recovered) {
+      setFeedback('error', String(error?.message || t('kernelManager.cleanupAutoFailed')))
+    }
   } finally {
-    cleanupAutoPurging.value = false
+    cleanupTaskStartPending.value = false
   }
 }
 
 const stopDownloadProgressPolling = () => {
   if (downloadProgressTimerId.value != null) {
-    window.clearInterval(downloadProgressTimerId.value)
+    window.clearTimeout(downloadProgressTimerId.value)
     downloadProgressTimerId.value = null
   }
 }
 
 const stopInstallStatusPolling = () => {
   if (installStatusTimerId.value != null) {
-    window.clearInterval(installStatusTimerId.value)
+    window.clearTimeout(installStatusTimerId.value)
     installStatusTimerId.value = null
+  }
+}
+
+const stopKernelCleanupTaskPolling = () => {
+  if (cleanupTaskTimerId.value != null) {
+    window.clearTimeout(cleanupTaskTimerId.value)
+    cleanupTaskTimerId.value = null
   }
 }
 
@@ -1310,13 +1508,23 @@ const isTerminalKernelInstall = (status: KernelInstallStatus) => (
   && ['success', 'error'].includes(status.state)
 )
 
+const isTerminalKernelCleanupTask = (status: KernelCleanupTaskStatus) => (
+  ['success', 'error', 'cancelled', 'timed_out'].includes(status.state)
+)
+
 const buildKernelInstallStatusKey = (status: KernelInstallStatus) => (
   `${status.state}:${status.startedAt}:${status.finishedAt}:${status.updatedAt}`
+)
+
+const buildKernelCleanupTaskStatusKey = (status: KernelCleanupTaskStatus) => (
+  `${status.id}:${status.state}:${status.startedAt}:${status.finishedAt}:${status.updatedAt}`
 )
 
 let completedKernelDownloadTaskID = ''
 let completedKernelInstallStatusKey = ''
 let observedKernelDownloadTaskID = ''
+let completedKernelCleanupTaskKey = ''
+let observedKernelCleanupTaskID = ''
 
 const shouldAllowRecoveredKernelDownloadTerminal = (progress: KernelDownloadProgress) => {
   const id = progress.id.trim()
@@ -1324,6 +1532,14 @@ const shouldAllowRecoveredKernelDownloadTerminal = (progress: KernelDownloadProg
     return false
   }
   return id === observedKernelDownloadTaskID || id === downloadProgress.value.id.trim()
+}
+
+const shouldAllowRecoveredKernelCleanupTerminal = (status: KernelCleanupTaskStatus) => {
+  const id = status.id.trim()
+  if (id === '' || !isTerminalKernelCleanupTask(status)) {
+    return false
+  }
+  return id === observedKernelCleanupTaskID || id === cleanupTaskId.value.trim()
 }
 
 const clearCompletedKernelDownloadTask = (id: string) => {
@@ -1384,11 +1600,42 @@ const completeKernelInstallStatus = async (status: KernelInstallStatus, allowTer
   if (status.state === 'success') {
     applyKernelInstallFeedback(status)
     await loadRuntimeOverview()
+    if (!isKernelManageActive()) return
     await loadOverview()
+    if (!isKernelManageActive()) return
     await scanCleanupPackages()
     return
   }
   setFeedback('error', status.error || t('kernelManager.installFailed'))
+}
+
+const completeKernelCleanupTask = async (status: KernelCleanupTaskStatus, allowTerminal = true) => {
+  if (!isTerminalKernelCleanupTask(status) || !status.id) return
+  const snapshotKey = buildKernelCleanupTaskStatusKey(status)
+  if (completedKernelCleanupTaskKey === snapshotKey) return
+  completedKernelCleanupTaskKey = snapshotKey
+  if (!allowTerminal) return
+
+  if (status.state === 'success') {
+    const result = status.result ?? normalizeKernelCleanupPurgeResult(null)
+    const count = result.requested.length
+    const message = status.operation === 'auto'
+      ? t('kernelManager.cleanupAutoDone', { count })
+      : t('kernelManager.cleanupPurgeDone', { count })
+    applyKernelSuccessFeedback(message, result)
+    if (!isKernelManageActive()) return
+    await loadRuntimeOverview()
+    if (!isKernelManageActive()) return
+    await loadOverview()
+    if (!isKernelManageActive()) return
+    await scanCleanupPackages()
+    return
+  }
+
+  const fallback = status.operation === 'auto'
+    ? t('kernelManager.cleanupAutoFailed')
+    : t('kernelManager.cleanupPurgeFailed')
+  setFeedback('error', status.error || fallback)
 }
 
 const applyKernelDownloadProgress = (raw: any, allowTerminal = true) => {
@@ -1418,14 +1665,35 @@ const applyKernelInstallStatus = (raw: any, allowTerminal = true) => {
   }
 }
 
+const applyKernelCleanupTaskStatus = (raw: any, allowTerminal = true) => {
+  const nextStatus = normalizeKernelCleanupTaskStatus(raw)
+  cleanupTaskStatus.value = nextStatus
+  if (nextStatus.id !== '') {
+    cleanupTaskId.value = nextStatus.id
+  }
+  if (kernelCleanupTaskActive.value && nextStatus.id !== '') {
+    observedKernelCleanupTaskID = nextStatus.id
+    completedKernelCleanupTaskKey = ''
+  }
+  if (isTerminalKernelCleanupTask(nextStatus)) {
+    stopKernelCleanupTaskPolling()
+    void completeKernelCleanupTask(nextStatus, allowTerminal)
+  }
+}
+
 const pollDownloadProgress = async (): Promise<void> => {
   if (downloadProgressRequest) return downloadProgressRequest
   const sessionId = downloadProgressSessionId.value.trim()
   if (!sessionId) return
   const request = (async () => {
-    const msg = await HttpUtils.get('api/kernel-download-progress', { id: sessionId }, { silentAuthCheck: true })
-    if (!msg.success || sessionId !== downloadProgressSessionId.value.trim()) return
-    applyKernelDownloadProgress(msg.obj)
+    try {
+      const msg = await HttpUtils.get('api/kernel-download-progress', { id: sessionId }, { silentAuthCheck: true })
+      if (!msg.success || sessionId !== downloadProgressSessionId.value.trim() || !isKernelManageActive()) return
+      applyKernelDownloadProgress(msg.obj)
+    } catch {
+      // HttpUtils normally converts transport errors to Msg; keep polling even if
+      // a custom adapter rejects unexpectedly.
+    }
   })()
   downloadProgressRequest = request
   try {
@@ -1440,9 +1708,13 @@ const pollDownloadProgress = async (): Promise<void> => {
 const pollInstallStatus = async (): Promise<void> => {
   if (installStatusRequest) return installStatusRequest
   const request = (async () => {
-    const msg = await HttpUtils.get('api/kernel-install-status', {}, { silentAuthCheck: true, silentErrorToast: true })
-    if (!msg.success || !msg.obj) return
-    applyKernelInstallStatus(msg.obj)
+    try {
+      const msg = await HttpUtils.get('api/kernel-install-status', {}, { silentAuthCheck: true, silentErrorToast: true })
+      if (!msg.success || !msg.obj || !isKernelManageActive()) return
+      applyKernelInstallStatus(msg.obj)
+    } catch {
+      // Keep the interval alive across a transient transport failure.
+    }
   })()
   installStatusRequest = request
   try {
@@ -1454,55 +1726,159 @@ const pollInstallStatus = async (): Promise<void> => {
   }
 }
 
+const isKernelManageActive = () => (
+  props.active
+  && (typeof document === 'undefined' || document.visibilityState === 'visible')
+)
+
+const pollKernelCleanupTask = async (): Promise<void> => {
+  if (cleanupTaskRequest) return cleanupTaskRequest
+  const taskID = cleanupTaskId.value.trim()
+  if (!taskID || !isKernelManageActive()) return
+  const request = (async () => {
+    try {
+      const msg = await HttpUtils.get('api/kernel-cleanup-status', { id: taskID }, {
+        silentAuthCheck: true,
+        silentErrorToast: true,
+      })
+      if (!msg.success || taskID !== cleanupTaskId.value.trim() || !isKernelManageActive()) return
+      applyKernelCleanupTaskStatus(msg.obj)
+    } catch {
+      // Keep the interval alive across a transient transport failure.
+    }
+  })()
+  cleanupTaskRequest = request
+  try {
+    await request
+  } finally {
+    if (cleanupTaskRequest === request) {
+      cleanupTaskRequest = null
+    }
+  }
+}
+
+const scheduleDownloadProgressPolling = (delay = 800) => {
+  if (!isKernelManageActive() || !kernelDownloadTaskActive.value || !downloadProgressSessionId.value.trim()) return
+  if (downloadProgressTimerId.value != null) window.clearTimeout(downloadProgressTimerId.value)
+  downloadProgressTimerId.value = window.setTimeout(async () => {
+    downloadProgressTimerId.value = null
+    await pollDownloadProgress()
+    if (isKernelManageActive() && kernelDownloadTaskActive.value && !isTerminalKernelDownload(downloadProgress.value)) {
+      scheduleDownloadProgressPolling()
+    }
+  }, delay)
+}
+
+const scheduleInstallStatusPolling = (delay = 1000) => {
+  if (!isKernelManageActive() || !kernelInstallTaskActive.value) return
+  if (installStatusTimerId.value != null) window.clearTimeout(installStatusTimerId.value)
+  installStatusTimerId.value = window.setTimeout(async () => {
+    installStatusTimerId.value = null
+    await pollInstallStatus()
+    if (isKernelManageActive() && kernelInstallTaskActive.value && !isTerminalKernelInstall(installStatus.value)) {
+      scheduleInstallStatusPolling()
+    }
+  }, delay)
+}
+
+const scheduleKernelCleanupTaskPolling = (delay = 1000) => {
+  if (!isKernelManageActive() || !kernelCleanupTaskActive.value || !cleanupTaskId.value.trim()) return
+  if (cleanupTaskTimerId.value != null) window.clearTimeout(cleanupTaskTimerId.value)
+  cleanupTaskTimerId.value = window.setTimeout(async () => {
+    cleanupTaskTimerId.value = null
+    await pollKernelCleanupTask()
+    if (isKernelManageActive() && kernelCleanupTaskActive.value && !isTerminalKernelCleanupTask(cleanupTaskStatus.value)) {
+      scheduleKernelCleanupTaskPolling()
+    }
+  }, delay)
+}
+
 const startDownloadProgressPolling = (sessionId: string) => {
   stopDownloadProgressPolling()
   downloadProgressSessionId.value = sessionId.trim()
   if (!downloadProgressSessionId.value || !props.active || (typeof document !== 'undefined' && document.visibilityState !== 'visible')) return
-  downloadProgressTimerId.value = window.setInterval(() => {
-    void pollDownloadProgress()
-  }, 800)
-  void pollDownloadProgress()
+  void pollDownloadProgress().finally(() => scheduleDownloadProgressPolling())
 }
 
 const startInstallStatusPolling = () => {
   stopInstallStatusPolling()
   if (!props.active || (typeof document !== 'undefined' && document.visibilityState !== 'visible')) return
-  installStatusTimerId.value = window.setInterval(() => {
-    void pollInstallStatus()
-  }, 1000)
-  void pollInstallStatus()
+  void pollInstallStatus().finally(() => scheduleInstallStatusPolling())
+}
+
+const startKernelCleanupTaskPolling = (taskID: string) => {
+  stopKernelCleanupTaskPolling()
+  cleanupTaskId.value = taskID.trim()
+  if (!cleanupTaskId.value || !isKernelManageActive()) return
+  void pollKernelCleanupTask().finally(() => scheduleKernelCleanupTaskPolling())
 }
 
 const recoverKernelDownloadTask = async (allowTerminal = false): Promise<boolean> => {
-  const msg = await HttpUtils.get('api/kernel-download-progress', {}, { silentAuthCheck: true })
-  if (!msg.success || !msg.obj) return false
-  const nextProgress = normalizeKernelDownloadProgress(msg.obj)
-  if (nextProgress.id === '' || nextProgress.state === 'idle' || nextProgress.status === 'missing') return false
-  const terminal = isTerminalKernelDownload(nextProgress)
-  const resolvedAllowTerminal = allowTerminal || shouldAllowRecoveredKernelDownloadTerminal(nextProgress)
-  applyKernelDownloadProgress(nextProgress, resolvedAllowTerminal)
-  if (terminal) return resolvedAllowTerminal
-  if (kernelDownloadTaskActive.value) {
-    startDownloadProgressPolling(nextProgress.id)
+  if (!isKernelManageActive()) return false
+  try {
+    const msg = await HttpUtils.get('api/kernel-download-progress', {}, { silentAuthCheck: true })
+    if (!msg.success || !msg.obj || !isKernelManageActive()) return false
+    const nextProgress = normalizeKernelDownloadProgress(msg.obj)
+    if (nextProgress.id === '' || nextProgress.state === 'idle' || nextProgress.status === 'missing') return false
+    const terminal = isTerminalKernelDownload(nextProgress)
+    const resolvedAllowTerminal = allowTerminal || shouldAllowRecoveredKernelDownloadTerminal(nextProgress)
+    applyKernelDownloadProgress(nextProgress, resolvedAllowTerminal)
+    if (terminal) return resolvedAllowTerminal
+    if (kernelDownloadTaskActive.value && isKernelManageActive()) {
+      startDownloadProgressPolling(nextProgress.id)
+    }
+    return true
+  } catch {
+    return false
   }
-  return true
 }
 
 const recoverKernelInstallStatus = async (allowTerminal = false): Promise<boolean> => {
-  const msg = await HttpUtils.get('api/kernel-install-status', {}, { silentAuthCheck: true, silentErrorToast: true })
-  if (!msg.success || !msg.obj) return false
-  const nextStatus = normalizeKernelInstallStatus(msg.obj)
-  if (!nextStatus.active && !nextStatus.installing && nextStatus.state === 'missing') {
-    resetInstallStatus()
+  if (!isKernelManageActive()) return false
+  try {
+    const msg = await HttpUtils.get('api/kernel-install-status', {}, { silentAuthCheck: true, silentErrorToast: true })
+    if (!msg.success || !msg.obj || !isKernelManageActive()) return false
+    const nextStatus = normalizeKernelInstallStatus(msg.obj)
+    if (!nextStatus.active && !nextStatus.installing && nextStatus.state === 'missing') {
+      resetInstallStatus()
+      return false
+    }
+    const terminal = isTerminalKernelInstall(nextStatus)
+    applyKernelInstallStatus(nextStatus, allowTerminal)
+    if (terminal) return allowTerminal
+    if (kernelInstallTaskActive.value && isKernelManageActive()) {
+      startInstallStatusPolling()
+    }
+    return true
+  } catch {
     return false
   }
-  const terminal = isTerminalKernelInstall(nextStatus)
-  applyKernelInstallStatus(nextStatus, allowTerminal)
-  if (terminal) return allowTerminal
-  if (kernelInstallTaskActive.value) {
-    startInstallStatusPolling()
+}
+
+const recoverKernelCleanupTask = async (allowTerminal = false): Promise<boolean> => {
+  if (!isKernelManageActive()) return false
+  try {
+    const msg = await HttpUtils.get('api/kernel-cleanup-status', {}, {
+      silentAuthCheck: true,
+      silentErrorToast: true,
+    })
+    if (!msg.success || !msg.obj || !isKernelManageActive()) return false
+    const nextStatus = normalizeKernelCleanupTaskStatus(msg.obj)
+    if (nextStatus.id === '' || nextStatus.state === 'idle') {
+      resetKernelCleanupTaskStatus()
+      return false
+    }
+    const terminal = isTerminalKernelCleanupTask(nextStatus)
+    const resolvedAllowTerminal = allowTerminal || shouldAllowRecoveredKernelCleanupTerminal(nextStatus)
+    applyKernelCleanupTaskStatus(nextStatus, resolvedAllowTerminal)
+    if (terminal) return resolvedAllowTerminal
+    if (kernelCleanupTaskActive.value && isKernelManageActive()) {
+      startKernelCleanupTaskPolling(nextStatus.id)
+    }
+    return true
+  } catch {
+    return false
   }
-  return true
 }
 
 const handleVisibilityChange = () => {
@@ -1510,10 +1886,12 @@ const handleVisibilityChange = () => {
     if (!props.active) return
     void recoverKernelDownloadTask()
     void recoverKernelInstallStatus()
+    void recoverKernelCleanupTask()
     return
   }
   stopDownloadProgressPolling()
   stopInstallStatusPolling()
+  stopKernelCleanupTaskPolling()
 }
 
 const buildSelectionFormData = () => {
@@ -1550,11 +1928,13 @@ const downloadPackages = async () => {
       }
       return
     }
+    if (!isKernelManageActive()) return
     const recovered = await recoverKernelDownloadTask(true)
     if (!recovered) {
       setFeedback('error', String(msg.msg || t('kernelManager.downloadFailed')))
     }
   } catch (error: any) {
+    if (!isKernelManageActive()) return
     const recovered = await recoverKernelDownloadTask(true)
     if (!recovered) {
       setFeedback('error', String(error?.message || t('kernelManager.downloadFailed')))
@@ -1567,6 +1947,7 @@ const downloadPackages = async () => {
 const stopKernelDownload = async () => {
   const id = downloadProgress.value.id.trim()
   if (!id || !downloadProgress.value.canCancel || kernelDownloadStopRequestPending.value) return
+  const previousProgress = { ...downloadProgress.value }
   kernelDownloadStopRequestPending.value = true
   downloadProgress.value = {
     ...downloadProgress.value,
@@ -1579,9 +1960,15 @@ const stopKernelDownload = async () => {
     const msg = await HttpUtils.post('api/kernel-download-stop', { id }, { silentAuthCheck: true })
     if (msg.success && msg.obj) {
       applyKernelDownloadProgress(msg.obj)
+    } else if (!msg.success) {
+      downloadProgress.value = previousProgress
+      kernelDownloadStopRequestPending.value = false
+      if (isKernelManageActive()) {
+        setFeedback('error', String(msg.msg || '停止内核下载失败'))
+      }
     }
   } catch {
-    // 状态轮询会确认已经受理但响应丢失的停止请求。
+    // 响应丢失时保留停止态，由轮询确认服务端最终状态。
   } finally {
     if (kernelDownloadTaskActive.value) {
       startDownloadProgressPolling(id)
@@ -1604,17 +1991,20 @@ const installPackages = async () => {
   try {
     const msg = await HttpUtils.post('api/kernel-install', {}, { timeout: kernelPackageOperationTimeout })
     if (msg.success) {
+      if (!isKernelManageActive()) return
       applyKernelInstallFeedback(msg.obj)
       await loadRuntimeOverview()
       await loadOverview()
       await scanCleanupPackages()
       return
     }
+    if (!isKernelManageActive()) return
     const recovered = await recoverKernelInstallStatus(true)
     if (!recovered) {
       setFeedback('error', String(msg.msg || t('kernelManager.installFailed')))
     }
   } catch (error: any) {
+    if (!isKernelManageActive()) return
     const recovered = await recoverKernelInstallStatus(true)
     if (!recovered) {
       setFeedback('error', String(error?.message || t('kernelManager.installFailed')))
@@ -1691,6 +2081,7 @@ const clearDownloadedKernel = async () => {
   try {
     const msg = await HttpUtils.post('api/kernel-downloaded-clear', {})
     if (msg.success) {
+      resetDownloadProgress()
       overview.value.downloadedKernel = ''
       overview.value.downloadedDirectory = ''
       downloadDirectory.value = ''
@@ -1710,7 +2101,9 @@ const refreshKernelData = async (
   selectionRequestToken = beginSelectionRequest(),
   cleanupRequestToken = beginCleanupScanRequest(),
 ) => {
+  if (!isKernelManageActive()) return
   await loadRuntimeOverview()
+  if (!isKernelManageActive()) return
   if (!selectedProvider.value) {
     return
   }
@@ -1718,7 +2111,9 @@ const refreshKernelData = async (
     return
   }
   await loadOverview(selectionRequestToken)
+  if (!isKernelManageActive()) return
   await loadVersions(selectionRequestToken)
+  if (!isKernelManageActive()) return
   if (canManageKernelCleanup.value) {
     await scanCleanupPackages(false, cleanupRequestToken)
   }
@@ -1731,13 +2126,14 @@ const refreshCurrentKernelData = async () => {
 }
 
 watch(provider, async (nextProvider) => {
+  if (!props.active) return
   clearFeedback()
   kernelSelectionHydrating.value = true
   resetKernelSelection(nextProvider)
   await nextTick()
   kernelSelectionHydrating.value = false
   await refreshCurrentKernelData()
-}, { immediate: true })
+})
 
 watch(selectedLine, async () => {
   if (kernelSelectionHydrating.value || !isXanMod.value) return
@@ -1784,25 +2180,25 @@ onMounted(() => {
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', handleVisibilityChange)
   }
-  if (props.active) {
-    void recoverKernelDownloadTask()
-    void recoverKernelInstallStatus()
-  }
 })
 
 watch(() => props.active, (active) => {
   if (active) {
+    void refreshCurrentKernelData()
     void recoverKernelDownloadTask()
     void recoverKernelInstallStatus()
+    void recoverKernelCleanupTask()
     return
   }
   stopDownloadProgressPolling()
   stopInstallStatusPolling()
-})
+  stopKernelCleanupTaskPolling()
+}, { immediate: true })
 
 onBeforeUnmount(() => {
   stopDownloadProgressPolling()
   stopInstallStatusPolling()
+  stopKernelCleanupTaskPolling()
   clearReconnectTimer()
   if (downloadFeedbackTimer != null) {
     window.clearTimeout(downloadFeedbackTimer)
@@ -1818,6 +2214,26 @@ onBeforeUnmount(() => {
 .kernel-provider-select {
   min-width: 220px;
   max-width: 320px;
+}
+
+.kernel-reboot-dialog {
+  width: min(380px, calc(100vw - 24px)) !important;
+  max-width: calc(100vw - 24px);
+}
+
+.kernel-table-wrap {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.kernel-table-wrap--packages :deep(table) {
+  min-width: 520px;
+}
+
+.kernel-table-wrap--cleanup :deep(table) {
+  min-width: 760px;
 }
 
 .kernel-action-btn {

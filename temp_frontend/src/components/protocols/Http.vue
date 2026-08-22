@@ -1,7 +1,7 @@
 <template>
   <v-card subtitle="HTTP">
     <v-row>
-      <v-col cols="12" sm="6" md="4">
+      <v-col cols="12" sm="6" md="4" v-if="!isMihomoNamespace">
         <v-text-field
         :label="$t('types.un')"
         hide-details
@@ -31,11 +31,19 @@
 import Headers from '@/components/Headers.vue'
 
 export default {
-  props: ['data'],
+  props: ['data', 'namespace'],
   data() {
     return {}
   },
+  methods: {
+    sanitizeMihomoUnsupportedFields() {
+      if (this.isMihomoNamespace) delete this.data.path
+    },
+  },
   computed: {
+    isMihomoNamespace(): boolean {
+      return this.namespace === 'mihomo'
+    },
     username: {
       get(): string { return this.data.username?.length > 0 ? this.data.username : '' },
       set(v:string) { this.data.username = v.length > 0 ? v : undefined },
@@ -43,6 +51,17 @@ export default {
     password: {
       get(): string { return this.data.password?.length > 0 ? this.data.password : '' },
       set(v:string) { this.data.password = v.length > 0 ? v : undefined },
+    },
+  },
+  mounted() {
+    this.sanitizeMihomoUnsupportedFields()
+  },
+  watch: {
+    data() {
+      this.sanitizeMihomoUnsupportedFields()
+    },
+    namespace() {
+      this.sanitizeMihomoUnsupportedFields()
     },
   },
   components: { Headers }

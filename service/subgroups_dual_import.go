@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"strconv"
 	"strings"
 
 	"github.com/alireza0/s-ui/util"
@@ -48,6 +47,9 @@ func extractClashProxies(yamlData []byte) ([]map[string]interface{}, error) {
 		}
 
 		result = append(result, cloneMap(proxy))
+		if len(result) > subscriptionImportMaxNodes {
+			return nil, fmt.Errorf("clash subscription contains more than %d valid nodes", subscriptionImportMaxNodes)
+		}
 	}
 	return result, nil
 }
@@ -308,7 +310,34 @@ func convertClashProxyToSubOutbound(proxy map[string]interface{}) (map[string]in
 			outbound["zero_rtt_handshake"] = true
 		}
 		if heartbeatMS, ok := toIntValue(proxy["heartbeat-interval"]); ok && heartbeatMS > 0 {
-			outbound["heartbeat"] = fmt.Sprintf("%ds", heartbeatMS/1000)
+			outbound["heartbeat"] = formatMihomoImportedMilliseconds(heartbeatMS)
+		}
+		if timeoutMS, ok := toIntValue(proxy["request-timeout"]); ok && timeoutMS > 0 {
+			outbound["request_timeout"] = formatMihomoImportedMilliseconds(timeoutMS)
+		}
+		if maxOpenStreams, ok := toIntValue(proxy["max-open-streams"]); ok && maxOpenStreams > 0 {
+			outbound["max_open_streams"] = maxOpenStreams
+		}
+		if maxPacketSize, ok := toIntValue(proxy["max-udp-relay-packet-size"]); ok && maxPacketSize > 0 {
+			outbound["max_udp_relay_packet_size"] = maxPacketSize
+		}
+		if value, ok := toIntValue(proxy["cwnd"]); ok && value > 0 {
+			outbound["cwnd"] = value
+		}
+		if value, ok := toIntValue(proxy["udp-over-stream-version"]); ok && value > 0 {
+			outbound["udp_over_stream_version"] = value
+		}
+		if value, ok := toIntValue(proxy["max-datagram-frame-size"]); ok && value > 0 {
+			outbound["max_datagram_frame_size"] = value
+		}
+		if ip, ok := proxy["ip"].(string); ok && strings.TrimSpace(ip) != "" {
+			outbound["ip"] = strings.TrimSpace(ip)
+		}
+		if value, ok := toBoolValue(proxy["udp-over-stream"]); ok {
+			outbound["udp_over_stream"] = value
+		}
+		if value, ok := toBoolValue(proxy["disable-mtu-discovery"]); ok {
+			outbound["disable_mtu_discovery"] = value
 		}
 	case "hysteria":
 		if auth, ok := proxy["auth-str"].(string); ok && auth != "" {
@@ -338,6 +367,9 @@ func convertClashProxyToSubOutbound(proxy map[string]interface{}) (map[string]in
 				outbound["server_ports"] = serverPorts
 			}
 		}
+		if fastOpen, ok := toBoolValue(proxy["fast-open"]); ok {
+			outbound["mihomo_fast_open"] = fastOpen
+		}
 	case "hysteria2":
 		if password, ok := proxy["password"].(string); ok && password != "" {
 			outbound["password"] = password
@@ -363,6 +395,23 @@ func convertClashProxyToSubOutbound(proxy map[string]interface{}) (map[string]in
 		}
 		if hopInterval, ok := toIntValue(proxy["hop-interval"]); ok && hopInterval > 0 {
 			outbound["hop_interval"] = fmt.Sprintf("%ds", hopInterval)
+		}
+		if fastOpen, ok := toBoolValue(proxy["fast-open"]); ok {
+			outbound["mihomo_fast_open"] = fastOpen
+		}
+		mihomoHy2 := map[string]interface{}{}
+		for proxyKey, outboundKey := range map[string]string{
+			"initial-stream-receive-window":     "initial_stream_receive_window",
+			"max-stream-receive-window":         "max_stream_receive_window",
+			"initial-connection-receive-window": "initial_connection_receive_window",
+			"max-connection-receive-window":     "max_connection_receive_window",
+		} {
+			if value, ok := toIntValue(proxy[proxyKey]); ok && value > 0 {
+				mihomoHy2[outboundKey] = value
+			}
+		}
+		if len(mihomoHy2) > 0 {
+			outbound["mihomo_hy2"] = mihomoHy2
 		}
 	case "anytls":
 		if password, ok := proxy["password"].(string); ok && password != "" {
@@ -1035,28 +1084,7 @@ func cloneMap(src map[string]interface{}) map[string]interface{} {
 }
 
 func toIntValue(raw interface{}) (int, bool) {
-	switch value := raw.(type) {
-	case int:
-		return value, true
-	case int32:
-		return int(value), true
-	case int64:
-		return int(value), true
-	case float32:
-		return int(value), true
-	case float64:
-		return int(value), true
-	case string:
-		value = strings.TrimSpace(value)
-		if value == "" {
-			return 0, false
-		}
-		n, err := strconv.Atoi(value)
-		if err == nil {
-			return n, true
-		}
-	}
-	return 0, false
+	return toInt(raw)
 }
 
 func toBoolValue(raw interface{}) (bool, bool) {

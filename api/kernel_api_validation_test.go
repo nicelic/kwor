@@ -132,6 +132,13 @@ func TestKernelAPIValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("cleanup status returns current or idle task", func(t *testing.T) {
+		rec, msg := performKernelAPIGet(t, svc.GetKernelCleanupStatus, "/api/kernel-cleanup-status")
+		if !msg.Success || rec.Code != 200 {
+			t.Fatalf("unexpected response: code=%d msg=%q", rec.Code, msg.Msg)
+		}
+	})
+
 	t.Run("download stop rejects unknown id", func(t *testing.T) {
 		rec, msg := performKernelAPIPostJSON(t, svc.StopKernelDownload, `{"id":"kernel-unknown-task"}`)
 		if msg.Success {

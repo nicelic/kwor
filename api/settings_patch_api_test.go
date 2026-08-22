@@ -157,6 +157,9 @@ func TestSettingsPatchRejectsUnknownInvalidAndOversizedValues(t *testing.T) {
 		{name: "duplicate yaml key", body: `{"expectedRevision":1,"changes":{"subClashExt":"mixed-port: 7890\nmixed-port: 7891\n"}}`},
 		{name: "JSON ruleset format mismatch", body: `{"expectedRevision":1,"changes":{"subJsonExt":"{\"rule_set\":[{\"tag\":\"x\",\"format\":\"source\",\"url\":\"https://example.com/x.srs\"}]}"}}`},
 		{name: "Clash ruleset format mismatch", body: `{"expectedRevision":1,"changes":{"subClashExt":"rule-providers:\n  x:\n    type: http\n    behavior: domain\n    format: yaml\n    url: https://example.com/x.mrs\n"}}`},
+		{name: "Clash latency interval too short", body: `{"expectedRevision":1,"changes":{"subClashExt":"_uiConfig:\n  latencyTestInterval: 1s\n"}}`},
+		{name: "Clash rule provider interval too short", body: `{"expectedRevision":1,"changes":{"subClashExt":"_uiConfig:\n  updateInterval: 30m\n"}}`},
+		{name: "Clash provider seconds too short", body: `{"expectedRevision":1,"changes":{"subClashExt":"rule-providers:\n  x:\n    type: http\n    behavior: domain\n    format: yaml\n    url: https://example.com/x.yaml\n    interval: 60\n"}}`},
 		{name: "custom name type conflict", body: `{"expectedRevision":1,"changes":{"subJsonExt":"{\"_uiConfig\":{\"ruleSetSource\":\"karingx_github\",\"ruleRows\":[{\"kind\":\"custom\",\"name\":\"same\",\"customType\":\"domain\"},{\"kind\":\"custom\",\"name\":\"same\",\"customType\":\"domain_suffix\"}]}}"}}`},
 		{name: "invalid subscription URI scheme", body: `{"expectedRevision":1,"changes":{"subURI":"ftp://example.com/sub"}}`},
 		{name: "subscription URI query", body: `{"expectedRevision":1,"changes":{"subURI":"https://example.com/sub?token=x"}}`},
@@ -181,6 +184,16 @@ func TestSettingsPatchRejectsUnknownInvalidAndOversizedValues(t *testing.T) {
 	_, response := performSettingsPatchJSONPost(t, apiService.SaveSettingsPatch, string(body))
 	if response.Success || !strings.Contains(response.Msg, "超过") {
 		t.Fatalf("oversized extension was not rejected: %#v", response)
+	}
+
+	oversizedClash := "x: \"" + strings.Repeat("a", service.SubscriptionClashExtensionMaxBytes) + "\"\n"
+	body, _ = json.Marshal(map[string]interface{}{
+		"expectedRevision": 1,
+		"changes":          map[string]string{"subClashExt": oversizedClash},
+	})
+	_, response = performSettingsPatchJSONPost(t, apiService.SaveSettingsPatch, string(body))
+	if response.Success || !strings.Contains(response.Msg, "超过") {
+		t.Fatalf("oversized Clash extension was not rejected: %#v", response)
 	}
 }
 
@@ -234,6 +247,52 @@ func TestCompactAndSubscriptionSettingsSnapshotsShareAtomicRevision(t *testing.T
 	}
 	if extension.Revision != compact.Revision || extension.Value == "" || extension.Default == "" {
 		t.Fatalf("extension snapshot is inconsistent: compact=%#v extension=%#v", compact, extension)
+	}
+}
+
+func TestCompactSettingsSnapshotExcludesLargeExtensions(t *testing.T) {
+	setupSettingsPatchAPITestDB(t)
+	settingService := &service.SettingService{}
+	largeExtension := strings.Repeat("x", 1024*1024)
+	for _, key := range []string{"subJsonExt", "subClashExt"} {
+		if err := database.GetDB().Model(&model.Setting{}).Where("key = ?", key).Update("value", largeExtension).Error; err != nil {
+			t.Fatalf("write large %s fixture: %v", key, err)
+		}
+	}
+
+	compact, err := settingService.GetSettingsSnapshot(false)
+	if err != nil {
+		t.Fatalf("load compact settings snapshot: %v", err)
+	}
+	if compact.ExtensionsIncluded {
+		t.Fatalf("compact snapshot unexpectedly marked extensions as included: %#v", compact)
+	}
+	if _, exists := compact.Values["subJsonExt"]; exists {
+		t.Fatal("compact snapshot exposed the JSON extension")
+	}
+	if _, exists := compact.Values["subClashExt"]; exists {
+		t.Fatal("compact snapshot exposed the Clash extension")
+	}
+}
+
+func TestSessionMaxAgeCacheInvalidatesAfterSettingsPatch(t *testing.T) {
+	setupSettingsPatchAPITestDB(t)
+	settingService := &service.SettingService{}
+	before, err := settingService.GetSessionMaxAge()
+	if err != nil || before != 0 {
+		t.Fatalf("load initial cached session max age: value=%d err=%v", before, err)
+	}
+
+	result, err := settingService.ApplySettingsPatch(service.SettingsPatchRequest{
+		ExpectedRevision: 1,
+		Changes:          map[string]string{"sessionMaxAge": "60"},
+	}, "tester")
+	if err != nil || result.Revision != 2 {
+		t.Fatalf("patch session max age: result=%#v err=%v", result, err)
+	}
+	after, err := settingService.GetSessionMaxAge()
+	if err != nil || after != 60 {
+		t.Fatalf("session max age cache was stale: value=%d err=%v", after, err)
 	}
 }
 
@@ -412,7 +471,7 @@ func TestDirectEditableSettingWriteBumpsRevisionOnlyOnChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load first snapshot: %v", err)
 	}
-	if first.Revision != 2 || first.Values["subURI"] != "https://direct.example/sub" {
+	if first.Revision != 2 || first.Values["subURI"] != "https://direct.example/sub/" {
 		t.Fatalf("unexpected first direct setting snapshot: %#v", first)
 	}
 	if err := settingService.SaveSetting("subURI", "https://direct.example/sub"); err != nil {

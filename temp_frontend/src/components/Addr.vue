@@ -13,6 +13,9 @@
       :label="$t('out.port')"
       hide-details
       type="number"
+      min="1"
+      max="65535"
+      step="1"
       required
       v-model.number="addr.server_port"></v-text-field>
     </v-col>
@@ -24,7 +27,7 @@
       </v-text-field>
     </v-col>
   </v-row>
-  <OutTLS :outbound="addr" v-if="optionTLS" />
+  <OutTLS :outbound="addr" :namespace="namespace" :protocol="protocol" v-if="optionTLS" />
   <v-row>
     <v-spacer></v-spacer>
     <v-col cols="auto" align="end" justify="center">
@@ -50,7 +53,12 @@
 <script lang="ts">
 import OutTLS from '@/components/tls/OutTLS.vue'
 export default {
-  props: ['addr', 'hasTls'],
+  props: {
+    addr: { type: Object, required: true },
+    hasTls: { type: Boolean, default: false },
+    namespace: { type: String, default: 'default' },
+    protocol: { type: String, default: '' },
+  },
   data() {
     return {
       menu: false

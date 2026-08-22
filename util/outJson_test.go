@@ -117,6 +117,20 @@ func TestNaiveOut_RemovesServerNetworkAndPreservesClientFields(t *testing.T) {
 	}
 }
 
+func TestNaiveOut_RemovesEmptyOrUnsupportedQuicCongestionControl(t *testing.T) {
+	for _, value := range []interface{}{"", "unsupported", 123} {
+		outbound := map[string]interface{}{
+			"quic_congestion_control": value,
+		}
+
+		naiveOut(&outbound, map[string]interface{}{})
+
+		if _, exists := outbound["quic_congestion_control"]; exists {
+			t.Fatalf("expected invalid quic_congestion_control to be removed for %#v, got %#v", value, outbound)
+		}
+	}
+}
+
 func TestTrustTunnelOut_MapsListenerUDPToClientProxy(t *testing.T) {
 	outbound := map[string]interface{}{}
 
@@ -651,5 +665,35 @@ func TestSSHOut_MapsInboundFieldsToOutJSON(t *testing.T) {
 	}
 	if got, _ := outbound["client_version"].(string); got != "SSH-2.0-OpenSSH_9.0" {
 		t.Fatalf("expected client_version mapped, got %#v", outbound["client_version"])
+	}
+}
+
+func TestPositiveIntFromAnyRejectsFractionalValues(t *testing.T) {
+	for _, value := range []interface{}{float64(1.5), float32(2.5)} {
+		if _, ok := positiveIntFromAny(value); ok {
+			t.Fatalf("fractional value %#v must not be truncated into a positive integer", value)
+		}
+	}
+
+	if value, ok := positiveIntFromAny(float64(3)); !ok || value != 3 {
+		t.Fatalf("integral float should remain usable, got (%d, %v)", value, ok)
+	}
+}
+
+func TestMieruAndSudokuIntegerHelpersRejectFractionalValues(t *testing.T) {
+	for _, raw := range []interface{}{float64(1200.5), float32(8.5), "1200.5", "1200x"} {
+		if value, ok := toIntValue(raw); ok {
+			t.Fatalf("Mieru integer helper accepted %#v as %d", raw, value)
+		}
+		if value, ok := sudokuToInt(raw); ok {
+			t.Fatalf("Sudoku integer helper accepted %#v as %d", raw, value)
+		}
+	}
+
+	if value, ok := toIntValue(float64(1200)); !ok || value != 1200 {
+		t.Fatalf("Mieru integral float = (%d, %v), want (1200, true)", value, ok)
+	}
+	if value, ok := sudokuToInt("1200"); !ok || value != 1200 {
+		t.Fatalf("Sudoku integer string = (%d, %v), want (1200, true)", value, ok)
 	}
 }

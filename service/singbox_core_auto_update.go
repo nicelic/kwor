@@ -334,12 +334,17 @@ func (s *CoreManagerService) runSingboxAutoUpdateAttempt(ctx context.Context) (b
 
 func (s *CoreManagerService) RunScheduledAutoUpdate() error {
 	coreAutoCheckMu.Lock()
+	autoCheckEnabled, err := (&SettingService{}).getBool(coreAutoCheckEnabledKey)
+	if err != nil {
+		coreAutoCheckMu.Unlock()
+		return err
+	}
 	state, err := s.getCoreAutoUpdateState()
 	coreAutoCheckMu.Unlock()
 	if err != nil {
 		return err
 	}
-	if !state.Enabled {
+	if !autoCheckEnabled || !state.Enabled {
 		return nil
 	}
 

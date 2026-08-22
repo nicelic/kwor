@@ -40,6 +40,8 @@ const (
 	coreAutoCheckEnabledKey        = "coreAutoCheckEnabled"
 	coreAutoCheckIntervalHoursKey  = "coreAutoCheckIntervalHours"
 	coreAutoCheckLastAtKey         = "coreAutoCheckLastAt"
+	coreAutoCheckFirstAtKey        = "coreAutoCheckFirstAt"
+	coreAutoCheckFirstTimeZoneKey  = "coreAutoCheckFirstTimeZone"
 	coreAutoCheckLatestStableKey   = "coreAutoCheckLatestStable"
 	coreAutoCheckLatestAlphaKey    = "coreAutoCheckLatestAlpha"
 	coreAutoCheckPendingStableKey  = "coreAutoCheckPendingStable"
@@ -176,6 +178,7 @@ type SingboxCoreInfo struct {
 	RuntimeMode        string                        `json:"runtimeMode,omitempty"`
 	InstalledTarget    SingboxCoreDownloadTarget     `json:"installedTarget,omitempty"`
 	InstalledChannel   string                        `json:"installedChannel,omitempty"`
+	LogLevel           string                        `json:"logLevel"`
 	DownloadPreference SingboxCoreDownloadPreference `json:"downloadPreference"`
 }
 
@@ -406,6 +409,12 @@ func (s *CoreManagerService) GetCoreStatus() (*SingboxCoreInfo, error) {
 
 	info := &SingboxCoreInfo{
 		Platform: s.getPlatformInfo(),
+		LogLevel: defaultSingboxCoreLogLevel,
+	}
+	if level, err := GetSingboxCoreLogLevel(); err != nil {
+		logger.Warning("failed to load sing-box core log level: ", err)
+	} else {
+		info.LogLevel = level
 	}
 	info.RuntimeMode = string(getManagedCoreRuntimeMode())
 	if preference, err := s.GetDownloadPreference(); err == nil {
@@ -1306,16 +1315,22 @@ func (s *CoreManagerService) StartCore() (err error) {
 		return lockErr
 	}
 	defer func() { _ = lifecycleLock.Release() }()
+	finishTrafficMutation := BeginRuntimeTrafficMutation()
+	defer finishTrafficMutation()
 
 	s.mu.Lock()
+	invalidateManagedCoreProcessRuntimeCache()
 	defer func() {
 		if err == nil {
 			SyncPortForwardNftablesAfterCoreRuntimeReady()
 			notifyCertificateCoreLoadedLatestConfig(certificateCoreKindSingbox)
+			InvalidateDashboardRuntimeCache()
 		}
 	}()
 	defer s.mu.Unlock()
-
+	if flushErr := FlushTrafficRuntimeJournal(); flushErr != nil {
+		return fmt.Errorf("启动 sing-box 前刷新流量账本失败: %w", flushErr)
+	}
 	if err := EnsureManagedCoreLayout(); err != nil {
 		return err
 	}
@@ -1441,18 +1456,31 @@ func (s *CoreManagerService) StopCore() error {
 		return err
 	}
 	defer func() { _ = lifecycleLock.Release() }()
+	finishTrafficMutation := BeginRuntimeTrafficMutation()
+	defer finishTrafficMutation()
 
 	s.mu.Lock()
+	invalidateManagedCoreProcessRuntimeCache()
 	defer s.mu.Unlock()
+	defer func() {
+		InvalidateDashboardRuntimeCache()
+	}()
+	if flushErr := FlushTrafficRuntimeJournal(); flushErr != nil {
+		return fmt.Errorf("停止 sing-box 前刷新流量账本失败: %w", flushErr)
+	}
 
 	if IsSystemPlatformLinux() {
 		err := s.stopCoreLinuxFull()
-		if err == nil {
-			clearManagedCoreShouldRun("singbox")
+		if err != nil {
+			return err
 		}
+		clearManagedCoreShouldRun("singbox")
+	} else if err := s.stopCoreInternal(); err != nil {
 		return err
 	}
-	return s.stopCoreInternal()
+
+	DiscardMaterializedManagedRuntimeCoreFile(s.getConfigPath())
+	return nil
 }
 
 // DeleteCore stops running core/service and removes the core binary.
@@ -1462,9 +1490,18 @@ func (s *CoreManagerService) DeleteCore() error {
 		return err
 	}
 	defer func() { _ = lifecycleLock.Release() }()
+	finishTrafficMutation := BeginRuntimeTrafficMutation()
+	defer finishTrafficMutation()
 
 	s.mu.Lock()
+	invalidateManagedCoreProcessRuntimeCache()
 	defer s.mu.Unlock()
+	defer func() {
+		InvalidateDashboardRuntimeCache()
+	}()
+	if flushErr := FlushTrafficRuntimeJournal(); flushErr != nil {
+		return fmt.Errorf("删除 sing-box 前刷新流量账本失败: %w", flushErr)
+	}
 
 	if err := EnsureManagedCoreLayout(); err != nil {
 		return err
@@ -1482,6 +1519,7 @@ func (s *CoreManagerService) DeleteCore() error {
 			return err
 		}
 	}
+	DiscardMaterializedManagedRuntimeCoreFile(s.getConfigPath())
 
 	binPath := s.getCoreBinPath()
 	if err := os.Remove(binPath); err != nil && !os.IsNotExist(err) {
@@ -1514,15 +1552,22 @@ func (s *CoreManagerService) RestartCore() (err error) {
 		return lockErr
 	}
 	defer func() { _ = lifecycleLock.Release() }()
+	finishTrafficMutation := BeginRuntimeTrafficMutation()
+	defer finishTrafficMutation()
 
 	s.mu.Lock()
+	invalidateManagedCoreProcessRuntimeCache()
 	defer func() {
 		if err == nil {
 			SyncPortForwardNftablesAfterCoreRuntimeReady()
 			notifyCertificateCoreLoadedLatestConfig(certificateCoreKindSingbox)
+			InvalidateDashboardRuntimeCache()
 		}
 	}()
 	defer s.mu.Unlock()
+	if flushErr := FlushTrafficRuntimeJournal(); flushErr != nil {
+		return fmt.Errorf("重启 sing-box 前刷新流量账本失败: %w", flushErr)
+	}
 
 	if err := EnsureManagedCoreLayout(); err != nil {
 		return err
@@ -1740,6 +1785,7 @@ func (s *CoreManagerService) startCoreWindows(coreDir string) error {
 		if s.coreCmd == startedCmd {
 			s.isStarted = false
 			s.coreCmd = nil
+			DiscardMaterializedManagedRuntimeCoreFile(s.getConfigPath())
 			closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
 			s.stdout = nil
 			s.stderr = nil
@@ -1847,6 +1893,7 @@ func (s *CoreManagerService) startCoreDirectLinux(coreDir string) error {
 		if s.coreCmd == startedCmd {
 			s.isStarted = false
 			s.coreCmd = nil
+			DiscardMaterializedManagedRuntimeCoreFile(s.getConfigPath())
 			closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
 			s.stdout = nil
 			s.stderr = nil
@@ -2139,33 +2186,16 @@ func normalizeCoreAutoCheckIntervalHours(raw string) int {
 }
 
 func (s *CoreManagerService) getCoreAutoCheckSettings() (enabled bool, intervalHours int, lastCheckedAt int64, err error) {
-	settingSvc := &SettingService{}
+	schedule, err := loadCoreAutoCheckSchedule(&SettingService{}, singboxCoreAutoCheckSettingKeys)
+	return schedule.Enabled, schedule.IntervalHours, schedule.LastCheckedAt, err
+}
 
-	enabled, err = settingSvc.getBool(coreAutoCheckEnabledKey)
-	if err != nil {
-		return false, 12, 0, err
-	}
-
-	intervalRaw, err := settingSvc.getString(coreAutoCheckIntervalHoursKey)
-	if err != nil {
-		return false, 12, 0, err
-	}
-	intervalHours = normalizeCoreAutoCheckIntervalHours(intervalRaw)
-
-	lastRaw, err := settingSvc.getString(coreAutoCheckLastAtKey)
-	if err != nil {
-		return false, 12, 0, err
-	}
-	lastRaw = strings.TrimSpace(lastRaw)
-	if lastRaw == "" {
-		return enabled, intervalHours, 0, nil
-	}
-
-	lastCheckedAt, parseErr := strconv.ParseInt(lastRaw, 10, 64)
-	if parseErr != nil || lastCheckedAt < 0 {
-		lastCheckedAt = 0
-	}
-	return enabled, intervalHours, lastCheckedAt, nil
+var singboxCoreAutoCheckSettingKeys = coreAutoCheckSettingKeys{
+	enabled:            coreAutoCheckEnabledKey,
+	intervalHours:      coreAutoCheckIntervalHoursKey,
+	lastCheckedAt:      coreAutoCheckLastAtKey,
+	firstCheckAt:       coreAutoCheckFirstAtKey,
+	firstCheckTimeZone: coreAutoCheckFirstTimeZoneKey,
 }
 
 func (s *CoreManagerService) buildSingboxCoreUpdateInfo() (*SingboxCoreUpdateInfo, error) {
@@ -2237,55 +2267,102 @@ func (s *CoreManagerService) buildSingboxCoreUpdateInfo() (*SingboxCoreUpdateInf
 	return info, nil
 }
 
-// SetCoreAutoCheckSettings updates auto-check switch and check interval (hours).
+// SetCoreAutoCheckSettings preserves compatibility with the historical combined request.
 func (s *CoreManagerService) SetCoreAutoCheckSettings(enabled bool, intervalHours int, hasAutoUpdate bool, autoUpdateEnabled bool) error {
-	if intervalHours <= 0 {
-		intervalHours = 12
+	if err := s.SetCoreAutoCheckEnabled(enabled); err != nil {
+		return err
 	}
+	if err := s.SetCoreAutoCheckInterval(intervalHours); err != nil {
+		return err
+	}
+	if hasAutoUpdate && enabled {
+		return s.SetCoreAutoUpdateEnabled(autoUpdateEnabled)
+	}
+	return nil
+}
 
+func (s *CoreManagerService) SetCoreAutoCheckEnabled(enabled bool) error {
 	coreAutoCheckMu.Lock()
 	defer coreAutoCheckMu.Unlock()
 
 	settingSvc := &SettingService{}
-	prevAutoUpdateEnabled, err := settingSvc.getBool(coreAutoUpdateEnabledKey)
+	current, err := settingSvc.getBool(coreAutoCheckEnabledKey)
 	if err != nil {
 		return err
 	}
 	if err := settingSvc.setString(coreAutoCheckEnabledKey, strconv.FormatBool(enabled)); err != nil {
 		return err
 	}
-	if err := settingSvc.setString(coreAutoCheckIntervalHoursKey, strconv.Itoa(intervalHours)); err != nil {
+	if enabled && !current {
+		return scheduleCoreAutoCheckFirstRunLocked(settingSvc, singboxCoreAutoCheckSettingKeys)
+	}
+	if enabled {
+		return nil
+	}
+	if err := s.setCoreAutoUpdateEnabledLocked(settingSvc, false); err != nil {
 		return err
 	}
-	if hasAutoUpdate {
-		if autoUpdateEnabled && !prevAutoUpdateEnabled {
-			status, err := s.GetCoreStatus()
-			if err != nil {
-				return err
-			}
-			if reason := singboxAutoUpdateReadinessReason(status); reason != "" {
-				return fmt.Errorf("%s", reason)
-			}
-		}
-		if err := s.setCoreAutoUpdateEnabledLocked(settingSvc, autoUpdateEnabled); err != nil {
+	if err := clearCoreAutoCheckFirstRunLocked(settingSvc, singboxCoreAutoCheckSettingKeys); err != nil {
+		return err
+	}
+	if err := settingSvc.setString(coreAutoCheckPendingStableKey, ""); err != nil {
+		return err
+	}
+	return settingSvc.setString(coreAutoCheckPendingAlphaKey, "")
+}
+
+func (s *CoreManagerService) SetCoreAutoCheckInterval(intervalHours int) error {
+	if intervalHours <= 0 {
+		return fmt.Errorf("检查间隔必须是正整数小时")
+	}
+	coreAutoCheckMu.Lock()
+	defer coreAutoCheckMu.Unlock()
+	return (&SettingService{}).setString(coreAutoCheckIntervalHoursKey, strconv.Itoa(intervalHours))
+}
+
+func (s *CoreManagerService) ReschedulePendingCoreAutoCheckForPanelTimeZone() error {
+	coreAutoCheckMu.Lock()
+	defer coreAutoCheckMu.Unlock()
+
+	settingSvc := &SettingService{}
+	schedule, err := loadCoreAutoCheckSchedule(settingSvc, singboxCoreAutoCheckSettingKeys)
+	if err != nil || !schedule.Enabled || schedule.FirstCheckAt == 0 {
+		return err
+	}
+	return scheduleCoreAutoCheckFirstRunLocked(settingSvc, singboxCoreAutoCheckSettingKeys)
+}
+
+func (s *CoreManagerService) SetCoreAutoUpdateEnabled(enabled bool) error {
+	coreAutoCheckMu.Lock()
+	defer coreAutoCheckMu.Unlock()
+
+	settingSvc := &SettingService{}
+	autoCheckEnabled, err := settingSvc.getBool(coreAutoCheckEnabledKey)
+	if err != nil {
+		return err
+	}
+	if enabled && !autoCheckEnabled {
+		return fmt.Errorf("请先启用自动更新检查")
+	}
+	previouslyEnabled, err := settingSvc.getBool(coreAutoUpdateEnabledKey)
+	if err != nil {
+		return err
+	}
+	if enabled && !previouslyEnabled {
+		status, err := s.GetCoreStatus()
+		if err != nil {
 			return err
 		}
-		if autoUpdateEnabled {
-			if err := s.clearCoreAutoUpdateDisableReasonLocked(settingSvc); err != nil {
-				return err
-			}
+		if reason := singboxAutoUpdateReadinessReason(status); reason != "" {
+			return fmt.Errorf("%s", reason)
 		}
 	}
-
-	if !enabled {
-		if err := settingSvc.setString(coreAutoCheckPendingStableKey, ""); err != nil {
-			return err
-		}
-		if err := settingSvc.setString(coreAutoCheckPendingAlphaKey, ""); err != nil {
-			return err
-		}
+	if err := s.setCoreAutoUpdateEnabledLocked(settingSvc, enabled); err != nil {
+		return err
 	}
-
+	if enabled {
+		return s.clearCoreAutoUpdateDisableReasonLocked(settingSvc)
+	}
 	return nil
 }
 
@@ -2376,21 +2453,16 @@ func (s *CoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
 	coreAutoCheckMu.Lock()
 	defer coreAutoCheckMu.Unlock()
 
-	enabled, intervalHours, lastCheckedAt, err := s.getCoreAutoCheckSettings()
+	settingSvc := &SettingService{}
+	schedule, err := loadCoreAutoCheckSchedule(settingSvc, singboxCoreAutoCheckSettingKeys)
 	if err != nil {
 		return err
 	}
-	if !enabled {
-		return nil
+	shouldRun, err := shouldRunCoreAutoCheckLocked(settingSvc, singboxCoreAutoCheckSettingKeys, schedule, force)
+	if err != nil || !shouldRun {
+		return err
 	}
-
-	now := time.Now().Unix()
-	if !force && lastCheckedAt > 0 {
-		nextDueAt := lastCheckedAt + int64(intervalHours)*3600
-		if now < nextDueAt {
-			return nil
-		}
-	}
+	now := PanelNow().Unix()
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	latestStable, err := s.fetchLatestStableTag(client)
@@ -2399,7 +2471,6 @@ func (s *CoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
 	}
 	latestAlpha, alphaErr := s.fetchLatestAlphaTag(client)
 
-	settingSvc := &SettingService{}
 	prevStable, err := settingSvc.getString(coreAutoCheckLatestStableKey)
 	if err != nil {
 		return err
@@ -2410,6 +2481,9 @@ func (s *CoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
 	}
 
 	if err = settingSvc.setString(coreAutoCheckLastAtKey, strconv.FormatInt(now, 10)); err != nil {
+		return err
+	}
+	if err = clearCoreAutoCheckFirstRunLocked(settingSvc, singboxCoreAutoCheckSettingKeys); err != nil {
 		return err
 	}
 

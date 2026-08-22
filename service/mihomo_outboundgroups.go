@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alireza0/s-ui/database"
@@ -18,6 +19,42 @@ type MihomoOutboundGroupService struct{}
 
 const mihomoImportedClashProxyKey = "_mihomo_clash_proxy"
 
+const (
+	mihomoSubscriptionImportMaxNodes         = 512
+	mihomoSubscriptionImportMaxResponseBytes = 4 * 1024 * 1024
+	mihomoSubscriptionImportMaxNodeBytes     = 64 * 1024
+	mihomoSubscriptionImportMaxPayloadBytes  = 2 * 1024 * 1024
+)
+
+var mihomoOutboundSubscriptionImportMu sync.Mutex
+
+// ErrMihomoSubscriptionImportBusy is returned instead of waiting behind an
+// in-flight download. Keeping a SQLite transaction open while a remote
+// subscription is being fetched would block the application's single DB
+// connection and make unrelated pages appear stalled.
+var ErrMihomoSubscriptionImportBusy = fmt.Errorf("another Mihomo subscription import is already running")
+
+// CommittedMihomoSubscriptionImportError distinguishes a failed runtime-file
+// refresh from a failed import transaction. Callers must not roll the panel
+// group back when the database commit has already succeeded.
+type CommittedMihomoSubscriptionImportError struct {
+	Err error
+}
+
+func (e *CommittedMihomoSubscriptionImportError) Error() string {
+	if e == nil || e.Err == nil {
+		return "Mihomo subscription data was saved, but the runtime config refresh failed"
+	}
+	return e.Err.Error()
+}
+
+func (e *CommittedMihomoSubscriptionImportError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 type mihomoOutboundGroupReorderRequest struct {
 	IDs []uint `json:"ids"`
 }
@@ -27,7 +64,7 @@ func (s *MihomoOutboundGroupService) GetAll() ([]*model.MihomoOutboundGroup, err
 	if err := ensureMihomoOutboundGroupSortOrders(db); err != nil {
 		return nil, err
 	}
-	var groups []*model.MihomoOutboundGroup
+	groups := make([]*model.MihomoOutboundGroup, 0)
 	if err := db.Model(model.MihomoOutboundGroup{}).Order("sort_order ASC").Order("id ASC").Find(&groups).Error; err != nil {
 		return nil, err
 	}
@@ -155,16 +192,44 @@ func (s *MihomoOutboundGroupService) reorder(tx *gorm.DB, ids []uint) error {
 }
 
 func (s *MihomoOutboundGroupService) Save(tx *gorm.DB, act string, data json.RawMessage) error {
+	_, err := s.SaveWithRuntimeImpact(tx, act, data)
+	return err
+}
+
+// SaveWithRuntimeImpact reports whether this group mutation changes the
+// generated Mihomo runtime. Group metadata and order are panel-only data.
+func (s *MihomoOutboundGroupService) SaveWithRuntimeImpact(tx *gorm.DB, act string, data json.RawMessage) (bool, error) {
+	// Subscription parsing intentionally keeps this lock across the remote
+	// download. Reject conflicting panel-group changes immediately instead of
+	// letting a save race with the later import transaction.
+	if !mihomoOutboundSubscriptionImportMu.TryLock() {
+		return false, ErrMihomoSubscriptionImportBusy
+	}
+	defer mihomoOutboundSubscriptionImportMu.Unlock()
+	return s.saveWithRuntimeImpactLocked(tx, act, data)
+}
+
+// saveWithRuntimeImpactLocked is used by ConfigService after it has acquired
+// the shared import lock before the Mihomo generator lock and SQLite
+// transaction. Keeping that order consistent avoids single-connection SQLite
+// lock inversions with subscription refreshes and runtime regeneration.
+func (s *MihomoOutboundGroupService) saveWithRuntimeImpactLocked(tx *gorm.DB, act string, data json.RawMessage) (bool, error) {
 	switch act {
 	case "new", "edit":
 		var group model.MihomoOutboundGroup
 		if err := json.Unmarshal(data, &group); err != nil {
-			return err
+			return false, err
 		}
 		group.Name = strings.TrimSpace(group.Name)
 		group.SubscriptionUrl = strings.TrimSpace(group.SubscriptionUrl)
 		if group.Outbounds == "" {
 			group.Outbounds = "[]"
+		}
+		if act == "new" {
+			// A copied group payload must not reuse the source group's primary key.
+			group.Id = 0
+		} else if act == "edit" && group.Id == 0 {
+			return false, fmt.Errorf("mihomo outbound group id is required for edit")
 		}
 		oldName := ""
 		if group.Id > 0 {
@@ -174,78 +239,89 @@ func (s *MihomoOutboundGroupService) Save(tx *gorm.DB, act string, data json.Raw
 				if group.SortOrder <= 0 {
 					group.SortOrder = existing.SortOrder
 				}
-			} else if !database.IsNotFound(err) {
-				return err
+			} else if act == "edit" || !database.IsNotFound(err) {
+				return false, err
 			}
 		} else if group.SortOrder <= 0 {
 			nextSortOrder, err := nextMihomoOutboundGroupSortOrder(tx)
 			if err != nil {
-				return err
+				return false, err
 			}
 			group.SortOrder = nextSortOrder
 		}
 		if err := tx.Save(&group).Error; err != nil {
-			return err
+			return false, err
 		}
 		if oldName != "" && oldName != group.Name {
-			return replaceMihomoShadowQUICJLSProxyReferences(tx, oldName, group.Name)
+			// Panel groups are not Mihomo runtime targets. Keep legacy references
+			// traceable across a rename, but do not treat this data repair as a
+			// server.yaml change.
+			if err := replaceMihomoShadowQUICJLSProxyReferences(tx, oldName, group.Name); err != nil {
+				return false, err
+			}
 		}
-		return nil
+		return false, nil
 	case "del":
 		var name string
 		if err := json.Unmarshal(data, &name); err != nil {
-			return err
+			return false, err
 		}
 		name = strings.TrimSpace(name)
 		if name == "" {
-			return fmt.Errorf("group name is required")
+			return false, fmt.Errorf("group name is required")
 		}
 
 		var group model.MihomoOutboundGroup
 		if err := tx.Where("name = ?", name).First(&group).Error; err != nil {
-			return err
+			return false, err
 		}
 
 		tags := parseOutboundGroupTags(group.Outbounds)
-		targets := append([]string{name}, tags...)
-		inboundTags, err := findMihomoShadowQUICJLSProxyInboundTags(tx, targets...)
-		if err != nil {
-			return err
-		}
-		if len(inboundTags) > 0 {
-			return common.NewErrorf("cannot delete mihomo outbound group %q: referenced by shadowquic inbound(s): %s", name, strings.Join(inboundTags, ", "))
+		if err := validateMihomoOutboundRemovalReferences(tx, tags, []string{name}, append(append([]string{}, tags...), name)); err != nil {
+			return false, err
 		}
 		if len(tags) > 0 {
 			if err := tx.Where("tag IN ?", tags).Delete(&model.MihomoOutbound{}).Error; err != nil {
-				return err
+				return false, err
 			}
 		}
 
-		return tx.Where("name = ?", name).Delete(model.MihomoOutboundGroup{}).Error
+		if err := tx.Where("name = ?", name).Delete(model.MihomoOutboundGroup{}).Error; err != nil {
+			return false, err
+		}
+		return len(tags) > 0, nil
 	case "reorder":
 		var request mihomoOutboundGroupReorderRequest
 		if err := json.Unmarshal(data, &request); err != nil {
-			return err
+			return false, err
 		}
-		return s.reorder(tx, request.IDs)
+		return false, s.reorder(tx, request.IDs)
 	default:
-		return common.NewErrorf("unknown action: %s", act)
+		return false, common.NewErrorf("unknown action: %s", act)
 	}
 }
 
 func (s *MihomoOutboundGroupService) FetchAndSaveSubscription(groupName string, url string, allowInsecure bool) error {
+	if !mihomoOutboundSubscriptionImportMu.TryLock() {
+		return ErrMihomoSubscriptionImportBusy
+	}
+	defer mihomoOutboundSubscriptionImportMu.Unlock()
+
 	groupName = strings.TrimSpace(groupName)
 	url = strings.TrimSpace(url)
 	if groupName == "" || url == "" {
 		return fmt.Errorf("group_name and url are required")
 	}
 
-	clashData, err := fetchSubscriptionJSON(url, allowInsecure)
+	clashData, err := fetchSubscriptionJSONWithTimeoutAndLimit(url, allowInsecure, 30*time.Second, mihomoSubscriptionImportMaxResponseBytes)
 	if err != nil {
 		return err
 	}
 	proxies, err := extractClashProxiesRaw(clashData)
 	if err != nil {
+		return err
+	}
+	if err := validateMihomoImportedSubscriptionSize(proxies, nil); err != nil {
 		return err
 	}
 	rawByTag, err := extractClashProxyRawYAMLByName(clashData)
@@ -256,44 +332,24 @@ func (s *MihomoOutboundGroupService) FetchAndSaveSubscription(groupName string, 
 	if len(outbounds) == 0 {
 		return fmt.Errorf("subscription has no valid mihomo outbounds")
 	}
+	if err := validateMihomoImportedSubscriptionSize(outbounds, rawByTag); err != nil {
+		return err
+	}
 
 	db := database.GetDB()
-	var group model.MihomoOutboundGroup
-	if err := db.Where("name = ?", groupName).First(&group).Error; err != nil {
+	if err := s.applyImportedSubscription(db, groupName, url, allowInsecure, outbounds, rawByTag, true); err != nil {
 		return err
 	}
 
-	savedTags := make([]string, 0, len(outbounds))
-	for _, outbound := range outbounds {
-		tag, _ := outbound["tag"].(string)
-		if strings.TrimSpace(tag) == "" {
-			continue
-		}
-		if err := upsertImportedMihomoOutbound(db, outbound, nil, rawByTag[tag]); err != nil {
-			logger.Errorf("[MihomoOutboundGroup] save outbound failed [%s]: %v", tag, err)
-			continue
-		}
-		savedTags = append(savedTags, tag)
-	}
-
-	if len(savedTags) == 0 {
-		return fmt.Errorf("no valid mihomo outbounds were saved")
-	}
-
-	tagsJSON, _ := json.Marshal(savedTags)
-	if err := db.Model(&model.MihomoOutboundGroup{}).Where("name = ?", groupName).Updates(map[string]interface{}{
-		"outbounds":        string(tagsJSON),
-		"subscription_url": url,
-		"allow_insecure":   allowInsecure,
-	}).Error; err != nil {
-		return err
-	}
-
-	s.notifyOutboundsChanged()
-	return nil
+	return s.notifyOutboundsChanged()
 }
 
 func (s *MihomoOutboundGroupService) RefreshSubscription(groupName string, url string, allowInsecure bool) (*SubscriptionRefreshResult, error) {
+	if !mihomoOutboundSubscriptionImportMu.TryLock() {
+		return nil, ErrMihomoSubscriptionImportBusy
+	}
+	defer mihomoOutboundSubscriptionImportMu.Unlock()
+
 	result := &SubscriptionRefreshResult{
 		Added:   []string{},
 		Removed: []string{},
@@ -306,18 +362,15 @@ func (s *MihomoOutboundGroupService) RefreshSubscription(groupName string, url s
 		return nil, fmt.Errorf("group_name and url are required")
 	}
 
-	dbConn := database.GetDB()
-	var group model.MihomoOutboundGroup
-	if err := dbConn.Where("name = ?", groupName).First(&group).Error; err != nil {
-		return nil, err
-	}
-
-	clashData, err := fetchSubscriptionJSON(url, allowInsecure)
+	clashData, err := fetchSubscriptionJSONWithTimeoutAndLimit(url, allowInsecure, 30*time.Second, mihomoSubscriptionImportMaxResponseBytes)
 	if err != nil {
 		return nil, err
 	}
 	proxies, err := extractClashProxiesRaw(clashData)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateMihomoImportedSubscriptionSize(proxies, nil); err != nil {
 		return nil, err
 	}
 	rawByTag, err := extractClashProxyRawYAMLByName(clashData)
@@ -327,6 +380,15 @@ func (s *MihomoOutboundGroupService) RefreshSubscription(groupName string, url s
 	newOutbounds := buildMihomoImportedOutbounds(proxies)
 	if len(newOutbounds) == 0 {
 		return nil, fmt.Errorf("subscription has no valid mihomo outbounds")
+	}
+	if err := validateMihomoImportedSubscriptionSize(newOutbounds, rawByTag); err != nil {
+		return nil, err
+	}
+
+	dbConn := database.GetDB()
+	var group model.MihomoOutboundGroup
+	if err := dbConn.Where("name = ?", groupName).First(&group).Error; err != nil {
+		return nil, err
 	}
 
 	oldOutbounds, err := loadGroupedMihomoOutbounds(dbConn, parseOutboundGroupTags(group.Outbounds))
@@ -368,50 +430,190 @@ func (s *MihomoOutboundGroupService) RefreshSubscription(groupName string, url s
 		}
 	}
 
-	if len(result.Removed) > 0 {
-		inboundTags, err := findMihomoShadowQUICJLSProxyInboundTags(dbConn, result.Removed...)
-		if err != nil {
-			return nil, err
+	if err := s.applyImportedSubscription(dbConn, groupName, url, allowInsecure, newOutbounds, rawByTag, true); err != nil {
+		return nil, err
+	}
+
+	if err := s.notifyOutboundsChanged(); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func (s *MihomoOutboundGroupService) notifyOutboundsChanged() error {
+	markMihomoLastUpdate(time.Now().Unix())
+	if err := NewMihomoManagerService().RegenerateServerConfig(); err != nil {
+		logger.Warning("[MihomoOutboundGroup] regenerate mihomo server config failed: ", err)
+		return &CommittedMihomoSubscriptionImportError{Err: err}
+	}
+	return nil
+}
+
+func (s *MihomoOutboundGroupService) applyImportedSubscription(db *gorm.DB, groupName string, url string, allowInsecure bool, outbounds []map[string]interface{}, rawByTag map[string][]byte, replaceExisting bool) error {
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if tx.Error != nil {
+			tx.Rollback()
 		}
-		if len(inboundTags) > 0 {
-			return nil, common.NewErrorf("cannot refresh mihomo outbound group %q: removed outbound(s) are referenced by shadowquic inbound(s): %s", groupName, strings.Join(inboundTags, ", "))
+	}()
+
+	var group model.MihomoOutboundGroup
+	if err := tx.Where("name = ?", groupName).First(&group).Error; err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	newTags := mihomoImportedOutboundTags(outbounds)
+	if len(newTags) == 0 {
+		tx.Rollback()
+		return fmt.Errorf("subscription has no valid mihomo outbounds")
+	}
+	oldTags := parseOutboundGroupTags(group.Outbounds)
+	if err := validateMihomoImportedTagOwnership(tx, group, newTags); err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	removedTags := []string{}
+	if replaceExisting {
+		newTagSet := normalizedMihomoReferenceSet(newTags)
+		for _, tag := range oldTags {
+			if _, kept := newTagSet[tag]; !kept {
+				removedTags = append(removedTags, tag)
+			}
 		}
-		if err := dbConn.Where("tag IN ?", result.Removed).Delete(&model.MihomoOutbound{}).Error; err != nil {
-			return nil, err
+		if err := validateMihomoOutboundRemovalReferences(tx, removedTags, []string{group.Name}, removedTags); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if len(removedTags) > 0 {
+			if err := tx.Where("tag IN ?", removedTags).Delete(&model.MihomoOutbound{}).Error; err != nil {
+				tx.Rollback()
+				return err
+			}
 		}
 	}
 
-	savedTags := make([]string, 0, len(newOutbounds))
-	for _, outbound := range newOutbounds {
-		tag, _ := outbound["tag"].(string)
-		if strings.TrimSpace(tag) == "" {
-			continue
+	for _, outbound := range outbounds {
+		tag := strings.TrimSpace(firstString(outbound["tag"]))
+		if err := upsertImportedMihomoOutbound(tx, outbound, nil, rawByTag[tag]); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("save imported mihomo outbound %q: %w", tag, err)
 		}
-		if err := upsertImportedMihomoOutbound(dbConn, outbound, nil, rawByTag[tag]); err != nil {
-			logger.Errorf("[MihomoOutboundGroup] refresh save outbound failed [%s]: %v", tag, err)
-			continue
-		}
-		savedTags = append(savedTags, tag)
 	}
 
-	tagsJSON, _ := json.Marshal(savedTags)
-	if err := dbConn.Model(&model.MihomoOutboundGroup{}).Where("name = ?", groupName).Updates(map[string]interface{}{
+	tagsJSON, err := json.Marshal(newTags)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	if err := tx.Model(&model.MihomoOutboundGroup{}).Where("id = ?", group.Id).Updates(map[string]interface{}{
 		"outbounds":        string(tagsJSON),
 		"subscription_url": url,
 		"allow_insecure":   allowInsecure,
 	}).Error; err != nil {
-		return nil, err
+		tx.Rollback()
+		return err
 	}
 
-	s.notifyOutboundsChanged()
-	return result, nil
+	if err := NewMihomoManagerService().ValidateServerConfig(tx); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("invalid Mihomo runtime config after subscription import: %w", err)
+	}
+	if err := tx.Commit().Error; err != nil {
+		return err
+	}
+	return nil
 }
 
-func (s *MihomoOutboundGroupService) notifyOutboundsChanged() {
-	markLastUpdate(time.Now().Unix())
-	if err := NewMihomoManagerService().RegenerateServerConfig(); err != nil {
-		logger.Warning("[MihomoOutboundGroup] regenerate mihomo server config failed: ", err)
+func validateMihomoImportedSubscriptionSize(outbounds []map[string]interface{}, rawByTag map[string][]byte) error {
+	if len(outbounds) > mihomoSubscriptionImportMaxNodes {
+		return fmt.Errorf("Clash subscription contains more than %d valid nodes", mihomoSubscriptionImportMaxNodes)
 	}
+
+	totalBytes := 0
+	for _, outbound := range outbounds {
+		if outbound == nil {
+			continue
+		}
+		tag := strings.TrimSpace(firstString(outbound["tag"]))
+		if tag == "" {
+			tag = strings.TrimSpace(firstString(outbound["name"]))
+		}
+		encoded, err := json.Marshal(outbound)
+		if err != nil {
+			return err
+		}
+		entryBytes := len(encoded) + len(rawByTag[tag])
+		if entryBytes > mihomoSubscriptionImportMaxNodeBytes {
+			return fmt.Errorf("Clash subscription node %q exceeds the %d KiB safety limit", tag, mihomoSubscriptionImportMaxNodeBytes/1024)
+		}
+		totalBytes += entryBytes
+		if totalBytes > mihomoSubscriptionImportMaxPayloadBytes {
+			return fmt.Errorf("Clash subscription nodes exceed the %d MiB safety limit", mihomoSubscriptionImportMaxPayloadBytes/(1024*1024))
+		}
+	}
+	return nil
+}
+
+func mihomoImportedOutboundTags(outbounds []map[string]interface{}) []string {
+	tags := make([]string, 0, len(outbounds))
+	seen := make(map[string]struct{}, len(outbounds))
+	for _, outbound := range outbounds {
+		tag := strings.TrimSpace(firstString(outbound["tag"]))
+		if tag == "" {
+			continue
+		}
+		if _, exists := seen[tag]; exists {
+			continue
+		}
+		seen[tag] = struct{}{}
+		tags = append(tags, tag)
+	}
+	return tags
+}
+
+func validateMihomoImportedTagOwnership(tx *gorm.DB, group model.MihomoOutboundGroup, tags []string) error {
+	owned := normalizedMihomoReferenceSet(parseOutboundGroupTags(group.Outbounds))
+	if len(tags) == 0 {
+		return nil
+	}
+
+	var existing []model.MihomoOutbound
+	if err := tx.Model(&model.MihomoOutbound{}).Select("tag").Where("tag IN ?", tags).Find(&existing).Error; err != nil {
+		return err
+	}
+	conflicts := make([]string, 0)
+	for _, outbound := range existing {
+		if _, allowed := owned[strings.TrimSpace(outbound.Tag)]; !allowed {
+			conflicts = append(conflicts, strings.TrimSpace(outbound.Tag))
+		}
+	}
+
+	if len(conflicts) == 0 {
+		candidateTags := normalizedMihomoReferenceSet(tags)
+		var groups []model.MihomoOutboundGroup
+		if err := tx.Model(&model.MihomoOutboundGroup{}).Select("id", "name", "outbounds").Find(&groups).Error; err != nil {
+			return err
+		}
+		for _, otherGroup := range groups {
+			if otherGroup.Id == group.Id {
+				continue
+			}
+			for _, tag := range parseOutboundGroupTags(otherGroup.Outbounds) {
+				if _, found := candidateTags[tag]; found {
+					conflicts = append(conflicts, fmt.Sprintf("%s (group %s)", tag, otherGroup.Name))
+				}
+			}
+		}
+	}
+	if len(conflicts) == 0 {
+		return nil
+	}
+	return fmt.Errorf("subscription contains outbound tag(s) already owned outside group %q: %s", group.Name, strings.Join(conflicts, ", "))
 }
 
 func buildMihomoImportedOutbounds(proxies []map[string]interface{}) []map[string]interface{} {

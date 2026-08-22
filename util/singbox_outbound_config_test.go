@@ -86,6 +86,38 @@ func TestSanitizeSingboxSubscriptionOutboundRemovesPanelFields(t *testing.T) {
 	}
 }
 
+func TestSanitizeSingboxSubscriptionOutboundPromotesHysteria2ReceiveWindows(t *testing.T) {
+	outbound := map[string]interface{}{
+		"type": "hysteria2",
+		"mihomo_hy2": map[string]interface{}{
+			"initial_stream_receive_window":     38000000,
+			"max_stream_receive_window":         70000000,
+			"initial_connection_receive_window": 120000000,
+			"max_connection_receive_window":     150000000,
+		},
+		"mihomo_fast_open": true,
+	}
+
+	SanitizeSingboxSubscriptionOutbound(outbound)
+
+	for key, want := range map[string]interface{}{
+		"initial_stream_receive_window":     38000000,
+		"max_stream_receive_window":         70000000,
+		"initial_connection_receive_window": 120000000,
+		"max_connection_receive_window":     150000000,
+	} {
+		if got := outbound[key]; got != want {
+			t.Fatalf("%s = %#v, want %#v", key, got, want)
+		}
+	}
+	if _, exists := outbound["mihomo_hy2"]; exists {
+		t.Fatalf("mihomo_hy2 wrapper survived sing-box sanitization: %#v", outbound)
+	}
+	if _, exists := outbound["mihomo_fast_open"]; exists {
+		t.Fatalf("mihomo_fast_open survived sing-box sanitization: %#v", outbound)
+	}
+}
+
 func TestSubscriptionClientConfigUsernamePrefersCanonicalValue(t *testing.T) {
 	if got := SubscriptionClientConfigUsername(map[string]interface{}{"name": "legacy"}); got != "legacy" {
 		t.Fatalf("legacy name fallback = %q, want legacy", got)

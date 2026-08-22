@@ -84,14 +84,27 @@ func pureJsonMsg(c *gin.Context, success bool, msg string) {
 }
 
 func checkLogin(c *gin.Context) {
-	if !IsLogin(c) {
-		if c.GetHeader("X-Requested-With") == "XMLHttpRequest" {
-			pureJsonMsg(c, false, "Invalid login")
-		} else {
-			c.Redirect(http.StatusTemporaryRedirect, "/login")
-		}
-		c.Abort()
-	} else {
+	validation := validateLoginSession(c)
+	if validation.valid() {
+		c.Set(loginUserContextKey, validation.userName)
 		c.Next()
+		return
 	}
+	if loginSessionReasonIsTransient(validation.reason) {
+		logger.Warningf("login session temporarily unavailable: reason=%s remote=%s error=%v", validation.reason, getRemoteIp(c), validation.err)
+		c.JSON(http.StatusServiceUnavailable, Msg{
+			Success: false,
+			Msg:     "Session temporarily unavailable",
+			Obj:     map[string]string{"reason": validation.reason},
+		})
+		c.Abort()
+		return
+	}
+	clearSessionCookie(c)
+	if c.GetHeader("X-Requested-With") == "XMLHttpRequest" {
+		pureJsonMsg(c, false, "Invalid login")
+	} else {
+		c.Redirect(http.StatusTemporaryRedirect, "/login")
+	}
+	c.Abort()
 }

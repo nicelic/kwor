@@ -86,6 +86,322 @@ func TestShadowQUICInboundSanitizerKeepsOnlyOfficialFields(t *testing.T) {
 	}
 }
 
+func TestShadowQUICInboundSaveOmitsEmptyOptionalFields(t *testing.T) {
+	db := setupMihomoSyncTestDB(t, "shadowquic-inbound-empty-options.db")
+	payload := mustJSONRaw(t, map[string]interface{}{
+		"type":        "shadowquic",
+		"tag":         "sq-empty-options",
+		"listen":      "0.0.0.0",
+		"listen_port": 10822,
+		"jls_upstream": map[string]interface{}{
+			"addr":       "www.example.com:443",
+			"sni":        "",
+			"rate_limit": "",
+		},
+		"alpn":                    []string{},
+		"quic_versions":           []string{},
+		"congestion_controller":   "",
+		"up":                      "",
+		"down":                    "",
+		"cwnd":                    "",
+		"bbr_profile":             "",
+		"max_idle_time":           "",
+		"max_datagram_frame_size": "",
+		"recv_window_conn":        "",
+		"recv_window":             "",
+	})
+
+	tx := db.Begin()
+	if tx.Error != nil {
+		t.Fatalf("begin ShadowQUIC save transaction failed: %v", tx.Error)
+	}
+	if _, err := (&MihomoInboundService{}).Save(tx, "new", payload, "", "panel.example.com"); err != nil {
+		tx.Rollback()
+		t.Fatalf("save ShadowQUIC inbound with empty optional fields failed: %v", err)
+	}
+	if err := tx.Commit().Error; err != nil {
+		t.Fatalf("commit ShadowQUIC save failed: %v", err)
+	}
+
+	var stored model.MihomoInbound
+	if err := db.Where("tag = ?", "sq-empty-options").First(&stored).Error; err != nil {
+		t.Fatalf("reload saved ShadowQUIC inbound failed: %v", err)
+	}
+	options := map[string]interface{}{}
+	if err := json.Unmarshal(stored.Options, &options); err != nil {
+		t.Fatalf("decode saved ShadowQUIC options failed: %v", err)
+	}
+	for _, key := range []string{
+		"alpn", "quic_versions", "congestion_controller", "up", "down", "cwnd",
+		"bbr_profile", "max_idle_time", "max_datagram_frame_size", "recv_window_conn", "recv_window",
+	} {
+		if _, exists := options[key]; exists {
+			t.Fatalf("empty optional field %s must not be stored: %#v", key, options)
+		}
+	}
+	upstream, ok := options["jls_upstream"].(map[string]interface{})
+	if !ok || upstream["sni"] != "www.example.com" {
+		t.Fatalf("expected addr-derived required SNI, got %#v", options["jls_upstream"])
+	}
+	if _, exists := upstream["rate_limit"]; exists {
+		t.Fatalf("empty JLS rate-limit must not be stored: %#v", upstream)
+	}
+	template := map[string]interface{}{}
+	if err := json.Unmarshal(stored.OutJson, &template); err != nil {
+		t.Fatalf("decode saved ShadowQUIC client template failed: %v", err)
+	}
+	if template["sni"] != "www.example.com" {
+		t.Fatalf("expected addr-derived SNI in client template, got %#v", template)
+	}
+	for _, key := range []string{
+		"alpn", "quic_versions", "zero_rtt", "congestion_controller", "cwnd", "bbr_profile",
+		"max_datagram_frame_size", "recv_window_conn", "recv_window", "disable_mtu_discovery",
+	} {
+		if _, exists := template[key]; exists {
+			t.Fatalf("empty optional field %s must not enter client template: %#v", key, template)
+		}
+	}
+
+	document, err := NewMihomoManagerService().GenerateServerDocument()
+	if err != nil {
+		t.Fatalf("generate ShadowQUIC server document failed: %v", err)
+	}
+	listener := findMihomoListenerByTag(document, stored.Tag)
+	if listener == nil {
+		t.Fatalf("ShadowQUIC listener %q was not generated", stored.Tag)
+	}
+	for _, key := range []string{
+		"alpn", "quic-versions", "congestion-controller", "up", "down", "cwnd",
+		"bbr-profile", "max-idle-time", "max-datagram-frame-size", "recv-window-conn", "recv-window",
+	} {
+		if _, exists := listener[key]; exists {
+			t.Fatalf("empty optional field %s must not be generated: %#v", key, listener)
+		}
+	}
+}
+
+func TestShadowQUICInboundSaveRoundTripPreservesALPN(t *testing.T) {
+	db := setupMihomoSyncTestDB(t, "shadowquic-inbound-alpn-roundtrip.db")
+	payload := mustJSONRaw(t, map[string]interface{}{
+		"type":        "shadowquic",
+		"tag":         "sq-alpn-roundtrip",
+		"listen":      "::",
+		"listen_port": 10443,
+		"jls_upstream": map[string]interface{}{
+			"addr": "upstream.example.com:443",
+			"sni":  "cdn.example.com",
+		},
+		"alpn":                    []string{"h3", "h2"},
+		"quic_versions":           []string{"v2", "v1"},
+		"zero_rtt":                true,
+		"max_datagram_frame_size": 1400,
+	})
+
+	tx := db.Begin()
+	if tx.Error != nil {
+		t.Fatalf("begin ShadowQUIC save transaction failed: %v", tx.Error)
+	}
+	if _, err := (&MihomoInboundService{}).Save(tx, "new", payload, "", "panel.example.com"); err != nil {
+		tx.Rollback()
+		t.Fatalf("save ShadowQUIC inbound failed: %v", err)
+	}
+	if err := tx.Commit().Error; err != nil {
+		t.Fatalf("commit ShadowQUIC inbound save failed: %v", err)
+	}
+
+	var stored model.MihomoInbound
+	if err := db.Where("tag = ?", "sq-alpn-roundtrip").First(&stored).Error; err != nil {
+		t.Fatalf("reload saved ShadowQUIC inbound failed: %v", err)
+	}
+	storedOptions := map[string]interface{}{}
+	if err := json.Unmarshal(stored.Options, &storedOptions); err != nil {
+		t.Fatalf("decode saved ShadowQUIC options failed: %v", err)
+	}
+	if got := fmt.Sprint(storedOptions["alpn"]); got != "[h3 h2]" {
+		t.Fatalf("saved ShadowQUIC alpn was lost: %#v", storedOptions)
+	}
+
+	views, err := (&MihomoInboundService{}).Get(fmt.Sprint(stored.Id))
+	if err != nil || views == nil || len(*views) != 1 {
+		t.Fatalf("read saved ShadowQUIC inbound failed: views=%#v err=%v", views, err)
+	}
+	if got := fmt.Sprint((*views)[0]["alpn"]); got != "[h3 h2]" {
+		t.Fatalf("ShadowQUIC alpn was not returned to the editor: %#v", (*views)[0])
+	}
+
+	clientTemplate := map[string]interface{}{}
+	if err := json.Unmarshal(stored.OutJson, &clientTemplate); err != nil {
+		t.Fatalf("decode saved ShadowQUIC client template failed: %v", err)
+	}
+	if got := fmt.Sprint(clientTemplate["alpn"]); got != "[h3 h2]" {
+		t.Fatalf("ShadowQUIC alpn was not copied to the client template: %#v", clientTemplate)
+	}
+
+	document, err := NewMihomoManagerService().GenerateServerDocument()
+	if err != nil {
+		t.Fatalf("generate ShadowQUIC server document failed: %v", err)
+	}
+	listener := findMihomoListenerByTag(document, stored.Tag)
+	if listener == nil || fmt.Sprint(listener["alpn"]) != "[h3 h2]" {
+		t.Fatalf("ShadowQUIC alpn was not rendered to the listener: %#v", listener)
+	}
+}
+
+func TestShadowQUICInboundSanitizerAddsDefaultPortAndSNI(t *testing.T) {
+	inbound := model.MihomoInbound{Type: "shadowquic", Options: json.RawMessage(`{"jls_upstream":{"addr":"[2001:db8::1]"}}`)}
+	if err := sanitizeMihomoShadowQUICInboundOptions(&inbound); err != nil {
+		t.Fatalf("sanitize failed: %v", err)
+	}
+	var options map[string]interface{}
+	if err := json.Unmarshal(inbound.Options, &options); err != nil {
+		t.Fatalf("decode sanitized options failed: %v", err)
+	}
+	upstream, ok := options["jls_upstream"].(map[string]interface{})
+	if !ok || upstream["addr"] != "[2001:db8::1]:443" || upstream["sni"] != "2001:db8::1" {
+		t.Fatalf("unexpected normalized upstream: %#v", options["jls_upstream"])
+	}
+}
+
+func TestShadowQUICInboundSaveRoundTripPreservesAllServerControls(t *testing.T) {
+	db := setupMihomoSyncTestDB(t, "shadowquic-inbound-control-roundtrip.db")
+	payload := mustJSONRaw(t, map[string]interface{}{
+		"type":        "shadowquic",
+		"tag":         "sq-control-roundtrip",
+		"listen":      "::",
+		"listen_port": 10443,
+		"jls_upstream": map[string]interface{}{
+			"addr":       "upstream.example.com:443",
+			"sni":        "cdn.example.com",
+			"rate_limit": 0,
+		},
+		"alpn":                    []string{"h3", "h2", "http/1.1"},
+		"quic_versions":           []string{"v2", "v1"},
+		"zero_rtt":                false,
+		"congestion_controller":   "new_reno",
+		"up":                      "100 Mbps",
+		"down":                    "200 Mbps",
+		"ignore_client_bandwidth": false,
+		"cwnd":                    0,
+		"bbr_profile":             "conservative",
+		"max_idle_time":           0,
+		"max_datagram_frame_size": 0,
+		"recv_window_conn":        0,
+		"recv_window":             0,
+		"disable_mtu_discovery":   false,
+	})
+
+	tx := db.Begin()
+	if tx.Error != nil {
+		t.Fatalf("begin ShadowQUIC save transaction failed: %v", tx.Error)
+	}
+	if _, err := (&MihomoInboundService{}).Save(tx, "new", payload, "", "panel.example.com"); err != nil {
+		tx.Rollback()
+		t.Fatalf("save ShadowQUIC inbound failed: %v", err)
+	}
+	if err := tx.Commit().Error; err != nil {
+		t.Fatalf("commit ShadowQUIC inbound save failed: %v", err)
+	}
+
+	var stored model.MihomoInbound
+	if err := db.Where("tag = ?", "sq-control-roundtrip").First(&stored).Error; err != nil {
+		t.Fatalf("reload saved ShadowQUIC inbound failed: %v", err)
+	}
+	options := map[string]interface{}{}
+	if err := json.Unmarshal(stored.Options, &options); err != nil {
+		t.Fatalf("decode saved ShadowQUIC options failed: %v", err)
+	}
+	for key, want := range map[string]interface{}{
+		"zero_rtt":                false,
+		"congestion_controller":   "new_reno",
+		"up":                      "100 Mbps",
+		"down":                    "200 Mbps",
+		"ignore_client_bandwidth": false,
+		"cwnd":                    float64(0),
+		"bbr_profile":             "conservative",
+		"max_idle_time":           float64(0),
+		"max_datagram_frame_size": float64(0),
+		"recv_window_conn":        float64(0),
+		"recv_window":             float64(0),
+		"disable_mtu_discovery":   false,
+	} {
+		if got, exists := options[key]; !exists || got != want {
+			t.Fatalf("stored option %s = %#v (exists=%v), want %#v; options=%#v", key, got, exists, want, options)
+		}
+	}
+	if got := fmt.Sprint(options["alpn"]); got != "[h3 h2 http/1.1]" {
+		t.Fatalf("stored alpn = %#v", options["alpn"])
+	}
+	if got := fmt.Sprint(options["quic_versions"]); got != "[v2 v1]" {
+		t.Fatalf("stored quic_versions = %#v", options["quic_versions"])
+	}
+	upstream, ok := options["jls_upstream"].(map[string]interface{})
+	if !ok || upstream["sni"] != "cdn.example.com" || upstream["rate_limit"] != float64(0) {
+		t.Fatalf("stored jls_upstream = %#v", options["jls_upstream"])
+	}
+
+	template := map[string]interface{}{}
+	if err := json.Unmarshal(stored.OutJson, &template); err != nil {
+		t.Fatalf("decode saved ShadowQUIC client template failed: %v", err)
+	}
+	for key, want := range map[string]interface{}{
+		"sni":                     "cdn.example.com",
+		"zero_rtt":                false,
+		"congestion_controller":   "new_reno",
+		"cwnd":                    float64(0),
+		"bbr_profile":             "conservative",
+		"max_datagram_frame_size": float64(0),
+		"recv_window_conn":        float64(0),
+		"recv_window":             float64(0),
+		"disable_mtu_discovery":   false,
+	} {
+		if got, exists := template[key]; !exists || got != want {
+			t.Fatalf("client template %s = %#v (exists=%v), want %#v; template=%#v", key, got, exists, want, template)
+		}
+	}
+	for _, key := range []string{"up", "down", "ignore_client_bandwidth", "max_idle_time", "rate_limit"} {
+		if _, exists := template[key]; exists {
+			t.Fatalf("server-only field %s leaked to client template: %#v", key, template)
+		}
+	}
+
+	document, err := NewMihomoManagerService().GenerateServerDocument()
+	if err != nil {
+		t.Fatalf("generate ShadowQUIC server document failed: %v", err)
+	}
+	listener := findMihomoListenerByTag(document, stored.Tag)
+	if listener == nil {
+		t.Fatalf("ShadowQUIC listener %q was not generated", stored.Tag)
+	}
+	for key, want := range map[string]interface{}{
+		"zero-rtt":                false,
+		"congestion-controller":   "new_reno",
+		"up":                      "100 Mbps",
+		"down":                    "200 Mbps",
+		"ignore-client-bandwidth": false,
+		"cwnd":                    0,
+		"bbr-profile":             "conservative",
+		"max-idle-time":           0,
+		"max-datagram-frame-size": 0,
+		"recv-window-conn":        0,
+		"recv-window":             0,
+		"disable-mtu-discovery":   false,
+	} {
+		if got, exists := listener[key]; !exists || got != want {
+			t.Fatalf("listener %s = %#v (exists=%v), want %#v; listener=%#v", key, got, exists, want, listener)
+		}
+	}
+	if got := fmt.Sprint(listener["alpn"]); got != "[h3 h2 http/1.1]" {
+		t.Fatalf("listener alpn = %#v", listener["alpn"])
+	}
+	if got := fmt.Sprint(listener["quic-versions"]); got != "[v2 v1]" {
+		t.Fatalf("listener quic-versions = %#v", listener["quic-versions"])
+	}
+	listenerUpstream, ok := listener["jls-upstream"].(map[string]interface{})
+	if !ok || listenerUpstream["sni"] != "cdn.example.com" || listenerUpstream["rate-limit"] != 0 {
+		t.Fatalf("listener jls-upstream = %#v", listener["jls-upstream"])
+	}
+}
+
 func TestShadowQUICJLSDirectNormalizesForStorageAndListener(t *testing.T) {
 	inbound := model.MihomoInbound{
 		Type: "shadowquic",
@@ -315,7 +631,7 @@ func TestShadowQUICSyncClientToSubManagerPersistsRawAndClashOptions(t *testing.T
 	}
 }
 
-func TestShadowQUICOutSyncsServerFieldsAndKeepsClientOnlyFields(t *testing.T) {
+func TestShadowQUICOutSyncsServerFieldsAndKeepsClientOwnedFields(t *testing.T) {
 	inbound := &model.MihomoInbound{
 		Type: "shadowquic",
 		Tag:  "sq-sync",
@@ -323,6 +639,8 @@ func TestShadowQUICOutSyncsServerFieldsAndKeepsClientOnlyFields(t *testing.T) {
           "udp_over_stream": true,
           "keep_alive_interval": 25000,
           "max_open_streams": 2048,
+          "up": "20 Mbps",
+          "down": "30 Mbps",
           "mihomo_common": {
             "udp": true,
             "ip_version": "ipv6",
@@ -381,6 +699,9 @@ func TestShadowQUICOutSyncsServerFieldsAndKeepsClientOnlyFields(t *testing.T) {
 	if template["udp_over_stream"] != true {
 		t.Fatalf("client-only udp-over-stream must be preserved: %#v", template)
 	}
+	if template["up"] != "20 Mbps" || template["down"] != "30 Mbps" {
+		t.Fatalf("client bandwidth must not be overwritten by listener bandwidth: %#v", template)
+	}
 	common, ok := template["mihomo_common"].(map[string]interface{})
 	if !ok || common["udp"] != true || common["ip_version"] != "ipv6" || common["routing_mark"] != float64(88) {
 		t.Fatalf("expected supported common fields to remain, got %#v", template["mihomo_common"])
@@ -403,7 +724,7 @@ func TestShadowQUICOutSyncsServerFieldsAndKeepsClientOnlyFields(t *testing.T) {
 	}
 	for _, key := range []string{
 		"sni", "alpn", "quic_versions", "zero_rtt", "congestion_controller",
-		"up", "down", "cwnd", "bbr_profile", "max_datagram_frame_size",
+		"cwnd", "bbr_profile", "max_datagram_frame_size",
 		"recv_window_conn", "recv_window", "disable_mtu_discovery",
 	} {
 		if _, exists := cleared[key]; exists {
@@ -412,6 +733,9 @@ func TestShadowQUICOutSyncsServerFieldsAndKeepsClientOnlyFields(t *testing.T) {
 	}
 	if cleared["udp_over_stream"] != true || cleared["keep_alive_interval"] != float64(25000) || cleared["max_open_streams"] != float64(2048) {
 		t.Fatalf("client-only fields must survive server sync: %#v", cleared)
+	}
+	if cleared["up"] != "20 Mbps" || cleared["down"] != "30 Mbps" {
+		t.Fatalf("client bandwidth must survive server option changes: %#v", cleared)
 	}
 }
 
@@ -452,6 +776,8 @@ func TestShadowQUICClientSyncRefreshesServerOwnedFields(t *testing.T) {
           "udp_over_stream":true,
           "keep_alive_interval":25000,
           "max_open_streams":2048,
+          "up":"20 Mbps",
+          "down":"30 Mbps",
           "mihomo_common":{
             "udp":true,
             "ip_version":"ipv6",
@@ -471,6 +797,8 @@ func TestShadowQUICClientSyncRefreshesServerOwnedFields(t *testing.T) {
           "quic_versions":["v2","v1"],
           "zero_rtt":true,
           "congestion_controller":"bbr",
+          "up":"100 Mbps",
+          "down":"100 Mbps",
           "max_datagram_frame_size":1400
         }`),
 	}
@@ -498,6 +826,9 @@ func TestShadowQUICClientSyncRefreshesServerOwnedFields(t *testing.T) {
 	if outbound["udp_over_stream"] != true || outbound["keep_alive_interval"] != 25000 || outbound["max_open_streams"] != 2048 {
 		t.Fatalf("client-only fields must survive subscription sync: %#v", outbound)
 	}
+	if outbound["up"] != "20 Mbps" || outbound["down"] != "30 Mbps" {
+		t.Fatalf("client bandwidth must survive subscription sync: %#v", outbound)
+	}
 	clashData, err := buildMihomoClashOptions(clashSource, inbound.Tag)
 	if err != nil {
 		t.Fatalf("buildMihomoClashOptions failed: %v", err)
@@ -511,6 +842,9 @@ func TestShadowQUICClientSyncRefreshesServerOwnedFields(t *testing.T) {
 	}
 	if got := clash["quic-versions"]; fmt.Sprint(got) != "[v2 v1]" {
 		t.Fatalf("expected Clash proxy quic versions to remain ordered, got %#v", got)
+	}
+	if clash["up"] != "20 Mbps" || clash["down"] != "30 Mbps" {
+		t.Fatalf("expected client bandwidth in Clash proxy, got %#v", clash)
 	}
 	for _, key := range []string{"tls", "proxy", "quic-version-probe"} {
 		if _, exists := clash[key]; exists {
@@ -536,6 +870,9 @@ func TestShadowQUICClientSyncRefreshesServerOwnedFields(t *testing.T) {
 	}
 	if outbound["udp_over_stream"] != true || outbound["keep_alive_interval"] != 25000 || outbound["max_open_streams"] != 2048 {
 		t.Fatalf("client-only fields must remain after clearing server options: %#v", outbound)
+	}
+	if outbound["up"] != "20 Mbps" || outbound["down"] != "30 Mbps" {
+		t.Fatalf("client bandwidth must remain after clearing server options: %#v", outbound)
 	}
 	clashData, err = buildMihomoClashOptions(clashSource, inbound.Tag)
 	if err != nil {

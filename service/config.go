@@ -2,7 +2,10 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -13,14 +16,84 @@ import (
 	"gorm.io/gorm"
 )
 
+// LastUpdate is the default-chain data revision used by sing-box pages.
+// Mihomo keeps a separate revision so an update in one independent core does
+// not force the other page to rebuild and ship a full snapshot.
 var LastUpdate int64
+var MihomoLastUpdate int64
 
-func markLastUpdate(value int64) {
-	atomic.StoreInt64(&LastUpdate, value)
+func markLastUpdate(_ int64) {
+	advanceConfigRevision(&LastUpdate)
+}
+
+func markMihomoLastUpdate(_ int64) {
+	advanceConfigRevision(&MihomoLastUpdate)
+}
+
+func markBothLastUpdates(_ int64) {
+	advanceConfigRevision(&LastUpdate)
+	advanceConfigRevision(&MihomoLastUpdate)
+}
+
+func advanceConfigRevision(revision *int64) {
+	// This is an in-memory synchronization revision, not a persisted wall-clock
+	// field. Millisecond precision plus a CAS increment prevents two saves in the
+	// same second from being invisible to browser polling.
+	now := time.Now().UnixMilli()
+	for {
+		current := atomic.LoadInt64(revision)
+		next := now
+		if next <= current {
+			next = current + 1
+		}
+		if atomic.CompareAndSwapInt64(revision, current, next) {
+			return
+		}
+	}
 }
 
 func currentLastUpdate() int64 {
 	return atomic.LoadInt64(&LastUpdate)
+}
+
+// CurrentConfigRevisionForPolling exposes the in-memory monotonic revision to
+// API snapshots without coupling callers to the internal atomic state.
+func CurrentConfigRevisionForPolling() int64 {
+	return currentLastUpdate()
+}
+
+func CurrentMihomoConfigRevisionForPolling() int64 {
+	return atomic.LoadInt64(&MihomoLastUpdate)
+}
+
+// MihomoConfigRevisionConflictError prevents a stale route or DNS draft from
+// replacing a newer Mihomo configuration saved by another page or session.
+// Mihomo's polling revision is monotonic for the running panel process and is
+// sufficient for the compact editor snapshots that own only part of config.
+type MihomoConfigRevisionConflictError struct {
+	ExpectedRevision int64
+	CurrentRevision  int64
+}
+
+func (e *MihomoConfigRevisionConflictError) Error() string {
+	if e == nil {
+		return "mihomo configuration revision conflict"
+	}
+	return fmt.Sprintf("mihomo configuration revision conflict: expected %d, current %d", e.ExpectedRevision, e.CurrentRevision)
+}
+
+func ensureMihomoConfigRevision(expected *int64) error {
+	if expected == nil {
+		return nil
+	}
+	current := CurrentMihomoConfigRevisionForPolling()
+	if *expected != current {
+		return &MihomoConfigRevisionConflictError{
+			ExpectedRevision: *expected,
+			CurrentRevision:  current,
+		}
+	}
+	return nil
 }
 
 type ConfigService struct {
@@ -48,7 +121,8 @@ type ConfigService struct {
 // allowing callers that coordinated an external reversible change to tell it
 // apart from a database rollback. The SQLite transaction has already committed.
 type CommittedSaveError struct {
-	Err error
+	Err                 error
+	RetrySingboxRuntime bool
 }
 
 func (e *CommittedSaveError) Error() string {
@@ -65,8 +139,23 @@ func (e *CommittedSaveError) Unwrap() error {
 	return e.Err
 }
 
+// regenerateCommittedSingboxRuntime is replaceable in focused tests. It is
+// deliberately separate from ConfigService.Save so retrying a post-commit
+// failure cannot run the original database mutation a second time.
+var regenerateCommittedSingboxRuntime = func(configService *ConfigService) error {
+	return GetProManagerService(configService).RegenerateCoreConfig()
+}
+
+// RetrySingboxRuntime rebuilds only the rendered sing-box runtime file after a
+// mutation has already committed. Callers must not replay the original save.
+func (s *ConfigService) RetrySingboxRuntime() error {
+	if s == nil {
+		return errors.New("config service is nil")
+	}
+	return regenerateCommittedSingboxRuntime(s)
+}
+
 type SingBoxConfig struct {
-	Log          json.RawMessage   `json:"log"`
 	Dns          json.RawMessage   `json:"dns"`
 	Ntp          json.RawMessage   `json:"ntp"`
 	Inbounds     []json.RawMessage `json:"inbounds"`
@@ -108,7 +197,6 @@ func (s *ConfigService) GetConfig(data string) (*SingBoxConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	singboxConfig.Inbounds, err = s.InboundService.GetAllConfig(database.GetDB())
 	if err != nil {
 		return nil, err
@@ -134,9 +222,29 @@ func (s *ConfigService) GetConfig(data string) (*SingBoxConfig, error) {
 
 func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initUsers string, loginUser string, hostname string) (objs []string, err error) {
 	objs = []string{obj}
+	// A Clash import holds this lock while downloading outside SQLite and then
+	// applies a short transaction. Reject concurrent Mihomo writes so an import
+	// result cannot overwrite a later save made from another tab.
+	if strings.HasPrefix(obj, "mihomo_") {
+		if !mihomoOutboundSubscriptionImportMu.TryLock() {
+			return nil, ErrMihomoSubscriptionImportBusy
+		}
+		defer mihomoOutboundSubscriptionImportMu.Unlock()
+	}
 	postCommitHooks := make([]func() error, 0)
+	defaultTLSSaveImpact := TlsSaveImpact{}
 	compactStatsAfterCommit := false
 	panelTimeLocationChanged := false
+	singboxOutboundGroupsRuntimeChanged := false
+	retrySingboxRuntime := false
+	mihomoRuntimeChanged := false
+	var mihomoRenderedServerConfig []byte
+	mihomoServerConfigLockHeld := false
+	singboxOutboundWriteLockHeld := false
+	// Mihomo group create/edit/reorder operations only change panel metadata.
+	// A group delete can remove actual outbounds, so it takes the same snapshot
+	// lock as other runtime-affecting Mihomo saves.
+	mihomoRuntimeSnapshotSave := strings.HasPrefix(obj, "mihomo_") && (obj != "mihomo_outboundgroups" || act == "del")
 	if obj == "settings" {
 		panelTimeLocationChanged, err = s.SettingService.WillChangePanelTimeLocation(data)
 		if err != nil {
@@ -148,6 +256,40 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 		if err != nil {
 			return nil, err
 		}
+	}
+	if obj == "outbounds" || obj == "outboundgroups" {
+		// Take the import lock before SQLite's only connection. A subscription
+		// refresh downloads outside the database and then applies a short
+		// transaction; this prevents a panel outbound save from racing that
+		// commit and being overwritten by the imported payload.
+		if !singboxOutboundSubscriptionImportMu.TryLock() {
+			return nil, ErrSingboxOutboundSubscriptionImportBusy
+		}
+		singboxOutboundWriteLockHeld = true
+	}
+	if mihomoRuntimeSnapshotSave {
+		// Take the generator lock before checking out SQLite's only connection.
+		// RegenerateServerConfig takes this lock before querying the database too;
+		// reversing that order can deadlock a save against a concurrent rebuild.
+		mihomoServerConfigRegenerationMu.Lock()
+		mihomoServerConfigLockHeld = true
+	}
+	defer func() {
+		if singboxOutboundWriteLockHeld {
+			singboxOutboundSubscriptionImportMu.Unlock()
+		}
+		if mihomoServerConfigLockHeld {
+			mihomoServerConfigRegenerationMu.Unlock()
+		}
+	}()
+
+	// Configuration changes can invalidate traffic baselines and nft comments.
+	// Drain the durable history tail before the mutation so the next sampler pass
+	// never replays bytes against a newly rendered inbound/client set.
+	finishTrafficMutation := BeginRuntimeTrafficMutation()
+	defer finishTrafficMutation()
+	if flushErr := FlushTrafficRuntimeJournal(); flushErr != nil {
+		return nil, fmt.Errorf("保存配置前刷新流量账本失败: %w", flushErr)
 	}
 
 	db := database.GetDB()
@@ -177,60 +319,111 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 		if panelTimeLocationChanged {
 			InvalidatePanelTimeLocationCache()
 		}
+		if obj == "settings" {
+			InvalidateSessionMaxAgeCache()
+			InvalidateTrafficAgeCache()
+			// ConfigService.Save is still used by legacy/internal settings
+			// callers. Keep subscription rendering in sync with that path too.
+			invalidateSubscriptionRuntimeSettings()
+		}
+		if obj == "tls" && defaultTLSSaveImpact.PathBindingsChanged {
+			InvalidateSubscriptionTLSPathWatchBindings()
+		}
+		if obj == "mihomo_tls" {
+			InvalidateSubscriptionTLSPathWatchBindings()
+		}
 
-		markLastUpdate(time.Now().Unix())
 		managedRuntimeErr := RunManagedRuntimeHookScope(tx)
 
 		proManager := GetProManagerService(s)
+		regenerateSingboxRuntime := func() {
+			if regenerateErr := proManager.RegenerateCoreConfig(); regenerateErr != nil {
+				retrySingboxRuntime = true
+				managedRuntimeErr = errors.Join(managedRuntimeErr, fmt.Errorf("regenerate sing-box core config failed: %w", regenerateErr))
+			}
+		}
 
 		switch obj {
 		case "inbounds":
-			proManager.regenerateCoreConfig()
+			regenerateSingboxRuntime()
 			postCommitHooks = append(postCommitHooks, func() error {
 				return s.syncAutoManagedDefaultClients(hostname)
 			})
 		case "outbounds":
-			proManager.regenerateCoreConfig()
+			regenerateSingboxRuntime()
 			postCommitHooks = append(postCommitHooks, func() error {
 				return s.syncAutoManagedDefaultClients(hostname)
 			})
 		case "outboundgroups":
-			proManager.regenerateCoreConfig()
-			postCommitHooks = append(postCommitHooks, func() error {
-				return s.syncAutoManagedDefaultClients(hostname)
-			})
+			if singboxOutboundGroupsRuntimeChanged {
+				regenerateSingboxRuntime()
+				postCommitHooks = append(postCommitHooks, func() error {
+					return s.syncAutoManagedDefaultClients(hostname)
+				})
+			}
 		case "suboutbounds", "subgroups":
 			// Subscription payloads are rendered from SQLite on request.
 		case "clients":
-			proManager.regenerateCoreConfig()
+			regenerateSingboxRuntime()
 			postCommitHooks = append(postCommitHooks, func() error {
 				return s.syncAutoManagedDefaultClients(hostname)
 			})
 		case "tls":
-			proManager.regenerateCoreConfig()
-			postCommitHooks = append(postCommitHooks, func() error {
-				return s.syncAutoManagedDefaultClients(hostname)
-			})
+			if defaultTLSSaveImpact.RuntimeConfigChanged {
+				regenerateSingboxRuntime()
+			}
+			if defaultTLSSaveImpact.SubscriptionProjectionChanged && defaultTLSSaveImpact.TLSID > 0 {
+				tlsID := defaultTLSSaveImpact.TLSID
+				postCommitHooks = append(postCommitHooks, func() error {
+					return s.syncAutoManagedDefaultClientsForCertificateBinding(hostname, []uint{tlsID})
+				})
+			}
 		case "services", "endpoints":
-			proManager.regenerateCoreConfig()
+			regenerateSingboxRuntime()
 			postCommitHooks = append(postCommitHooks, func() error {
 				return s.syncAutoManagedDefaultClients(hostname)
 			})
 		case "config", "settings":
-			proManager.regenerateCoreConfig()
+			regenerateSingboxRuntime()
 			postCommitHooks = append(postCommitHooks, func() error {
 				if err := s.syncAutoManagedDefaultClients(hostname); err != nil {
 					return err
 				}
 				return s.syncAutoManagedMihomoClients(hostname)
 			})
-		case "mihomo_inbounds", "mihomo_outbounds", "mihomo_outboundgroups", "mihomo_clients", "mihomo_tls", "mihomo_config":
-			if err := NewMihomoManagerService().RegenerateServerConfig(); err != nil {
-				logger.Warning("regenerate mihomo server config failed: ", err)
+		case "mihomo_inbounds", "mihomo_outbounds", "mihomo_clients", "mihomo_tls", "mihomo_config":
+			mihomoRuntimeChanged = true
+			fallthrough
+		case "mihomo_outboundgroups":
+			if obj != "mihomo_outboundgroups" || mihomoRuntimeChanged {
+				mihomoManager := NewMihomoManagerService()
+				var regenerateErr error
+				if mihomoServerConfigLockHeld {
+					regenerateErr = mihomoManager.writeRenderedServerConfig(mihomoRenderedServerConfig)
+				} else {
+					regenerateErr = mihomoManager.RegenerateServerConfig()
+				}
+				if regenerateErr != nil {
+					managedRuntimeErr = errors.Join(managedRuntimeErr, fmt.Errorf("regenerate mihomo server config failed: %w", regenerateErr))
+				} else {
+					if obj == "mihomo_tls" {
+						tlsID := mihomoTLSIDFromSavePayload(data)
+						if tlsID > 0 {
+							postCommitHooks = append(postCommitHooks, func() error {
+								return s.syncAutoManagedMihomoClientsForCertificateBinding(hostname, []uint{tlsID})
+							})
+						}
+					} else {
+						postCommitHooks = append(postCommitHooks, func() error {
+							return s.syncAutoManagedMihomoClients(hostname)
+						})
+					}
+				}
+				if mihomoServerConfigLockHeld {
+					mihomoServerConfigRegenerationMu.Unlock()
+					mihomoServerConfigLockHeld = false
+				}
 			}
-			postCommitHooks = append(postCommitHooks, func() error {
-				return s.syncAutoManagedMihomoClients(hostname)
-			})
 		}
 
 		for _, hook := range postCommitHooks {
@@ -238,13 +431,40 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 				logger.Warning("post-commit hook failed: ", hookErr)
 			}
 		}
+		// Advance polling revisions only after every post-commit hook has
+		// finished. Several hooks reconcile managed subscription nodes in their
+		// own transactions; publishing a revision first could let another page
+		// load the old projection and then skip its next refresh.
+		//
+		// Some default-chain saves reconcile auto-managed client projections.
+		// Those projections are shared with Mihomo, so both polling revisions
+		// must advance even though the initiating object belongs to one core.
+		// Pure group metadata/order changes stay local.
+		sharedSubManagerMutation := obj == "clients" || obj == "inbounds" || obj == "tls" ||
+			obj == "outbounds" || obj == "services" || obj == "endpoints" ||
+			obj == "config" || obj == "settings" ||
+			(obj == "outboundgroups" && singboxOutboundGroupsRuntimeChanged) ||
+			obj == "suboutbounds" || obj == "subgroups" || obj == "mihomo_clients" ||
+			obj == "mihomo_inbounds" || obj == "mihomo_tls" || obj == "mihomo_outbounds" ||
+			(obj == "mihomo_outboundgroups" && mihomoRuntimeChanged) || obj == "mihomo_config"
+		if sharedSubManagerMutation {
+			markBothLastUpdates(time.Now().Unix())
+		} else if strings.HasPrefix(obj, "mihomo_") {
+			markMihomoLastUpdate(time.Now().Unix())
+		} else {
+			markLastUpdate(time.Now().Unix())
+		}
 		if compactStatsAfterCommit {
 			requestMainSQLiteCompaction(db, true)
 		}
 
 		if managedRuntimeErr != nil {
-			err = &CommittedSaveError{Err: managedRuntimeErr}
+			err = &CommittedSaveError{
+				Err:                 managedRuntimeErr,
+				RetrySingboxRuntime: retrySingboxRuntime,
+			}
 		}
+		InvalidateDashboardRuntimeCache()
 	}()
 
 	switch obj {
@@ -301,6 +521,10 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 			if syncErr := s.SyncService.SyncClientOnSave(tx, oldClient, &newClient, hostname); syncErr != nil {
 				return nil, common.NewErrorf("failed to sync client suboutbounds: %v", syncErr)
 			}
+		}
+		// The post-commit auto-sync hook can also rebuild already-managed users.
+		// Always return the shared collections for a successful client mutation.
+		if err == nil {
 			objs = append(objs, "suboutbounds", "subgroups")
 		}
 		if err == nil {
@@ -309,12 +533,32 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 			})
 		}
 	case "tls":
-		err = s.TlsService.Save(tx, act, data, hostname)
-		objs = append(objs, "clients", "inbounds")
+		defaultTLSSaveImpact, err = s.TlsService.Save(tx, act, data, hostname)
+		if err == nil && defaultTLSSaveImpact.RefreshClientAndInboundData {
+			objs = append(objs, "clients", "inbounds")
+		}
+		// TLS edits can rebuild managed subscription nodes through the
+		// certificate-binding hook. Return both projection collections so the
+		// subscription manager does not keep stale cards until a full reload.
+		if err == nil && defaultTLSSaveImpact.SubscriptionProjectionChanged {
+			objs = append(objs, "suboutbounds", "subgroups")
+		}
 	case "inbounds":
 		nftAction, nftPlanErr := s.InboundService.Save(tx, act, data, initUsers, hostname)
 		err = nftPlanErr
-		objs = append(objs, "clients")
+		// Inbound mutations also update client links and may create/remove
+		// managed subscription outbounds. Return the shared collections on every
+		// action so both default and Mihomo-facing subscription views converge.
+		objs = append(objs, "clients", "suboutbounds", "subgroups")
+		if err == nil {
+			affectedClientIDs, syncErr := loadAffectedDefaultClientIDsForInboundSave(tx, act, data, initUsers)
+			if syncErr != nil {
+				return nil, common.NewErrorf("failed to identify affected client suboutbounds: %v", syncErr)
+			}
+			if syncErr := s.syncManagedDefaultClientsForIDs(tx, hostname, affectedClientIDs); syncErr != nil {
+				return nil, common.NewErrorf("failed to sync affected client suboutbounds: %v", syncErr)
+			}
+		}
 		if err == nil && nftAction != nil {
 			actionCopy := *nftAction
 			postCommitHooks = append(postCommitHooks, func() error {
@@ -328,20 +572,38 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 		}
 	case "outbounds":
 		err = s.OutboundService.Save(tx, act, data)
+		// Outbound rename/delete operations rewrite references in panel groups.
+		// The group editor must receive the updated tags in the same response.
+		if err == nil {
+			objs = append(objs, "outboundgroups", "suboutbounds", "subgroups")
+		}
 	case "outboundgroups":
-		err = s.OutboundGroupService.Save(tx, act, data)
-		objs = append(objs, "outbounds")
+		singboxOutboundGroupsRuntimeChanged, err = s.OutboundGroupService.saveWithRuntimeImpactLocked(tx, act, data)
+		if singboxOutboundGroupsRuntimeChanged {
+			objs = append(objs, "outbounds", "suboutbounds", "subgroups")
+		}
 	case "suboutbounds":
 		err = s.SubOutboundService.Save(tx, act, data)
 		// Save keeps subscription rendering validation in the post-commit hook.
 		objs = append(objs, "subgroups")
 	case "subgroups":
 		err = s.SubGroupService.Save(tx, act, data)
-		// Group payloads are rendered dynamically; Save only validates in memory.
+		// Deleting an imported group also deletes its managed suboutbounds. Return
+		// both collections for every group mutation so an empty result can clear
+		// both default and Mihomo subscription views immediately.
+		if err == nil {
+			objs = append(objs, "suboutbounds")
+		}
 	case "services":
 		err = s.ServicesService.Save(tx, act, data)
+		if err == nil {
+			objs = append(objs, "suboutbounds", "subgroups")
+		}
 	case "endpoints":
 		err = s.EndpointService.Save(tx, act, data)
+		if err == nil {
+			objs = append(objs, "suboutbounds", "subgroups")
+		}
 	case "config":
 		normalizedConfig := data
 		aliasMap, aliasErr := buildInboundTagAliasMap(tx)
@@ -355,21 +617,29 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 			}
 		}
 		data = normalizedConfig
+		if err = validateSingboxConfigRouteBounds(normalizedConfig, tx); err != nil {
+			return nil, err
+		}
 
 		err = s.SettingService.SaveConfig(tx, normalizedConfig)
 		if err != nil {
 			return nil, err
 		}
+		objs = append(objs, "suboutbounds", "subgroups")
 	case "settings":
 		err = s.SettingService.Save(tx, data)
 		if err == nil {
 			compactStatsAfterCommit = shouldCompactStatsAfterSettingsSave(data)
+			objs = append(objs, "suboutbounds", "subgroups")
 		}
 		if err == nil {
 			postCommitHooks = append(postCommitHooks, func() error {
 				if panelTimeLocationChanged {
 					if err := ReloadPanelTimeSchedule(); err != nil {
 						logger.Warning("reload panel timezone schedule failed: ", err)
+					}
+					if err := ReschedulePendingCoreAutoChecksForPanelTimeZone(); err != nil {
+						logger.Warning("reschedule pending core auto checks after panel timezone update failed: ", err)
 					}
 				}
 				if err := ApplyPanelTLSRuntimeSettings(PanelSelfSignedTargetPanel); err != nil {
@@ -455,7 +725,10 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 		}
 	case "mihomo_tls":
 		err = s.MihomoTlsService.Save(tx, act, data, hostname)
-		objs = append(objs, "mihomo_clients", "mihomo_inbounds")
+		// TLS edits can rewrite inbound out_json, client links and their
+		// Mihomo-managed subscription outbounds. Return every affected list so
+		// all seven related pages converge without a full-page reload.
+		objs = append(objs, "mihomo_inbounds", "mihomo_clients", "suboutbounds", "subgroups")
 	case "mihomo_inbounds":
 		nftAction, nftPlanErr := s.MihomoInboundService.Save(tx, act, data, initUsers, hostname)
 		err = nftPlanErr
@@ -467,7 +740,11 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 			})
 		}
 		if err == nil {
-			if syncErr := s.syncManagedMihomoClients(tx, hostname); syncErr != nil {
+			affectedClientIDs, syncErr := loadAffectedMihomoClientIDsForInboundSave(tx, act, data, initUsers)
+			if syncErr != nil {
+				return nil, common.NewErrorf("failed to identify affected mihomo client suboutbounds: %v", syncErr)
+			}
+			if syncErr := s.syncManagedMihomoClientsForIDs(tx, hostname, affectedClientIDs); syncErr != nil {
 				return nil, common.NewErrorf("failed to sync mihomo client suboutbounds: %v", syncErr)
 			}
 			objs = append(objs, "suboutbounds", "subgroups")
@@ -479,16 +756,29 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 		}
 	case "mihomo_outbounds":
 		err = s.MihomoOutboundService.Save(tx, act, data)
+		mihomoRuntimeChanged = err == nil
+		// Renames and deletes also update panel group references and ShadowQUIC
+		// proxy references, so the group selector must receive the same response.
+		objs = append(objs, "mihomo_outboundgroups", "suboutbounds", "subgroups")
 	case "mihomo_outboundgroups":
-		err = s.MihomoOutboundGroupService.Save(tx, act, data)
-		objs = append(objs, "mihomo_outbounds")
+		mihomoRuntimeChanged, err = s.MihomoOutboundGroupService.saveWithRuntimeImpactLocked(tx, act, data)
+		if mihomoRuntimeChanged {
+			objs = append(objs, "mihomo_outbounds", "suboutbounds", "subgroups")
+		}
 	case "mihomo_config":
 		err = s.MihomoConfigService.SaveConfig(tx, data)
+		mihomoRuntimeChanged = err == nil
+		if err == nil {
+			objs = append(objs, "suboutbounds", "subgroups")
+		}
 	default:
 		return nil, common.NewError("unknown object: ", obj)
 	}
 	if err != nil {
 		return nil, err
+	}
+	if strings.HasPrefix(obj, "mihomo_") && obj != "mihomo_outboundgroups" {
+		mihomoRuntimeChanged = true
 	}
 	if obj == "settings" || obj == "inbounds" || obj == "mihomo_inbounds" {
 		if err := validatePortForwardListenerClaimsAgainstActiveRules(tx); err != nil {
@@ -500,58 +790,86 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 			return nil, err
 		}
 	}
-
+	// Group labels/order are panel metadata only. They must not invalidate the
+	// route/DNS optimistic-concurrency revision unless the mutation actually
+	// removes or changes runtime outbounds.
+	singboxConfigMutation := isSingboxConfigMutationObject(obj) &&
+		!(obj == "outboundgroups" && !singboxOutboundGroupsRuntimeChanged)
+	if singboxConfigMutation {
+		currentRevision, revisionErr := ensureSingboxConfigRevisionState(tx)
+		if revisionErr != nil {
+			return nil, revisionErr
+		}
+		if _, revisionErr = bumpSingboxConfigRevision(tx, currentRevision); revisionErr != nil {
+			return nil, revisionErr
+		}
+	}
 	dt := time.Now().Unix()
+	auditData := data
+	if obj == "config" {
+		auditData = buildSingboxConfigChangeAudit(data)
+	} else if obj == "mihomo_config" {
+		auditData = buildMihomoConfigChangeAudit(data)
+	}
 	err = recordChange(tx, model.Changes{
 		DateTime: dt,
 		Actor:    loginUser,
 		Key:      obj,
 		Action:   act,
-		Obj:      data,
+		Obj:      auditData,
 	})
 	if err != nil {
 		return nil, err
 	}
+	if mihomoRuntimeChanged {
+		mihomoManager := NewMihomoManagerService()
+		if mihomoServerConfigLockHeld {
+			// Keep the pre-acquired generator lock across commit and the matching
+			// runtime-file write. The YAML is rendered from this transaction, but is
+			// never written until the database state is durable.
+			mihomoRenderedServerConfig, err = mihomoManager.renderServerConfig(tx)
+			if err != nil {
+				return nil, fmt.Errorf("invalid mihomo runtime config: %w", err)
+			}
+		} else if err := mihomoManager.ValidateServerConfig(tx); err != nil {
+			return nil, fmt.Errorf("invalid mihomo runtime config: %w", err)
+		}
+	}
 
-	return objs, nil
+	return uniqueConfigSaveObjects(objs), nil
+}
+
+func uniqueConfigSaveObjects(objs []string) []string {
+	if len(objs) < 2 {
+		return objs
+	}
+	unique := make([]string, 0, len(objs))
+	seen := make(map[string]struct{}, len(objs))
+	for _, obj := range objs {
+		if _, exists := seen[obj]; exists {
+			continue
+		}
+		seen[obj] = struct{}{}
+		unique = append(unique, obj)
+	}
+	return unique
+}
+
+func mihomoTLSIDFromSavePayload(data json.RawMessage) uint {
+	var payload struct {
+		ID uint `json:"id"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return 0
+	}
+	return payload.ID
 }
 
 func (s *ConfigService) applyInboundNftAction(action *InboundNftAction) error {
 	if action == nil {
 		return nil
 	}
-
-	db := database.GetDB()
-	nftSvc := &NftTrafficService{}
-	coreSvc := &CoreManagerService{}
-	coreRunning := coreSvc.IsRunning()
-
-	var err error
-	switch action.Kind {
-	case "upsert":
-		if coreRunning {
-			err = nftSvc.UpdateInboundRules(db, action.InboundID, action.Tag, action.Port, action.PortHopRange)
-		} else {
-			err = nftSvc.UpsertInboundStateOnly(db, action.InboundID, action.Tag, action.Port, action.PortHopRange)
-		}
-	case "remove":
-		if coreRunning {
-			err = nftSvc.RemoveInboundRules(db, action.InboundID)
-		} else {
-			err = nftSvc.RemoveInboundStateOnly(db, action.InboundID)
-		}
-	default:
-		err = common.NewError("unknown inbound nft action: ", action.Kind)
-	}
-	if err != nil {
-		return err
-	}
-
-	if !coreRunning {
-		nftSvc.CleanupOnShutdown()
-	}
-
-	return nil
+	return (&NftTrafficService{}).ApplyInboundNftAction(database.GetDB(), action)
 }
 
 func (s *ConfigService) applyClientRateLimitNft() error {
@@ -593,6 +911,12 @@ func (s *ConfigService) applyMihomoClientNftPolicies() error {
 }
 
 func (s *ConfigService) applyMihomoInboundNftAction(action *InboundNftAction) error {
+	return runMihomoInboundNftMutation(func() error {
+		return s.applyMihomoInboundNftActionLocked(action)
+	})
+}
+
+func (s *ConfigService) applyMihomoInboundNftActionLocked(action *InboundNftAction) error {
 	if action == nil {
 		return nil
 	}
@@ -624,13 +948,23 @@ func (s *ConfigService) applyMihomoInboundNftAction(action *InboundNftAction) er
 	}
 
 	if !coreRunning {
-		nftSvc.CleanupOnShutdown()
+		nftSvc.cleanupOnShutdown()
 	}
 
 	return nil
 }
 
 func (s *ConfigService) CheckChanges(lu string) (bool, error) {
+	return checkConfigRevisionChanges(lu, currentLastUpdate, func() { markLastUpdate(time.Now().Unix()) })
+}
+
+func (s *ConfigService) CheckMihomoChanges(lu string) (bool, error) {
+	return checkConfigRevisionChanges(lu, func() int64 {
+		return atomic.LoadInt64(&MihomoLastUpdate)
+	}, func() { markMihomoLastUpdate(time.Now().Unix()) })
+}
+
+func checkConfigRevisionChanges(lu string, current func() int64, initialize func()) (bool, error) {
 	if lu == "" {
 		return true, nil
 	}
@@ -638,18 +972,18 @@ func (s *ConfigService) CheckChanges(lu string) (bool, error) {
 	if err != nil {
 		return true, nil
 	}
-	lastUpdate := currentLastUpdate()
+	lastUpdate := current()
 	if lastUpdate == 0 {
-		db := database.GetDB()
-		var count int64
-		err := db.Model(model.Changes{}).Where("date_time > ?", intLu).Count(&count).Error
-		if err == nil {
-			markLastUpdate(time.Now().Unix())
-		}
-		return count > 0, err
-	} else {
-		return lastUpdate > intLu, err
+		// After a panel restart the in-memory revision has no ordering relation to
+		// an already-open browser. Force one full snapshot instead of comparing a
+		// millisecond revision to the historical seconds-based audit table.
+		initialize()
+		return true, nil
 	}
+	// A browser can retain a revision from a previous process lifetime. Treat
+	// both directions as changed so a newer process cannot be mistaken for an
+	// already-synchronized snapshot.
+	return lastUpdate != intLu, nil
 }
 
 func (s *ConfigService) GetChanges(actor string, chngKey string, count string) []model.Changes {
@@ -868,6 +1202,73 @@ func loadManagedClientIDsForInboundIDs(db *gorm.DB, sourceType string, inboundID
 	return compactPositiveUintList(clientIDs), nil
 }
 
+// loadAffectedDefaultClientIDsForInboundSave returns clients whose managed
+// subscription projections may have changed because an inbound was written.
+// The inbound save itself updates local links and removes deleted-inbound
+// records; this helper covers the remaining managed subscription rebuild.
+func loadAffectedDefaultClientIDsForInboundSave(tx *gorm.DB, act string, data json.RawMessage, initUserIDs string) ([]uint, error) {
+	if tx == nil {
+		return nil, common.NewError("client transaction is nil")
+	}
+	switch act {
+	case "new":
+		return dedupeUintIDs(parseIDList(initUserIDs)), nil
+	case "del":
+		return []uint{}, nil
+	case "edit":
+		var inbound model.Inbound
+		if err := inbound.UnmarshalJSON(data); err != nil {
+			return nil, err
+		}
+		if inbound.Id == 0 {
+			return []uint{}, nil
+		}
+		var clients []model.Client
+		if err := tx.Model(model.Client{}).Select("id", "inbounds").Find(&clients).Error; err != nil {
+			return nil, err
+		}
+		ids := make([]uint, 0, len(clients))
+		for _, client := range clients {
+			bound, err := parseClientInboundIDs(client.Inbounds)
+			if err != nil {
+				continue
+			}
+			if anyUintInSet(bound, uintSetFromSlice([]uint{inbound.Id})) {
+				ids = append(ids, client.Id)
+			}
+		}
+		managed, err := loadManagedClientIDsForInboundIDs(tx, subOutboundSourceClient, []uint{inbound.Id})
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, managed...)
+		return dedupeUintIDs(ids), nil
+	default:
+		return []uint{}, nil
+	}
+}
+
+func (s *ConfigService) syncManagedDefaultClientsForIDs(tx *gorm.DB, hostname string, clientIDs []uint) error {
+	if tx == nil {
+		return nil
+	}
+	clientIDs = compactPositiveUintList(clientIDs)
+	if len(clientIDs) == 0 {
+		return nil
+	}
+	var clients []model.Client
+	if err := tx.Model(model.Client{}).Where("id IN ?", clientIDs).Find(&clients).Error; err != nil {
+		return err
+	}
+	for i := range clients {
+		client := clients[i]
+		if err := s.SyncService.SyncClientOnSave(tx, &client, &client, hostname); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func uintSetFromSlice(ids []uint) map[uint]struct{} {
 	result := make(map[uint]struct{}, len(ids))
 	for _, id := range ids {
@@ -903,10 +1304,9 @@ func (s *ConfigService) syncManagedMihomoClients(tx *gorm.DB, hostname string, s
 
 	skip := make(map[uint]struct{}, len(skipClientIDs))
 	for _, id := range skipClientIDs {
-		if id == 0 {
-			continue
+		if id > 0 {
+			skip[id] = struct{}{}
 		}
-		skip[id] = struct{}{}
 	}
 
 	for _, client := range clients {
@@ -921,6 +1321,61 @@ func (s *ConfigService) syncManagedMihomoClients(tx *gorm.DB, hostname string, s
 	}
 
 	return nil
+}
+
+func (s *ConfigService) syncManagedMihomoClientsForIDs(tx *gorm.DB, hostname string, clientIDs []uint) error {
+	if tx == nil {
+		return nil
+	}
+	clientIDs = compactPositiveUintList(clientIDs)
+	if len(clientIDs) == 0 {
+		return nil
+	}
+
+	var clients []model.MihomoClient
+	if err := tx.Model(model.MihomoClient{}).Where("id IN ?", clientIDs).Find(&clients).Error; err != nil {
+		return err
+	}
+	for _, client := range clients {
+		oldClient := client
+		newClient := client
+		if err := s.MihomoSyncService.SyncClientOnSave(tx, &oldClient, &newClient, hostname); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func loadAffectedMihomoClientIDsForInboundSave(tx *gorm.DB, act string, data json.RawMessage, initUserIDs string) ([]uint, error) {
+	if tx == nil {
+		return nil, nil
+	}
+	var inboundID uint
+	switch act {
+	case "new":
+		return dedupeUintIDs(parseIDList(initUserIDs)), nil
+	case "edit":
+		var inbound model.MihomoInbound
+		if err := inbound.UnmarshalJSON(data); err != nil {
+			return nil, err
+		}
+		inboundID = inbound.Id
+	case "del":
+		return []uint{}, nil
+	}
+	if inboundID == 0 {
+		return []uint{}, nil
+	}
+	var clients []model.MihomoClient
+	if err := tx.Model(model.MihomoClient{}).Select("id", "inbounds").Find(&clients).Error; err != nil {
+		return nil, err
+	}
+	clients = filterMihomoClientsBoundToInboundIDs(clients, []uint{inboundID})
+	clientIDs := make([]uint, 0, len(clients))
+	for _, client := range clients {
+		clientIDs = append(clientIDs, client.Id)
+	}
+	return compactPositiveUintList(clientIDs), nil
 }
 
 func discoverAutoManagedClientIDsBySource(sourceType string) ([]uint, error) {
@@ -1097,6 +1552,7 @@ func (s *ConfigService) forceSyncDefaultClientIDsToSubManager(hostname string, i
 		byID[client.Id] = client
 	}
 
+	var syncErr error
 	for _, id := range ids {
 		client, ok := byID[id]
 		if !ok {
@@ -1110,7 +1566,14 @@ func (s *ConfigService) forceSyncDefaultClientIDsToSubManager(hostname string, i
 		}
 		if _, err := s.SyncService.syncClientSubOutbounds(tx, nil, client, hostname, true, true); err != nil {
 			logger.Warningf("force sync default client %s failed: %v", client.Name, err)
+			syncErr = err
+			break
 		}
+	}
+	if syncErr != nil {
+		DiscardManagedRuntimeHookScope(tx)
+		tx.Rollback()
+		return nil, syncErr
 	}
 
 	if err := tx.Commit().Error; err != nil {
@@ -1226,6 +1689,7 @@ func (s *ConfigService) forceSyncMihomoClientIDsToSubManager(hostname string, id
 		byID[client.Id] = client
 	}
 
+	var syncErr error
 	for _, id := range ids {
 		client, ok := byID[id]
 		if !ok {
@@ -1239,7 +1703,14 @@ func (s *ConfigService) forceSyncMihomoClientIDsToSubManager(hostname string, id
 		}
 		if _, err := s.MihomoSyncService.syncClientSubOutbounds(tx, nil, client, hostname, true, true); err != nil {
 			logger.Warningf("force sync mihomo client %s failed: %v", client.Name, err)
+			syncErr = err
+			break
 		}
+	}
+	if syncErr != nil {
+		DiscardManagedRuntimeHookScope(tx)
+		tx.Rollback()
+		return nil, syncErr
 	}
 
 	if err := tx.Commit().Error; err != nil {
@@ -1251,7 +1722,7 @@ func (s *ConfigService) forceSyncMihomoClientIDsToSubManager(hostname string, id
 		return nil, err
 	}
 	if len(existing) > 0 {
-		markLastUpdate(time.Now().Unix())
+		markBothLastUpdates(time.Now().Unix())
 	}
 	return existing, nil
 }

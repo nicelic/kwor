@@ -49,7 +49,7 @@ func TestResolveMihomoInboundRedirectSpec_NonMieruUsesPortHopRange(t *testing.T)
 	if gotRedirectTCP {
 		t.Fatalf("expected redirectTCP=false for non-mieru")
 	}
-	if gotRange != "9000:9010" {
-		t.Fatalf("expected port_hop_range from options, got %q", gotRange)
+	if gotRange != "9000-9010" {
+		t.Fatalf("expected normalized port_hop_range from options, got %q", gotRange)
 	}
 }

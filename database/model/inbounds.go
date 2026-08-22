@@ -2,6 +2,7 @@ package model
 
 import (
 	"encoding/json"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -164,8 +165,15 @@ func normalizeStoredBandwidthValue(value interface{}) (int, bool) {
 	case uint64:
 		return int(v), true
 	case float32:
-		return int(v), true
+		value := float64(v)
+		if math.IsNaN(value) || math.IsInf(value, 0) || math.Trunc(value) != value {
+			return 0, false
+		}
+		return int(value), true
 	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) || math.Trunc(v) != v {
+			return 0, false
+		}
 		return int(v), true
 	case string:
 		text := strings.TrimSpace(v)

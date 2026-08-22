@@ -24,6 +24,7 @@
         hide-details
         type="number"
         min="3"
+        step="any"
         :suffix="$t('date.s')"
         v-model.number="interval"></v-text-field>
       </v-col>
@@ -33,6 +34,7 @@
         hide-details
         type="number"
         min="0"
+        step="1"
         :suffix="$t('date.ms')"
         v-model.number="tolerance"></v-text-field>
       </v-col>
@@ -42,6 +44,7 @@
         hide-details
         type="number"
         min="0"
+        step="any"
         :suffix="$t('date.m')"
         v-model.number="idle_timeout"></v-text-field>
       </v-col>
@@ -79,6 +82,7 @@
 </template>
 
 <script lang="ts">
+import { readSingboxDuration, writeSingboxDuration } from '@/plugins/singboxDuration'
 
 export default {
   props: ['data', 'tags', 'namespace'],
@@ -88,6 +92,11 @@ export default {
     }
   },
   methods: {
+    normalizeNonNegativeInteger(value: unknown): number | undefined {
+      if (value === '' || value === null || value === undefined) return undefined
+      const normalized = Number(value)
+      return Number.isSafeInteger(normalized) && normalized >= 0 ? normalized : undefined
+    },
     sanitizeForNamespace() {
       if (!this.isMihomoNamespace) {
         return
@@ -118,20 +127,28 @@ export default {
       set(v:boolean) { this.$props.data.idle_timeout = v ? '30m' : undefined }
     },
     interval: {
-      get() { return this.$props.data.interval ? parseInt(this.$props.data.interval.replace('s','')) : 3 },
-      set(v:number) { this.$props.data.interval = v > 0 ? v + 's' : '3s' }
+      get() { return readSingboxDuration(this.$props.data.interval, 's') ?? 3 },
+      set(v:number) { this.$props.data.interval = writeSingboxDuration(v, 's', { minimum: 3 }) ?? '3s' }
     },
     tolerance: {
-      get() { return this.$props.data.tolerance ? parseInt(this.$props.data.tolerance) : 0 },
-      set(v:number) { this.$props.data.tolerance = v > 0 ? v : 0 }
+      get() { return this.normalizeNonNegativeInteger(this.$props.data.tolerance) ?? 0 },
+      set(v:number) { this.$props.data.tolerance = this.normalizeNonNegativeInteger(v) ?? 0 }
     },
     idle_timeout: {
-      get() { return this.$props.data.idle_timeout ? parseInt(this.$props.data.idle_timeout.replace('m','')) : 30 },
-      set(v:number) { this.$props.data.idle_timeout = v > 0 ? v + 'm' : '0m' }
+      get() { return readSingboxDuration(this.$props.data.idle_timeout, 'm') ?? 30 },
+      set(v:number) { this.$props.data.idle_timeout = writeSingboxDuration(v, 'm', { allowZero: true }) ?? '0m' }
     }
   },
   mounted() {
     this.sanitizeForNamespace()
+  },
+  watch: {
+    data() {
+      this.sanitizeForNamespace()
+    },
+    namespace() {
+      this.sanitizeForNamespace()
+    },
   }
 }
 </script>

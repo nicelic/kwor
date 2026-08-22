@@ -30,6 +30,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/alireza0/s-ui/config"
 	"github.com/alireza0/s-ui/database"
@@ -62,7 +63,13 @@ const (
 	acmeGitHubReleaseTagAPI                        = "https://api.github.com/repos/acmesh-official/acme.sh/releases/tags/"
 	acmeGitHubTagsAPI                              = "https://api.github.com/repos/acmesh-official/acme.sh/tags"
 	acmeGitHubResponseMaxBytes               int64 = 4 * 1024 * 1024
-	acmeLogMaxLines                                = 800
+	acmeCommandOutputMaxBytes                int   = 512 * 1024
+	acmeCommandErrorMaxBytes                 int   = 16 * 1024
+	acmeCommandOutputLineMaxBytes            int   = 64 * 1024
+	acmeStoredOutputMaxBytes                 int   = 128 * 1024
+	acmeLogMaxLines                                = 400
+	acmeLogMaxBytes                                = 256 * 1024
+	acmeLogMaxLineBytes                            = 4 * 1024
 	acmeLogTTL                                     = 30 * time.Minute
 	acmeTaskTTL                                    = 30 * time.Minute
 	acmeTaskQueueCapacity                          = 32
@@ -246,6 +253,249 @@ var defaultAcmeDNSProviderCatalog = []AcmeDNSProviderMeta{
 			{Key: "VERCEL_TOKEN", Label: "API Token", Required: true},
 		},
 	},
+	{
+		Name:         "Spaceship",
+		ProviderCode: "dns_spaceship",
+		Helper:       "acme.sh 官方: dns_spaceship；API Key 需要 dnsrecords:read 和 dnsrecords:write 权限；根域名自动识别失败时可填写 SPACESHIP_ROOT_DOMAIN",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "SPACESHIP_API_KEY", Label: "API Key", Required: true},
+			{Key: "SPACESHIP_API_SECRET", Label: "API Secret", Required: true},
+			{Key: "SPACESHIP_ROOT_DOMAIN", Label: "根域名（可选）", Required: false, Placeholder: "example.com"},
+		},
+	},
+	{
+		Name:         "Google Cloud DNS",
+		ProviderCode: "dns_gcloud",
+		Helper:       "acme.sh 官方: dns_gcloud；依赖服务器已安装并授权 gcloud CLI，CLOUDSDK_ACTIVE_CONFIG_NAME 可选",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "CLOUDSDK_ACTIVE_CONFIG_NAME", Label: "gcloud 配置名称（可选）", Required: false, Placeholder: "default"},
+		},
+	},
+	{
+		Name:         "Azure DNS",
+		ProviderCode: "dns_azure",
+		Helper:       "acme.sh 官方: dns_azure；必填订阅 ID，并选择托管身份、Bearer Token 或服务主体（Tenant/App/Client Secret）之一",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "AZUREDNS_SUBSCRIPTIONID", Label: "Subscription ID", Required: true},
+			{Key: "AZUREDNS_TENANTID", Label: "Tenant ID（服务主体模式）", Required: false},
+			{Key: "AZUREDNS_APPID", Label: "App ID（服务主体模式）", Required: false},
+			{Key: "AZUREDNS_CLIENTSECRET", Label: "Client Secret（服务主体模式）", Required: false},
+			{Key: "AZUREDNS_MANAGEDIDENTITY", Label: "Managed Identity（可选）", Required: false, Placeholder: "true"},
+			{Key: "AZUREDNS_BEARERTOKEN", Label: "Bearer Token（可选）", Required: false},
+		},
+	},
+	{
+		Name:         "Oracle Cloud Infrastructure DNS",
+		ProviderCode: "dns_oci",
+		Helper:       "acme.sh 官方: dns_oci；默认读取 OCI CLI 的 DEFAULT 配置，也可填写租户、用户、区域和签名密钥参数",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "OCI_CLI_TENANCY", Label: "Tenancy OCID（可选）", Required: false},
+			{Key: "OCI_CLI_USER", Label: "User OCID（可选）", Required: false},
+			{Key: "OCI_CLI_REGION", Label: "Region（可选）", Required: false, Placeholder: "us-ashburn-1"},
+			{Key: "OCI_CLI_KEY_FILE", Label: "API Signing Key 文件路径（可选）", Required: false},
+			{Key: "OCI_CLI_KEY", Label: "API Signing Key PEM（可选）", Required: false},
+		},
+	},
+	{
+		Name:         "NS1",
+		ProviderCode: "dns_nsone",
+		Helper:       "acme.sh 官方: dns_nsone",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "NS1_Key", Label: "API Key", Required: true},
+		},
+	},
+	{
+		Name:         "Akamai Connected Cloud（Linode）",
+		ProviderCode: "dns_linode_v4",
+		Helper:       "acme.sh 官方: dns_linode_v4",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "LINODE_V4_API_KEY", Label: "API Key", Required: true},
+		},
+	},
+	{
+		Name:         "DigitalOcean",
+		ProviderCode: "dns_dgon",
+		Helper:       "acme.sh 官方: dns_dgon",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "DO_API_KEY", Label: "API Key", Required: true},
+		},
+	},
+	{
+		Name:         "Vultr",
+		ProviderCode: "dns_vultr",
+		Helper:       "acme.sh 官方: dns_vultr",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "VULTR_API_KEY", Label: "API Key", Required: true},
+		},
+	},
+	{
+		Name:         "Namecheap",
+		ProviderCode: "dns_namecheap",
+		Helper:       "acme.sh 官方: dns_namecheap；需要开启 Namecheap API，Source IP 可选，未填写时由 acme.sh 尝试探测",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "NAMECHEAP_API_KEY", Label: "API Key", Required: true},
+			{Key: "NAMECHEAP_USERNAME", Label: "Username", Required: true},
+			{Key: "NAMECHEAP_SOURCEIP", Label: "Source IP（可选）", Required: false},
+		},
+	},
+	{
+		Name:         "Gandi LiveDNS",
+		ProviderCode: "dns_gandi_livedns",
+		Helper:       "acme.sh 官方: dns_gandi_livedns；优先使用 GANDI_LIVEDNS_TOKEN，旧版 API Key 仅作兼容",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "GANDI_LIVEDNS_TOKEN", Label: "Personal Access Token（推荐）", Required: false},
+			{Key: "GANDI_LIVEDNS_KEY", Label: "旧版 API Key（可选）", Required: false},
+		},
+	},
+	{
+		Name:         "Porkbun",
+		ProviderCode: "dns_porkbun",
+		Helper:       "acme.sh 官方: dns_porkbun",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "PORKBUN_API_KEY", Label: "API Key", Required: true},
+			{Key: "PORKBUN_SECRET_API_KEY", Label: "Secret API Key", Required: true},
+		},
+	},
+	{
+		Name:         "Name.com",
+		ProviderCode: "dns_namecom",
+		Helper:       "acme.sh 官方: dns_namecom",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "Namecom_Username", Label: "Username", Required: true},
+			{Key: "Namecom_Token", Label: "API Token", Required: true},
+		},
+	},
+	{
+		Name:         "Njalla",
+		ProviderCode: "dns_njalla",
+		Helper:       "acme.sh 官方: dns_njalla",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "NJALLA_Token", Label: "API Token", Required: true},
+		},
+	},
+	{
+		Name:         "ClouDNS",
+		ProviderCode: "dns_cloudns",
+		Helper:       "acme.sh 官方: dns_cloudns；CLOUDNS_AUTH_ID 与 CLOUDNS_SUB_AUTH_ID 至少填写一个，并填写密码",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "CLOUDNS_AUTH_ID", Label: "Auth ID（可选）", Required: false},
+			{Key: "CLOUDNS_SUB_AUTH_ID", Label: "Sub Auth ID（可选）", Required: false},
+			{Key: "CLOUDNS_AUTH_PASSWORD", Label: "Auth Password", Required: true},
+		},
+	},
+	{
+		Name:         "Hurricane Electric DNS",
+		ProviderCode: "dns_he",
+		Helper:       "acme.sh 官方: dns_he；使用 dns.he.net 账号密码管理 DNS 记录",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "HE_Username", Label: "Username", Required: true},
+			{Key: "HE_Password", Label: "Password", Required: true},
+		},
+	},
+	{
+		Name:         "DNS Made Easy",
+		ProviderCode: "dns_me",
+		Helper:       "acme.sh 官方: dns_me",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "ME_Key", Label: "API Key", Required: true},
+			{Key: "ME_Secret", Label: "API Secret", Required: true},
+		},
+	},
+	{
+		Name:         "Constellix",
+		ProviderCode: "dns_constellix",
+		Helper:       "acme.sh 官方: dns_constellix",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "CONSTELLIX_Key", Label: "API Key", Required: true},
+			{Key: "CONSTELLIX_Secret", Label: "API Secret", Required: true},
+		},
+	},
+	{
+		Name:         "FreeDNS（afraid.org）",
+		ProviderCode: "dns_freedns",
+		Helper:       "acme.sh 官方: dns_freedns；使用 FreeDNS 账号密码",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "FREEDNS_User", Label: "Username", Required: true},
+			{Key: "FREEDNS_Password", Label: "Password", Required: true},
+		},
+	},
+	{
+		Name:         "ZoneEdit",
+		ProviderCode: "dns_zoneedit",
+		Helper:       "acme.sh 官方: dns_zoneedit",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "ZONEEDIT_ID", Label: "ID", Required: true},
+			{Key: "ZONEEDIT_Token", Label: "API Token", Required: true},
+		},
+	},
+	{
+		Name:         "Rage4",
+		ProviderCode: "dns_rage4",
+		Helper:       "acme.sh 官方: dns_rage4",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "RAGE4_USERNAME", Label: "Username", Required: true},
+			{Key: "RAGE4_TOKEN", Label: "API Token", Required: true},
+		},
+	},
+	{
+		Name:         "Yandex Cloud DNS",
+		ProviderCode: "dns_yc",
+		Helper:       "acme.sh 官方: dns_yc；需要 Zone ID 或 Folder ID，以及 Service Account ID、IAM Key ID 和 RSA 私钥文件路径或 Base64 内容",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "YC_Zone_ID", Label: "DNS Zone ID（可选）", Required: false},
+			{Key: "YC_Folder_ID", Label: "Folder ID（可选）", Required: false},
+			{Key: "YC_SA_ID", Label: "Service Account ID", Required: false},
+			{Key: "YC_SA_Key_ID", Label: "Service Account IAM Key ID", Required: false},
+			{Key: "YC_SA_Key_File_Path", Label: "RSA 私钥文件路径（可选）", Required: false},
+			{Key: "YC_SA_Key_File_PEM_b64", Label: "RSA 私钥 Base64（可选）", Required: false},
+		},
+	},
+	{
+		Name:         "DuckDNS",
+		ProviderCode: "dns_duckdns",
+		Helper:       "acme.sh 官方: dns_duckdns",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "DuckDNS_Token", Label: "API Token", Required: true},
+		},
+	},
+	{
+		Name:         "Dynu",
+		ProviderCode: "dns_dynu",
+		Helper:       "acme.sh 官方: dns_dynu；使用 Dynu API Client ID 与 Secret",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "Dynu_ClientId", Label: "Client ID", Required: true},
+			{Key: "Dynu_Secret", Label: "Client Secret", Required: true},
+		},
+	},
+	{
+		Name:         "Volcano Engine DNS",
+		ProviderCode: "dns_volcengine",
+		Helper:       "acme.sh 官方: dns_volcengine；支持长期 AK/SK，也支持临时 STS Session Token",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "Volcengine_ACCESS_KEY_ID", Label: "Access Key ID", Required: true},
+			{Key: "Volcengine_SECRET_ACCESS_KEY", Label: "Secret Access Key", Required: true},
+			{Key: "Volcengine_SESSION_TOKEN", Label: "Session Token（可选）", Required: false},
+		},
+	},
+	{
+		Name:         "百度智能云 DNS",
+		ProviderCode: "dns_baidu",
+		Helper:       "acme.sh 官方: dns_baidu；默认自动选择新版 DNS API，Baidu_API_Preference 等高级参数可通过额外环境变量覆盖",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "Baidu_AK", Label: "AccessKeyId", Required: true},
+			{Key: "Baidu_SK", Label: "SecretAccessKey", Required: true},
+			{Key: "Baidu_API_Preference", Label: "API Preference（可选）", Required: false, Placeholder: "auto"},
+		},
+	},
+	{
+		Name:         "西部数码 West.cn",
+		ProviderCode: "dns_west_cn",
+		Helper:       "acme.sh 官方: dns_west_cn",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "WEST_Username", Label: "API Username", Required: true},
+			{Key: "WEST_Key", Label: "API Key", Required: true},
+		},
+	},
 }
 
 type AcmeService struct {
@@ -272,7 +522,6 @@ type AcmeOverview struct {
 	DNSProviders       []AcmeDNSProviderMeta   `json:"dnsProviders"`
 	AcmeAccounts       []AcmeAccountView       `json:"acmeAccounts"`
 	DNSAccounts        []AcmeDNSAccountView    `json:"dnsAccounts"`
-	Certificates       []AcmeCertificateView   `json:"certificates"`
 	Error              string                  `json:"error,omitempty"`
 }
 
@@ -532,6 +781,8 @@ type AcmeLogSessionView struct {
 	Title      string            `json:"title"`
 	Status     string            `json:"status"`
 	Lines      []string          `json:"lines"`
+	LineStart  int               `json:"lineStart"`
+	LineNext   int               `json:"lineNext"`
 	Error      string            `json:"error,omitempty"`
 	TaskID     string            `json:"taskId,omitempty"`
 	TaskStatus string            `json:"taskStatus,omitempty"`
@@ -579,10 +830,6 @@ type acmeChallengePortSnapshot struct {
 }
 
 func (s *AcmeService) GetOverview() (*AcmeOverview, error) {
-	if err := s.EnsureOverviewRuntimeConsistency(false); err != nil {
-		return nil, err
-	}
-
 	overview := &AcmeOverview{
 		Supported: IsSystemPlatformLinux(),
 	}
@@ -624,12 +871,6 @@ func (s *AcmeService) GetOverview() (*AcmeOverview, error) {
 			overview.Version = version
 		}
 	}
-
-	certs, err := certificateInventory.List()
-	if err != nil {
-		return nil, err
-	}
-	overview.Certificates = certs
 
 	acmeAccounts, err := s.listAcmeAccounts()
 	if err != nil {
@@ -717,6 +958,10 @@ func acmeMaintenanceDBKeyMatches(dbKey string) bool {
 
 func (s *AcmeService) GetLogSession(id string) (*AcmeLogSessionView, error) {
 	return acmeLogSessionStore.get(id), nil
+}
+
+func (s *AcmeService) GetLogSessionAfter(id string, after int) (*AcmeLogSessionView, error) {
+	return acmeLogSessionStore.getAfter(id, after), nil
 }
 
 func (s *AcmeService) GetIPCertificatePortStatus() (*AcmeIPPortStatus, error) {
@@ -1498,6 +1743,10 @@ func (s *AcmeService) Issue(payload AcmeIssuePayload) (*AcmeActionResult, error)
 		return nil, common.NewError("dns challenge requires dns provider (for example dns_cf)")
 	}
 	if challenge == "dns" {
+		if err := ensureAcmeDNSProviderScript(homeDir, dnsProvider); err != nil {
+			logSession.fail(err.Error())
+			return nil, err
+		}
 		logSession.append("DNS Provider: " + dnsProvider)
 		logSession.append("开始 DNS 验证流程，acme.sh 将添加并等待 TXT 记录生效")
 	}
@@ -1592,7 +1841,7 @@ func (s *AcmeService) Issue(payload AcmeIssuePayload) (*AcmeActionResult, error)
 		return nil, err
 	}
 	manualDNSAccountCommitted = manualDNSAccountID == 0 || certEntry.DNSAccountID == manualDNSAccountID
-	certEntry.LastOutput = strings.TrimSpace(output)
+	certEntry.LastOutput = truncateAcmeStoredOutput(output)
 	if err := database.GetDB().Save(certEntry).Error; err != nil {
 		logSession.fail(err.Error())
 		return nil, err
@@ -1790,6 +2039,13 @@ func (s *AcmeService) Renew(payload AcmeRenewPayload) (*AcmeActionResult, error)
 		_ = s.markCertificateError(row.Id, err.Error())
 		return nil, err
 	}
+	if challenge == "dns" {
+		if err := ensureAcmeDNSProviderScript(homeDir, dnsProvider); err != nil {
+			logSession.fail(err.Error())
+			_ = s.markCertificateError(row.Id, err.Error())
+			return nil, err
+		}
+	}
 
 	var tempFirewall *acmeTemporaryFirewallRule
 	if !useDNSChallenge && isAcmePortChallenge(challenge) && challengeDecision.Port > 0 {
@@ -1901,7 +2157,7 @@ func (s *AcmeService) Renew(payload AcmeRenewPayload) (*AcmeActionResult, error)
 	if err != nil {
 		return nil, err
 	}
-	updated.LastOutput = strings.TrimSpace(output)
+	updated.LastOutput = truncateAcmeStoredOutput(output)
 	if err := database.GetDB().Save(updated).Error; err != nil {
 		return nil, err
 	}
@@ -3310,7 +3566,16 @@ func (s *AcmeService) cleanupNonDNSCertificateDNSReferences() error {
 func (s *AcmeService) scrubLegacyAcmeCertificateRuntimeFields() error {
 	db := database.GetDB()
 	rows := make([]model.CertificateRecord, 0)
-	if err := db.Where("source_type = ?", CertificateSourceACME).Find(&rows).Error; err != nil {
+	if err := db.Select(
+		"id",
+		"acme_home",
+		"dns_env_text",
+		"renew_config",
+		"cert_path",
+		"key_path",
+		"fullchain_path",
+		"chain_path",
+	).Where("source_type = ?", CertificateSourceACME).Find(&rows).Error; err != nil {
 		return err
 	}
 
@@ -5915,6 +6180,32 @@ func lookupAcmeDNSProvider(code string) (AcmeDNSProviderMeta, bool) {
 	return AcmeDNSProviderMeta{}, false
 }
 
+// ensureAcmeDNSProviderScript surfaces an actionable error before acme.sh
+// starts a DNS-01 command with an installation that lacks the provider script.
+func ensureAcmeDNSProviderScript(homeDir string, providerCode string) error {
+	provider, known := lookupAcmeDNSProvider(providerCode)
+	if !known {
+		// Custom dnsapi providers retain acme.sh's existing compatibility path.
+		return nil
+	}
+
+	homeDir = strings.TrimSpace(homeDir)
+	if homeDir == "" {
+		return common.NewError("无法确认 acme.sh 的 DNS API 目录，请重新安装或升级 acme.sh 后重试")
+	}
+
+	scriptPath := filepath.Join(homeDir, "dnsapi", provider.ProviderCode+".sh")
+	info, err := os.Stat(scriptPath)
+	if err == nil && !info.IsDir() {
+		return nil
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return common.NewError("检查 acme.sh DNS API 脚本失败: ", err)
+	}
+
+	return common.NewError("当前安装的 acme.sh 不包含 ", provider.ProviderCode, " DNS API 脚本；请升级 acme.sh 后重试")
+}
+
 func parseAcmeEnvJSON(raw string) (map[string]string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -6083,6 +6374,7 @@ func isAcmeSecretEnvKey(key string) bool {
 		strings.Contains(key, "secret") ||
 		strings.Contains(key, "password") ||
 		strings.Contains(key, "private_key") ||
+		strings.Contains(key, "key_file") ||
 		strings.Contains(key, "access_key") ||
 		strings.Contains(key, "api_key") ||
 		strings.HasSuffix(key, "_key") ||
@@ -6106,6 +6398,44 @@ func validateDNSProviderEnv(provider AcmeDNSProviderMeta, env map[string]string)
 		legacyMode := email != "" && key != ""
 		if !tokenMode && !legacyMode {
 			return common.NewError("Cloudflare DNS 需填写以下其一：CF_Token，或 CF_Email + CF_Key")
+		}
+		return nil
+	case "dns_azure":
+		if trim("AZUREDNS_SUBSCRIPTIONID") == "" {
+			return common.NewError("Azure DNS 必须填写 AZUREDNS_SUBSCRIPTIONID")
+		}
+		if strings.EqualFold(trim("AZUREDNS_MANAGEDIDENTITY"), "true") {
+			return nil
+		}
+		if trim("AZUREDNS_BEARERTOKEN") != "" {
+			return nil
+		}
+		if trim("AZUREDNS_TENANTID") == "" || trim("AZUREDNS_APPID") == "" || trim("AZUREDNS_CLIENTSECRET") == "" {
+			return common.NewError("Azure DNS 需使用 Managed Identity、Bearer Token，或同时填写 AZUREDNS_TENANTID、AZUREDNS_APPID、AZUREDNS_CLIENTSECRET")
+		}
+		return nil
+	case "dns_gandi_livedns":
+		if trim("GANDI_LIVEDNS_TOKEN") == "" && trim("GANDI_LIVEDNS_KEY") == "" {
+			return common.NewError("Gandi LiveDNS 需填写 GANDI_LIVEDNS_TOKEN（推荐）或旧版 GANDI_LIVEDNS_KEY")
+		}
+		return nil
+	case "dns_cloudns":
+		if trim("CLOUDNS_AUTH_ID") == "" && trim("CLOUDNS_SUB_AUTH_ID") == "" {
+			return common.NewError("ClouDNS 需填写 CLOUDNS_AUTH_ID 或 CLOUDNS_SUB_AUTH_ID")
+		}
+		if trim("CLOUDNS_AUTH_PASSWORD") == "" {
+			return common.NewError("ClouDNS 必须填写 CLOUDNS_AUTH_PASSWORD")
+		}
+		return nil
+	case "dns_yc":
+		if trim("YC_Zone_ID") == "" && trim("YC_Folder_ID") == "" {
+			return common.NewError("Yandex Cloud DNS 需填写 YC_Zone_ID 或 YC_Folder_ID")
+		}
+		if trim("YC_SA_ID") == "" || trim("YC_SA_Key_ID") == "" {
+			return common.NewError("Yandex Cloud DNS 必须填写 YC_SA_ID 与 YC_SA_Key_ID")
+		}
+		if trim("YC_SA_Key_File_Path") == "" && trim("YC_SA_Key_File_PEM_b64") == "" {
+			return common.NewError("Yandex Cloud DNS 需填写 RSA 私钥文件路径或 YC_SA_Key_File_PEM_b64")
 		}
 		return nil
 	case "dns_aws":
@@ -7898,7 +8228,7 @@ func runCommandOutputWithTimeoutEnvContextLogInDir(parent context.Context, timeo
 	}
 	PrepareKworManagedCommandContext(parent, cmd)
 
-	var output strings.Builder
+	var output boundedAcmeOutput
 	var outputMu sync.Mutex
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -7924,12 +8254,11 @@ func runCommandOutputWithTimeoutEnvContextLogInDir(parent context.Context, timeo
 	collect := func(reader io.Reader) {
 		defer wg.Done()
 		scanner := bufio.NewScanner(reader)
-		scanner.Buffer(make([]byte, 1024), 1024*1024)
+		scanner.Buffer(make([]byte, 1024), acmeCommandOutputLineMaxBytes)
 		for scanner.Scan() {
 			line := redactAcmeCommandOutput(strings.TrimRight(scanner.Text(), "\r"), envPairs)
 			outputMu.Lock()
-			output.WriteString(line)
-			output.WriteString("\n")
+			output.AppendLine(line)
 			outputMu.Unlock()
 			if logSession != nil {
 				logSession.append(line)
@@ -7958,12 +8287,72 @@ func runCommandOutputWithTimeoutEnvContextLogInDir(parent context.Context, timeo
 		if text == "" {
 			return "", err
 		}
-		return "", fmt.Errorf("%w: %s", err, text)
+		return "", fmt.Errorf("%w: %s", err, truncateAcmeTextByBytes(text, acmeCommandErrorMaxBytes))
 	}
 	outputMu.Lock()
 	text := output.String()
 	outputMu.Unlock()
 	return text, nil
+}
+
+type boundedAcmeOutput struct {
+	builder    strings.Builder
+	truncated  bool
+	byteLength int
+}
+
+func (b *boundedAcmeOutput) AppendLine(line string) {
+	if b == nil || b.truncated {
+		return
+	}
+	remaining := acmeCommandOutputMaxBytes - b.byteLength
+	if remaining <= 0 {
+		b.truncated = true
+		return
+	}
+	line += "\n"
+	if len(line) > remaining {
+		truncated := truncateAcmeTextByBytes(line, remaining)
+		b.builder.WriteString(truncated)
+		b.byteLength += len(truncated)
+		b.truncated = true
+		return
+	}
+	b.builder.WriteString(line)
+	b.byteLength += len(line)
+}
+
+func (b *boundedAcmeOutput) String() string {
+	if b == nil {
+		return ""
+	}
+	value := b.builder.String()
+	if !b.truncated {
+		return value
+	}
+	return value + "\n... command output truncated after 512 KiB"
+}
+
+func truncateAcmeStoredOutput(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= acmeStoredOutputMaxBytes {
+		return value
+	}
+	return strings.TrimSpace(truncateAcmeTextByBytes(value, acmeStoredOutputMaxBytes)) + "\n... 历史命令输出已截断（最多 128 KiB）"
+}
+
+func truncateAcmeTextByBytes(value string, maxBytes int) string {
+	if maxBytes <= 0 || value == "" {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut]
 }
 
 type acmeLogStore struct {
@@ -7976,6 +8365,8 @@ type acmeLogSession struct {
 	title      string
 	status     string
 	lines      []string
+	lineBytes  int
+	truncated  bool
 	errText    string
 	taskID     string
 	taskStatus string
@@ -8136,6 +8527,10 @@ func (s *acmeLogStore) setTaskState(logSessionID string, taskID string, status s
 }
 
 func (s *acmeLogStore) get(id string) *AcmeLogSessionView {
+	return s.getAfter(id, -1)
+}
+
+func (s *acmeLogStore) getAfter(id string, after int) *AcmeLogSessionView {
 	id = strings.TrimSpace(id)
 	now := time.Now().Unix()
 	s.mu.Lock()
@@ -8149,11 +8544,13 @@ func (s *acmeLogStore) get(id string) *AcmeLogSessionView {
 			Title:     "ACME 任务",
 			Status:    "missing",
 			Lines:     []string{"log session not found"},
+			LineStart: 0,
+			LineNext:  1,
 			StartedAt: now,
 			UpdatedAt: now,
 		}
 	}
-	return session.snapshotLocked()
+	return session.snapshotAfterLocked(after)
 }
 
 func (s *acmeLogStore) pruneLocked(now int64) {
@@ -8166,16 +8563,9 @@ func (s *acmeLogStore) pruneLocked(now int64) {
 }
 
 func (s *acmeLogSession) append(line string) {
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return
-	}
 	acmeLogSessionStore.mu.Lock()
 	defer acmeLogSessionStore.mu.Unlock()
-	s.lines = append(s.lines, line)
-	if len(s.lines) > acmeLogMaxLines {
-		s.lines = append([]string{"日志过长，已隐藏较早输出"}, s.lines[len(s.lines)-acmeLogMaxLines:]...)
-	}
+	s.appendLocked(line)
 	s.updatedAt = time.Now().Unix()
 }
 
@@ -8209,19 +8599,41 @@ func (s *acmeLogSession) appendLocked(line string) {
 	if line == "" {
 		return
 	}
-	s.lines = append(s.lines, line)
-	if len(s.lines) > acmeLogMaxLines {
-		s.lines = append([]string{"日志过长，已隐藏较早输出"}, s.lines[len(s.lines)-acmeLogMaxLines:]...)
+	if len(line) > acmeLogMaxLineBytes {
+		const suffix = "... 单行日志已截断"
+		line = truncateAcmeTextByBytes(line, acmeLogMaxLineBytes-len(suffix)) + suffix
 	}
+	if s.truncated {
+		return
+	}
+	lineBytes := len(line)
+	if len(s.lines) >= acmeLogMaxLines || s.lineBytes+lineBytes > acmeLogMaxBytes {
+		s.lines = []string{"日志过长，后续输出已截断"}
+		s.lineBytes = len(s.lines[0])
+		s.truncated = true
+		return
+	}
+	s.lines = append(s.lines, line)
+	s.lineBytes += lineBytes
 }
 
 func (s *acmeLogSession) snapshotLocked() *AcmeLogSessionView {
-	lines := append([]string(nil), s.lines...)
+	return s.snapshotAfterLocked(-1)
+}
+
+func (s *acmeLogSession) snapshotAfterLocked(after int) *AcmeLogSessionView {
+	start := 0
+	if after >= 0 && after <= len(s.lines) {
+		start = after
+	}
+	lines := append([]string(nil), s.lines[start:]...)
 	return &AcmeLogSessionView{
 		Id:         s.id,
 		Title:      s.title,
 		Status:     s.status,
 		Lines:      lines,
+		LineStart:  start,
+		LineNext:   len(s.lines),
 		Error:      s.errText,
 		TaskID:     s.taskID,
 		TaskStatus: s.taskStatus,

@@ -153,3 +153,38 @@ func cleanupManagedCoreInstallWorkspaceArtifacts(coreDir string, binName string)
 	}
 	return nil
 }
+
+// CleanupStaleManagedCoreRuntimeWorkspacesOnStartup removes only abandoned
+// installation workspaces from a previous interrupted panel process. Core
+// binaries, managed configurations and user-provided auxiliary files are not
+// part of this cleanup.
+func CleanupStaleManagedCoreRuntimeWorkspacesOnStartup() error {
+	return cleanupStaleManagedCoreRuntimeWorkspaces(
+		GetSingboxCoreDir(),
+		GetMihomoCoreDir(),
+	)
+}
+
+func cleanupStaleManagedCoreRuntimeWorkspaces(singboxCoreDir string, mihomoCoreDir string) error {
+	var cleanupErrors []error
+
+	if err := cleanupStaleManagedCoreInstallWorkspaces(
+		singboxCoreDir,
+		"extract_tmp_",
+		singboxCoreInstallStagePrefix,
+		singboxCoreInstallBackupPrefix,
+	); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("cleanup stale sing-box workspaces: %w", err))
+	}
+
+	if err := cleanupStaleManagedCoreInstallWorkspaces(
+		mihomoCoreDir,
+		"extract_tmp_",
+		mihomoCoreInstallStagePrefix,
+		mihomoCoreInstallBackupPrefix,
+	); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("cleanup stale mihomo workspaces: %w", err))
+	}
+
+	return errors.Join(cleanupErrors...)
+}

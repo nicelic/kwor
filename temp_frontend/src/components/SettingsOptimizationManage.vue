@@ -1,5 +1,29 @@
 <template>
   <section class="opt-page">
+    <v-alert
+      v-if="pageLoadError"
+      type="error"
+      variant="tonal"
+      density="comfortable"
+      class="mb-4">
+      <div class="d-flex align-center justify-space-between flex-wrap ga-3">
+        <span>{{ pageLoadError }}</span>
+        <v-btn variant="text" prepend-icon="mdi-refresh" :loading="pageLoading" @click="refreshAll">
+          重新加载
+        </v-btn>
+      </div>
+    </v-alert>
+    <v-alert
+      v-else-if="!pageReady"
+      type="info"
+      variant="tonal"
+      density="comfortable"
+      class="mb-4">
+      <div class="d-flex align-center ga-2">
+        <v-progress-circular indeterminate size="18" width="2" />
+        <span>正在读取系统优化概览</span>
+      </div>
+    </v-alert>
     <v-row class="mt-1">
       <v-col cols="12" md="4">
         <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-cyan">
@@ -12,7 +36,7 @@
             <v-switch
               :model-value="logOverview.enabled"
               :loading="switchingLog"
-              :disabled="loadingLog || switchingLog || !logOverview.supported"
+              :disabled="overviewInteractionDisabled || !logLoaded || loadingLog || switchingLog || !logOverview.supported"
               color="success"
               inset
               hide-details
@@ -36,7 +60,7 @@
             <v-btn
               color="primary"
               prepend-icon="mdi-file-document-edit-outline"
-              :disabled="loadingLog || !logOverview.supported"
+              :disabled="overviewInteractionDisabled || !logLoaded || loadingLog || !logOverview.supported"
               @click="openLogEditor">
               编辑
             </v-btn>
@@ -85,7 +109,7 @@
             <v-switch
               :model-value="sysctlOverview.enabled"
               :loading="switchingSysctl"
-              :disabled="loadingSysctl || switchingSysctl || !sysctlOverview.supported"
+              :disabled="overviewInteractionDisabled || !sysctlLoaded || loadingSysctl || switchingSysctl || !sysctlOverview.supported"
               color="success"
               inset
               hide-details
@@ -109,7 +133,7 @@
             <v-btn
               color="primary"
               prepend-icon="mdi-tune-variant"
-              :disabled="loadingSysctl || !sysctlOverview.supported"
+              :disabled="overviewInteractionDisabled || !sysctlLoaded || loadingSysctl || !sysctlOverview.supported"
               @click="openSysctlEditor">
               编辑
             </v-btn>
@@ -188,7 +212,7 @@
             <v-btn
               color="primary"
               prepend-icon="mdi-dns"
-              :disabled="loadingDns || !dnsOverview.supported"
+              :disabled="overviewInteractionDisabled || !dnsLoaded || loadingDns || !dnsOverview.supported"
               @click="openDnsEditor">
               编辑
             </v-btn>
@@ -208,18 +232,20 @@
             </div>
             <div class="dns-quick-layout">
               <v-textarea
-                v-model="dnsNameServerInput"
+                :model-value="dnsNameServerInput"
                 label="DNS 地址（支持空格/换行混合）"
                 variant="outlined"
                 :rows="getDnsNameServerRows()"
-                auto-grow
+                :maxlength="DNS_INPUT_MAX_LENGTH"
+                :disabled="overviewInteractionDisabled || !dnsLoaded || loadingDns || savingDnsNameServers || !dnsOverview.supported"
+                @update:model-value="updateDnsNameServerInput"
                 class="dns-quick-input" />
               <div class="dns-quick-action">
                 <v-btn
                   color="primary"
                   block
                   :loading="savingDnsNameServers"
-                  :disabled="loadingDns || savingDnsNameServers || !dnsOverview.supported"
+                  :disabled="overviewInteractionDisabled || !dnsLoaded || loadingDns || savingDnsNameServers || !dnsOverview.supported"
                   @click="saveDnsNameServers">
                   保存
                 </v-btn>
@@ -251,7 +277,7 @@
             <v-switch
               :model-value="mtuOverview.enabled"
               :loading="switchingMtu"
-              :disabled="loadingMtu || switchingMtu || (!mtuOverview.supported && !mtuOverview.enabled)"
+              :disabled="overviewInteractionDisabled || !mtuLoaded || loadingMtu || switchingMtu || (!mtuOverview.supported && !mtuOverview.enabled)"
               color="success"
               inset
               hide-details
@@ -281,13 +307,14 @@
                 max="9500"
                 variant="outlined"
                 hide-details
+                :disabled="overviewInteractionDisabled || !mtuLoaded || loadingMtu || switchingMtu || (!mtuOverview.supported && !mtuOverview.enabled)"
                 class="dns-quick-input" />
               <div class="dns-quick-action">
                 <v-btn
                   color="primary"
                   block
                   :loading="savingMtu"
-                  :disabled="!canSaveMtu"
+                  :disabled="overviewInteractionDisabled || !canSaveMtu"
                   @click="saveMtu">
                   保存
                 </v-btn>
@@ -303,7 +330,12 @@
       </v-col>
     </v-row>
 
-    <v-dialog v-model="logDialogVisible" max-width="980">
+    <v-dialog
+      v-model="logDialogVisible"
+      max-width="980"
+      :fullscreen="smAndDown"
+      scrollable
+      :persistent="savingLog || resettingLog">
       <v-card rounded="xl">
         <v-card-title class="text-subtitle-1 font-weight-medium">编辑 journald 配置</v-card-title>
         <v-divider />
@@ -315,20 +347,25 @@
             hide-details
             class="mb-3" />
           <v-textarea
-            v-model="logEditorContent"
+            :model-value="logEditorContent"
             label="配置内容"
             variant="outlined"
             rows="14"
-            auto-grow
+            :maxlength="OPTIMIZATION_CONTENT_MAX_LENGTH"
+            :readonly="savingLog || resettingLog"
+            @update:model-value="updateLogEditorContent"
             class="opt-editor" />
+          <div class="text-caption text-medium-emphasis mt-1">
+            UTF-8 字节：{{ formatUtf8ByteCount(logEditorContent) }}
+          </div>
           <div class="text-caption text-medium-emphasis mt-2">
             保存时会执行：chattr -i -> 删除旧文件并重建 -> 写入并校验 -> chattr +i -> 重启 journald（即使内容未变也会完整执行）。
           </div>
         </v-card-text>
         <v-divider />
-        <v-card-actions>
+        <v-card-actions class="opt-editor-actions">
           <v-spacer />
-          <v-btn variant="text" @click="closeLogEditor">取消</v-btn>
+          <v-btn variant="text" :disabled="savingLog || resettingLog" @click="closeLogEditor">取消</v-btn>
           <v-btn
             color="warning"
             variant="outlined"
@@ -340,7 +377,7 @@
           <v-btn
             color="primary"
             :loading="savingLog"
-            :disabled="savingLog || resettingLog || logEditorContent.trim().length === 0"
+            :disabled="savingLog || resettingLog || !hasOptimizationContentWithinLimit(logEditorContent)"
             @click="saveLogContent">
             保存
           </v-btn>
@@ -348,7 +385,12 @@
       </v-card>
     </v-dialog>
 
-    <v-dialog v-model="sysctlDialogVisible" max-width="980">
+    <v-dialog
+      v-model="sysctlDialogVisible"
+      max-width="980"
+      :fullscreen="smAndDown"
+      scrollable
+      :persistent="savingSysctl || resettingSysctl">
       <v-card rounded="xl">
         <v-card-title class="text-subtitle-1 font-weight-medium">编辑 sysctl 配置</v-card-title>
         <v-divider />
@@ -360,20 +402,25 @@
             hide-details
             class="mb-3" />
           <v-textarea
-            v-model="sysctlEditorContent"
+            :model-value="sysctlEditorContent"
             label="配置内容"
             variant="outlined"
             rows="14"
-            auto-grow
+            :maxlength="OPTIMIZATION_CONTENT_MAX_LENGTH"
+            :readonly="savingSysctl || resettingSysctl"
+            @update:model-value="updateSysctlEditorContent"
             class="opt-editor" />
+          <div class="text-caption text-medium-emphasis mt-1">
+            UTF-8 字节：{{ formatUtf8ByteCount(sysctlEditorContent) }}
+          </div>
           <div class="text-caption text-medium-emphasis mt-2">
             保存时会执行：两处文件 chattr -i -> 删除旧文件并重建 -> 写入并校验 -> chattr +i -> 按系统可用命令应用 sysctl 参数（即使内容未变也会完整执行）。
           </div>
         </v-card-text>
         <v-divider />
-        <v-card-actions>
+        <v-card-actions class="opt-editor-actions">
           <v-spacer />
-          <v-btn variant="text" @click="closeSysctlEditor">取消</v-btn>
+          <v-btn variant="text" :disabled="savingSysctl || resettingSysctl" @click="closeSysctlEditor">取消</v-btn>
           <v-btn
             color="warning"
             variant="outlined"
@@ -385,7 +432,7 @@
           <v-btn
             color="primary"
             :loading="savingSysctl"
-            :disabled="savingSysctl || resettingSysctl || sysctlEditorContent.trim().length === 0"
+            :disabled="savingSysctl || resettingSysctl || !hasOptimizationContentWithinLimit(sysctlEditorContent)"
             @click="saveSysctlContent">
             保存
           </v-btn>
@@ -393,7 +440,12 @@
       </v-card>
     </v-dialog>
 
-    <v-dialog v-model="dnsDialogVisible" max-width="980">
+    <v-dialog
+      v-model="dnsDialogVisible"
+      max-width="980"
+      :fullscreen="smAndDown"
+      scrollable
+      :persistent="savingDns">
       <v-card rounded="xl">
         <v-card-title class="text-subtitle-1 font-weight-medium">编辑 Linux DNS（resolv.conf）</v-card-title>
         <v-divider />
@@ -405,24 +457,29 @@
             hide-details
             class="mb-3" />
           <v-textarea
-            v-model="dnsEditorContent"
+            :model-value="dnsEditorContent"
             label="配置内容"
             variant="outlined"
             rows="14"
-            auto-grow
+            :maxlength="OPTIMIZATION_CONTENT_MAX_LENGTH"
+            :readonly="savingDns"
+            @update:model-value="updateDnsEditorContent"
             class="opt-editor" />
+          <div class="text-caption text-medium-emphasis mt-1">
+            UTF-8 字节：{{ formatUtf8ByteCount(dnsEditorContent) }}
+          </div>
           <div class="text-caption text-medium-emphasis mt-2">
             保存时会执行：chattr -i -> 删除旧文件并重建 -> 写入并校验 -> chattr +i（即使内容未变也会完整执行）。
           </div>
         </v-card-text>
         <v-divider />
-        <v-card-actions>
+        <v-card-actions class="opt-editor-actions">
           <v-spacer />
-          <v-btn variant="text" @click="closeDnsEditor">取消</v-btn>
+          <v-btn variant="text" :disabled="savingDns" @click="closeDnsEditor">取消</v-btn>
           <v-btn
             color="primary"
             :loading="savingDns"
-            :disabled="savingDns || dnsEditorContent.trim().length === 0"
+            :disabled="savingDns || !hasOptimizationContentWithinLimit(dnsEditorContent)"
             @click="saveDnsContent">
             保存
           </v-btn>
@@ -436,6 +493,7 @@
 import HttpUtils from '@/plugins/httputil'
 import { computed, ref, watch } from 'vue'
 import { push } from 'notivue'
+import { useDisplay } from 'vuetify'
 
 type OptimizationOverview = {
   supported: boolean
@@ -471,6 +529,8 @@ const props = withDefaults(defineProps<{
 }>(), {
   active: false,
 })
+
+const { smAndDown } = useDisplay()
 
 const logOverview = ref<OptimizationOverview>({
   supported: false,
@@ -526,6 +586,7 @@ const mtuOverview = ref<MTUOptimizationOverview>({
 })
 
 const loadingLog = ref(false)
+const logLoaded = ref(false)
 const switchingLog = ref(false)
 const logDialogVisible = ref(false)
 const savingLog = ref(false)
@@ -533,6 +594,7 @@ const resettingLog = ref(false)
 const logEditorContent = ref('')
 
 const loadingSysctl = ref(false)
+const sysctlLoaded = ref(false)
 const switchingSysctl = ref(false)
 const sysctlDialogVisible = ref(false)
 const savingSysctl = ref(false)
@@ -540,6 +602,7 @@ const resettingSysctl = ref(false)
 const sysctlEditorContent = ref('')
 
 const loadingDns = ref(false)
+const dnsLoaded = ref(false)
 const dnsDialogVisible = ref(false)
 const savingDns = ref(false)
 const dnsEditorContent = ref('')
@@ -547,14 +610,48 @@ const savingDnsNameServers = ref(false)
 const dnsNameServerInput = ref('')
 
 const loadingMtu = ref(false)
+const mtuLoaded = ref(false)
 const switchingMtu = ref(false)
 const savingMtu = ref(false)
 const mtuInput = ref('')
 
-const logRefreshFlight = ref<Promise<void> | null>(null)
-const sysctlRefreshFlight = ref<Promise<void> | null>(null)
-const dnsRefreshFlight = ref<Promise<void> | null>(null)
-const mtuRefreshFlight = ref<Promise<void> | null>(null)
+const logLoadError = ref('')
+const sysctlLoadError = ref('')
+const dnsLoadError = ref('')
+const mtuLoadError = ref('')
+
+const pageLoading = computed(() => (
+  loadingLog.value || loadingSysctl.value || loadingDns.value || loadingMtu.value
+))
+const pageReady = computed(() => (
+  logLoaded.value && sysctlLoaded.value && dnsLoaded.value && mtuLoaded.value
+))
+const optimizationMutationBusy = computed(() => (
+  switchingLog.value
+  || savingLog.value
+  || resettingLog.value
+  || switchingSysctl.value
+  || savingSysctl.value
+  || resettingSysctl.value
+  || savingDns.value
+  || savingDnsNameServers.value
+  || switchingMtu.value
+  || savingMtu.value
+))
+const overviewInteractionDisabled = computed(() => (
+  !pageReady.value || pageLoading.value || optimizationMutationBusy.value || Boolean(pageLoadError.value)
+))
+const pageLoadError = computed(() => [
+  logLoadError.value,
+  sysctlLoadError.value,
+  dnsLoadError.value,
+  mtuLoadError.value,
+].filter((value): value is string => Boolean(value && value.trim())).join('；'))
+
+const logRefreshFlight = ref<Promise<boolean> | null>(null)
+const sysctlRefreshFlight = ref<Promise<boolean> | null>(null)
+const dnsRefreshFlight = ref<Promise<boolean> | null>(null)
+const mtuRefreshFlight = ref<Promise<boolean> | null>(null)
 
 const readString = (raw: Record<string, unknown>, key: string, fallback = ''): string => {
   const value = raw[key]
@@ -584,12 +681,14 @@ const readStringArray = (raw: Record<string, unknown>, key: string): string[] =>
 
 const readInt = (raw: Record<string, unknown>, key: string, fallback = 0): number => {
   const value = raw[key]
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return Math.trunc(value)
+  if (typeof value === 'number' && Number.isSafeInteger(value)) {
+    return value
   }
   if (typeof value === 'string') {
-    const parsed = Number.parseInt(value.trim(), 10)
-    if (Number.isFinite(parsed)) {
+    const normalized = value.trim()
+    if (!/^-?\d+$/.test(normalized)) return fallback
+    const parsed = Number(normalized)
+    if (Number.isSafeInteger(parsed)) {
       return parsed
     }
   }
@@ -659,7 +758,9 @@ const applyDnsOverview = (raw: unknown) => {
   const next = normalizeOverview(raw)
   dnsOverview.value = next
   dnsNameServerInput.value = next.nameServersInput || next.nameServers.join(' ')
-  dnsEditorContent.value = next.content
+  if (!dnsDialogVisible.value) {
+    dnsEditorContent.value = next.content
+  }
 }
 
 const applyMtuOverview = (raw: unknown) => {
@@ -669,7 +770,7 @@ const applyMtuOverview = (raw: unknown) => {
   mtuInput.value = String(nextInputValue)
 }
 
-const refreshLogOverview = async () => {
+const refreshLogOverview = async (): Promise<boolean> => {
   if (logRefreshFlight.value) {
     return logRefreshFlight.value
   }
@@ -678,9 +779,16 @@ const refreshLogOverview = async () => {
     loadingLog.value = true
     try {
       const msg = await HttpUtils.get('api/system-log-optimization-overview')
-      if (msg.success) {
+      if (msg.success && msg.obj) {
         applyLogOverview(msg.obj)
+        logLoaded.value = true
+        logLoadError.value = ''
+        return true
+      } else {
+        const message = msg.msg || '系统日志概览加载失败'
+        logLoadError.value = message
       }
+      return false
     } finally {
       loadingLog.value = false
     }
@@ -693,7 +801,7 @@ const refreshLogOverview = async () => {
   return logRefreshFlight.value
 }
 
-const refreshSysctlOverview = async () => {
+const refreshSysctlOverview = async (): Promise<boolean> => {
   if (sysctlRefreshFlight.value) {
     return sysctlRefreshFlight.value
   }
@@ -702,9 +810,16 @@ const refreshSysctlOverview = async () => {
     loadingSysctl.value = true
     try {
       const msg = await HttpUtils.get('api/system-sysctl-optimization-overview')
-      if (msg.success) {
+      if (msg.success && msg.obj) {
         applySysctlOverview(msg.obj)
+        sysctlLoaded.value = true
+        sysctlLoadError.value = ''
+        return true
+      } else {
+        const message = msg.msg || 'sysctl 概览加载失败'
+        sysctlLoadError.value = message
       }
+      return false
     } finally {
       loadingSysctl.value = false
     }
@@ -717,7 +832,7 @@ const refreshSysctlOverview = async () => {
   return sysctlRefreshFlight.value
 }
 
-const refreshDnsOverview = async () => {
+const refreshDnsOverview = async (): Promise<boolean> => {
   if (dnsRefreshFlight.value) {
     return dnsRefreshFlight.value
   }
@@ -726,9 +841,16 @@ const refreshDnsOverview = async () => {
     loadingDns.value = true
     try {
       const msg = await HttpUtils.get('api/system-linux-dns-optimization-overview')
-      if (msg.success) {
+      if (msg.success && msg.obj) {
         applyDnsOverview(msg.obj)
+        dnsLoaded.value = true
+        dnsLoadError.value = ''
+        return true
+      } else {
+        const message = msg.msg || 'Linux DNS 概览加载失败'
+        dnsLoadError.value = message
       }
+      return false
     } finally {
       loadingDns.value = false
     }
@@ -741,7 +863,7 @@ const refreshDnsOverview = async () => {
   return dnsRefreshFlight.value
 }
 
-const refreshMtuOverview = async () => {
+const refreshMtuOverview = async (): Promise<boolean> => {
   if (mtuRefreshFlight.value) {
     return mtuRefreshFlight.value
   }
@@ -750,9 +872,16 @@ const refreshMtuOverview = async () => {
     loadingMtu.value = true
     try {
       const msg = await HttpUtils.get('api/system-mtu-optimization-overview')
-      if (msg.success) {
+      if (msg.success && msg.obj) {
         applyMtuOverview(msg.obj)
+        mtuLoaded.value = true
+        mtuLoadError.value = ''
+        return true
+      } else {
+        const message = msg.msg || 'MTU 概览加载失败'
+        mtuLoadError.value = message
       }
+      return false
     } finally {
       loadingMtu.value = false
     }
@@ -767,6 +896,50 @@ const refreshMtuOverview = async () => {
 
 const MTU_MIN = 576
 const MTU_MAX = 9500
+const OPTIMIZATION_CONTENT_MAX_LENGTH = 256 * 1024
+const DNS_INPUT_MAX_LENGTH = 16 * 1024
+const textEncoder = new TextEncoder()
+
+const utf8ByteLength = (value: string): number => textEncoder.encode(value).byteLength
+
+const formatUtf8ByteCount = (value: string): string => (
+  `${utf8ByteLength(value)} / ${OPTIMIZATION_CONTENT_MAX_LENGTH} 字节`
+)
+
+const limitUtf8Input = (raw: unknown, maxBytes: number): string => {
+  const value = typeof raw === 'string' ? raw : ''
+  if (utf8ByteLength(value) <= maxBytes) {
+    return value
+  }
+
+  let result = ''
+  let usedBytes = 0
+  for (const char of value) {
+    const charBytes = utf8ByteLength(char)
+    if (usedBytes + charBytes > maxBytes) {
+      break
+    }
+    result += char
+    usedBytes += charBytes
+  }
+  return result
+}
+
+const updateLogEditorContent = (value: unknown) => {
+  logEditorContent.value = limitUtf8Input(value, OPTIMIZATION_CONTENT_MAX_LENGTH)
+}
+
+const updateSysctlEditorContent = (value: unknown) => {
+  sysctlEditorContent.value = limitUtf8Input(value, OPTIMIZATION_CONTENT_MAX_LENGTH)
+}
+
+const updateDnsEditorContent = (value: unknown) => {
+  dnsEditorContent.value = limitUtf8Input(value, OPTIMIZATION_CONTENT_MAX_LENGTH)
+}
+
+const updateDnsNameServerInput = (value: unknown) => {
+  dnsNameServerInput.value = limitUtf8Input(value, DNS_INPUT_MAX_LENGTH)
+}
 
 const hasToastMessage = (message: unknown): boolean => {
   return typeof message === 'string' && message.trim().length > 0
@@ -788,21 +961,28 @@ const notifyQuickSaveResult = (scope: 'DNS' | 'MTU', success: boolean, rawMessag
 }
 
 const parseMtuInputValue = (): number | null => {
-  const parsed = Number.parseInt(mtuInput.value.trim(), 10)
-  if (!Number.isFinite(parsed)) return null
+  const raw = mtuInput.value.trim()
+  if (!/^\d+$/.test(raw)) return null
+  const parsed = Number(raw)
+  if (!Number.isSafeInteger(parsed)) return null
   if (parsed < MTU_MIN || parsed > MTU_MAX) return null
   return parsed
 }
 
+const hasOptimizationContentWithinLimit = (content: string): boolean => {
+  return content.trim().length > 0 && utf8ByteLength(content) <= OPTIMIZATION_CONTENT_MAX_LENGTH
+}
+
 const formatMtuValue = (value: number): string => {
-  if (!Number.isFinite(value) || value <= 0) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
     return '-'
   }
-  return String(Math.trunc(value))
+  return String(value)
 }
 
 const canSaveMtu = computed(() => {
   return (
+    mtuLoaded.value &&
     mtuOverview.value.supported &&
     mtuOverview.value.enabled &&
     !loadingMtu.value &&
@@ -839,15 +1019,18 @@ const onToggleSysctlSwitch = async (value: unknown) => {
 
 const onToggleMtuSwitch = async (value: unknown) => {
   const enabled = Boolean(value)
+  const payload: Record<string, unknown> = { enabled }
+  if (enabled) {
+    const parsed = parseMtuInputValue()
+    if (parsed === null) {
+      notifyQuickSaveResult('MTU', false, `MTU 必须是 ${MTU_MIN}-${MTU_MAX} 的整数`)
+      return
+    }
+    payload.mtu = parsed
+  }
+
   switchingMtu.value = true
   try {
-    const payload: Record<string, unknown> = { enabled }
-    if (enabled) {
-      const parsed = parseMtuInputValue()
-      if (parsed !== null) {
-        payload.mtu = parsed
-      }
-    }
     const msg = await HttpUtils.post('api/system-mtu-optimization-switch', payload)
     if (msg.success) {
       applyMtuOverview(msg.obj)
@@ -858,7 +1041,9 @@ const onToggleMtuSwitch = async (value: unknown) => {
 }
 
 const openLogEditor = async () => {
-  await refreshLogOverview()
+  if (overviewInteractionDisabled.value) return
+  const loaded = await refreshLogOverview()
+  if (!loaded || !logLoaded.value || !logOverview.value.supported) return
   logEditorContent.value = logOverview.value.content
   logDialogVisible.value = true
 }
@@ -896,7 +1081,9 @@ const resetLogContent = async () => {
 }
 
 const openSysctlEditor = async () => {
-  await refreshSysctlOverview()
+  if (overviewInteractionDisabled.value) return
+  const loaded = await refreshSysctlOverview()
+  if (!loaded || !sysctlLoaded.value || !sysctlOverview.value.supported) return
   sysctlEditorContent.value = sysctlOverview.value.content
   sysctlDialogVisible.value = true
 }
@@ -934,7 +1121,9 @@ const resetSysctlContent = async () => {
 }
 
 const openDnsEditor = async () => {
-  await refreshDnsOverview()
+  if (overviewInteractionDisabled.value) return
+  const loaded = await refreshDnsOverview()
+  if (!loaded || !dnsLoaded.value || !dnsOverview.value.supported) return
   dnsEditorContent.value = dnsOverview.value.content
   dnsDialogVisible.value = true
 }
@@ -970,7 +1159,7 @@ const normalizeDnsNameServerInput = (raw: string): string[] => {
 
 const getDnsNameServerRows = (): number => {
   const count = normalizeDnsNameServerInput(dnsNameServerInput.value).length
-  return Math.max(3, Math.ceil(count / 3))
+  return Math.min(6, Math.max(3, Math.ceil(count / 3)))
 }
 
 const saveDnsNameServers = async () => {
@@ -1019,8 +1208,12 @@ const saveMtu = async () => {
   }
 }
 
-const refreshAll = async () => {
-  await Promise.all([refreshLogOverview(), refreshSysctlOverview(), refreshDnsOverview(), refreshMtuOverview()])
+const refreshAll = async (): Promise<boolean> => {
+  const logReady = await refreshLogOverview()
+  const sysctlReady = await refreshSysctlOverview()
+  const dnsReady = await refreshDnsOverview()
+  const mtuReady = await refreshMtuOverview()
+  return logReady && sysctlReady && dnsReady && mtuReady
 }
 
 watch(
@@ -1110,6 +1303,27 @@ watch(
 @media (max-width: 960px) {
   .dns-quick-layout {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 599px) {
+  .opt-meta__row {
+    align-items: flex-start;
+  }
+
+  .opt-meta__row strong {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    text-align: right;
+  }
+
+  .opt-editor-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  .opt-editor-actions :deep(.v-spacer) {
+    display: none;
   }
 }
 

@@ -14,7 +14,7 @@ import (
 
 // MihomoClientPortBlockService manages mihomo port-level nftables access blocks.
 // It blocks all effective inbound-facing ports for depleted users,
-// including listen ports and redirect ranges (HY1/HY2/Mieru).
+// including listen ports and supported redirect ranges (HY2/Mieru).
 type MihomoClientPortBlockService struct{}
 
 func (s *MihomoClientPortBlockService) IsNftTableReady() bool {
@@ -37,18 +37,40 @@ func (s *MihomoClientPortBlockService) EnsureRuleIntegrity() error {
 	if !(&MihomoCoreManagerService{}).IsRunning() {
 		return nil
 	}
+	return s.EnsureRuleIntegrityWhenRunning()
+}
+
+// EnsureRuleIntegrityWhenRunning avoids another core status command when the
+// caller already confirmed Mihomo Core is running.
+func (s *MihomoClientPortBlockService) EnsureRuleIntegrityWhenRunning() error {
+	if !IsSystemPlatformLinux() || !nftSupported() {
+		return nil
+	}
 	return s.Reconcile(true)
 }
 
 func (s *MihomoClientPortBlockService) Reconcile(applyRules bool) error {
+	return s.reconcile(applyRules, true)
+}
+
+// ReconcileAfterTraffic applies newly needed block rules after a measured
+// traffic delta. Existing rules are not probed here: the Core sync job keeps
+// the full integrity scan, so the 10-second traffic loop avoids redundant nft
+// handle lookups when no rule state changed.
+func (s *MihomoClientPortBlockService) ReconcileAfterTraffic() error {
+	return s.reconcile(true, false)
+}
+
+func (s *MihomoClientPortBlockService) reconcile(applyRules bool, verifyExistingRules bool) error {
 	db := database.GetDB()
 	desired, err := s.collectDesiredBlockedPorts(db)
 	if err != nil {
 		return err
 	}
 
+	rulesChanged := false
 	if applyRules {
-		err = s.reconcileWithRules(db, desired)
+		rulesChanged, err = s.reconcileWithRules(db, desired, verifyExistingRules)
 	} else {
 		err = s.reconcileStateOnly(db, desired)
 	}
@@ -56,7 +78,7 @@ func (s *MihomoClientPortBlockService) Reconcile(applyRules bool) error {
 		return err
 	}
 
-	if applyRules && len(desired) > 0 {
+	if applyRules && rulesChanged {
 		if err := flushConntrackTable(); err != nil {
 			logger.Warning("flush conntrack after mihomo client block apply failed: ", err)
 		}
@@ -84,10 +106,6 @@ func (s *MihomoClientPortBlockService) CleanupOnShutdown() {
 }
 
 func (s *MihomoClientPortBlockService) reconcileStateOnly(tx *gorm.DB, desired map[int]clientBlockedPortSpec) error {
-	if err := deleteRulesByCommentPrefix(mihomoBlockNftRuleComments.prefix); err != nil {
-		return err
-	}
-
 	var states []model.MihomoClientPortBlockState
 	if err := tx.Find(&states).Error; err != nil {
 		return err
@@ -111,6 +129,9 @@ func (s *MihomoClientPortBlockService) reconcileStateOnly(tx *gorm.DB, desired m
 		spec := desired[port]
 		encodedRanges := encodePortRangesJSON(spec.Ranges)
 		if st, ok := existing[port]; ok {
+			if st.Tag == spec.Tag && st.PortRanges == encodedRanges && st.InHandle == 0 && st.OutHandle == 0 {
+				continue
+			}
 			if err := tx.Model(st).Updates(map[string]interface{}{
 				"tag":         spec.Tag,
 				"port_ranges": encodedRanges,
@@ -140,14 +161,27 @@ func (s *MihomoClientPortBlockService) reconcileStateOnly(tx *gorm.DB, desired m
 	return nil
 }
 
-func (s *MihomoClientPortBlockService) reconcileWithRules(tx *gorm.DB, desired map[int]clientBlockedPortSpec) error {
+func (s *MihomoClientPortBlockService) reconcileWithRules(tx *gorm.DB, desired map[int]clientBlockedPortSpec, verifyExistingRules bool) (bool, error) {
+	rulesChanged := false
 	var states []model.MihomoClientPortBlockState
 	if err := tx.Find(&states).Error; err != nil {
-		return err
+		return false, err
 	}
 	existing := make(map[int]*model.MihomoClientPortBlockState, len(states))
 	for i := range states {
 		existing[states[i].Port] = &states[i]
+	}
+	var inHandles, outHandles map[string]int
+	if verifyExistingRules {
+		var err error
+		inHandles, err = snapshotManagedRuleHandles(nftChainIn, mihomoBlockNftRuleComments.prefix)
+		if err != nil {
+			return false, err
+		}
+		outHandles, err = snapshotManagedRuleHandles(nftChainOut, mihomoBlockNftRuleComments.prefix)
+		if err != nil {
+			return false, err
+		}
 	}
 
 	for _, state := range states {
@@ -158,8 +192,12 @@ func (s *MihomoClientPortBlockService) reconcileWithRules(tx *gorm.DB, desired m
 			logger.Warning("failed to remove obsolete mihomo client block nft rules for port ", state.Port, ": ", err)
 		}
 		if err := tx.Delete(&state).Error; err != nil {
-			return err
+			return rulesChanged, err
 		}
+		portTag := strconv.Itoa(state.Port)
+		delete(inHandles, mihomoBlockNftRuleComments.in(portTag))
+		delete(outHandles, mihomoBlockNftRuleComments.out(portTag))
+		rulesChanged = true
 	}
 
 	validComments := make(map[string]struct{}, len(desired)*2)
@@ -172,16 +210,33 @@ func (s *MihomoClientPortBlockService) reconcileWithRules(tx *gorm.DB, desired m
 		encodedRanges := encodePortRangesJSON(spec.Ranges)
 
 		if st, ok := existing[port]; ok {
-			st.Tag = spec.Tag
 			desiredRanges := normalizeNftPortRanges(spec.Ranges)
 			currentRanges := decodePortRangesJSON(st.PortRanges)
 			rangesChanged := !portRangeSlicesEqual(currentRanges, desiredRanges)
-
-			if err := s.tryRecoverHandles(tx, st); err != nil {
-				logger.Warning("recover mihomo client block handles failed for port ", st.Port, ": ", err)
+			if !rangesChanged && !verifyExistingRules {
+				if st.Tag != spec.Tag || st.PortRanges != encodedRanges {
+					if err := tx.Model(st).Updates(map[string]interface{}{
+						"tag":         spec.Tag,
+						"port_ranges": encodedRanges,
+						"updated_at":  time.Now(),
+					}).Error; err != nil {
+						return rulesChanged, err
+					}
+				}
+				continue
 			}
-			inOk := ruleHandleExists(nftChainIn, st.InHandle)
-			outOk := ruleHandleExists(nftChainOut, st.OutHandle)
+
+			originalInHandle := st.InHandle
+			originalOutHandle := st.OutHandle
+			portTag := strconv.Itoa(port)
+			inHandle, inOk := inHandles[mihomoBlockNftRuleComments.in(portTag)]
+			outHandle, outOk := outHandles[mihomoBlockNftRuleComments.out(portTag)]
+			if inOk {
+				st.InHandle = inHandle
+			}
+			if outOk {
+				st.OutHandle = outHandle
+			}
 			if rangesChanged || !inOk || !outOk {
 				if err := s.removeRulesFromState(st); err != nil {
 					logger.Warning("failed to clear broken mihomo client block rules for port ", st.Port, ": ", err)
@@ -194,20 +249,25 @@ func (s *MihomoClientPortBlockService) reconcileWithRules(tx *gorm.DB, desired m
 					"out_handle":  outHandle,
 					"updated_at":  time.Now(),
 				}).Error; err != nil {
-					return err
+					return rulesChanged, err
 				}
+				rulesChanged = true
 				if ensureErr != nil {
-					return ensureErr
+					return rulesChanged, ensureErr
 				}
 				continue
 			}
 
-			if err := tx.Model(st).Updates(map[string]interface{}{
-				"tag":         spec.Tag,
-				"port_ranges": encodedRanges,
-				"updated_at":  time.Now(),
-			}).Error; err != nil {
-				return err
+			if st.Tag != spec.Tag || st.PortRanges != encodedRanges || originalInHandle != st.InHandle || originalOutHandle != st.OutHandle {
+				if err := tx.Model(st).Updates(map[string]interface{}{
+					"tag":         spec.Tag,
+					"port_ranges": encodedRanges,
+					"in_handle":   st.InHandle,
+					"out_handle":  st.OutHandle,
+					"updated_at":  time.Now(),
+				}).Error; err != nil {
+					return rulesChanged, err
+				}
 			}
 			continue
 		}
@@ -224,17 +284,22 @@ func (s *MihomoClientPortBlockService) reconcileWithRules(tx *gorm.DB, desired m
 			CreatedAt:  now,
 		}
 		if err := tx.Create(&next).Error; err != nil {
-			return err
+			return rulesChanged, err
 		}
+		rulesChanged = true
 		if ensureErr != nil {
-			return ensureErr
+			return rulesChanged, ensureErr
 		}
 	}
 
-	if err := s.cleanupOrphanRules(validComments); err != nil {
-		logger.Warning("cleanup orphan mihomo client block nft rules failed: ", err)
+	if verifyExistingRules {
+		if orphanRulesChanged, err := s.cleanupOrphanRules(validComments, inHandles, outHandles); err != nil {
+			logger.Warning("cleanup orphan mihomo client block nft rules failed: ", err)
+		} else if orphanRulesChanged {
+			rulesChanged = true
+		}
 	}
-	return nil
+	return rulesChanged, nil
 }
 
 func (s *MihomoClientPortBlockService) ensureBlockRules(port int, ranges []portRange) (int, int, error) {
@@ -286,34 +351,27 @@ func (s *MihomoClientPortBlockService) removeRulesFromState(state *model.MihomoC
 	return firstErr
 }
 
-func (s *MihomoClientPortBlockService) cleanupOrphanRules(validComments map[string]struct{}) error {
-	if !nftSupported() || !nftTableExists() {
-		return nil
-	}
-
-	chains := []string{nftChainIn, nftChainOut}
+func (s *MihomoClientPortBlockService) cleanupOrphanRules(validComments map[string]struct{}, inHandles map[string]int, outHandles map[string]int) (bool, error) {
 	var firstErr error
-	for _, chain := range chains {
-		rules, err := listRuleCommentsByPrefix(chain, mihomoBlockNftRuleComments.prefix)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		for _, rule := range rules {
-			if _, ok := validComments[rule.comment]; ok {
+	changed := false
+	cleanupChain := func(chain string, handles map[string]int) {
+		for comment, handle := range handles {
+			if _, ok := validComments[comment]; ok {
 				continue
 			}
-			if err := deleteRuleByHandle(chain, rule.handle); err != nil {
-				logger.Warning("failed to delete orphan mihomo client block nft rule ", rule.comment, " handle ", rule.handle, ": ", err)
+			if err := deleteRuleByHandle(chain, handle); err != nil && !nftObjectMissing(err) {
+				logger.Warning("failed to delete orphan mihomo client block nft rule ", comment, " handle ", handle, ": ", err)
 				if firstErr == nil {
 					firstErr = err
 				}
+				continue
 			}
+			changed = true
 		}
 	}
-	return firstErr
+	cleanupChain(nftChainIn, inHandles)
+	cleanupChain(nftChainOut, outHandles)
+	return changed, firstErr
 }
 
 func (s *MihomoClientPortBlockService) tryRecoverHandles(tx *gorm.DB, state *model.MihomoClientPortBlockState) error {
@@ -362,6 +420,9 @@ func (s *MihomoClientPortBlockService) collectDesiredBlockedPorts(tx *gorm.DB) (
 	}
 	inboundPorts := make(map[uint]inboundPortInfo, len(inbounds))
 	for _, inbound := range inbounds {
+		if !isSupportedMihomoInboundType(inbound.Type) {
+			continue
+		}
 		mockInbound := model.MihomoInbound{
 			Id:      inbound.Id,
 			Tag:     inbound.Tag,
@@ -384,8 +445,7 @@ func (s *MihomoClientPortBlockService) collectDesiredBlockedPorts(tx *gorm.DB) (
 	nowUnix := time.Now().Unix()
 	var clients []model.MihomoClient
 	if err := tx.Model(&model.MihomoClient{}).
-		Select("enable, inbounds, volume, expiry, up, down").
-		Where("enable = ?", true).
+		Select("enable, depleted, inbounds, volume, expiry, up, down").
 		Find(&clients).Error; err != nil {
 		return nil, err
 	}
@@ -393,8 +453,12 @@ func (s *MihomoClientPortBlockService) collectDesiredBlockedPorts(tx *gorm.DB) (
 	desired := make(map[int]clientBlockedPortSpec)
 	for _, client := range clients {
 		used := client.Up + client.Down
-		evaluation := evaluateClientAccess(client.Enable, used, client.Volume, client.Expiry, nowUnix)
-		if !evaluation.Blocked {
+		evaluation := evaluateClientAccess(true, used, client.Volume, client.Expiry, nowUnix)
+		// A depleted client is persisted as disabled by DepleteClients. Keep its
+		// port block until an administrator changes its access settings. A manually
+		// disabled client that is otherwise valid must not block a shared port.
+		shouldBlock := (client.Enable && evaluation.Blocked) || (!client.Enable && client.Depleted)
+		if !shouldBlock {
 			continue
 		}
 

@@ -1,14 +1,13 @@
 ﻿<template>
-  <v-dialog v-model="dialogVisible" transition="dialog-bottom-transition" width="800" max-width="90vw">
+  <v-dialog v-model="dialogVisible" transition="dialog-bottom-transition" width="800" max-width="90vw" max-height="90vh" :persistent="operationBusy">
     <v-card class="rounded-lg">
       <v-card-title>
-        <v-row align="center">
-          <v-col cols="auto">
+        <v-row align="center" class="ga-2">
+          <v-col cols="12" sm="auto">
             {{ $t('actions.group') }}
           </v-col>
-          <v-spacer></v-spacer>
-          <v-col cols="auto">
-            <div class="d-flex align-center" style="gap: 12px;">
+          <v-col cols="12" sm="auto" class="d-flex justify-sm-end">
+            <div class="d-flex align-center flex-wrap" style="gap: 12px;">
               <v-switch
                 v-model="autoUpdateEnabled"
                 label="自动更新"
@@ -16,7 +15,8 @@
                 density="compact"
                 hide-details
                 inset
-                :loading="autoUpdateSaving"
+                :loading="autoUpdateSaving || autoUpdateLoading"
+                :disabled="autoUpdateLoading || operationBusy"
                 @update:model-value="handleAutoUpdateToggle"
               ></v-switch>
               <v-text-field
@@ -27,29 +27,38 @@
                 density="compact"
                 hide-details
                 style="width: 130px;"
-                :disabled="!autoUpdateEnabled"
-                :loading="autoUpdateSaving"
+                :disabled="!autoUpdateEnabled || autoUpdateLoading || operationBusy"
+                :loading="autoUpdateSaving || autoUpdateLoading"
                 @blur="handleAutoUpdateIntervalCommit"
                 @keydown.enter.prevent="handleAutoUpdateIntervalCommit"
               ></v-text-field>
             </div>
           </v-col>
-          <v-col cols="auto">
-            <v-btn color="primary" variant="flat" @click="showAddDialog">
+          <v-col cols="auto" class="ml-sm-auto">
+            <v-btn color="primary" variant="flat" :disabled="operationBusy" @click="showAddDialog">
               {{ $t('actions.add') }}
             </v-btn>
           </v-col>
           <v-col cols="auto">
-            <v-icon icon="mdi-close" @click="$emit('close')"></v-icon>
+            <v-btn icon="mdi-close" variant="text" :disabled="operationBusy" @click="$emit('close')">
+              <v-tooltip activator="parent" location="top">{{ $t('actions.close') }}</v-tooltip>
+            </v-btn>
           </v-col>
         </v-row>
       </v-card-title>
       <v-divider></v-divider>
-      <v-card-text style="padding: 16px; min-height: 400px;">
-        <v-list v-if="groups.length > 0">
+      <v-card-text style="padding: 16px; min-height: 400px; max-height: calc(90vh - 96px); overflow-y: auto;">
+        <v-alert v-if="groupsLoadFailed && groups.length > 0" type="warning" variant="tonal" class="mb-3">
+          分组列表刷新失败，当前仍显示上次成功读取的数据。
+          <v-btn class="mt-2" size="small" variant="outlined" :loading="groupsLoading" :disabled="operationBusy" @click="loadGroups">
+            {{ $t('actions.update') }}
+          </v-btn>
+        </v-alert>
+        <v-progress-linear v-if="groupsLoading && groups.length === 0" indeterminate color="primary" class="mb-3" />
+        <v-list v-else-if="groups.length > 0">
           <v-list-item
             v-for="(group, index) in groups"
-            :key="group.id"
+            :key="group.id || `subgroup-${index}`"
             class="mb-2 subgroup-sort-item"
             :class="{
               'subgroup-sort-item--active': dragOverIndex === index,
@@ -64,15 +73,15 @@
               <div class="d-flex align-center subgroup-prepend">
                 <div
                   class="subgroup-drag-handle d-flex align-center justify-center mr-3"
-                  :class="{ 'subgroup-drag-handle--disabled': groups.length < 2 || reordering }"
-                  :draggable="groups.length > 1 && !reordering"
+                  :class="{ 'subgroup-drag-handle--disabled': groups.length < 2 || operationBusy }"
+                  :draggable="groups.length > 1 && !operationBusy"
                   @dragstart="handleDragStart(index)"
                   @dragend="handleDragEnd"
                 >
                   <v-icon size="small">mdi-drag</v-icon>
                   <v-tooltip activator="parent" location="top">拖动排序</v-tooltip>
                 </div>
-                <v-list-item-title class="text-h6">{{ group.name }}</v-list-item-title>
+                <v-list-item-title class="text-h6">{{ displayGroupName(group) }}</v-list-item-title>
               </div>
             </template>
             <template v-slot:append>
@@ -81,8 +90,8 @@
                 size="small"
                 color="error"
                 variant="text"
-                :disabled="reordering"
-                @click="confirmDelete(index)"
+                :disabled="operationBusy"
+                @click="confirmDelete(group.id)"
               >
                 <v-icon />
                 <v-tooltip activator="parent" location="top">{{ $t('actions.del') }}</v-tooltip>
@@ -92,7 +101,7 @@
                 size="small"
                 color="primary"
                 variant="text"
-                :disabled="reordering"
+                :disabled="operationBusy"
                 @click="showEditDialog(index)"
               >
                 <v-icon />
@@ -105,8 +114,8 @@
                 size="small"
                 color="info"
                 variant="text"
-                :disabled="reordering"
-                :loading="refreshingGroup === group.name"
+                :disabled="operationBusy"
+                :loading="refreshingGroup === displayGroupName(group)"
                 @click="refreshSubscription(group)"
               >
                 <v-icon />
@@ -117,7 +126,7 @@
                 size="small"
                 color="success"
                 variant="text"
-                :disabled="reordering"
+                :disabled="operationBusy"
                 @click="showGroupQrCode(group)"
               >
                 <v-icon />
@@ -170,6 +179,12 @@
             </v-list-item-subtitle>
           </v-list-item>
         </v-list>
+        <v-alert v-else-if="groupsLoadFailed" type="error" variant="tonal">
+          分组列表加载失败，请稍后重试。
+          <v-btn class="mt-2" size="small" variant="outlined" :loading="groupsLoading" :disabled="operationBusy" @click="loadGroups">
+            {{ $t('actions.update') }}
+          </v-btn>
+        </v-alert>
         <v-alert v-else type="info" variant="tonal">
           暂无分组，点击“添加”按钮创建新分组
         </v-alert>
@@ -178,13 +193,13 @@
   </v-dialog>
 
   <!-- 添加/编辑分组对话框 -->
-  <v-dialog v-model="editDialog" max-width="500">
+  <v-dialog v-model="editDialog" width="500" max-width="90vw" max-height="90vh" :persistent="saving">
     <v-card class="rounded-lg">
       <v-card-title>
-        {{ editingIndex === -1 ? $t('actions.add') : $t('actions.edit') }}{{ $t('actions.group') }}
+        {{ editingGroupId === null ? $t('actions.add') : $t('actions.edit') }}{{ $t('actions.group') }}
       </v-card-title>
       <v-divider></v-divider>
-      <v-card-text style="padding: 16px;">
+      <v-card-text style="padding: 16px; max-height: calc(90vh - 152px); overflow-y: auto;">
         <v-row>
           <v-col cols="12">
             <v-text-field
@@ -193,6 +208,7 @@
               variant="outlined"
               density="compact"
               hide-details
+              :disabled="saving"
             ></v-text-field>
           </v-col>
         </v-row>
@@ -208,6 +224,7 @@
               chips
               closable-chips
               hide-details
+              :disabled="saving"
             ></v-select>
           </v-col>
         </v-row>
@@ -221,6 +238,7 @@
               density="compact"
               hide-details
               clearable
+              :disabled="saving"
             ></v-text-field>
           </v-col>
         </v-row>
@@ -234,6 +252,7 @@
               density="compact"
               hide-details
               clearable
+              :disabled="saving"
             ></v-text-field>
           </v-col>
         </v-row>
@@ -245,6 +264,7 @@
               color="warning"
               density="compact"
               hide-details
+              :disabled="saving"
             ></v-switch>
           </v-col>
         </v-row>
@@ -252,10 +272,10 @@
       <v-divider></v-divider>
       <v-card-actions>
         <v-spacer></v-spacer>
-        <v-btn color="primary" variant="outlined" @click="editDialog = false">
+        <v-btn color="primary" variant="outlined" :disabled="saving" @click="editDialog = false">
           {{ $t('actions.close') }}
         </v-btn>
-        <v-btn color="primary" variant="flat" :loading="saving" @click="saveGroup">
+        <v-btn color="primary" variant="flat" :loading="saving" :disabled="saving" @click="saveGroup">
           {{ $t('actions.save') }}
         </v-btn>
       </v-card-actions>
@@ -263,17 +283,17 @@
   </v-dialog>
 
   <!-- 删除确认对话框 -->
-  <v-dialog v-model="deleteDialog" max-width="400">
+  <v-dialog v-model="deleteDialog" width="400" max-width="90vw" :persistent="deletingGroupId !== null">
     <v-card class="rounded-lg">
       <v-card-title>{{ $t('actions.del') }}</v-card-title>
       <v-divider></v-divider>
       <v-card-text>{{ $t('confirm') }}</v-card-text>
       <v-card-actions>
         <v-spacer></v-spacer>
-        <v-btn color="success" variant="outlined" @click="deleteDialog = false">
+        <v-btn color="success" variant="outlined" :disabled="deletingGroupId !== null" @click="closeDeleteDialog">
           {{ $t('no') }}
         </v-btn>
-        <v-btn color="error" variant="outlined" @click="deleteGroup">
+        <v-btn color="error" variant="outlined" :loading="deletingGroupId !== null" :disabled="deletingGroupId !== null" @click="deleteGroup">
           {{ $t('yes') }}
         </v-btn>
       </v-card-actions>
@@ -289,32 +309,38 @@
   />
 
   <!-- 刷新结果对话框 -->
-  <v-dialog v-model="refreshResultDialog" max-width="600">
+  <v-dialog v-model="refreshResultDialog" width="600" max-width="90vw" max-height="90vh" :persistent="operationBusy">
     <v-card class="rounded-lg">
       <v-card-title>刷新订阅结果</v-card-title>
       <v-divider></v-divider>
-      <v-card-text style="padding: 16px;">
+      <v-card-text style="padding: 16px; max-height: calc(90vh - 152px); overflow-y: auto;">
         <v-alert v-if="refreshResult.error" type="error" variant="tonal" class="mb-3">
           {{ refreshResult.error }}
         </v-alert>
         <div v-else>
+          <v-alert v-if="refreshResult.warning" type="warning" variant="tonal" class="mb-3">
+            {{ refreshResult.warning }}
+          </v-alert>
           <v-alert v-if="refreshResult.added.length > 0" type="success" variant="tonal" class="mb-2">
             <div class="font-weight-bold mb-1">新增节点 ({{ refreshResult.added.length }}):</div>
-            <v-chip v-for="node in refreshResult.added" :key="node" size="small" class="mr-1 mb-1" color="success">
+            <v-chip v-for="node in previewRefreshNodes(refreshResult.added)" :key="node" size="small" class="mr-1 mb-1" color="success">
               {{ node }}
             </v-chip>
+            <div v-if="refreshResult.added.length > refreshResultPreviewLimit" class="text-caption mt-1">仅显示前 {{ refreshResultPreviewLimit }} 个节点标签</div>
           </v-alert>
           <v-alert v-if="refreshResult.removed.length > 0" type="warning" variant="tonal" class="mb-2">
             <div class="font-weight-bold mb-1">删除节点 ({{ refreshResult.removed.length }}):</div>
-            <v-chip v-for="node in refreshResult.removed" :key="node" size="small" class="mr-1 mb-1" color="warning">
+            <v-chip v-for="node in previewRefreshNodes(refreshResult.removed)" :key="node" size="small" class="mr-1 mb-1" color="warning">
               {{ node }}
             </v-chip>
+            <div v-if="refreshResult.removed.length > refreshResultPreviewLimit" class="text-caption mt-1">仅显示前 {{ refreshResultPreviewLimit }} 个节点标签</div>
           </v-alert>
           <v-alert v-if="refreshResult.updated.length > 0" type="info" variant="tonal" class="mb-2">
             <div class="font-weight-bold mb-1">更新节点 ({{ refreshResult.updated.length }}):</div>
-            <v-chip v-for="node in refreshResult.updated" :key="node" size="small" class="mr-1 mb-1" color="info">
+            <v-chip v-for="node in previewRefreshNodes(refreshResult.updated)" :key="node" size="small" class="mr-1 mb-1" color="info">
               {{ node }}
             </v-chip>
+            <div v-if="refreshResult.updated.length > refreshResultPreviewLimit" class="text-caption mt-1">仅显示前 {{ refreshResultPreviewLimit }} 个节点标签</div>
           </v-alert>
           <v-alert v-if="refreshResult.added.length === 0 && refreshResult.removed.length === 0 && refreshResult.updated.length === 0" type="info" variant="tonal">
             订阅内容没有变化
@@ -346,6 +372,12 @@ const props = defineProps<{
 
 const emit = defineEmits(['close', 'update:modelValue'])
 
+// Data.setNewData synchronizes shared subscription collections to the Mihomo
+// store. Keep every group mutation on the same update boundary.
+const applySubscriptionData = (data: any) => {
+  Data().setNewData(data)
+}
+
 // 使用本地 ref 控制对话框显示，避免直接修改 props
 const dialogVisible = ref(props.visible)
 
@@ -355,6 +387,9 @@ watch(() => props.visible, (newVal) => {
   if (newVal) {
     void loadGroups()
     void loadAutoUpdateSettings()
+  } else {
+    groupsRequestSequence.value += 1
+    autoUpdateRequestSequence.value += 1
   }
 })
 
@@ -368,22 +403,28 @@ watch(dialogVisible, (newVal) => {
 
 // 分组列表
 const groups = ref<SubGroup[]>([])
+const groupsLoading = ref(false)
+const groupsLoadFailed = ref(false)
+const groupsRequestSequence = ref(0)
 const draggedGroupIndex = ref<number | null>(null)
 const dragOverIndex = ref<number | null>(null)
 const reordering = ref(false)
 const autoUpdateEnabled = ref(false)
 const autoUpdateIntervalInput = ref('5')
 const autoUpdateSaving = ref(false)
+const autoUpdateLoading = ref(false)
+const autoUpdateRequestSequence = ref(0)
 
 // 编辑对话框
 const editDialog = ref(false)
-const editingIndex = ref(-1)
+const editingGroupId = ref<number | null>(null)
 const editingGroup = ref<SubGroup>(createSubGroup())
 const saving = ref(false)
 
 // 删除对话框
 const deleteDialog = ref(false)
-const deletingIndex = ref(-1)
+const deleteTargetGroupId = ref<number | null>(null)
+const deletingGroupId = ref<number | null>(null)
 
 // 二维码对话框
 const qrcodeDialog = ref(false)
@@ -392,43 +433,93 @@ const qrcodeGroupName = ref('')
 // 刷新订阅状态
 const refreshingGroup = ref('')
 const refreshResultDialog = ref(false)
-const refreshResult = ref<{
+const refreshResultPreviewLimit = 80
+type SubscriptionRefreshResult = {
   added: string[]
   removed: string[]
   updated: string[]
   error: string
-}>({
+  warning: string
+}
+const refreshResult = ref<SubscriptionRefreshResult>({
   added: [],
   removed: [],
   updated: [],
-  error: ''
+  error: '',
+  warning: ''
 })
 
-const outboundOptions = computed(() => {
-  const suboutbounds = Data().suboutbounds as Outbound[]
-  return suboutbounds.map((o: Outbound) => ({
-    title: o.tag,
-    value: o.tag
-  }))
+const operationBusy = computed(() => {
+  return saving.value
+    || deletingGroupId.value !== null
+    || reordering.value
+    || autoUpdateSaving.value
+    || refreshingGroup.value !== ''
 })
+
+const normalizeText = (value: unknown): string => {
+  if (value === null || value === undefined) return ''
+  const text = String(value).trim()
+  return text === '' || text.toLowerCase() === 'null' || text.toLowerCase() === 'undefined' ? '' : text
+}
 
 const normalizeSelectedOutbounds = (raw: unknown): string[] => {
-  if (!Array.isArray(raw)) {
-    return []
+  if (typeof raw === 'string') {
+    try {
+      raw = JSON.parse(raw)
+    } catch {
+      return []
+    }
   }
-
+  if (!Array.isArray(raw)) return []
   const normalized: string[] = []
   const seen = new Set<string>()
   for (const item of raw) {
-    const tag = String(item ?? '').trim()
-    if (!tag || seen.has(tag)) {
-      continue
-    }
+    const tag = normalizeText(item)
+    if (!tag || seen.has(tag)) continue
     seen.add(tag)
     normalized.push(tag)
   }
   return normalized
 }
+
+const normalizeSubGroup = (raw: unknown): SubGroup => {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {}
+  const id = Number(source.id)
+  return createSubGroup({
+    ...source,
+    id: Number.isInteger(id) && id > 0 ? id : 0,
+    name: normalizeText(source.name),
+    outbounds: normalizeSelectedOutbounds(source.outbounds),
+    subscription_url: normalizeText(source.subscription_url),
+    subscription_url_clash: normalizeText(source.subscription_url_clash),
+    allow_insecure: source.allow_insecure === true,
+    auto_update_failed_sources: typeof source.auto_update_failed_sources === 'string'
+      || Array.isArray(source.auto_update_failed_sources)
+      ? source.auto_update_failed_sources as string | string[]
+      : '',
+    auto_update_error: normalizeText(source.auto_update_error),
+  })
+}
+
+const normalizeSubGroups = (raw: unknown): SubGroup[] => {
+  if (!Array.isArray(raw)) return []
+  return raw.map(normalizeSubGroup)
+}
+
+const displayGroupName = (group: SubGroup): string => normalizeText(group?.name) || '-'
+
+const outboundOptions = computed(() => {
+  const suboutbounds = Data().suboutbounds as Outbound[]
+  const seen = new Set<string>()
+  return (Array.isArray(suboutbounds) ? suboutbounds : []).reduce<Array<{ title: string; value: string }>>((items, outbound: Outbound) => {
+    const tag = normalizeText(outbound?.tag)
+    if (!tag || seen.has(tag)) return items
+    seen.add(tag)
+    items.push({ title: tag, value: tag })
+    return items
+  }, [])
+})
 
 const sameOutboundOrder = (left: unknown, right: unknown): boolean => {
   const a = Array.isArray(left) ? left : []
@@ -451,14 +542,21 @@ const applyEditingGroupOutboundOrder = () => {
 }
 
 watch(() => Data().subgroups, (newGroups) => {
-  if (dialogVisible.value) {
-    groups.value = (newGroups ?? []) as SubGroup[]
+  if (dialogVisible.value && Array.isArray(newGroups)) {
+    groups.value = normalizeSubGroups(newGroups)
+    groupsLoadFailed.value = false
   }
 })
 
 watch(() => editingGroup.value.outbounds, () => {
   applyEditingGroupOutboundOrder()
 }, { deep: true })
+
+watch(() => [editingGroup.value.subscription_url, editingGroup.value.subscription_url_clash], ([jsonUrl, clashUrl]) => {
+  if (!String(jsonUrl ?? '').trim() && !String(clashUrl ?? '').trim()) {
+    editingGroup.value.allow_insecure = false
+  }
+})
 
 watch(() => Data().suboutbounds, () => {
   if (!editDialog.value) {
@@ -468,14 +566,29 @@ watch(() => Data().suboutbounds, () => {
 }, { deep: true })
 
 const loadGroups = async () => {
-  // 从后端加载分组数据
-  const data = await Data().loadSubGroups()
-  if (data) {
-    groups.value = data
+  const requestSequence = ++groupsRequestSequence.value
+  groupsLoading.value = true
+  try {
+    const data = await Data().loadSubGroups()
+    if (requestSequence !== groupsRequestSequence.value || !dialogVisible.value) return false
+    if (Array.isArray(data)) {
+      groups.value = normalizeSubGroups(data)
+      groupsLoadFailed.value = false
+      return true
+    }
+  } catch {
+    // Keep the last known list visible when a refresh request fails.
+  } finally {
+    if (requestSequence === groupsRequestSequence.value) groupsLoading.value = false
   }
+  if (requestSequence !== groupsRequestSequence.value || !dialogVisible.value) return false
+  groupsLoadFailed.value = true
+  push.warning({ title: '分组', message: '分组列表加载失败，请稍后重试。' })
+  return false
 }
 
 const saveGroupOrder = async (): Promise<boolean> => {
+  if (operationBusy.value) return false
   const ids = groups.value
     .map((group) => Number(group.id))
     .filter((id) => Number.isInteger(id) && id > 0)
@@ -497,8 +610,13 @@ const saveGroupOrder = async (): Promise<boolean> => {
       data: JSON.stringify({ ids }, null, 2)
     })
     if (msg.success && msg.obj) {
-      Data().setNewData(msg.obj)
-      groups.value = (msg.obj.subgroups ?? []) as SubGroup[]
+      applySubscriptionData(msg.obj)
+      if (Array.isArray(msg.obj.subgroups)) {
+        groups.value = msg.obj.subgroups as SubGroup[]
+        groupsLoadFailed.value = false
+      } else {
+        await loadGroups()
+      }
       push.success({
         title: '分组',
         message: '分组顺序已保存'
@@ -512,7 +630,7 @@ const saveGroupOrder = async (): Promise<boolean> => {
 }
 
 const handleDragStart = (index: number) => {
-  if (reordering.value || groups.value.length < 2) {
+  if (operationBusy.value || groups.value.length < 2) {
     return
   }
   draggedGroupIndex.value = index
@@ -520,7 +638,7 @@ const handleDragStart = (index: number) => {
 }
 
 const handleDragOver = (index: number) => {
-  if (draggedGroupIndex.value === null || reordering.value) {
+  if (draggedGroupIndex.value === null || operationBusy.value) {
     return
   }
   dragOverIndex.value = index
@@ -533,7 +651,7 @@ const handleDragEnd = () => {
 
 const handleDrop = async (index: number) => {
   const fromIndex = draggedGroupIndex.value
-  if (fromIndex === null || reordering.value) {
+  if (fromIndex === null || operationBusy.value) {
     handleDragEnd()
     return
   }
@@ -545,7 +663,8 @@ const handleDrop = async (index: number) => {
 
   const previousGroups = groups.value.slice()
   const [movedGroup] = groups.value.splice(fromIndex, 1)
-  groups.value.splice(index, 0, movedGroup)
+  const targetIndex = fromIndex < index ? index - 1 : index
+  groups.value.splice(targetIndex, 0, movedGroup)
   handleDragEnd()
 
   const success = await saveGroupOrder()
@@ -561,9 +680,22 @@ const applyAutoUpdateInfo = (info: any) => {
 }
 
 const loadAutoUpdateSettings = async () => {
-  const msg = await HttpUtils.get('api/subgroup-auto-update-info')
-  if (msg.success && msg.obj) {
-    applyAutoUpdateInfo(msg.obj)
+  const requestSequence = ++autoUpdateRequestSequence.value
+  autoUpdateLoading.value = true
+  try {
+    const msg = await HttpUtils.get('api/subgroup-auto-update-info')
+    if (requestSequence !== autoUpdateRequestSequence.value || !dialogVisible.value) return
+    if (msg.success && msg.obj) {
+      applyAutoUpdateInfo(msg.obj)
+    } else {
+      push.warning({ title: '自动更新', message: '自动更新设置加载失败，请稍后重试。' })
+    }
+  } catch {
+    if (requestSequence === autoUpdateRequestSequence.value && dialogVisible.value) {
+      push.warning({ title: '自动更新', message: '自动更新设置加载失败，请稍后重试。' })
+    }
+  } finally {
+    if (requestSequence === autoUpdateRequestSequence.value) autoUpdateLoading.value = false
   }
 }
 
@@ -580,6 +712,7 @@ const normalizeAutoUpdateIntervalMinutes = (raw: string): number | null => {
 }
 
 const saveAutoUpdateSettings = async (): Promise<boolean> => {
+  if (operationBusy.value) return false
   const intervalMinutes = normalizeAutoUpdateIntervalMinutes(autoUpdateIntervalInput.value)
   if (intervalMinutes == null) {
     push.error({
@@ -612,6 +745,7 @@ const saveAutoUpdateSettings = async (): Promise<boolean> => {
 }
 
 const handleAutoUpdateToggle = async () => {
+  if (autoUpdateLoading.value || operationBusy.value) return
   const success = await saveAutoUpdateSettings()
   if (!success) {
     await loadAutoUpdateSettings()
@@ -619,6 +753,7 @@ const handleAutoUpdateToggle = async () => {
 }
 
 const handleAutoUpdateIntervalCommit = async () => {
+  if (autoUpdateLoading.value || operationBusy.value) return
   const success = await saveAutoUpdateSettings()
   if (!success) {
     await loadAutoUpdateSettings()
@@ -626,21 +761,13 @@ const handleAutoUpdateIntervalCommit = async () => {
 }
 
 const getGroupOutbounds = (group: SubGroup): string[] => {
-  // 如果 outbounds 是字符串，解析为数组
-  if (typeof group.outbounds === 'string') {
-    try {
-      return JSON.parse(group.outbounds)
-    } catch {
-      return []
-    }
-  }
-  return group.outbounds as unknown as string[]
+  return normalizeSelectedOutbounds(group?.outbounds)
 }
 
 const parseFailedSources = (group: SubGroup): string[] => {
   const raw = group.auto_update_failed_sources
   if (Array.isArray(raw)) {
-    return raw.map((item) => String(item).trim().toLowerCase()).filter(Boolean)
+    return raw.map((item) => normalizeText(item).toLowerCase()).filter(Boolean)
   }
   if (typeof raw !== 'string' || !raw.trim()) {
     return []
@@ -650,7 +777,7 @@ const parseFailedSources = (group: SubGroup): string[] => {
     if (!Array.isArray(parsed)) {
       return []
     }
-    return parsed.map((item) => String(item).trim().toLowerCase()).filter(Boolean)
+    return parsed.map((item) => normalizeText(item).toLowerCase()).filter(Boolean)
   } catch {
     return []
   }
@@ -676,31 +803,31 @@ const getAutoUpdateFailureLabel = (group: SubGroup): string => {
 }
 
 const getAutoUpdateError = (group: SubGroup): string => {
-  return String(group.auto_update_error || '').trim()
+  return normalizeText(group?.auto_update_error)
 }
 
 const showAddDialog = () => {
-  editingIndex.value = -1
+  if (operationBusy.value) return
+  editingGroupId.value = null
   editingGroup.value = createSubGroup()
   editDialog.value = true
 }
 
 const showEditDialog = (index: number) => {
-  editingIndex.value = index
+  if (operationBusy.value) return
   const group = groups.value[index]
+  const id = Number(group?.id)
+  if (!group || !Number.isInteger(id) || id <= 0) return
+  editingGroupId.value = id
   const outbounds = normalizeSelectedOutbounds(getGroupOutbounds(group))
-  editingGroup.value = {
-    ...group,
-    outbounds: outbounds as any,
-    subscription_url: group.subscription_url || '',
-    subscription_url_clash: group.subscription_url_clash || '',
-    allow_insecure: group.allow_insecure || false
-  }
+  editingGroup.value = normalizeSubGroup({ ...group, outbounds })
   editDialog.value = true
 }
 
 const saveGroup = async () => {
-  if (!editingGroup.value.name.trim()) {
+  if (operationBusy.value) return
+  editingGroup.value = normalizeSubGroup(editingGroup.value)
+  if (!editingGroup.value.name) {
     return
   }
 
@@ -708,6 +835,10 @@ const saveGroup = async () => {
 
   try {
     const normalizedOutbounds = normalizeSelectedOutbounds(editingGroup.value.outbounds)
+    const jsonUrl = String(editingGroup.value.subscription_url ?? '').trim()
+    const clashUrl = String(editingGroup.value.subscription_url_clash ?? '').trim()
+    const hasSubscriptionSource = jsonUrl !== '' || clashUrl !== ''
+    const allowInsecure = hasSubscriptionSource && editingGroup.value.allow_insecure === true
     editingGroup.value = {
       ...editingGroup.value,
       outbounds: normalizedOutbounds as any
@@ -715,26 +846,29 @@ const saveGroup = async () => {
     const groupData = {
       ...editingGroup.value,
       outbounds: JSON.stringify(normalizedOutbounds),
-      subscription_url: editingGroup.value.subscription_url || '',
-      subscription_url_clash: editingGroup.value.subscription_url_clash || '',
-      allow_insecure: editingGroup.value.allow_insecure || false
+      subscription_url: jsonUrl,
+      subscription_url_clash: clashUrl,
+      allow_insecure: allowInsecure
     }
 
-    const action = editingIndex.value === -1 ? 'new' : 'edit'
+    const action = editingGroupId.value === null ? 'new' : 'edit'
     const success = await Data().save('subgroups', action, groupData)
     
     if (success) {
       // 如果有订阅链接，触发抓取订阅
-      if (editingGroup.value.subscription_url || editingGroup.value.subscription_url_clash) {
-        try {
-          await fetchAndSaveSubscription(
-            editingGroup.value.name,
-            editingGroup.value.subscription_url || '',
-            editingGroup.value.subscription_url_clash || '',
-            editingGroup.value.allow_insecure || false
-          )
-        } catch (e: any) {
-          console.error('获取订阅失败:', e)
+      if (hasSubscriptionSource) {
+        const result = await fetchAndSaveSubscription(
+          editingGroup.value.name,
+          jsonUrl,
+          clashUrl,
+          allowInsecure
+        )
+        if (!(result.success || result.obj?.committed === true)) {
+          push.warning({
+            title: '订阅管理',
+            duration: 7000,
+            message: result.msg || '分组已保存，但订阅节点未能刷新',
+          })
         }
       }
       editDialog.value = false
@@ -755,75 +889,124 @@ const fetchAndSaveSubscription = async (groupName: string, jsonUrl: string, clas
   formData.append('allow_insecure', String(allowInsecure))
 
   const msg = await HttpUtils.post('api/fetchSubscription', formData)
-  if (msg.success && msg.obj) {
-    Data().setNewData(msg.obj)
+  if (msg.obj && (msg.success || msg.obj.committed === true)) {
+    applySubscriptionData(msg.obj)
   }
   return msg
 }
 
+const normalizeRefreshNodes = (raw: unknown): string[] => {
+  if (!Array.isArray(raw)) return []
+  const seen = new Set<string>()
+  const nodes: string[] = []
+  for (const value of raw) {
+    if (typeof value !== 'string') continue
+    const node = value.trim()
+    if (!node || seen.has(node)) continue
+    seen.add(node)
+    nodes.push(node)
+  }
+  return nodes
+}
+
+const normalizeRefreshResult = (raw: unknown, fallbackError = ''): SubscriptionRefreshResult => {
+  const result = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : {}
+  return {
+    added: normalizeRefreshNodes(result.added),
+    removed: normalizeRefreshNodes(result.removed),
+    updated: normalizeRefreshNodes(result.updated),
+    error: typeof result.error === 'string' && result.error.trim() !== '' ? result.error.trim() : fallbackError,
+    warning: typeof result.warning === 'string' ? result.warning.trim() : '',
+  }
+}
+
+const previewRefreshNodes = (nodes: unknown): string[] => normalizeRefreshNodes(nodes).slice(0, refreshResultPreviewLimit)
+
 // 刷新订阅
 const refreshSubscription = async (group: SubGroup) => {
-  if (!group.subscription_url && !group.subscription_url_clash) return
+  const groupName = normalizeText(group?.name)
+  const jsonUrl = normalizeText(group?.subscription_url)
+  const clashUrl = normalizeText(group?.subscription_url_clash)
+  if (operationBusy.value || !groupName || (!jsonUrl && !clashUrl)) return
 
-  refreshingGroup.value = group.name
+  refreshingGroup.value = groupName
 
   try {
     const formData = new FormData()
-    formData.append('group_name', group.name)
-    formData.append('json_url', group.subscription_url || '')
-    formData.append('clash_url', group.subscription_url_clash || '')
-    formData.append('allow_insecure', String(group.allow_insecure || false))
+    formData.append('group_name', groupName)
+    formData.append('json_url', jsonUrl)
+    formData.append('clash_url', clashUrl)
+    formData.append('allow_insecure', String(group.allow_insecure === true))
 
     const msg = await HttpUtils.post('api/refreshSubscription', formData)
     
-    if (msg.success && msg.obj) {
+    if (msg.obj && (msg.success || msg.obj.committed === true)) {
       if (Object.hasOwn(msg.obj, 'suboutbounds') || Object.hasOwn(msg.obj, 'subgroups')) {
-        Data().setNewData(msg.obj)
+        applySubscriptionData(msg.obj)
       }
-      refreshResult.value = msg.obj.result || msg.obj
+      const result = normalizeRefreshResult(msg.obj.result)
+      if (msg.obj.committed === true) result.warning = msg.msg || '订阅数据已保存，但运行配置未更新'
+      refreshResult.value = result
     } else {
-      refreshResult.value = {
-        added: [],
-        removed: [],
-        updated: [],
-        error: ''
-      }
+      refreshResult.value = normalizeRefreshResult(null, msg.msg || '刷新订阅失败')
     }
     refreshResultDialog.value = true
 
     // 重新加载分组列表
     await loadGroups()
   } catch (e: any) {
-    refreshResult.value = {
-      added: [],
-      removed: [],
-      updated: [],
-      error: e.message || '刷新订阅失败'
-    }
+    refreshResult.value = normalizeRefreshResult(null, e.message || '刷新订阅失败')
     refreshResultDialog.value = true
   } finally {
     refreshingGroup.value = ''
   }
 }
 
-const confirmDelete = (index: number) => {
-  deletingIndex.value = index
+const confirmDelete = (id: number) => {
+  if (operationBusy.value) return
+  deleteTargetGroupId.value = id
   deleteDialog.value = true
 }
 
+const closeDeleteDialog = () => {
+  if (deletingGroupId.value !== null) return
+  deleteTargetGroupId.value = null
+  deleteDialog.value = false
+}
+
+watch(deleteDialog, (visible) => {
+  if (!visible && deletingGroupId.value === null) deleteTargetGroupId.value = null
+})
+
 const deleteGroup = async () => {
-  const groupName = groups.value[deletingIndex.value].name
-  const success = await Data().save('subgroups', 'del', groupName)
-  
-  if (success) {
+  const id = deleteTargetGroupId.value
+  if (id == null) return
+  const group = groups.value.find((item) => Number(item.id) === id)
+  const groupName = normalizeText(group?.name)
+  if (!groupName) {
+    deleteTargetGroupId.value = null
     deleteDialog.value = false
-    // 重新加载分组列表
-    await loadGroups()
+    return
+  }
+  deletingGroupId.value = id
+  try {
+    const success = await Data().save('subgroups', 'del', groupName)
+    if (success) {
+      deleteDialog.value = false
+      deleteTargetGroupId.value = null
+      await loadGroups()
+    }
+  } finally {
+    deletingGroupId.value = null
   }
 }
 
 const showGroupQrCode = (group: SubGroup) => {
-  qrcodeGroupName.value = group.name
+  const groupName = normalizeText(group?.name)
+  if (operationBusy.value || !groupName) return
+  qrcodeGroupName.value = groupName
   qrcodeDialog.value = true
 }
 
@@ -874,5 +1057,3 @@ const closeQrCode = () => {
   opacity: 0.72;
 }
 </style>
-
-

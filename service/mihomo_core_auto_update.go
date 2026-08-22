@@ -269,12 +269,17 @@ func (s *MihomoCoreManagerService) runMihomoAutoUpdateAttempt(ctx context.Contex
 
 func (s *MihomoCoreManagerService) RunScheduledAutoUpdate() error {
 	mihomoCoreAutoCheckMu.Lock()
+	autoCheckEnabled, err := (&SettingService{}).getBool(mihomoCoreAutoCheckEnabledKey)
+	if err != nil {
+		mihomoCoreAutoCheckMu.Unlock()
+		return err
+	}
 	state, err := s.getCoreAutoUpdateState()
 	mihomoCoreAutoCheckMu.Unlock()
 	if err != nil {
 		return err
 	}
-	if !state.Enabled {
+	if !autoCheckEnabled || !state.Enabled {
 		return nil
 	}
 

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/pem"
 	"testing"
@@ -195,6 +196,54 @@ func TestDetectTLSSelfSignedTemplate_BlanksLegacyAndPartialChains(t *testing.T) 
 	}
 }
 
+func TestInspectTLSCertificateCombinesDerivedValues(t *testing.T) {
+	service := &ServerService{}
+	_, certPEM, err := service.generateCertWithTemplate(
+		"inspection.example.com",
+		"ecc256",
+		"ecc256",
+		tlsCertificateUsageServer,
+		time.Now(),
+		time.Now().Add(24*time.Hour),
+		resolveTLSSelfSignedTemplate("zerossl"),
+	)
+	if err != nil {
+		t.Fatalf("generateCertWithTemplate failed: %v", err)
+	}
+
+	inspection, err := service.InspectTLSCertificate("pem", "", string(certPEM))
+	if err != nil {
+		t.Fatalf("InspectTLSCertificate failed: %v", err)
+	}
+	if inspection.PublicKeySHA256 == "" || inspection.Fingerprint == "" {
+		t.Fatalf("expected certificate hashes, got %#v", inspection)
+	}
+	if inspection.KeyAlgorithm != "ecc256" || inspection.SignatureAlgorithm != "ecc256" {
+		t.Fatalf("unexpected algorithms: %#v", inspection)
+	}
+	if inspection.TemplateCode != "zerossl" {
+		t.Fatalf("expected zerossl template, got %q", inspection.TemplateCode)
+	}
+}
+
+func TestParseCertificatesRejectsExcessiveChainLength(t *testing.T) {
+	service := &ServerService{}
+	_, certPEM, err := service.generateCertWithAlgorithm(
+		"chain-limit.example.com",
+		"ecc256",
+		"ecc256",
+		tlsCertificateUsageServer,
+		time.Now(),
+		time.Now().Add(24*time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("generateCertWithAlgorithm failed: %v", err)
+	}
+	if _, err := parseCertificates(bytes.Repeat(certPEM, 17)); err == nil {
+		t.Fatal("expected excessive certificate chain to be rejected")
+	}
+}
+
 func TestGenKeypairWithTemplate_RejectsUnknownTLSTemplate(t *testing.T) {
 	service := &ServerService{}
 
@@ -204,5 +253,24 @@ func TestGenKeypairWithTemplate_RejectsUnknownTLSTemplate(t *testing.T) {
 	}
 	if keypair[0] != "Failed to generate TLS keypair: unknown tls self-signed template: unknown-template" {
 		t.Fatalf("unexpected error line: %q", keypair[0])
+	}
+}
+
+func TestGenerateTLSKeyPairRejectsConcurrentGeneration(t *testing.T) {
+	select {
+	case tlsKeyPairGenerationGate <- struct{}{}:
+		defer func() {
+			<-tlsKeyPairGenerationGate
+		}()
+	default:
+		t.Fatal("TLS keypair generation gate was unexpectedly occupied")
+	}
+
+	keypair := (&ServerService{}).generateTLSKeyPairWithTemplate("example.com,1,y,ecc256,ecc256", "")
+	if len(keypair) != 1 {
+		t.Fatalf("expected a single busy error line, got %#v", keypair)
+	}
+	if keypair[0] != "Failed to generate TLS keypair: generation already in progress" {
+		t.Fatalf("unexpected busy error line: %q", keypair[0])
 	}
 }

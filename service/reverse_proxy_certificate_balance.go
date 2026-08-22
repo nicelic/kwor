@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alireza0/s-ui/database"
@@ -38,6 +39,7 @@ type reverseProxyCertificateBalanceRuntimeState struct {
 	LastSelectedAt int64
 	UpdatedAtUnix  int64
 	element        *list.Element
+	globalSlot     bool
 }
 
 type reverseProxyCertificateBalanceLRUKey struct {
@@ -45,10 +47,10 @@ type reverseProxyCertificateBalanceLRUKey struct {
 	certificateID uint
 }
 
-// Certificate selection is on the TLS handshake hot path.  Keep independent
+// Certificate selection is on the TLS handshake hot path. Keep independent
 // LRU tables per shard so unrelated SNI buckets do not serialize every
-// handshake behind one listener-wide mutex.  The aggregate configured
-// capacity remains 16,384 entries.
+// handshake behind one listener-wide mutex. A process-wide slot counter keeps
+// every listener group within the configured 16,384-entry diagnostic budget.
 type reverseProxyCertificateBalanceShard struct {
 	mu      sync.Mutex
 	states  map[string]map[uint]*reverseProxyCertificateBalanceRuntimeState
@@ -57,6 +59,36 @@ type reverseProxyCertificateBalanceShard struct {
 }
 
 const reverseProxyCertificateBalanceShardLimit = reverseProxyRuntimeTableMaxEntries / reverseProxyRuntimeTableShardCount
+
+var reverseProxyCertificateBalanceEntryCount atomic.Int64
+
+func reserveReverseProxyCertificateBalanceEntry() bool {
+	for {
+		current := reverseProxyCertificateBalanceEntryCount.Load()
+		if current >= reverseProxyRuntimeTableMaxEntries {
+			return false
+		}
+		if reverseProxyCertificateBalanceEntryCount.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+func releaseReverseProxyCertificateBalanceEntry(state *reverseProxyCertificateBalanceRuntimeState) {
+	if state == nil || !state.globalSlot {
+		return
+	}
+	state.globalSlot = false
+	for {
+		current := reverseProxyCertificateBalanceEntryCount.Load()
+		if current <= 0 {
+			return
+		}
+		if reverseProxyCertificateBalanceEntryCount.CompareAndSwap(current, current-1) {
+			return
+		}
+	}
+}
 
 func (g *reverseProxyListenerGroup) certificateBalanceShard(bucket string) *reverseProxyCertificateBalanceShard {
 	if g == nil {
@@ -146,7 +178,15 @@ func (g *reverseProxyListenerGroup) reserveCertificateBalanceSelection(sniBucket
 		}
 		state = states[selected.Binding.CertificateRecordID]
 		if state == nil {
-			state = &reverseProxyCertificateBalanceRuntimeState{}
+			if !reserveReverseProxyCertificateBalanceEntry() {
+				// Prefer evicting an idle local diagnostic to creating an
+				// unbounded process-wide table for arbitrary wildcard SNI input.
+				shard.evictOneInactiveLocked()
+				if !reserveReverseProxyCertificateBalanceEntry() {
+					return selected.Binding, reverseProxyCertificateSelection{}, nil
+				}
+			}
+			state = &reverseProxyCertificateBalanceRuntimeState{globalSlot: true}
 			states[selected.Binding.CertificateRecordID] = state
 			shard.entries++
 		}
@@ -230,23 +270,28 @@ func (s *reverseProxyCertificateBalanceShard) makeRoomLocked() {
 	}
 	s.ensureLocked()
 	for s.entries >= reverseProxyCertificateBalanceShardLimit {
-		candidate := s.lru.Back()
-		for candidate != nil {
-			key, _ := candidate.Value.(reverseProxyCertificateBalanceLRUKey)
-			state := s.states[key.bucket][key.certificateID]
-			if state == nil || state.ActiveConn == 0 {
-				s.removeStateLocked(key.bucket, key.certificateID, state)
-				break
-			}
-			candidate = candidate.Prev()
-		}
-		if candidate == nil {
+		if !s.evictOneInactiveLocked() {
 			// Every entry still owns a live connection.  Keeping those counters
 			// is more important than rejecting a valid TLS handshake; this is a
 			// transient soft overflow and is pruned as connections close.
 			return
 		}
 	}
+}
+
+func (s *reverseProxyCertificateBalanceShard) evictOneInactiveLocked() bool {
+	if s == nil {
+		return false
+	}
+	for candidate := s.lru.Back(); candidate != nil; candidate = candidate.Prev() {
+		key, _ := candidate.Value.(reverseProxyCertificateBalanceLRUKey)
+		state := s.states[key.bucket][key.certificateID]
+		if state == nil || state.ActiveConn == 0 {
+			s.removeStateLocked(key.bucket, key.certificateID, state)
+			return true
+		}
+	}
+	return false
 }
 
 func (s *reverseProxyCertificateBalanceShard) removeStateLocked(bucket string, certificateID uint, state *reverseProxyCertificateBalanceRuntimeState) {
@@ -271,6 +316,9 @@ func (s *reverseProxyCertificateBalanceShard) removeStateLocked(bucket string, c
 	}
 	removedState := false
 	if states := s.states[bucket]; states != nil {
+		if state == nil {
+			state = states[certificateID]
+		}
 		if _, exists := states[certificateID]; exists {
 			delete(states, certificateID)
 			removedState = true
@@ -281,6 +329,41 @@ func (s *reverseProxyCertificateBalanceShard) removeStateLocked(bucket string, c
 	}
 	if (removedLRU || removedState) && s.entries > 0 {
 		s.entries--
+	}
+	if removedState {
+		releaseReverseProxyCertificateBalanceEntry(state)
+	}
+}
+
+func (g *reverseProxyListenerGroup) pruneCertificateBalanceStates(now time.Time) {
+	if g == nil {
+		return
+	}
+	for index := range g.certificateBalanceShards {
+		shard := &g.certificateBalanceShards[index]
+		shard.mu.Lock()
+		shard.pruneLocked(now)
+		shard.mu.Unlock()
+	}
+}
+
+func (g *reverseProxyListenerGroup) clearCertificateBalanceStates() {
+	if g == nil {
+		return
+	}
+	for index := range g.certificateBalanceShards {
+		shard := &g.certificateBalanceShards[index]
+		shard.mu.Lock()
+		for bucket, states := range shard.states {
+			for certificateID, state := range states {
+				shard.removeStateLocked(bucket, certificateID, state)
+			}
+		}
+		if shard.lru != nil {
+			shard.lru.Init()
+		}
+		shard.entries = 0
+		shard.mu.Unlock()
 	}
 }
 

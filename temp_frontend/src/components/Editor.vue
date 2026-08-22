@@ -1,14 +1,14 @@
 <template>
-  <v-dialog transition="dialog-bottom-transition" width="800">
-    <v-card class="rounded-lg">
+  <v-dialog transition="dialog-bottom-transition" max-width="800" width="calc(100vw - 24px)">
+    <v-card>
       <v-card-title>
         {{ title }}
       </v-card-title>
       <v-divider></v-divider>
-      <v-card-text style="padding: 0 16px; overflow-y: scroll;">
-        <div class="code-editor">
-          <div class="line-numbers">
-            <span v-for="n in lineCount" :key="n">{{ n }}</span>
+      <v-card-text class="editor-card-text">
+        <div class="code-editor" :class="{ 'code-editor--large': isLargeDocument }">
+          <div v-if="showLineNumbers" ref="lineNumbersRef" class="line-numbers">
+            <span v-for="n in lineNumberCount" :key="n">{{ n }}</span>
           </div>
           <v-textarea
             ref="textareaRef"
@@ -18,8 +18,8 @@
             variant="outlined"
             bg-color="background"
             :style="{ 'font-family': 'monospace' }"
+            rows="20"
             no-resize
-            auto-grow
           ></v-textarea>
         </div>
       </v-card-text>
@@ -47,6 +47,19 @@
 <script lang="ts">
 import { useTheme } from 'vuetify'
 
+const EDITOR_LARGE_DOCUMENT_BYTES = 256 * 1024
+const EDITOR_MAX_LINE_NUMBER_ROWS = 2000
+
+function countDocumentLines(value: string, maximum: number): number {
+  let count = 1
+  for (let index = 0; index < value.length; index += 1) {
+    if (value.charCodeAt(index) !== 10) continue
+    count += 1
+    if (count > maximum) return count
+  }
+  return count
+}
+
 export default {
   props: ['visible', 'data', 'title'],
   emits: ['close', 'save'],
@@ -57,14 +70,22 @@ export default {
     }
   },
   computed: {
-    lineCount() {
-      return this.content?.split('\n').length
+    isLargeDocument() {
+      return String(this.content ?? '').length > EDITOR_LARGE_DOCUMENT_BYTES
+    },
+    lineNumberCount() {
+      if (this.isLargeDocument) return 0
+      return countDocumentLines(String(this.content ?? ''), EDITOR_MAX_LINE_NUMBER_ROWS + 1)
+    },
+    showLineNumbers() {
+      return this.lineNumberCount > 0 && this.lineNumberCount <= EDITOR_MAX_LINE_NUMBER_ROWS
     }
   },
   methods: {
     syncScroll() {
-      const textarea = document.querySelector('textarea')
-      const lineNumbers = textarea?.parentElement?.parentElement?.querySelector('.line-numbers')
+      const textareaComponent = this.$refs.textareaRef as { $el?: HTMLElement } | undefined
+      const textarea = textareaComponent?.$el?.querySelector('textarea')
+      const lineNumbers = this.$refs.lineNumbersRef as HTMLElement | undefined
       if (lineNumbers && textarea) {
         lineNumbers.scrollTop = textarea.scrollTop
       }
@@ -96,6 +117,10 @@ export default {
   font-size: 14px; /* Consistent font size */
 }
 
+.editor-card-text {
+  padding: 0 16px;
+}
+
 .line-numbers {
   width: 40px;
   background: v-bind('theme.current.colors["surface"]');
@@ -125,9 +150,18 @@ export default {
   font-size: 14px !important; /* Match font size */
 }
 
+:deep(.v-textarea textarea) {
+  max-height: min(60vh, 560px) !important;
+  overflow: auto !important;
+}
+
 /* Ensure textarea and line numbers align */
 :deep(.v-textarea textarea) {
   margin-top: 0 !important; /* Remove any default margin */
   padding-top: 0 !important; /* Remove any default padding */
+}
+
+.code-editor--large :deep(.v-textarea .v-field__input) {
+  white-space: pre-wrap;
 }
 </style>

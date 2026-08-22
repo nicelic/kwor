@@ -12,6 +12,16 @@
 	  <v-alert v-if="parseError" type="error" variant="tonal" density="compact" class="mb-4">
 	    {{ parseError }}
 	  </v-alert>
+	  <template v-if="formRowsTooLarge">
+	    <v-alert type="warning" variant="tonal" density="compact" class="mb-4">
+	      {{ $t('subscriptionEditor.formRowsTooLarge') }}
+	    </v-alert>
+	    <v-card-actions>
+	      <v-spacer></v-spacer>
+	      <v-btn @click="openEditor" variant="outlined">{{ $t('editor') }}</v-btn>
+	    </v-card-actions>
+	  </template>
+	  <template v-else>
     <!-- Basic settings: mixed port, LAN access, external controller, log level -->
     <v-row>
       <v-col cols="12" sm="6" md="3" lg="2">
@@ -123,6 +133,8 @@
           placeholder="198.18.0.1/30"
          @update:model-value="onFormValueChange"></v-combobox>
       </v-col>
+    </v-row>
+    <v-row v-if="tunEnabled">
       <v-col cols="12" sm="6" md="4" lg="3">
         <v-combobox
           v-model="tunInet6Address"
@@ -153,11 +165,27 @@
       <v-col cols="12" sm="4" md="2" lg="2">
         <v-switch v-model="dnsEnabled" color="primary" :label="$t('pages.dns')" hide-details  @update:model-value="onFormValueChange"/>
       </v-col>
-      <v-col cols="12" sm="4" md="2" lg="2" v-if="dnsEnabled">
-        <v-switch v-model="dnsIpv6" color="primary" label="DNS_IPv6" hide-details  @update:model-value="onFormValueChange"/>
+    </v-row>
+    <v-row v-if="dnsEnabled">
+      <v-col cols="12" sm="6" md="3" lg="2">
+        <v-select
+          v-model="dnsIpv6"
+          :items="optionalBoolOptions"
+          label="DNS_IPv6"
+          hide-details
+          @update:model-value="onFormValueChange"
+        ></v-select>
       </v-col>
-      <v-col cols="12" sm="4" md="2" lg="2" v-if="dnsEnabled">
-        <v-switch v-model="dnsPreferH3" color="primary" label="prefer-h3" hide-details  @update:model-value="onFormValueChange"/>
+    </v-row>
+    <v-row v-if="dnsEnabled">
+      <v-col cols="12" sm="6" md="3" lg="2">
+        <v-select
+          v-model="dnsPreferH3"
+          :items="optionalBoolOptions"
+          label="prefer-h3"
+          hide-details
+          @update:model-value="onFormValueChange"
+        ></v-select>
       </v-col>
     </v-row>
     <template v-if="dnsEnabled">
@@ -582,7 +610,16 @@
 		<v-select v-model="updateMethod" :items="clashUpdateMethodOptions" :label="$t('subscriptionEditor.updateMethod')" hide-details @update:model-value="onFormValueChange"></v-select>
       </v-col>
       <v-col cols="12" sm="3" md="2">
-		<v-text-field v-model="updateInterval" :label="$t('subscriptionEditor.updateInterval')" hide-details placeholder="1d" @update:model-value="onFormValueChange"></v-text-field>
+		<v-text-field
+		  v-model="updateInterval"
+		  :label="$t('subscriptionEditor.updateInterval')"
+		  hide-details="auto"
+		  :hint="$t('subscriptionEditor.clashRuleProviderIntervalHint')"
+		  persistent-hint
+		  :error-messages="ruleProviderIntervalError ? [ruleProviderIntervalError] : []"
+		  :placeholder="$t('subscriptionEditor.clashRuleProviderIntervalPlaceholder')"
+		  @update:model-value="onFormValueChange"
+		></v-text-field>
       </v-col>
       <v-col cols="12" sm="3" md="2">
         <v-select
@@ -775,6 +812,7 @@
       <v-spacer></v-spacer>
       <v-btn @click="openEditor" variant="outlined" hide-details>{{ $t('editor') }}</v-btn>
     </v-card-actions>
+	  </template>
   </v-card>
 </template>
 
@@ -842,6 +880,7 @@ export default {
 	  _parseError: '',
 	  _rawSource: '',
 	  _editorSourcePending: false,
+	  formRowsTooLarge: false,
 
       // Clash rule rows (independent from JSON sub rule rows).
       ruleSetSource: 'metacubex_cdn' as string,

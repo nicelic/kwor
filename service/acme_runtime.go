@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -20,6 +21,7 @@ const (
 	acmeRuntimeStateMaxFileLen = 2 * 1024 * 1024
 	acmeRuntimeStateMaxBytes   = 8 * 1024 * 1024
 	acmeIPRuntimeProfile       = "ip_acme"
+	acmeTempWorkspaceStaleAge  = 30 * time.Minute
 )
 
 // acmeRuntimeState is deliberately limited to the acme.sh ca/ tree. The
@@ -126,6 +128,55 @@ func (r *acmeOperationRuntime) cleanup() {
 		return
 	}
 	_ = os.RemoveAll(root)
+}
+
+// CleanupStaleAcmeTempWorkspaces removes only old, panel-owned ACME temporary
+// directories left behind by a crash, forced termination, or power loss.
+// Active operations are protected by the age threshold and are never removed
+// during normal startup.
+func CleanupStaleAcmeTempWorkspaces() error {
+	return cleanupStaleAcmeTempWorkspacesIn(os.TempDir())
+}
+
+func cleanupStaleAcmeTempWorkspacesIn(tempRoot string) error {
+	root := filepath.Clean(strings.TrimSpace(tempRoot))
+	if root == "" || root == "." || root == string(filepath.Separator) {
+		return nil
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read ACME temporary directory failed: %w", err)
+	}
+
+	cutoff := time.Now().Add(-acmeTempWorkspaceStaleAge)
+	var firstErr error
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, acmeRuntimeTempPrefix) && !strings.HasPrefix(name, "sui-acme-") {
+			continue
+		}
+		if entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() {
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("inspect ACME temporary workspace %q failed: %w", name, infoErr)
+			}
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			continue
+		}
+		path := filepath.Join(root, name)
+		if removeErr := os.RemoveAll(path); removeErr != nil && !os.IsNotExist(removeErr) && firstErr == nil {
+			firstErr = fmt.Errorf("remove stale ACME temporary workspace %q failed: %w", name, removeErr)
+		}
+	}
+	return firstErr
 }
 
 func restoreAcmeRuntimeState(configHome string, raw []byte) error {

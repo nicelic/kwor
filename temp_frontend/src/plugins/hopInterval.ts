@@ -11,26 +11,40 @@ function normalizeIntervalUnit(unit?: string, fallback: string = 's'): string {
   return normalized !== '' ? normalized : fallback
 }
 
-function intervalUnitToSeconds(amount: number, unit: string): number {
-  if (!Number.isFinite(amount) || amount <= 0) return 0
+function parsePositiveHopInteger(value: unknown): number {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value > 0 ? value : 0
+  }
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) return 0
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0
+}
 
+function intervalUnitToSeconds(amount: number, unit: string): number {
+  if (!Number.isSafeInteger(amount) || amount <= 0) return 0
+
+  let seconds = amount
   switch (normalizeIntervalUnit(unit)) {
     case 'd':
-      return amount * 86400
+      seconds = amount * 86400
+      break
     case 'h':
-      return amount * 3600
+      seconds = amount * 3600
+      break
     case 'm':
-      return amount * 60
+      seconds = amount * 60
+      break
     case 'ms':
-      return Math.max(1, Math.round(amount / 1000))
-    default:
-      return amount
+      if (amount % 1000 !== 0) return 0
+      seconds = amount / 1000
+      break
   }
+  return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : 0
 }
 
 export function parseHopIntervalSeconds(raw: unknown): number {
   if (typeof raw === 'number') {
-    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0
+    return parsePositiveHopInteger(raw)
   }
   if (typeof raw !== 'string') return 0
 
@@ -40,7 +54,7 @@ export function parseHopIntervalSeconds(raw: unknown): number {
   const matched = input.match(SINGLE_INTERVAL_RE)
   if (!matched) return 0
 
-  const amount = Number.parseInt(matched[1], 10)
+  const amount = parsePositiveHopInteger(matched[1])
   return intervalUnitToSeconds(amount, normalizeIntervalUnit(matched[2]))
 }
 
@@ -67,8 +81,8 @@ export function parseHopIntervalInput(raw: unknown): ParsedHopIntervalInput | un
 
     const leftUnit = normalizeIntervalUnit(leftMatch[2], normalizeIntervalUnit(rightMatch[2]))
     const rightUnit = normalizeIntervalUnit(rightMatch[2], normalizeIntervalUnit(leftMatch[2]))
-    const leftSeconds = intervalUnitToSeconds(Number.parseInt(leftMatch[1], 10), leftUnit)
-    const rightSeconds = intervalUnitToSeconds(Number.parseInt(rightMatch[1], 10), rightUnit)
+    const leftSeconds = intervalUnitToSeconds(parsePositiveHopInteger(leftMatch[1]), leftUnit)
+    const rightSeconds = intervalUnitToSeconds(parsePositiveHopInteger(rightMatch[1]), rightUnit)
     if (leftSeconds <= 0 || rightSeconds <= 0) return undefined
 
     const lower = Math.min(leftSeconds, rightSeconds)

@@ -60,7 +60,7 @@ func (o *EndpointService) GetAll() (*[]map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	var data []map[string]interface{}
+	data := make([]map[string]interface{}, 0, len(endpoints))
 	for _, endpoint := range endpoints {
 		routeTag := deriveEffectiveEndpointRouteTagFromRaw(endpoint.Tag, endpoint.Options)
 		epData := map[string]interface{}{
@@ -109,12 +109,19 @@ func (s *EndpointService) PrepareSave(act string, data json.RawMessage) (json.Ra
 		return data, nil
 	}
 
-	var endpoint model.Endpoint
-	if err := endpoint.UnmarshalJSON(data); err != nil {
+	normalizedData, identity, err := validateAndNormalizeSingboxEndpointPayload(data, act)
+	if err != nil {
 		return nil, err
 	}
+	var endpoint model.Endpoint
+	if err := endpoint.UnmarshalJSON(normalizedData); err != nil {
+		return nil, err
+	}
+	endpoint.Id = identity.ID
+	endpoint.Type = identity.Type
+	endpoint.Tag = identity.Tag
 	if endpoint.Type != "warp" {
-		return data, nil
+		return normalizedData, nil
 	}
 
 	if act == "new" {
@@ -122,13 +129,15 @@ func (s *EndpointService) PrepareSave(act string, data json.RawMessage) (json.Ra
 			return nil, err
 		}
 	} else {
-		var oldLicense string
-		if err := database.GetDB().Model(model.Endpoint{}).
-			Select("json_extract(ext, '$.license_key')").
-			Where("id = ?", endpoint.Id).
-			Find(&oldLicense).Error; err != nil {
+		var existing model.Endpoint
+		if err := database.GetDB().Select("id", "ext").Where("id = ?", endpoint.Id).Take(&existing).Error; err != nil {
 			return nil, err
 		}
+		var ext map[string]interface{}
+		if err := json.Unmarshal(existing.Ext, &ext); err != nil && len(existing.Ext) > 0 {
+			return nil, err
+		}
+		oldLicense, _ := ext["license_key"].(string)
 		if err := s.WarpService.SetWarpLicense(oldLicense, &endpoint); err != nil {
 			return nil, err
 		}
@@ -142,14 +151,44 @@ func (s *EndpointService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 
 	switch act {
 	case "new", "edit":
-		var endpoint model.Endpoint
-		err = endpoint.UnmarshalJSON(data)
+		normalizedData, identity, err := validateAndNormalizeSingboxEndpointPayload(data, act)
 		if err != nil {
 			return err
+		}
+		var endpoint model.Endpoint
+		err = endpoint.UnmarshalJSON(normalizedData)
+		if err != nil {
+			return err
+		}
+		endpoint.Id = identity.ID
+		endpoint.Type = identity.Type
+		endpoint.Tag = identity.Tag
+		endpointFields := map[string]interface{}{}
+		if err := json.Unmarshal(normalizedData, &endpointFields); err != nil {
+			return err
+		}
+		if err := validateSingboxDNSResolverFields(tx, endpointFields, "sing-box endpoint "+endpoint.Tag); err != nil {
+			return err
+		}
+		var previousRouteTags []string
+		if act == "edit" {
+			var previous model.Endpoint
+			if err := tx.Where("id = ?", endpoint.Id).First(&previous).Error; err != nil {
+				return err
+			}
+			previousRouteTags = singboxRouteEndpointReferenceTags(&previous)
+			if previous.Tag != endpoint.Tag {
+				if err := validateSingboxEndpointRemovalReferences(tx, []string{previous.Tag}); err != nil {
+					return err
+				}
+			}
 		}
 
 		err = tx.Save(&endpoint).Error
 		if err != nil {
+			return err
+		}
+		if err := validateSingboxInboundRemovalReferences(tx, removedSingboxRuntimeTags(previousRouteTags, singboxRouteEndpointReferenceTags(&endpoint))); err != nil {
 			return err
 		}
 	case "del":
@@ -158,8 +197,20 @@ func (s *EndpointService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 		if err != nil {
 			return err
 		}
+		var existing model.Endpoint
+		if err := tx.Where("tag = ?", tag).First(&existing).Error; err != nil {
+			return err
+		}
+		removedRouteTags := singboxRouteEndpointReferenceTags(&existing)
+		removedRouteTags = append(removedRouteTags, existing.Tag)
+		if err := validateSingboxEndpointRemovalReferences(tx, removedRouteTags); err != nil {
+			return err
+		}
 		err = tx.Where("tag = ?", tag).Delete(model.Endpoint{}).Error
 		if err != nil {
+			return err
+		}
+		if err := validateSingboxInboundRemovalReferences(tx, removedRouteTags); err != nil {
 			return err
 		}
 	default:

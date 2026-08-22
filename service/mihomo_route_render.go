@@ -127,6 +127,9 @@ func renderMihomoRoutes(route map[string]interface{}, providerTags map[string]st
 }
 
 func buildMihomoRuleStrings(rule map[string]interface{}, providerTags map[string]struct{}, ipRuleProviderTags map[string]struct{}, targets *mihomoProxyConversionResult, noResolveEnabled bool) ([]string, bool) {
+	if err := validateMihomoRouteNumericMatchers(rule); err != nil {
+		return nil, false
+	}
 	target, ok := resolveMihomoRuleTarget(rule, targets)
 	if !ok {
 		return nil, false
@@ -200,35 +203,56 @@ func buildMihomoRuleStrings(rule map[string]interface{}, providerTags map[string
 		return []string{"MATCH," + target}, true
 	}
 
-	combinations := expandMihomoMatcherGroups(matcherGroups)
-	if len(combinations) == 0 {
+	combinationCount := 1
+	for _, group := range matcherGroups {
+		if len(group) == 0 || combinationCount > maxMihomoRuleCombinations/len(group) {
+			return nil, false
+		}
+		combinationCount *= len(group)
+	}
+	if combinationCount == 0 {
 		return nil, false
 	}
 
-	rendered := make([]string, 0, len(combinations))
-	for _, atoms := range combinations {
-		if len(atoms) == 0 {
-			continue
-		}
-		if len(atoms) == 1 {
-			ruleString := atoms[0] + "," + target
-			if noResolveEnabled && hasTargetIPMatcher {
-				ruleString += ",no-resolve"
+	rendered := make([]string, 0, combinationCount)
+	atoms := make([]string, len(matcherGroups))
+	var renderCombination func(int)
+	renderCombination = func(groupIndex int) {
+		if groupIndex == len(matcherGroups) {
+			if len(atoms) == 1 {
+				ruleString := atoms[0] + "," + target
+				if noResolveEnabled && hasTargetIPMatcher {
+					ruleString += ",no-resolve"
+				}
+				rendered = append(rendered, ruleString)
+				return
 			}
-			rendered = append(rendered, ruleString)
-			continue
+
+			var builder strings.Builder
+			builder.WriteString("AND,(")
+			for index, atom := range atoms {
+				if index > 0 {
+					builder.WriteByte(',')
+				}
+				builder.WriteByte('(')
+				builder.WriteString(atom)
+				builder.WriteByte(')')
+			}
+			builder.WriteString("),")
+			builder.WriteString(target)
+			if noResolveEnabled && hasTargetIPMatcher {
+				builder.WriteString(",no-resolve")
+			}
+			rendered = append(rendered, builder.String())
+			return
 		}
 
-		parts := make([]string, 0, len(atoms))
-		for _, atom := range atoms {
-			parts = append(parts, "("+atom+")")
+		for _, atom := range matcherGroups[groupIndex] {
+			atoms[groupIndex] = atom
+			renderCombination(groupIndex + 1)
 		}
-		ruleString := "AND,(" + strings.Join(parts, ",") + ")," + target
-		if noResolveEnabled && hasTargetIPMatcher {
-			ruleString += ",no-resolve"
-		}
-		rendered = append(rendered, ruleString)
 	}
+	renderCombination(0)
 	return rendered, len(rendered) > 0
 }
 
@@ -266,8 +290,14 @@ func resolveMihomoRuleTarget(rule map[string]interface{}, targets *mihomoProxyCo
 
 func describeInvalidMihomoRule(rule map[string]interface{}, providerTags map[string]struct{}, targets *mihomoProxyConversionResult) string {
 	action := strings.TrimSpace(firstString(rule["action"]))
+	if err := validateMihomoRouteNumericMatchers(rule); err != nil {
+		return fmt.Sprintf("route rule %v", err)
+	}
 	if missing := collectMissingMihomoRuleProviderTags(normalizeMihomoRuleSetRefs(rule["rule_set"]), providerTags); len(missing) > 0 {
 		return fmt.Sprintf("route rule references unknown rule_set provider(s): %s", strings.Join(missing, ", "))
+	}
+	if _, err := mihomoRuleCombinationCount(rule); err != nil {
+		return fmt.Sprintf("route rule %v", err)
 	}
 	switch action {
 	case "reject":
@@ -425,13 +455,15 @@ func buildPortMatcherAtoms(matcher string, portsRaw interface{}, rangesRaw inter
 	}
 
 	for _, port := range toIntList(portsRaw) {
-		if port < 0 {
+		if port < 1 || port > 65535 {
 			continue
 		}
 		add(fmt.Sprintf("%d", port))
 	}
 	for _, portRange := range toStringSlice(rangesRaw) {
-		add(portRange)
+		if normalized, ok := normalizeMihomoPortRangeValue(portRange); ok {
+			add(normalized)
+		}
 	}
 
 	return atoms
@@ -445,7 +477,7 @@ func buildIntegerMatcherAtoms(matcher string, raw interface{}) []string {
 	atoms := make([]string, 0, len(values))
 	seen := map[int]struct{}{}
 	for _, value := range values {
-		if value < 0 {
+		if value < 0 || int64(value) > maxMihomoUID {
 			continue
 		}
 		if _, exists := seen[value]; exists {
@@ -472,19 +504,25 @@ func toIntList(raw interface{}) []int {
 	case []int32:
 		result := make([]int, 0, len(value))
 		for _, item := range value {
-			result = append(result, int(item))
+			if intValue, ok := toInt(item); ok {
+				result = append(result, intValue)
+			}
 		}
 		return result
 	case []int64:
 		result := make([]int, 0, len(value))
 		for _, item := range value {
-			result = append(result, int(item))
+			if intValue, ok := toInt(item); ok {
+				result = append(result, intValue)
+			}
 		}
 		return result
 	case []float64:
 		result := make([]int, 0, len(value))
 		for _, item := range value {
-			result = append(result, int(item))
+			if intValue, ok := toInt(item); ok {
+				result = append(result, intValue)
+			}
 		}
 		return result
 	case []interface{}:
@@ -582,29 +620,6 @@ func hasMihomoTargetIPRuleSetMatcher(values []string, ipRuleProviderTags map[str
 		}
 	}
 	return false
-}
-
-func expandMihomoMatcherGroups(groups [][]string) [][]string {
-	if len(groups) == 0 {
-		return nil
-	}
-
-	combinations := [][]string{{}}
-	for _, group := range groups {
-		if len(group) == 0 {
-			continue
-		}
-		next := make([][]string, 0, len(combinations)*len(group))
-		for _, combination := range combinations {
-			for _, atom := range group {
-				cloned := append([]string{}, combination...)
-				cloned = append(cloned, atom)
-				next = append(next, cloned)
-			}
-		}
-		combinations = next
-	}
-	return combinations
 }
 
 func normalizeMihomoInboundRules(raw interface{}, aliasMap map[string]string) []string {
@@ -929,6 +944,9 @@ func normalizeMihomoListenerPayload(listener map[string]interface{}) {
 		listenerType = "redir"
 	}
 
+	for _, key := range []string{"shadow-tls", "res-tls", "jls-config"} {
+		delete(listener, key)
+	}
 	normalizeMihomoListenerCompatFields(listener, listenerType)
 
 	tlsMap, ok := listener["tls"].(map[string]interface{})
@@ -954,6 +972,7 @@ func normalizeMihomoListenerPayload(listener map[string]interface{}) {
 	if realityConfig := buildMihomoListenerRealityConfig(tlsMap); len(realityConfig) > 0 {
 		listener["reality-config"] = realityConfig
 	}
+	copyMihomoWrapperTLS(listener, tlsMap)
 	if (listenerType == "hysteria2" || listenerType == "tuic") && listener["alpn"] == nil {
 		if alpn := toStringSlice(tlsMap["alpn"]); len(alpn) > 0 {
 			listener["alpn"] = alpn
@@ -961,6 +980,59 @@ func normalizeMihomoListenerPayload(listener map[string]interface{}) {
 	}
 
 	delete(listener, "tls")
+}
+
+func copyMihomoWrapperTLS(listener, tlsMap map[string]interface{}) {
+	if listener == nil || tlsMap == nil {
+		return
+	}
+	if config, ok := tlsMap["shadow_tls"].(map[string]interface{}); ok && config != nil {
+		listener["shadow-tls"] = normalizeMihomoWrapperMap(config, map[string]string{
+			"strict_mode":               "strict-mode",
+			"wildcard_sni":              "wildcard-sni",
+			"handshake_for_server_name": "handshake-for-server-name",
+		})
+	}
+	if config, ok := tlsMap["res_tls"].(map[string]interface{}); ok && config != nil {
+		listener["res-tls"] = normalizeMihomoWrapperMap(config, map[string]string{
+			"restls_script":  "restls-script",
+			"min_record_len": "min-record-len",
+			"rate_limit":     "rate-limit",
+		})
+	}
+	if config, ok := tlsMap["jls_config"].(map[string]interface{}); ok && config != nil {
+		listener["jls-config"] = normalizeMihomoWrapperMap(config, map[string]string{
+			"rate_limit": "rate-limit",
+		})
+	}
+}
+
+func normalizeMihomoWrapperMap(source map[string]interface{}, aliases map[string]string) map[string]interface{} {
+	result := make(map[string]interface{}, len(source))
+	for key, value := range source {
+		outputKey := key
+		if alias, ok := aliases[key]; ok {
+			outputKey = alias
+		}
+		if nested, ok := value.(map[string]interface{}); ok && nested != nil {
+			result[outputKey] = normalizeMihomoWrapperMap(nested, nil)
+			continue
+		}
+		if list, ok := value.([]interface{}); ok {
+			copied := make([]interface{}, 0, len(list))
+			for _, item := range list {
+				if nested, ok := item.(map[string]interface{}); ok && nested != nil {
+					copied = append(copied, normalizeMihomoWrapperMap(nested, nil))
+				} else {
+					copied = append(copied, item)
+				}
+			}
+			result[outputKey] = copied
+			continue
+		}
+		result[outputKey] = value
+	}
+	return result
 }
 
 func normalizeMihomoListenerTLSValue(content interface{}, path interface{}) string {
@@ -998,7 +1070,7 @@ func buildMihomoListenerRealityConfig(tlsMap map[string]interface{}) map[string]
 	handshake, _ := realityMap["handshake"].(map[string]interface{})
 	handshakeServer := strings.TrimSpace(firstString(handshake["server"]))
 	handshakePort, _ := toInt(handshake["server_port"])
-	if handshakeServer != "" && handshakePort > 0 {
+	if handshakeServer != "" && handshakePort >= 1 && handshakePort <= 65535 {
 		realityConfig["dest"] = fmt.Sprintf("%s:%d", handshakeServer, handshakePort)
 	}
 
@@ -1054,10 +1126,9 @@ func buildMihomoInboundRouteRef(inbound model.MihomoInbound, targets *mihomoProx
 func filterSupportedMihomoListeners(inbounds []model.MihomoInbound) []model.MihomoInbound {
 	supported := make([]model.MihomoInbound, 0, len(inbounds))
 	for _, inbound := range inbounds {
-		switch inbound.Type {
-		case "mixed", "socks", "http", "redirect", "tproxy", "tun", "snell", "shadowsocks", "shadowtls", "shadowquic", "vmess", "vless", "trojan", "anytls", "tuic", "hysteria2", "mieru", "sudoku", "trusttunnel":
+		if isSupportedMihomoInboundType(inbound.Type) {
 			supported = append(supported, inbound)
-		default:
+		} else {
 			logger.Warning("skip unsupported mihomo listener type: ", inbound.Type, " tag=", inbound.Tag)
 		}
 	}
@@ -1065,13 +1136,14 @@ func filterSupportedMihomoListeners(inbounds []model.MihomoInbound) []model.Miho
 }
 
 func normalizeMihomoSniffer(raw interface{}) map[string]interface{} {
-	value, ok := raw.(map[string]interface{})
-	if !ok || value == nil {
-		return nil
-	}
-
-	enabled, _ := toBool(value["enable"])
-	if !enabled {
+	value, isObject := raw.(map[string]interface{})
+	if !isObject || value == nil {
+		enabled, ok := toBool(raw)
+		if !ok || !enabled {
+			return nil
+		}
+		value = map[string]interface{}{}
+	} else if enabled, _ := toBool(value["enable"]); !enabled {
 		return nil
 	}
 
@@ -1121,12 +1193,6 @@ func copyMihomoGeneralConfig(base map[string]interface{}) map[string]interface{}
 			continue
 		default:
 			result[key] = value
-		}
-	}
-
-	if logMap, ok := base["log"].(map[string]interface{}); ok {
-		if level, ok := logMap["level"].(string); ok && strings.TrimSpace(level) != "" {
-			result["log-level"] = strings.TrimSpace(level)
 		}
 	}
 

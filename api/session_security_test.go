@@ -760,3 +760,87 @@ func TestLoginCookieWriteFailureRollsBackDatabaseOverflow(t *testing.T) {
 		t.Fatalf("failed cookie write left %d database overflow sessions", got)
 	}
 }
+
+func TestSessionStoreFailureReturnsRetryableStatusAndPreservesCookie(t *testing.T) {
+	state := isolateLoginSessionState(t)
+	prepareLoginSessionDatabase(t)
+	// Re-open a usable database after this test closes the active SQL handle so
+	// the package-level database remains safe for tests that follow it.
+	recoveryPath := filepath.Join(t.TempDir(), "session-store-recovery.db")
+	t.Cleanup(func() {
+		if err := database.InitDB(recoveryPath); err != nil {
+			return
+		}
+		if recoveredDB := database.GetDB(); recoveredDB != nil {
+			if recoveredSQLDB, err := recoveredDB.DB(); err == nil && recoveredSQLDB != nil {
+				_ = recoveredSQLDB.Close()
+			}
+		}
+	})
+
+	var token string
+	for index := 0; index <= maxInMemoryLoginSessions; index++ {
+		currentToken, _ := createStoredLoginSession(t, state, "temporary-failure-user", 0)
+		if index == maxInMemoryLoginSessions {
+			token = currentToken
+		}
+	}
+
+	gin.SetMode(gin.TestMode)
+	store := cookie.NewStore([]byte("session-store-failure-test-secret"))
+	router := gin.New()
+	router.Use(sessions.Sessions("kwor", store))
+	router.GET("/session", (&ApiService{}).Session)
+	router.GET("/protected", checkLogin, func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+	sessionCookie := writeSessionCookie(t, store, map[interface{}]interface{}{
+		loginSessionToken: token,
+	})
+
+	db := database.GetDB()
+	if db == nil {
+		t.Fatal("login session database is nil")
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get login session sql database: %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("close login session sql database: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/session", nil)
+	request.AddCookie(sessionCookie)
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("store failure status=%d body=%q, want %d", recorder.Code, recorder.Body.String(), http.StatusServiceUnavailable)
+	}
+	var response sessionAPIResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode store failure response: %v; body=%q", err, recorder.Body.String())
+	}
+	if response.Success || response.Obj.Reason != loginSessionReasonStoreFailed {
+		t.Fatalf("store failure response=%#v, want reason=%q", response, loginSessionReasonStoreFailed)
+	}
+	for _, responseCookie := range recorder.Result().Cookies() {
+		if responseCookie.Name == "kwor" && responseCookie.MaxAge < 0 {
+			t.Fatalf("temporary session store failure deleted the login cookie: %#v", responseCookie)
+		}
+	}
+
+	protectedRecorder := httptest.NewRecorder()
+	protectedRequest := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	protectedRequest.Header.Set("X-Requested-With", "XMLHttpRequest")
+	protectedRequest.AddCookie(sessionCookie)
+	router.ServeHTTP(protectedRecorder, protectedRequest)
+	if protectedRecorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("protected route store failure status=%d body=%q, want %d", protectedRecorder.Code, protectedRecorder.Body.String(), http.StatusServiceUnavailable)
+	}
+	for _, responseCookie := range protectedRecorder.Result().Cookies() {
+		if responseCookie.Name == "kwor" && responseCookie.MaxAge < 0 {
+			t.Fatalf("protected route temporary store failure deleted the login cookie: %#v", responseCookie)
+		}
+	}
+}

@@ -1,11 +1,24 @@
 <template>
-  <v-dialog transition="dialog-bottom-transition" width="90%" max-width="800" :loading="loading">
+  <v-dialog
+    :model-value="visible"
+    transition="dialog-bottom-transition"
+    width="90%"
+    max-width="800"
+    max-height="calc(100vh - 24px)"
+    scrollable
+    :loading="loading"
+    @update:model-value="updateDialog"
+  >
     <v-card class="rounded-lg">
       <v-card-title>
         <v-row>
           <v-col>{{ $t('admin.changes') }}</v-col>
           <v-spacer></v-spacer>
-          <v-col cols="auto"><v-icon icon="mdi-close-box" @click="$emit('close')" /></v-col>
+          <v-col cols="auto">
+            <v-btn icon="mdi-close" variant="text" :aria-label="$t('actions.close')" @click="$emit('close')">
+              <v-tooltip activator="parent" location="top" :text="$t('actions.close')" />
+            </v-btn>
+          </v-col>
         </v-row>
       </v-card-title>
       <v-divider></v-divider>
@@ -24,7 +37,7 @@
             <v-select
             hide-details
             :label="$t('admin.key')"
-            :items="['', 'inbounds', 'outbounds', 'clients', 'route', 'tls', 'experimental']"
+            :items="changeKeys"
             v-model="key"
             @update:model-value="loadData">
             </v-select>
@@ -70,7 +83,7 @@
             <tr>
               <td :colspan="columns.length">
                 <v-card dir="ltr" v-if="item.index>0">Index: {{ item.index }}</v-card>
-                <v-card style="background-color: background" dir="ltr"><pre>{{ item.obj }}</pre></v-card>
+                <v-card style="background-color: background" dir="ltr"><pre class="change-object">{{ item.obj }}</pre></v-card>
               </td>
             </tr>
           </template>
@@ -86,7 +99,7 @@ import HttpUtils from '@/plugins/httputil'
 import { formatPanelDateTime } from '@/plugins/panelTime'
 
 export default {
-  props: ['admins', 'actor', 'visible'],
+  props: ['admins', 'actor', 'visible', 'modelValue'],
   data() {
     return {
       loading: false,
@@ -102,9 +115,32 @@ export default {
         { title: i18n.global.t('admin.key'), key: 'key' },
         { title: i18n.global.t('admin.action'), key: 'action' },
       ],
+      changeKeys: [
+        '',
+        'inbounds',
+        'outbounds',
+        'clients',
+        'route',
+        'tls',
+        'experimental',
+        'config',
+        'settings',
+        'singbox_basics',
+        'singbox_dns',
+        'singbox_route',
+        'mihomo_inbounds',
+        'mihomo_clients',
+        'mihomo_outbounds',
+        'mihomo_config',
+        'mihomo_tls',
+      ],
     }
   },
   methods: {
+    updateDialog(value: boolean) {
+      this.$emit('update:modelValue', value)
+      if (!value) this.$emit('close')
+    },
     async loadData() {
       this.loading = true
       try {
@@ -146,3 +182,12 @@ export default {
   },
 }
 </script>
+
+<style scoped>
+.change-object {
+  max-width: 100%;
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+</style>

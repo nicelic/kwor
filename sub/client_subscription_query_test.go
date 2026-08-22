@@ -61,3 +61,28 @@ func TestMihomoSubscriptionQueryRouteAcceptsSpecialCharacters(t *testing.T) {
 		t.Fatalf("expected status 200, got %d with body %q", recorder.Code, recorder.Body.String())
 	}
 }
+
+func TestSubscriptionRenderReturnsRetryAfterWhenRendererIsBusy(t *testing.T) {
+	for index := 0; index < subscriptionRenderMaxConcurrent; index++ {
+		subscriptionRenderSlots <- struct{}{}
+	}
+	t.Cleanup(func() {
+		for index := 0; index < subscriptionRenderMaxConcurrent; index++ {
+			<-subscriptionRenderSlots
+		}
+	})
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	(&SubHandler{}).initRouter(router.Group("/"))
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/q/client?name=busy", nil))
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusTooManyRequests)
+	}
+	if got := recorder.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After = %q, want %q", got, "1")
+	}
+}

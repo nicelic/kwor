@@ -102,7 +102,7 @@ func TestResolveManagedLinuxDNSNameServersInputPreservesSavedLayout(t *testing.T
 	}
 }
 
-func TestResolveManagedLinuxDNSNameServersInputClearsMismatchedSavedLayout(t *testing.T) {
+func TestResolveManagedLinuxDNSNameServersInputDoesNotPersistDuringRead(t *testing.T) {
 	settingService := initSystemLinuxDNSTestSettingService(t)
 	svc := &SystemLinuxDNSOptimizationService{SettingService: *settingService}
 
@@ -124,7 +124,7 @@ func TestResolveManagedLinuxDNSNameServersInputClearsMismatchedSavedLayout(t *te
 	if err != nil {
 		t.Fatalf("get saved dns input failed: %v", err)
 	}
-	if saved != want {
-		t.Fatalf("saved input = %q, want %q", saved, want)
+	if saved != "1.1.1.1 1.0.0.1 9.9.9.9" {
+		t.Fatalf("overview read unexpectedly changed saved input: %q", saved)
 	}
 }

@@ -3,8 +3,8 @@ package api
 import (
 	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/alireza0/s-ui/database"

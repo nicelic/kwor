@@ -32,6 +32,17 @@ func NewNftCoreSyncJob() *NftCoreSyncJob {
 }
 
 func (s *NftCoreSyncJob) Run() {
+	s.run(false)
+}
+
+// RunNow is used by the centralized runtime sampler after a save, lifecycle
+// change, or restore. It preserves the normal 15-second cadence while still
+// reconciling a just-invalidated runtime immediately.
+func (s *NftCoreSyncJob) RunNow() {
+	s.run(true)
+}
+
+func (s *NftCoreSyncJob) run(forceIntegrity bool) {
 	if !service.IsSystemPlatformLinux() {
 		return
 	}
@@ -70,14 +81,14 @@ func (s *NftCoreSyncJob) Run() {
 		s.lastIntegrityScan = time.Time{}
 	} else if running {
 		now := time.Now()
-		if s.lastIntegrityScan.IsZero() || now.Sub(s.lastIntegrityScan) >= nftIntegrityScanInterval {
-			if err := s.NftTrafficService.EnsureRuleIntegrity(); err != nil {
+		if forceIntegrity || s.lastIntegrityScan.IsZero() || now.Sub(s.lastIntegrityScan) >= nftIntegrityScanInterval {
+			if err := s.NftTrafficService.EnsureRuleIntegrityWhenRunning(); err != nil {
 				logger.Warning("nft rule integrity scan failed: ", err)
 			}
-			if err := s.ClientRateLimitService.EnsureRuleIntegrity(); err != nil {
+			if err := s.ClientRateLimitService.EnsureRuleIntegrityWhenRunning(); err != nil {
 				logger.Warning("client rate limit nft integrity scan failed: ", err)
 			}
-			if err := s.ClientPortBlockService.EnsureRuleIntegrity(); err != nil {
+			if err := s.ClientPortBlockService.EnsureRuleIntegrityWhenRunning(); err != nil {
 				logger.Warning("client block nft integrity scan failed: ", err)
 			}
 			s.lastIntegrityScan = now

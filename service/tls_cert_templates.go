@@ -16,13 +16,15 @@ type tlsTemplateSubjectProfile struct {
 }
 
 type tlsSelfSignedTemplateProfile struct {
-	Code         string
-	Name         string
-	Root         tlsTemplateSubjectProfile
-	Intermediate tlsTemplateSubjectProfile
-	CAURL        string
-	OCSPURL      string
-	CRLURL       string
+	Code            string
+	Name            string
+	Root            tlsTemplateSubjectProfile
+	Intermediate    tlsTemplateSubjectProfile
+	CAURL           string
+	OCSPURL         string
+	CRLURL          string
+	LeafKeyUsage    x509.KeyUsage
+	LeafExtKeyUsage []x509.ExtKeyUsage
 }
 
 type TLSSelfSignedTemplateOption struct {

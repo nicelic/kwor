@@ -12,6 +12,18 @@ type AutoNamedFieldLocation = {
 }
 
 const sessionGeneratedUUIDs = new Set<string>()
+const sessionGeneratedUUIDOrder: string[] = []
+const sessionGeneratedUUIDLimit = 4096
+
+function rememberSessionGeneratedValue(value: string): void {
+  if (sessionGeneratedUUIDs.has(value)) return
+  sessionGeneratedUUIDs.add(value)
+  sessionGeneratedUUIDOrder.push(value)
+  while (sessionGeneratedUUIDOrder.length > sessionGeneratedUUIDLimit) {
+    const oldest = sessionGeneratedUUIDOrder.shift()
+    if (oldest) sessionGeneratedUUIDs.delete(oldest)
+  }
+}
 const defaultUUIDStyleFields: ReadonlyArray<ConfigFieldLocation> = [
   { key: "vmess", field: "uuid" },
   { key: "vless", field: "uuid" },
@@ -175,7 +187,7 @@ function randomUUIDExcluding(excludes?: Iterable<string>): string {
   while (reserved.has(value)) {
     value = RandomUtil.randomUUID()
   }
-  sessionGeneratedUUIDs.add(value)
+  rememberSessionGeneratedValue(value)
   return value
 }
 
@@ -194,7 +206,7 @@ function randomCredentialIDExcluding(excludes?: Iterable<string>): string {
   while (reserved.has(value)) {
     value = RandomUtil.randomCredentialID()
   }
-  sessionGeneratedUUIDs.add(value)
+  rememberSessionGeneratedValue(value)
   return value
 }
 
@@ -310,6 +322,25 @@ type Config = {
   }
 }
 
+const bytesPerGiB = 1024 ** 3
+
+export function clientVolumeGiBToBytes(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return 0
+
+  const gib = Number(value)
+  if (!Number.isFinite(gib) || gib < 0) return null
+
+  const bytes = Math.round(gib * bytesPerGiB)
+  return Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : null
+}
+
+export function clientVolumeBytesToGiB(value: unknown): number {
+  const bytes = Number(value)
+  if (!Number.isFinite(bytes) || bytes <= 0) return 0
+
+  return Number((bytes / bytesPerGiB).toFixed(6))
+}
+
 function normalizeTrustTunnelClientConfig(configs: Config, userName: string, oldUserName?: string): Config {
   const config = configs.trusttunnel
   if (!config) return configs
@@ -377,12 +408,27 @@ function normalizeSudokuClientConfig(configs: Config): Config {
   return configs
 }
 
+function normalizeVmessClientConfig(configs: Config): Config {
+  const config = configs.vmess
+  if (!config) return configs
+
+  const alterID = Number(config.alterId)
+  configs.vmess = {
+    ...config,
+    alterId: Number.isInteger(alterID) && alterID >= 0 ? alterID : 0,
+  }
+
+  return configs
+}
+
 export function updateConfigs(configs: Config, newUserName: string, oldUserName?: string, namespace?: string): Config {
-  return normalizeSudokuClientConfig(
-    normalizeTrustTunnelClientConfig(
-      syncAutoNamedConfigFields(configs, newUserName, namespace, oldUserName),
-      newUserName,
-      oldUserName,
+  return normalizeVmessClientConfig(
+    normalizeSudokuClientConfig(
+      normalizeTrustTunnelClientConfig(
+        syncAutoNamedConfigFields(configs, newUserName, namespace, oldUserName),
+        newUserName,
+        oldUserName,
+      ),
     ),
   )
 }
@@ -412,13 +458,27 @@ function applyUUIDStyleDefaults(configs: Config, namespace?: string): Config {
   return configs
 }
 
+const defaultConfigKeys = [
+  "mixed",
+  "socks",
+  "http",
+  "shadowtls",
+  "vmess",
+  "vless",
+  "anytls",
+  "trojan",
+  "naive",
+  "hysteria",
+  "tuic",
+  "hysteria2",
+]
+
 const mihomoConfigKeys = [
   "mixed",
   "socks",
   "http",
   "snell",
   "shadowsocks",
-  "shadowtls",
   "vmess",
   "vless",
   "anytls",
@@ -433,25 +493,19 @@ const mihomoConfigKeys = [
 
 function sanitizeConfigsByNamespace(configs: Config, namespace?: string): Config {
   const normalizedNamespace = normalizeClientConfigNamespace(namespace)
-  if (normalizedNamespace !== "mihomo") {
-    delete configs.snell
-    return configs
+  const allowedKeys = new Set(normalizedNamespace === "mihomo" ? mihomoConfigKeys : defaultConfigKeys)
+  for (const key of Object.keys(configs)) {
+    if (!allowedKeys.has(key)) delete configs[key]
   }
-
-  delete configs.hysteria
-  delete configs.shadowsocks16
-  delete configs.naive
   return configs
 }
 
 export function getConfigKeys(configs: Config, namespace?: string): string[] {
   const normalizedNamespace = normalizeClientConfigNamespace(namespace)
-  const keys = Object.keys(configs)
-  if (normalizedNamespace !== "mihomo") return keys
-
-  const allowed = new Set(mihomoConfigKeys)
-  const ordered = mihomoConfigKeys.filter((key) => allowed.has(key) && Object.hasOwn(configs, key))
-  const extra = keys.filter((key) => allowed.has(key) && !ordered.includes(key))
+  const orderedKeys = normalizedNamespace === "mihomo" ? mihomoConfigKeys : defaultConfigKeys
+  const allowed = new Set(orderedKeys)
+  const ordered = orderedKeys.filter((key) => Object.hasOwn(configs, key))
+  const extra = Object.keys(configs).filter((key) => allowed.has(key) && !ordered.includes(key))
   return [...ordered, ...extra]
 }
 
@@ -611,12 +665,31 @@ export function randomConfigs(user: string, namespace?: string): Config {
 export function createClient<T extends Client>(json?: Partial<T>, namespace?: string): Client {
   defaultClient.name = RandomUtil.randomSeq(8)
   const defaultObject: Client = { ...defaultClient, ...(json || {}) }
+  // 历史数据库记录可能把数组字段序列化为 null；编辑器和保存链路统一使用数组。
+  defaultObject.inbounds = Array.isArray(defaultObject.inbounds)
+    ? Array.from(new Set(defaultObject.inbounds
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0)))
+    : []
+  defaultObject.links = Array.isArray(defaultObject.links)
+    ? defaultObject.links.filter((link): link is Link => Boolean(link && typeof link === 'object' && typeof link.uri === 'string'))
+    : []
+  const generatedConfigs = randomConfigs(defaultObject.name, namespace)
+  const suppliedConfigs = defaultObject.config
+  const mergedConfigs: Config = { ...generatedConfigs }
 
-  // Add missing config
-  defaultObject.config = sanitizeConfigsByNamespace({
-    ...randomConfigs(defaultObject.name, namespace),
-    ...defaultObject.config,
-  }, namespace)
+  if (suppliedConfigs && typeof suppliedConfigs === 'object' && !Array.isArray(suppliedConfigs)) {
+    for (const [key, value] of Object.entries(suppliedConfigs)) {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) continue
+      mergedConfigs[key] = {
+        ...mergedConfigs[key],
+        ...value,
+      }
+    }
+  }
+
+  // Preserve stored credentials while restoring defaults for missing fields.
+  defaultObject.config = sanitizeConfigsByNamespace(mergedConfigs, namespace)
   defaultObject.config = updateConfigs(defaultObject.config, defaultObject.name, undefined, namespace)
   
   return defaultObject

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	dnsproxy "github.com/AdguardTeam/dnsproxy/proxy"
+	compressionalgorithm "github.com/alireza0/s-ui/compression/Compression-algorithm"
 	"github.com/alireza0/s-ui/database/model"
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
@@ -426,7 +427,12 @@ func (h *reverseProxyDNSRuleHandler) serveDoHRule(writer http.ResponseWriter, re
 	}
 	wire, err := reverseProxyDNSReadDoHMessage(writer, request)
 	if err != nil {
-		http.Error(writer, err.Error(), http.StatusBadRequest)
+		status := http.StatusBadRequest
+		if errors.Is(err, compressionalgorithm.ErrUnsupportedEncoding) {
+			status = http.StatusUnsupportedMediaType
+			writer.Header().Set("Accept-Encoding", compressionalgorithm.UpstreamAcceptEncoding())
+		}
+		http.Error(writer, err.Error(), status)
 		return
 	}
 	query := &dns.Msg{}
@@ -448,8 +454,15 @@ func (h *reverseProxyDNSRuleHandler) serveDoHRule(writer http.ResponseWriter, re
 	}
 	writer.Header().Set("Content-Type", "application/dns-message")
 	writer.Header().Set("Cache-Control", "no-store")
-	writer.WriteHeader(http.StatusOK)
-	_, _ = writer.Write(encoded)
+	compressedWriter := compressionalgorithm.NewHTTPResponseWriter(writer, compressionalgorithm.HTTPResponseOptions{
+		Request: request,
+		Level:   reverseProxyCompressionLevel,
+		Enabled: true,
+		MinSize: 0,
+	})
+	defer compressedWriter.Close()
+	compressedWriter.WriteHeader(http.StatusOK)
+	_, _ = compressedWriter.Write(encoded)
 }
 
 func reverseProxyDNSReadDoHMessage(writer http.ResponseWriter, request *http.Request) ([]byte, error) {
@@ -471,10 +484,21 @@ func reverseProxyDNSReadDoHMessage(writer http.ResponseWriter, request *http.Req
 		return wire, nil
 	}
 	if !strings.EqualFold(strings.TrimSpace(strings.Split(request.Header.Get("Content-Type"), ";")[0]), "application/dns-message") {
+		_ = request.Body.Close()
 		return nil, errors.New("content-type must be application/dns-message")
 	}
 	defer request.Body.Close()
-	wire, err := io.ReadAll(http.MaxBytesReader(writer, request.Body, reverseProxyDNSMaximumWireBytes+1))
+	body := request.Body
+	contentEncoding := strings.TrimSpace(strings.Join(request.Header.Values("Content-Encoding"), ","))
+	if contentEncoding != "" && !strings.EqualFold(contentEncoding, string(compressionalgorithm.AlgorithmIdentity)) {
+		decoded, decodeErr := compressionalgorithm.NewDecoder(request.Body, contentEncoding, reverseProxyDNSMaximumWireBytes+1)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		defer decoded.Close()
+		body = decoded
+	}
+	wire, err := io.ReadAll(http.MaxBytesReader(writer, body, reverseProxyDNSMaximumWireBytes+1))
 	if err != nil || len(wire) == 0 || len(wire) > reverseProxyDNSMaximumWireBytes {
 		return nil, errors.New("invalid dns message body")
 	}

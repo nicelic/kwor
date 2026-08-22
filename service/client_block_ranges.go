@@ -34,7 +34,7 @@ func collectInboundBlockRanges(inbound *model.Inbound) []portRange {
 }
 
 func collectMihomoInboundBlockRanges(inbound *model.MihomoInbound) []portRange {
-	if inbound == nil {
+	if inbound == nil || !isSupportedMihomoInboundType(inbound.Type) {
 		return nil
 	}
 

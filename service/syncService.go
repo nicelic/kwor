@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
-	"strconv"
 	"strings"
 	"time"
 
@@ -87,9 +85,12 @@ func (s *SyncService) SyncClientToSubManager(clientName string, hostname string)
 		return nil, err
 	}
 
-	markLastUpdate(time.Now().Unix())
+	markBothLastUpdates(time.Now().Unix())
 	if err := RunManagedRuntimeHookScope(tx); err != nil {
-		return nil, err
+		// The transaction has already committed. Keep the result so the API can
+		// preserve the automatic-sync marker even when post-commit validation
+		// reports an error.
+		return result, err
 	}
 
 	return result, nil
@@ -362,6 +363,48 @@ func (s *SyncService) syncClientSubOutboundsFullRebuild(
 		desiredTagSet[tag] = struct{}{}
 	}
 
+	// Build every replacement before deleting the current managed records. The
+	// manual API runs in a transaction, while automatic callers may continue
+	// their surrounding transaction after an error; staging here prevents a
+	// failed rebuild from first removing the old subscription nodes.
+	type pendingSyncedSubOutbound struct {
+		inboundID   uint
+		subTag      string
+		outbound    map[string]interface{}
+		clashSource map[string]interface{}
+	}
+	pending := make([]pendingSyncedSubOutbound, 0, len(newInboundIDs))
+	for _, inboundID := range newInboundIDs {
+		if isBlockedSubSyncInbound(blockedInboundIDs, inboundID) {
+			continue
+		}
+		inbound := inboundMap[inboundID]
+		if inbound == nil || isServerOnlySubscriptionInbound(inbound.Type, inbound.OutJson) {
+			continue
+		}
+		baseTag := strings.TrimSpace(inbound.Tag)
+		if baseTag == "" {
+			continue
+		}
+		subTag := buildManagedClientSubTag(baseTag, client.Name)
+		if subTag == "" {
+			continue
+		}
+
+		outbound, clashSource, buildErr := s.buildSyncedOutbound(db, inbound, clientConfig, client.Name, serverHost, preserveRaw)
+		if buildErr != nil {
+			return nil, fmt.Errorf("failed to build suboutbound %s: %w", subTag, buildErr)
+		}
+		rewriteOutboundTagReferences(outbound, baseTag, subTag)
+		rewriteOutboundTagReferences(clashSource, baseTag, subTag)
+		pending = append(pending, pendingSyncedSubOutbound{
+			inboundID:   inboundID,
+			subTag:      subTag,
+			outbound:    outbound,
+			clashSource: clashSource,
+		})
+	}
+
 	var subOutboundService SubOutboundService
 	removedCount := 0
 
@@ -413,45 +456,13 @@ func (s *SyncService) syncClientSubOutboundsFullRebuild(
 	}
 
 	syncCount := 0
-	for _, inboundID := range newInboundIDs {
-		if isBlockedSubSyncInbound(blockedInboundIDs, inboundID) {
-			continue
-		}
-		inbound := inboundMap[inboundID]
-		if inbound == nil {
-			logger.Warningf("[Sync] skip inbound id=%d: not found", inboundID)
-			continue
-		}
-		if isServerOnlySubscriptionInbound(inbound.Type, inbound.OutJson) {
-			continue
-		}
-		baseTag := strings.TrimSpace(inbound.Tag)
-		if baseTag == "" {
-			logger.Warningf("[Sync] skip inbound id=%d: empty inbound tag", inbound.Id)
-			continue
-		}
-
-		subTag := buildManagedClientSubTag(baseTag, client.Name)
-		if subTag == "" {
-			logger.Warningf("[Sync] skip inbound id=%d: failed to build sub tag", inbound.Id)
-			continue
-		}
-
-		outbound, clashSource, buildErr := s.buildSyncedOutbound(db, inbound, clientConfig, client.Name, serverHost, preserveRaw)
-		if buildErr != nil {
-			logger.Warningf("[Sync] skip inbound %s: %v", baseTag, buildErr)
-			continue
-		}
-		rewriteOutboundTagReferences(outbound, baseTag, subTag)
-		rewriteOutboundTagReferences(clashSource, baseTag, subTag)
-
-		if saveErr := s.saveSyncedSubOutbound(db, &subOutboundService, nil, outbound, clashSource, subTag, client.Id, inbound.Id); saveErr != nil {
-			logger.Warningf("[Sync] failed to save suboutbound %s: %v", subTag, saveErr)
-			continue
+	for _, item := range pending {
+		if saveErr := s.saveSyncedSubOutbound(db, &subOutboundService, nil, item.outbound, item.clashSource, item.subTag, client.Id, item.inboundID); saveErr != nil {
+			return nil, fmt.Errorf("failed to save suboutbound %s: %w", item.subTag, saveErr)
 		}
 
 		syncCount++
-		logger.Infof("[Sync] full rebuild synced suboutbound: %s", subTag)
+		logger.Infof("[Sync] full rebuild synced suboutbound: %s", item.subTag)
 	}
 
 	legacyRemovedCount, cleanupErr := s.cleanupStaleClientSubOutbounds(
@@ -593,10 +604,12 @@ func stripSyncedSubscriptionJSONFields(outbound map[string]interface{}) {
 	if outbound == nil {
 		return
 	}
+	util.PromoteHysteria2ReceiveWindowsToSingbox(outbound)
 	delete(outbound, "mihomo_common")
 	delete(outbound, "mihomo_hy2")
 	delete(outbound, "mihomo_fast_open")
 	delete(outbound, "fast_open")
+	delete(outbound, "fast-open")
 	tlsMap, ok := outbound["tls"].(map[string]interface{})
 	if !ok || tlsMap == nil {
 		return
@@ -608,46 +621,7 @@ func stripSyncedSubscriptionJSONFields(outbound map[string]interface{}) {
 }
 
 func parseClientInboundIDs(raw json.RawMessage) ([]uint, error) {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" || trimmed == "null" {
-		return []uint{}, nil
-	}
-
-	var inboundIDs []uint
-	if err := json.Unmarshal(raw, &inboundIDs); err == nil {
-		return deduplicateInboundIDs(inboundIDs), nil
-	}
-
-	var mixed []interface{}
-	if err := json.Unmarshal(raw, &mixed); err != nil {
-		return nil, err
-	}
-
-	parsed := make([]uint, 0, len(mixed))
-	for _, item := range mixed {
-		switch value := item.(type) {
-		case float64:
-			if value > 0 && math.Trunc(value) == value {
-				parsed = append(parsed, uint(value))
-			}
-		case int:
-			if value > 0 {
-				parsed = append(parsed, uint(value))
-			}
-		case string:
-			numeric, err := strconv.ParseUint(strings.TrimSpace(value), 10, 64)
-			if err == nil && numeric > 0 {
-				parsed = append(parsed, uint(numeric))
-			}
-		case json.Number:
-			numeric, err := value.Int64()
-			if err == nil && numeric > 0 {
-				parsed = append(parsed, uint(numeric))
-			}
-		}
-	}
-
-	return deduplicateInboundIDs(parsed), nil
+	return util.ParseInboundIDs(raw)
 }
 
 func mergeInboundIDs(parts ...[]uint) []uint {
@@ -1233,6 +1207,12 @@ func applyServerHostOverride(outbound map[string]interface{}, serverHost string)
 
 func hydrateOutboundTLSFromInboundTLS(outbound map[string]interface{}, inbound *model.Inbound) {
 	if outbound == nil || inbound == nil || inbound.TlsId == 0 || inbound.Tls == nil {
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(firstString(outbound["type"])), "shadowsocks") {
+		// Shadowsocks uses its own plugin/plugin-opts projection for Mihomo
+		// wrapper TLS. Adding an internal tls object here would produce an
+		// invalid mixed representation in synced JSON subscriptions.
 		return
 	}
 

@@ -9,6 +9,16 @@
     @save="saveEditor"
     />
 	<v-card @input.capture="onFormValueChange" @change.capture="onFormValueChange">
+	  <template v-if="formRowsTooLarge">
+	    <v-alert type="warning" variant="tonal" density="compact" class="ma-4">
+	      {{ $t('subscriptionEditor.formRowsTooLarge') }}
+	    </v-alert>
+	    <v-card-actions>
+	      <v-spacer></v-spacer>
+	      <v-btn @click="openEditor" variant="outlined" hide-details>{{ $t('editor') }}</v-btn>
+	    </v-card-actions>
+	  </template>
+	  <template v-else>
 	  <v-alert v-if="parseError" type="error" variant="tonal" density="compact" class="mb-4">
 	    {{ parseError }}
 	  </v-alert>
@@ -72,6 +82,9 @@
             <v-col cols="3" v-if="proxyDnsShowServer">
               <v-text-field v-model.number="proxyDnsPort" :label="$t('in.port')" density="compact" type="number" class="noGutters" min="1" hide-details @update:model-value="onFormValueChange"></v-text-field>
             </v-col>
+            <v-col cols="12" v-if="proxyDnsUsesPath">
+              <v-text-field v-model="proxyDnsPath" :label="$t('transport.path')" density="compact" class="noGutters" hide-details @update:model-value="onFormValueChange"></v-text-field>
+            </v-col>
           </v-row>
         </v-col>
         <v-col cols="12" sm="6" md="4" lg="4">
@@ -85,6 +98,9 @@
             </v-col>
             <v-col cols="3" v-if="directDnsShowServer">
               <v-text-field v-model.number="directDnsPort" :label="$t('in.port')" density="compact" type="number" class="noGutters" min="1" hide-details @update:model-value="onFormValueChange"></v-text-field>
+            </v-col>
+            <v-col cols="12" v-if="directDnsUsesPath">
+              <v-text-field v-model="directDnsPath" :label="$t('transport.path')" density="compact" class="noGutters" hide-details @update:model-value="onFormValueChange"></v-text-field>
             </v-col>
           </v-row>
         </v-col>
@@ -103,6 +119,9 @@
             <v-col cols="3" v-if="proxyBootstrapDnsShowServer">
               <v-text-field v-model.number="proxyBootstrapDnsPort" :label="$t('in.port')" density="compact" type="number" class="noGutters" min="1" hide-details @update:model-value="onFormValueChange"></v-text-field>
             </v-col>
+            <v-col cols="12" v-if="proxyBootstrapDnsUsesPath">
+              <v-text-field v-model="proxyBootstrapDnsPath" :label="$t('transport.path')" density="compact" class="noGutters" hide-details @update:model-value="onFormValueChange"></v-text-field>
+            </v-col>
           </v-row>
         </v-col>
         <v-col cols="12" sm="6" md="4" lg="4">
@@ -116,6 +135,9 @@
             </v-col>
             <v-col cols="3" v-if="directBootstrapDnsShowServer">
               <v-text-field v-model.number="directBootstrapDnsPort" :label="$t('in.port')" density="compact" type="number" class="noGutters" min="1" hide-details @update:model-value="onFormValueChange"></v-text-field>
+            </v-col>
+            <v-col cols="12" v-if="directBootstrapDnsUsesPath">
+              <v-text-field v-model="directBootstrapDnsPath" :label="$t('transport.path')" density="compact" class="noGutters" hide-details @update:model-value="onFormValueChange"></v-text-field>
             </v-col>
           </v-row>
         </v-col>
@@ -549,12 +571,17 @@
       <v-spacer></v-spacer>
       <v-btn @click="openEditor" variant="outlined" hide-details>{{ $t('editor') }}</v-btn>
     </v-card-actions>
+	  </template>
   </v-card>
 </template>
 
 <script lang="ts">
 import Editor from './Editor.vue'
-import { SubJsonExtMixin } from './SubJsonExtLogic'
+import {
+  SubJsonExtMixin,
+  jsonSubscriptionDNSUsesPath,
+  normalizeJSONSubscriptionDNSPath,
+} from './SubJsonExtLogic'
 import {
   levels,
   tunIpOptions,
@@ -633,7 +660,8 @@ export default {
 	  _resetRequested: this.initialReset === true,
 	  _parseError: '',
 	  _rawSource: '',
-	  _editorSourcePending: false,
+      _editorSourcePending: false,
+	  formRowsTooLarge: false,
 
       // DNS server type options.
       dnsTypeOptions: ['udp', 'tcp', 'local', 'dhcp', 'tls', 'quic', 'h3', 'https'],
@@ -704,6 +732,11 @@ export default {
       set(v: number) { if (this.proxyDnsObj && this.proxyDnsObj.tag) this.proxyDnsObj.server_port = v }
     },
     proxyDnsShowServer(): boolean { return !this.noServerTypes.includes(this.proxyDnsType) },
+    proxyDnsUsesPath(): boolean { return jsonSubscriptionDNSUsesPath(this.proxyDnsType) },
+    proxyDnsPath: {
+      get(): string { return typeof this.proxyDnsObj?.path === 'string' ? this.proxyDnsObj.path : '' },
+      set(v: string) { if (this.proxyDnsObj && this.proxyDnsObj.tag) this.proxyDnsObj.path = v }
+    },
     directDnsType: {
       get(): string { return this.directDnsObj?.type ?? 'https' },
       set(v: string) { if (this.directDnsObj && this.directDnsObj.tag) this.directDnsObj.type = v }
@@ -717,6 +750,11 @@ export default {
       set(v: number) { if (this.directDnsObj && this.directDnsObj.tag) this.directDnsObj.server_port = v }
     },
     directDnsShowServer(): boolean { return !this.noServerTypes.includes(this.directDnsType) },
+    directDnsUsesPath(): boolean { return jsonSubscriptionDNSUsesPath(this.directDnsType) },
+    directDnsPath: {
+      get(): string { return typeof this.directDnsObj?.path === 'string' ? this.directDnsObj.path : '' },
+      set(v: string) { if (this.directDnsObj && this.directDnsObj.tag) this.directDnsObj.path = v }
+    },
     proxyBootstrapDnsType: {
       get(): string { return this.proxyBootstrapDnsObj?.type ?? 'udp' },
       set(v: string) { if (this.proxyBootstrapDnsObj && this.proxyBootstrapDnsObj.tag) this.proxyBootstrapDnsObj.type = v }
@@ -733,6 +771,11 @@ export default {
       set(v: number) { if (this.proxyBootstrapDnsObj && this.proxyBootstrapDnsObj.tag) this.proxyBootstrapDnsObj.server_port = v }
     },
     proxyBootstrapDnsShowServer(): boolean { return !this.noServerTypes.includes(this.proxyBootstrapDnsType) },
+    proxyBootstrapDnsUsesPath(): boolean { return jsonSubscriptionDNSUsesPath(this.proxyBootstrapDnsType) },
+    proxyBootstrapDnsPath: {
+      get(): string { return typeof this.proxyBootstrapDnsObj?.path === 'string' ? this.proxyBootstrapDnsObj.path : '' },
+      set(v: string) { if (this.proxyBootstrapDnsObj && this.proxyBootstrapDnsObj.tag) this.proxyBootstrapDnsObj.path = v }
+    },
     directBootstrapDnsType: {
       get(): string { return this.directBootstrapDnsObj?.type ?? 'udp' },
       set(v: string) { if (this.directBootstrapDnsObj && this.directBootstrapDnsObj.tag) this.directBootstrapDnsObj.type = v }
@@ -749,6 +792,11 @@ export default {
       set(v: number) { if (this.directBootstrapDnsObj && this.directBootstrapDnsObj.tag) this.directBootstrapDnsObj.server_port = v }
     },
     directBootstrapDnsShowServer(): boolean { return !this.noServerTypes.includes(this.directBootstrapDnsType) },
+    directBootstrapDnsUsesPath(): boolean { return jsonSubscriptionDNSUsesPath(this.directBootstrapDnsType) },
+    directBootstrapDnsPath: {
+      get(): string { return typeof this.directBootstrapDnsObj?.path === 'string' ? this.directBootstrapDnsObj.path : '' },
+      set(v: string) { if (this.directBootstrapDnsObj && this.directBootstrapDnsObj.tag) this.directBootstrapDnsObj.path = v }
+    },
     // TUN inbound bindings.
     tunAddress: {
       get(): string[] { return this.tunInbound?.address ?? [] },
@@ -769,6 +817,14 @@ export default {
 	  if (['tls', 'quic'].includes(t)) return 853
       return 53
     },
+    syncDnsPathForType(dns: any, type: string) {
+      if (!dns || typeof dns !== 'object') return
+      if (jsonSubscriptionDNSUsesPath(type)) {
+        dns.path = normalizeJSONSubscriptionDNSPath(dns.path)
+      } else {
+        delete dns.path
+      }
+    },
     onProxyDnsTypeChange(t: string) {
       const dns = this.proxyDnsObj
       if (!dns || !dns.tag) return
@@ -785,6 +841,7 @@ export default {
         }
         if (!dns.domain_resolver) dns.domain_resolver = 'proxy-bootstrap-dns'
       }
+      this.syncDnsPathForType(dns, t)
       this.updateJson()
     },
     onDirectDnsTypeChange(t: string) {
@@ -803,6 +860,7 @@ export default {
         }
         if (!dns.domain_resolver) dns.domain_resolver = 'direct-bootstrap-dns'
       }
+      this.syncDnsPathForType(dns, t)
       this.updateJson()
     },
     onProxyBootstrapDnsTypeChange(t: string) {
@@ -820,6 +878,7 @@ export default {
           delete dns.tls
         }
       }
+      this.syncDnsPathForType(dns, t)
       this.updateJson()
     },
     onDirectBootstrapDnsTypeChange(t: string) {
@@ -837,6 +896,7 @@ export default {
           delete dns.tls
         }
       }
+      this.syncDnsPathForType(dns, t)
       this.updateJson()
     },
   },

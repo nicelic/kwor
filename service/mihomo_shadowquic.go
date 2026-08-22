@@ -104,25 +104,29 @@ func validateMihomoShadowQUICJLSUpstreamProxy(tx *gorm.DB, inbound *model.Mihomo
 	if proxy == "" {
 		return nil
 	}
-	if proxy == "DIRECT" {
-		return nil
-	}
-
-	var count int64
-	if err := tx.Model(&model.MihomoOutbound{}).Where("tag = ?", proxy).Count(&count).Error; err != nil {
+	targets, err := loadMihomoRouteTargets(tx)
+	if err != nil {
 		return err
 	}
-	if count > 0 {
-		return nil
+	normalized, ok := normalizeMihomoTarget(proxy, targets)
+	if !ok || normalized == "REJECT" || normalized == "REJECT-DROP" {
+		return fmt.Errorf("shadowquic jls-upstream.proxy target %q is not a supported Mihomo proxy or proxy group", proxy)
 	}
-	if err := tx.Model(&model.MihomoOutboundGroup{}).Where("name = ?", proxy).Count(&count).Error; err != nil {
-		return err
+	options := map[string]interface{}{}
+	if err := json.Unmarshal(inbound.Options, &options); err != nil {
+		return fmt.Errorf("parse shadowquic inbound options: %w", err)
 	}
-	if count > 0 {
-		return nil
+	upstream, ok := options["jls_upstream"].(map[string]interface{})
+	if !ok || upstream == nil {
+		return fmt.Errorf("shadowquic jls-upstream.proxy normalization requires jls_upstream")
 	}
-
-	return fmt.Errorf("shadowquic jls-upstream.proxy target %q does not exist", proxy)
+	upstream["proxy"] = normalized
+	encoded, err := json.Marshal(options)
+	if err != nil {
+		return fmt.Errorf("marshal shadowquic inbound options: %w", err)
+	}
+	inbound.Options = json.RawMessage(encoded)
+	return nil
 }
 
 func shadowQUICJLSProxyFromOptions(raw json.RawMessage) (string, error) {
@@ -319,11 +323,10 @@ func ensureMihomoShadowQUICCredentialsForClientBindings(tx *gorm.DB, client *mod
 		return false, nil
 	}
 
-	var inboundIDs []uint
-	if err := json.Unmarshal(client.Inbounds, &inboundIDs); err != nil {
+	inboundIDs, err := parseClientInboundIDs(client.Inbounds)
+	if err != nil {
 		return false, err
 	}
-	inboundIDs = dedupeUintIDs(inboundIDs)
 	if len(inboundIDs) == 0 {
 		return false, nil
 	}
@@ -350,11 +353,10 @@ func repairMihomoShadowQUICInboundClientCredentials(db *gorm.DB, inboundID uint)
 	}
 
 	var clients []model.MihomoClient
-	if err := db.Model(model.MihomoClient{}).
-		Where("EXISTS (SELECT 1 FROM json_each(mihomo_clients.inbounds) WHERE json_each.value = ?)", inboundID).
-		Find(&clients).Error; err != nil {
+	if err := db.Model(model.MihomoClient{}).Find(&clients).Error; err != nil {
 		return err
 	}
+	clients = filterMihomoClientsBoundToInboundIDs(clients, []uint{inboundID})
 
 	for index := range clients {
 		changed, err := ensureMihomoShadowQUICClientCredentials(&clients[index])
@@ -377,14 +379,18 @@ func sanitizeMihomoShadowQUICJLSUpstream(source map[string]interface{}) (map[str
 		return nil, fmt.Errorf("shadowquic jls-upstream.addr is required")
 	}
 
-	addr := strings.TrimSpace(firstString(source["addr"]))
-	if err := util.ValidateMihomoShadowQUICJLSUpstreamAddr(addr); err != nil {
+	addr, inferredSNI, err := util.NormalizeMihomoShadowQUICJLSUpstreamAddr(firstString(source["addr"]))
+	if err != nil {
 		return nil, err
 	}
 	clean := map[string]interface{}{
 		"addr": addr,
 	}
-	shadowQUICInboundCopyString(source, clean, "sni", "sni")
+	if sni := strings.TrimSpace(firstString(source["sni"])); sni != "" {
+		clean["sni"] = sni
+	} else {
+		clean["sni"] = inferredSNI
+	}
 	if proxy := normalizeMihomoShadowQUICJLSProxyTarget(firstString(source["proxy"])); proxy != "" {
 		clean["proxy"] = proxy
 	}

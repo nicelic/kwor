@@ -156,6 +156,7 @@ import { normalizePortRangeInput } from '@/plugins/portRange'
 
 function normalizeMieruBindings(raw: string): string[] {
   return normalizePortRangeInput(String(raw ?? '').replace(/\uFF1A/g, ':'))
+    .filter((item) => /^\d+(?::\d+)?$/.test(item))
     .map((item) => item.replace(/:/g, '-'))
     .filter((item, index, arr) => arr.indexOf(item) === index)
 }
@@ -169,9 +170,10 @@ function normalizeSingleMieruPortRange(raw: string): string | undefined {
   const binding = normalized[0]
   if (!binding.includes('-')) return undefined
   const [startRaw, endRaw] = binding.split('-')
-  const start = Number.parseInt(startRaw, 10)
-  const end = Number.parseInt(endRaw, 10)
-  if (!Number.isInteger(start) || !Number.isInteger(end)) return undefined
+  if (!/^\d+$/.test(startRaw) || !/^\d+$/.test(endRaw)) return undefined
+  const start = Number(startRaw)
+  const end = Number(endRaw)
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) return undefined
   if (start < 1 || end > 65535 || start >= end) return undefined
   return `${start}-${end}`
 }
@@ -180,8 +182,9 @@ function firstBindingPort(binding: string): number | undefined {
   const normalized = String(binding ?? '').trim()
   if (normalized === '') return undefined
   const first = normalized.split('-')[0]
-  const port = Number.parseInt(first, 10)
-  return Number.isNaN(port) ? undefined : port
+  if (!/^\d+$/.test(first)) return undefined
+  const port = Number(first)
+  return Number.isSafeInteger(port) && port >= 1 && port <= 65535 ? port : undefined
 }
 
 export default {
@@ -214,6 +217,18 @@ export default {
       ],
     }
   },
+  methods: {
+    sanitizeMieruTransport() {
+      const transport = typeof this.data.transport === 'string' ? this.data.transport.trim().toUpperCase() : ''
+      this.data.transport = transport === 'UDP' ? 'UDP' : 'TCP'
+      if (this.data.transport === 'UDP') {
+        delete this.data.udp
+      }
+    },
+  },
+  mounted() {
+    this.sanitizeMieruTransport()
+  },
   computed: {
     inboundPort: {
       get(): string {
@@ -228,8 +243,9 @@ export default {
           this.data.listen_port = undefined
           return
         }
-        const parsed = Number.parseInt(value, 10)
-        if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535) {
+        if (!/^\d+$/.test(value)) return
+        const parsed = Number(value)
+        if (Number.isSafeInteger(parsed) && parsed >= 1 && parsed <= 65535) {
           this.data.listen_port = parsed
         }
       }
@@ -293,11 +309,12 @@ export default {
     },
   },
   watch: {
-    'data.transport'(value: string) {
-      if (value === 'UDP') {
-        this.data.udp = undefined
-      }
-    }
+    data() {
+      this.sanitizeMieruTransport()
+    },
+    'data.transport'() {
+      this.sanitizeMieruTransport()
+    },
   }
 }
 </script>

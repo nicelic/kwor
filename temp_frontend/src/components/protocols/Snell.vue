@@ -80,6 +80,31 @@ export default {
       ],
     }
   },
+  methods: {
+    sanitizeInboundState() {
+      if (this.direction !== 'in') return
+
+      const version = Number(this.data.version)
+      this.data.version = Number.isSafeInteger(version) && version >= 4 && version <= 5 ? version : 5
+      this.data.udp = typeof this.data.udp === 'boolean' ? this.data.udp : true
+
+      const rawObfs = this.data.obfs_opts
+      if (!rawObfs || typeof rawObfs !== 'object' || Array.isArray(rawObfs)) {
+        delete this.data.obfs_opts
+        return
+      }
+      const mode = typeof rawObfs.mode === 'string' ? rawObfs.mode.trim().toLowerCase() : ''
+      if (mode !== 'http' && mode !== 'tls') {
+        delete this.data.obfs_opts
+        return
+      }
+      const host = typeof rawObfs.host === 'string' ? rawObfs.host.trim() : ''
+      this.data.obfs_opts = { mode, host: host || 'www.bing.com' }
+    },
+  },
+  mounted() {
+    this.sanitizeInboundState()
+  },
   computed: {
     showCard(): boolean {
       return this.direction !== 'out_json'
@@ -176,6 +201,14 @@ export default {
           this.syncTarget.obfs_opts = { ...next }
         }
       },
+    },
+  },
+  watch: {
+    data() {
+      this.sanitizeInboundState()
+    },
+    direction() {
+      this.sanitizeInboundState()
     },
   },
 }

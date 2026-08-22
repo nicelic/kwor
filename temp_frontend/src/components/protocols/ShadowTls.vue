@@ -34,7 +34,9 @@
           <v-text-field
           :label="$t('out.port')"
           type="number"
-          min="0"
+          min="1"
+          max="65535"
+          step="1"
           hide-details
           v-model.number="server_port">
           </v-text-field>
@@ -106,6 +108,7 @@
     </v-row>
     <v-card
       v-for="(value, key) in Inbound.handshake_for_server_name"
+      :key="key"
       border
       density="compact"
       style="margin: 5px;"
@@ -130,7 +133,9 @@
           <v-text-field
           :label="$t('out.port')"
           type="number"
-          min="0"
+          min="1"
+          max="65535"
+          step="1"
           hide-details
           v-model.number="value.server_port">
           </v-text-field>
@@ -178,6 +183,16 @@ export default {
     }
   },
   methods: {
+    normalizeVersion(value: unknown): 1 | 2 | 3 {
+      const version = Number(value)
+      return version === 1 || version === 2 || version === 3 ? version : 3
+    },
+    parseValidPort(value: unknown): number | undefined {
+      if (value === '' || value === null || value === undefined) return undefined
+      if (typeof value === 'string' && !/^\d+$/.test(value.trim())) return undefined
+      const port = Number(value)
+      return Number.isSafeInteger(port) && port >= 1 && port <= 65535 ? port : undefined
+    },
     sanitizeMihomoShadowTLS() {
       if (!this.isMihomo) return
       delete this.Inbound.strict_mode
@@ -201,8 +216,8 @@ export default {
               server = dest.slice(1, endBracket)
               const suffix = dest.slice(endBracket + 1)
               if (suffix.startsWith(':')) {
-                const parsed = Number.parseInt(suffix.slice(1), 10)
-                if (Number.isInteger(parsed) && parsed > 0) {
+                const parsed = this.parseValidPort(suffix.slice(1))
+                if (parsed !== undefined) {
                   port = parsed
                 }
               }
@@ -212,8 +227,8 @@ export default {
             const lastColon = dest.lastIndexOf(':')
             if (firstColon > 0 && firstColon === lastColon) {
               server = dest.slice(0, lastColon)
-              const parsed = Number.parseInt(dest.slice(lastColon + 1), 10)
-              if (Number.isInteger(parsed) && parsed > 0) {
+              const parsed = this.parseValidPort(dest.slice(lastColon + 1))
+              if (parsed !== undefined) {
                 port = parsed
               }
             }
@@ -227,12 +242,24 @@ export default {
       delete handshake.dest
       delete handshake.proxy
       delete handshake.detour
+      handshake.server_port = this.parseValidPort(handshake.server_port) ?? 443
       if (this.Inbound.ss_config && typeof this.Inbound.ss_config === 'object') {
         delete this.Inbound.ss_config.network
       }
     },
     addHandshakeServer() {
-      this.data.handshake_for_server_name[this.handshake_server] = {}
+      const serverName = this.handshake_server.trim()
+      if (!serverName) return
+      if (!this.Inbound.handshake_for_server_name) {
+        this.Inbound.handshake_for_server_name = {}
+      }
+      if (!this.Inbound.handshake_for_server_name[serverName]) {
+        const primaryHandshake = this.Inbound.handshake ?? { server: '', server_port: 443 }
+        this.Inbound.handshake_for_server_name[serverName] = {
+          server: typeof primaryHandshake.server === 'string' ? primaryHandshake.server.trim() : '',
+          server_port: this.parseValidPort(primaryHandshake.server_port) ?? 443,
+        }
+      }
       // Clear the input field after adding the server
       this.handshake_server = ''
     },
@@ -245,8 +272,18 @@ export default {
         this.ssConfig.password = RandomUtil.randomSeq(10)
       }
     },
+    ensurePrimaryHandshake() {
+      if (!this.Inbound.handshake || typeof this.Inbound.handshake !== 'object' || Array.isArray(this.Inbound.handshake)) {
+        this.Inbound.handshake = { server: '', server_port: 443 }
+        return
+      }
+      if (typeof this.Inbound.handshake.server !== 'string') {
+        this.Inbound.handshake.server = ''
+      }
+      this.Inbound.handshake.server_port = this.parseValidPort(this.Inbound.handshake.server_port) ?? 443
+    },
     initSsConfig() {
-      if (!this.Inbound.ss_config) {
+      if (!this.Inbound.ss_config || typeof this.Inbound.ss_config !== 'object' || Array.isArray(this.Inbound.ss_config)) {
         this.Inbound.ss_config = {
           method: '2022-blake3-aes-128-gcm',
           password: RandomUtil.randomShadowsocksPassword(16),
@@ -276,11 +313,46 @@ export default {
       if (!this.Inbound.ss_config.password && this.Inbound.ss_config.method != 'none') {
         this.changeMethod(this.Inbound.ss_config.method)
       }
+    },
+    ensureVersionSpecificFields() {
+      const version = this.normalizeVersion(this.Inbound.version)
+      this.Inbound.version = version
+      this.ensurePrimaryHandshake()
+      if (this.isMihomo) {
+        delete this.Inbound.handshake_for_server_name
+        delete this.Inbound.wildcard_sni
+        delete this.Inbound.strict_mode
+        return
+      }
+
+      if (version === 2 || version === 3) {
+        if (!this.Inbound.handshake_for_server_name ||
+          typeof this.Inbound.handshake_for_server_name !== 'object' ||
+          Array.isArray(this.Inbound.handshake_for_server_name)) {
+          this.Inbound.handshake_for_server_name = {}
+        }
+      } else {
+        delete this.Inbound.handshake_for_server_name
+      }
+
+      if (version === 3) {
+        if (this.Inbound.wildcard_sni === undefined || this.Inbound.wildcard_sni === null) {
+          this.Inbound.wildcard_sni = ''
+        }
+        if (this.Inbound.strict_mode === undefined) {
+          this.Inbound.strict_mode = true
+        }
+      } else {
+        delete this.Inbound.wildcard_sni
+        delete this.Inbound.strict_mode
+      }
     }
   },
   mounted() {
-    this.version = this.Inbound.version
+    this.Inbound.version = this.normalizeVersion(this.Inbound.version)
+    this.ensurePrimaryHandshake()
     this.initSsConfig()
+    this.ensureVersionSpecificFields()
     this.sanitizeMihomoShadowTLS()
   },
   computed: {
@@ -289,7 +361,6 @@ export default {
     },
     version: {
       get() {
-        this.version = this.Inbound.version
         return this.Inbound.version
       },
       set(newValue: any) {
@@ -339,8 +410,8 @@ export default {
       return <ShadowTLS>this.$props.data
     },
     server_port: {
-      get() { return this.Inbound.handshake.server_port ? this.Inbound.handshake.server_port : 443 },
-      set(newValue: any) { this.Inbound.handshake.server_port = newValue.length == 0 || newValue == 0 ? 443 : parseInt(newValue) }
+      get() { return this.parseValidPort(this.Inbound.handshake.server_port) ?? 443 },
+      set(newValue: any) { this.Inbound.handshake.server_port = this.parseValidPort(newValue) ?? 443 }
     },
     strictMode: {
       get(): boolean { return this.Inbound.strict_mode ?? true },
@@ -358,6 +429,7 @@ export default {
     data: {
       handler() {
         this.initSsConfig()
+        this.ensureVersionSpecificFields()
         this.sanitizeMihomoShadowTLS()
         this.ssNetwork = this.ssConfig.network ?? ''
       },

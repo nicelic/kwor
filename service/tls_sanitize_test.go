@@ -65,3 +65,54 @@ func TestSanitizeStoredTLSRecord_RemovesConflictingVerificationMaterial(t *testi
 		t.Fatalf("expected client hash to remain, got %#v", client["certificate_public_key_sha256"])
 	}
 }
+
+func TestSanitizeStoredTLSRecord_RemovesEmptyOptionalSNIAndALPN(t *testing.T) {
+	record := &model.Tls{
+		Server: mustTLSRawMessage(t, map[string]interface{}{
+			"server_name": "  ",
+			"alpn":        []string{},
+		}),
+		Client: mustTLSRawMessage(t, map[string]interface{}{
+			"server_name": "",
+			"alpn":        []string{" ", ""},
+		}),
+	}
+
+	if err := sanitizeStoredTLSRecord(record); err != nil {
+		t.Fatalf("sanitizeStoredTLSRecord failed: %v", err)
+	}
+	for name, raw := range map[string]json.RawMessage{"server": record.Server, "client": record.Client} {
+		payload := mustTLSMap(t, raw)
+		if _, exists := payload["server_name"]; exists {
+			t.Fatalf("%s payload kept empty server_name: %#v", name, payload)
+		}
+		if _, exists := payload["alpn"]; exists {
+			t.Fatalf("%s payload kept empty alpn: %#v", name, payload)
+		}
+	}
+}
+
+func TestTLSPathBindingsChangedOnlyWhenPathMaterialChanges(t *testing.T) {
+	previous := mustTLSRawMessage(t, map[string]interface{}{
+		"certificate_path": "C:/certs/server.pem",
+	})
+	same := mustTLSRawMessage(t, map[string]interface{}{
+		"certificate_path": "C:/certs/server.pem",
+	})
+	changed := mustTLSRawMessage(t, map[string]interface{}{
+		"certificate_path": "C:/certs/next.pem",
+	})
+	withoutPath := mustTLSRawMessage(t, map[string]interface{}{
+		"server_name": "example.com",
+	})
+
+	if tlsPathBindingsChanged(previous, same) {
+		t.Fatal("identical TLS path bindings were reported as changed")
+	}
+	if !tlsPathBindingsChanged(previous, changed) {
+		t.Fatal("changed TLS path binding was not reported")
+	}
+	if !tlsPathBindingsChanged(previous, withoutPath) {
+		t.Fatal("removed TLS path binding was not reported")
+	}
+}

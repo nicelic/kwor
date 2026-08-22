@@ -3,9 +3,7 @@ package service
 import (
 	"encoding/json"
 	"errors"
-	"math"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +11,7 @@ import (
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/logger"
+	"github.com/alireza0/s-ui/util"
 	"gorm.io/gorm"
 )
 
@@ -25,6 +24,7 @@ type mihomoInboundTrafficSample struct {
 	originalInHandle       int
 	originalOutHandle      int
 	originalRedirectHandle int
+	stateChanged           bool
 	delta                  inboundDelta
 }
 
@@ -33,6 +33,21 @@ var mihomoPortHopRefreshState = struct {
 	last map[uint]time.Time
 }{
 	last: map[uint]time.Time{},
+}
+
+// Mihomo has an independent rule/state model, but its nft commands still need
+// one local mutation boundary. Without this lock an API save, port-hop refresh
+// and sampler read could replace a handle between the counter snapshot and the
+// SQLite baseline update, causing a missed or duplicated delta.
+var mihomoInboundNftMutationMu sync.Mutex
+
+func runMihomoInboundNftMutation(fn func() error) error {
+	if fn == nil {
+		return nil
+	}
+	mihomoInboundNftMutationMu.Lock()
+	defer mihomoInboundNftMutationMu.Unlock()
+	return fn()
 }
 
 func (s *MihomoNftTrafficService) IsNftTableReady() bool {
@@ -50,6 +65,19 @@ func (s *MihomoNftTrafficService) EnsureRuleIntegrity() error {
 	if !coreSvc.IsRunning() {
 		return nil
 	}
+	return s.EnsureRuleIntegrityWhenRunning()
+}
+
+// EnsureRuleIntegrityWhenRunning is for callers that already checked the
+// Mihomo Core state in the current synchronization pass.
+func (s *MihomoNftTrafficService) EnsureRuleIntegrityWhenRunning() error {
+	return runMihomoInboundNftMutation(s.ensureRuleIntegrityWhenRunning)
+}
+
+func (s *MihomoNftTrafficService) ensureRuleIntegrityWhenRunning() error {
+	if !IsSystemPlatformLinux() || !nftSupported() {
+		return nil
+	}
 
 	db := database.GetDB()
 	var inbounds []model.MihomoInbound
@@ -58,6 +86,36 @@ func (s *MihomoNftTrafficService) EnsureRuleIntegrity() error {
 	}
 	if len(inbounds) == 0 {
 		return nil
+	}
+	unsupportedInboundIDs := make([]uint, 0)
+	supportedInbounds := make([]model.MihomoInbound, 0, len(inbounds))
+	for _, inbound := range inbounds {
+		if !isSupportedMihomoInboundType(inbound.Type) {
+			unsupportedInboundIDs = append(unsupportedInboundIDs, inbound.Id)
+			continue
+		}
+		supportedInbounds = append(supportedInbounds, inbound)
+	}
+	if len(unsupportedInboundIDs) > 0 {
+		if err := s.removeUnsupportedInboundStates(db, unsupportedInboundIDs); err != nil {
+			return err
+		}
+	}
+	inbounds = supportedInbounds
+	if len(inbounds) == 0 {
+		return nil
+	}
+	inHandles, err := snapshotManagedRuleHandles(nftChainIn, mihomoNftRuleComments.prefix)
+	if err != nil {
+		return err
+	}
+	outHandles, err := snapshotManagedRuleHandles(nftChainOut, mihomoNftRuleComments.prefix)
+	if err != nil {
+		return err
+	}
+	redirectRules, err := snapshotManagedRedirectRules(mihomoNftRuleComments.prefix)
+	if err != nil {
+		return err
 	}
 
 	validComments := make(map[string]struct{}, len(inbounds)*3)
@@ -81,7 +139,7 @@ func (s *MihomoNftTrafficService) EnsureRuleIntegrity() error {
 			continue
 		}
 		redirectRange, redirectTCP := resolveMihomoInboundRedirectSpec(&inbound)
-		if err := s.ensureInboundRuleIntegrity(db, &inbound, port, redirectRange, redirectTCP); err != nil {
+		if err := s.ensureInboundRuleIntegrity(db, &inbound, port, redirectRange, redirectTCP, inHandles, outHandles, redirectRules); err != nil {
 			logger.Warning("mihomo nft integrity check failed for inbound ", inbound.Tag, ": ", err)
 			if firstErr == nil {
 				firstErr = err
@@ -89,7 +147,7 @@ func (s *MihomoNftTrafficService) EnsureRuleIntegrity() error {
 		}
 	}
 
-	if err := s.cleanupOrphanInboundRules(validComments); err != nil {
+	if err := s.cleanupOrphanInboundRules(validComments, inHandles, outHandles, redirectRules.comments); err != nil {
 		logger.Warning("cleanup orphan mihomo nft rules failed: ", err)
 		if firstErr == nil {
 			firstErr = err
@@ -99,38 +157,24 @@ func (s *MihomoNftTrafficService) EnsureRuleIntegrity() error {
 	return firstErr
 }
 
-func (s *MihomoNftTrafficService) cleanupOrphanInboundRules(validComments map[string]struct{}) error {
-	if !nftSupported() || !nftTableExists() {
-		return nil
-	}
-
-	chains := []string{nftChainIn, nftChainOut}
+func (s *MihomoNftTrafficService) cleanupOrphanInboundRules(validComments map[string]struct{}, inHandles map[string]int, outHandles map[string]int, redirectComments map[string]struct{}) error {
 	var firstErr error
-	for _, chain := range chains {
-		rules, err := listRuleCommentsByPrefix(chain, mihomoNftRuleComments.prefix)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		for _, rule := range rules {
-			if _, ok := validComments[rule.comment]; ok {
+	cleanupChain := func(chain string, handles map[string]int) {
+		for comment, handle := range handles {
+			if _, ok := validComments[comment]; ok {
 				continue
 			}
-			if err = deleteRuleByHandle(chain, rule.handle); err != nil {
-				logger.Warning("failed to delete orphan mihomo nft rule ", rule.comment, " handle ", rule.handle, ": ", err)
+			if err := deleteRuleByHandle(chain, handle); err != nil && !nftObjectMissing(err) {
+				logger.Warning("failed to delete orphan mihomo nft rule ", comment, " handle ", handle, ": ", err)
 				if firstErr == nil {
 					firstErr = err
 				}
 			}
 		}
 	}
-	redirectComments, err := listNftRedirectCommentsByPrefix(mihomoNftRuleComments.prefix)
-	if err != nil && firstErr == nil {
-		firstErr = err
-	}
-	for _, comment := range redirectComments {
+	cleanupChain(nftChainIn, inHandles)
+	cleanupChain(nftChainOut, outHandles)
+	for comment := range redirectComments {
 		if _, ok := validComments[comment]; ok {
 			continue
 		}
@@ -141,7 +185,7 @@ func (s *MihomoNftTrafficService) cleanupOrphanInboundRules(validComments map[st
 	return firstErr
 }
 
-func (s *MihomoNftTrafficService) ensureInboundRuleIntegrity(tx *gorm.DB, inbound *model.MihomoInbound, port int, portHopRange string, redirectTCP bool) error {
+func (s *MihomoNftTrafficService) ensureInboundRuleIntegrity(tx *gorm.DB, inbound *model.MihomoInbound, port int, portHopRange string, redirectTCP bool, inHandles map[string]int, outHandles map[string]int, redirectRules *managedRedirectRuleSnapshot) error {
 	if inbound == nil || inbound.Id == 0 || port <= 0 {
 		return nil
 	}
@@ -159,27 +203,28 @@ func (s *MihomoNftTrafficService) ensureInboundRuleIntegrity(tx *gorm.DB, inboun
 		return s.UpdateInboundRules(tx, inbound.Id, inbound.Tag, port, portHopRange, redirectTCP)
 	}
 
-	s.tryRecoverHandles(tx, &state)
+	originalInHandle := state.InHandle
+	originalOutHandle := state.OutHandle
 	missing := false
 
-	if state.InHandle <= 0 {
-		missing = true
-	} else if _, err := getChainRuleBytesByHandle(nftChainIn, state.InHandle); err != nil {
+	if handle, ok := inHandles[mihomoNftRuleComments.in(inbound.Tag)]; ok {
+		state.InHandle = handle
+	} else {
 		missing = true
 	}
 
-	if state.OutHandle <= 0 {
-		missing = true
-	} else if _, err := getChainRuleBytesByHandle(nftChainOut, state.OutHandle); err != nil {
+	if handle, ok := outHandles[mihomoNftRuleComments.out(inbound.Tag)]; ok {
+		state.OutHandle = handle
+	} else {
 		missing = true
 	}
 
 	if strings.TrimSpace(portHopRange) != "" {
 		comment := mihomoNftRuleComments.redirect(inbound.Tag)
-		if !nftRedirectRuleExistsByComment(comment) {
+		if redirectRules == nil || !redirectRules.valid[comment] {
 			missing = true
 		}
-	} else if state.RedirectHandle > 0 || nftRedirectRuleExistsInAnyLayout(mihomoNftRuleComments.redirect(inbound.Tag)) {
+	} else if state.RedirectHandle > 0 || redirectRules.hasComment(mihomoNftRuleComments.redirect(inbound.Tag)) {
 		if err := deleteNftRedirectRulesByComment(mihomoNftRuleComments.redirect(inbound.Tag)); err != nil {
 			logger.Warning("failed to delete stale mihomo redirect rule for inbound ", inbound.Tag, ": ", err)
 		}
@@ -193,6 +238,13 @@ func (s *MihomoNftTrafficService) ensureInboundRuleIntegrity(tx *gorm.DB, inboun
 	}
 
 	if !missing {
+		if state.InHandle != originalInHandle || state.OutHandle != originalOutHandle {
+			return tx.Model(&state).Updates(map[string]interface{}{
+				"in_handle":  state.InHandle,
+				"out_handle": state.OutHandle,
+				"updated_at": time.Now(),
+			}).Error
+		}
 		return nil
 	}
 
@@ -671,6 +723,12 @@ func (s *MihomoNftTrafficService) DeleteClientBindings(tx *gorm.DB, clientID uin
 
 // ResetClientTraffic resets mihomo client up/down and active binding accumulators.
 func (s *MihomoNftTrafficService) ResetClientTraffic(tx *gorm.DB, clientID uint) error {
+	return runMihomoInboundNftMutation(func() error {
+		return s.resetClientTraffic(tx, clientID)
+	})
+}
+
+func (s *MihomoNftTrafficService) resetClientTraffic(tx *gorm.DB, clientID uint) error {
 	if clientID == 0 {
 		return nil
 	}
@@ -749,6 +807,10 @@ func (s *MihomoNftTrafficService) getCurrentInboundBytes(tx *gorm.DB, inboundID 
 
 // RefreshPortHopRedirects refreshes REDIRECT rules according to port_hop_interval.
 func (s *MihomoNftTrafficService) RefreshPortHopRedirects() error {
+	return runMihomoInboundNftMutation(s.refreshPortHopRedirects)
+}
+
+func (s *MihomoNftTrafficService) refreshPortHopRedirects() error {
 	if !IsSystemPlatformLinux() || !nftSupported() {
 		return nil
 	}
@@ -799,7 +861,30 @@ func (s *MihomoNftTrafficService) RefreshPortHopRedirects() error {
 			logger.Warning("skip mihomo port hop refresh because inbound no longer exists: ", state.Tag)
 			continue
 		}
-		interval, ok := parsePortHopInterval(extractPortHopInterval(inbound.Options))
+		if !isSupportedMihomoInboundType(inbound.Type) {
+			if err := s.RemoveInboundRules(db, state.InboundId); err != nil {
+				logger.Warning("failed to remove unsupported mihomo inbound nft state for ", state.Tag, ": ", err)
+			}
+			continue
+		}
+		normalizedRange, rangeErr := normalizeMihomoPortHopRange(state.PortHopRange)
+		if rangeErr != nil {
+			clearMihomoPortHopRefresh(state.InboundId)
+			if err := s.removeRedirectRule(&state); err != nil {
+				logger.Warning("failed to remove invalid mihomo port hop redirect for inbound ", state.Tag, ": ", err)
+			}
+			if err := db.Model(&model.MihomoInboundRedirectState{}).Where("id = ?", state.Id).Updates(map[string]interface{}{
+				"port_hop_range":  "",
+				"redirect_handle": 0,
+				"updated_at":      time.Now(),
+			}).Error; err != nil {
+				logger.Warning("failed to clear invalid mihomo port hop range for inbound ", state.Tag, ": ", err)
+			}
+			logger.Warning("skip invalid mihomo port hop range for inbound ", state.Tag, ": ", rangeErr)
+			continue
+		}
+		originalRange := state.PortHopRange
+		interval, ok := parseMihomoPortHopInterval(extractPortHopInterval(inbound.Options))
 		if !ok {
 			clearMihomoPortHopRefresh(state.InboundId)
 			continue
@@ -815,7 +900,7 @@ func (s *MihomoNftTrafficService) RefreshPortHopRedirects() error {
 			logger.Warning("failed to delete existing mihomo REDIRECT rule for inbound ", state.Tag, ": ", err)
 		}
 
-		hopNft, skipped, sample := portHopRangeToNftWithExclusions(state.PortHopRange, state.Port)
+		hopNft, skipped, sample := portHopRangeToNftWithExclusions(normalizedRange, state.Port)
 		if skipped > 0 {
 			if len(sample) > 0 {
 				logger.Info("mihomo port hop interval refresh for inbound ", state.Tag, ": skipped ", skipped, " UDP ports (sample ", sample, ")")
@@ -839,8 +924,9 @@ func (s *MihomoNftTrafficService) RefreshPortHopRedirects() error {
 
 		result := db.Model(&model.MihomoInboundRedirectState{}).
 			Where("id = ? AND tag = ? AND port = ? AND port_hop_range = ? AND redirect_handle = ?",
-				state.Id, state.Tag, state.Port, state.PortHopRange, state.RedirectHandle).
+				state.Id, state.Tag, state.Port, originalRange, state.RedirectHandle).
 			Updates(map[string]interface{}{
+				"port_hop_range":  normalizedRange,
 				"redirect_handle": redirectHandle,
 				"updated_at":      now,
 			})
@@ -868,70 +954,111 @@ func (s *MihomoNftTrafficService) RefreshPortHopRedirects() error {
 }
 
 // CollectAndSaveTraffic reads mihomo nft counters, writes inbound/client stats,
-// and updates cumulative counters in MihomoInboundRedirectState.
-func (s *MihomoNftTrafficService) CollectAndSaveTraffic() error {
+// and updates cumulative counters in MihomoInboundRedirectState. Its boolean
+// result reports whether a traffic delta was committed.
+func (s *MihomoNftTrafficService) CollectAndSaveTraffic() (bool, error) {
+	return s.collectAndSaveTraffic(nil)
+}
+
+// CollectAndSaveTrafficWithHistory lets the serialized runtime sampler reuse
+// its one trafficAge read for both Core chains without changing the legacy
+// no-argument method contract.
+func (s *MihomoNftTrafficService) CollectAndSaveTrafficWithHistory(saveTraffic bool) (bool, error) {
+	return s.collectAndSaveTraffic(&saveTraffic)
+}
+
+func (s *MihomoNftTrafficService) collectAndSaveTraffic(saveTrafficOverride *bool) (bool, error) {
+	var changed bool
+	err := runMihomoInboundNftMutation(func() error {
+		var collectErr error
+		changed, collectErr = s.collectAndSaveTrafficLocked(saveTrafficOverride)
+		return collectErr
+	})
+	return changed, err
+}
+
+func (s *MihomoNftTrafficService) collectAndSaveTrafficLocked(saveTrafficOverride *bool) (bool, error) {
 	if !IsSystemPlatformLinux() || !nftSupported() {
-		return nil
+		return false, nil
+	}
+	samplingEpoch, samplingAllowed := captureRuntimeTrafficSamplingEpoch()
+	if !samplingAllowed {
+		return false, nil
 	}
 
 	coreSvc := &MihomoCoreManagerService{}
 	if !coreSvc.IsRunning() {
 		setMihomoOnlines(nil, nil)
-		return nil
+		return false, nil
 	}
 
 	db := database.GetDB()
 	var states []model.MihomoInboundRedirectState
 	if err := db.Find(&states).Error; err != nil {
-		return err
+		return false, err
 	}
 
 	if len(states) == 0 {
 		// Legacy self-heal: old deployments may have mihomo inbounds but no nft state rows yet.
-		s.InitOnStartup()
+		s.initOnStartup()
 		if err := db.Find(&states).Error; err != nil {
-			return err
+			return false, err
 		}
 		if len(states) == 0 {
 			setMihomoOnlines(nil, nil)
-			return nil
+			return false, nil
 		}
 	}
 
 	saveTraffic := true
-	if trafficAge, err := (&SettingService{}).GetTrafficAge(); err == nil {
+	if saveTrafficOverride != nil {
+		saveTraffic = *saveTrafficOverride
+	} else if trafficAge, err := (&SettingService{}).GetTrafficAge(); err == nil {
 		saveTraffic = trafficAge > 0
 	} else {
 		logger.Warning("failed to load trafficAge for mihomo nft collection: ", err)
 	}
 	if saveTraffic {
 		if err := EnsureHistoryStorageReady(); err != nil {
-			return err
+			return false, err
+		}
+		if err := runtimeTrafficStats.ensureReady(); err != nil {
+			return false, err
 		}
 	}
 
 	// Read nft counters before opening SQLite's single connection transaction.
-	samples := make([]mihomoInboundTrafficSample, 0, len(states))
+	samples := s.readInboundTrafficSamples(states)
 	snapshots := make(map[uint]inboundCounterSnapshot, len(states))
-	for i := range states {
-		sample, ok := s.readInboundTrafficSample(states[i])
-		if !ok {
-			snapshots[states[i].InboundId] = inboundCounterSnapshot{
-				inBytes:  states[i].InBytes,
-				outBytes: states[i].OutBytes,
-			}
-			continue
+	for _, state := range states {
+		snapshots[state.InboundId] = inboundCounterSnapshot{
+			inBytes:  state.InBytes,
+			outBytes: state.OutBytes,
 		}
-		samples = append(samples, sample)
+	}
+	hasStateUpdates := false
+	for _, sample := range samples {
+		if sample.stateChanged {
+			hasStateUpdates = true
+		}
 		snapshots[sample.state.InboundId] = inboundCounterSnapshot{
 			inBytes:  sample.delta.currentIn,
 			outBytes: sample.delta.currentOut,
 		}
 	}
+	if !hasStateUpdates {
+		setMihomoOnlines(nil, nil)
+		return false, nil
+	}
+	if !runtimeTrafficSamplingEpochUnchanged(samplingEpoch) {
+		return false, nil
+	}
 
+	unlockJournalTransaction := lockTrafficRuntimeJournalTransaction()
+	defer unlockJournalTransaction()
 	tx := db.Begin()
 	if tx.Error != nil {
-		return tx.Error
+		return false, tx.Error
 	}
 	committed := false
 	defer func() {
@@ -942,6 +1069,7 @@ func (s *MihomoNftTrafficService) CollectAndSaveTraffic() error {
 
 	now := time.Now().Unix()
 	deltas := make([]inboundDelta, 0, len(samples))
+	historySamples := make([]model.Stats, 0, len(samples)*2)
 	inboundOnlineSet := make(map[string]struct{})
 	for _, sample := range samples {
 		result := tx.Model(&model.MihomoInboundRedirectState{}).
@@ -965,7 +1093,7 @@ func (s *MihomoNftTrafficService) CollectAndSaveTraffic() error {
 				"updated_at":      time.Now(),
 			})
 		if result.Error != nil {
-			return result.Error
+			return false, result.Error
 		}
 		if result.RowsAffected == 0 {
 			continue
@@ -978,48 +1106,140 @@ func (s *MihomoNftTrafficService) CollectAndSaveTraffic() error {
 		deltas = append(deltas, delta)
 		inboundOnlineSet[delta.tag] = struct{}{}
 		if saveTraffic && delta.deltaIn > 0 {
-			if err := upsertStatsTraffic(tx, model.Stats{
+			historySamples = append(historySamples, model.Stats{
 				DateTime:  now,
 				Resource:  "mihomo_inbound",
 				Tag:       delta.tag,
 				Direction: true,
 				Traffic:   delta.deltaIn,
-			}); err != nil {
-				return err
-			}
+			})
 		}
 		if saveTraffic && delta.deltaOut > 0 {
-			if err := upsertStatsTraffic(tx, model.Stats{
+			historySamples = append(historySamples, model.Stats{
 				DateTime:  now,
 				Resource:  "mihomo_inbound",
 				Tag:       delta.tag,
 				Direction: false,
 				Traffic:   delta.deltaOut,
-			}); err != nil {
-				return err
-			}
+			})
 		}
 	}
 
 	userOnlines := []string{}
 	if len(deltas) > 0 {
-		if err := s.ensureClientBindings(tx, snapshots); err != nil {
-			return err
-		}
 		var err error
-		userOnlines, err = s.writeClientStats(tx, deltas, now, saveTraffic)
+		userOnlines, err = s.writeClientStats(tx, deltas, now, saveTraffic, &historySamples)
 		if err != nil {
-			return err
+			return false, err
 		}
+	}
+	journalStage, journalErr := stageTrafficRuntimeStatsForTransaction(tx, historySamples)
+	if journalErr != nil {
+		return false, journalErr
+	}
+	if !runtimeTrafficSamplingEpochUnchanged(samplingEpoch) {
+		discardStagedTrafficRuntimeStats(journalStage)
+		return false, nil
 	}
 
 	if err := tx.Commit().Error; err != nil {
-		return err
+		discardStagedTrafficRuntimeStats(journalStage)
+		return false, err
 	}
 	committed = true
+	if commitStagedTrafficRuntimeStats(journalStage) {
+		if err := runtimeTrafficStats.flush(); err != nil {
+			logger.Warning("flush mihomo traffic runtime journal at capacity threshold failed: ", err)
+		}
+	}
 
 	setMihomoOnlines(tagsFromSet(inboundOnlineSet), userOnlines)
-	return nil
+	return len(deltas) > 0, nil
+}
+
+// readInboundTrafficSamples batches normal counter reads into one nft command
+// per direction. A failed snapshot falls back to the existing single-inbound
+// recovery path so externally removed rules still self-heal correctly.
+func (s *MihomoNftTrafficService) readInboundTrafficSamples(states []model.MihomoInboundRedirectState) []mihomoInboundTrafficSample {
+	if len(states) == 0 {
+		return nil
+	}
+
+	prepared := make([]model.MihomoInboundRedirectState, len(states))
+	originalByInboundID := make(map[uint]model.MihomoInboundRedirectState, len(states))
+	inputHandles := make([]int, 0, len(states))
+	outputHandles := make([]int, 0, len(states))
+	for i := range states {
+		prepared[i] = states[i]
+		originalByInboundID[states[i].InboundId] = states[i]
+		if prepared[i].InHandle <= 0 || prepared[i].OutHandle <= 0 {
+			s.recoverHandles(&prepared[i])
+		}
+		inputHandles = append(inputHandles, prepared[i].InHandle)
+		outputHandles = append(outputHandles, prepared[i].OutHandle)
+	}
+
+	inputBytes, inputErr := getChainRuleBytesByHandles(nftChainIn, inputHandles)
+	outputBytes, outputErr := getChainRuleBytesByHandles(nftChainOut, outputHandles)
+	if inputErr != nil || outputErr != nil {
+		if inputErr != nil {
+			logger.Warning("failed to batch-read mihomo nft input counters: ", inputErr)
+		}
+		if outputErr != nil {
+			logger.Warning("failed to batch-read mihomo nft output counters: ", outputErr)
+		}
+		return s.readInboundTrafficSamplesIndividually(states)
+	}
+
+	samples := make([]mihomoInboundTrafficSample, 0, len(prepared))
+	for _, state := range prepared {
+		currentIn, inOK := inputBytes[state.InHandle]
+		currentOut, outOK := outputBytes[state.OutHandle]
+		if !inOK || !outOK {
+			return s.readInboundTrafficSamplesIndividually(states)
+		}
+		samples = append(samples, newMihomoInboundTrafficSample(state, originalByInboundID[state.InboundId], currentIn, currentOut))
+	}
+	return samples
+}
+
+func (s *MihomoNftTrafficService) readInboundTrafficSamplesIndividually(states []model.MihomoInboundRedirectState) []mihomoInboundTrafficSample {
+	samples := make([]mihomoInboundTrafficSample, 0, len(states))
+	for _, state := range states {
+		sample, ok := s.readInboundTrafficSample(state)
+		if ok {
+			samples = append(samples, sample)
+		}
+	}
+	return samples
+}
+
+func newMihomoInboundTrafficSample(state model.MihomoInboundRedirectState, original model.MihomoInboundRedirectState, currentIn int64, currentOut int64) mihomoInboundTrafficSample {
+	deltaIn := currentIn - original.InBytes
+	deltaOut := currentOut - original.OutBytes
+	if deltaIn < 0 {
+		deltaIn = currentIn
+	}
+	if deltaOut < 0 {
+		deltaOut = currentOut
+	}
+	return mihomoInboundTrafficSample{
+		state:                  state,
+		originalInBytes:        original.InBytes,
+		originalOutBytes:       original.OutBytes,
+		originalInHandle:       original.InHandle,
+		originalOutHandle:      original.OutHandle,
+		originalRedirectHandle: original.RedirectHandle,
+		stateChanged:           state.InHandle != original.InHandle || state.OutHandle != original.OutHandle || state.RedirectHandle != original.RedirectHandle || currentIn != original.InBytes || currentOut != original.OutBytes,
+		delta: inboundDelta{
+			inboundId:  state.InboundId,
+			tag:        state.Tag,
+			deltaIn:    deltaIn,
+			deltaOut:   deltaOut,
+			currentIn:  currentIn,
+			currentOut: currentOut,
+		},
+	}
 }
 
 func (s *MihomoNftTrafficService) readInboundTrafficSample(state model.MihomoInboundRedirectState) (mihomoInboundTrafficSample, bool) {
@@ -1064,6 +1284,11 @@ func (s *MihomoNftTrafficService) readInboundTrafficSample(state model.MihomoInb
 		deltaOut = currentOut
 	}
 	sample.state = state
+	sample.stateChanged = state.InHandle != sample.originalInHandle ||
+		state.OutHandle != sample.originalOutHandle ||
+		state.RedirectHandle != sample.originalRedirectHandle ||
+		currentIn != sample.originalInBytes ||
+		currentOut != sample.originalOutBytes
 	sample.delta = inboundDelta{
 		inboundId:  state.InboundId,
 		tag:        state.Tag,
@@ -1075,7 +1300,7 @@ func (s *MihomoNftTrafficService) readInboundTrafficSample(state model.MihomoInb
 	return sample, true
 }
 
-func (s *MihomoNftTrafficService) writeClientStats(tx *gorm.DB, deltas []inboundDelta, now int64, saveTraffic bool) ([]string, error) {
+func (s *MihomoNftTrafficService) writeClientStats(tx *gorm.DB, deltas []inboundDelta, now int64, saveTraffic bool, historySamples *[]model.Stats) ([]string, error) {
 	deltaMap := make(map[uint]*inboundDelta, len(deltas))
 	for i := range deltas {
 		deltaMap[deltas[i].inboundId] = &deltas[i]
@@ -1150,15 +1375,13 @@ func (s *MihomoNftTrafficService) writeClientStats(tx *gorm.DB, deltas []inbound
 
 		if agg.upTotal > 0 {
 			if saveTraffic {
-				if err := upsertStatsTraffic(tx, model.Stats{
+				*historySamples = append(*historySamples, model.Stats{
 					DateTime:  now,
 					Resource:  "mihomo_client",
 					Tag:       name,
 					Direction: true,
 					Traffic:   agg.upTotal,
-				}); err != nil {
-					return nil, err
-				}
+				})
 			}
 			if err := tx.Model(&model.MihomoClient{}).Where("id = ?", clientID).
 				UpdateColumn("up", gorm.Expr("up + ?", agg.upTotal)).Error; err != nil {
@@ -1168,15 +1391,13 @@ func (s *MihomoNftTrafficService) writeClientStats(tx *gorm.DB, deltas []inbound
 
 		if agg.downTotal > 0 {
 			if saveTraffic {
-				if err := upsertStatsTraffic(tx, model.Stats{
+				*historySamples = append(*historySamples, model.Stats{
 					DateTime:  now,
 					Resource:  "mihomo_client",
 					Tag:       name,
 					Direction: false,
 					Traffic:   agg.downTotal,
-				}); err != nil {
-					return nil, err
-				}
+				})
 			}
 			if err := tx.Model(&model.MihomoClient{}).Where("id = ?", clientID).
 				UpdateColumn("down", gorm.Expr("down + ?", agg.downTotal)).Error; err != nil {
@@ -1218,46 +1439,11 @@ func (s *MihomoNftTrafficService) ensureClientBindings(tx *gorm.DB, snapshots ma
 }
 
 func parseMihomoInboundIDs(raw json.RawMessage) []uint {
-	if len(raw) == 0 {
+	ids, err := util.ParseInboundIDs(raw)
+	if err != nil || len(ids) == 0 {
 		return []uint{}
 	}
-
-	var ids []uint
-	if err := json.Unmarshal(raw, &ids); err == nil {
-		return deduplicateInboundIDs(ids)
-	}
-
-	// Backward-compatible fallback for historical malformed payloads.
-	var mixed []interface{}
-	if err := json.Unmarshal(raw, &mixed); err != nil {
-		return []uint{}
-	}
-
-	parsed := make([]uint, 0, len(mixed))
-	for _, item := range mixed {
-		switch value := item.(type) {
-		case float64:
-			if value > 0 && math.Trunc(value) == value {
-				parsed = append(parsed, uint(value))
-			}
-		case int:
-			if value > 0 {
-				parsed = append(parsed, uint(value))
-			}
-		case string:
-			numeric, err := strconv.ParseUint(strings.TrimSpace(value), 10, 64)
-			if err == nil && numeric > 0 {
-				parsed = append(parsed, uint(numeric))
-			}
-		case json.Number:
-			numeric, err := value.Int64()
-			if err == nil && numeric > 0 {
-				parsed = append(parsed, uint(numeric))
-			}
-		}
-	}
-
-	return deduplicateInboundIDs(parsed)
+	return ids
 }
 
 func deduplicateInboundIDs(ids []uint) []uint {
@@ -1282,6 +1468,13 @@ func deduplicateInboundIDs(ids []uint) []uint {
 
 // InitOnStartup restores mihomo nft rules for existing inbounds.
 func (s *MihomoNftTrafficService) InitOnStartup() {
+	_ = runMihomoInboundNftMutation(func() error {
+		s.initOnStartup()
+		return nil
+	})
+}
+
+func (s *MihomoNftTrafficService) initOnStartup() {
 	if !IsSystemPlatformLinux() || !nftSupported() {
 		return
 	}
@@ -1292,8 +1485,23 @@ func (s *MihomoNftTrafficService) InitOnStartup() {
 		logger.Warning("failed to load mihomo inbounds for nft init: ", err)
 		return
 	}
+	unsupportedInboundIDs := make([]uint, 0)
+	for _, inbound := range inbounds {
+		if !isSupportedMihomoInboundType(inbound.Type) {
+			unsupportedInboundIDs = append(unsupportedInboundIDs, inbound.Id)
+		}
+	}
+	if err := s.removeUnsupportedInboundStates(db, unsupportedInboundIDs); err != nil {
+		logger.Warning("failed to remove unsupported mihomo inbound nft states on startup: ", err)
+	}
 
 	for _, inbound := range inbounds {
+		if !isSupportedMihomoInboundType(inbound.Type) {
+			if err := s.RemoveInboundRules(db, inbound.Id); err != nil {
+				logger.Warning("failed to remove unsupported mihomo inbound nft state for ", inbound.Tag, ": ", err)
+			}
+			continue
+		}
 		port := extractPort(inbound.Options)
 		if port <= 0 {
 			continue
@@ -1374,8 +1582,28 @@ func (s *MihomoNftTrafficService) InitOnStartup() {
 	}
 }
 
+func (s *MihomoNftTrafficService) removeUnsupportedInboundStates(db *gorm.DB, inboundIDs []uint) error {
+	if db == nil || len(inboundIDs) == 0 {
+		return nil
+	}
+	var firstErr error
+	for _, inboundID := range inboundIDs {
+		if err := s.RemoveInboundRules(db, inboundID); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 // CleanupOnShutdown removes mihomo nft rules and clears volatile handles/baselines.
 func (s *MihomoNftTrafficService) CleanupOnShutdown() {
+	_ = runMihomoInboundNftMutation(func() error {
+		s.cleanupOnShutdown()
+		return nil
+	})
+}
+
+func (s *MihomoNftTrafficService) cleanupOnShutdown() {
 	mihomoPortHopRefreshState.mu.Lock()
 	mihomoPortHopRefreshState.last = map[uint]time.Time{}
 	mihomoPortHopRefreshState.mu.Unlock()

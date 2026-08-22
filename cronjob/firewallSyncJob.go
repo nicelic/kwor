@@ -19,7 +19,7 @@ func (j *FirewallSyncJob) Run() {
 	if !service.IsSystemPlatformLinux() {
 		return
 	}
-	if err := j.FirewallService.SyncIfNeeded(3 * time.Second); err != nil {
+	if err := j.FirewallService.SyncIfNeeded(4*time.Minute + 55*time.Second); err != nil {
 		logger.Warning("firewall sync job failed: ", err)
 	}
 }

@@ -75,7 +75,7 @@
         </v-col>
       </template>
     </v-row>
-    <v-row v-if="[inTypes.Hysteria, inTypes.Hysteria2].includes(type)">
+    <v-row v-if="type == inTypes.Hysteria || type == inTypes.Hysteria2">
       <v-col cols="12" sm="6" md="4">
         <v-text-field
           :label="$t('stats.upload')"
@@ -110,14 +110,15 @@
           :label="$t('ruleset.interval')"
           type="number"
           min="0"
+          step="any"
           :suffix="$t('date.s')"
-          v-model.number="hop_interval">
+          v-model="hop_interval">
         </v-text-field>
       </v-col>
       <v-col cols="12" sm="6" md="4" v-if="type == inTypes.Hysteria2">
         <v-text-field
           :label="$t('ruleset.interval')"
-          placeholder="30 | 30s | 30-60 | 30:60s"
+          placeholder="10 | 10s | 10-60 | 10:60s"
           v-model="hy2HopIntervalInput"
           @blur="applyHy2HopIntervalInput"
           @keydown.enter.prevent="applyHy2HopIntervalInput">
@@ -139,8 +140,9 @@ import Headers from './Headers.vue'
 import TrustTunnel from './protocols/TrustTunnel.vue'
 import AnyTls from './protocols/AnyTls.vue'
 import OutNaive from './protocols/OutNaive.vue'
-import { formatHopIntervalInput, parseHopIntervalInput } from '@/plugins/hopInterval'
-import { normalizePortRangeInput } from '@/plugins/portRange'
+import { formatHopIntervalInput, parseHopIntervalInput, parseHopIntervalSeconds } from '@/plugins/hopInterval'
+import { normalizeManagedPortHopRangeInput, normalizePortRangeInput } from '@/plugins/portRange'
+import { readSingboxDuration, writeSingboxDuration } from '@/plugins/singboxDuration'
 
 export default {
   emits: ['port-hop-range-blur'],
@@ -185,15 +187,14 @@ export default {
     normalizeOptionalMbpsValue(value: unknown): number | undefined {
       if (value === '' || value === null || value === undefined) return undefined
       const normalized = Number(value)
-      if (!Number.isFinite(normalized)) return undefined
-      if (normalized > 0) return Math.trunc(normalized)
-      return 0
+      if (!Number.isSafeInteger(normalized) || normalized < 0) return undefined
+      return normalized
     },
     readOptionalMbpsValue(key: string): number | null {
       const value = this.$props.inData.out_json?.[key]
       if (value === '' || value === null || value === undefined) return null
       const normalized = Number(value)
-      return Number.isFinite(normalized) ? Math.trunc(normalized) : null
+      return Number.isSafeInteger(normalized) && normalized >= 0 ? normalized : null
     },
     writeOptionalMbpsValue(key: string, value: unknown) {
       if (!this.$props.inData.out_json) this.$props.inData.out_json = {}
@@ -233,6 +234,16 @@ export default {
  
       const parsed = parseHopIntervalInput(this.hy2HopIntervalInput)
       if (!parsed) {
+        this.syncHy2HopIntervalInput()
+        return
+      }
+      const lower = parseHopIntervalSeconds(parsed.hopInterval)
+      const upper = parseHopIntervalSeconds(parsed.hopIntervalMax)
+      if (
+        this.usesInboundPortHopBackend &&
+        ((parsed.hopInterval !== undefined && lower < 10) ||
+          (parsed.hopIntervalMax !== undefined && upper < 10))
+      ) {
         this.syncHy2HopIntervalInput()
         return
       }
@@ -310,7 +321,9 @@ export default {
       }
     },
     usesInboundPortHopBackend(): boolean {
-      return [this.inTypes.Hysteria, this.inTypes.Hysteria2].includes(this.$props.type)
+      return this.$props.type === this.inTypes.Hysteria2 || (
+        this.$props.namespace !== 'mihomo' && this.$props.type === this.inTypes.Hysteria
+      )
     },
     server_ports: {
       get() {
@@ -320,6 +333,13 @@ export default {
         return this.$props.inData.out_json.server_ports?.join(',') ?? ''
       },
       set(v:string) {
+        if (this.usesInboundPortHopBackend) {
+          const parsed = normalizeManagedPortHopRangeInput(v)
+          // Keep an incomplete edit in the field until blur/save validation so
+          // typing a range such as 21000-22000 never clears the user's input.
+          this.$props.inData.port_hop_range = parsed.error ? (v.trim() || undefined) : (parsed.normalized || undefined)
+          return
+        }
         const normalized = normalizePortRangeInput(v)
         if (this.usesInboundPortHopBackend) {
           this.$props.inData.port_hop_range = normalized.length > 0 ? normalized.join(',') : undefined
@@ -331,14 +351,15 @@ export default {
     hop_interval: {
       get() {
         const rawValue = this.usesInboundPortHopBackend ? this.$props.inData.port_hop_interval : this.$props.inData.out_json.hop_interval
-        return rawValue ? parseInt(rawValue.replace('s','')) : 0
+        return readSingboxDuration(rawValue, 's') ?? 0
       },
-      set(v:number) {
+      set(v:unknown) {
+        const value = writeSingboxDuration(v, 's')
         if (this.usesInboundPortHopBackend) {
-          this.$props.inData.port_hop_interval = v>0 ? v + 's' : undefined
+          this.$props.inData.port_hop_interval = value
           return
         }
-        this.$props.inData.out_json.hop_interval = v>0 ? v + 's' : undefined
+        this.$props.inData.out_json.hop_interval = value
       }
     },
   },

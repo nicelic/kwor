@@ -1,10 +1,10 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
-	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/service"
 	"github.com/gin-gonic/gin"
 )
@@ -32,6 +32,7 @@ type mihomoCorePreferenceRequest struct {
 }
 
 type mihomoCoreUpdateSettingsRequest struct {
+	Action        string
 	Enabled       bool
 	IntervalHours int
 	AutoUpdate    bool
@@ -84,21 +85,40 @@ func parseMihomoCorePreferenceRequest(c *gin.Context) mihomoCorePreferenceReques
 }
 
 func parseMihomoCoreUpdateSettingsRequest(c *gin.Context) (mihomoCoreUpdateSettingsRequest, error) {
+	action := strings.ToLower(strings.TrimSpace(c.Request.FormValue("action")))
 	enabledRaw := strings.TrimSpace(c.Request.FormValue("enabled"))
 	enabled := strings.EqualFold(enabledRaw, "true") || enabledRaw == "1"
-	intervalHours, err := parseCoreIntervalHours(c.Request.FormValue("interval"))
-	if err != nil {
-		return mihomoCoreUpdateSettingsRequest{}, err
-	}
 	autoUpdateRaw := strings.TrimSpace(c.Request.FormValue("auto_update_enabled"))
 	_, hasAutoUpdate := c.Request.Form["auto_update_enabled"]
 	autoUpdateEnabled := strings.EqualFold(autoUpdateRaw, "true") || autoUpdateRaw == "1"
-	return mihomoCoreUpdateSettingsRequest{
+	request := mihomoCoreUpdateSettingsRequest{
+		Action:        action,
 		Enabled:       enabled,
-		IntervalHours: intervalHours,
 		AutoUpdate:    autoUpdateEnabled,
 		HasAutoUpdate: hasAutoUpdate,
-	}, nil
+	}
+
+	switch action {
+	case "auto_check":
+		if _, exists := c.Request.Form["enabled"]; !exists {
+			return mihomoCoreUpdateSettingsRequest{}, fmt.Errorf("enabled is required for auto_check")
+		}
+		return request, nil
+	case "auto_update":
+		if !hasAutoUpdate {
+			return mihomoCoreUpdateSettingsRequest{}, fmt.Errorf("auto_update_enabled is required for auto_update")
+		}
+		return request, nil
+	case "interval", "":
+		intervalHours, err := parseCoreIntervalHours(c.Request.FormValue("interval"))
+		if err != nil {
+			return mihomoCoreUpdateSettingsRequest{}, err
+		}
+		request.IntervalHours = intervalHours
+		return request, nil
+	default:
+		return mihomoCoreUpdateSettingsRequest{}, fmt.Errorf("unsupported core update settings action: %s", action)
+	}
 }
 
 func (a *ApiService) GetMihomoCoreManagerStatus(c *gin.Context) {
@@ -136,16 +156,22 @@ func (a *ApiService) SaveMihomoCoreUpdateSettings(c *gin.Context) {
 		jsonMsg(c, "", err)
 		return
 	}
-	if err = a.mihomoCoreManagerService().SetCoreAutoCheckSettings(request.Enabled, request.IntervalHours, request.HasAutoUpdate, request.AutoUpdate); err != nil {
+	manager := a.mihomoCoreManagerService()
+	switch request.Action {
+	case "auto_check":
+		err = manager.SetCoreAutoCheckEnabled(request.Enabled)
+	case "auto_update":
+		err = manager.SetCoreAutoUpdateEnabled(request.AutoUpdate)
+	case "interval":
+		err = manager.SetCoreAutoCheckInterval(request.IntervalHours)
+	default:
+		err = manager.SetCoreAutoCheckSettings(request.Enabled, request.IntervalHours, request.HasAutoUpdate, request.AutoUpdate)
+	}
+	if err != nil {
 		jsonMsg(c, "", err)
 		return
 	}
-	if request.Enabled {
-		if checkErr := a.mihomoCoreManagerService().CheckAndMarkCoreUpdates(true); checkErr != nil {
-			logger.Warning("check mihomo core updates after settings update failed: ", checkErr)
-		}
-	}
-	info, err := a.mihomoCoreManagerService().GetMihomoCoreUpdateInfo(false)
+	info, err := manager.GetMihomoCoreUpdateInfo(false)
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
@@ -240,6 +266,20 @@ func (a *ApiService) SaveMihomoCoreDownloadPreference(c *gin.Context) {
 		return
 	}
 	jsonObj(c, preference, nil)
+}
+
+func (a *ApiService) SaveMihomoCoreLogLevel(c *gin.Context, loginUser string) {
+	result, err := service.SaveMihomoCoreLogLevel(c.Request.FormValue("level"), loginUser)
+	if err != nil {
+		var committedErr *service.CommittedSaveError
+		if errors.As(err, &committedErr) {
+			writeCommittedSaveFailure(c, committedErr)
+			return
+		}
+		jsonMsg(c, "save mihomo core log level", err)
+		return
+	}
+	jsonObj(c, result, nil)
 }
 
 func (a *ApiService) StartMihomoCoreManager(c *gin.Context) {

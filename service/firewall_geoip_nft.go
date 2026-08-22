@@ -10,6 +10,11 @@ import (
 	"github.com/alireza0/s-ui/database/model"
 )
 
+const (
+	firewallGeoMaxNftScriptBytes   = 16 * 1024 * 1024
+	firewallGeoMaxPrefixesPerGroup = 50000
+)
+
 type firewallGeoRenderGroup struct {
 	Action   string
 	Family   string
@@ -83,7 +88,7 @@ func appendManagedFirewallGeoRulesScript(script *strings.Builder, rows []model.F
 			return err
 		}
 	}
-	return nil
+	return ensureFirewallGeoScriptLimit(script)
 }
 
 func collectFirewallGeoRenderGroup(
@@ -94,16 +99,17 @@ func collectFirewallGeoRenderGroup(
 ) error {
 	switch row.Family {
 	case firewallFamilyIPv4:
-		addFirewallGeoRenderGroupEntry(selectFirewallGeoGroupMap(row.Action, blockGroups, allowGroups), row, firewallFamilyIPv4, runtimeEntry.IPv4, row.Action == firewallGeoRuleActionAllow)
+		return addFirewallGeoRenderGroupEntry(selectFirewallGeoGroupMap(row.Action, blockGroups, allowGroups), row, firewallFamilyIPv4, runtimeEntry.IPv4, row.Action == firewallGeoRuleActionAllow)
 	case firewallFamilyIPv6:
-		addFirewallGeoRenderGroupEntry(selectFirewallGeoGroupMap(row.Action, blockGroups, allowGroups), row, firewallFamilyIPv6, runtimeEntry.IPv6, row.Action == firewallGeoRuleActionAllow)
+		return addFirewallGeoRenderGroupEntry(selectFirewallGeoGroupMap(row.Action, blockGroups, allowGroups), row, firewallFamilyIPv6, runtimeEntry.IPv6, row.Action == firewallGeoRuleActionAllow)
 	case firewallFamilyDual:
-		addFirewallGeoRenderGroupEntry(selectFirewallGeoGroupMap(row.Action, blockGroups, allowGroups), row, firewallFamilyIPv4, runtimeEntry.IPv4, row.Action == firewallGeoRuleActionAllow)
-		addFirewallGeoRenderGroupEntry(selectFirewallGeoGroupMap(row.Action, blockGroups, allowGroups), row, firewallFamilyIPv6, runtimeEntry.IPv6, row.Action == firewallGeoRuleActionAllow)
+		if err := addFirewallGeoRenderGroupEntry(selectFirewallGeoGroupMap(row.Action, blockGroups, allowGroups), row, firewallFamilyIPv4, runtimeEntry.IPv4, row.Action == firewallGeoRuleActionAllow); err != nil {
+			return err
+		}
+		return addFirewallGeoRenderGroupEntry(selectFirewallGeoGroupMap(row.Action, blockGroups, allowGroups), row, firewallFamilyIPv6, runtimeEntry.IPv6, row.Action == firewallGeoRuleActionAllow)
 	default:
 		return fmt.Errorf("unsupported geo rule family: %s", row.Family)
 	}
-	return nil
 }
 
 func selectFirewallGeoGroupMap(
@@ -123,9 +129,9 @@ func addFirewallGeoRenderGroupEntry(
 	family string,
 	prefixes []string,
 	createIfEmpty bool,
-) {
+) error {
 	if len(prefixes) == 0 && !createIfEmpty {
-		return
+		return nil
 	}
 	key := strings.Join([]string{row.Action, family, row.Protocol, row.PortSpec}, "|")
 	group, exists := groups[key]
@@ -140,8 +146,12 @@ func addFirewallGeoRenderGroupEntry(
 		groups[key] = group
 	}
 	for _, prefix := range prefixes {
+		if _, exists := group.Prefixes[prefix]; !exists && len(group.Prefixes) >= firewallGeoMaxPrefixesPerGroup {
+			return fmt.Errorf("GeoIP render group exceeds %d prefixes", firewallGeoMaxPrefixesPerGroup)
+		}
 		group.Prefixes[prefix] = struct{}{}
 	}
+	return nil
 }
 
 func sortFirewallGeoRenderGroups(groups map[string]*firewallGeoRenderGroup) []*firewallGeoRenderGroup {
@@ -175,14 +185,16 @@ func addManagedFirewallGeoBlockGroup(group firewallGeoRenderGroup) error {
 
 func appendManagedFirewallGeoBlockGroupScript(script *strings.Builder, group firewallGeoRenderGroup) error {
 	setName := firewallGeoSetName(group.Action, group.Family, group.Protocol, group.PortSpec)
-	appendManagedFirewallGeoSetScript(script, setName, group.Family, flattenFirewallGeoPrefixes(group.Prefixes))
+	if err := appendManagedFirewallGeoSetScript(script, setName, group.Family, flattenFirewallGeoPrefixes(group.Prefixes)); err != nil {
+		return err
+	}
 	args, err := buildManagedFirewallGeoRuleArgs(group, setName)
 	if err != nil {
 		return err
 	}
 	args = append(args, "counter", "drop", "comment", firewallGeoRuleComment("block", group, "match"))
 	appendFirewallScriptArgs(script, args)
-	return nil
+	return ensureFirewallGeoScriptLimit(script)
 }
 
 func addManagedFirewallGeoAllowGroup(group firewallGeoRenderGroup) error {
@@ -215,7 +227,9 @@ func addManagedFirewallGeoAllowGroup(group firewallGeoRenderGroup) error {
 func appendManagedFirewallGeoAllowGroupScript(script *strings.Builder, group firewallGeoRenderGroup) error {
 	if len(group.Prefixes) > 0 {
 		setName := firewallGeoSetName(group.Action, group.Family, group.Protocol, group.PortSpec)
-		appendManagedFirewallGeoSetScript(script, setName, group.Family, flattenFirewallGeoPrefixes(group.Prefixes))
+		if err := appendManagedFirewallGeoSetScript(script, setName, group.Family, flattenFirewallGeoPrefixes(group.Prefixes)); err != nil {
+			return err
+		}
 		acceptArgs, err := buildManagedFirewallGeoRuleArgs(group, setName)
 		if err != nil {
 			return err
@@ -230,7 +244,7 @@ func appendManagedFirewallGeoAllowGroupScript(script *strings.Builder, group fir
 	}
 	dropArgs = append(dropArgs, "counter", "drop", "comment", firewallGeoRuleComment("allow", group, "fallback_drop"))
 	appendFirewallScriptArgs(script, dropArgs)
-	return nil
+	return ensureFirewallGeoScriptLimit(script)
 }
 
 func flattenFirewallGeoPrefixes(prefixSet map[string]struct{}) []string {
@@ -291,16 +305,22 @@ func addManagedFirewallGeoSet(setName string, family string, prefixes []string) 
 
 	script := &strings.Builder{}
 	script.WriteString(fmt.Sprintf("add set %s %s %s { type %s; flags interval; }\n", nftFamily, firewallNftTable, setName, addrType))
+	if err := ensureFirewallGeoScriptLimit(script); err != nil {
+		return err
+	}
 	for _, chunk := range chunkFirewallGeoPrefixes(prefixes, 180) {
 		script.WriteString(fmt.Sprintf("add element %s %s %s { %s }\n", nftFamily, firewallNftTable, setName, strings.Join(chunk, ", ")))
+		if err := ensureFirewallGeoScriptLimit(script); err != nil {
+			return err
+		}
 	}
 	_, err := runNftScript(script.String())
 	return err
 }
 
-func appendManagedFirewallGeoSetScript(script *strings.Builder, setName string, family string, prefixes []string) {
+func appendManagedFirewallGeoSetScript(script *strings.Builder, setName string, family string, prefixes []string) error {
 	if len(prefixes) == 0 {
-		return
+		return nil
 	}
 	addrType := "ipv4_addr"
 	if family == firewallFamilyIPv6 {
@@ -308,9 +328,23 @@ func appendManagedFirewallGeoSetScript(script *strings.Builder, setName string, 
 	}
 
 	script.WriteString(fmt.Sprintf("add set %s %s %s { type %s; flags interval; }\n", nftFamily, firewallNftTable, setName, addrType))
+	if err := ensureFirewallGeoScriptLimit(script); err != nil {
+		return err
+	}
 	for _, chunk := range chunkFirewallGeoPrefixes(prefixes, 180) {
 		script.WriteString(fmt.Sprintf("add element %s %s %s { %s }\n", nftFamily, firewallNftTable, setName, strings.Join(chunk, ", ")))
+		if err := ensureFirewallGeoScriptLimit(script); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+func ensureFirewallGeoScriptLimit(script *strings.Builder) error {
+	if script != nil && script.Len() > firewallGeoMaxNftScriptBytes {
+		return fmt.Errorf("GeoIP nft script exceeds %d MiB", firewallGeoMaxNftScriptBytes/(1024*1024))
+	}
+	return nil
 }
 
 func chunkFirewallGeoPrefixes(prefixes []string, chunkSize int) [][]string {

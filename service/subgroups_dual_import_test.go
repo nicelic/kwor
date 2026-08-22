@@ -584,6 +584,7 @@ func TestConvertClashProxyToSubOutbound_MapsHysteriaProxyToNewQUICFields(t *test
 		"recv-window-conn":      25000000,
 		"recv-window":           67108864,
 		"disable-mtu-discovery": true,
+		"fast-open":             true,
 		"ports":                 "443-8443,9000",
 	}
 
@@ -602,6 +603,9 @@ func TestConvertClashProxyToSubOutbound_MapsHysteriaProxyToNewQUICFields(t *test
 	}
 	if got, _ := outbound["disable_path_mtu_discovery"].(bool); !got {
 		t.Fatalf("expected disable_path_mtu_discovery=true, got %#v", outbound["disable_path_mtu_discovery"])
+	}
+	if got, _ := outbound["mihomo_fast_open"].(bool); !got {
+		t.Fatalf("expected mihomo_fast_open=true, got %#v", outbound["mihomo_fast_open"])
 	}
 	if _, exists := outbound["recv_window_conn"]; exists {
 		t.Fatalf("legacy recv_window_conn should be removed, got %#v", outbound["recv_window_conn"])

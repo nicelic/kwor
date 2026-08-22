@@ -72,9 +72,22 @@ func forceSyncTLSPathBindingsForTLSIDsUnlocked(defaultTLSIDs []uint, mihomoTLSID
 	}); err != nil {
 		return false, err
 	}
+	InvalidateSubscriptionTLSPathWatchBindings()
 
 	configSvc := &ConfigService{}
-	if len(defaultTLSIDs) > 0 {
+	defaultRuntimeChanged, err := defaultTLSPathBindingsAffectRuntime(defaultTLSIDs)
+	if err != nil {
+		return false, err
+	}
+	mihomoRuntimeChanged, err := mihomoTLSPathBindingsAffectRuntime(mihomoTLSIDs)
+	if err != nil {
+		return false, err
+	}
+	if !defaultRuntimeChanged && !mihomoRuntimeChanged {
+		return false, nil
+	}
+
+	if defaultRuntimeChanged {
 		manager := NewProManagerService(configSvc)
 		if err := manager.RegenerateCoreConfig(); err != nil {
 			return true, err
@@ -83,7 +96,7 @@ func forceSyncTLSPathBindingsForTLSIDsUnlocked(defaultTLSIDs []uint, mihomoTLSID
 			return true, err
 		}
 	}
-	if len(mihomoTLSIDs) > 0 {
+	if mihomoRuntimeChanged {
 		if err := NewMihomoManagerService().RegenerateServerConfig(); err != nil {
 			return true, err
 		}
@@ -92,8 +105,47 @@ func forceSyncTLSPathBindingsForTLSIDsUnlocked(defaultTLSIDs []uint, mihomoTLSID
 		}
 	}
 
-	markLastUpdate(time.Now().Unix())
+	if defaultRuntimeChanged || mihomoRuntimeChanged {
+		// Either TLS path can rebuild the shared subscription projection. Notify
+		// both chains only after all related regeneration and sync work finishes.
+		markBothLastUpdates(time.Now().Unix())
+	}
 	return true, nil
+}
+
+func defaultTLSPathBindingsAffectRuntime(tlsIDs []uint) (bool, error) {
+	tlsIDs = compactPositiveUintList(tlsIDs)
+	if len(tlsIDs) == 0 {
+		return false, nil
+	}
+
+	db := database.GetDB()
+	var inboundCount int64
+	if err := db.Model(model.Inbound{}).Where("tls_id IN ?", tlsIDs).Count(&inboundCount).Error; err != nil {
+		return false, err
+	}
+	if inboundCount > 0 {
+		return true, nil
+	}
+
+	var serviceCount int64
+	if err := db.Model(model.Service{}).Where("tls_id IN ?", tlsIDs).Count(&serviceCount).Error; err != nil {
+		return false, err
+	}
+	return serviceCount > 0, nil
+}
+
+func mihomoTLSPathBindingsAffectRuntime(tlsIDs []uint) (bool, error) {
+	tlsIDs = compactPositiveUintList(tlsIDs)
+	if len(tlsIDs) == 0 {
+		return false, nil
+	}
+
+	var inboundCount int64
+	if err := database.GetDB().Model(model.MihomoInbound{}).Where("tls_id IN ?", tlsIDs).Count(&inboundCount).Error; err != nil {
+		return false, err
+	}
+	return inboundCount > 0, nil
 }
 
 func syncTLSBindingsForCertificateRecordUnlocked(recordID uint, hostname string, force bool, queueCoreRestart bool) (bool, error) {
@@ -140,6 +192,9 @@ func syncTLSBindingsForCertificateRecordUnlocked(recordID uint, hostname string,
 	}); err != nil {
 		return false, err
 	}
+	if defaultChanged || mihomoChanged {
+		InvalidateSubscriptionTLSPathWatchBindings()
+	}
 
 	configSvc := &ConfigService{}
 	defaultBroadcast := defaultChanged || (force && len(defaultTLSIDs) > 0)
@@ -183,7 +238,9 @@ func syncTLSBindingsForCertificateRecordUnlocked(recordID uint, hostname string,
 		}
 	}
 	if defaultBroadcast || mihomoBroadcast {
-		markLastUpdate(time.Now().Unix())
+		// Certificate inventory changes can update shared managed subscription
+		// rows through either core, so both page families must reload together.
+		markBothLastUpdates(time.Now().Unix())
 	}
 
 	return defaultBroadcast || mihomoBroadcast, nil

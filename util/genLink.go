@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 
@@ -104,6 +105,10 @@ func LinkGenerator(clientConfig json.RawMessage, i *model.Inbound, hostname stri
 }
 
 func prepareTls(t *model.Tls) map[string]interface{} {
+	if t == nil {
+		return nil
+	}
+
 	var iTls, oTls map[string]interface{}
 	if err := json.Unmarshal(t.Client, &oTls); err != nil {
 		return nil
@@ -111,15 +116,33 @@ func prepareTls(t *model.Tls) map[string]interface{} {
 	if err := json.Unmarshal(t.Server, &iTls); err != nil {
 		return nil
 	}
+	if iTls == nil {
+		iTls = map[string]interface{}{}
+	}
+	if oTls == nil {
+		oTls = map[string]interface{}{}
+	}
 
 	for k, v := range iTls {
 		switch k {
 		case "enabled", "server_name", "alpn":
 			oTls[k] = v
+		case "shadow_tls", "res_tls", "jls_config":
+			// Mihomo wrapper modes are needed by Shadowsocks plugin links. Other
+			// URI builders simply ignore these internal fields.
+			oTls[k] = v
 		case "reality":
-			reality := v.(map[string]interface{})
-			clientReality := oTls["reality"].(map[string]interface{})
-			clientReality["enabled"] = reality["enabled"]
+			reality, ok := v.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			clientReality, ok := oTls["reality"].(map[string]interface{})
+			if !ok || clientReality == nil {
+				clientReality = map[string]interface{}{}
+			}
+			if enabled, exists := reality["enabled"]; exists {
+				clientReality["enabled"] = enabled
+			}
 			if shortIDs, hasSIds := reality["short_id"].([]interface{}); hasSIds && len(shortIDs) > 0 {
 				clientReality["short_id"] = shortIDs[common.RandomInt(len(shortIDs))]
 			}
@@ -144,8 +167,8 @@ func socksLink(userConfig map[string]interface{}, addrs []map[string]interface{}
 
 func httpLink(userConfig map[string]interface{}, addrs []map[string]interface{}) []string {
 	var links []string
-	protocol := "http"
 	for _, addr := range addrs {
+		protocol := "http"
 		if addr["tls"] != nil {
 			protocol = "https"
 		}
@@ -173,14 +196,122 @@ func shadowsocksLink(
 
 	var links []string
 	for _, addr := range addrs {
+		var params []LinkParam
+		if tls, ok := addr["tls"].(map[string]interface{}); ok {
+			if plugin := mihomoShadowsocksPluginLink(tls); plugin != "" {
+				params = append(params, LinkParam{"plugin", plugin})
+			}
+		}
 		port, _ := addr["server_port"].(float64)
 		hostPort := FormatSubscriptionLinkHostPort(firstStringFromInterface(addr["server"]), int(port))
 		if hostPort == "" {
 			continue
 		}
-		links = append(links, fmt.Sprintf("%s@%s#%s", uriBase, hostPort, addr["remark"].(string)))
+		uri := fmt.Sprintf("%s@%s", uriBase, hostPort)
+		remark, _ := addr["remark"].(string)
+		links = append(links, addParams(uri, params, remark))
 	}
 	return links
+}
+
+func mihomoShadowsocksPluginLink(tls map[string]interface{}) string {
+	if tls == nil {
+		return ""
+	}
+	var plugin string
+	var opts []string
+	var wrapper map[string]interface{}
+	if value, ok := tls["shadow_tls"].(map[string]interface{}); ok && value != nil {
+		plugin, wrapper = "shadow-tls", value
+		appendMihomoPluginOption(&opts, "version", tlsMapString(tls["shadow_tls_opts"], "version"))
+		appendMihomoPluginOption(&opts, "password", tlsMapString(tls["shadow_tls_opts"], "password"))
+	} else if value, ok := tls["res_tls"].(map[string]interface{}); ok && value != nil {
+		plugin, wrapper = "restls", value
+		appendMihomoPluginOption(&opts, "password", tlsMapString(tls["restls_opts"], "password"))
+		appendMihomoPluginOption(&opts, "version-hint", tlsMapString(tls["restls_opts"], "version_hint"))
+		script := tlsMapString(tls["restls_opts"], "restls_script")
+		if script == "" {
+			script = tlsMapString(wrapper, "restls_script")
+		}
+		appendMihomoPluginOption(&opts, "restls-script", script)
+	} else if value, ok := tls["jls_config"].(map[string]interface{}); ok && value != nil {
+		plugin, wrapper = "jls", value
+		appendMihomoPluginOption(&opts, "username", tlsMapString(tls["jls_opts"], "username"))
+		appendMihomoPluginOption(&opts, "password", tlsMapString(tls["jls_opts"], "password"))
+		if alpn := tlsStringList(wrapper["alpn"]); len(alpn) > 0 {
+			appendMihomoPluginOption(&opts, "alpn", strings.Join(alpn, ","))
+		}
+	}
+	if plugin == "" {
+		return ""
+	}
+	host := firstStringFromInterface(tls["server_name"])
+	if host == "" && wrapper != nil {
+		host = firstStringFromInterface(wrapper["sni"])
+		if host == "" {
+			host = mihomoWrapperHostForLink(firstStringFromInterface(wrapper["dest"]))
+		}
+		if host == "" {
+			if handshake, ok := wrapper["handshake"].(map[string]interface{}); ok {
+				host = mihomoWrapperHostForLink(firstStringFromInterface(handshake["dest"]))
+			}
+		}
+	}
+	appendMihomoPluginOption(&opts, "host", host)
+	return plugin + ";" + strings.Join(opts, ";")
+}
+
+func appendMihomoPluginOption(opts *[]string, key, value string) {
+	if opts == nil || strings.TrimSpace(key) == "" || strings.TrimSpace(value) == "" {
+		return
+	}
+	*opts = append(*opts, key+"="+value)
+}
+
+func tlsMapString(raw interface{}, key string) string {
+	value, ok := raw.(map[string]interface{})
+	if !ok || value == nil {
+		return ""
+	}
+	return firstStringFromInterface(value[key])
+}
+
+func tlsStringList(raw interface{}) []string {
+	var result []string
+	switch values := raw.(type) {
+	case []string:
+		for _, value := range values {
+			if value = strings.TrimSpace(value); value != "" {
+				result = append(result, value)
+			}
+		}
+	case []interface{}:
+		for _, value := range values {
+			if text := strings.TrimSpace(firstStringFromInterface(value)); text != "" {
+				result = append(result, text)
+			}
+		}
+	}
+	return result
+}
+
+func mihomoWrapperHostForLink(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		return strings.Trim(host, "[]")
+	}
+	if strings.HasPrefix(value, "[") {
+		if end := strings.Index(value, "]"); end > 1 {
+			return value[1:end]
+		}
+	}
+	if strings.Count(value, ":") == 1 {
+		return strings.TrimSpace(strings.SplitN(value, ":", 2)[0])
+	}
+	return value
 }
 
 func naiveLink(
@@ -704,10 +835,12 @@ func vlessLink(
 		if encryption := firstLinkString(settings, "encryption"); encryption != "" {
 			params = append(params, LinkParam{"encryption", encryption})
 		}
-		if tls, ok := addr["tls"].(map[string]interface{}); ok && tls["enabled"].(bool) {
-			getTlsParams(&params, tls, "allowInsecure")
-			if flow, ok := userConfig["flow"].(string); ok {
-				params = append(params, LinkParam{"flow", flow})
+		if tls, ok := addr["tls"].(map[string]interface{}); ok {
+			if enabled, _ := tls["enabled"].(bool); enabled {
+				getTlsParams(&params, tls, "allowInsecure")
+				if flow, ok := userConfig["flow"].(string); ok {
+					params = append(params, LinkParam{"flow", flow})
+				}
 			}
 		}
 		port, _ := addr["server_port"].(float64)
@@ -734,8 +867,10 @@ func trojanLink(
 	for _, addr := range addrs {
 		params := make([]LinkParam, len(baseParams))
 		copy(params, baseParams)
-		if tls, ok := addr["tls"].(map[string]interface{}); ok && tls["enabled"].(bool) {
-			getTlsParams(&params, tls, "allowInsecure")
+		if tls, ok := addr["tls"].(map[string]interface{}); ok {
+			if enabled, _ := tls["enabled"].(bool); enabled {
+				getTlsParams(&params, tls, "allowInsecure")
+			}
 		}
 		port, _ := addr["server_port"].(float64)
 		hostPort := FormatSubscriptionLinkHostPort(firstStringFromInterface(addr["server"]), int(port))
@@ -816,7 +951,12 @@ func vmessLink(
 }
 
 func populateVmessTlsParams(obj map[string]interface{}, tlsConfig interface{}) {
-	if tlsMap, ok := tlsConfig.(map[string]interface{}); ok && tlsMap["enabled"].(bool) {
+	if tlsMap, ok := tlsConfig.(map[string]interface{}); ok {
+		enabled, _ := tlsMap["enabled"].(bool)
+		if !enabled {
+			obj["tls"] = "none"
+			return
+		}
 		obj["tls"] = "tls"
 		var tlsParams []LinkParam
 		getTlsParams(&tlsParams, tlsMap, "allowInsecure")
@@ -834,9 +974,9 @@ func populateVmessTlsParams(obj map[string]interface{}, tlsConfig interface{}) {
 				obj["alpn"] = p.Value
 			}
 		}
-	} else {
-		obj["tls"] = "none"
+		return
 	}
+	obj["tls"] = "none"
 }
 
 func toBase64(d []byte) string {
@@ -936,15 +1076,20 @@ func getTransportParams(t interface{}) []LinkParam {
 }
 
 func getTlsParams(params *[]LinkParam, tls map[string]interface{}, insecureKey string) {
-	if reality, ok := tls["reality"].(map[string]interface{}); ok && reality["enabled"].(bool) {
-		*params = append(*params, LinkParam{"security", "reality"})
-		if pbk, ok := reality["public_key"].(string); ok {
-			*params = append(*params, LinkParam{"pbk", pbk})
+	realityEnabled := false
+	if reality, ok := tls["reality"].(map[string]interface{}); ok {
+		if enabled, _ := reality["enabled"].(bool); enabled {
+			realityEnabled = true
+			*params = append(*params, LinkParam{"security", "reality"})
+			if pbk, ok := reality["public_key"].(string); ok {
+				*params = append(*params, LinkParam{"pbk", pbk})
+			}
+			if sid, ok := reality["short_id"].(string); ok {
+				*params = append(*params, LinkParam{"sid", sid})
+			}
 		}
-		if sid, ok := reality["short_id"].(string); ok {
-			*params = append(*params, LinkParam{"sid", sid})
-		}
-	} else {
+	}
+	if !realityEnabled {
 		*params = append(*params, LinkParam{"security", "tls"})
 		if insecure, ok := tls["insecure"].(bool); ok && insecure {
 			*params = append(*params, LinkParam{insecureKey, "1"})
@@ -961,11 +1106,28 @@ func getTlsParams(params *[]LinkParam, tls map[string]interface{}, insecureKey s
 	if sni, ok := tls["server_name"].(string); ok {
 		*params = append(*params, LinkParam{"sni", sni})
 	}
-	if alpn, ok := tls["alpn"].([]interface{}); ok {
-		alpnList := make([]string, len(alpn))
-		for i, v := range alpn {
-			alpnList[i] = v.(string)
+	var alpnList []string
+	switch alpn := tls["alpn"].(type) {
+	case []interface{}:
+		for _, rawValue := range alpn {
+			value, ok := rawValue.(string)
+			if !ok {
+				continue
+			}
+			value = strings.TrimSpace(value)
+			if value != "" {
+				alpnList = append(alpnList, value)
+			}
 		}
+	case []string:
+		for _, rawValue := range alpn {
+			value := strings.TrimSpace(rawValue)
+			if value != "" {
+				alpnList = append(alpnList, value)
+			}
+		}
+	}
+	if len(alpnList) > 0 {
 		*params = append(*params, LinkParam{"alpn", strings.Join(alpnList, ",")})
 	}
 }

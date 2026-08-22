@@ -1,6 +1,8 @@
 package sub
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/alireza0/s-ui/database/model"
@@ -8,6 +10,7 @@ import (
 	"github.com/alireza0/s-ui/service"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/sync/singleflight"
 )
 
 type SubHandler struct {
@@ -16,6 +19,63 @@ type SubHandler struct {
 	JsonService
 	ClashService
 	SubManagerSubService
+}
+
+const (
+	// Rendering parses and merges a full extension and marshals YAML/JSON. Keep
+	// the render pool below the request pool so bursts of distinct cache keys
+	// cannot create a large simultaneous heap peak.
+	subscriptionRenderMaxConcurrent  = 8
+	subscriptionRequestMaxConcurrent = 64
+)
+
+var (
+	subscriptionRequestSlots  = make(chan struct{}, subscriptionRequestMaxConcurrent)
+	subscriptionRenderSlots   = make(chan struct{}, subscriptionRenderMaxConcurrent)
+	subscriptionRenderFlight  singleflight.Group
+	errSubscriptionRenderBusy = errors.New("subscription renderer is busy")
+)
+
+type clientSubscriptionRenderResult struct {
+	content      string
+	headers      []string
+	showUserInfo bool
+}
+
+func tryAcquireSubscriptionRenderSlot() bool {
+	select {
+	case subscriptionRenderSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseSubscriptionRenderSlot() {
+	<-subscriptionRenderSlots
+}
+
+func tryAcquireSubscriptionRequestSlot() bool {
+	select {
+	case subscriptionRequestSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseSubscriptionRequestSlot() {
+	<-subscriptionRequestSlots
+}
+
+func writeSubscriptionRenderError(c *gin.Context, err error) {
+	if errors.Is(err, errSubscriptionRenderBusy) {
+		c.Header("Retry-After", "1")
+		c.String(429, "Too Many Requests")
+		return
+	}
+	logger.Error(err)
+	c.String(400, "Error!")
 }
 
 func NewSubHandler(g *gin.RouterGroup) {
@@ -47,47 +107,76 @@ func (s *SubHandler) mihomoSubs(c *gin.Context) {
 }
 
 func (s *SubHandler) renderClientSub(c *gin.Context, mihomo bool) {
-	var headers []string
-	var result *string
-	var err error
 	subId := resolveClientSubscriptionID(c)
 	format, isFormat := c.GetQuery("format")
-	if isFormat {
+	if isFormat && format != "json" && format != "clash" {
+		c.String(400, "Error!")
+		return
+	}
+	if !tryAcquireSubscriptionRequestSlot() {
+		writeSubscriptionRenderError(c, errSubscriptionRenderBusy)
+		return
+	}
+	defer releaseSubscriptionRequestSlot()
+
+	settingsGeneration := service.SubscriptionRuntimeSettingsGeneration()
+	key := fmt.Sprintf("client|mihomo=%t|id=%s|format=%s|settings=%d", mihomo, subId, format, settingsGeneration)
+	raw, err, _ := subscriptionRenderFlight.Do(key, func() (interface{}, error) {
+		if !tryAcquireSubscriptionRenderSlot() {
+			return nil, errSubscriptionRenderBusy
+		}
+		defer releaseSubscriptionRenderSlot()
+
+		showUserInfo, showInfoErr := s.SettingService.GetSubShowInfo()
+		if showInfoErr != nil {
+			return nil, showInfoErr
+		}
+		var result *string
+		var headers []string
+		var renderErr error
 		switch format {
 		case "json":
 			if mihomo {
-				result, headers, err = s.JsonService.GetMihomoJson(subId, format)
+				result, headers, renderErr = s.JsonService.GetMihomoJson(subId, format)
 			} else {
-				result, headers, err = s.JsonService.GetJson(subId, format)
+				result, headers, renderErr = s.JsonService.GetJson(subId, format)
 			}
 		case "clash":
 			if mihomo {
-				result, headers, err = s.ClashService.GetMihomoClash(subId)
+				result, headers, renderErr = s.ClashService.GetMihomoClash(subId)
 			} else {
-				result, headers, err = s.ClashService.GetClash(subId)
+				result, headers, renderErr = s.ClashService.GetClash(subId)
+			}
+		default:
+			if mihomo {
+				result, headers, renderErr = s.SubService.GetMihomoSubs(subId)
+			} else {
+				result, headers, renderErr = s.SubService.GetSubs(subId)
 			}
 		}
-		if err != nil || result == nil {
-			logger.Error(err)
-			c.String(400, "Error!")
-			return
+		if renderErr != nil {
+			return nil, renderErr
 		}
-	} else {
-		if mihomo {
-			result, headers, err = s.SubService.GetMihomoSubs(subId)
-		} else {
-			result, headers, err = s.SubService.GetSubs(subId)
+		if result == nil {
+			return nil, fmt.Errorf("subscription renderer returned no content")
 		}
-		if err != nil || result == nil {
-			logger.Error(err)
-			c.String(400, "Error!")
-			return
-		}
+		return clientSubscriptionRenderResult{content: *result, headers: append([]string(nil), headers...), showUserInfo: showUserInfo}, nil
+	})
+	if err != nil {
+		writeSubscriptionRenderError(c, err)
+		return
+	}
+	response, ok := raw.(clientSubscriptionRenderResult)
+	if !ok {
+		logger.Error("invalid subscription render response")
+		c.String(500, "Error!")
+		return
+	}
+	if response.showUserInfo {
+		s.addHeaders(c, response.headers)
 	}
 
-	s.addHeaders(c, headers)
-
-	c.String(200, *result)
+	c.String(200, response.content)
 }
 
 func (s *SubHandler) subHeaders(c *gin.Context) {
@@ -115,8 +204,10 @@ func (s *SubHandler) renderClientSubHeaders(c *gin.Context, mihomo bool) {
 		return
 	}
 
-	headers := s.SubService.getClientHeaders(client)
-	s.addHeaders(c, headers)
+	if showUserInfo, showInfoErr := s.SettingService.GetSubShowInfo(); showInfoErr == nil && showUserInfo {
+		headers := s.SubService.getClientHeaders(client)
+		s.addHeaders(c, headers)
+	}
 
 	c.Status(200)
 }
@@ -128,26 +219,49 @@ func (s *SubHandler) subManagerSubs(c *gin.Context) {
 	}
 	format, _ := c.GetQuery("format")
 
-	var result *string
-	var err error
-
-	switch format {
-	case "json":
-		result, err = s.SubManagerSubService.GetSubManagerJson(tag)
-	case "clash":
-		result, err = s.SubManagerSubService.GetSubManagerClash(tag)
-	default:
-		// 默认返回 JSON 格式
-		result, err = s.SubManagerSubService.GetSubManagerJson(tag)
-	}
-
-	if err != nil || result == nil {
-		logger.Error(err)
+	if format != "" && format != "json" && format != "clash" {
 		c.String(400, "Error!")
 		return
 	}
+	if !tryAcquireSubscriptionRequestSlot() {
+		writeSubscriptionRenderError(c, errSubscriptionRenderBusy)
+		return
+	}
+	defer releaseSubscriptionRequestSlot()
 
-	c.String(200, *result)
+	key := fmt.Sprintf("sub-manager|tag=%s|format=%s|settings=%d", tag, format, service.SubscriptionRuntimeSettingsGeneration())
+	raw, err, _ := subscriptionRenderFlight.Do(key, func() (interface{}, error) {
+		if !tryAcquireSubscriptionRenderSlot() {
+			return nil, errSubscriptionRenderBusy
+		}
+		defer releaseSubscriptionRenderSlot()
+
+		var result *string
+		var renderErr error
+		if format == "clash" {
+			result, renderErr = s.SubManagerSubService.GetSubManagerClash(tag)
+		} else {
+			result, renderErr = s.SubManagerSubService.GetSubManagerJson(tag)
+		}
+		if renderErr != nil {
+			return nil, renderErr
+		}
+		if result == nil {
+			return nil, fmt.Errorf("subscription renderer returned no content")
+		}
+		return clientSubscriptionRenderResult{content: *result}, nil
+	})
+	if err != nil {
+		writeSubscriptionRenderError(c, err)
+		return
+	}
+	result, ok := raw.(clientSubscriptionRenderResult)
+	if !ok {
+		logger.Error("invalid subscription render response")
+		c.String(500, "Error!")
+		return
+	}
+	c.String(200, result.content)
 }
 
 func (s *SubHandler) subGroupSubs(c *gin.Context) {
@@ -157,29 +271,56 @@ func (s *SubHandler) subGroupSubs(c *gin.Context) {
 	}
 	format, _ := c.GetQuery("format")
 
-	var result *string
-	var err error
-
-	switch format {
-	case "json":
-		result, err = s.SubManagerSubService.GetSubGroupJson(groupName)
-	case "clash":
-		result, err = s.SubManagerSubService.GetSubGroupClash(groupName)
-	default:
-		// 默认返回 JSON 格式
-		result, err = s.SubManagerSubService.GetSubGroupJson(groupName)
-	}
-
-	if err != nil || result == nil {
-		logger.Error(err)
+	if format != "" && format != "json" && format != "clash" {
 		c.String(400, "Error!")
 		return
 	}
+	if !tryAcquireSubscriptionRequestSlot() {
+		writeSubscriptionRenderError(c, errSubscriptionRenderBusy)
+		return
+	}
+	defer releaseSubscriptionRequestSlot()
 
-	c.String(200, *result)
+	key := fmt.Sprintf("sub-group|name=%s|format=%s|settings=%d", groupName, format, service.SubscriptionRuntimeSettingsGeneration())
+	raw, err, _ := subscriptionRenderFlight.Do(key, func() (interface{}, error) {
+		if !tryAcquireSubscriptionRenderSlot() {
+			return nil, errSubscriptionRenderBusy
+		}
+		defer releaseSubscriptionRenderSlot()
+
+		var result *string
+		var renderErr error
+		if format == "clash" {
+			result, renderErr = s.SubManagerSubService.GetSubGroupClash(groupName)
+		} else {
+			result, renderErr = s.SubManagerSubService.GetSubGroupJson(groupName)
+		}
+		if renderErr != nil {
+			return nil, renderErr
+		}
+		if result == nil {
+			return nil, fmt.Errorf("subscription renderer returned no content")
+		}
+		return clientSubscriptionRenderResult{content: *result}, nil
+	})
+	if err != nil {
+		writeSubscriptionRenderError(c, err)
+		return
+	}
+	result, ok := raw.(clientSubscriptionRenderResult)
+	if !ok {
+		logger.Error("invalid subscription render response")
+		c.String(500, "Error!")
+		return
+	}
+	c.String(200, result.content)
 }
 
 func (s *SubHandler) addHeaders(c *gin.Context, headers []string) {
+	if len(headers) < 3 {
+		logger.Error("subscription renderer returned incomplete client headers")
+		return
+	}
 	c.Writer.Header().Set("Subscription-Userinfo", headers[0])
 	c.Writer.Header().Set("Profile-Update-Interval", headers[1])
 	c.Writer.Header().Set("Profile-Title", headers[2])

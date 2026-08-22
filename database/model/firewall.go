@@ -43,6 +43,12 @@ type FirewallRule struct {
 	// SourceSpec keeps the normalized source IP/CIDR expression.
 	SourceSpec string `json:"sourceSpec" gorm:"type:text"`
 
+	// SourceMode controls how SourceSpec is applied for managed ingress rules:
+	// empty means no source filter, "block" drops the listed sources while
+	// allowing other sources for the same rule, and "allow" only allows the
+	// listed sources for the same rule.
+	SourceMode string `json:"sourceMode"`
+
 	// Observed* fields are only used when Origin=external so the panel can
 	// track and optionally remove the original nftables rule. These rows are
 	// not auto-applied into the managed allowlist.

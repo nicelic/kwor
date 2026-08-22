@@ -65,6 +65,23 @@ type SettingsRevisionConflictError struct {
 	CurrentRevision uint64
 }
 
+var settingsSnapshotExcludedKeys = []string{
+	"secret",
+	"config",
+	"mihomo_config",
+	"version",
+	"trafficOverviewState",
+	"trafficOverviewSnapshot",
+	"trafficOverviewCapState",
+	"trafficOverviewPauseState",
+	"trafficOverviewVnstatManifest",
+	certificateCoreRestartStateSettingKey,
+	certificateAutoRenewBatchStateSettingKey,
+	systemLinuxDNSContentKey,
+	systemLinuxDNSPathKey,
+	systemLinuxDNSNameServersInputKey,
+}
+
 func (e *SettingsRevisionConflictError) Error() string {
 	if e == nil {
 		return "settings revision conflict"
@@ -117,18 +134,20 @@ func (s *SettingService) GetSettingsSnapshot(includeExtensions ...bool) (*Settin
 		if err != nil {
 			return err
 		}
+		excludedKeys := append([]string(nil), settingsSnapshotExcludedKeys...)
+		if !includeExtensionValues {
+			excludedKeys = append(excludedKeys, "subJsonExt", "subClashExt")
+		}
 		rows := make([]model.Setting, 0)
-		if err := tx.Order("id ASC").Find(&rows).Error; err != nil {
+		if err := tx.Select("key", "value").
+			Where("key NOT IN ?", excludedKeys).
+			Order("id ASC").
+			Find(&rows).Error; err != nil {
 			return err
 		}
 		values := make(map[string]string, len(rows))
 		for _, row := range rows {
 			values[row.Key] = row.Value
-		}
-		removePrivateSettingsSnapshotValues(values)
-		if !includeExtensionValues {
-			delete(values, "subJsonExt")
-			delete(values, "subClashExt")
 		}
 		snapshot.Revision = revision
 		snapshot.Values = values
@@ -191,27 +210,6 @@ func (s *SettingService) GetSubscriptionSettingsSnapshot(kind string) (*Subscrip
 	return snapshot, nil
 }
 
-func removePrivateSettingsSnapshotValues(values map[string]string) {
-	for _, key := range []string{
-		"secret",
-		"config",
-		"mihomo_config",
-		"version",
-		"trafficOverviewState",
-		"trafficOverviewSnapshot",
-		"trafficOverviewCapState",
-		"trafficOverviewPauseState",
-		"trafficOverviewVnstatManifest",
-		certificateCoreRestartStateSettingKey,
-		certificateAutoRenewBatchStateSettingKey,
-		systemLinuxDNSContentKey,
-		systemLinuxDNSPathKey,
-		systemLinuxDNSNameServersInputKey,
-	} {
-		delete(values, key)
-	}
-}
-
 func (s *SettingService) CurrentSettingsRevision() (uint64, error) {
 	db := database.GetDB()
 	if db == nil {
@@ -270,6 +268,11 @@ func (s *SettingService) ApplySettingsPatch(request SettingsPatchRequest, actor 
 	normalized, err := normalizeSettingsPatchChanges(request.Changes)
 	if err != nil {
 		return nil, err
+	}
+	if normalized["trafficAge"] == "0" {
+		if flushErr := FlushTrafficRuntimeJournal(); flushErr != nil {
+			return nil, common.NewErrorf("清空历史流量前刷新运行态账本失败: %v", flushErr)
+		}
 	}
 	result := &SettingsPatchResult{}
 	err = db.Transaction(func(tx *gorm.DB) error {
@@ -362,11 +365,17 @@ func (s *SettingService) ApplySettingsPatch(request SettingsPatchRequest, actor 
 	}
 	if len(result.ChangedKeys) > 0 || result.SystemTimeChanged {
 		markLastUpdate(time.Now().Unix())
+		if hasSettingsKey(result.ChangedKeys, "sessionMaxAge") {
+			InvalidateSessionMaxAgeCache()
+		}
+		if hasSettingsKey(result.ChangedKeys, "trafficAge") {
+			InvalidateTrafficAgeCache()
+		}
 		if hasSettingsKey(result.ChangedKeys, "timeLocation") {
 			InvalidatePanelTimeLocationCache()
 		}
 		for _, key := range result.ChangedKeys {
-			if isSubscriptionRuntimeSettingsKey(key) {
+			if isSubscriptionRenderSettingKey(key) {
 				invalidateSubscriptionRuntimeSettings()
 				break
 			}
@@ -599,6 +608,11 @@ func (s *SettingService) saveEditableSettingDirect(key string, value string) err
 	if err != nil {
 		return err
 	}
+	if key == "trafficAge" && normalized == "0" {
+		if flushErr := FlushTrafficRuntimeJournal(); flushErr != nil {
+			return common.NewErrorf("清空历史流量前刷新运行态账本失败: %v", flushErr)
+		}
+	}
 	db := database.GetDB()
 	if db == nil {
 		return common.NewError("database is not ready")
@@ -647,6 +661,12 @@ func (s *SettingService) saveEditableSettingDirect(key string, value string) err
 	}
 	if changed {
 		markLastUpdate(time.Now().Unix())
+		if key == "sessionMaxAge" {
+			InvalidateSessionMaxAgeCache()
+		}
+		if key == "trafficAge" {
+			InvalidateTrafficAgeCache()
+		}
 		if key == "timeLocation" {
 			InvalidatePanelTimeLocationCache()
 		}
@@ -684,6 +704,9 @@ func (s *ConfigService) ApplySettingsPatchPostCommit(result *SettingsPatchResult
 	if hasSettingsKey(result.ChangedKeys, "timeLocation") {
 		if err := ReloadPanelTimeSchedule(); err != nil {
 			warnings = append(warnings, fmt.Sprintf("时区计划重建失败: %v", err))
+		}
+		if err := ReschedulePendingCoreAutoChecksForPanelTimeZone(); err != nil {
+			warnings = append(warnings, fmt.Sprintf("内核首次检查计划重排失败: %v", err))
 		}
 	}
 	if result.StatsCleared {

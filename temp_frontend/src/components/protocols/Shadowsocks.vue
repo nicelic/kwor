@@ -59,6 +59,9 @@ export default {
       this.$props.data.managed = false
     }
   },
+  mounted() {
+    this.sanitizeInboundPassword()
+  },
   data() {
     return {
       ssMethods: [
@@ -75,6 +78,11 @@ export default {
     }
   },
   methods: {
+    sanitizeInboundPassword() {
+      if (this.$props.direction === 'in' && this.$props.data?.method === 'none') {
+        delete this.$props.data.password
+      }
+    },
     changeMethod(ssMethod :string) {
       if (ssMethod.startsWith('2022')) {
         this.$props.data.password = ssMethod == "2022-blake3-aes-128-gcm" ? RandomUtil.randomShadowsocksPassword(16) : RandomUtil.randomShadowsocksPassword(32)
@@ -84,6 +92,14 @@ export default {
         this.$props.data.password = RandomUtil.randomSeq(10)
       }
     }
+  },
+  watch: {
+    data() {
+      this.sanitizeInboundPassword()
+    },
+    direction() {
+      this.sanitizeInboundPassword()
+    },
   },
   components: { Network, UoT }
 }

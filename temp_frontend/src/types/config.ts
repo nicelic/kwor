@@ -3,13 +3,6 @@ import { Outbound } from './outbounds'
 import { Dns } from './dns'
 import { Dial } from './dial'
 
-interface Log {
-  disabled?: boolean
-  level?: string
-  output?: string
-  timestamp?: boolean
-}
-
 export interface Ntp extends Dial{
   enabled?: boolean
   server: string
@@ -25,7 +18,7 @@ interface Route {
   auto_detect_interface?: boolean
   default_interface?: string
   default_mark?: number
-  default_domain_resolver: string
+  default_domain_resolver?: string
 }
 
 interface RouteRule       {
@@ -109,7 +102,6 @@ interface ClashApi {
 }
 
 export interface Config {
-  log: Log
   dns: Dns
   ntp?: Ntp
   inbounds: Inbound[]

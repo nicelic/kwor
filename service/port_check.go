@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -11,10 +12,16 @@ import (
 )
 
 const (
-	procTCP  = "/proc/net/tcp"
-	procTCP6 = "/proc/net/tcp6"
-	procUDP  = "/proc/net/udp"
-	procUDP6 = "/proc/net/udp6"
+	procTCP                 = "/proc/net/tcp"
+	procTCP6                = "/proc/net/tcp6"
+	procUDP                 = "/proc/net/udp"
+	procUDP6                = "/proc/net/udp6"
+	maxPortCheckSinglePorts = 128
+	maxPortCheckRangeItems  = 32
+	maxPortCheckRangeBytes  = 512
+	maxPortCheckRangeParts  = 32
+	maxPortCheckPortsPerSet = 4096
+	maxPortCheckTotalPorts  = 8192
 )
 
 // PortCheckService reads /proc socket tables and reports current port occupancy.
@@ -68,6 +75,9 @@ type portSpan struct {
 }
 
 func (s *PortCheckService) Check(req PortCheckRequest) (*PortCheckResponse, error) {
+	if err := ValidatePortCheckRequest(req); err != nil {
+		return nil, err
+	}
 	resp := &PortCheckResponse{
 		Supported: IsSystemPlatformLinux(),
 		CheckedAt: time.Now().Unix(),
@@ -125,6 +135,48 @@ func (s *PortCheckService) Check(req PortCheckRequest) (*PortCheckResponse, erro
 	return resp, nil
 }
 
+// ValidatePortCheckRequest keeps the occupancy endpoint bounded because it is
+// invoked from a periodic browser monitor and expands ranges while checking
+// Linux socket snapshots.
+func ValidatePortCheckRequest(req PortCheckRequest) error {
+	if len(req.SinglePorts) > maxPortCheckSinglePorts {
+		return fmt.Errorf("too many single ports (max %d)", maxPortCheckSinglePorts)
+	}
+	if len(req.UDPRanges) > maxPortCheckRangeItems {
+		return fmt.Errorf("too many UDP ranges (max %d)", maxPortCheckRangeItems)
+	}
+
+	totalPorts := 0
+	for _, item := range req.UDPRanges {
+		if len([]byte(item.ID)) > 128 || len([]byte(item.Tag)) > 256 {
+			return fmt.Errorf("port occupancy range identifier is too long")
+		}
+		input := strings.TrimSpace(item.Range)
+		if len([]byte(input)) > maxPortCheckRangeBytes {
+			return fmt.Errorf("UDP range is too long (max %d bytes)", maxPortCheckRangeBytes)
+		}
+		ranges, _, err := parseStrictPortRanges(input)
+		if err != nil {
+			// Keep the existing structured invalid-range response. Invalid input is
+			// cheap to parse and must not turn the periodic monitor into a silent
+			// transport failure.
+			continue
+		}
+		if len(ranges) > maxPortCheckRangeParts {
+			return fmt.Errorf("UDP range has too many segments (max %d)", maxPortCheckRangeParts)
+		}
+		count := countPorts(ranges)
+		if count > maxPortCheckPortsPerSet {
+			return fmt.Errorf("UDP range contains too many ports (max %d)", maxPortCheckPortsPerSet)
+		}
+		totalPorts += count
+		if totalPorts > maxPortCheckTotalPorts {
+			return fmt.Errorf("port occupancy request contains too many ports (max %d)", maxPortCheckTotalPorts)
+		}
+	}
+	return nil
+}
+
 func buildUnsupportedSingles(ports []int) []SinglePortStatus {
 	out := make([]SinglePortStatus, 0, len(ports))
 	for _, port := range ports {
@@ -177,14 +229,23 @@ func readSocketSnapshot() (*socketSnapshot, error) {
 }
 
 func readProcPorts(path string, ports map[int]struct{}, tcpListenOnly bool) error {
-	data, err := readFileFresh(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 
-	lines := strings.Split(string(data), "\n")
-	for i := 1; i < len(lines); i++ { // skip header
-		line := strings.TrimSpace(lines[i])
+	// Socket tables can be large on busy hosts. Scan them line by line so the
+	// page-level monitor does not allocate and copy each whole /proc snapshot.
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 4096), 128*1024)
+	firstLine := true
+	for scanner.Scan() {
+		if firstLine {
+			firstLine = false
+			continue
+		}
+		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
@@ -201,9 +262,11 @@ func readProcPorts(path string, ports map[int]struct{}, tcpListenOnly bool) erro
 		}
 		ports[port] = struct{}{}
 	}
-	return nil
+	return scanner.Err()
 }
 
+// readFileFresh is shared with small sysctl readers. Large socket tables use
+// readProcPorts above so they are never materialized as one byte slice.
 func readFileFresh(path string) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {

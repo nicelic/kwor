@@ -282,24 +282,18 @@ func sudokuToBool(raw interface{}) (bool, bool) {
 }
 
 func sudokuToInt(raw interface{}) (int, bool) {
-	switch value := raw.(type) {
-	case int:
+	if value, ok := positiveIntFromAny(raw); ok {
 		return value, true
-	case int32:
-		return int(value), true
-	case int64:
-		return int(value), true
-	case float32:
-		return int(value), true
-	case float64:
-		return int(value), true
+	}
+
+	switch value := raw.(type) {
 	case string:
 		normalized := UnquoteSudokuString(value)
 		if normalized == "" {
 			return 0, false
 		}
 		number, err := strconv.Atoi(normalized)
-		if err == nil {
+		if err == nil && number > 0 {
 			return number, true
 		}
 	}

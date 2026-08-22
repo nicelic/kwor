@@ -1,6 +1,9 @@
 package util
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestShadowQUICJLSUpstreamAddrValidation(t *testing.T) {
 	valid := []string{
@@ -14,10 +17,25 @@ func TestShadowQUICJLSUpstreamAddrValidation(t *testing.T) {
 		}
 	}
 
-	invalid := []string{"", "www.example.com", "2001:db8::1:443", "[2001:db8::1]", "[not-an-ip]:443", "host:+443", "host:0", "host:65536"}
+	invalid := []string{"", "2001:db8::1:443", "[not-an-ip]:443", "host:+443", "host:0", "host:65536"}
 	for _, value := range invalid {
 		if err := ValidateMihomoShadowQUICJLSUpstreamAddr(value); err == nil {
 			t.Fatalf("expected %q to be invalid", value)
+		}
+	}
+}
+
+func TestShadowQUICJLSUpstreamAddrNormalization(t *testing.T) {
+	tests := []struct{ input, addr, host string }{
+		{"www.example.com", "www.example.com:443", "www.example.com"},
+		{"1.1.1.1", "1.1.1.1:443", "1.1.1.1"},
+		{"[2001:db8::1]", "[2001:db8::1]:443", "2001:db8::1"},
+		{"www.example.com:8808", "www.example.com:8808", "www.example.com"},
+	}
+	for _, test := range tests {
+		addr, host, err := NormalizeMihomoShadowQUICJLSUpstreamAddr(test.input)
+		if err != nil || addr != test.addr || host != test.host {
+			t.Fatalf("normalize %q = %q, %q, %v", test.input, addr, host, err)
 		}
 	}
 }
@@ -110,6 +128,58 @@ func TestShadowQUICOutboundSanitizeAndClashBuild(t *testing.T) {
 	}
 }
 
+func TestShadowQUICOutboundEmptyOptionalFieldsAreOmitted(t *testing.T) {
+	outbound := map[string]interface{}{
+		"type":                    "shadowquic",
+		"tag":                     "sq-empty-options",
+		"server":                  "edge.example.com",
+		"server_port":             10443,
+		"username":                "alice",
+		"password":                "secret",
+		"sni":                     "",
+		"alpn":                    []interface{}{},
+		"quic_versions":           []interface{}{},
+		"zero_rtt":                "",
+		"keep_alive_interval":     "",
+		"congestion_controller":   "",
+		"up":                      "",
+		"down":                    "",
+		"cwnd":                    "",
+		"bbr_profile":             "",
+		"max_datagram_frame_size": "",
+		"max_open_streams":        "",
+		"recv_window_conn":        "",
+		"recv_window":             "",
+		"disable_mtu_discovery":   "",
+	}
+
+	SanitizeMihomoShadowQUICOutbound(outbound)
+
+	for _, key := range []string{
+		"sni", "alpn", "quic_versions", "zero_rtt", "keep_alive_interval", "congestion_controller",
+		"up", "down", "cwnd", "bbr_profile", "max_datagram_frame_size", "max_open_streams",
+		"recv_window_conn", "recv_window", "disable_mtu_discovery",
+	} {
+		if _, exists := outbound[key]; exists {
+			t.Fatalf("empty optional field %s must not survive outbound sanitization: %#v", key, outbound)
+		}
+	}
+
+	proxy, ok := BuildMihomoShadowQUICClashProxy(outbound, "")
+	if !ok {
+		t.Fatalf("expected required ShadowQUIC outbound to remain valid: %#v", outbound)
+	}
+	for _, key := range []string{
+		"sni", "alpn", "quic-versions", "zero-rtt", "keep-alive-interval", "congestion-controller",
+		"up", "down", "cwnd", "bbr-profile", "max-datagram-frame-size", "max-open-streams",
+		"recv-window-conn", "recv-window", "disable-mtu-discovery",
+	} {
+		if _, exists := proxy[key]; exists {
+			t.Fatalf("empty optional field %s must not be generated in Clash proxy: %#v", key, proxy)
+		}
+	}
+}
+
 func TestShadowQUICProtocolNormalizers(t *testing.T) {
 	alpn := NormalizeMihomoShadowQUICALPN([]interface{}{"h3", "invalid", "h2", "http/1.1", "h3"})
 	if len(alpn) != 3 || alpn[0] != "h3" || alpn[1] != "h2" || alpn[2] != "http/1.1" {
@@ -121,6 +191,56 @@ func TestShadowQUICProtocolNormalizers(t *testing.T) {
 	}
 	if controller, ok := NormalizeMihomoShadowQUICCongestionController("BBR"); !ok || controller != "bbr" {
 		t.Fatalf("unexpected normalized congestion controller: %q, %v", controller, ok)
+	}
+	if ipVersion, ok := NormalizeMihomoClientIPVersion(" IPv6-Prefer "); !ok || ipVersion != "ipv6-prefer" {
+		t.Fatalf("unexpected normalized IP version: %q, %v", ipVersion, ok)
+	}
+	if _, ok := NormalizeMihomoClientIPVersion("unsupported"); ok {
+		t.Fatal("unsupported Mihomo IP version must be rejected")
+	}
+}
+
+func TestShadowQUICOutboundSanitizerNormalizesControlValues(t *testing.T) {
+	outbound := map[string]interface{}{
+		"type":                  "shadowquic",
+		"tag":                   "sq-controls",
+		"server":                "edge.example.com",
+		"server_port":           10443,
+		"username":              "alice",
+		"password":              "secret",
+		"quic_versions":         []interface{}{"v2", "unsupported", "v1", "v2"},
+		"congestion_controller": "BBR",
+		"mihomo_common": map[string]interface{}{
+			"udp":          false,
+			"ip_version":   " IPv4-Prefer ",
+			"routing_mark": float64(0),
+		},
+	}
+
+	SanitizeMihomoShadowQUICOutbound(outbound)
+
+	if got := fmt.Sprint(outbound["quic_versions"]); got != "[v2 v1]" {
+		t.Fatalf("unexpected normalized quic_versions: %#v", outbound["quic_versions"])
+	}
+	if got := outbound["congestion_controller"]; got != "bbr" {
+		t.Fatalf("unexpected normalized congestion_controller: %#v", got)
+	}
+	common, ok := outbound["mihomo_common"].(map[string]interface{})
+	if !ok || common["udp"] != false || common["ip_version"] != "ipv4-prefer" || common["routing_mark"] != 0 {
+		t.Fatalf("unexpected normalized common fields: %#v", outbound["mihomo_common"])
+	}
+
+	outbound["quic_versions"] = []interface{}{"unsupported"}
+	outbound["congestion_controller"] = "unsupported"
+	outbound["mihomo_common"] = map[string]interface{}{
+		"ip_version":   "unsupported",
+		"routing_mark": -1,
+	}
+	SanitizeMihomoShadowQUICOutbound(outbound)
+	for _, key := range []string{"quic_versions", "congestion_controller", "mihomo_common"} {
+		if _, exists := outbound[key]; exists {
+			t.Fatalf("invalid %s survived sanitizer: %#v", key, outbound)
+		}
 	}
 }
 

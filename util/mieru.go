@@ -185,24 +185,18 @@ func BuildMieruBindingQueryValue(binding string) string {
 }
 
 func toIntValue(raw interface{}) (int, bool) {
-	switch value := raw.(type) {
-	case int:
+	if value, ok := positiveIntFromAny(raw); ok {
 		return value, true
-	case int32:
-		return int(value), true
-	case int64:
-		return int(value), true
-	case float32:
-		return int(value), true
-	case float64:
-		return int(value), true
+	}
+
+	switch value := raw.(type) {
 	case string:
 		value = strings.TrimSpace(value)
 		if value == "" {
 			return 0, false
 		}
 		port, err := strconv.Atoi(value)
-		if err == nil {
+		if err == nil && port > 0 {
 			return port, true
 		}
 	}

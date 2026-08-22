@@ -97,3 +97,54 @@ func TestCleanupManagedSingboxRootRuntimeArtifactsKeepsSharedFiles(t *testing.T)
 		}
 	}
 }
+
+func TestCleanupStaleManagedCoreRuntimeWorkspacesRemovesOnlyOwnedNames(t *testing.T) {
+	singboxCoreDir := t.TempDir()
+	mihomoCoreDir := t.TempDir()
+
+	removedPaths := []string{
+		filepath.Join(singboxCoreDir, "extract_tmp_singbox"),
+		filepath.Join(singboxCoreDir, singboxCoreInstallStagePrefix+"new"),
+		filepath.Join(singboxCoreDir, singboxCoreInstallBackupPrefix+"old"),
+		filepath.Join(mihomoCoreDir, "extract_tmp_mihomo"),
+		filepath.Join(mihomoCoreDir, mihomoCoreInstallStagePrefix+"new"),
+		filepath.Join(mihomoCoreDir, mihomoCoreInstallBackupPrefix+"old"),
+	}
+	for _, dir := range removedPaths {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("create stale workspace %s failed: %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "partial"), []byte("temporary"), 0o600); err != nil {
+			t.Fatalf("write stale workspace file %s failed: %v", dir, err)
+		}
+	}
+
+	keptPaths := []string{
+		filepath.Join(singboxCoreDir, "sing-box"),
+		filepath.Join(singboxCoreDir, "config.json"),
+		filepath.Join(singboxCoreDir, "custom-rule-set.srs"),
+		filepath.Join(mihomoCoreDir, "mihomo"),
+		filepath.Join(mihomoCoreDir, "server.yaml"),
+		filepath.Join(mihomoCoreDir, "custom-provider.yaml"),
+	}
+	for _, filePath := range keptPaths {
+		if err := os.WriteFile(filePath, []byte("keep"), 0o600); err != nil {
+			t.Fatalf("write preserved runtime file %s failed: %v", filePath, err)
+		}
+	}
+
+	if err := cleanupStaleManagedCoreRuntimeWorkspaces(singboxCoreDir, mihomoCoreDir); err != nil {
+		t.Fatalf("cleanup stale managed Core workspaces failed: %v", err)
+	}
+
+	for _, dir := range removedPaths {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("expected stale workspace removed at %s, got err=%v", dir, err)
+		}
+	}
+	for _, filePath := range keptPaths {
+		if _, err := os.Stat(filePath); err != nil {
+			t.Fatalf("expected preserved runtime file at %s: %v", filePath, err)
+		}
+	}
+}

@@ -60,6 +60,34 @@ func TestBuildSubscriptionTLSPathDigest_ChangesWhenCertificateFileContentChanges
 	}
 }
 
+func TestDigestTLSPathFileSeparatesCertificateAndPrivateKeyValidation(t *testing.T) {
+	_, certificatePEM, err := (&ServerService{}).generateCertWithAlgorithm(
+		"cache-key.example.com",
+		"ecc256",
+		"ecc256",
+		tlsCertificateUsageServer,
+		time.Now().Add(-time.Hour),
+		time.Now().Add(24*time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("generate certificate failed: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "certificate.pem")
+	if err := os.WriteFile(path, certificatePEM, 0o600); err != nil {
+		t.Fatalf("write certificate failed: %v", err)
+	}
+
+	if _, _, issue, err := digestTLSPathFile(path, "certificate_path"); err != nil || issue != "" {
+		t.Fatalf("certificate validation failed: err=%v issue=%q", err, issue)
+	}
+	if _, _, issue, err := digestTLSPathFile(path, "key_path"); err != nil {
+		t.Fatalf("private key digest failed: %v", err)
+	} else if issue == "" {
+		t.Fatal("certificate content was incorrectly accepted as a private key")
+	}
+}
+
 func TestCheckAndSyncAutoManagedSubscriptionsOnTLSPathChange_DetectsAndCachesDigest(t *testing.T) {
 	resetSubscriptionTLSPathWatchStateForTest()
 	t.Cleanup(resetSubscriptionTLSPathWatchStateForTest)

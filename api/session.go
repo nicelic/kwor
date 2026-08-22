@@ -70,8 +70,19 @@ type loginSessionStatus struct {
 	IdleDeadlineAt int64 `json:"idleDeadlineAt,omitempty"`
 }
 
+const loginUserContextKey = "kwor.login_user"
+
 func (v loginSessionValidation) valid() bool {
 	return v.err == nil && v.reason == "" && v.userName != "" && v.tokenHash != ""
+}
+
+func loginSessionReasonIsTransient(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case loginSessionReasonStoreFailed, loginSessionReasonWriteFailed:
+		return true
+	default:
+		return false
+	}
 }
 
 var loginSessionRegistry = struct {
@@ -194,7 +205,9 @@ func SetLoginUser(c *gin.Context, userName string, sessionMaxAgeMinutes int) err
 func RefreshLoginSession(c *gin.Context, _ bool) (loginSessionStatus, bool, string, error) {
 	validation := validateLoginSession(c)
 	if !validation.valid() {
-		clearSessionCookie(c)
+		if !loginSessionReasonIsTransient(validation.reason) {
+			clearSessionCookie(c)
+		}
 		return loginSessionStatus{}, false, validation.reason, validation.err
 	}
 
@@ -204,7 +217,9 @@ func RefreshLoginSession(c *gin.Context, _ bool) (loginSessionStatus, bool, stri
 		now,
 	)
 	if !refreshed {
-		clearSessionCookie(c)
+		if !loginSessionReasonIsTransient(reason) {
+			clearSessionCookie(c)
+		}
 		return loginSessionStatus{}, false, reason, err
 	}
 
@@ -213,18 +228,29 @@ func RefreshLoginSession(c *gin.Context, _ bool) (loginSessionStatus, bool, stri
 	s.Set(loginSessionToken, validation.token)
 	s.Options(sessionCookieOptions(c, loginSessionCookieMaxAgeSecondsForRecord(record, now)))
 	if err := s.Save(); err != nil {
-		removeLoginSession(validation.tokenHash)
-		clearSessionCookie(c)
 		return loginSessionStatus{}, false, loginSessionReasonWriteFailed, err
 	}
+	c.Set(loginUserContextKey, validation.userName)
 	return loginSessionStatusFromRecord(record), true, "", nil
 }
 
 func GetLoginUser(c *gin.Context) string {
+	if c != nil {
+		if value, exists := c.Get(loginUserContextKey); exists {
+			if userName, ok := value.(string); ok {
+				return userName
+			}
+		}
+	}
 	validation := validateLoginSession(c)
 	if !validation.valid() {
-		clearSessionCookie(c)
+		if !loginSessionReasonIsTransient(validation.reason) {
+			clearSessionCookie(c)
+		}
 		return ""
+	}
+	if c != nil {
+		c.Set(loginUserContextKey, validation.userName)
 	}
 	return validation.userName
 }
@@ -232,12 +258,17 @@ func GetLoginUser(c *gin.Context) string {
 func IsLogin(c *gin.Context) bool {
 	validation := validateLoginSession(c)
 	if validation.valid() {
+		if c != nil {
+			c.Set(loginUserContextKey, validation.userName)
+		}
 		return true
 	}
 	// Delete expired, legacy, or otherwise incompatible cookies as soon as they
 	// are presented. Authentication has already failed even if deletion cannot
 	// be written back to the browser.
-	clearSessionCookie(c)
+	if !loginSessionReasonIsTransient(validation.reason) {
+		clearSessionCookie(c)
+	}
 	return false
 }
 
@@ -251,6 +282,35 @@ func ClearSession(c *gin.Context) {
 		}
 	}
 	clearSessionCookie(c)
+}
+
+// RenameLoginSessionUser keeps active browser sessions associated with an
+// administrator usable after that administrator changes their username.
+func RenameLoginSessionUser(oldUsername string, newUsername string) error {
+	oldUsername = strings.TrimSpace(oldUsername)
+	newUsername = strings.TrimSpace(newUsername)
+	if oldUsername == "" || newUsername == "" || oldUsername == newUsername {
+		return nil
+	}
+
+	loginSessionRegistry.Lock()
+	defer loginSessionRegistry.Unlock()
+
+	db := database.GetDB()
+	if db != nil {
+		if err := db.Model(&model.LoginSession{}).
+			Where("user_name = ?", oldUsername).
+			Update("user_name", newUsername).Error; err != nil {
+			return err
+		}
+	}
+	for tokenHash, record := range loginSessionRegistry.sessions {
+		if record.userName == oldUsername {
+			record.userName = newUsername
+			loginSessionRegistry.sessions[tokenHash] = record
+		}
+	}
+	return nil
 }
 
 // InvalidateAllLoginSessions is called only for a full panel restart. TLS

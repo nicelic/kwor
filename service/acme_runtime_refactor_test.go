@@ -166,6 +166,40 @@ func TestAcmeOperationRuntimeSnapshotsCAStateAndCleansUp(t *testing.T) {
 	}
 }
 
+func TestCleanupStaleAcmeTempWorkspacesRemovesOnlyOldOwnedDirectories(t *testing.T) {
+	tempRoot := t.TempDir()
+
+	oldRuntime := filepath.Join(tempRoot, acmeRuntimeTempPrefix+"old")
+	oldCert := filepath.Join(tempRoot, "sui-acme-old")
+	newRuntime := filepath.Join(tempRoot, acmeRuntimeTempPrefix+"new")
+	foreign := filepath.Join(tempRoot, "other-temp")
+	for _, path := range []string{oldRuntime, oldCert, newRuntime, foreign} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatalf("create temporary fixture %q failed: %v", path, err)
+		}
+	}
+	old := time.Now().Add(-2 * acmeTempWorkspaceStaleAge)
+	for _, path := range []string{oldRuntime, oldCert} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatalf("age temporary fixture %q failed: %v", path, err)
+		}
+	}
+
+	if err := cleanupStaleAcmeTempWorkspacesIn(tempRoot); err != nil {
+		t.Fatalf("cleanup stale ACME workspaces failed: %v", err)
+	}
+	for _, path := range []string{oldRuntime, oldCert} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("stale workspace %q was not removed, stat err=%v", path, err)
+		}
+	}
+	for _, path := range []string{newRuntime, foreign} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("non-stale or foreign workspace %q was removed: %v", path, err)
+		}
+	}
+}
+
 func TestRestoreAcmeRuntimeStateRejectsOversizedAggregate(t *testing.T) {
 	files := make(map[string]string, 5)
 	content := strings.Repeat("x", acmeRuntimeStateMaxFileLen)

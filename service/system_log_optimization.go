@@ -60,6 +60,13 @@ type SystemLogOptimizationOverview struct {
 }
 
 func (s *SystemLogOptimizationService) GetOverview() (*SystemLogOptimizationOverview, error) {
+	return s.GetOverviewContext(context.Background())
+}
+
+// GetOverviewContext only reads persisted and host state. It deliberately does
+// not wait for a write operation so a page refresh cannot queue behind a slow
+// service restart.
+func (s *SystemLogOptimizationService) GetOverviewContext(ctx context.Context) (*SystemLogOptimizationOverview, error) {
 	content, err := s.getString(systemLogJournaldContentKey)
 	if err != nil {
 		return nil, err
@@ -79,11 +86,14 @@ func (s *SystemLogOptimizationService) GetOverview() (*SystemLogOptimizationOver
 		overview.Error = "系统日志优化仅支持 Linux"
 		return overview, nil
 	}
+	if err := validateSystemOptimizationContent(content); err != nil {
+		return nil, err
+	}
 
 	path, pathErr := s.resolveJournaldConfigPath(false)
 	if pathErr == nil {
 		overview.ConfigPath = path
-		immutable, immutableErr := detectFileImmutable(path)
+		immutable, immutableErr := detectFileImmutableContext(ctx, path)
 		if immutableErr == nil {
 			overview.Immutable = immutable
 		}
@@ -95,6 +105,10 @@ func (s *SystemLogOptimizationService) GetOverview() (*SystemLogOptimizationOver
 }
 
 func (s *SystemLogOptimizationService) SetDisabled(enabled bool) error {
+	return s.SetDisabledContext(context.Background(), enabled)
+}
+
+func (s *SystemLogOptimizationService) SetDisabledContext(ctx context.Context, enabled bool) error {
 	systemLogOptimizationMu.Lock()
 	defer systemLogOptimizationMu.Unlock()
 
@@ -107,12 +121,15 @@ func (s *SystemLogOptimizationService) SetDisabled(enabled bool) error {
 		if err != nil {
 			return err
 		}
+		if err := validateSystemOptimizationContent(content); err != nil {
+			return err
+		}
 		content = normalizeManagedJournaldContent(content)
-		path, err := s.applyManagedJournaldContentLocked(content)
+		path, err := s.applyManagedJournaldContentLocked(ctx, content)
 		if err != nil {
 			return err
 		}
-		if err := restartJournaldService(); err != nil {
+		if err := restartJournaldServiceContext(ctx); err != nil {
 			return err
 		}
 		if err := s.setString(systemLogDisableEnabledKey, "true"); err != nil {
@@ -132,6 +149,10 @@ func (s *SystemLogOptimizationService) SetDisabled(enabled bool) error {
 }
 
 func (s *SystemLogOptimizationService) SaveContent(content string) error {
+	return s.SaveContentContext(context.Background(), content)
+}
+
+func (s *SystemLogOptimizationService) SaveContentContext(ctx context.Context, content string) error {
 	systemLogOptimizationMu.Lock()
 	defer systemLogOptimizationMu.Unlock()
 
@@ -139,16 +160,19 @@ func (s *SystemLogOptimizationService) SaveContent(content string) error {
 		return common.NewError("系统日志优化仅支持 Linux")
 	}
 
+	if err := validateSystemOptimizationContent(content); err != nil {
+		return err
+	}
 	normalized := normalizeManagedJournaldContent(content)
 	if strings.TrimSpace(normalized) == "" {
 		return common.NewError("journald 配置内容不能为空")
 	}
 
-	path, err := s.applyManagedJournaldContentLocked(normalized)
+	path, err := s.applyManagedJournaldContentLocked(ctx, normalized)
 	if err != nil {
 		return err
 	}
-	if err := restartJournaldService(); err != nil {
+	if err := restartJournaldServiceContext(ctx); err != nil {
 		return err
 	}
 	if err := s.setString(systemLogJournaldContentKey, normalized); err != nil {
@@ -209,11 +233,14 @@ func (s *SystemLogOptimizationService) ReconcileOnStartup() error {
 	}
 	content = normalizeManagedJournaldContent(content)
 
-	appliedPath, err := s.applyManagedJournaldContentLocked(content)
+	if err := validateSystemOptimizationContent(content); err != nil {
+		return err
+	}
+	appliedPath, err := s.applyManagedJournaldContentLocked(context.Background(), content)
 	if err != nil {
 		return err
 	}
-	if err := restartJournaldService(); err != nil {
+	if err := restartJournaldServiceContext(context.Background()); err != nil {
 		return err
 	}
 	if err := s.setString(systemLogJournaldPathKey, appliedPath); err != nil {
@@ -222,7 +249,7 @@ func (s *SystemLogOptimizationService) ReconcileOnStartup() error {
 	return s.setString(systemLogDisableEnabledKey, "true")
 }
 
-func (s *SystemLogOptimizationService) applyManagedJournaldContentLocked(content string) (string, error) {
+func (s *SystemLogOptimizationService) applyManagedJournaldContentLocked(ctx context.Context, content string) (string, error) {
 	path, err := s.resolveJournaldConfigPath(true)
 	if err != nil {
 		return "", err
@@ -239,6 +266,7 @@ func (s *SystemLogOptimizationService) applyManagedJournaldContentLocked(content
 
 	if err := rewriteManagedFileWithImmutable(path, content, managedFileRewriteOptions{
 		DisplayName: "journald 配置",
+		Context:     ctx,
 	}); err != nil {
 		return "", err
 	}
@@ -303,6 +331,10 @@ func normalizeManagedJournaldContent(content string) string {
 }
 
 func detectFileImmutable(path string) (bool, error) {
+	return detectFileImmutableContext(context.Background(), path)
+}
+
+func detectFileImmutableContext(ctx context.Context, path string) (bool, error) {
 	if !pathExists(path) {
 		return false, nil
 	}
@@ -310,7 +342,7 @@ func detectFileImmutable(path string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("lsattr is unavailable: %w", err)
 	}
-	output, err := runCommandOutputWithTimeout(8*time.Second, lsattrPath, path)
+	output, err := runOptimizationCommandOutputWithTimeout(ctx, 8*time.Second, lsattrPath, path)
 	if err != nil {
 		return false, err
 	}
@@ -322,25 +354,24 @@ func detectFileImmutable(path string) (bool, error) {
 }
 
 func runCommandOutputWithTimeout(timeout time.Duration, command string, args ...string) (string, error) {
+	if timeout <= 0 {
+		timeout = systemCommandTimeout
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, command, args...)
-	output, err := cmd.CombinedOutput()
+	output, err := exec.CommandContext(ctx, command, args...).CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
-		return "", fmt.Errorf("command timed out (%s %s)", command, strings.Join(args, " "))
+		return string(output), fmt.Errorf("%s timed out after %s", command, timeout)
 	}
-	if err != nil {
-		trimmed := strings.TrimSpace(string(output))
-		if trimmed == "" {
-			return "", err
-		}
-		return "", fmt.Errorf("%w: %s", err, trimmed)
-	}
-	return string(output), nil
+	return string(output), err
 }
 
 func restartJournaldService() error {
+	return restartJournaldServiceContext(context.Background())
+}
+
+func restartJournaldServiceContext(ctx context.Context) error {
 	attempts := make([]string, 0)
 	appendAttempt := func(prefix string, err error) {
 		if err == nil {
@@ -358,7 +389,7 @@ func restartJournaldService() error {
 		actions := []string{"restart", "reload-or-restart", "try-restart"}
 		for _, action := range actions {
 			for _, serviceName := range serviceNames {
-				commandErr := runCommandWithTimeout(12*time.Second, systemctlPath, action, serviceName)
+				commandErr := runOptimizationCommandWithTimeout(ctx, 12*time.Second, systemctlPath, action, serviceName)
 				if commandErr == nil {
 					return nil
 				}
@@ -369,7 +400,7 @@ func restartJournaldService() error {
 
 	if servicePath, err := exec.LookPath("service"); err == nil {
 		for _, serviceName := range serviceNames {
-			commandErr := runCommandWithTimeout(12*time.Second, servicePath, serviceName, "restart")
+			commandErr := runOptimizationCommandWithTimeout(ctx, 12*time.Second, servicePath, serviceName, "restart")
 			if commandErr == nil {
 				return nil
 			}
@@ -379,7 +410,7 @@ func restartJournaldService() error {
 
 	if openrcPath, err := exec.LookPath("rc-service"); err == nil {
 		for _, serviceName := range serviceNames {
-			commandErr := runCommandWithTimeout(12*time.Second, openrcPath, serviceName, "restart")
+			commandErr := runOptimizationCommandWithTimeout(ctx, 12*time.Second, openrcPath, serviceName, "restart")
 			if commandErr == nil {
 				return nil
 			}
@@ -389,7 +420,7 @@ func restartJournaldService() error {
 
 	if runitPath, err := exec.LookPath("sv"); err == nil {
 		for _, serviceName := range serviceNames {
-			commandErr := runCommandWithTimeout(12*time.Second, runitPath, "restart", serviceName)
+			commandErr := runOptimizationCommandWithTimeout(ctx, 12*time.Second, runitPath, "restart", serviceName)
 			if commandErr == nil {
 				return nil
 			}
@@ -402,7 +433,7 @@ func restartJournaldService() error {
 		if !pathExists(initScript) {
 			continue
 		}
-		commandErr := runCommandWithTimeout(12*time.Second, initScript, "restart")
+		commandErr := runOptimizationCommandWithTimeout(ctx, 12*time.Second, initScript, "restart")
 		if commandErr == nil {
 			return nil
 		}

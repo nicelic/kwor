@@ -22,7 +22,7 @@ import (
 // - enabled clients only
 // - bound inbound tags only
 // - per inbound port use the MIN speedLimitMbps across all bound clients
-// - port hopping ranges are not used; only listen_port is limited
+// - listener ports and validated Hysteria2/Mieru ranges are limited
 type MihomoClientRateLimitService struct{}
 
 func (s *MihomoClientRateLimitService) IsNftTableReady() bool {
@@ -43,6 +43,15 @@ func (s *MihomoClientRateLimitService) EnsureRuleIntegrity() error {
 		return nil
 	}
 	if !(&MihomoCoreManagerService{}).IsRunning() {
+		return nil
+	}
+	return s.EnsureRuleIntegrityWhenRunning()
+}
+
+// EnsureRuleIntegrityWhenRunning avoids another core status command when the
+// caller already confirmed Mihomo Core is running.
+func (s *MihomoClientRateLimitService) EnsureRuleIntegrityWhenRunning() error {
+	if !IsSystemPlatformLinux() || !nftSupported() {
 		return nil
 	}
 	return s.Reconcile(true)
@@ -87,10 +96,6 @@ func (s *MihomoClientRateLimitService) CleanupOnShutdown() {
 }
 
 func (s *MihomoClientRateLimitService) reconcileStateOnly(tx *gorm.DB, desired map[int]int, desiredTags map[int]string) error {
-	if err := deleteRulesByCommentPrefix(mihomoLimitNftRuleComments.prefix); err != nil {
-		return err
-	}
-
 	var states []model.MihomoClientPortLimitState
 	if err := tx.Find(&states).Error; err != nil {
 		return err
@@ -114,6 +119,9 @@ func (s *MihomoClientRateLimitService) reconcileStateOnly(tx *gorm.DB, desired m
 		limit := desired[port]
 		tag := desiredTags[port]
 		if st, ok := existing[port]; ok {
+			if st.Tag == tag && st.LimitMbps == limit && st.InHandle == 0 && st.OutHandle == 0 {
+				continue
+			}
 			if err := tx.Model(st).Updates(map[string]interface{}{
 				"tag":        tag,
 				"limit_mbps": limit,
@@ -151,6 +159,14 @@ func (s *MihomoClientRateLimitService) reconcileWithRules(tx *gorm.DB, desired m
 	existing := make(map[int]*model.MihomoClientPortLimitState, len(states))
 	for i := range states {
 		existing[states[i].Port] = &states[i]
+	}
+	inHandles, err := snapshotManagedRuleHandles(nftChainIn, mihomoLimitNftRuleComments.prefix)
+	if err != nil {
+		return err
+	}
+	outHandles, err := snapshotManagedRuleHandles(nftChainOut, mihomoLimitNftRuleComments.prefix)
+	if err != nil {
+		return err
 	}
 
 	// Remove obsolete states/rules.
@@ -196,12 +212,16 @@ func (s *MihomoClientRateLimitService) reconcileWithRules(tx *gorm.DB, desired m
 				continue
 			}
 
-			st.Tag = tag
-			if err := s.tryRecoverHandles(tx, st); err != nil {
-				logger.Warning("recover mihomo client limit handles failed for port ", st.Port, ": ", err)
+			originalInHandle := st.InHandle
+			originalOutHandle := st.OutHandle
+			inHandle, inOk := inHandles[mihomoLimitNftRuleComments.in(portTag)]
+			outHandle, outOk := outHandles[mihomoLimitNftRuleComments.out(portTag)]
+			if inOk {
+				st.InHandle = inHandle
 			}
-			inOk := ruleHandleExists(nftChainIn, st.InHandle)
-			outOk := ruleHandleExists(nftChainOut, st.OutHandle)
+			if outOk {
+				st.OutHandle = outHandle
+			}
 			if !inOk || !outOk {
 				if err := s.removeRulesFromState(st); err != nil {
 					logger.Warning("failed to clear broken mihomo client limit rules for port ", st.Port, ": ", err)
@@ -221,11 +241,15 @@ func (s *MihomoClientRateLimitService) reconcileWithRules(tx *gorm.DB, desired m
 				continue
 			}
 
-			if err := tx.Model(st).Updates(map[string]interface{}{
-				"tag":        tag,
-				"updated_at": time.Now(),
-			}).Error; err != nil {
-				return err
+			if st.Tag != tag || originalInHandle != st.InHandle || originalOutHandle != st.OutHandle {
+				if err := tx.Model(st).Updates(map[string]interface{}{
+					"tag":        tag,
+					"in_handle":  st.InHandle,
+					"out_handle": st.OutHandle,
+					"updated_at": time.Now(),
+				}).Error; err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -249,7 +273,7 @@ func (s *MihomoClientRateLimitService) reconcileWithRules(tx *gorm.DB, desired m
 		}
 	}
 
-	if err := s.cleanupOrphanRules(validComments); err != nil {
+	if err := s.cleanupOrphanRules(validComments, inHandles, outHandles); err != nil {
 		logger.Warning("cleanup orphan mihomo client limit nft rules failed: ", err)
 	}
 	return nil
@@ -304,33 +328,23 @@ func (s *MihomoClientRateLimitService) removeRulesFromState(state *model.MihomoC
 	return firstErr
 }
 
-func (s *MihomoClientRateLimitService) cleanupOrphanRules(validComments map[string]struct{}) error {
-	if !nftSupported() || !nftTableExists() {
-		return nil
-	}
-
-	chains := []string{nftChainIn, nftChainOut}
+func (s *MihomoClientRateLimitService) cleanupOrphanRules(validComments map[string]struct{}, inHandles map[string]int, outHandles map[string]int) error {
 	var firstErr error
-	for _, chain := range chains {
-		rules, err := listRuleCommentsByPrefix(chain, mihomoLimitNftRuleComments.prefix)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		for _, rule := range rules {
-			if _, ok := validComments[rule.comment]; ok {
+	cleanupChain := func(chain string, handles map[string]int) {
+		for comment, handle := range handles {
+			if _, ok := validComments[comment]; ok {
 				continue
 			}
-			if err := deleteRuleByHandle(chain, rule.handle); err != nil {
-				logger.Warning("failed to delete orphan mihomo client limit nft rule ", rule.comment, " handle ", rule.handle, ": ", err)
+			if err := deleteRuleByHandle(chain, handle); err != nil && !nftObjectMissing(err) {
+				logger.Warning("failed to delete orphan mihomo client limit nft rule ", comment, " handle ", handle, ": ", err)
 				if firstErr == nil {
 					firstErr = err
 				}
 			}
 		}
 	}
+	cleanupChain(nftChainIn, inHandles)
+	cleanupChain(nftChainOut, outHandles)
 	return firstErr
 }
 
@@ -366,9 +380,10 @@ func (s *MihomoClientRateLimitService) collectDesiredPortLimits(tx *gorm.DB) (ma
 		Type    string
 		Tag     string
 		Options json.RawMessage
+		OutJson json.RawMessage
 	}
 	var inbounds []inboundEntry
-	if err := tx.Model(&model.MihomoInbound{}).Select("id, type, tag, options").Find(&inbounds).Error; err != nil {
+	if err := tx.Model(&model.MihomoInbound{}).Select("id, type, tag, options, out_json").Find(&inbounds).Error; err != nil {
 		return nil, nil, err
 	}
 
@@ -378,11 +393,15 @@ func (s *MihomoClientRateLimitService) collectDesiredPortLimits(tx *gorm.DB) (ma
 	}
 	inboundPorts := make(map[uint]inboundPortInfo, len(inbounds))
 	for _, inbound := range inbounds {
+		if !isSupportedMihomoInboundType(inbound.Type) {
+			continue
+		}
 		baseInbound := model.MihomoInbound{
 			Id:      inbound.Id,
 			Type:    inbound.Type,
 			Tag:     inbound.Tag,
 			Options: inbound.Options,
+			OutJson: inbound.OutJson,
 		}
 		ports := expandPortRangesToPorts(collectMihomoInboundLimitRanges(&baseInbound))
 		if len(ports) == 0 {

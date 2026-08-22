@@ -117,6 +117,7 @@ func ResolveTrustTunnelReuseOption(config map[string]interface{}, keys ...string
 }
 
 func parseTrustTunnelNonNegativeInt(raw interface{}) (int, bool) {
+	maxInt := int64(^uint(0) >> 1)
 	switch value := raw.(type) {
 	case int:
 		if value >= 0 {
@@ -127,16 +128,16 @@ func parseTrustTunnelNonNegativeInt(raw interface{}) (int, bool) {
 			return int(value), true
 		}
 	case int64:
-		if value >= 0 {
+		if value >= 0 && value <= maxInt {
 			return int(value), true
 		}
 	case float32:
 		number := float64(value)
-		if number >= 0 && number == math.Trunc(number) && number <= float64(math.MaxInt64) {
+		if number >= 0 && number == math.Trunc(number) && number <= float64(maxInt) {
 			return int(number), true
 		}
 	case float64:
-		if value >= 0 && value == math.Trunc(value) && value <= float64(math.MaxInt64) {
+		if value >= 0 && value == math.Trunc(value) && value <= float64(maxInt) {
 			return int(value), true
 		}
 	case string:

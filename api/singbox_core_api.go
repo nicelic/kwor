@@ -1,10 +1,10 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
-	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/service"
 	"github.com/gin-gonic/gin"
 )
@@ -32,10 +32,11 @@ type singboxCorePreferenceRequest struct {
 }
 
 type singboxCoreUpdateSettingsRequest struct {
-	Enabled         bool
-	IntervalHours   int
-	AutoUpdate      bool
-	HasAutoUpdate   bool
+	Action        string
+	Enabled       bool
+	IntervalHours int
+	AutoUpdate    bool
+	HasAutoUpdate bool
 }
 
 func parseSingboxCoreVersionWindowQuery(c *gin.Context) singboxCoreVersionRequest {
@@ -84,21 +85,40 @@ func parseSingboxCorePreferenceRequest(c *gin.Context) singboxCorePreferenceRequ
 }
 
 func parseSingboxCoreUpdateSettingsRequest(c *gin.Context) (singboxCoreUpdateSettingsRequest, error) {
+	action := strings.ToLower(strings.TrimSpace(c.Request.FormValue("action")))
 	enabledRaw := strings.TrimSpace(c.Request.FormValue("enabled"))
 	enabled := strings.EqualFold(enabledRaw, "true") || enabledRaw == "1"
-	intervalHours, err := parseCoreIntervalHours(c.Request.FormValue("interval"))
-	if err != nil {
-		return singboxCoreUpdateSettingsRequest{}, err
-	}
 	autoUpdateRaw := strings.TrimSpace(c.Request.FormValue("auto_update_enabled"))
 	_, hasAutoUpdate := c.Request.Form["auto_update_enabled"]
 	autoUpdateEnabled := strings.EqualFold(autoUpdateRaw, "true") || autoUpdateRaw == "1"
-	return singboxCoreUpdateSettingsRequest{
+	request := singboxCoreUpdateSettingsRequest{
+		Action:        action,
 		Enabled:       enabled,
-		IntervalHours: intervalHours,
 		AutoUpdate:    autoUpdateEnabled,
 		HasAutoUpdate: hasAutoUpdate,
-	}, nil
+	}
+
+	switch action {
+	case "auto_check":
+		if _, exists := c.Request.Form["enabled"]; !exists {
+			return singboxCoreUpdateSettingsRequest{}, fmt.Errorf("enabled is required for auto_check")
+		}
+		return request, nil
+	case "auto_update":
+		if !hasAutoUpdate {
+			return singboxCoreUpdateSettingsRequest{}, fmt.Errorf("auto_update_enabled is required for auto_update")
+		}
+		return request, nil
+	case "interval", "":
+		intervalHours, err := parseCoreIntervalHours(c.Request.FormValue("interval"))
+		if err != nil {
+			return singboxCoreUpdateSettingsRequest{}, err
+		}
+		request.IntervalHours = intervalHours
+		return request, nil
+	default:
+		return singboxCoreUpdateSettingsRequest{}, fmt.Errorf("unsupported core update settings action: %s", action)
+	}
 }
 
 func (a *ApiService) GetCoreManagerStatus(c *gin.Context) {
@@ -136,16 +156,22 @@ func (a *ApiService) SaveCoreUpdateSettings(c *gin.Context) {
 		jsonMsg(c, "", err)
 		return
 	}
-	if err = a.coreManagerService().SetCoreAutoCheckSettings(request.Enabled, request.IntervalHours, request.HasAutoUpdate, request.AutoUpdate); err != nil {
+	manager := a.coreManagerService()
+	switch request.Action {
+	case "auto_check":
+		err = manager.SetCoreAutoCheckEnabled(request.Enabled)
+	case "auto_update":
+		err = manager.SetCoreAutoUpdateEnabled(request.AutoUpdate)
+	case "interval":
+		err = manager.SetCoreAutoCheckInterval(request.IntervalHours)
+	default:
+		err = manager.SetCoreAutoCheckSettings(request.Enabled, request.IntervalHours, request.HasAutoUpdate, request.AutoUpdate)
+	}
+	if err != nil {
 		jsonMsg(c, "", err)
 		return
 	}
-	if request.Enabled {
-		if checkErr := a.coreManagerService().CheckAndMarkCoreUpdates(true); checkErr != nil {
-			logger.Warning("check core updates after settings update failed: ", checkErr)
-		}
-	}
-	info, err := a.coreManagerService().GetSingboxCoreUpdateInfo(false)
+	info, err := manager.GetSingboxCoreUpdateInfo(false)
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
@@ -240,6 +266,20 @@ func (a *ApiService) SaveCoreDownloadPreference(c *gin.Context) {
 		return
 	}
 	jsonObj(c, preference, nil)
+}
+
+func (a *ApiService) SaveSingboxCoreLogLevel(c *gin.Context, loginUser string) {
+	result, err := service.SaveSingboxCoreLogLevel(c.Request.FormValue("level"), loginUser)
+	if err != nil {
+		var committedErr *service.CommittedSaveError
+		if errors.As(err, &committedErr) {
+			writeCommittedSaveFailure(c, committedErr)
+			return
+		}
+		jsonMsg(c, "save sing-box core log level", err)
+		return
+	}
+	jsonObj(c, result, nil)
 }
 
 func (a *ApiService) StartCoreManager(c *gin.Context) {

@@ -2,10 +2,12 @@ package database
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/alireza0/s-ui/config"
 	"github.com/alireza0/s-ui/database/model"
@@ -15,16 +17,20 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-var db *gorm.DB
+var (
+	db   *gorm.DB
+	dbMu sync.RWMutex
+)
 
 // GetPersistedSystemPlatformOS returns the OS captured during the latest
 // panel start. It intentionally never probes the running host.
 func GetPersistedSystemPlatformOS() string {
-	if db == nil {
+	currentDB := GetDB()
+	if currentDB == nil {
 		return ""
 	}
 	platform := &model.SystemPlatform{}
-	if err := db.First(platform, 1).Error; err != nil {
+	if err := currentDB.First(platform, 1).Error; err != nil {
 		return ""
 	}
 	return strings.ToLower(strings.TrimSpace(platform.OS))
@@ -33,11 +39,12 @@ func GetPersistedSystemPlatformOS() string {
 // GetPersistedSystemPlatformArchitecture returns the architecture captured
 // during the latest panel start. It intentionally never probes the host.
 func GetPersistedSystemPlatformArchitecture() string {
-	if db == nil {
+	currentDB := GetDB()
+	if currentDB == nil {
 		return ""
 	}
 	platform := &model.SystemPlatform{}
-	if err := db.First(platform, 1).Error; err != nil {
+	if err := currentDB.First(platform, 1).Error; err != nil {
 		return ""
 	}
 	return strings.ToLower(strings.TrimSpace(platform.Architecture))
@@ -87,12 +94,12 @@ func OpenDB(dbPath string) error {
 	c := &gorm.Config{
 		Logger: gormLogger,
 	}
-	db, err = gorm.Open(sqlite.Open(sqliteDSNWithPragmas(dbPath)), c)
+	openedDB, err := gorm.Open(sqlite.Open(sqliteDSNWithPragmas(dbPath)), c)
 	if err != nil {
 		return err
 	}
 
-	sqlDB, err := db.DB()
+	sqlDB, err := openedDB.DB()
 	if err != nil {
 		return err
 	}
@@ -103,8 +110,11 @@ func OpenDB(dbPath string) error {
 	sqlDB.SetMaxIdleConns(1)
 
 	if config.IsDebug() {
-		db = db.Debug()
+		openedDB = openedDB.Debug()
 	}
+	dbMu.Lock()
+	db = openedDB
+	dbMu.Unlock()
 
 	runDBResetHooks()
 	return nil
@@ -115,26 +125,32 @@ func InitDB(dbPath string) error {
 	if err != nil {
 		return err
 	}
+	target := GetDB()
+	if target == nil {
+		return fmt.Errorf("database is not initialized")
+	}
 
 	// Default Outbounds
-	if !db.Migrator().HasTable(&model.Outbound{}) {
-		db.Migrator().CreateTable(&model.Outbound{})
+	if !target.Migrator().HasTable(&model.Outbound{}) {
+		target.Migrator().CreateTable(&model.Outbound{})
 		defaultOutbound := []model.Outbound{
 			{Type: "direct", Tag: "direct", Options: json.RawMessage(`{}`)},
 		}
-		db.Create(&defaultOutbound)
+		target.Create(&defaultOutbound)
 	}
-	if !db.Migrator().HasTable(&model.MihomoOutbound{}) {
-		db.Migrator().CreateTable(&model.MihomoOutbound{})
+	if !target.Migrator().HasTable(&model.MihomoOutbound{}) {
+		target.Migrator().CreateTable(&model.MihomoOutbound{})
 		defaultOutbound := []model.MihomoOutbound{
 			{Type: "direct", Tag: "direct", Options: json.RawMessage(`{}`)},
 		}
-		db.Create(&defaultOutbound)
+		target.Create(&defaultOutbound)
 	}
 
-	err = db.AutoMigrate(
+	hadMihomoTLSMode := target.Migrator().HasColumn(&model.MihomoTls{}, "mode")
+	err = target.AutoMigrate(
 		&model.Setting{},
 		&model.SettingsState{},
+		&model.SingboxConfigState{},
 		&model.SubscriptionInitialState{},
 		&model.SystemPlatform{},
 		&model.PanelCertificate{},
@@ -154,6 +170,7 @@ func InitDB(dbPath string) error {
 		&model.SubSyncBlock{},
 		&model.SubGroup{},
 		&model.Service{},
+		&model.DnsServer{},
 		&model.Endpoint{},
 		&model.User{},
 		&model.Tokens{},
@@ -186,22 +203,36 @@ func InitDB(dbPath string) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureSettingsStorage(db); err != nil {
+	if !hadMihomoTLSMode {
+		if err := backfillMihomoRealityModes(target); err != nil {
+			return err
+		}
+	}
+	if err := ensureClientNameUniqueness(target); err != nil {
 		return err
 	}
-	if err := ensureReverseProxySettingsSingleton(db); err != nil {
+	if err := ensureMihomoClientNameUniqueness(target); err != nil {
 		return err
 	}
-	if err := ensureCertificateRecordIndexes(db); err != nil {
+	if err := ensureSettingsStorage(target); err != nil {
 		return err
 	}
-	if err := ensureAcmeAccountIndexes(db); err != nil {
+	if err := ensureSingboxConfigStorage(target); err != nil {
 		return err
 	}
-	if err := ensureReverseProxyCertificateBalanceIndexes(db); err != nil {
+	if err := ensureReverseProxySettingsSingleton(target); err != nil {
 		return err
 	}
-	if err := ensurePanelCertificateBalanceIndexes(db); err != nil {
+	if err := ensureCertificateRecordIndexes(target); err != nil {
+		return err
+	}
+	if err := ensureAcmeAccountIndexes(target); err != nil {
+		return err
+	}
+	if err := ensureReverseProxyCertificateBalanceIndexes(target); err != nil {
+		return err
+	}
+	if err := ensurePanelCertificateBalanceIndexes(target); err != nil {
 		return err
 	}
 	err = initUser()
@@ -210,6 +241,176 @@ func InitDB(dbPath string) error {
 	}
 
 	return nil
+}
+
+// backfillMihomoRealityModes preserves pre-mode Mihomo TLS records when the
+// mode column is introduced. It intentionally handles only the existing
+// Reality shape; standalone ShadowTLS rows are not migrated or resurrected.
+func backfillMihomoRealityModes(target *gorm.DB) error {
+	if target == nil {
+		return nil
+	}
+
+	type mihomoTLSRow struct {
+		ID     uint            `gorm:"column:id"`
+		Mode   string          `gorm:"column:mode"`
+		Server json.RawMessage `gorm:"column:server"`
+	}
+	var rows []mihomoTLSRow
+	if err := target.Table("mihomo_tls").Select("id, mode, server").Find(&rows).Error; err != nil {
+		return err
+	}
+
+	for _, row := range rows {
+		if !strings.EqualFold(strings.TrimSpace(row.Mode), model.MihomoTlsModeTLS) {
+			continue
+		}
+		var server map[string]interface{}
+		if err := json.Unmarshal(row.Server, &server); err != nil || server == nil {
+			continue
+		}
+		if reality, ok := server["reality"].(map[string]interface{}); !ok || reality == nil {
+			continue
+		}
+		if err := target.Model(&model.MihomoTls{}).Where("id = ?", row.ID).Update("mode", model.MihomoTlsModeReality).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensureClientNameUniqueness upgrades legacy databases without making startup
+// fail when historical users share a subscription name. The oldest row keeps
+// its name; later duplicates receive a deterministic ID suffix before the
+// database-level unique index is created.
+func ensureClientNameUniqueness(target *gorm.DB) error {
+	if target == nil {
+		return nil
+	}
+
+	type duplicateName struct {
+		Name  string
+		Count int64
+	}
+	type clientID struct {
+		Id uint
+	}
+
+	return target.Transaction(func(tx *gorm.DB) error {
+		var duplicates []duplicateName
+		if err := tx.Table("clients").
+			Select("name, COUNT(*) AS count").
+			Group("name").
+			Having("COUNT(*) > 1").
+			Find(&duplicates).Error; err != nil {
+			return err
+		}
+
+		for _, duplicate := range duplicates {
+			var clients []clientID
+			if err := tx.Table("clients").
+				Select("id").
+				Where("name = ?", duplicate.Name).
+				Order("id ASC").
+				Find(&clients).Error; err != nil {
+				return err
+			}
+			for index, client := range clients {
+				if index == 0 {
+					continue
+				}
+				candidateBase := strings.TrimSpace(duplicate.Name)
+				if candidateBase == "" {
+					candidateBase = "client"
+				}
+				candidate := fmt.Sprintf("%s-%d", candidateBase, client.Id)
+				for suffix := 2; ; suffix++ {
+					var count int64
+					if err := tx.Table("clients").Where("name = ?", candidate).Count(&count).Error; err != nil {
+						return err
+					}
+					if count == 0 {
+						break
+					}
+					candidate = fmt.Sprintf("%s-%d-%d", candidateBase, client.Id, suffix)
+				}
+				if err := tx.Model(&model.Client{}).
+					Where("id = ? AND name = ?", client.Id, duplicate.Name).
+					Update("name", candidate).Error; err != nil {
+					return err
+				}
+			}
+		}
+
+		return tx.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_clients_name_unique ON clients(name)").Error
+	})
+}
+
+// ensureMihomoClientNameUniqueness upgrades legacy databases without making
+// startup fail when historical users share a subscription name. The oldest row
+// keeps its name; later duplicates receive a deterministic ID suffix before
+// the database-level unique index is created.
+func ensureMihomoClientNameUniqueness(target *gorm.DB) error {
+	if target == nil {
+		return nil
+	}
+
+	type duplicateName struct {
+		Name  string
+		Count int64
+	}
+	type clientID struct {
+		Id uint
+	}
+
+	return target.Transaction(func(tx *gorm.DB) error {
+		var duplicates []duplicateName
+		if err := tx.Table("mihomo_clients").
+			Select("name, COUNT(*) AS count").
+			Group("name").
+			Having("COUNT(*) > 1").
+			Find(&duplicates).Error; err != nil {
+			return err
+		}
+
+		for _, duplicate := range duplicates {
+			var clients []clientID
+			if err := tx.Table("mihomo_clients").
+				Select("id").
+				Where("name = ?", duplicate.Name).
+				Order("id ASC").
+				Find(&clients).Error; err != nil {
+				return err
+			}
+			for index, client := range clients {
+				if index == 0 {
+					continue
+				}
+				candidateBase := strings.TrimSpace(duplicate.Name)
+				if candidateBase == "" {
+					candidateBase = "mihomo-client"
+				}
+				candidate := fmt.Sprintf("%s-%d", candidateBase, client.Id)
+				for suffix := 2; ; suffix++ {
+					var count int64
+					if err := tx.Table("mihomo_clients").Where("name = ?", candidate).Count(&count).Error; err != nil {
+						return err
+					}
+					if count == 0 {
+						break
+					}
+					candidate = fmt.Sprintf("%s-%d-%d", candidateBase, client.Id, suffix)
+				}
+				if err := tx.Model(&model.MihomoClient{}).
+					Where("id = ? AND name = ?", client.Id, duplicate.Name).
+					Update("name", candidate).Error; err != nil {
+					return err
+				}
+			}
+		}
+
+		return tx.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_mihomo_clients_name_unique ON mihomo_clients(name)").Error
+	})
 }
 
 func ensureSettingsStorage(target *gorm.DB) error {
@@ -235,8 +436,22 @@ func ensureSettingsStorage(target *gorm.DB) error {
 	})
 }
 
+func ensureSingboxConfigStorage(target *gorm.DB) error {
+	if target == nil {
+		return nil
+	}
+
+	return target.Transaction(func(tx *gorm.DB) error {
+		state := model.SingboxConfigState{Id: 1, Revision: 1}
+		return tx.Where("id = ?", state.Id).FirstOrCreate(&state).Error
+	})
+}
+
 func GetDB() *gorm.DB {
-	return db
+	dbMu.RLock()
+	currentDB := db
+	dbMu.RUnlock()
+	return currentDB
 }
 
 func IsNotFound(err error) bool {

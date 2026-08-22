@@ -165,8 +165,24 @@ func signalManagedProcessIdentity(identity managedProcessIdentity, force bool) e
 }
 
 func isManagedCoreProcessRunningByBinaryPath(binPath string) bool {
+	if running, known := cachedManagedCoreProcessRunning(binPath); known {
+		return running
+	}
 	processes, err := findManagedCoreProcessesByBinaryPath(binPath)
-	return err == nil && len(processes) > 0
+	if err != nil {
+		return false
+	}
+	for _, proc := range processes {
+		if proc == nil || !managedCoreProcessRunning(proc) {
+			continue
+		}
+		if identity, identityErr := captureManagedProcessIdentity(proc, binPath); identityErr == nil {
+			rememberManagedCoreProcessIdentity(managedCoreProcessRuntimeCacheKey(binPath), identity)
+		}
+		return true
+	}
+	rememberManagedCoreProcessAbsent(managedCoreProcessRuntimeCacheKey(binPath))
+	return false
 }
 
 func terminateManagedCoreProcessesByBinaryPath(binPath string, gracefulTimeout time.Duration) error {

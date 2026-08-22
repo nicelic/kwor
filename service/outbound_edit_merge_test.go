@@ -97,6 +97,55 @@ func TestOutboundServiceEditPreservesHiddenRawFieldsWhileUpdatingPublicFields(t 
 	}
 }
 
+func TestOutboundEditableMergeSchemaCoversHiddenOptionDisables(t *testing.T) {
+	tests := []struct {
+		name    string
+		outType string
+		base    map[string]interface{}
+		remove  []string
+	}{
+		{
+			name:    "direct override fields",
+			outType: "direct",
+			base: map[string]interface{}{
+				"type": "direct", "tag": "direct-node", "override_address": "192.0.2.1", "override_port": float64(8443),
+			},
+			remove: []string{"override_address", "override_port"},
+		},
+		{
+			name:    "socks udp over tcp",
+			outType: "socks",
+			base: map[string]interface{}{
+				"type": "socks", "tag": "socks-node", "udp_over_tcp": map[string]interface{}{"enabled": true, "version": float64(2)},
+			},
+			remove: []string{"udp_over_tcp"},
+		},
+		{
+			name:    "ssh algorithm fields",
+			outType: "ssh",
+			base: map[string]interface{}{
+				"type": "ssh", "tag": "ssh-node", "cipher": []interface{}{"aes128-ctr"}, "mac": []interface{}{"hmac-sha2-256"}, "kex_algorithm": []interface{}{"curve25519-sha256"},
+			},
+			remove: []string{"cipher", "mac", "kex_algorithm"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			edited := cloneJSONMapForTest(test.base)
+			for _, key := range test.remove {
+				delete(edited, key)
+			}
+			merged := mergeEditableOutboundMap(test.base, edited, outboundEditableMergeSchema("default", test.outType))
+			for _, key := range test.remove {
+				if _, exists := merged[key]; exists {
+					t.Fatalf("%s remained after UI disable: %#v", key, merged[key])
+				}
+			}
+		})
+	}
+}
+
 func TestSubOutboundServiceEditRebuildsClashProxyWithUIOverridesAndPreservesRawExtras(t *testing.T) {
 	db := initOutboundEditMergeTestDB(t, "suboutbound-edit.db")
 
@@ -360,6 +409,269 @@ func TestMihomoOutboundServiceEditPreservesHiddenRawFieldsAndUsesUIOverrides(t *
 	if extra, ok := proxy["extra"].(map[string]interface{}); !ok || extra["note"] != "raw" {
 		t.Fatalf("expected generated proxy extra.note to survive edit, got %#v", proxy["extra"])
 	}
+}
+
+func TestMihomoOutboundServiceEditAppliesEveryProtocolFieldExposedByTheEditor(t *testing.T) {
+	db := initOutboundEditMergeTestDB(t, "mihomo-editor-fields.db")
+	service := &MihomoOutboundService{}
+
+	saveAndEdit := func(t *testing.T, original map[string]interface{}, edit func(map[string]interface{}), verify func(map[string]interface{})) {
+		t.Helper()
+		if err := service.Save(db, "new", mustMarshalJSON(t, original)); err != nil {
+			t.Fatalf("save new outbound failed: %v", err)
+		}
+
+		tag, _ := original["tag"].(string)
+		record := &model.MihomoOutbound{}
+		if err := db.Where("tag = ?", tag).First(record).Error; err != nil {
+			t.Fatalf("load saved outbound failed: %v", err)
+		}
+
+		edited := cloneJSONMapForTest(original)
+		edited["id"] = float64(record.Id)
+		edit(edited)
+		if err := service.Save(db, "edit", mustMarshalJSON(t, edited)); err != nil {
+			t.Fatalf("save edited outbound failed: %v", err)
+		}
+
+		updated := &model.MihomoOutbound{}
+		if err := db.Where("tag = ?", tag).First(updated).Error; err != nil {
+			t.Fatalf("reload edited outbound failed: %v", err)
+		}
+		resolved, err := resolveMihomoOutboundJSON(updated)
+		if err != nil {
+			t.Fatalf("resolve edited outbound failed: %v", err)
+		}
+		verify(mustDecodeJSONMap(t, resolved))
+	}
+
+	t.Run("shadowsocks udp over tcp can be disabled", func(t *testing.T) {
+		saveAndEdit(t, map[string]interface{}{
+			"type":        "shadowsocks",
+			"tag":         "editor-ss-uot",
+			"server":      "1.1.1.1",
+			"server_port": float64(443),
+			"method":      "aes-128-gcm",
+			"password":    "secret",
+			"udp_over_tcp": map[string]interface{}{
+				"enabled": true,
+				"version": float64(1),
+			},
+		}, func(edited map[string]interface{}) {
+			delete(edited, "udp_over_tcp")
+		}, func(resolved map[string]interface{}) {
+			if _, exists := resolved["udp_over_tcp"]; exists {
+				t.Fatalf("udp_over_tcp was not removed after the UI disabled it: %#v", resolved["udp_over_tcp"])
+			}
+		})
+	})
+
+	t.Run("socks udp over tcp can be disabled", func(t *testing.T) {
+		saveAndEdit(t, map[string]interface{}{
+			"type":        "socks",
+			"tag":         "editor-socks-uot",
+			"server":      "1.1.1.1",
+			"server_port": float64(443),
+			"udp_over_tcp": map[string]interface{}{
+				"enabled": true,
+				"version": float64(2),
+			},
+		}, func(edited map[string]interface{}) {
+			delete(edited, "udp_over_tcp")
+		}, func(resolved map[string]interface{}) {
+			if _, exists := resolved["udp_over_tcp"]; exists {
+				t.Fatalf("socks udp_over_tcp was not removed after the UI disabled it: %#v", resolved["udp_over_tcp"])
+			}
+		})
+	})
+
+	t.Run("snell fields are updated", func(t *testing.T) {
+		saveAndEdit(t, map[string]interface{}{
+			"type":        "snell",
+			"tag":         "editor-snell",
+			"server":      "2.2.2.2",
+			"server_port": float64(443),
+			"psk":         "old-psk",
+			"version":     float64(4),
+			"udp":         false,
+			"reuse":       false,
+			"obfs_opts":   map[string]interface{}{"mode": "http", "host": "old.example"},
+		}, func(edited map[string]interface{}) {
+			edited["psk"] = "new-psk"
+			edited["version"] = float64(5)
+			edited["udp"] = true
+			edited["reuse"] = true
+			edited["obfs_opts"] = map[string]interface{}{"mode": "tls", "host": "new.example"}
+		}, func(resolved map[string]interface{}) {
+			if got, _ := resolved["psk"].(string); got != "new-psk" {
+				t.Fatalf("psk = %q, want new-psk", got)
+			}
+			if got, _ := resolved["version"].(float64); got != 5 {
+				t.Fatalf("version = %#v, want 5", resolved["version"])
+			}
+			if got, _ := resolved["udp"].(bool); !got {
+				t.Fatalf("udp = %#v, want true", resolved["udp"])
+			}
+			if got, _ := resolved["reuse"].(bool); !got {
+				t.Fatalf("reuse = %#v, want true", resolved["reuse"])
+			}
+			obfs, _ := resolved["obfs_opts"].(map[string]interface{})
+			if obfs == nil || obfs["mode"] != "tls" || obfs["host"] != "new.example" {
+				t.Fatalf("obfs_opts = %#v, want updated mode/host", resolved["obfs_opts"])
+			}
+		})
+	})
+
+	t.Run("hysteria port fields are updated", func(t *testing.T) {
+		saveAndEdit(t, map[string]interface{}{
+			"type":         "hysteria",
+			"tag":          "editor-hysteria",
+			"server":       "3.3.3.3",
+			"server_port":  float64(443),
+			"server_ports": []interface{}{"443:8443"},
+			"hop_interval": "10s",
+		}, func(edited map[string]interface{}) {
+			edited["server_ports"] = []interface{}{"8443:9443", "10443"}
+			edited["hop_interval"] = "30s"
+		}, func(resolved map[string]interface{}) {
+			ports, _ := resolved["server_ports"].([]interface{})
+			if len(ports) != 2 || ports[0] != "8443:9443" || ports[1] != "10443" {
+				t.Fatalf("server_ports = %#v, want edited ports", resolved["server_ports"])
+			}
+			if got, _ := resolved["hop_interval"].(string); got != "30s" {
+				t.Fatalf("hop_interval = %q, want 30s", got)
+			}
+		})
+	})
+
+	t.Run("tuic extended fields reach the runtime proxy", func(t *testing.T) {
+		saveAndEdit(t, map[string]interface{}{
+			"type":                      "tuic",
+			"tag":                       "editor-tuic",
+			"server":                    "4.4.4.4",
+			"server_port":               float64(443),
+			"token":                     "old-token",
+			"uuid":                      "old-id",
+			"password":                  "old-password",
+			"congestion_control":        "cubic",
+			"udp_relay_mode":            "native",
+			"udp_over_stream":           false,
+			"udp_over_stream_version":   float64(1),
+			"zero_rtt_handshake":        false,
+			"heartbeat":                 "1s",
+			"request_timeout":           "1000ms",
+			"max_open_streams":          float64(10),
+			"max_udp_relay_packet_size": float64(1200),
+			"cwnd":                      float64(20),
+			"ip":                        "192.0.2.10",
+			"disable_mtu_discovery":     false,
+			"max_datagram_frame_size":   float64(1000),
+		}, func(edited map[string]interface{}) {
+			edited["token"] = "new-token"
+			edited["uuid"] = "new-id"
+			edited["password"] = "new-password"
+			edited["congestion_control"] = "bbr"
+			edited["udp_relay_mode"] = "quic"
+			edited["udp_over_stream"] = true
+			edited["udp_over_stream_version"] = float64(2)
+			edited["zero_rtt_handshake"] = true
+			edited["heartbeat"] = "2s"
+			edited["request_timeout"] = "2500ms"
+			edited["max_open_streams"] = float64(99)
+			edited["max_udp_relay_packet_size"] = float64(1400)
+			edited["cwnd"] = float64(55)
+			edited["ip"] = "192.0.2.55"
+			edited["disable_mtu_discovery"] = true
+			edited["max_datagram_frame_size"] = float64(1300)
+		}, func(resolved map[string]interface{}) {
+			if got, _ := resolved["token"].(string); got != "new-token" {
+				t.Fatalf("token = %q, want new-token", got)
+			}
+			if got, _ := resolved["request_timeout"].(string); got != "2500ms" {
+				t.Fatalf("request_timeout = %q, want 2500ms", got)
+			}
+			if got, _ := resolved["max_open_streams"].(float64); got != 99 {
+				t.Fatalf("max_open_streams = %#v, want 99", resolved["max_open_streams"])
+			}
+
+			converted := convertMihomoOutboundsToClash([]map[string]interface{}{resolved})
+			if converted == nil || len(converted.Proxies) != 1 {
+				t.Fatalf("expected one TUIC proxy, got %#v", converted)
+			}
+			proxy := converted.Proxies[0]
+			if got, _ := proxy["token"].(string); got != "new-token" {
+				t.Fatalf("runtime token = %q, want new-token", got)
+			}
+			if got, _ := proxy["request-timeout"].(int); got != 2500 {
+				t.Fatalf("runtime request-timeout = %#v, want 2500", proxy["request-timeout"])
+			}
+			if got, _ := proxy["max-open-streams"].(int); got != 99 {
+				t.Fatalf("runtime max-open-streams = %#v, want 99", proxy["max-open-streams"])
+			}
+			if got, _ := proxy["udp-over-stream-version"].(int); got != 2 {
+				t.Fatalf("runtime udp-over-stream-version = %#v, want 2", proxy["udp-over-stream-version"])
+			}
+			if got, _ := proxy["max-datagram-frame-size"].(int); got != 1300 {
+				t.Fatalf("runtime max-datagram-frame-size = %#v, want 1300", proxy["max-datagram-frame-size"])
+			}
+			if got, _ := proxy["disable-mtu-discovery"].(bool); !got {
+				t.Fatalf("runtime disable-mtu-discovery = %#v, want true", proxy["disable-mtu-discovery"])
+			}
+		})
+	})
+
+	t.Run("ssh username aliases are updated together", func(t *testing.T) {
+		saveAndEdit(t, map[string]interface{}{
+			"type":        "ssh",
+			"tag":         "editor-ssh",
+			"server":      "5.5.5.5",
+			"server_port": float64(22),
+			"username":    "old-user",
+			"user":        "old-user",
+			"password":    "old-password",
+		}, func(edited map[string]interface{}) {
+			edited["username"] = "new-user"
+			edited["user"] = "new-user"
+		}, func(resolved map[string]interface{}) {
+			if got, _ := resolved["username"].(string); got != "new-user" {
+				t.Fatalf("username = %q, want new-user", got)
+			}
+			if got, _ := resolved["user"].(string); got != "new-user" {
+				t.Fatalf("user = %q, want new-user", got)
+			}
+			converted := convertMihomoOutboundsToClash([]map[string]interface{}{resolved})
+			if converted == nil || len(converted.Proxies) != 1 {
+				t.Fatalf("expected one SSH proxy, got %#v", converted)
+			}
+			if got, _ := converted.Proxies[0]["username"].(string); got != "new-user" {
+				t.Fatalf("runtime username = %q, want new-user", got)
+			}
+		})
+	})
+
+	t.Run("ssh optional algorithm fields can be disabled", func(t *testing.T) {
+		saveAndEdit(t, map[string]interface{}{
+			"type":          "ssh",
+			"tag":           "editor-ssh-options",
+			"server":        "5.5.5.5",
+			"server_port":   float64(22),
+			"username":      "user",
+			"password":      "secret",
+			"cipher":        []interface{}{"aes128-ctr"},
+			"mac":           []interface{}{"hmac-sha2-256"},
+			"kex_algorithm": []interface{}{"curve25519-sha256"},
+		}, func(edited map[string]interface{}) {
+			delete(edited, "cipher")
+			delete(edited, "mac")
+			delete(edited, "kex_algorithm")
+		}, func(resolved map[string]interface{}) {
+			for _, key := range []string{"cipher", "mac", "kex_algorithm"} {
+				if _, exists := resolved[key]; exists {
+					t.Fatalf("ssh %s was not removed after the UI disabled it: %#v", key, resolved[key])
+				}
+			}
+		})
+	})
 }
 
 func initOutboundEditMergeTestDB(t *testing.T, filename string) *gorm.DB {

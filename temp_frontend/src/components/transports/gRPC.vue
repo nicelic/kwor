@@ -31,6 +31,7 @@
       type="number"
       suffix="s"
       min="1"
+      step="any"
       v-model.number="idle_timeout">
       </v-text-field>
     </v-col>
@@ -41,6 +42,7 @@
       type="number"
       suffix="s"
       min="1"
+      step="any"
       v-model.number="ping_timeout">
       </v-text-field>
     </v-col>
@@ -52,6 +54,7 @@
       hide-details
       type="number"
       min="1"
+      step="1"
       v-model.number="ping_interval">
       </v-text-field>
     </v-col>
@@ -61,6 +64,7 @@
       hide-details
       type="number"
       min="1"
+      step="1"
       v-model.number="max_connections">
       </v-text-field>
     </v-col>
@@ -70,6 +74,7 @@
       hide-details
       type="number"
       min="0"
+      step="1"
       v-model.number="min_streams">
       </v-text-field>
     </v-col>
@@ -79,6 +84,7 @@
       hide-details
       type="number"
       min="0"
+      step="1"
       v-model.number="max_streams">
       </v-text-field>
     </v-col>
@@ -87,6 +93,7 @@
 
 <script lang="ts">
 import { gRPC } from '../../types/transport'
+import { readSingboxDuration, writeSingboxDuration } from '@/plugins/singboxDuration'
 export default {
   props: {
     transport: {
@@ -102,6 +109,33 @@ export default {
     return {
     }
   },
+  methods: {
+    normalizePositiveInteger(value: unknown): number | undefined {
+      if (value === '' || value === null || value === undefined) return undefined
+      const normalized = Number(value)
+      return Number.isSafeInteger(normalized) && normalized > 0 ? normalized : undefined
+    },
+    normalizeNonNegativeInteger(value: unknown): number | undefined {
+      if (value === '' || value === null || value === undefined) return undefined
+      const normalized = Number(value)
+      return Number.isSafeInteger(normalized) && normalized >= 0 ? normalized : undefined
+    },
+    sanitizeMihomoGRPCNumericFields() {
+      if (!this.isMihomo || String(this.$props.transport?.type ?? '').trim().toLowerCase() !== 'grpc') return
+      const positiveKeys = ['ping_interval', 'max_connections'] as const
+      const nonNegativeKeys = ['min_streams', 'max_streams'] as const
+      for (const key of positiveKeys) {
+        const normalized = this.normalizePositiveInteger(this.$props.transport[key])
+        if (normalized === undefined) delete this.$props.transport[key]
+        else this.$props.transport[key] = normalized
+      }
+      for (const key of nonNegativeKeys) {
+        const normalized = this.normalizeNonNegativeInteger(this.$props.transport[key])
+        if (normalized === undefined) delete this.$props.transport[key]
+        else this.$props.transport[key] = normalized
+      }
+    },
+  },
   computed: {
     isMihomo(): boolean {
       return this.$props.namespace === 'mihomo'
@@ -110,53 +144,61 @@ export default {
       return <gRPC> this.$props.transport?? {}
     },
     idle_timeout: {
-      get() { return this.GRPC.idle_timeout ? parseInt(this.GRPC.idle_timeout.replace('s','')) : '' },
-      set(newValue:number) { this.$props.transport.idle_timeout = newValue ? newValue + 's' : '' }
+      get() { return readSingboxDuration(this.GRPC.idle_timeout, 's') ?? '' },
+      set(newValue:number) {
+        const normalized = writeSingboxDuration(newValue, 's', { minimum: 1 })
+        if (normalized === undefined) delete this.$props.transport.idle_timeout
+        else this.$props.transport.idle_timeout = normalized
+      }
     },
     ping_timeout: {
-      get() { return this.GRPC.ping_timeout ? parseInt(this.GRPC.ping_timeout.replace('s','')) : '' },
-      set(newValue:number) { this.$props.transport.ping_timeout = newValue ? newValue + 's' : '' }
+      get() { return readSingboxDuration(this.GRPC.ping_timeout, 's') ?? '' },
+      set(newValue:number) {
+        const normalized = writeSingboxDuration(newValue, 's', { minimum: 1 })
+        if (normalized === undefined) delete this.$props.transport.ping_timeout
+        else this.$props.transport.ping_timeout = normalized
+      }
     },
     ping_interval: {
       get() { return this.GRPC.ping_interval ?? '' },
       set(newValue:number) {
-        if (newValue && newValue > 0) {
-          this.$props.transport.ping_interval = Math.floor(newValue)
-        } else {
-          delete this.$props.transport.ping_interval
-        }
+        const normalized = this.normalizePositiveInteger(newValue)
+        if (normalized === undefined) delete this.$props.transport.ping_interval
+        else this.$props.transport.ping_interval = normalized
       },
     },
     max_connections: {
       get() { return this.GRPC.max_connections ?? '' },
       set(newValue:number) {
-        if (newValue && newValue > 0) {
-          this.$props.transport.max_connections = Math.floor(newValue)
-        } else {
-          delete this.$props.transport.max_connections
-        }
+        const normalized = this.normalizePositiveInteger(newValue)
+        if (normalized === undefined) delete this.$props.transport.max_connections
+        else this.$props.transport.max_connections = normalized
       },
     },
     min_streams: {
       get() { return this.GRPC.min_streams ?? '' },
       set(newValue:number) {
-        if (newValue === 0 || (newValue && newValue > 0)) {
-          this.$props.transport.min_streams = Math.floor(newValue)
-        } else {
-          delete this.$props.transport.min_streams
-        }
+        const normalized = this.normalizeNonNegativeInteger(newValue)
+        if (normalized === undefined) delete this.$props.transport.min_streams
+        else this.$props.transport.min_streams = normalized
       },
     },
     max_streams: {
       get() { return this.GRPC.max_streams ?? '' },
       set(newValue:number) {
-        if (newValue === 0 || (newValue && newValue > 0)) {
-          this.$props.transport.max_streams = Math.floor(newValue)
-        } else {
-          delete this.$props.transport.max_streams
-        }
+        const normalized = this.normalizeNonNegativeInteger(newValue)
+        if (normalized === undefined) delete this.$props.transport.max_streams
+        else this.$props.transport.max_streams = normalized
       },
     }
-  }
+  },
+  watch: {
+    transport: {
+      handler() {
+        this.sanitizeMihomoGRPCNumericFields()
+      },
+      immediate: true,
+    },
+  },
 }
 </script>

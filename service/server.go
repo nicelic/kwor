@@ -1,7 +1,6 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -22,6 +21,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alireza0/s-ui/config"
@@ -37,6 +37,10 @@ import (
 )
 
 type ServerService struct{}
+
+// tlsKeyPairGenerationGate prevents concurrent self-signed certificate chains
+// from competing for CPU, especially when RSA8192 is selected from the panel.
+var tlsKeyPairGenerationGate = make(chan struct{}, 1)
 
 type tlsCertificateUsage string
 
@@ -59,7 +63,33 @@ type systemdUnitStats struct {
 	UptimeSec uint64
 }
 
-const systemdStatusCommandTimeout = 2 * time.Second
+const (
+	systemdStatusCommandTimeout = 2 * time.Second
+	systemdUnitActiveCacheTTL   = 3 * time.Second
+)
+
+type systemdUnitActiveCacheEntry struct {
+	checkedAt time.Time
+	active    bool
+}
+
+var systemdUnitActiveCache = struct {
+	sync.Mutex
+	generation uint64
+	entries    map[string]systemdUnitActiveCacheEntry
+	inflight   map[string]chan struct{}
+}{
+	entries:  make(map[string]systemdUnitActiveCacheEntry),
+	inflight: make(map[string]chan struct{}),
+}
+
+var systemctlUnitIsActiveFn = func(unit string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), systemdStatusCommandTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit).Run() == nil
+}
+
+var cpuPercentFn = cpu.Percent
 
 type managedCoreRuntimeInspector interface {
 	IsRunning() bool
@@ -93,13 +123,16 @@ func (s *ServerService) GetStatus(request string) *map[string]interface{} {
 }
 
 func (s *ServerService) GetCpuPercent() float64 {
-	percents, err := cpu.Percent(0, false)
+	percents, err := cpuPercentFn(0, false)
 	if err != nil {
 		logger.Warning("get cpu percent failed:", err)
 		return 0
-	} else {
-		return percents[0]
 	}
+	if len(percents) == 0 {
+		logger.Warning("get cpu percent returned no samples")
+		return 0
+	}
+	return percents[0]
 }
 
 func (s *ServerService) GetUptime() uint64 {
@@ -186,21 +219,32 @@ func (s *ServerService) GetNetInfo() map[string]interface{} {
 
 func (s *ServerService) GetSingboxInfo() map[string]interface{} {
 	appProcessStats := s.getProcessRuntimeStats(int32(os.Getpid()))
-	appStats := s.getAppRuntimeStats()
+	appStats := s.getAppRuntimeStatsFromProcess(appProcessStats)
+	directManagedCoreRuntime := !IsSystemPlatformLinux() || shouldUseDirectManagedCoreRuntime()
 	singboxStats := s.getSingboxRuntimeStats()
 	singboxProcessStats := runtimeStats{}
 	if singboxStats.MainPID > 0 {
-		singboxProcessStats = s.getProcessRuntimeStats(singboxStats.MainPID)
+		if directManagedCoreRuntime {
+			singboxProcessStats = runtimeStatsFromManagedCoreUnit(singboxStats)
+		} else {
+			singboxProcessStats = s.getProcessRuntimeStats(singboxStats.MainPID)
+		}
 	}
 	mihomoStats := s.getMihomoRuntimeStats()
 	mihomoProcessStats := runtimeStats{}
 	if mihomoStats.MainPID > 0 {
-		mihomoProcessStats = s.getProcessRuntimeStats(mihomoStats.MainPID)
+		if directManagedCoreRuntime {
+			mihomoProcessStats = runtimeStatsFromManagedCoreUnit(mihomoStats)
+		} else {
+			mihomoProcessStats = s.getProcessRuntimeStats(mihomoStats.MainPID)
+		}
 	}
 
-	appActualStats := preferRuntimeStats(appProcessStats, appStats)
-	singboxActualStats := preferManagedCoreRuntimeStats(singboxProcessStats, singboxStats)
-	mihomoActualStats := preferManagedCoreRuntimeStats(mihomoProcessStats, mihomoStats)
+	// systemd cgroup memory is the panel's actual service footprint; process
+	// RSS remains the fallback for direct-runtime and non-systemd deployments.
+	appActualStats := preferRuntimeStats(appStats, appProcessStats)
+	singboxActualStats := preferManagedCoreRuntimeStatsFromCgroup(singboxStats, singboxProcessStats)
+	mihomoActualStats := preferManagedCoreRuntimeStatsFromCgroup(mihomoStats, mihomoProcessStats)
 
 	coreCombinedMemory := singboxStats.Memory + mihomoStats.Memory
 	coreCombinedMemoryRSS := singboxProcessStats.MemoryBytes + mihomoProcessStats.MemoryBytes
@@ -208,7 +252,8 @@ func (s *ServerService) GetSingboxInfo() map[string]interface{} {
 	totalMemoryRSS := appProcessStats.MemoryBytes + coreCombinedMemoryRSS
 
 	return map[string]interface{}{
-		"running": singboxStats.Active,
+		"running":       singboxStats.Active,
+		"mihomoRunning": mihomoStats.Active,
 		"stats": map[string]interface{}{
 			"AppMemory":             appStats.MemoryBytes,
 			"CoreMemory":            singboxStats.Memory,
@@ -243,8 +288,14 @@ func (s *ServerService) GetSingboxInfo() map[string]interface{} {
 }
 
 func (s *ServerService) getAppRuntimeStats() runtimeStats {
-	stats := s.getProcessRuntimeStats(int32(os.Getpid()))
-	if !IsSystemPlatformLinux() {
+	return s.getAppRuntimeStatsFromProcess(s.getProcessRuntimeStats(int32(os.Getpid())))
+}
+
+func (s *ServerService) getAppRuntimeStatsFromProcess(stats runtimeStats) runtimeStats {
+	// Direct managed cores can share the panel service cgroup. In that mode
+	// the cgroup is a combined footprint rather than the panel process itself,
+	// so use the panel RSS and keep each core in its own process segment.
+	if !IsSystemPlatformLinux() || shouldUseDirectManagedCoreRuntime() {
 		return stats
 	}
 
@@ -269,55 +320,105 @@ func (s *ServerService) getAppRuntimeStats() runtimeStats {
 	return stats
 }
 
+func runtimeStatsFromManagedCoreUnit(stats systemdUnitStats) runtimeStats {
+	return runtimeStats{
+		MemoryBytes: stats.Memory,
+		Threads:     stats.Tasks,
+		Uptime:      stats.UptimeSec,
+	}
+}
+
 func (s *ServerService) getSingboxRuntimeStats() systemdUnitStats {
-	return s.getManagedCoreRuntimeStats(singboxSystemdName, "sing-box", &CoreManagerService{})
+	coreManager := &CoreManagerService{}
+	return s.getManagedCoreRuntimeStats(singboxSystemdName, coreManager.getCoreBinPath(), coreManager)
 }
 
 func (s *ServerService) getMihomoRuntimeStats() systemdUnitStats {
-	return s.getManagedCoreRuntimeStats(mihomoSystemdName, "mihomo", &MihomoCoreManagerService{})
+	coreManager := &MihomoCoreManagerService{}
+	return s.getManagedCoreRuntimeStats(mihomoSystemdName, coreManager.getCoreBinPath(), coreManager)
 }
 
-func (s *ServerService) getManagedCoreRuntimeStats(unit string, processName string, inspector managedCoreRuntimeInspector) systemdUnitStats {
+func (s *ServerService) getManagedCoreRuntimeStats(unit string, binaryPath string, inspector managedCoreRuntimeInspector) systemdUnitStats {
 	stats := systemdUnitStats{}
-	if !IsSystemPlatformLinux() {
-		return stats
+
+	if !IsSystemPlatformLinux() || shouldUseDirectManagedCoreRuntime() {
+		// A direct runtime can be identified from the exact managed binary path.
+		// Check that once before falling back to the manager's own probe so a
+		// Windows dashboard refresh does not enumerate processes twice per core.
+		procStats := s.findManagedCoreProcessStatsByBinaryPath(binaryPath)
+		running := procStats.pid > 0
+		if !running && !procStats.knownAbsent && inspector != nil {
+			running = inspector.IsRunning()
+		}
+		if !running && procStats.scannedAbsent && !procStats.knownAbsent {
+			rememberManagedCoreProcessAbsent(managedCoreProcessRuntimeCacheKey(binaryPath))
+		}
+		return managedCoreRuntimeStatsFromDirectProcess(running, procStats)
 	}
 
-	if shouldUseDirectManagedCoreRuntime() {
-		if inspector == nil || !inspector.IsRunning() {
-			return stats
-		}
-		procStats := s.findManagedCoreProcessStats(processName)
-		if procStats.pid <= 0 {
-			return stats
-		}
-		stats.Active = true
-		stats.MainPID = procStats.pid
-		stats.Memory = procStats.MemoryBytes
-		stats.Tasks = procStats.Threads
-		stats.UptimeSec = procStats.Uptime
-		return stats
-	}
+	running := inspector != nil && inspector.IsRunning()
 
 	unitStats, err := s.getSystemdUnitStats(unit)
 	if err != nil {
+		// A systemctl show failure must not turn an independently running core
+		// into a false negative or erase its memory display. IsRunning uses the
+		// lightweight is-active probe, while the exact managed binary path is a
+		// bounded fallback for RSS and thread data.
+		fallback := s.findManagedCoreProcessStatsByBinaryPath(binaryPath)
+		if fallback.pid > 0 {
+			return managedCoreRuntimeStatsFromDirectProcess(true, fallback)
+		}
+		stats.Active = running
 		return stats
 	}
 	stats = unitStats
+	if !stats.Active && running {
+		stats.Active = true
+	}
 
 	if stats.MainPID > 0 {
-		procStats := s.getProcessRuntimeStats(stats.MainPID)
-		if stats.Memory == 0 {
-			stats.Memory = procStats.MemoryBytes
-		}
-		if stats.Tasks == 0 {
-			stats.Tasks = procStats.Threads
-		}
-		if stats.UptimeSec == 0 {
-			stats.UptimeSec = procStats.Uptime
+		mergeManagedCoreProcessStats(&stats, s.getProcessRuntimeStats(stats.MainPID))
+	} else if stats.Active || running {
+		// Some systemd-compatible environments expose ActiveState but no usable
+		// MainPID. Recover the exact managed process metrics without changing the
+		// independent core's lifecycle decision.
+		fallback := s.findManagedCoreProcessStatsByBinaryPath(binaryPath)
+		if fallback.pid > 0 {
+			stats.MainPID = fallback.pid
+			mergeManagedCoreProcessStats(&stats, fallback.runtimeStats)
 		}
 	}
 
+	return stats
+}
+
+func mergeManagedCoreProcessStats(stats *systemdUnitStats, processStats runtimeStats) {
+	if stats == nil {
+		return
+	}
+	if stats.Memory == 0 {
+		stats.Memory = processStats.MemoryBytes
+	}
+	if stats.Tasks == 0 {
+		stats.Tasks = processStats.Threads
+	}
+	if stats.UptimeSec == 0 {
+		stats.UptimeSec = processStats.Uptime
+	}
+}
+
+func managedCoreRuntimeStatsFromDirectProcess(running bool, procStats processRuntimeStatsWithPID) systemdUnitStats {
+	if !running {
+		return systemdUnitStats{}
+	}
+	stats := systemdUnitStats{Active: true}
+	if procStats.pid <= 0 {
+		return stats
+	}
+	stats.MainPID = procStats.pid
+	stats.Memory = procStats.MemoryBytes
+	stats.Tasks = procStats.Threads
+	stats.UptimeSec = procStats.Uptime
 	return stats
 }
 
@@ -342,47 +443,140 @@ func preferManagedCoreRuntimeStats(primary runtimeStats, fallback systemdUnitSta
 	})
 }
 
+func preferManagedCoreRuntimeStatsFromCgroup(cgroup systemdUnitStats, processStats runtimeStats) runtimeStats {
+	return preferRuntimeStats(runtimeStats{
+		MemoryBytes: cgroup.Memory,
+		Threads:     cgroup.Tasks,
+		Uptime:      cgroup.UptimeSec,
+	}, processStats)
+}
+
 type processRuntimeStatsWithPID struct {
-	pid int32
+	pid           int32
+	knownAbsent   bool
+	scannedAbsent bool
 	runtimeStats
 }
 
-func (s *ServerService) findManagedCoreProcessStats(processName string) processRuntimeStatsWithPID {
+// Direct-runtime status checks used to enumerate every process on each
+// dashboard request. Keep only a small, identity-checked PID cache: the
+// create-time and executable path validation prevents PID reuse from turning a
+// different process into a false Core status, while normal lifecycle invalidation
+// forces the next request to rediscover a just-started binary.
+var managedCoreProcessRuntimeCache = struct {
+	sync.Mutex
+	entries map[string]managedCoreProcessRuntimeCacheEntry
+}{
+	entries: make(map[string]managedCoreProcessRuntimeCacheEntry),
+}
+
+const managedCoreProcessMissingCacheTTL = 12 * time.Second
+
+type managedCoreProcessRuntimeCacheEntry struct {
+	identity     managedProcessIdentity
+	missingUntil time.Time
+}
+
+func invalidateManagedCoreProcessRuntimeCache() {
+	managedCoreProcessRuntimeCache.Lock()
+	managedCoreProcessRuntimeCache.entries = make(map[string]managedCoreProcessRuntimeCacheEntry)
+	managedCoreProcessRuntimeCache.Unlock()
+}
+
+func managedCoreProcessRuntimeCacheKey(path string) string {
+	path = normalizeManagedCoreProcessPath(path)
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(path)
+	}
+	return path
+}
+
+func rememberManagedCoreProcessAbsent(cacheKey string) {
+	if cacheKey == "" {
+		return
+	}
+	managedCoreProcessRuntimeCache.Lock()
+	managedCoreProcessRuntimeCache.entries[cacheKey] = managedCoreProcessRuntimeCacheEntry{
+		missingUntil: time.Now().Add(managedCoreProcessMissingCacheTTL),
+	}
+	managedCoreProcessRuntimeCache.Unlock()
+}
+
+func rememberManagedCoreProcessIdentity(cacheKey string, identity managedProcessIdentity) {
+	if cacheKey == "" || identity.pid <= 0 {
+		return
+	}
+	managedCoreProcessRuntimeCache.Lock()
+	managedCoreProcessRuntimeCache.entries[cacheKey] = managedCoreProcessRuntimeCacheEntry{identity: identity}
+	managedCoreProcessRuntimeCache.Unlock()
+}
+
+func cachedManagedCoreProcessRunning(binaryPath string) (bool, bool) {
+	cacheKey := managedCoreProcessRuntimeCacheKey(binaryPath)
+	if cacheKey == "" {
+		return false, false
+	}
+	managedCoreProcessRuntimeCache.Lock()
+	entry, ok := managedCoreProcessRuntimeCache.entries[cacheKey]
+	managedCoreProcessRuntimeCache.Unlock()
+	if !ok {
+		return false, false
+	}
+	if entry.missingUntil.After(time.Now()) {
+		return false, true
+	}
+	if managedProcessIdentityMatches(entry.identity) {
+		return true, true
+	}
+	managedCoreProcessRuntimeCache.Lock()
+	delete(managedCoreProcessRuntimeCache.entries, cacheKey)
+	managedCoreProcessRuntimeCache.Unlock()
+	return false, false
+}
+
+func (s *ServerService) findManagedCoreProcessStatsByBinaryPath(binaryPath string) processRuntimeStatsWithPID {
 	result := processRuntimeStatsWithPID{}
-	processName = strings.TrimSpace(processName)
-	if processName == "" {
+	binaryPath = strings.TrimSpace(binaryPath)
+	if binaryPath == "" {
 		return result
 	}
+	cacheKey := managedCoreProcessRuntimeCacheKey(binaryPath)
+	managedCoreProcessRuntimeCache.Lock()
+	cachedEntry, cached := managedCoreProcessRuntimeCache.entries[cacheKey]
+	managedCoreProcessRuntimeCache.Unlock()
+	if cached {
+		if cachedEntry.missingUntil.After(time.Now()) {
+			return processRuntimeStatsWithPID{knownAbsent: true, scannedAbsent: true}
+		}
+		if managedProcessIdentityMatches(cachedEntry.identity) {
+			return processRuntimeStatsWithPID{
+				pid:          cachedEntry.identity.pid,
+				runtimeStats: s.getProcessRuntimeStats(cachedEntry.identity.pid),
+			}
+		}
+		managedCoreProcessRuntimeCache.Lock()
+		delete(managedCoreProcessRuntimeCache.entries, cacheKey)
+		managedCoreProcessRuntimeCache.Unlock()
+	}
 
-	processes, err := process.Processes()
+	processes, err := findManagedCoreProcessesByBinaryPath(binaryPath)
 	if err != nil {
 		return result
 	}
 	for _, proc := range processes {
-		if proc == nil {
+		if proc == nil || !managedCoreProcessRunning(proc) {
 			continue
-		}
-		name, err := proc.Name()
-		if err != nil {
-			continue
-		}
-		if name != processName {
-			continue
-		}
-		exe, exeErr := proc.Exe()
-		if exeErr == nil {
-			exe = filepath.Clean(exe)
-			expected := filepath.Clean(filepath.Join(config.GetDataDir(), "core"))
-			if !strings.Contains(exe, expected) {
-				continue
-			}
 		}
 		stats := s.getProcessRuntimeStats(proc.Pid)
+		if identity, identityErr := captureManagedProcessIdentity(proc, binaryPath); identityErr == nil {
+			rememberManagedCoreProcessIdentity(cacheKey, identity)
+		}
 		return processRuntimeStatsWithPID{
 			pid:          proc.Pid,
 			runtimeStats: stats,
 		}
 	}
+	result.scannedAbsent = true
 	return result
 }
 
@@ -479,9 +673,61 @@ func (s *ServerService) getSystemdUnitStats(unit string) (systemdUnitStats, erro
 }
 
 func systemctlUnitIsActive(unit string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), systemdStatusCommandTimeout)
-	defer cancel()
-	return exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit).Run() == nil
+	unit = strings.TrimSpace(unit)
+	if unit == "" {
+		return false
+	}
+
+	for {
+		now := time.Now()
+		systemdUnitActiveCache.Lock()
+		if cached, ok := systemdUnitActiveCache.entries[unit]; ok && now.Sub(cached.checkedAt) < systemdUnitActiveCacheTTL {
+			active := cached.active
+			systemdUnitActiveCache.Unlock()
+			return active
+		}
+		if done := systemdUnitActiveCache.inflight[unit]; done != nil {
+			systemdUnitActiveCache.Unlock()
+			<-done
+			continue
+		}
+		done := make(chan struct{})
+		systemdUnitActiveCache.inflight[unit] = done
+		generation := systemdUnitActiveCache.generation
+		systemdUnitActiveCache.Unlock()
+
+		active := false
+		func() {
+			defer func() {
+				if recover() != nil {
+					active = false
+				}
+			}()
+			active = systemctlUnitIsActiveFn(unit)
+		}()
+
+		systemdUnitActiveCache.Lock()
+		delete(systemdUnitActiveCache.inflight, unit)
+		if systemdUnitActiveCache.generation == generation {
+			systemdUnitActiveCache.entries[unit] = systemdUnitActiveCacheEntry{
+				checkedAt: time.Now(),
+				active:    active,
+			}
+		}
+		close(done)
+		systemdUnitActiveCache.Unlock()
+		return active
+	}
+}
+
+// invalidateSystemdUnitActiveCache is called after systemctl mutations and
+// runtime lifecycle changes. The cache only avoids duplicate probes within a
+// sampler pass; it must never mask a just-started or just-stopped core.
+func invalidateSystemdUnitActiveCache() {
+	systemdUnitActiveCache.Lock()
+	systemdUnitActiveCache.generation++
+	systemdUnitActiveCache.entries = make(map[string]systemdUnitActiveCacheEntry)
+	systemdUnitActiveCache.Unlock()
 }
 
 func parseSystemdShowOutput(output string) map[string]string {
@@ -498,13 +744,17 @@ func parseSystemdShowOutput(output string) map[string]string {
 
 func (s *ServerService) GetSystemInfo() map[string]interface{} {
 	info := make(map[string]interface{}, 0)
-	var rtm runtime.MemStats
-	runtime.ReadMemStats(&rtm)
-
-	info["appMem"] = rtm.Sys
+	// Never present runtime.MemStats.Sys as process memory: it is allocator
+	// reservation, not resident usage. The managed service cgroup is preferred
+	// on Linux and process RSS is the fallback on other hosts.
+	appRSS := s.getProcessRuntimeStats(int32(os.Getpid()))
+	appStats := s.getAppRuntimeStatsFromProcess(appRSS)
+	info["appMem"] = appStats.MemoryBytes
+	info["appMemoryRSS"] = appRSS.MemoryBytes
+	info["appMemoryActual"] = appStats.MemoryBytes
 	info["appThreads"] = uint32(runtime.NumGoroutine())
 	cpuInfo, err := cpu.Info()
-	if err == nil {
+	if err == nil && len(cpuInfo) > 0 {
 		info["cpuType"] = cpuInfo[0].ModelName
 	}
 	info["cpuCount"] = runtime.NumCPU()
@@ -587,69 +837,48 @@ func (s *ServerService) GenKeypairWithTemplate(keyType string, options string, t
 	return []string{"Failed to generate keypair"}
 }
 
-// GenerateTLSPublicKeySHA256 calculates SHA-256 of certificate public key via openssl.
+type TLSCertificateInspection struct {
+	PublicKeySHA256    string `json:"public_key_sha256"`
+	Fingerprint        string `json:"fingerprint"`
+	SignatureAlgorithm string `json:"signature_algorithm"`
+	KeyAlgorithm       string `json:"key_algorithm"`
+	TemplateCode       string `json:"template_code"`
+}
+
+// GenerateTLSPublicKeySHA256 calculates SHA-256 of a certificate public key.
 // sourceType supports "path" (certificate_path) and "pem" (certificate_pem).
 func (s *ServerService) GenerateTLSPublicKeySHA256(sourceType string, certificatePath string, certificatePEM string) (string, error) {
-	certInput, err := loadCertificateInput(sourceType, certificatePath, certificatePEM)
+	inspection, err := s.InspectTLSCertificate(sourceType, certificatePath, certificatePEM)
 	if err != nil {
 		return "", err
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	pubKeyPEM, err := runOpenSSLCommand(ctx, []string{"x509", "-pubkey", "-noout"}, certInput)
-	if err != nil {
-		return "", err
-	}
-	pubKeyDER, err := runOpenSSLCommand(ctx, []string{"pkey", "-pubin", "-outform", "der"}, pubKeyPEM)
-	if err != nil {
-		return "", err
-	}
-	sha256Raw, err := runOpenSSLCommand(ctx, []string{"dgst", "-sha256", "-binary"}, pubKeyDER)
-	if err != nil {
-		return "", err
-	}
-	sha256Base64, err := runOpenSSLCommand(ctx, []string{"enc", "-base64", "-A"}, sha256Raw)
-	if err != nil {
-		return "", err
-	}
-
-	hash := strings.TrimSpace(string(sha256Base64))
-	if hash == "" {
-		return "", fmt.Errorf("failed to generate sha256: empty output")
-	}
-	if _, err := base64.StdEncoding.DecodeString(hash); err != nil {
-		return "", fmt.Errorf("failed to parse sha256 output: %w", err)
-	}
-	return hash, nil
+	return inspection.PublicKeySHA256, nil
 }
 
 // GenerateTLSCertificateFingerprint calculates SHA-256 certificate fingerprint in OpenSSL style.
 // sourceType supports "path" (certificate_path) and "pem" (certificate_pem).
 func (s *ServerService) GenerateTLSCertificateFingerprint(sourceType string, certificatePath string, certificatePEM string) (string, error) {
-	certInput, err := loadCertificateInput(sourceType, certificatePath, certificatePEM)
+	inspection, err := s.InspectTLSCertificate(sourceType, certificatePath, certificatePEM)
 	if err != nil {
 		return "", err
 	}
-
-	certs, err := parseCertificates(certInput)
-	if err != nil {
-		return "", err
-	}
-
-	sum := sha256.Sum256(certs[0].Raw)
-	hexStr := strings.ToUpper(hex.EncodeToString(sum[:]))
-	parts := make([]string, 0, len(hexStr)/2)
-	for i := 0; i < len(hexStr); i += 2 {
-		parts = append(parts, hexStr[i:i+2])
-	}
-	return strings.Join(parts, ":"), nil
+	return inspection.Fingerprint, nil
 }
 
 // DetectTLSCertificateAlgorithm detects signature and key algorithm strength from a certificate.
 // sourceType supports "path" (certificate_path) and "pem" (certificate_pem).
 func (s *ServerService) DetectTLSCertificateAlgorithm(sourceType string, certificatePath string, certificatePEM string) (map[string]string, error) {
+	inspection, err := s.InspectTLSCertificate(sourceType, certificatePath, certificatePEM)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{
+		"signature_algorithm": inspection.SignatureAlgorithm,
+		"key_algorithm":       inspection.KeyAlgorithm,
+	}, nil
+}
+
+func (s *ServerService) InspectTLSCertificate(sourceType string, certificatePath string, certificatePEM string) (*TLSCertificateInspection, error) {
 	certInput, err := loadCertificateInput(sourceType, certificatePath, certificatePEM)
 	if err != nil {
 		return nil, err
@@ -671,24 +900,33 @@ func (s *ServerService) DetectTLSCertificateAlgorithm(sourceType string, certifi
 		signatureAlgorithm = keyAlgorithm
 	}
 
-	return map[string]string{
-		"signature_algorithm": signatureAlgorithm,
-		"key_algorithm":       keyAlgorithm,
+	publicKeyDER, err := x509.MarshalPKIXPublicKey(leafCert.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal certificate public key: %w", err)
+	}
+	publicKeySHA256 := sha256.Sum256(publicKeyDER)
+	fingerprintSum := sha256.Sum256(leafCert.Raw)
+	fingerprintHex := strings.ToUpper(hex.EncodeToString(fingerprintSum[:]))
+	fingerprintParts := make([]string, 0, len(fingerprintHex)/2)
+	for i := 0; i < len(fingerprintHex); i += 2 {
+		fingerprintParts = append(fingerprintParts, fingerprintHex[i:i+2])
+	}
+
+	return &TLSCertificateInspection{
+		PublicKeySHA256:    base64.StdEncoding.EncodeToString(publicKeySHA256[:]),
+		Fingerprint:        strings.Join(fingerprintParts, ":"),
+		SignatureAlgorithm: signatureAlgorithm,
+		KeyAlgorithm:       keyAlgorithm,
+		TemplateCode:       detectTLSSelfSignedTemplateCode(certs),
 	}, nil
 }
 
 func (s *ServerService) DetectTLSSelfSignedTemplate(sourceType string, certificatePath string, certificatePEM string) (string, error) {
-	certInput, err := loadCertificateInput(sourceType, certificatePath, certificatePEM)
+	inspection, err := s.InspectTLSCertificate(sourceType, certificatePath, certificatePEM)
 	if err != nil {
 		return "", err
 	}
-
-	certs, err := parseCertificates(certInput)
-	if err != nil {
-		return "", err
-	}
-
-	return detectTLSSelfSignedTemplateCode(certs), nil
+	return inspection.TemplateCode, nil
 }
 
 func loadCertificateInput(sourceType string, certificatePath string, certificatePEM string) ([]byte, error) {
@@ -704,7 +942,7 @@ func loadCertificateInput(sourceType string, certificatePath string, certificate
 		if path == "" {
 			return nil, fmt.Errorf("certificate_path is required when source_type is path")
 		}
-		content, err := os.ReadFile(path)
+		content, _, err := readTLSPathMaterial(path)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read certificate file: %w", err)
 		}
@@ -713,6 +951,9 @@ func loadCertificateInput(sourceType string, certificatePath string, certificate
 		content := strings.TrimSpace(certificatePEM)
 		if content == "" {
 			return nil, fmt.Errorf("certificate_pem is required when source_type is pem")
+		}
+		if len(content) > int(maxTLSPathMaterialBytes) {
+			return nil, fmt.Errorf("certificate PEM exceeds the %d byte limit", maxTLSPathMaterialBytes)
 		}
 		certInput = []byte(content + "\n")
 	default:
@@ -727,6 +968,7 @@ func loadCertificateInput(sourceType string, certificatePath string, certificate
 }
 
 func parseCertificates(certInput []byte) ([]*x509.Certificate, error) {
+	const maxTLSCertificateChainEntries = 16
 	rest := certInput
 	certs := make([]*x509.Certificate, 0)
 	for len(rest) > 0 {
@@ -737,6 +979,9 @@ func parseCertificates(certInput []byte) ([]*x509.Certificate, error) {
 		}
 		if block.Type != "CERTIFICATE" {
 			continue
+		}
+		if len(certs) >= maxTLSCertificateChainEntries {
+			return nil, fmt.Errorf("certificate chain exceeds the %d certificate limit", maxTLSCertificateChainEntries)
 		}
 		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
@@ -823,30 +1068,6 @@ func detectRSAAlgorithmByBits(bits int) string {
 	return ""
 }
 
-func runOpenSSLCommand(ctx context.Context, args []string, input []byte) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "openssl", args...)
-	if len(input) > 0 {
-		cmd.Stdin = bytes.NewReader(input)
-	}
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("openssl command timeout")
-		}
-		errText := strings.TrimSpace(stderr.String())
-		if errText == "" {
-			errText = err.Error()
-		}
-		return nil, fmt.Errorf("openssl %s failed: %s", strings.Join(args, " "), errText)
-	}
-
-	return stdout.Bytes(), nil
-}
-
 func (s *ServerService) generateECHKeyPair(serverName string) []string {
 	_ = serverName
 	return []string{"ECH keypair generation is disabled in this build to keep sing-box code fully external"}
@@ -860,6 +1081,15 @@ func (s *ServerService) generateTLSKeyPair(options string) []string {
 }
 
 func (s *ServerService) generateTLSKeyPairWithTemplate(options string, templateCode string) []string {
+	select {
+	case tlsKeyPairGenerationGate <- struct{}{}:
+		defer func() {
+			<-tlsKeyPairGenerationGate
+		}()
+	default:
+		return []string{"Failed to generate TLS keypair: generation already in progress"}
+	}
+
 	parts := strings.Split(options, ",")
 	serverName := parts[0]
 	durationValue := 1
@@ -1019,6 +1249,10 @@ func (s *ServerService) generateCertWithAlgorithm(serverName string, keyAlgorith
 }
 
 func (s *ServerService) generateCertWithTemplate(serverName string, keyAlgorithm string, signatureAlgorithm string, usage tlsCertificateUsage, notBefore time.Time, notAfter time.Time, templateProfile *tlsSelfSignedTemplateProfile) ([]byte, []byte, error) {
+	return s.generateCertWithTemplateForNames([]string{serverName}, keyAlgorithm, signatureAlgorithm, usage, notBefore, notAfter, templateProfile)
+}
+
+func (s *ServerService) generateCertWithTemplateForNames(serverNames []string, keyAlgorithm string, signatureAlgorithm string, usage tlsCertificateUsage, notBefore time.Time, notAfter time.Time, templateProfile *tlsSelfSignedTemplateProfile) ([]byte, []byte, error) {
 	rootPrivKey, rootPubKey, err := s.generateKeyPairByAlgorithm(signatureAlgorithm)
 	if err != nil {
 		return nil, nil, err
@@ -1111,6 +1345,17 @@ func (s *ServerService) generateCertWithTemplate(serverName string, keyAlgorithm
 		return nil, nil, err
 	}
 
+	leafKeyUsage := x509.KeyUsageDigitalSignature
+	leafExtKeyUsage := tlsLeafExtKeyUsage(usage)
+	if templateProfile != nil {
+		if templateProfile.LeafKeyUsage != 0 {
+			leafKeyUsage = templateProfile.LeafKeyUsage
+		}
+		if len(templateProfile.LeafExtKeyUsage) > 0 {
+			leafExtKeyUsage = append([]x509.ExtKeyUsage(nil), templateProfile.LeafExtKeyUsage...)
+		}
+	}
+
 	leafTemplate := x509.Certificate{
 		SerialNumber: leafSerialNumber,
 		Subject: pkix.Name{
@@ -1118,23 +1363,39 @@ func (s *ServerService) generateCertWithTemplate(serverName string, keyAlgorithm
 		},
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           tlsLeafExtKeyUsage(usage),
+		KeyUsage:              leafKeyUsage,
+		ExtKeyUsage:           leafExtKeyUsage,
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 		SignatureAlgorithm:    leafSigAlg,
 	}
 
-	serverName = strings.TrimSpace(serverName)
-	if serverName != "" {
-		leafTemplate.Subject.CommonName = serverName
+	normalizedNames := make([]string, 0, len(serverNames))
+	seenNames := make(map[string]struct{}, len(serverNames))
+	for _, rawName := range serverNames {
+		name := strings.TrimSpace(rawName)
+		if name == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if _, exists := seenNames[key]; exists {
+			continue
+		}
+		seenNames[key] = struct{}{}
+		normalizedNames = append(normalizedNames, name)
 	}
 
-	if usage == tlsCertificateUsageServer && serverName != "" {
-		if parsedIP := stdnet.ParseIP(serverName); parsedIP != nil {
-			leafTemplate.IPAddresses = []stdnet.IP{parsedIP}
-		} else {
-			leafTemplate.DNSNames = []string{serverName}
+	if len(normalizedNames) > 0 {
+		leafTemplate.Subject.CommonName = normalizedNames[0]
+	}
+
+	if usage == tlsCertificateUsageServer {
+		for _, name := range normalizedNames {
+			if parsedIP := stdnet.ParseIP(name); parsedIP != nil {
+				leafTemplate.IPAddresses = append(leafTemplate.IPAddresses, parsedIP)
+				continue
+			}
+			leafTemplate.DNSNames = append(leafTemplate.DNSNames, name)
 		}
 	}
 

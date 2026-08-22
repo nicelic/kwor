@@ -1,11 +1,22 @@
 <template>
-  <v-dialog transition="dialog-bottom-transition" width="calc(100vw - 32px)" max-width="400">
+  <v-dialog v-model="dialogVisible" transition="dialog-bottom-transition" width="calc(100vw - 32px)" max-width="400" max-height="90vh">
     <v-card class="rounded-lg" id="qrcode-modal" :loading="loading">
       <v-card-title>
         <v-row>
           <v-col>QrCode</v-col>
           <v-spacer></v-spacer>
-          <v-col cols="auto"><v-icon icon="mdi-close-box" @click="$emit('close')" /></v-col>
+          <v-col cols="auto">
+            <v-tooltip location="top" :text="$t('actions.close')">
+              <template #activator="{ props: tooltipProps }">
+                <v-btn
+                  v-bind="tooltipProps"
+                  icon="mdi-close-box"
+                  density="compact"
+                  variant="text"
+                  @click="closeDialog" />
+              </template>
+            </v-tooltip>
+          </v-col>
         </v-row>
       </v-card-title>
       <v-divider></v-divider>
@@ -15,19 +26,28 @@
         type="text, image, divider, text, image"
         v-if="loading">
       </v-skeleton-loader>
-      <v-card-text style="overflow-y: auto; padding: 0" :hidden="loading">
-        <v-tabs
-          v-if="showSubscriptionQr"
-          v-model="tab"
-          density="compact"
-          fixed-tabs
-          align-tabs="center">
-          <v-tab value="sub">{{ $t('setting.sub') }}</v-tab>
-          <v-tab value="link">{{ $t('client.links') }}</v-tab>
-        </v-tabs>
-        <v-window v-model="tab" style="margin-top: 10px;">
+      <v-card-text style="max-height: calc(90vh - 72px); overflow-y: auto; padding: 0" :hidden="loading">
+        <v-alert v-if="clientLoadError" class="ma-3" type="error" variant="tonal">
+          <div class="d-flex align-center flex-wrap" style="gap: 8px;">
+            <span>无法读取用户详情，二维码不会生成。</span>
+            <v-btn color="primary" size="small" variant="outlined" @click="reloadData">
+              {{ $t('actions.update') }}
+            </v-btn>
+          </div>
+        </v-alert>
+        <template v-else>
+          <v-tabs
+            v-if="showSubscriptionQr"
+            v-model="tab"
+            density="compact"
+            fixed-tabs
+            align-tabs="center">
+            <v-tab value="sub">{{ $t('setting.sub') }}</v-tab>
+            <v-tab value="link">{{ $t('client.links') }}</v-tab>
+          </v-tabs>
+          <v-window v-model="tab" style="margin-top: 10px;">
           <v-window-item value="sub" v-if="showSubscriptionQr">
-            <template v-if="subscriptionUriReady">
+            <template v-if="subscriptionQrReady">
               <v-row>
                 <v-col style="text-align: center;">
                   <v-chip>{{ $t('setting.sub') }}</v-chip><br />
@@ -69,14 +89,15 @@
             </v-alert>
           </v-window-item>
           <v-window-item value="link">
-            <v-row v-for="l in clientLinks">
+            <v-row v-for="(l, index) in clientLinks" :key="`${l.type}-${index}-${l.uri}`">
               <v-col style="text-align: center;">
                 <v-chip>{{ l.remark ?? $t('client.' + l.type) }}</v-chip><br />
                 <QrcodeVue :value="l.uri" :size="size" @click="copyToClipboard(l.uri)" :margin="1" style="border-radius: .5rem; cursor: copy;" />
               </v-col>
             </v-row>
           </v-window-item>
-        </v-window>
+          </v-window>
+        </template>
       </v-card-text>
     </v-card>
   </v-dialog>
@@ -91,6 +112,10 @@ import { getNamespaceApi, getNamespaceStore } from '@/store/uiNamespace'
 
 export default {
   props: {
+    modelValue: {
+      type: Boolean,
+      default: undefined,
+    },
     id: Number,
     visible: Boolean,
     namespace: {
@@ -98,6 +123,7 @@ export default {
       default: 'default',
     },
   },
+  emits: ['close', 'update:modelValue'],
   data() {
     return {
       tab: 'sub',
@@ -108,21 +134,46 @@ export default {
       subscriptionUriError: '',
       subscriptionUriRequestSequence: 0,
       clientLoadRequestSequence: 0,
+      clientReady: false,
+      clientLoadError: false,
+      viewportWidth: typeof window === 'undefined' ? 320 : window.innerWidth,
     }
   },
   methods: {
     async load() {
       const requestSequence = ++this.clientLoadRequestSequence
       this.loading = true
+      this.clientReady = false
+      this.clientLoadError = false
       try {
-        const newData = await getNamespaceStore(this.namespace).loadClients(this.$props.id ?? 0)
+        const id = Number(this.$props.id ?? 0)
+        const newData = await getNamespaceStore(this.namespace).loadClients(id)
         if (requestSequence !== this.clientLoadRequestSequence || !this.$props.visible) return
+        if (id <= 0 || Number(newData?.id) !== id) {
+          this.clientLoadError = true
+          return
+        }
         this.client = newData
+        this.clientReady = true
+      } catch {
+        if (requestSequence === this.clientLoadRequestSequence && this.$props.visible) {
+          this.clientLoadError = true
+        }
       } finally {
         if (requestSequence === this.clientLoadRequestSequence) {
           this.loading = false
         }
       }
+    },
+    reloadData() {
+      void this.load()
+      if (this.showSubscriptionQr) void this.refreshSubscriptionUri()
+    },
+    closeDialog() {
+      this.clientLoadRequestSequence += 1
+      this.subscriptionUriRequestSequence += 1
+      this.$emit('update:modelValue', false)
+      this.$emit('close')
     },
     copyToClipboard(txt: string) {
       if (!txt) return
@@ -175,7 +226,7 @@ export default {
       }
     },
     buildSubscriptionUrl(format?: string) {
-      if (!this.subscriptionUriReady) return ''
+      if (!this.subscriptionUriReady || !this.clientReady) return ''
       const baseURI = getNamespaceStore(this.namespace).subURI
       if (!baseURI) return ''
       const name = encodeURIComponent(String(this.client?.name ?? ''))
@@ -185,8 +236,23 @@ export default {
       }
       return baseURI + 'q/client?name=' + name + query
     },
+    updateViewportWidth() {
+      this.viewportWidth = window.innerWidth
+    },
   },
   computed: {
+    dialogVisible: {
+      get(): boolean {
+        return this.$props.modelValue ?? this.$props.visible ?? false
+      },
+      set(value: boolean) {
+        if (value) {
+          this.$emit('update:modelValue', true)
+          return
+        }
+        this.closeDialog()
+      },
+    },
     showSubscriptionQr(): boolean {
       return getNamespaceApi(this.namespace).supportsSubscriptionQr
     },
@@ -199,15 +265,18 @@ export default {
     clientClashSub() {
       return this.buildSubscriptionUrl('clash')
     },
+    subscriptionQrReady(): boolean {
+      return this.subscriptionUriReady && this.clientReady && !this.clientLoadError
+    },
     singbox() {
       if (!this.clientJsonSub) return ''
       return 'sing-box://import-remote-profile?url=' + encodeURIComponent(this.clientJsonSub) + '#' + encodeURIComponent(String(this.client?.name ?? ''))
     },
     clientLinks() {
-      return this.client.links ?? []
+      return Array.isArray(this.client.links) ? this.client.links : []
     },
     size() {
-      return Math.max(120, Math.min(300, window.innerWidth - 72))
+      return Math.max(120, Math.min(300, this.viewportWidth - 72))
     },
   },
   watch: {
@@ -223,10 +292,26 @@ export default {
         this.subscriptionUriRequestSequence += 1
         this.client = {}
         this.loading = false
+        this.clientReady = false
+        this.clientLoadError = false
         this.subscriptionUriReady = false
         this.subscriptionUriLoading = false
       }
     },
+    id(newId, oldId) {
+      if (!this.dialogVisible || Number(newId ?? 0) === Number(oldId ?? 0)) return
+      this.tab = this.showSubscriptionQr ? 'sub' : 'link'
+      void this.load()
+      if (this.showSubscriptionQr) {
+        void this.refreshSubscriptionUri()
+      }
+    },
+  },
+  mounted() {
+    window.addEventListener('resize', this.updateViewportWidth)
+  },
+  beforeUnmount() {
+    window.removeEventListener('resize', this.updateViewportWidth)
   },
   components: { QrcodeVue },
 }

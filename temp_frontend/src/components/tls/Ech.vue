@@ -14,12 +14,8 @@
           variant="outlined"
           shaped
           mandatory>
-            <v-btn
-              @click="delete ech.key"
-            >{{ $t('tls.usePath') }}</v-btn>
-            <v-btn
-              @click="delete ech.key_path"
-            >{{ $t('tls.useText') }}</v-btn>
+            <v-btn :value="0">{{ $t('tls.usePath') }}</v-btn>
+            <v-btn :value="1">{{ $t('tls.useText') }}</v-btn>
           </v-btn-toggle>
         </v-col>
         <v-spacer></v-spacer>
@@ -56,9 +52,31 @@
         </v-col>
       </v-row>
       <v-row>
+        <v-col cols="auto">
+          <v-btn-toggle v-model="useEchConfigPath"
+          class="rounded-xl"
+          density="compact"
+          variant="outlined"
+          shaped
+          mandatory>
+            <v-btn :value="0">{{ $t('tls.usePath') }}</v-btn>
+            <v-btn :value="1">{{ $t('tls.useText') }}</v-btn>
+          </v-btn-toggle>
+        </v-col>
+      </v-row>
+      <v-row v-if="useEchConfigPath == 0">
+        <v-col cols="12">
+          <v-text-field
+            label="ECH Config Path"
+            hide-details
+            v-model="echConfigPath">
+          </v-text-field>
+        </v-col>
+      </v-row>
+      <v-row v-else>
         <v-col cols="12">
           <v-textarea
-            :label="$t('tls.cert')"
+            label="ECH Config"
             hide-details
             v-model="echConfigText">
           </v-textarea>
@@ -78,18 +96,51 @@ export default {
   props: ['iTls','oTls'],
   data() {
     return {
-      useEchPath: this.$props.iTls?.ech?.key? 1:0,
       loading: false,
+      echController: undefined as AbortController | undefined,
+      echRequestSeq: 0,
     }
   },
   methods: {
+    normalizeEchSources() {
+      const server = this.$props.iTls?.ech
+      const client = this.$props.oTls?.ech
+      if (server && Array.isArray(server.key) && server.key.length > 0) {
+        delete server.key_path
+      }
+      if (client && Array.isArray(client.config) && client.config.length > 0) {
+        delete client.config_path
+      }
+    },
+    ensureEchPayloads(): boolean {
+      if (!this.$props.iTls || !this.$props.oTls) return false
+      if (!this.$props.iTls.ech || typeof this.$props.iTls.ech !== 'object' || Array.isArray(this.$props.iTls.ech)) {
+        this.$props.iTls.ech = { enabled: true }
+      }
+      if (!this.$props.oTls.ech || typeof this.$props.oTls.ech !== 'object' || Array.isArray(this.$props.oTls.ech)) {
+        this.$props.oTls.ech = { enabled: true }
+      }
+      this.normalizeEchSources()
+      return true
+    },
     async genECH(){
+      if (!this.ensureEchPayloads()) return
       this.loading = true
+      this.echController?.abort()
+      const controller = new AbortController()
+      this.echController = controller
+      const requestId = ++this.echRequestSeq
       try {
-        const msg = await HttpUtils.get('api/keypairs', {
-          k: "ech",
-          o: this.iTls.server_name?? "''"
-        })
+        let msg
+        try {
+          msg = await HttpUtils.get('api/keypairs', {
+            k: "ech",
+            o: this.iTls.server_name?? "''"
+          }, { signal: controller.signal, silentErrorToast: true })
+        } catch {
+          return
+        }
+        if (requestId !== this.echRequestSeq || this.echController !== controller) return
         if (!msg.success || !Array.isArray(msg.obj) || !this.iTls.ech || !this.oTls.ech) {
           push.error({
             message: i18n.global.t('error') + ": " + msg.obj
@@ -131,10 +182,18 @@ export default {
             key.push(line)
           }
         })
-        this.iTls.ech.key = key?? undefined
-        this.oTls.ech.config = config?? undefined
+        if (key.length === 0 || config.length === 0) {
+          push.error({
+            message: i18n.global.t('error') + ': ECH 返回内容不完整'
+          })
+          return
+        }
+        this.iTls.ech.key = key
+        this.oTls.ech.config = config
+        delete this.oTls.ech.config_path
       } finally {
-        this.loading = false
+        if (this.echController === controller) this.echController = undefined
+        if (requestId === this.echRequestSeq) this.loading = false
       }
     },
   },
@@ -145,18 +204,69 @@ export default {
     enabled: {
       get() { return this.ech?.enabled?? false },
       set(v: boolean) { 
-        this.$props.iTls.ech = v ? { enabled: true } : undefined
-        this.$props.oTls.ech = v ? {} : undefined
+        if (!v) {
+          this.echController?.abort()
+          this.echRequestSeq++
+          this.loading = false
+          this.$props.iTls.ech = undefined
+          this.$props.oTls.ech = undefined
+          return
+        }
+        this.$props.iTls.ech = { enabled: true }
+        this.$props.oTls.ech = { enabled: true }
+      this.normalizeEchSources()
+      }
+    },
+    useEchPath: {
+      get(): number { return Array.isArray(this.ech?.key) && this.ech.key.length > 0 ? 1 : 0 },
+      set(value: number) {
+        if (!this.ech) return
+        if (Number(value) === 1) delete this.ech.key_path
+        else delete this.ech.key
+      }
+    },
+    useEchConfigPath: {
+      get(): number { return Array.isArray(this.oTls.ech?.config) && this.oTls.ech.config.length > 0 ? 1 : 0 },
+      set(value: number) {
+        if (!this.ensureEchPayloads()) return
+        if (Number(value) === 1) delete this.oTls.ech.config_path
+        else delete this.oTls.ech.config
       }
     },
     echKeyText: {
       get(): string { return this.ech?.key ? this.ech.key.join('\n') : '' },
-      set(newValue:string) { this.ech.key = newValue.split('\n') }
+      set(newValue:string) {
+        if (!this.ech) return
+        const lines = newValue.split('\n').map(line => line.trim()).filter(line => line.length > 0)
+        this.ech.key = lines.length > 0 ? lines : undefined
+        if (lines.length > 0) delete this.ech.key_path
+      }
     },
     echConfigText: {
       get(): string { return this.oTls.ech?.config ? this.oTls.ech.config.join('\n') : '' },
-      set(newValue:string) { this.oTls.ech.config = newValue.split('\n') }
+      set(newValue:string) {
+        if (!this.ensureEchPayloads()) return
+        const lines = newValue.split('\n').map(line => line.trim()).filter(line => line.length > 0)
+        this.oTls.ech.config = lines.length > 0 ? lines : undefined
+        if (lines.length > 0) delete this.oTls.ech.config_path
+      }
     },
+    echConfigPath: {
+      get(): string { return this.oTls.ech?.config_path ?? '' },
+      set(newValue: string) {
+        if (!this.ensureEchPayloads()) return
+        const path = newValue.trim()
+        this.oTls.ech.config_path = path.length > 0 ? path : undefined
+        if (path.length > 0) delete this.oTls.ech.config
+      }
+    },
+  },
+  mounted() {
+    this.normalizeEchSources()
+  },
+  beforeUnmount() {
+    this.echController?.abort()
+    this.echRequestSeq++
   }
 }
 </script>

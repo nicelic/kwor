@@ -1,40 +1,60 @@
 <template>
-  <SingboxCore
-    v-if="namespaceApi.showCoreControlsOnInbounds && props.namespace !== 'mihomo'"
-    v-model="coreModal.visible"
-    :visible="coreModal.visible"
-    @close="closeCoreModal"
-  />
-  <MihomoCore
-    v-else-if="namespaceApi.showCoreControlsOnInbounds"
-    v-model="coreModal.visible"
-    :visible="coreModal.visible"
-    @close="closeCoreModal"
-  />
-  <InboundVue
-    v-model="modal.visible"
-    :visible="modal.visible"
-    :id="modal.id"
-    :namespace="props.namespace"
-    :inTags="inTags"
-    :tlsConfigs="tlsConfigs"
-    @close="closeModal"
-  />
-  <Stats
-    v-model="stats.visible"
-    :visible="stats.visible"
-    :resource="stats.resource"
-    :tag="stats.tag"
-    :namespace="props.namespace"
-    @close="closeStats"
-  />
-  <PortLogs
-    v-model="portLogModal.visible"
-    :visible="portLogModal.visible"
-    :logs="portLogs"
-    @close="closePortLog"
-    @clear="clearPortLogs"
-  />
+  <template v-if="initializing">
+    <v-row align="center" justify="center" style="min-height: 240px;">
+      <v-col cols="12" class="text-center">
+        <v-progress-circular indeterminate color="primary" />
+        <div class="mt-3">{{ $t('loading') }}</div>
+      </v-col>
+    </v-row>
+  </template>
+  <template v-else-if="loadFailed">
+    <v-row align="center" justify="center" style="min-height: 240px;">
+      <v-col cols="12" sm="8" md="6">
+        <v-alert type="error" variant="tonal" :title="$t('failed')" class="text-center">
+          <v-btn color="primary" class="mt-2" prepend-icon="mdi-refresh" @click="initialize">
+            {{ $t('actions.update') }}
+          </v-btn>
+        </v-alert>
+      </v-col>
+    </v-row>
+  </template>
+  <template v-else>
+    <SingboxCore
+      v-if="namespaceApi.showCoreControlsOnInbounds && props.namespace !== 'mihomo'"
+      v-model="coreModal.visible"
+      :visible="coreModal.visible"
+      @close="closeCoreModal"
+    />
+    <MihomoCore
+      v-else-if="namespaceApi.showCoreControlsOnInbounds"
+      v-model="coreModal.visible"
+      :visible="coreModal.visible"
+      @close="closeCoreModal"
+    />
+    <InboundVue
+      v-model="modal.visible"
+      :visible="modal.visible"
+      :id="modal.id"
+      :namespace="props.namespace"
+      :inTags="inTags"
+      :tlsConfigs="tlsConfigs"
+      @close="closeModal"
+    />
+    <Stats
+      v-model="stats.visible"
+      :visible="stats.visible"
+      :resource="stats.resource"
+      :tag="stats.tag"
+      :namespace="props.namespace"
+      @close="closeStats"
+    />
+    <PortLogs
+      v-model="portLogModal.visible"
+      :visible="portLogModal.visible"
+      :logs="portLogs"
+      @close="closePortLog"
+      @clear="clearPortLogs"
+    />
 
   <v-row v-if="namespaceApi.showCoreControlsOnInbounds" align="center" class="mb-1">
     <v-col cols="auto" class="d-flex align-center" style="gap: 6px;">
@@ -46,42 +66,48 @@
       >
         {{ coreRunning ? t('coreManager.running') : t('coreManager.stopped') }}
       </v-chip>
-      <v-btn
-        color="success"
-        variant="flat"
-        size="x-small"
-        icon="mdi-play"
-        :disabled="coreDownloadTaskActive || coreRunning"
-        :loading="startingCore"
-        @click="startCore"
-      >
-        <v-icon />
-        <v-tooltip activator="parent" location="top" :text="t('coreManager.start')"></v-tooltip>
-      </v-btn>
-      <v-btn
-        color="error"
-        variant="flat"
-        size="x-small"
-        icon="mdi-stop"
-        :disabled="coreDownloadTaskActive || !coreRunning"
-        :loading="stoppingCore"
-        @click="stopCore"
-      >
-        <v-icon />
-        <v-tooltip activator="parent" location="top" :text="t('coreManager.stop')"></v-tooltip>
-      </v-btn>
-      <v-btn
-        color="warning"
-        variant="flat"
-        size="x-small"
-        icon="mdi-restart"
-        :disabled="coreDownloadTaskActive || !coreRunning"
-        :loading="restartingCore"
-        @click="restartCore"
-      >
-        <v-icon />
-        <v-tooltip activator="parent" location="top" :text="t('coreManager.restart')"></v-tooltip>
-      </v-btn>
+      <v-tooltip location="top" :text="t('coreManager.start')">
+        <template #activator="{ props: tooltipProps }">
+          <v-btn
+            v-bind="tooltipProps"
+            color="success"
+            variant="flat"
+            size="x-small"
+            icon="mdi-play"
+            :disabled="coreDownloadTaskActive || coreControlBusy || coreRunning || !coreReady"
+            :loading="startingCore"
+            @click="startCore"
+          />
+        </template>
+      </v-tooltip>
+      <v-tooltip location="top" :text="t('coreManager.stop')">
+        <template #activator="{ props: tooltipProps }">
+          <v-btn
+            v-bind="tooltipProps"
+            color="error"
+            variant="flat"
+            size="x-small"
+            icon="mdi-stop"
+            :disabled="coreDownloadTaskActive || coreControlBusy || !coreRunning"
+            :loading="stoppingCore"
+            @click="stopCore"
+          />
+        </template>
+      </v-tooltip>
+      <v-tooltip location="top" :text="t('coreManager.restart')">
+        <template #activator="{ props: tooltipProps }">
+          <v-btn
+            v-bind="tooltipProps"
+            color="warning"
+            variant="flat"
+            size="x-small"
+            icon="mdi-restart"
+            :disabled="coreDownloadTaskActive || coreControlBusy || !coreRunning || !coreReady"
+            :loading="restartingCore"
+            @click="restartCore"
+          />
+        </template>
+      </v-tooltip>
     </v-col>
     <v-spacer></v-spacer>
     <v-col cols="auto" class="d-flex align-center" style="gap: 8px;">
@@ -109,15 +135,15 @@
     </v-col>
   </v-row>
 
-  <v-row>
-    <v-col cols="12" justify="center" align="center">
-      <v-btn color="primary" @click="showModal(0)">{{ $t('actions.add') }}</v-btn>
-      <v-btn color="primary" variant="tonal" class="ml-3" @click="openPortLog">{{ t('portLogs.open') }}</v-btn>
-    </v-col>
-  </v-row>
+    <v-row>
+      <v-col cols="12" justify="center" align="center">
+        <v-btn color="primary" :disabled="inboundWriteBusy" @click="showModal(0)">{{ $t('actions.add') }}</v-btn>
+        <v-btn color="primary" variant="tonal" class="ml-3" @click="openPortLog">{{ t('portLogs.open') }}</v-btn>
+      </v-col>
+    </v-row>
 
-  <v-row>
-    <v-col cols="12" sm="4" md="3" lg="2" v-for="(item, index) in <any[]>inbounds" :key="item.tag">
+    <v-row>
+      <v-col cols="12" sm="4" md="3" lg="2" v-for="item in <any[]>inbounds" :key="item.id">
       <v-card rounded="xl" elevation="5" min-width="200" :title="item.tag">
         <v-card-subtitle style="margin-top: -20px;">
           <v-row>
@@ -167,36 +193,42 @@
         </v-card-text>
         <v-divider></v-divider>
         <v-card-actions style="padding: 0;">
-          <v-btn icon="mdi-file-edit" @click="showModal(item.id)">
-            <v-icon />
-            <v-tooltip activator="parent" location="top" :text="$t('actions.edit')"></v-tooltip>
-          </v-btn>
-          <v-btn icon="mdi-file-remove" style="margin-inline-start:0;" color="warning" @click="delOverlay[index] = true">
-            <v-icon />
-            <v-tooltip activator="parent" location="top" :text="$t('actions.del')"></v-tooltip>
-          </v-btn>
+          <v-tooltip location="top" :text="$t('actions.edit')">
+            <template #activator="{ props: tooltipProps }">
+              <v-btn v-bind="tooltipProps" icon="mdi-file-edit" :disabled="inboundWriteBusy" @click="showModal(item.id)" />
+            </template>
+          </v-tooltip>
+          <v-tooltip location="top" :text="$t('actions.del')">
+            <template #activator="{ props: tooltipProps }">
+              <v-btn v-bind="tooltipProps" icon="mdi-file-remove" style="margin-inline-start:0;" color="warning" :disabled="inboundWriteBusy" @click="requestDeleteConfirm(item.id)" />
+            </template>
+          </v-tooltip>
           <v-overlay
-            v-model="delOverlay[index]"
+            :model-value="deleteConfirmId === item.id"
             contained
+            :persistent="inboundWriteBusy"
             class="align-center justify-center"
+            @update:model-value="value => { if (!value) closeDeleteConfirm(item.id) }"
           >
             <v-card :title="$t('actions.del')" rounded="lg">
               <v-divider></v-divider>
               <v-card-text>{{ $t('confirm') }}</v-card-text>
               <v-card-actions>
-                <v-btn color="error" variant="outlined" @click="delInbound(item.id)">{{ $t('yes') }}</v-btn>
-                <v-btn color="success" variant="outlined" @click="delOverlay[index] = false">{{ $t('no') }}</v-btn>
+                <v-btn color="error" variant="outlined" :loading="isDeletingInbound(item.id)" :disabled="inboundWriteBusy" @click="delInbound(item.id)">{{ $t('yes') }}</v-btn>
+                <v-btn color="success" variant="outlined" :disabled="inboundWriteBusy" @click="closeDeleteConfirm(item.id)">{{ $t('no') }}</v-btn>
               </v-card-actions>
             </v-card>
           </v-overlay>
-          <v-btn icon="mdi-chart-line" @click="showStats(item.tag)" v-if="enableTraffic">
-            <v-icon />
-            <v-tooltip activator="parent" location="top" :text="$t('stats.graphTitle')"></v-tooltip>
-          </v-btn>
+          <v-tooltip v-if="enableTraffic" location="top" :text="$t('stats.graphTitle')">
+            <template #activator="{ props: tooltipProps }">
+              <v-btn v-bind="tooltipProps" icon="mdi-chart-line" :disabled="inboundWriteBusy" @click="showStats(item.tag)" />
+            </template>
+          </v-tooltip>
         </v-card-actions>
       </v-card>
-    </v-col>
-  </v-row>
+      </v-col>
+    </v-row>
+  </template>
 </template>
 
 <script lang="ts" setup>
@@ -237,6 +269,29 @@ const { t } = useI18n()
 const store = getNamespaceStore(props.namespace)
 const namespaceApi = getNamespaceApi(props.namespace)
 const PORT_LOG_STORAGE_KEY = namespaceApi.portLogStorageKey
+const initializing = ref(true)
+const loadFailed = ref(false)
+let componentActive = true
+
+const initialize = async () => {
+  const hadLoadedData = store.hasFullData
+  initializing.value = true
+  loadFailed.value = false
+  try {
+    const success = await store.loadData()
+    if (!componentActive) return
+    if (!success && !hadLoadedData) {
+      loadFailed.value = true
+    }
+  } catch {
+    if (componentActive && !hadLoadedData) loadFailed.value = true
+  } finally {
+    if (componentActive) {
+      initializing.value = false
+      if (!loadFailed.value) startBackgroundPolling()
+    }
+  }
+}
 
 const inbounds = computed((): Inbound[] => {
   return <Inbound[]>store.inbounds
@@ -263,19 +318,41 @@ const modal = ref({
   id: 0,
 })
 
-const delOverlay = ref(new Array<boolean>())
+const deleteConfirmId = ref<number | null>(null)
+const deletingInboundIds = ref<number[]>([])
+const inboundWriteBusy = computed(() => deletingInboundIds.value.length > 0)
 const coreModal = ref({
   visible: false,
 })
 const startingCore = ref(false)
 const stoppingCore = ref(false)
 const restartingCore = ref(false)
+const coreActionTimers = new Set<number>()
+
+const scheduleCoreAction = (callback: () => void, delay: number) => {
+  const timer = window.setTimeout(() => {
+    coreActionTimers.delete(timer)
+    callback()
+  }, delay)
+  coreActionTimers.add(timer)
+}
+
+const clearCoreActionTimers = () => {
+  for (const timer of coreActionTimers) {
+    window.clearTimeout(timer)
+  }
+  coreActionTimers.clear()
+}
+
 const coreUpdateCount = ref(0)
-const coreUpdateTimerId = ref<ReturnType<typeof setInterval> | 0>(0)
+const coreUpdateTimerId = ref<number | 0>(0)
 const coreDownloadTask = ref<CoreDownloadTaskStatus | null>(null)
 const coreDownloadTimerId = ref<number | null>(null)
+const coreInstalled = ref(false)
+const coreCompatible = ref(false)
 
 const showModal = (id: number) => {
+  if (inboundWriteBusy.value) return
   modal.value.id = id
   modal.value.visible = true
 }
@@ -294,12 +371,33 @@ const closeCoreModal = () => {
   void loadCoreUpdateMarker()
 }
 
-const delInbound = async (id: number) => {
-  const index = inbounds.value.findIndex(i => i.id == id)
-  const tag = inbounds.value[index].tag
-  const success = await store.save('inbounds', 'del', tag)
-  if (success) delOverlay.value[index] = false
+const requestDeleteConfirm = (id: number) => {
+  if (inboundWriteBusy.value) return
+  deleteConfirmId.value = id
 }
+
+const closeDeleteConfirm = (id: number) => {
+  if (inboundWriteBusy.value) return
+  if (deleteConfirmId.value === id) deleteConfirmId.value = null
+}
+
+const delInbound = async (id: number) => {
+  if (inboundWriteBusy.value) return
+  const inbound = inbounds.value.find(item => item.id === id)
+  if (!inbound) {
+    deleteConfirmId.value = null
+    return
+  }
+  deletingInboundIds.value = [...deletingInboundIds.value, id]
+  try {
+    const success = await store.save('inbounds', 'del', inbound.tag)
+    if (success && deleteConfirmId.value === id) deleteConfirmId.value = null
+  } finally {
+    deletingInboundIds.value = deletingInboundIds.value.filter(value => value !== id)
+  }
+}
+
+const isDeletingInbound = (id: number) => deletingInboundIds.value.includes(id)
 
 const stats = ref({
   visible: false,
@@ -308,6 +406,7 @@ const stats = ref({
 })
 
 const showStats = (tag: string) => {
+  if (inboundWriteBusy.value) return
   stats.value.tag = tag
   stats.value.visible = true
 }
@@ -329,23 +428,49 @@ const closePortLog = () => {
 }
 
 const portLogs = ref(<PortLogEntry[]>[])
+const normalizePortLogs = (raw: unknown): PortLogEntry[] => {
+  if (!Array.isArray(raw)) return []
+  return raw.map((item: any) => {
+    const timestamp = Number(item?.timestamp)
+    const id = String(item?.id ?? '').trim()
+    const tag = String(item?.tag ?? '')
+    const range = String(item?.range ?? '')
+    const message = String(item?.message ?? '')
+    if (!id || !Number.isFinite(timestamp) || timestamp <= 0 || !message) return null
+    return { id, timestamp, tag, range, message }
+  }).filter((item): item is PortLogEntry => item !== null).slice(0, 1000)
+}
 const clearPortLogs = () => {
   portLogs.value = []
-  localStorage.removeItem(PORT_LOG_STORAGE_KEY)
+  try {
+    localStorage.removeItem(PORT_LOG_STORAGE_KEY)
+  } catch {
+    // Storage may be unavailable in a restricted browser context.
+  }
 }
 
 const monitorState = ref(<Record<string, string>>{})
-const monitorIntervalId = ref(<ReturnType<typeof setInterval> | 0>0)
+const monitorIntervalId = ref(<number | 0>0)
 const portCheckUnsupportedHinted = ref(false)
+const portMonitorLimitHinted = ref(false)
 const coreRunning = ref(false)
 let portRangeMonitorRequest: Promise<void> | null = null
+let coreStatusRequest: Promise<boolean> | null = null
 let coreUpdateMarkerRequest: Promise<void> | null = null
 let coreDownloadTaskRequest: Promise<void> | null = null
+let portRangeMonitorController: AbortController | null = null
+let coreStatusController: AbortController | null = null
+let coreUpdateMarkerController: AbortController | null = null
+let coreDownloadTaskController: AbortController | null = null
 
 const coreDownloadTaskActive = computed(() => {
   const state = String(coreDownloadTask.value?.state ?? '').trim().toLowerCase()
   return state === 'queued' || state === 'running' || state === 'stopping'
 })
+const coreControlBusy = computed(() => (
+  startingCore.value || stoppingCore.value || restartingCore.value
+))
+const coreReady = computed(() => coreInstalled.value && coreCompatible.value)
 
 const coreDownloadTaskStageText = computed(() => {
   const stage = String(coreDownloadTask.value?.stage ?? '').trim().toLowerCase()
@@ -400,22 +525,44 @@ const appendPortLog = (tag: string, range: string, message: string) => {
   if (portLogs.value.length > 1000) {
     portLogs.value = portLogs.value.slice(0, 1000)
   }
-  localStorage.setItem(PORT_LOG_STORAGE_KEY, JSON.stringify(portLogs.value))
+  try {
+    localStorage.setItem(PORT_LOG_STORAGE_KEY, JSON.stringify(portLogs.value))
+  } catch {
+    // Keep the in-memory log even when persistence is unavailable/full.
+  }
 }
 
-const refreshCoreRunning = async (): Promise<boolean> => {
-  try {
-    const data = await HttpUtils.get(namespaceApi.core.statusEndpoint)
-    if (data.success && data.obj) {
-      coreRunning.value = data.obj.running === true
+const refreshCoreRunning = (): Promise<boolean> => {
+  if (coreStatusRequest) return coreStatusRequest
+  const request = (async () => {
+    const controller = new AbortController()
+    coreStatusController = controller
+    try {
+      const data = await HttpUtils.get(namespaceApi.core.statusEndpoint, {}, { silentAuthCheck: true, signal: controller.signal })
+      if (controller.signal.aborted || coreStatusController !== controller) return coreRunning.value
+      if (data.success && data.obj) {
+        coreRunning.value = data.obj.running === true
+        coreInstalled.value = data.obj.installed === true
+        coreCompatible.value = data.obj.compatible === true
+      }
+    } catch {
+      // Keep last known state to avoid noisy monitor flapping.
+    } finally {
+      if (coreStatusController === controller) coreStatusController = null
     }
-  } catch {
-    // Keep last known state to avoid noisy monitor flapping.
-  }
-  return coreRunning.value
+    return coreRunning.value
+  })()
+  coreStatusRequest = request
+  void request.finally(() => {
+    if (coreStatusRequest === request) {
+      coreStatusRequest = null
+    }
+  })
+  return request
 }
 
 const getMonitorTargets = (): PortRangeCheckItem[] => {
+	const maxTargets = 32
   const targets: PortRangeCheckItem[] = []
   for (const inbound of inbounds.value) {
     if (!namespaceApi.portHopTypes.includes(inbound.type)) continue
@@ -427,9 +574,18 @@ const getMonitorTargets = (): PortRangeCheckItem[] => {
       id: String(inbound.id ?? 0),
       tag: inbound.tag ?? '',
       range: normalizedRange,
-    })
-  }
-  return targets
+	  })
+	}
+	if (targets.length <= maxTargets) return targets
+	if (!portMonitorLimitHinted.value) {
+		portMonitorLimitHinted.value = true
+		push.warning({
+			title: t('portMonitor.monitorTitle'),
+			duration: 7000,
+			message: `端口跳跃监控最多同时检查 ${maxTargets} 个入站，当前仅监控前 ${maxTargets} 个。`,
+		})
+	}
+	return targets.slice(0, maxTargets)
 }
 
 const getStateKey = (status: UDPRangeStatus): string => {
@@ -486,6 +642,9 @@ const handleRangeStatus = (status: UDPRangeStatus) => {
 const runPortRangeMonitor = (): Promise<void> => {
   if (portRangeMonitorRequest) return portRangeMonitorRequest
   const request = (async () => {
+		portRangeMonitorController?.abort()
+		const controller = new AbortController()
+		portRangeMonitorController = controller
     if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
     const targets = getMonitorTargets()
     if (targets.length === 0) {
@@ -494,14 +653,16 @@ const runPortRangeMonitor = (): Promise<void> => {
     }
 
     const isCoreRunning = await refreshCoreRunning()
+    if (controller.signal.aborted || portRangeMonitorController !== controller) return
     if (!isCoreRunning) {
       monitorState.value = {}
       return
     }
 
-    const response = await checkPortOccupancy({
+		const response = await checkPortOccupancy({
       udp_ranges: targets,
-    })
+		}, { signal: controller.signal })
+		if (controller.signal.aborted || portRangeMonitorController !== controller) return
     if (!response) return
     if (!response.supported) {
       showUnsupportedHint()
@@ -519,7 +680,7 @@ const runPortRangeMonitor = (): Promise<void> => {
         delete monitorState.value[key]
       }
     }
-  })()
+	})()
   portRangeMonitorRequest = request
   void request.finally(() => {
     if (portRangeMonitorRequest === request) {
@@ -536,13 +697,17 @@ const loadCoreStatus = async () => {
 const loadCoreUpdateMarker = (): Promise<void> => {
   if (coreUpdateMarkerRequest) return coreUpdateMarkerRequest
   const request = (async () => {
+		coreUpdateMarkerController?.abort()
+		const controller = new AbortController()
+		coreUpdateMarkerController = controller
     if (!namespaceApi.showCoreControlsOnInbounds) {
       coreUpdateCount.value = 0
       return
     }
     if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
     try {
-      const data = await HttpUtils.get(namespaceApi.core.updateInfoEndpoint)
+		const data = await HttpUtils.get(namespaceApi.core.updateInfoEndpoint, {}, { silentAuthCheck: true, signal: controller.signal })
+		if (controller.signal.aborted || coreUpdateMarkerController !== controller) return
       if (data.success && data.obj) {
         const stable = data.obj.pendingStable ? 1 : 0
         const alpha = namespaceApi.core.supportsPrereleaseChannel && data.obj.pendingAlpha ? 1 : 0
@@ -595,8 +760,12 @@ const loadCoreDownloadTask = async (): Promise<void> => {
   if (coreDownloadTaskRequest || !namespaceApi.showCoreControlsOnInbounds) return
   if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
   const request = (async () => {
+		coreDownloadTaskController?.abort()
+		const controller = new AbortController()
+		coreDownloadTaskController = controller
     try {
-      const data = await HttpUtils.get(namespaceApi.core.progressEndpoint, {}, { silentAuthCheck: true })
+		const data = await HttpUtils.get(namespaceApi.core.progressEndpoint, {}, { silentAuthCheck: true, signal: controller.signal })
+		if (controller.signal.aborted || coreDownloadTaskController !== controller) return
       if (!data.success || !data.obj) {
         scheduleCoreDownloadTaskPolling()
         return
@@ -623,11 +792,11 @@ const loadCoreDownloadTask = async (): Promise<void> => {
 }
 
 const startCore = async () => {
-  if (coreDownloadTaskActive.value || startingCore.value) return
+  if (coreDownloadTaskActive.value || coreControlBusy.value || !coreReady.value) return
   startingCore.value = true
   try {
     await HttpUtils.post(namespaceApi.core.startEndpoint, {})
-    setTimeout(() => {
+    scheduleCoreAction(() => {
       void loadCoreStatus()
       startingCore.value = false
     }, 1500)
@@ -637,11 +806,11 @@ const startCore = async () => {
 }
 
 const stopCore = async () => {
-  if (coreDownloadTaskActive.value || stoppingCore.value) return
+  if (coreDownloadTaskActive.value || coreControlBusy.value) return
   stoppingCore.value = true
   try {
     await HttpUtils.post(namespaceApi.core.stopEndpoint, {})
-    setTimeout(() => {
+    scheduleCoreAction(() => {
       void loadCoreStatus()
       stoppingCore.value = false
     }, 1500)
@@ -651,11 +820,11 @@ const stopCore = async () => {
 }
 
 const restartCore = async () => {
-  if (coreDownloadTaskActive.value || restartingCore.value) return
+  if (coreDownloadTaskActive.value || coreControlBusy.value || !coreReady.value) return
   restartingCore.value = true
   try {
     await HttpUtils.post(namespaceApi.core.restartEndpoint, {})
-    setTimeout(() => {
+    scheduleCoreAction(() => {
       void loadCoreStatus()
       restartingCore.value = false
     }, 2500)
@@ -666,34 +835,67 @@ const restartCore = async () => {
 
 const stopBackgroundPolling = () => {
   if (monitorIntervalId.value !== 0) {
-    clearInterval(monitorIntervalId.value)
+    clearTimeout(monitorIntervalId.value)
     monitorIntervalId.value = 0
   }
   if (coreUpdateTimerId.value !== 0) {
-    clearInterval(coreUpdateTimerId.value)
+    clearTimeout(coreUpdateTimerId.value)
     coreUpdateTimerId.value = 0
   }
   clearCoreDownloadTaskPolling()
+	portRangeMonitorController?.abort()
+	portRangeMonitorController = null
+	portRangeMonitorRequest = null
+	coreStatusController?.abort()
+	coreStatusController = null
+	coreStatusRequest = null
+	coreUpdateMarkerController?.abort()
+	coreUpdateMarkerController = null
+	coreUpdateMarkerRequest = null
+	coreDownloadTaskController?.abort()
+	coreDownloadTaskController = null
+	coreDownloadTaskRequest = null
+}
+
+const scheduleCoreUpdateMarkerPolling = (delay = 60000) => {
+  if (!namespaceApi.showCoreControlsOnInbounds || typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+  if (coreUpdateTimerId.value !== 0) clearTimeout(coreUpdateTimerId.value)
+  coreUpdateTimerId.value = window.setTimeout(async () => {
+    coreUpdateTimerId.value = 0
+    try {
+      await loadCoreUpdateMarker()
+    } catch {
+      // Retry on the next marker pass.
+    } finally {
+      scheduleCoreUpdateMarkerPolling()
+    }
+  }, delay)
+}
+
+const schedulePortRangeMonitorPolling = (delay = 30000) => {
+  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+  if (getMonitorTargets().length === 0) return
+  if (monitorIntervalId.value !== 0) clearTimeout(monitorIntervalId.value)
+  monitorIntervalId.value = window.setTimeout(async () => {
+    monitorIntervalId.value = 0
+    try {
+      await runPortRangeMonitor()
+    } catch {
+      // Retry on the next visible monitor pass.
+    } finally {
+      schedulePortRangeMonitorPolling()
+    }
+  }, delay)
 }
 
 const startBackgroundPolling = () => {
   if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
   if (namespaceApi.showCoreControlsOnInbounds) {
     void loadCoreStatus()
-    void loadCoreUpdateMarker()
+    void loadCoreUpdateMarker().finally(() => scheduleCoreUpdateMarkerPolling())
     void loadCoreDownloadTask()
-    if (coreUpdateTimerId.value === 0) {
-      coreUpdateTimerId.value = setInterval(() => {
-        void loadCoreUpdateMarker()
-      }, 60000)
-    }
   }
-  void runPortRangeMonitor()
-  if (monitorIntervalId.value === 0) {
-    monitorIntervalId.value = setInterval(() => {
-      void runPortRangeMonitor()
-    }, 30000)
-  }
+  void runPortRangeMonitor().finally(() => schedulePortRangeMonitorPolling())
 }
 
 const handleVisibilityChange = () => {
@@ -705,26 +907,35 @@ const handleVisibilityChange = () => {
 }
 
 onMounted(() => {
-  const rawLogs = localStorage.getItem(PORT_LOG_STORAGE_KEY)
+  void initialize()
+  let rawLogs: string | null = null
+  try {
+    rawLogs = localStorage.getItem(PORT_LOG_STORAGE_KEY)
+  } catch {
+    rawLogs = null
+  }
   if (rawLogs) {
     try {
       const parsed = JSON.parse(rawLogs)
-      if (Array.isArray(parsed)) {
-        portLogs.value = parsed
-      }
+      portLogs.value = normalizePortLogs(parsed)
     } catch {
-      localStorage.removeItem(PORT_LOG_STORAGE_KEY)
+      try {
+        localStorage.removeItem(PORT_LOG_STORAGE_KEY)
+      } catch {
+        // Ignore unavailable storage.
+      }
     }
   }
 
 
-  startBackgroundPolling()
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', handleVisibilityChange)
   }
 })
 
 onUnmounted(() => {
+  componentActive = false
+  clearCoreActionTimers()
   stopBackgroundPolling()
   if (typeof document !== 'undefined') {
     document.removeEventListener('visibilitychange', handleVisibilityChange)

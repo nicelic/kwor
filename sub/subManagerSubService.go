@@ -10,6 +10,7 @@ import (
 	"github.com/alireza0/s-ui/service"
 	"github.com/alireza0/s-ui/util"
 	"gopkg.in/yaml.v3"
+	"gorm.io/gorm"
 )
 
 // SubManagerSubService renders subscriptions for sub-manager nodes/groups.
@@ -52,6 +53,9 @@ func (s *SubManagerSubService) GetSubManagerJson(tag string) (*string, error) {
 		outTags,
 		util.SupportsSingboxSubscriptionOutboundType,
 	)
+	if len(outbounds) > service.SubscriptionGroupMaxOutbounds {
+		return nil, fmt.Errorf("subscription group renders more than %d nodes", service.SubscriptionGroupMaxOutbounds)
+	}
 	for i := range outbounds {
 		util.SanitizeSingboxSubscriptionOutbound(outbounds[i])
 	}
@@ -230,10 +234,6 @@ func (s *SubManagerSubService) refreshSubOutboundTLS(outboundMap map[string]inte
 	if outboundMap == nil {
 		return
 	}
-	if _, ok := outboundMap["tls"].(map[string]interface{}); !ok {
-		return
-	}
-
 	if tlsConfig, ok := s.loadManagedSourceTLS(subOutbound); ok && tlsConfig != nil {
 		refreshSubscriptionOutboundTLS(outboundMap, tlsConfig)
 		return
@@ -271,15 +271,39 @@ func (s *SubManagerSubService) refreshSubOutboundClashProxyTLS(proxy map[string]
 	if !ok || tlsConfig == nil {
 		return
 	}
+	proxyType := strings.ToLower(strings.TrimSpace(firstString(proxy["type"])))
+	mode := model.NormalizeMihomoTlsMode(tlsConfig.Mode, tlsConfig.Server, tlsConfig.Client)
+	if proxyType == "shadowsocks" || isMihomoWrapperTLSMode(mode) {
+		refreshMihomoClashProxyTLS(proxy, tlsConfig)
+		return
+	}
+	clearMihomoClashWrapperProjection(proxy)
 
 	serverTLS := decodeSubscriptionTLSRaw(tlsConfig.Server)
 	clientTLS := decodeSubscriptionTLSRaw(tlsConfig.Client)
+	tlsEnabled := true
+	if value, ok := toBool(serverTLS["enabled"]); ok {
+		tlsEnabled = value
+	} else if value, ok := toBool(clientTLS["enabled"]); ok {
+		tlsEnabled = value
+	}
+	if !tlsEnabled {
+		for _, key := range []string{"tls", "sni", "servername", "alpn", "reality-opts", "ech-opts", "fingerprint", "skip-cert-verify", "disable-sni", "client-fingerprint"} {
+			delete(proxy, key)
+		}
+		return
+	}
+	proxy["tls"] = true
 
 	if shouldIncludeSubscriptionClashFingerprint(clientTLS) {
 		if _, serverCertPEM, ok := loadSubscriptionPEM(serverTLS["certificate"], serverTLS["certificate_path"], "CERTIFICATE"); ok {
 			if fingerprint, ok := calculateSubscriptionTLSFingerprint(serverCertPEM); ok {
 				proxy["fingerprint"] = fingerprint
+			} else {
+				delete(proxy, "fingerprint")
 			}
+		} else {
+			delete(proxy, "fingerprint")
 		}
 	} else {
 		delete(proxy, "fingerprint")
@@ -287,20 +311,77 @@ func (s *SubManagerSubService) refreshSubOutboundClashProxyTLS(proxy map[string]
 
 	if insecure, ok := clientTLS["insecure"].(bool); ok {
 		proxy["skip-cert-verify"] = insecure
+	} else {
+		delete(proxy, "skip-cert-verify")
 	}
 	if disableSNI, ok := clientTLS["disable_sni"].(bool); ok {
 		proxy["disable-sni"] = disableSNI
+	} else {
+		delete(proxy, "disable-sni")
+	}
+	if alpn := toStringSlice(clientTLS["alpn"]); len(alpn) > 0 {
+		proxy["alpn"] = alpn
+	} else {
+		delete(proxy, "alpn")
 	}
 
-	if serverName, ok := serverTLS["server_name"].(string); ok && strings.TrimSpace(serverName) != "" {
+	serverName := strings.TrimSpace(firstStringValue(clientTLS["server_name"]))
+	if serverName == "" {
+		serverName = strings.TrimSpace(firstStringValue(serverTLS["server_name"]))
+	}
+	if serverName != "" {
 		sni := strings.TrimSpace(serverName)
-		proxy["sni"] = sni
-		proxy["servername"] = sni
+		switch proxyType {
+		case "vmess", "vless":
+			proxy["servername"] = sni
+			delete(proxy, "sni")
+		default:
+			proxy["sni"] = sni
+			delete(proxy, "servername")
+		}
+	} else {
+		delete(proxy, "sni")
+		delete(proxy, "servername")
+	}
+	delete(proxy, "reality-opts")
+	if tlsReality, ok := clientTLS["reality"].(map[string]interface{}); ok && tlsReality != nil {
+		if enabled, ok := toBool(tlsReality["enabled"]); !ok || enabled {
+			realityOpts := map[string]interface{}{}
+			if publicKey := strings.TrimSpace(firstString(tlsReality["public_key"])); publicKey != "" {
+				realityOpts["public-key"] = publicKey
+			}
+			if shortID := strings.TrimSpace(firstString(tlsReality["short_id"])); shortID != "" {
+				realityOpts["short-id"] = shortID
+			}
+			if len(realityOpts) > 0 {
+				proxy["reality-opts"] = realityOpts
+			}
+		}
+	}
+	delete(proxy, "ech-opts")
+	if ech, ok := clientTLS["ech"].(map[string]interface{}); ok && ech != nil {
+		echoEnabled, _ := toBool(ech["enabled"])
+		echConfig := flattenECHConfig(ech["config"])
+		queryServerName := strings.TrimSpace(firstString(ech["query_server_name"]))
+		if echoEnabled || echConfig != "" || queryServerName != "" {
+			echOpts := map[string]interface{}{"enable": true}
+			if echConfig != "" {
+				echOpts["config"] = echConfig
+			}
+			if queryServerName != "" {
+				echOpts["query-server-name"] = queryServerName
+			}
+			proxy["ech-opts"] = echOpts
+		}
 	}
 	if utls, ok := clientTLS["utls"].(map[string]interface{}); ok && utls != nil {
 		if fp, ok := utls["fingerprint"].(string); ok && strings.TrimSpace(fp) != "" {
 			proxy["client-fingerprint"] = strings.TrimSpace(fp)
+		} else {
+			delete(proxy, "client-fingerprint")
 		}
+	} else {
+		delete(proxy, "client-fingerprint")
 	}
 }
 
@@ -613,34 +694,20 @@ func (s *SubManagerSubService) GetSubGroupJson(groupName string) (*string, error
 		return nil, err
 	}
 
-	// Parse outbound tags from group.
-	var outboundTags []string
-	if strings.TrimSpace(subGroup.Outbounds) != "" {
-		if err := json.Unmarshal([]byte(subGroup.Outbounds), &outboundTags); err != nil {
-			return nil, err
-		}
+	outboundTags, err := parseSubscriptionGroupOutboundTags(subGroup.Outbounds)
+	if err != nil {
+		return nil, err
 	}
-	if outboundTags == nil {
-		outboundTags = []string{}
+	subOutbounds, err := s.loadSubscriptionGroupOutbounds(db, outboundTags)
+	if err != nil {
+		return nil, err
 	}
-
-	// Load all suboutbounds referenced by group tags.
-	var outbounds []map[string]interface{}
-	var rawOutbounds []map[string]interface{}
-
-	for _, tag := range outboundTags {
-		subOutbound, getErr := s.getSubOutboundRecord(tag)
-		if getErr != nil {
-			// Skip missing/invalid records.
-			continue
-		}
-
+	rawOutbounds := make([]map[string]interface{}, 0, len(subOutbounds))
+	for _, subOutbound := range subOutbounds {
 		outboundMap, mapErr := s.buildRuntimeOutboundMap(subOutbound)
 		if mapErr != nil {
-			// Skip missing/invalid records.
 			continue
 		}
-
 		rawOutbounds = append(rawOutbounds, outboundMap)
 	}
 
@@ -656,6 +723,9 @@ func (s *SubManagerSubService) GetSubGroupJson(groupName string) (*string, error
 		outTags,
 		util.SupportsSingboxSubscriptionOutboundType,
 	)
+	if len(outbounds) > service.SubscriptionGroupMaxOutbounds {
+		return nil, fmt.Errorf("subscription group renders more than %d nodes", service.SubscriptionGroupMaxOutbounds)
+	}
 	for i := range outbounds {
 		util.SanitizeSingboxSubscriptionOutbound(outbounds[i])
 	}
@@ -679,14 +749,13 @@ func (s *SubManagerSubService) GetSubGroupClash(groupName string) (*string, erro
 		return nil, err
 	}
 
-	var outboundTags []string
-	if strings.TrimSpace(subGroup.Outbounds) != "" {
-		if err := json.Unmarshal([]byte(subGroup.Outbounds), &outboundTags); err != nil {
-			return nil, err
-		}
+	outboundTags, err := parseSubscriptionGroupOutboundTags(subGroup.Outbounds)
+	if err != nil {
+		return nil, err
 	}
-	if outboundTags == nil {
-		outboundTags = []string{}
+	subOutbounds, err := s.loadSubscriptionGroupOutbounds(db, outboundTags)
+	if err != nil {
+		return nil, err
 	}
 
 	extension, err := s.ClashService.loadClashExtension()
@@ -694,12 +763,8 @@ func (s *SubManagerSubService) GetSubGroupClash(groupName string) (*string, erro
 		return nil, err
 	}
 
-	renderEntries := make([]clashProxyRenderEntry, 0, len(outboundTags))
-	for _, tag := range outboundTags {
-		subOutbound, getErr := s.getSubOutboundRecord(tag)
-		if getErr != nil {
-			continue
-		}
+	renderEntries := make([]clashProxyRenderEntry, 0, len(subOutbounds))
+	for _, subOutbound := range subOutbounds {
 		if s.shouldUseStoredClashProxy(subOutbound) {
 			if proxy, ok := parseSubOutboundClashProxy(subOutbound); ok {
 				s.refreshSubOutboundClashProxyTLS(proxy, subOutbound)
@@ -728,6 +793,9 @@ func (s *SubManagerSubService) GetSubGroupClash(groupName string) (*string, erro
 			renderEntries = append(renderEntries, fallbackEntries...)
 		}
 	}
+	if len(renderEntries) > service.SubscriptionGroupMaxOutbounds {
+		return nil, fmt.Errorf("subscription group renders more than %d nodes", service.SubscriptionGroupMaxOutbounds)
+	}
 
 	generated := buildClashSubscriptionMapFromEntries(
 		renderEntries,
@@ -743,8 +811,60 @@ func (s *SubManagerSubService) GetSubGroupClash(groupName string) (*string, erro
 	return &resultStr, nil
 }
 
-// buildSubManagerRuntimeOutbounds expands manually configured Mixed endpoints and
-// ShadowTLS with ss_config into client-compatible subscription outbounds.
+func parseSubscriptionGroupOutboundTags(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return []string{}, nil
+	}
+	var tags []string
+	if err := json.Unmarshal([]byte(raw), &tags); err != nil {
+		return nil, err
+	}
+	result := make([]string, 0, len(tags))
+	seen := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			continue
+		}
+		if _, exists := seen[tag]; exists {
+			continue
+		}
+		seen[tag] = struct{}{}
+		result = append(result, tag)
+		if len(result) > service.SubscriptionGroupMaxOutbounds {
+			return nil, fmt.Errorf("subscription group contains more than %d nodes", service.SubscriptionGroupMaxOutbounds)
+		}
+	}
+	return result, nil
+}
+
+func (s *SubManagerSubService) loadSubscriptionGroupOutbounds(db *gorm.DB, tags []string) ([]*model.SubOutbound, error) {
+	if len(tags) == 0 {
+		return []*model.SubOutbound{}, nil
+	}
+	rows := make([]*model.SubOutbound, 0, len(tags))
+	if err := db.Model(model.SubOutbound{}).Where("tag IN ?", tags).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	byTag := make(map[string]*model.SubOutbound, len(rows))
+	for _, row := range rows {
+		if row == nil || isServerOnlySubscriptionSubOutbound(row) {
+			continue
+		}
+		byTag[strings.TrimSpace(row.Tag)] = row
+	}
+	ordered := make([]*model.SubOutbound, 0, len(tags))
+	for _, tag := range tags {
+		if row := byTag[tag]; row != nil {
+			ordered = append(ordered, row)
+		}
+	}
+	return ordered, nil
+}
+
+// buildSubManagerRuntimeOutbounds expands manually configured Mixed endpoints,
+// standalone ShadowTLS, and Mihomo Shadowsocks shadow-tls plugins into
+// client-compatible subscription outbounds.
 func buildSubManagerRuntimeOutbounds(raw []map[string]interface{}) ([]map[string]interface{}, []string) {
 	outbounds := make([]map[string]interface{}, 0, len(raw))
 	outTags := make([]string, 0, len(raw))
@@ -773,6 +893,12 @@ func buildSubManagerRuntimeOutbounds(raw []map[string]interface{}) ([]map[string
 			continue
 		}
 
+		if ssOutbound, shadowTLSOutbound, ok := util.BuildMihomoShadowsocksShadowTLSClientPair(outbound); ok {
+			outbounds = append(outbounds, ssOutbound, shadowTLSOutbound)
+			outTags = append(outTags, tag)
+			continue
+		}
+
 		if outType != "shadowtls" {
 			outbounds = append(outbounds, cloneRuntimeMap(outbound))
 			outTags = append(outTags, tag)
@@ -796,9 +922,5 @@ func buildSubManagerRuntimeOutbounds(raw []map[string]interface{}) ([]map[string
 }
 
 func cloneRuntimeMap(src map[string]interface{}) map[string]interface{} {
-	dst := make(map[string]interface{}, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
+	return util.CloneJSONMap(src)
 }

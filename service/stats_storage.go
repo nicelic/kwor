@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -329,9 +330,9 @@ func upsertStatsTraffic(tx *gorm.DB, sample model.Stats) error {
 }
 
 func upsertStatsTrafficBatch(tx *gorm.DB, samples []model.Stats) error {
-	if err := EnsureHistoryStorageReady(); err != nil {
-		return err
-	}
+	// The caller owns the active transaction and has already prepared the
+	// history schema. Re-entering EnsureHistoryStorageReady here would try to
+	// borrow the single SQLite connection while tx is holding it.
 	for _, sample := range samples {
 		if err := upsertStatsTraffic(tx, sample); err != nil {
 			return err
@@ -391,11 +392,55 @@ func queryStatsHistory(resource string, tag string, limitHours int) ([]model.Sta
 		ORDER BY bucket_start ASC, direction ASC
 	`, strings.Join(placeholders, ","))
 
+	// Keep the SQLite read and the in-memory tail under the same journal
+	// transaction gate.  Without this barrier a flush can commit rows to
+	// SQLite, but clear the in-memory tail just after the query snapshots it;
+	// the response would then add the same bytes twice.
+	unlock := lockTrafficRuntimeJournalTransaction()
+	defer unlock()
 	rows := make([]model.Stats, 0)
 	if err := db.Raw(query, args...).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
-	return rows, nil
+	_, pending := runtimeTrafficStats.snapshotPending()
+	return mergePendingTrafficRuntimeStatsWithSamples(rows, pending, resource, tag, startUnix, bucketSeconds), nil
+}
+
+func mergePendingTrafficRuntimeStats(rows []model.Stats, resource string, tag string, startUnix int64, bucketSeconds int64) []model.Stats {
+	_, pending := runtimeTrafficStats.snapshotPending()
+	return mergePendingTrafficRuntimeStatsWithSamples(rows, pending, resource, tag, startUnix, bucketSeconds)
+}
+
+func mergePendingTrafficRuntimeStatsWithSamples(rows []model.Stats, pendingSamples []model.Stats, resource string, tag string, startUnix int64, bucketSeconds int64) []model.Stats {
+	pending := pendingTrafficRuntimeStatsFromSamples(pendingSamples, resource, tag, startUnix, bucketSeconds)
+	if len(pending) == 0 {
+		return rows
+	}
+	merged := make(map[string]model.Stats, len(rows)+len(pending))
+	for _, row := range rows {
+		key := fmt.Sprintf("%d\x00%t", row.DateTime, row.Direction)
+		merged[key] = row
+	}
+	for _, row := range pending {
+		key := fmt.Sprintf("%d\x00%t", row.DateTime, row.Direction)
+		if current, ok := merged[key]; ok {
+			current.Traffic += row.Traffic
+			merged[key] = current
+			continue
+		}
+		merged[key] = row
+	}
+	result := make([]model.Stats, 0, len(merged))
+	for _, row := range merged {
+		result = append(result, row)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].DateTime != result[j].DateTime {
+			return result[i].DateTime < result[j].DateTime
+		}
+		return !result[i].Direction && result[j].Direction
+	})
+	return result
 }
 
 func statsQueryResources(resource string) []string {

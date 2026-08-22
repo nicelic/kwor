@@ -6,6 +6,7 @@
     prepend-inner-icon="mdi-calendar"
     readonly
     hide-details
+    :disabled="disabled"
   ></v-text-field>
   <DatePicker
     v-model="Input"
@@ -23,12 +24,13 @@
       </template>
       <template #submit-btn="{ submit, canSubmit  }">
         <v-btn
-          :disabled="!canSubmit"
+          :disabled="disabled || !canSubmit"
           @click="submit"
         >{{ $t('submit') }}</v-btn>
       </template>
       <template #cancel-btn="{ vm }">
         <v-btn
+          :disabled="disabled"
           @click="reset(vm)"
         >{{ $t('reset') }}</v-btn>
       </template>
@@ -91,6 +93,10 @@ export default {
     inputId: {
       type: String,
       default: '',
+    },
+    disabled: {
+      type: Boolean,
+      default: false,
     },
   },
   emits: ['submit'],
@@ -186,6 +192,9 @@ export default {
           return
         }
         this.input = parsed
+        if (this.disabled) {
+          return
+        }
         this.submit()
       }
     }
@@ -268,6 +277,9 @@ export default {
       return Number.isFinite(date.getTime()) ? panelCalendarDateFromInstant(date) : null
     },
     submit() {
+      if (this.disabled) {
+        return
+      }
       const parsed = this.coerceToDate(this.input)
       if (parsed == null) {
         return
@@ -285,6 +297,9 @@ export default {
       this.$emit('submit', epoch)
     },
     reset(vm:any) {
+      if (this.disabled) {
+        return
+      }
       this.$emit('submit',0)
       this.input = panelCalendarDateFromInstant(panelNow())
       vm.visible = false

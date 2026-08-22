@@ -35,7 +35,7 @@
           multiple
           chips
           :label="$t('network')"
-          :items="['tcp','udp']"
+          :items="['tcp','udp','icmp']"
           v-model="rule.network">
         </v-select>
       </v-col>
@@ -156,7 +156,7 @@
         v-model="source_port_range"></v-text-field>
       </v-col>
     </v-row>
-    <v-row v-if="isMihomoNamespace && optionProcess">
+    <v-row v-if="optionProcess">
       <v-col cols="12" sm="6" md="4">
         <v-select
           hide-details
@@ -184,7 +184,7 @@
         v-model="process_path_regex"></v-text-field>
       </v-col>
     </v-row>
-    <v-row v-if="isMihomoNamespace && optionUserID">
+    <v-row v-if="optionUserID">
       <v-col cols="12" sm="6">
         <v-text-field
         label="UID"
@@ -242,10 +242,10 @@
             <v-list-item>
               <v-switch v-model="optionSrcPort" color="primary" :label="$t('rule.srcPortRules')" hide-details></v-switch>
             </v-list-item>
-            <v-list-item v-if="isMihomoNamespace">
+            <v-list-item>
               <v-switch v-model="optionProcess" color="primary" label="Process Rules" hide-details></v-switch>
             </v-list-item>
-            <v-list-item v-if="isMihomoNamespace">
+            <v-list-item>
               <v-switch v-model="optionUserID" color="primary" label="UID" hide-details></v-switch>
             </v-list-item>
             <v-list-item>
@@ -289,6 +289,34 @@ export default {
     }
   },
   methods: {
+    parseMihomoIntegerList(value: string): Array<number | string> {
+      if (value.length === 0) {
+        return []
+      }
+      return value.split(',').map((item: string) => {
+        const token = item.trim()
+        if (/^\d+$/.test(token)) {
+          const parsed = Number(token)
+          if (Number.isSafeInteger(parsed)) {
+            return parsed
+          }
+        }
+        // Preserve malformed text for the namespace validator instead of
+        // letting parseInt silently turn it into a different value.
+        return token
+      })
+    },
+    parseIntegerList(value: string): Array<number | string> {
+      if (value.length === 0) return []
+      return value.split(',').map((item: string) => {
+        const token = item.trim()
+        if (/^\d+$/.test(token)) {
+          const parsed = Number(token)
+          if (Number.isSafeInteger(parsed)) return parsed
+        }
+        return token
+      })
+    },
     sanitizeRule() {
       if (!this.isMihomoNamespace) {
         return
@@ -320,6 +348,18 @@ export default {
     updateProcessOption(option:string) {
       this.processKeys.forEach(k => delete this.$props.rule[k])
       this.$props.rule[option] = []
+    },
+    syncOptionSelections() {
+      const ruleKeys = Object.keys(this.$props.rule ?? {})
+      const selectEnabled = (keys: string[], fallback: string): string => {
+        const enabledOption = keys.find((key) => ruleKeys.includes(key))
+        return enabledOption ?? fallback
+      }
+      this.domainOption = selectEnabled(this.domainKeys, 'domain')
+      this.portOption = selectEnabled(this.portKeys, 'port')
+      this.srcIPOption = selectEnabled(this.srcIPKeys, 'source_ip_cidr')
+      this.srcPortOption = selectEnabled(this.srcPortKeys, 'source_port')
+      this.processOption = selectEnabled(this.processKeys, 'process_name')
     },
   },
   computed: {
@@ -447,7 +487,7 @@ export default {
       get() { return this.$props.rule.port?.join(',') },
       set(v:string) {
         if(!v.endsWith(',')) {
-          this.$props.rule.port = v.length > 0 ? v.split(',').map(str => parseInt(str, 10)) : []
+          this.$props.rule.port = this.parseIntegerList(v)
         }
       }
     },
@@ -463,7 +503,7 @@ export default {
       get() { return this.$props.rule.source_port?.join(',') },
       set(v:string) {
         if(!v.endsWith(',')) {
-          this.$props.rule.source_port = v.length > 0 ? v.split(',').map(str => parseInt(str, 10)) : []
+          this.$props.rule.source_port = this.parseIntegerList(v)
         }
       }
     },
@@ -487,34 +527,21 @@ export default {
       get() { return this.$props.rule.user_id?.join(',') },
       set(v:string) {
         if(!v.endsWith(',')) {
-          this.$props.rule.user_id = v.length > 0 ? v.split(',').map(str => parseInt(str, 10)).filter((num: number) => !Number.isNaN(num)) : []
+          this.$props.rule.user_id = this.parseMihomoIntegerList(v)
         }
       }
     },
   },
+  watch: {
+    rule(newValue: any, oldValue: any) {
+      if (newValue === oldValue) return
+      this.sanitizeRule()
+      this.syncOptionSelections()
+    },
+  },
   mounted() {
     this.sanitizeRule()
-    const ruleKeys = Object.keys(this.$props.rule)
-    if (this.optionDomain) {
-      const enabledOption = this.domainKeys.filter(k => ruleKeys.includes(k))
-      this.domainOption = enabledOption.length>0 ? enabledOption[0] : 'domain'
-    }
-    if (this.optionPort) {
-      const enabledOption = this.portKeys.filter(k => ruleKeys.includes(k))
-      this.portOption = enabledOption.length>0 ? enabledOption[0] : 'port'
-    }
-    if (this.optionSrcIP) {
-      const enabledOption = this.srcIPKeys.filter(k => ruleKeys.includes(k))
-      this.srcIPOption = enabledOption.length>0 ? enabledOption[0] : 'source_ip_cidr'
-    }
-    if (this.optionSrcPort) {
-      const enabledOption = this.srcPortKeys.filter(k => ruleKeys.includes(k))
-      this.srcPortOption = enabledOption.length>0 ? enabledOption[0] : 'source_port'
-    }
-    if (this.optionProcess) {
-      const enabledOption = this.processKeys.filter(k => ruleKeys.includes(k))
-      this.processOption = enabledOption.length>0 ? enabledOption[0] : 'process_name'
-    }
+    this.syncOptionSelections()
   }
 }
 </script>

@@ -120,6 +120,19 @@ func copyBackupTable[T any](src *gorm.DB, dst *gorm.DB) error {
 }
 
 func GetDb(exclude string) ([]byte, error) {
+	// Export and replacement both read or move the live SQLite file. Keep them
+	// mutually exclusive so an export can never copy from a connection that a
+	// concurrent import has just closed.
+	databaseImportRestoreMu.Lock()
+	defer databaseImportRestoreMu.Unlock()
+
+	if err := runDBBeforeBackupHooks(); err != nil {
+		return nil, common.NewErrorf("备份前刷新运行态账本失败: %v", err)
+	}
+	db := GetDB()
+	if db == nil {
+		return nil, common.NewError("数据库尚未初始化")
+	}
 	excludeChanges, excludeStats := false, false
 	for _, table := range strings.Split(exclude, ",") {
 		if table == "changes" {
@@ -151,6 +164,7 @@ func GetDb(exclude string) ([]byte, error) {
 	err = backupDb.AutoMigrate(
 		&model.Setting{},
 		&model.SettingsState{},
+		&model.SingboxConfigState{},
 		&model.SubscriptionInitialState{},
 		// ACME/DNS account state and certificate inventory are all database
 		// source data. Keep them together in the lightweight database export as
@@ -169,6 +183,7 @@ func GetDb(exclude string) ([]byte, error) {
 		&model.SubOutbound{},
 		&model.SubGroup{},
 		&model.Service{},
+		&model.DnsServer{},
 		&model.Endpoint{},
 		&model.User{},
 		&model.Tokens{},
@@ -200,6 +215,7 @@ func GetDb(exclude string) ([]byte, error) {
 	copySteps := []func() error{
 		func() error { return copyBackupTable[model.Setting](db, backupDb) },
 		func() error { return copyBackupTable[model.SettingsState](db, backupDb) },
+		func() error { return copyBackupTable[model.SingboxConfigState](db, backupDb) },
 		func() error { return copyBackupTable[model.SubscriptionInitialState](db, backupDb) },
 		func() error { return copyBackupTable[model.AcmeAccount](db, backupDb) },
 		func() error { return copyBackupTable[model.AcmeDNSAccount](db, backupDb) },
@@ -215,6 +231,7 @@ func GetDb(exclude string) ([]byte, error) {
 		func() error { return copyBackupTable[model.SubOutbound](db, backupDb) },
 		func() error { return copyBackupTable[model.SubGroup](db, backupDb) },
 		func() error { return copyBackupTable[model.Service](db, backupDb) },
+		func() error { return copyBackupTable[model.DnsServer](db, backupDb) },
 		func() error { return copyBackupTable[model.Endpoint](db, backupDb) },
 		func() error { return copyBackupTable[model.User](db, backupDb) },
 		func() error { return copyBackupTable[model.Tokens](db, backupDb) },
@@ -277,6 +294,14 @@ func GetDb(exclude string) ([]byte, error) {
 }
 
 func BuildDBBackupArchive() (*DBBackupArchive, error) {
+	// Archive snapshots must see one stable database directory. Imports and
+	// restores use the same gate before replacing that directory.
+	databaseImportRestoreMu.Lock()
+	defer databaseImportRestoreMu.Unlock()
+
+	if err := runDBBeforeBackupHooks(); err != nil {
+		return nil, common.NewErrorf("归档前刷新运行态账本失败: %v", err)
+	}
 	dbDir := config.GetDBFolderPath()
 	if err := os.MkdirAll(dbDir, 0o740); err != nil {
 		return nil, err
@@ -361,12 +386,20 @@ func BuildDBBackupArchive() (*DBBackupArchive, error) {
 	}, nil
 }
 
-func ImportDB(file multipart.File) error {
+func ImportDB(file multipart.File) (err error) {
 	if file == nil {
 		return common.NewError("未选择数据库文件")
 	}
 	databaseImportRestoreMu.Lock()
 	defer databaseImportRestoreMu.Unlock()
+	defer func() {
+		if err != nil {
+			runDBRestoreAbortHooks()
+		}
+	}()
+	if err := runDBBeforeRestoreHooks(); err != nil {
+		return err
+	}
 	if err := ensureNoPendingDBRestore(); err != nil {
 		return err
 	}
@@ -457,6 +490,7 @@ func replaceMainDatabaseWithImportedFile(tempPath string) error {
 	if err := InitDB(dbPath); err != nil {
 		return restoreOriginal(common.NewErrorf("Error initializing imported db: %v", err))
 	}
+	runDBAfterRestoreHooks()
 	if err := os.Remove(fallbackPath); err != nil && !os.IsNotExist(err) {
 		logger.Warning("remove imported db fallback file failed: ", err)
 	}
@@ -468,7 +502,7 @@ func replaceMainDatabaseWithImportedFile(tempPath string) error {
 	return nil
 }
 
-func RestoreDBBackupArchive(file multipart.File, panelRestarter func() error, stopRunningCores func() error) error {
+func RestoreDBBackupArchive(file multipart.File, panelRestarter func() error, stopRunningCores func() error) (err error) {
 	if file == nil {
 		return common.NewError("未选择备份文件")
 	}
@@ -477,6 +511,14 @@ func RestoreDBBackupArchive(file multipart.File, panelRestarter func() error, st
 	}
 	databaseImportRestoreMu.Lock()
 	defer databaseImportRestoreMu.Unlock()
+	defer func() {
+		if err != nil {
+			runDBRestoreAbortHooks()
+		}
+	}()
+	if err := runDBBeforeRestoreHooks(); err != nil {
+		return err
+	}
 	if err := ensureNoPendingDBRestore(); err != nil {
 		return err
 	}
@@ -526,7 +568,6 @@ func RestoreDBBackupArchive(file multipart.File, panelRestarter func() error, st
 		cleanupStage()
 		return common.NewErrorf("写入恢复任务失败: %v", err)
 	}
-
 	if err := panelRestarter(); err != nil {
 		clearPendingDBRestoreMarker()
 		cleanupStage()
@@ -634,6 +675,11 @@ func ApplyPendingDBRestore() error {
 		}
 		return common.NewErrorf("重新初始化主数据库失败: %v", err)
 	}
+	// The staged database is active only after InitDB succeeds. Run restore
+	// hooks here, not before the panel restart request, so runtime sidecars are
+	// invalidated against the restored database generation rather than the old
+	// one that is about to be replaced.
+	runDBAfterRestoreHooks()
 
 	marker.StageDir = dbDir
 	marker.BackupDir = backupDir
@@ -879,15 +925,17 @@ func escapeSQLiteLiteral(value string) string {
 }
 
 func closeMainDatabase() error {
-	if db == nil {
+	currentDB := GetDB()
+	if currentDB == nil {
 		return nil
 	}
-	sqlDB, err := db.DB()
+	sqlDB, err := currentDB.DB()
 	if err != nil {
-		db = nil
 		return err
 	}
-	db = nil
+	// Keep the closed handle published until InitDB swaps in the replacement.
+	// Concurrent readers then receive the driver's normal "database is closed"
+	// error instead of dereferencing a transient nil global pointer.
 	return sqlDB.Close()
 }
 

@@ -19,7 +19,7 @@ func (s *ServicesService) GetAll() (*[]map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	var data []map[string]interface{}
+	data := make([]map[string]interface{}, 0, len(services))
 	for _, srv := range services {
 		srvData := map[string]interface{}{
 			"id":     srv.Id,
@@ -64,14 +64,42 @@ func (s *ServicesService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 
 	switch act {
 	case "new", "edit":
-		var srv model.Service
-		err = srv.UnmarshalJSON(data)
+		normalizedData, identity, err := validateAndNormalizeSingboxServicePayload(data, act)
 		if err != nil {
 			return err
 		}
+		if err := validateSingboxServiceReferences(tx, identity); err != nil {
+			return err
+		}
+		var srv model.Service
+		err = srv.UnmarshalJSON(normalizedData)
+		if err != nil {
+			return err
+		}
+		srv.Id = identity.ID
+		srv.Type = identity.Type
+		srv.Tag = identity.Tag
+		tlsID, err := parseOptionalSingboxTLSID(identity.Fields)
+		if err != nil {
+			return common.NewError("sing-box service ", err.Error())
+		}
+		srv.TlsId = tlsID
+		previousTag := ""
+		if act == "edit" {
+			var existing model.Service
+			if err := tx.Where("id = ?", srv.Id).First(&existing).Error; err != nil {
+				return err
+			}
+			previousTag = existing.Tag
+		}
+		if previousTag != "" && previousTag != srv.Tag {
+			if err := validateSingboxServiceRemovalReferences(tx, []string{previousTag}); err != nil {
+				return err
+			}
+		}
 
 		if srv.TlsId > 0 {
-			err = tx.Model(model.Tls{}).Where("id = ?", srv.TlsId).Find(&srv.Tls).Error
+			err = tx.Model(model.Tls{}).Where("id = ?", srv.TlsId).Take(&srv.Tls).Error
 			if err != nil {
 				return err
 			}
@@ -85,6 +113,9 @@ func (s *ServicesService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 		var tag string
 		err = json.Unmarshal(data, &tag)
 		if err != nil {
+			return err
+		}
+		if err := validateSingboxServiceRemovalReferences(tx, []string{tag}); err != nil {
 			return err
 		}
 		err = tx.Where("tag = ?", tag).Delete(model.Service{}).Error

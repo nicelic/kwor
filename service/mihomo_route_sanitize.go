@@ -26,6 +26,10 @@ var mihomoTransientRouteRuleKeys = []string{
 	"timeout",
 	"strategy",
 	"server",
+	"disable_cache",
+	"disable_optimistic_cache",
+	"rewrite_ttl",
+	"client_subnet",
 }
 
 func sanitizeMihomoConfigJSON(config json.RawMessage) (json.RawMessage, error) {
@@ -49,6 +53,7 @@ func sanitizeMihomoConfigJSON(config json.RawMessage) (json.RawMessage, error) {
 	} else {
 		delete(document, "tcp-concurrent")
 	}
+	delete(document, "log")
 
 	if dns := sanitizeMihomoDNSConfig(document["dns"]); len(dns) > 0 {
 		document["dns"] = dns

@@ -100,6 +100,33 @@ func TestHydrateOutboundTLSFromInboundTLSDoesNotOverrideExisting(t *testing.T) {
 	}
 }
 
+func TestHydrateOutboundTLSFromInboundTLSSkipsShadowsocksPluginProjection(t *testing.T) {
+	outbound := map[string]interface{}{
+		"type":   "shadowsocks",
+		"tag":    "ss-wrapper",
+		"plugin": "shadow-tls",
+		"plugin_opts": map[string]interface{}{
+			"host": "edge.example.com",
+		},
+	}
+	inbound := &model.Inbound{
+		TlsId: 1,
+		Tls: &model.Tls{
+			Server: mustJSON(t, map[string]interface{}{
+				"shadow_tls": map[string]interface{}{"version": 3},
+			}),
+			Client: mustJSON(t, map[string]interface{}{
+				"shadow_tls_opts": map[string]interface{}{"version": 3, "password": "p"},
+			}),
+		},
+	}
+
+	hydrateOutboundTLSFromInboundTLS(outbound, inbound)
+	if _, exists := outbound["tls"]; exists {
+		t.Fatalf("Shadowsocks plugin projection must not gain an internal tls map: %#v", outbound)
+	}
+}
+
 func mustJSON(t *testing.T, v interface{}) json.RawMessage {
 	t.Helper()
 	b, err := json.Marshal(v)

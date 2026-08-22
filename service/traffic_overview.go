@@ -28,8 +28,12 @@ import (
 	"time"
 
 	"github.com/alireza0/s-ui/config"
+	"github.com/alireza0/s-ui/database"
+	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/logger"
 	psnet "github.com/shirou/gopsutil/v4/net"
+	"golang.org/x/sync/singleflight"
+	"gorm.io/gorm"
 )
 
 type TrafficOverview struct {
@@ -132,6 +136,19 @@ type VnstatInstallJobStatus struct {
 	FinishedAt       int64  `json:"finishedAt,omitempty"`
 }
 
+// VnstatRemovalJobStatus represents the destructive vnStat cleanup task. It
+// is intentionally non-cancellable once accepted: stopping the daemon and a
+// package-manager removal must be allowed to finish coherently.
+type VnstatRemovalJobStatus struct {
+	ID         string `json:"id,omitempty"`
+	State      string `json:"state"`
+	Phase      string `json:"phase,omitempty"`
+	Error      string `json:"error,omitempty"`
+	StartedAt  int64  `json:"startedAt,omitempty"`
+	UpdatedAt  int64  `json:"updatedAt,omitempty"`
+	FinishedAt int64  `json:"finishedAt,omitempty"`
+}
+
 type vnstatInstallJob struct {
 	status VnstatInstallJobStatus
 	task   *ManagedDownloadTaskHandle
@@ -199,33 +216,37 @@ type vnstatVerifiedService struct {
 }
 
 const (
-	maxInt64AsUint64                 = ^uint64(0) >> 1
-	trafficOverviewStateKey          = "trafficOverviewState"
-	trafficOverviewLimitGiBKey       = "trafficOverviewLimitGiB"
-	trafficOverviewEnabledKey        = "trafficOverviewEnabled"
-	trafficOverviewResetDayKey       = "trafficOverviewResetDay"
-	trafficOverviewExpiryDateKey     = "trafficOverviewExpiryDate"
-	trafficOverviewSnapshotKey       = "trafficOverviewSnapshot"
-	trafficOverviewCapStateKey       = "trafficOverviewCapState"
-	trafficOverviewPauseStateKey     = "trafficOverviewPauseState"
-	trafficOverviewVnstatManifestKey = "trafficOverviewVnstatManifest"
-	trafficOverviewMinDisplayGiB     = 0.01
-	trafficOverviewFlushInterval     = 3 * time.Second
-	trafficOverviewFlushDelta        = int64(256 * 1024)
-	trafficCapTagLoopback            = "loopback"
-	trafficCapTagDropExcept          = "drop_except_allowed"
-	trafficCapTagDropForward         = "drop_all_forward"
-	vnstatPackageName                = "vnstat"
-	vnstatInstallMethodSystemPackage = "system-package"
-	vnstatInstallMethodGitHubRelease = "github-release"
-	vnstatOwnershipPanelInstalled    = "panel-installed"
-	vnstatOwnershipStateManaged      = "managed"
-	vnstatOwnershipStateUnmanaged    = "unmanaged"
-	vnstatOwnershipStateQuarantined  = "quarantined"
-	vnstatEvidenceSchema             = 2
-	vnstatGitHubLatestReleaseAPI     = "https://api.github.com/repos/vergoh/vnstat/releases/latest"
-	vnstatSystemdUnitPath            = "/etc/systemd/system/kwor-vnstat.service"
-	vnstatPanelSystemdUnit           = "kwor-vnstat"
+	maxInt64AsUint64                   = ^uint64(0) >> 1
+	trafficOverviewStateKey            = "trafficOverviewState"
+	trafficOverviewLimitGiBKey         = "trafficOverviewLimitGiB"
+	trafficOverviewEnabledKey          = "trafficOverviewEnabled"
+	trafficOverviewResetDayKey         = "trafficOverviewResetDay"
+	trafficOverviewExpiryDateKey       = "trafficOverviewExpiryDate"
+	trafficOverviewSnapshotKey         = "trafficOverviewSnapshot"
+	trafficOverviewCapStateKey         = "trafficOverviewCapState"
+	trafficOverviewPauseStateKey       = "trafficOverviewPauseState"
+	trafficOverviewVnstatManifestKey   = "trafficOverviewVnstatManifest"
+	trafficOverviewMinDisplayGiB       = 0.01
+	trafficOverviewFlushDelta          = int64(1024 * 1024)
+	trafficOverviewFlushInterval       = 30 * time.Second
+	trafficOverviewConfigCacheTTL      = 30 * time.Second
+	trafficOverviewCapEvaluateInterval = 30 * time.Second
+	vnstatStatusCacheTTL               = 15 * time.Second
+	maxVnstatCommandOutputBytes        = 1024 * 1024
+	trafficCapTagLoopback              = "loopback"
+	trafficCapTagDropExcept            = "drop_except_allowed"
+	trafficCapTagDropForward           = "drop_all_forward"
+	vnstatPackageName                  = "vnstat"
+	vnstatInstallMethodSystemPackage   = "system-package"
+	vnstatInstallMethodGitHubRelease   = "github-release"
+	vnstatOwnershipPanelInstalled      = "panel-installed"
+	vnstatOwnershipStateManaged        = "managed"
+	vnstatOwnershipStateUnmanaged      = "unmanaged"
+	vnstatOwnershipStateQuarantined    = "quarantined"
+	vnstatEvidenceSchema               = 2
+	vnstatGitHubLatestReleaseAPI       = "https://api.github.com/repos/vergoh/vnstat/releases/latest"
+	vnstatSystemdUnitPath              = "/etc/systemd/system/kwor-vnstat.service"
+	vnstatPanelSystemdUnit             = "kwor-vnstat"
 )
 
 var vnstatStandardProgramPaths = []string{
@@ -254,9 +275,14 @@ var vnstatStandardManPagePaths = []string{
 var trafficOverviewStateMu sync.Mutex
 var trafficOverviewSnapshotMu sync.Mutex
 var trafficOverviewCapMu sync.Mutex
+var trafficOverviewOperationMu sync.Mutex
 var vnstatInstallJobMu sync.Mutex
 var vnstatInstallJobState *vnstatInstallJob
 var vnstatInstallTaskManager = NewManagedDownloadTaskManager("vnstat install")
+var vnstatRemovalTaskManager = NewManagedDownloadTaskManager("vnstat removal")
+var vnstatLifecycleMu sync.Mutex
+var trafficOverviewCapScheduleMu sync.Mutex
+var trafficOverviewCapLastEvaluatedAt time.Time
 var trafficOverviewShutdownEnabledFn = func() bool {
 	return IsSystemPlatformLinux() && nftSupported()
 }
@@ -346,6 +372,15 @@ type trafficOverviewSnapshotState struct {
 	LastFlushAt  time.Time
 }
 
+type trafficOverviewRuntimeStateCacheState struct {
+	Loaded       bool
+	HasPersisted bool
+	Persisted    trafficOverviewRuntimeState
+	HasPending   bool
+	Pending      trafficOverviewRuntimeState
+	LastFlushAt  time.Time
+}
+
 type trafficOverviewCapState struct {
 	Active       bool  `json:"active"`
 	LimitReached bool  `json:"limitReached"`
@@ -354,6 +389,55 @@ type trafficOverviewCapState struct {
 }
 
 var trafficOverviewSnapshotCache trafficOverviewSnapshotState
+var trafficOverviewRuntimeStateCache trafficOverviewRuntimeStateCacheState
+var trafficOverviewRuntimeStateCacheMu sync.Mutex
+
+type trafficOverviewConfigCacheState struct {
+	loaded         bool
+	limitGiB       float64
+	resetDay       int
+	expiryDate     string
+	expiryBoundary time.Time
+	enabled        bool
+	updatedAt      time.Time
+}
+
+type vnstatStatusCacheState struct {
+	loaded    bool
+	status    VnstatPackageStatus
+	updatedAt time.Time
+}
+
+var trafficOverviewConfigMu sync.Mutex
+var trafficOverviewConfigCache trafficOverviewConfigCacheState
+var trafficOverviewSettingsMu sync.Mutex
+var vnstatStatusCacheMu sync.Mutex
+var vnstatStatusCache vnstatStatusCacheState
+var trafficOverviewFlight singleflight.Group
+var trafficOverviewCapStartupChecked bool
+
+func init() {
+	database.RegisterDBResetHook(func() {
+		trafficOverviewConfigMu.Lock()
+		trafficOverviewConfigCache = trafficOverviewConfigCacheState{}
+		trafficOverviewConfigMu.Unlock()
+		vnstatStatusCacheMu.Lock()
+		vnstatStatusCache = vnstatStatusCacheState{}
+		vnstatStatusCacheMu.Unlock()
+		trafficOverviewSnapshotMu.Lock()
+		trafficOverviewSnapshotCache = trafficOverviewSnapshotState{}
+		trafficOverviewSnapshotMu.Unlock()
+		trafficOverviewRuntimeStateCacheMu.Lock()
+		trafficOverviewRuntimeStateCache = trafficOverviewRuntimeStateCacheState{}
+		trafficOverviewRuntimeStateCacheMu.Unlock()
+		trafficOverviewCapMu.Lock()
+		trafficOverviewCapStartupChecked = false
+		trafficOverviewCapMu.Unlock()
+		trafficOverviewCapScheduleMu.Lock()
+		trafficOverviewCapLastEvaluatedAt = time.Time{}
+		trafficOverviewCapScheduleMu.Unlock()
+	})
+}
 
 type vnstatRuntimeConflictState struct {
 	conflict *VnstatRuntimeConflict
@@ -363,6 +447,22 @@ var vnstatRuntimeConflictMu sync.RWMutex
 var vnstatRuntimeConflictCache vnstatRuntimeConflictState
 
 func (s *TrafficOverviewService) GetTrafficOverview() (*TrafficOverview, error) {
+	result, err, _ := trafficOverviewFlight.Do("full", func() (any, error) {
+		return s.getTrafficOverviewUncached()
+	})
+	if err != nil {
+		return nil, err
+	}
+	overview, _ := result.(*TrafficOverview)
+	if overview == nil {
+		return nil, errors.New("traffic overview result is unavailable")
+	}
+	clone := *overview
+	clone.Vnstat = cloneVnstatPackageStatus(overview.Vnstat)
+	return &clone, nil
+}
+
+func (s *TrafficOverviewService) getTrafficOverviewUncached() (*TrafficOverview, error) {
 	overview := &TrafficOverview{
 		Source:    "vnstat",
 		Enabled:   true,
@@ -485,7 +585,7 @@ func (s *TrafficOverviewService) GetTrafficOverview() (*TrafficOverview, error) 
 	overview.Status = "running"
 
 	if stateChanged {
-		if err := s.saveRuntimeState(state); err != nil {
+		if err := s.stageRuntimeState(state, periodChanged); err != nil {
 			logger.Warning("save traffic overview state failed:", err)
 		}
 	}
@@ -495,7 +595,23 @@ func (s *TrafficOverviewService) GetTrafficOverview() (*TrafficOverview, error) 
 	return overview, nil
 }
 
+func cloneVnstatPackageStatus(status VnstatPackageStatus) VnstatPackageStatus {
+	status.DataPaths = append([]string(nil), status.DataPaths...)
+	status.ExternalPaths = append([]string(nil), status.ExternalPaths...)
+	status.ExternalUnits = append([]string(nil), status.ExternalUnits...)
+	if status.RuntimeConflict != nil {
+		clone := *status.RuntimeConflict
+		clone.Paths = append([]string(nil), clone.Paths...)
+		clone.PIDs = append([]int(nil), clone.PIDs...)
+		clone.Units = append([]string(nil), clone.Units...)
+		status.RuntimeConflict = &clone
+	}
+	return status
+}
+
 func (s *TrafficOverviewService) UpdateTrafficOverviewSettings(limitGiB float64, resetDay int, expiryDate string, expiryDateProvided bool) error {
+	trafficOverviewOperationMu.Lock()
+	defer trafficOverviewOperationMu.Unlock()
 	limitGiB = normalizeLimitGiB(limitGiB)
 	resetDay = normalizeResetDay(resetDay)
 	normalizedExpiryDate, err := normalizeTrafficOverviewExpiryDate(expiryDate)
@@ -503,25 +619,72 @@ func (s *TrafficOverviewService) UpdateTrafficOverviewSettings(limitGiB float64,
 		return err
 	}
 
-	settingSvc := &SettingService{}
-	if err := settingSvc.setString(trafficOverviewLimitGiBKey, strconv.FormatFloat(limitGiB, 'f', 2, 64)); err != nil {
-		return err
-	}
-	if err := settingSvc.setString(trafficOverviewResetDayKey, strconv.Itoa(resetDay)); err != nil {
-		return err
+	trafficOverviewSettingsMu.Lock()
+	defer trafficOverviewSettingsMu.Unlock()
+
+	changes := map[string]string{
+		trafficOverviewLimitGiBKey: strconv.FormatFloat(limitGiB, 'f', 2, 64),
+		trafficOverviewResetDayKey: strconv.Itoa(resetDay),
 	}
 	if expiryDateProvided {
-		if err := settingSvc.setString(trafficOverviewExpiryDateKey, normalizedExpiryDate); err != nil {
-			return err
-		}
+		changes[trafficOverviewExpiryDateKey] = normalizedExpiryDate
 	}
+	if err := saveTrafficOverviewSettingsAtomically(changes); err != nil {
+		return err
+	}
+	invalidateTrafficOverviewConfigCache()
+	markTrafficOverviewCapReconcileNeeded()
 	if err := s.ReconcileTrafficCap(); err != nil {
 		logger.Warning("reconcile traffic cap after settings update failed:", err)
 	}
 	return nil
 }
 
+func saveTrafficOverviewSettingsAtomically(changes map[string]string) error {
+	db := database.GetDB()
+	if db == nil {
+		return errors.New("database is not ready")
+	}
+	changed := false
+	err := db.Transaction(func(tx *gorm.DB) error {
+		current, err := loadCurrentPatchValues(tx, changes)
+		if err != nil {
+			return err
+		}
+		updates := changedSettingsValues(current, changes)
+		if len(updates) == 0 {
+			return nil
+		}
+		revision, err := ensureSettingsRevisionState(tx)
+		if err != nil {
+			return err
+		}
+		for _, key := range sortedSettingsKeys(updates) {
+			if err := upsertSetting(tx, key, updates[key]); err != nil {
+				return err
+			}
+		}
+		updated := tx.Model(&model.SettingsState{}).
+			Where("id = ? AND revision = ?", 1, revision).
+			Update("revision", gorm.Expr("revision + ?", 1))
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return errors.New("traffic overview settings revision conflict")
+		}
+		changed = true
+		return nil
+	})
+	if err == nil && changed {
+		markLastUpdate(time.Now().Unix())
+	}
+	return err
+}
+
 func (s *TrafficOverviewService) SetTrafficOverviewEnabled(enabled bool) error {
+	trafficOverviewOperationMu.Lock()
+	defer trafficOverviewOperationMu.Unlock()
 	currentEnabled, currentErr := s.isOverviewEnabled()
 	if currentErr != nil {
 		return currentErr
@@ -537,9 +700,19 @@ func (s *TrafficOverviewService) SetTrafficOverviewEnabled(enabled bool) error {
 		if err := s.pauseTrafficOverviewAccounting(); err != nil {
 			return err
 		}
+		if manifest, ok := loadTrustedVnstatManifest(); ok {
+			if err := stopVnstatDaemonForRestart(manifest); err != nil {
+				logger.Warning("stop managed vnstat daemon while disabling traffic overview failed: ", err)
+			} else {
+				invalidateVnstatStatusCache()
+			}
+		}
+		invalidateVnstatStatusCache()
 		if err := (&SettingService{}).setString(trafficOverviewEnabledKey, "false"); err != nil {
 			return err
 		}
+		invalidateTrafficOverviewConfigCache()
+		markTrafficOverviewCapReconcileNeeded()
 		if err := cleanupTrafficCapRules(); err != nil {
 			logger.Warning("cleanup traffic cap after disabling overview failed:", err)
 		}
@@ -551,6 +724,8 @@ func (s *TrafficOverviewService) SetTrafficOverviewEnabled(enabled bool) error {
 	if err := (&SettingService{}).setString(trafficOverviewEnabledKey, "true"); err != nil {
 		return err
 	}
+	invalidateTrafficOverviewConfigCache()
+	markTrafficOverviewCapReconcileNeeded()
 	if !IsSystemPlatformLinux() {
 		return nil
 	}
@@ -565,6 +740,7 @@ func (s *TrafficOverviewService) SetTrafficOverviewEnabled(enabled bool) error {
 	if daemonErr := ensureVnstatDaemonRunning(); daemonErr != nil {
 		logger.Warning("ensure vnstat daemon after enabling overview failed:", daemonErr)
 	}
+	invalidateVnstatStatusCache()
 	if err := s.ReconcileTrafficCap(); err != nil {
 		logger.Warning("reconcile traffic cap after enabling overview failed:", err)
 	}
@@ -756,6 +932,26 @@ func (s *TrafficOverviewService) resumeTrafficOverviewAccounting() error {
 }
 
 func (s *TrafficOverviewService) GetVnstatStatus() VnstatPackageStatus {
+	vnstatStatusCacheMu.Lock()
+	if vnstatStatusCache.loaded && time.Since(vnstatStatusCache.updatedAt) < vnstatStatusCacheTTL {
+		status := cloneVnstatPackageStatus(vnstatStatusCache.status)
+		vnstatStatusCacheMu.Unlock()
+		return status
+	}
+	vnstatStatusCacheMu.Unlock()
+
+	status := s.getVnstatStatusUncached()
+	vnstatStatusCacheMu.Lock()
+	vnstatStatusCache = vnstatStatusCacheState{
+		loaded:    true,
+		status:    cloneVnstatPackageStatus(status),
+		updatedAt: time.Now(),
+	}
+	vnstatStatusCacheMu.Unlock()
+	return status
+}
+
+func (s *TrafficOverviewService) getVnstatStatusUncached() VnstatPackageStatus {
 	status := VnstatPackageStatus{
 		Supported: IsSystemPlatformLinux(),
 		CanManage: IsSystemPlatformLinux(),
@@ -838,6 +1034,12 @@ func (s *TrafficOverviewService) GetVnstatStatus() VnstatPackageStatus {
 	}
 
 	return status
+}
+
+func invalidateVnstatStatusCache() {
+	vnstatStatusCacheMu.Lock()
+	vnstatStatusCache = vnstatStatusCacheState{}
+	vnstatStatusCacheMu.Unlock()
 }
 
 func populateVnstatPlatformStatus(status *VnstatPackageStatus) {
@@ -1358,6 +1560,11 @@ func (s *TrafficOverviewService) StartManagedVnstatInstall(source string) (Vnsta
 	if selectedSource == "" {
 		return VnstatInstallJobStatus{}, errors.New("请先选择来源")
 	}
+	vnstatLifecycleMu.Lock()
+	defer vnstatLifecycleMu.Unlock()
+	if vnstatRemovalTaskManager.IsActive() {
+		return VnstatInstallJobStatus{}, errors.New("vnstat 删除任务正在运行，请等待完成后再安装")
+	}
 	handle, taskStatus, created, err := vnstatInstallTaskManager.Start("vnstat-install", "source|"+selectedSource)
 	if err != nil {
 		return VnstatInstallJobStatus{}, err
@@ -1604,6 +1811,8 @@ func (s *TrafficOverviewService) installManagedVnstat(source string, report vnst
 }
 
 func (s *TrafficOverviewService) installManagedVnstatWithContext(ctx context.Context, source string, report vnstatInstallProgressReporter) (*TrafficOverview, error) {
+	trafficOverviewOperationMu.Lock()
+	defer trafficOverviewOperationMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1706,6 +1915,8 @@ func (s *TrafficOverviewService) installManagedVnstatWithContext(ctx context.Con
 	if err := (&SettingService{}).setString(trafficOverviewEnabledKey, "true"); err != nil {
 		return nil, err
 	}
+	invalidateTrafficOverviewConfigCache()
+	markTrafficOverviewCapReconcileNeeded()
 	if err := s.clearPauseState(); err != nil {
 		return nil, err
 	}
@@ -1829,7 +2040,12 @@ func removeManagedVnstatArtifacts(plan managedVnstatRemovalPlan) error {
 // snapshot. The daemon has already been confirmed stopped and all associated
 // overview state is removed immediately afterwards.
 func (s *TrafficOverviewService) disableTrafficOverviewForVnstatRemoval() error {
-	return (&SettingService{}).setString(trafficOverviewEnabledKey, "false")
+	if err := (&SettingService{}).setString(trafficOverviewEnabledKey, "false"); err != nil {
+		return err
+	}
+	invalidateTrafficOverviewConfigCache()
+	markTrafficOverviewCapReconcileNeeded()
+	return nil
 }
 
 func (s *TrafficOverviewService) finishManagedVnstatRemoval() error {
@@ -1851,6 +2067,10 @@ func (s *TrafficOverviewService) finishManagedVnstatRemoval() error {
 }
 
 func (s *TrafficOverviewService) RemoveManagedVnstat() (*TrafficOverview, error) {
+	vnstatLifecycleMu.Lock()
+	defer vnstatLifecycleMu.Unlock()
+	trafficOverviewOperationMu.Lock()
+	defer trafficOverviewOperationMu.Unlock()
 	if isManagedVnstatInstallRunning() {
 		return nil, errors.New("vnstat 安装任务正在运行，请等待完成后再删除")
 	}
@@ -1873,7 +2093,61 @@ func (s *TrafficOverviewService) RemoveManagedVnstat() (*TrafficOverview, error)
 	return s.GetTrafficOverview()
 }
 
+// StartManagedVnstatRemoval moves package-manager work out of the HTTP
+// lifetime. The task is deliberately non-cancellable after acceptance so the
+// daemon stop, package removal, and ownership cleanup cannot be left halfway.
+func (s *TrafficOverviewService) StartManagedVnstatRemoval() (VnstatRemovalJobStatus, error) {
+	vnstatLifecycleMu.Lock()
+	defer vnstatLifecycleMu.Unlock()
+	if isManagedVnstatInstallRunning() || vnstatInstallTaskManager.IsActive() {
+		return VnstatRemovalJobStatus{}, errors.New("vnstat 安装任务正在运行，请等待完成后再删除")
+	}
+	handle, status, created, err := vnstatRemovalTaskManager.Start("vnstat-remove", "remove")
+	if err != nil {
+		return VnstatRemovalJobStatus{}, err
+	}
+	if !created {
+		return managedVnstatRemovalJobStatus(status), nil
+	}
+	go s.runManagedVnstatRemovalJob(handle)
+	return managedVnstatRemovalJobStatus(status), nil
+}
+
+func (s *TrafficOverviewService) GetManagedVnstatRemovalJob(jobID string) VnstatRemovalJobStatus {
+	return managedVnstatRemovalJobStatus(vnstatRemovalTaskManager.Get(jobID))
+}
+
+func managedVnstatRemovalJobStatus(status ManagedDownloadTaskStatus) VnstatRemovalJobStatus {
+	return VnstatRemovalJobStatus{
+		ID:         status.ID,
+		State:      status.State,
+		Phase:      status.Phase,
+		Error:      status.Error,
+		StartedAt:  status.StartedAt,
+		UpdatedAt:  status.UpdatedAt,
+		FinishedAt: status.FinishedAt,
+	}
+}
+
+func (s *TrafficOverviewService) runManagedVnstatRemovalJob(task *ManagedDownloadTaskHandle) {
+	defer finishManagedDownloadTaskPanic(task, "failed", "vnStat removal")
+	if task == nil || !task.MarkRunning("正在核验 vnStat 删除条件") {
+		return
+	}
+	if !task.BeginApplying("正在停止并删除 vnStat") {
+		task.FinishCancelled("cancelled")
+		return
+	}
+	if _, err := s.RemoveManagedVnstat(); err != nil {
+		task.FinishError("vnStat 删除失败", err)
+		return
+	}
+	task.FinishSuccess("vnStat 删除完成")
+}
+
 func (s *TrafficOverviewService) RemoveManagedVnstatForUninstall() error {
+	vnstatLifecycleMu.Lock()
+	defer vnstatLifecycleMu.Unlock()
 	if isManagedVnstatInstallRunning() {
 		return errors.New("vnstat 安装任务正在运行，请等待完成后再卸载面板")
 	}
@@ -2572,6 +2846,8 @@ func installVnstatSystemdUnitContext(ctx context.Context, sourceDir string) (str
 }
 
 func (s *TrafficOverviewService) ResetAllTrafficOverviewStats() error {
+	trafficOverviewOperationMu.Lock()
+	defer trafficOverviewOperationMu.Unlock()
 	if !IsSystemPlatformLinux() {
 		return nil
 	}
@@ -2647,6 +2923,7 @@ func (s *TrafficOverviewService) ResetAllTrafficOverviewStats() error {
 	if err := s.stageOverviewSnapshot(resetSnapshot, true); err != nil {
 		return err
 	}
+	markTrafficOverviewCapReconcileNeeded()
 	if err := s.ReconcileTrafficCap(); err != nil {
 		logger.Warning("reconcile traffic cap after manual reset failed:", err)
 	}
@@ -2654,6 +2931,8 @@ func (s *TrafficOverviewService) ResetAllTrafficOverviewStats() error {
 }
 
 func (s *TrafficOverviewService) ResetPeriodTrafficOverviewStats() error {
+	trafficOverviewOperationMu.Lock()
+	defer trafficOverviewOperationMu.Unlock()
 	if !IsSystemPlatformLinux() {
 		return nil
 	}
@@ -2729,6 +3008,7 @@ func (s *TrafficOverviewService) ResetPeriodTrafficOverviewStats() error {
 	if err := s.stageOverviewSnapshot(resetSnapshot, true); err != nil {
 		return err
 	}
+	markTrafficOverviewCapReconcileNeeded()
 	if err := s.ReconcileTrafficCap(); err != nil {
 		logger.Warning("reconcile traffic cap after period reset failed:", err)
 	}
@@ -2736,6 +3016,8 @@ func (s *TrafficOverviewService) ResetPeriodTrafficOverviewStats() error {
 }
 
 func (s *TrafficOverviewService) ResetTotalTrafficOverviewStats() error {
+	trafficOverviewOperationMu.Lock()
+	defer trafficOverviewOperationMu.Unlock()
 	if !IsSystemPlatformLinux() {
 		return nil
 	}
@@ -2804,6 +3086,7 @@ func (s *TrafficOverviewService) ResetTotalTrafficOverviewStats() error {
 	if err := s.stageOverviewSnapshot(resetSnapshot, true); err != nil {
 		return err
 	}
+	markTrafficOverviewCapReconcileNeeded()
 	if err := s.ReconcileTrafficCap(); err != nil {
 		logger.Warning("reconcile traffic cap after total reset failed:", err)
 	}
@@ -2848,22 +3131,83 @@ func (s *TrafficOverviewService) EnsureRuntimeReady() error {
 }
 
 func (s *TrafficOverviewService) FlushPendingSnapshot() error {
+	if err := s.flushRuntimeState(); err != nil {
+		return err
+	}
 	return s.flushOverviewSnapshot(true)
 }
 
 func (s *TrafficOverviewService) ReconcileTrafficCap() error {
-	enabled, err := s.isOverviewEnabled()
+	limitGiB, _, _, expiryBoundary, enabled, err := s.getOverviewConfig()
 	if err != nil {
 		return err
 	}
-	if !enabled {
-		return cleanupTrafficCapRules()
+	expired := isTrafficOverviewExpired(expiryBoundary, PanelNow())
+	if !enabled || (limitGiB <= 0 && !expired) {
+		return s.reconcileInactiveTrafficCap()
+	}
+	if !shouldEvaluateTrafficCapNow() {
+		return nil
 	}
 	overview, err := s.GetTrafficOverview()
 	if err != nil {
 		return err
 	}
 	return s.reconcileTrafficCapFromOverview(overview)
+}
+
+// reconcileInactiveTrafficCap performs the expensive legacy rule probe only
+// once after startup or a traffic-cap setting change. The normal disabled and
+// unlimited state must not spawn nft commands every StatsJob tick.
+func (s *TrafficOverviewService) reconcileInactiveTrafficCap() error {
+	trafficOverviewCapMu.Lock()
+	defer trafficOverviewCapMu.Unlock()
+	if trafficOverviewCapStartupChecked {
+		return nil
+	}
+
+	state, err := s.loadCapStateLocked()
+	if err != nil {
+		return err
+	}
+	hasRules := state.Active && IsSystemPlatformLinux() && nftSupported()
+	if !hasRules && IsSystemPlatformLinux() && nftSupported() {
+		hasRules = hasTrafficCapRules()
+	}
+	if hasRules {
+		if err := cleanupTrafficCapRules(); err != nil {
+			return err
+		}
+	}
+	trafficOverviewCapStartupChecked = true
+	if !state.Active && !state.LimitReached && len(state.AllowedPorts) == 0 {
+		return nil
+	}
+	state.Active = false
+	state.LimitReached = false
+	state.AllowedPorts = nil
+	state.UpdatedAt = time.Now().Unix()
+	return s.saveCapStateLocked(state)
+}
+
+func markTrafficOverviewCapReconcileNeeded() {
+	trafficOverviewCapMu.Lock()
+	trafficOverviewCapStartupChecked = false
+	trafficOverviewCapMu.Unlock()
+	trafficOverviewCapScheduleMu.Lock()
+	trafficOverviewCapLastEvaluatedAt = time.Time{}
+	trafficOverviewCapScheduleMu.Unlock()
+}
+
+func shouldEvaluateTrafficCapNow() bool {
+	trafficOverviewCapScheduleMu.Lock()
+	defer trafficOverviewCapScheduleMu.Unlock()
+	now := time.Now()
+	if !trafficOverviewCapLastEvaluatedAt.IsZero() && now.Sub(trafficOverviewCapLastEvaluatedAt) < trafficOverviewCapEvaluateInterval {
+		return false
+	}
+	trafficOverviewCapLastEvaluatedAt = now
+	return true
 }
 
 func (s *TrafficOverviewService) CleanupTrafficCapOnShutdown() error {
@@ -2923,8 +3267,16 @@ func (s *TrafficOverviewService) reconcileTrafficCapFromOverview(overview *Traff
 	}
 	state.AllowedPorts = normalizePortList(state.AllowedPorts)
 
-	hasRules := hasTrafficCapRules()
-	active := state.Active || hasRules
+	active := state.Active
+	previousActive := state.Active
+	previousLimitReached := state.LimitReached
+	previousAllowedPorts := append([]int(nil), state.AllowedPorts...)
+	probeLegacyRules := !trafficOverviewCapStartupChecked
+	legacyRules := false
+	if probeLegacyRules {
+		legacyRules = hasTrafficCapRules()
+		trafficOverviewCapStartupChecked = true
+	}
 	limitReached := evaluateTrafficOverviewCapReached(
 		state.LimitReached,
 		limitGiB,
@@ -2948,12 +3300,16 @@ func (s *TrafficOverviewService) reconcileTrafficCapFromOverview(overview *Traff
 	desiredActive := (limitGiB > 0 || expired) && limitReached
 
 	if desiredActive {
+		hasRules := legacyRules || (active && hasTrafficCapRules())
 		needsRuleRefresh := !active || !intSliceEqual(state.AllowedPorts, allowedPorts) || !hasRules
 		if needsRuleRefresh {
 			if err := applyTrafficCapRules(allowedPorts); err != nil {
 				return err
 			}
 			hasRules = true
+		}
+		if state.Active == hasRules && state.LimitReached && intSliceEqual(state.AllowedPorts, allowedPorts) {
+			return nil
 		}
 		state.Active = hasRules
 		state.LimitReached = true
@@ -2962,19 +3318,49 @@ func (s *TrafficOverviewService) reconcileTrafficCapFromOverview(overview *Traff
 		return s.saveCapStateLocked(state)
 	}
 
-	if active {
+	if active || legacyRules {
 		if err := cleanupTrafficCapRules(); err != nil {
 			return err
 		}
 	}
 	state.Active = false
 	state.LimitReached = false
-	state.AllowedPorts = allowedPorts
+	state.AllowedPorts = nil
+	if !previousActive && !previousLimitReached && len(previousAllowedPorts) == 0 {
+		return nil
+	}
 	state.UpdatedAt = time.Now().Unix()
 	return s.saveCapStateLocked(state)
 }
 
 func (s *TrafficOverviewService) getOverviewConfig() (float64, int, string, time.Time, bool, error) {
+	trafficOverviewConfigMu.Lock()
+	if trafficOverviewConfigCache.loaded && time.Since(trafficOverviewConfigCache.updatedAt) < trafficOverviewConfigCacheTTL {
+		cache := trafficOverviewConfigCache
+		trafficOverviewConfigMu.Unlock()
+		return cache.limitGiB, cache.resetDay, cache.expiryDate, cache.expiryBoundary, cache.enabled, nil
+	}
+	trafficOverviewConfigMu.Unlock()
+
+	limitGiB, resetDay, expiryDate, expiryBoundary, enabled, err := s.getOverviewConfigUncached()
+	if err != nil {
+		return 0, 0, "", time.Time{}, true, err
+	}
+	trafficOverviewConfigMu.Lock()
+	trafficOverviewConfigCache = trafficOverviewConfigCacheState{
+		loaded:         true,
+		limitGiB:       limitGiB,
+		resetDay:       resetDay,
+		expiryDate:     expiryDate,
+		expiryBoundary: expiryBoundary,
+		enabled:        enabled,
+		updatedAt:      time.Now(),
+	}
+	trafficOverviewConfigMu.Unlock()
+	return limitGiB, resetDay, expiryDate, expiryBoundary, enabled, nil
+}
+
+func (s *TrafficOverviewService) getOverviewConfigUncached() (float64, int, string, time.Time, bool, error) {
 	settingSvc := &SettingService{}
 
 	limitRaw, err := settingSvc.getString(trafficOverviewLimitGiBKey)
@@ -3016,7 +3402,26 @@ func (s *TrafficOverviewService) getOverviewConfig() (float64, int, string, time
 	return normalizeLimitGiB(limitGiB), normalizeResetDay(resetDay), expiryDate, expiryBoundary, enabled, nil
 }
 
+func invalidateTrafficOverviewConfigCache() {
+	trafficOverviewConfigMu.Lock()
+	trafficOverviewConfigCache = trafficOverviewConfigCacheState{}
+	trafficOverviewConfigMu.Unlock()
+}
+
 func (s *TrafficOverviewService) loadRuntimeState() (trafficOverviewRuntimeState, error) {
+	trafficOverviewRuntimeStateCacheMu.Lock()
+	if trafficOverviewRuntimeStateCache.Loaded {
+		state := trafficOverviewRuntimeState{}
+		if trafficOverviewRuntimeStateCache.HasPending {
+			state = trafficOverviewRuntimeStateCache.Pending
+		} else if trafficOverviewRuntimeStateCache.HasPersisted {
+			state = trafficOverviewRuntimeStateCache.Persisted
+		}
+		trafficOverviewRuntimeStateCacheMu.Unlock()
+		return state, nil
+	}
+	trafficOverviewRuntimeStateCacheMu.Unlock()
+
 	settingSvc := &SettingService{}
 	raw, err := settingSvc.getString(trafficOverviewStateKey)
 	if err != nil {
@@ -3025,13 +3430,31 @@ func (s *TrafficOverviewService) loadRuntimeState() (trafficOverviewRuntimeState
 
 	state := trafficOverviewRuntimeState{}
 	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" || trimmed == "{}" {
-		return state, nil
+	if trimmed != "" && trimmed != "{}" {
+		if err := json.Unmarshal([]byte(trimmed), &state); err != nil {
+			return trafficOverviewRuntimeState{}, err
+		}
 	}
-	if err := json.Unmarshal([]byte(trimmed), &state); err != nil {
-		return trafficOverviewRuntimeState{}, err
-	}
+	state = normalizeTrafficOverviewRuntimeState(state)
 
+	trafficOverviewRuntimeStateCacheMu.Lock()
+	if !trafficOverviewRuntimeStateCache.Loaded {
+		trafficOverviewRuntimeStateCache = trafficOverviewRuntimeStateCacheState{
+			Loaded:       true,
+			HasPersisted: true,
+			Persisted:    state,
+		}
+	}
+	if trafficOverviewRuntimeStateCache.HasPending {
+		state = trafficOverviewRuntimeStateCache.Pending
+	} else if trafficOverviewRuntimeStateCache.HasPersisted {
+		state = trafficOverviewRuntimeStateCache.Persisted
+	}
+	trafficOverviewRuntimeStateCacheMu.Unlock()
+	return state, nil
+}
+
+func normalizeTrafficOverviewRuntimeState(state trafficOverviewRuntimeState) trafficOverviewRuntimeState {
 	state.ManualBaseUp = maxInt64(state.ManualBaseUp, 0)
 	state.ManualBaseDown = maxInt64(state.ManualBaseDown, 0)
 	state.PeriodBaseUp = maxInt64(state.PeriodBaseUp, 0)
@@ -3043,15 +3466,63 @@ func (s *TrafficOverviewService) loadRuntimeState() (trafficOverviewRuntimeState
 	state.KernelOffsetDown = maxInt64(state.KernelOffsetDown, 0)
 	state.LastKernelUp = maxInt64(state.LastKernelUp, 0)
 	state.LastKernelDown = maxInt64(state.LastKernelDown, 0)
-	return state, nil
+	return state
 }
 
 func (s *TrafficOverviewService) saveRuntimeState(state trafficOverviewRuntimeState) error {
+	state = normalizeTrafficOverviewRuntimeState(state)
 	raw, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
-	return (&SettingService{}).setString(trafficOverviewStateKey, string(raw))
+	if err := (&SettingService{}).setString(trafficOverviewStateKey, string(raw)); err != nil {
+		return err
+	}
+	trafficOverviewRuntimeStateCacheMu.Lock()
+	pendingChanged := trafficOverviewRuntimeStateCache.HasPending && trafficOverviewRuntimeStateCache.Pending != state
+	trafficOverviewRuntimeStateCache.Loaded = true
+	trafficOverviewRuntimeStateCache.HasPersisted = true
+	trafficOverviewRuntimeStateCache.Persisted = state
+	trafficOverviewRuntimeStateCache.LastFlushAt = time.Now()
+	if !pendingChanged {
+		trafficOverviewRuntimeStateCache.HasPending = false
+		trafficOverviewRuntimeStateCache.Pending = trafficOverviewRuntimeState{}
+	}
+	trafficOverviewRuntimeStateCacheMu.Unlock()
+	return nil
+}
+
+func (s *TrafficOverviewService) stageRuntimeState(state trafficOverviewRuntimeState, force bool) error {
+	state = normalizeTrafficOverviewRuntimeState(state)
+	trafficOverviewRuntimeStateCacheMu.Lock()
+	if !trafficOverviewRuntimeStateCache.Loaded {
+		trafficOverviewRuntimeStateCacheMu.Unlock()
+		if _, err := s.loadRuntimeState(); err != nil {
+			return err
+		}
+		trafficOverviewRuntimeStateCacheMu.Lock()
+	}
+	trafficOverviewRuntimeStateCache.Pending = state
+	trafficOverviewRuntimeStateCache.HasPending = true
+	shouldFlush := force || !trafficOverviewRuntimeStateCache.HasPersisted ||
+		trafficOverviewRuntimeStateCache.LastFlushAt.IsZero() ||
+		time.Since(trafficOverviewRuntimeStateCache.LastFlushAt) >= trafficOverviewFlushInterval
+	trafficOverviewRuntimeStateCacheMu.Unlock()
+	if !shouldFlush {
+		return nil
+	}
+	return s.flushRuntimeState()
+}
+
+func (s *TrafficOverviewService) flushRuntimeState() error {
+	trafficOverviewRuntimeStateCacheMu.Lock()
+	if !trafficOverviewRuntimeStateCache.HasPending {
+		trafficOverviewRuntimeStateCacheMu.Unlock()
+		return nil
+	}
+	pending := trafficOverviewRuntimeStateCache.Pending
+	trafficOverviewRuntimeStateCacheMu.Unlock()
+	return s.saveRuntimeState(pending)
 }
 
 func (s *TrafficOverviewService) loadCapStateLocked() (trafficOverviewCapState, error) {
@@ -3567,6 +4038,13 @@ func detectSSHPorts() []int {
 	if !IsSystemPlatformLinux() {
 		return []int{22}
 	}
+	probe, err := probeFirewallSSHConfigCached(detectSSHConfigMainPath())
+	if err == nil {
+		ports := append([]int(nil), probe.Ports...)
+		if len(ports) > 0 {
+			return ports
+		}
+	}
 	ports := parseSSHPortsFromConfig(detectSSHConfigMainPath())
 	if len(ports) == 0 {
 		return []int{22}
@@ -3888,6 +4366,40 @@ func loadTrustedVnstatManifest() (trafficOverviewVnstatManifest, bool) {
 	return manifest, true
 }
 
+type limitedOutputBuffer struct {
+	buffer   bytes.Buffer
+	limit    int
+	overflow bool
+}
+
+func (b *limitedOutputBuffer) Write(data []byte) (int, error) {
+	if b == nil {
+		return len(data), nil
+	}
+	if b.limit <= 0 {
+		b.limit = maxVnstatCommandOutputBytes
+	}
+	remaining := b.limit - b.buffer.Len()
+	if remaining <= 0 {
+		b.overflow = true
+		return len(data), nil
+	}
+	if len(data) > remaining {
+		_, _ = b.buffer.Write(data[:remaining])
+		b.overflow = true
+		return len(data), nil
+	}
+	_, _ = b.buffer.Write(data)
+	return len(data), nil
+}
+
+func (b *limitedOutputBuffer) String() string {
+	if b == nil {
+		return ""
+	}
+	return b.buffer.String()
+}
+
 func runVnstatCommand(args ...string) (string, error) {
 	manifest, ok := loadTrustedVnstatManifest()
 	if !ok {
@@ -3902,14 +4414,20 @@ func runVnstatCommand(args ...string) (string, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, binaryPath, args...)
-	output, err := cmd.CombinedOutput()
+	output := &limitedOutputBuffer{limit: maxVnstatCommandOutputBytes}
+	cmd.Stdout = output
+	cmd.Stderr = output
+	err := cmd.Run()
 	if ctx.Err() == context.DeadlineExceeded {
 		return "", ctx.Err()
 	}
-	if err != nil {
-		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
+	if output.overflow {
+		return "", errors.New("vnstat command output exceeds 1 MiB limit")
 	}
-	return strings.TrimSpace(string(output)), nil
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(output.String()))
+	}
+	return strings.TrimSpace(output.String()), nil
 }
 
 func detectVnstatPackageManagerPlan() *vnstatPackageManagerPlan {
@@ -5223,6 +5741,7 @@ func (s *TrafficOverviewService) saveVnstatManifest(manifest trafficOverviewVnst
 		}
 		return err
 	}
+	invalidateVnstatStatusCache()
 	return nil
 }
 
@@ -5246,6 +5765,12 @@ func (s *TrafficOverviewService) clearVnstatManagedState() error {
 	trafficOverviewSnapshotMu.Lock()
 	trafficOverviewSnapshotCache = trafficOverviewSnapshotState{}
 	trafficOverviewSnapshotMu.Unlock()
+	trafficOverviewRuntimeStateCacheMu.Lock()
+	trafficOverviewRuntimeStateCache = trafficOverviewRuntimeStateCacheState{}
+	trafficOverviewRuntimeStateCacheMu.Unlock()
+	invalidateVnstatStatusCache()
+	invalidateTrafficOverviewConfigCache()
+	markTrafficOverviewCapReconcileNeeded()
 	if err := removeVnstatOwnershipEvidence(); err != nil {
 		return err
 	}
@@ -5602,75 +6127,51 @@ func hasFlag(flags []string, target string) bool {
 }
 
 func parseVnstatTrafficTotals(output string) (int64, int64, error) {
-	var payload map[string]any
-	dec := json.NewDecoder(strings.NewReader(output))
-	dec.UseNumber()
-	if err := dec.Decode(&payload); err != nil {
+	type vnstatTotals struct {
+		RX json.Number `json:"rx"`
+		TX json.Number `json:"tx"`
+	}
+	type vnstatTraffic struct {
+		Total   vnstatTotals `json:"total"`
+		Alltime vnstatTotals `json:"alltime"`
+	}
+	type vnstatInterface struct {
+		Traffic vnstatTraffic `json:"traffic"`
+	}
+	var payload struct {
+		Interfaces []vnstatInterface `json:"interfaces"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(output))
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
 		return 0, 0, err
 	}
 
-	interfaces, ok := payload["interfaces"].([]any)
-	if !ok || len(interfaces) == 0 {
+	if len(payload.Interfaces) == 0 {
 		return 0, 0, errors.New("vnstat json does not contain interfaces")
 	}
-
-	first, ok := interfaces[0].(map[string]any)
-	if !ok {
-		return 0, 0, errors.New("vnstat json interface format is invalid")
-	}
-
-	traffic, ok := first["traffic"].(map[string]any)
-	if !ok {
-		return 0, 0, errors.New("vnstat json does not contain traffic totals")
-	}
-
-	for _, key := range []string{"total", "alltime"} {
-		if totals, ok := traffic[key].(map[string]any); ok {
-			rx, rxOK := numberFromAny(totals["rx"])
-			tx, txOK := numberFromAny(totals["tx"])
-			if rxOK && txOK {
-				return tx, rx, nil
-			}
+	for _, totals := range []vnstatTotals{payload.Interfaces[0].Traffic.Total, payload.Interfaces[0].Traffic.Alltime} {
+		rx, rxOK := parseVnstatJSONNumber(totals.RX)
+		tx, txOK := parseVnstatJSONNumber(totals.TX)
+		if rxOK && txOK {
+			return tx, rx, nil
 		}
 	}
 
 	return 0, 0, errors.New("vnstat json traffic total is missing")
 }
 
-func numberFromAny(value any) (int64, bool) {
-	switch v := value.(type) {
-	case json.Number:
-		parsed, err := v.Int64()
-		if err == nil {
-			return parsed, true
-		}
-		floatValue, err := v.Float64()
-		if err == nil {
-			return int64(floatValue), true
-		}
-	case float64:
-		return int64(v), true
-	case float32:
-		return int64(v), true
-	case int:
-		return int64(v), true
-	case int32:
-		return int64(v), true
-	case int64:
-		return v, true
-	case uint:
-		return int64(v), true
-	case uint32:
-		return int64(v), true
-	case uint64:
-		if v <= maxInt64AsUint64 {
-			return int64(v), true
-		}
-	case string:
-		parsed, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
-		if err == nil {
-			return parsed, true
-		}
+func parseVnstatJSONNumber(value json.Number) (int64, bool) {
+	if strings.TrimSpace(string(value)) == "" {
+		return 0, false
+	}
+	parsed, err := value.Int64()
+	if err == nil && parsed >= 0 {
+		return parsed, true
+	}
+	floatValue, floatErr := value.Float64()
+	if floatErr == nil && floatValue >= 0 && floatValue <= float64(maxInt64AsUint64) {
+		return int64(floatValue), true
 	}
 	return 0, false
 }

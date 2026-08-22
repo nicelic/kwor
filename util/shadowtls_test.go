@@ -93,6 +93,62 @@ func TestBuildShadowTLSClientPair_UsesVersionSpecificPasswordSources(t *testing.
 	}
 }
 
+func TestBuildShadowTLSClientPairClonesNestedTemplateFields(t *testing.T) {
+	outJSON := map[string]interface{}{
+		"type":        "shadowtls",
+		"tag":         "stls-node",
+		"server":      "203.0.113.10",
+		"server_port": 443,
+		"version":     3,
+		"tls": map[string]interface{}{
+			"server_name": "source.example.com",
+			"utls": map[string]interface{}{
+				"fingerprint": "chrome",
+			},
+		},
+		"ss_config": map[string]interface{}{
+			"method":   "2022-blake3-aes-128-gcm",
+			"password": "ss-pass",
+			"multiplex": map[string]interface{}{
+				"enabled": true,
+				"brutal":  map[string]interface{}{"enabled": true},
+			},
+		},
+	}
+
+	ssOutbound, stlsOutbound := BuildShadowTLSClientPair(
+		outJSON,
+		map[string]interface{}{"shadowtls": map[string]interface{}{"password": "shadow-pass"}},
+		nil,
+	)
+	if ssOutbound == nil || stlsOutbound == nil {
+		t.Fatalf("expected shadowtls client pair, got ss=%#v stls=%#v", ssOutbound, stlsOutbound)
+	}
+
+	stlsTLS := stlsOutbound["tls"].(map[string]interface{})
+	stlsTLS["server_name"] = "mutated.example.com"
+	stlsUTLS := stlsTLS["utls"].(map[string]interface{})
+	stlsUTLS["fingerprint"] = "firefox"
+	ssMultiplex := ssOutbound["multiplex"].(map[string]interface{})
+	ssMultiplex["enabled"] = false
+	ssMultiplex["brutal"].(map[string]interface{})["enabled"] = false
+
+	sourceTLS := outJSON["tls"].(map[string]interface{})
+	if got, _ := sourceTLS["server_name"].(string); got != "source.example.com" {
+		t.Fatalf("client pair mutated source TLS: %#v", sourceTLS)
+	}
+	if got, _ := sourceTLS["utls"].(map[string]interface{})["fingerprint"].(string); got != "chrome" {
+		t.Fatalf("client pair mutated source nested uTLS: %#v", sourceTLS)
+	}
+	sourceMultiplex := outJSON["ss_config"].(map[string]interface{})["multiplex"].(map[string]interface{})
+	if got, _ := sourceMultiplex["enabled"].(bool); !got {
+		t.Fatalf("client pair mutated source multiplex: %#v", sourceMultiplex)
+	}
+	if got, _ := sourceMultiplex["brutal"].(map[string]interface{})["enabled"].(bool); !got {
+		t.Fatalf("client pair mutated source nested multiplex: %#v", sourceMultiplex)
+	}
+}
+
 func TestBuildShadowTLSRuntimeOutboundPairMap_RespectsMultiplexPolicy(t *testing.T) {
 	raw := map[string]interface{}{
 		"type":         "shadowtls",
@@ -133,6 +189,50 @@ func TestBuildShadowTLSRuntimeOutboundPairMap_RespectsMultiplexPolicy(t *testing
 	ssOutbound, _ = BuildShadowTLSRuntimeOutboundPairMap(raw, true)
 	if _, ok := ssOutbound["multiplex"]; !ok {
 		t.Fatalf("disabled multiplex should be preserved when preserveDisabledMultiplex=true: %#v", ssOutbound)
+	}
+}
+
+func TestBuildShadowTLSRuntimeOutboundPairMapClonesNestedFields(t *testing.T) {
+	raw := map[string]interface{}{
+		"type":        "shadowtls",
+		"tag":         "stls-node",
+		"server":      "203.0.113.10",
+		"server_port": 443,
+		"version":     3,
+		"tls": map[string]interface{}{
+			"server_name": "source.example.com",
+			"utls":        map[string]interface{}{"fingerprint": "chrome"},
+		},
+		"ss_config": map[string]interface{}{
+			"method":   "2022-blake3-aes-128-gcm",
+			"password": "ss-pass",
+			"multiplex": map[string]interface{}{
+				"enabled": true,
+				"brutal":  map[string]interface{}{"enabled": true},
+			},
+		},
+	}
+
+	ssOutbound, stlsOutbound := BuildShadowTLSRuntimeOutboundPairMap(raw, true)
+	if ssOutbound == nil || stlsOutbound == nil {
+		t.Fatalf("expected shadowtls runtime pair, got ss=%#v stls=%#v", ssOutbound, stlsOutbound)
+	}
+
+	stlsOutbound["tls"].(map[string]interface{})["server_name"] = "mutated.example.com"
+	ssMultiplex := ssOutbound["multiplex"].(map[string]interface{})
+	ssMultiplex["enabled"] = false
+	ssMultiplex["brutal"].(map[string]interface{})["enabled"] = false
+
+	sourceTLS := raw["tls"].(map[string]interface{})
+	if got, _ := sourceTLS["server_name"].(string); got != "source.example.com" {
+		t.Fatalf("runtime pair mutated source TLS: %#v", sourceTLS)
+	}
+	sourceMultiplex := raw["ss_config"].(map[string]interface{})["multiplex"].(map[string]interface{})
+	if got, _ := sourceMultiplex["enabled"].(bool); !got {
+		t.Fatalf("runtime pair mutated source multiplex: %#v", sourceMultiplex)
+	}
+	if got, _ := sourceMultiplex["brutal"].(map[string]interface{})["enabled"].(bool); !got {
+		t.Fatalf("runtime pair mutated source nested multiplex: %#v", sourceMultiplex)
 	}
 }
 

@@ -110,6 +110,87 @@ func TestFirewallSyncIfNeeded_DisabledStillRefreshesSystemReservedPorts(t *testi
 	}
 }
 
+func TestFirewallSyncIfNeeded_DisabledDoesNotProbeNftables(t *testing.T) {
+	openFirewallSystemRuleTestDB(t)
+	withNftCapabilitiesTestGlobals(t)
+
+	originalSupported := firewallSupportedFn
+	firewallSupportedFn = func() bool {
+		t.Fatal("disabled firewall sync must not probe nftables availability")
+		return false
+	}
+	t.Cleanup(func() { firewallSupportedFn = originalSupported })
+	runNftFn = func(args ...string) ([]byte, error) {
+		t.Fatalf("disabled firewall sync must not execute nft: %v", args)
+		return nil, nil
+	}
+
+	service := &FirewallService{}
+	if err := service.setFirewallEnabledLocked(false); err != nil {
+		t.Fatalf("set firewall disabled failed: %v", err)
+	}
+	if err := service.SyncIfNeeded(0); err != nil {
+		t.Fatalf("disabled firewall sync failed: %v", err)
+	}
+}
+
+func TestFirewallSyncIfNeeded_MinGapSkipsNftCapabilityProbe(t *testing.T) {
+	openFirewallSystemRuleTestDB(t)
+
+	service := &FirewallService{}
+	if err := service.setFirewallEnabledLocked(true); err != nil {
+		t.Fatalf("set firewall enabled failed: %v", err)
+	}
+
+	firewallStateMu.Lock()
+	previousState := firewallState
+	firewallState.lastReconcile = time.Now()
+	firewallState.lastError = ""
+	firewallStateMu.Unlock()
+	t.Cleanup(func() {
+		firewallStateMu.Lock()
+		firewallState = previousState
+		firewallStateMu.Unlock()
+	})
+
+	originalSupported := firewallSupportedFn
+	firewallSupportedFn = func() bool {
+		t.Fatal("sync inside minGap must not probe nftables capability")
+		return false
+	}
+	t.Cleanup(func() { firewallSupportedFn = originalSupported })
+
+	if err := service.SyncIfNeeded(time.Hour); err != nil {
+		t.Fatalf("sync inside minGap failed: %v", err)
+	}
+}
+
+func TestFirewallSyncIfNeeded_DisabledDoesNotRefreshMissingGeoCache(t *testing.T) {
+	openFirewallSystemRuleTestDB(t)
+
+	if err := database.GetDB().Create(&model.FirewallGeoRule{
+		Name:             "disabled geo rule",
+		Enabled:          true,
+		Family:           firewallFamilyDual,
+		Protocol:         firewallProtocolTCP,
+		PortSpec:         "443",
+		Action:           firewallGeoRuleActionBlock,
+		CountryCode:      "us",
+		SourceProviders:  `["invalid-provider"]`,
+		CustomSourceURLs: "[]",
+	}).Error; err != nil {
+		t.Fatalf("create geo rule failed: %v", err)
+	}
+
+	service := &FirewallService{}
+	if err := service.setFirewallEnabledLocked(false); err != nil {
+		t.Fatalf("set firewall disabled failed: %v", err)
+	}
+	if err := service.SyncIfNeeded(0); err != nil {
+		t.Fatalf("disabled firewall sync must not refresh geo sources: %v", err)
+	}
+}
+
 func TestFirewallSystemRuleReserveToggle_PersistsAcrossSync(t *testing.T) {
 	openFirewallSystemRuleTestDB(t)
 

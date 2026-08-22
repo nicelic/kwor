@@ -19,13 +19,31 @@ type MihomoNftCoreSyncJob struct {
 	lastRunning       bool
 	lastIntegrityScan time.Time
 	lastRecoverAt     time.Time
+	recoverRetryAfter time.Duration
+	runningSince      time.Time
 }
+
+const (
+	mihomoNftIntegrityScanInterval     = nftIntegrityScanInterval
+	mihomoCoreRecoveryMaxRetryInterval = 5 * time.Minute
+	mihomoCoreRecoveryStableDuration   = 30 * time.Second
+)
 
 func NewMihomoNftCoreSyncJob() *MihomoNftCoreSyncJob {
 	return &MihomoNftCoreSyncJob{}
 }
 
 func (s *MihomoNftCoreSyncJob) Run() {
+	s.run(false)
+}
+
+// RunNow forces one integrity pass after a panel-side runtime change without
+// coupling Mihomo's independent lifecycle to the default core.
+func (s *MihomoNftCoreSyncJob) RunNow() {
+	s.run(true)
+}
+
+func (s *MihomoNftCoreSyncJob) run(forceIntegrity bool) {
 	if !service.IsSystemPlatformLinux() {
 		return
 	}
@@ -34,14 +52,26 @@ func (s *MihomoNftCoreSyncJob) Run() {
 	defer s.mu.Unlock()
 
 	running := s.MihomoCoreManagerService.IsRunning()
+	if !running {
+		s.runningSince = time.Time{}
+	}
 	if !running && service.ShouldAutoRecoverManagedCoreRuntime("mihomo") {
 		now := time.Now()
-		if s.lastRecoverAt.IsZero() || now.Sub(s.lastRecoverAt) >= managedCoreAutoRecoverRetryInterval {
+		retryAfter := s.recoverRetryAfter
+		if retryAfter <= 0 {
+			retryAfter = managedCoreAutoRecoverRetryInterval
+		}
+		if s.lastRecoverAt.IsZero() || now.Sub(s.lastRecoverAt) >= retryAfter {
 			s.lastRecoverAt = now
 			if err := s.MihomoCoreManagerService.StartCore(); err != nil {
 				logger.Warning("mihomo direct runtime auto-recover failed: ", err)
 			}
 			running = s.MihomoCoreManagerService.IsRunning()
+			if running {
+				s.runningSince = now
+			} else {
+				s.recoverRetryAfter = nextMihomoCoreRecoveryRetryInterval(retryAfter)
+			}
 		}
 	}
 	needInit := false
@@ -62,14 +92,14 @@ func (s *MihomoNftCoreSyncJob) Run() {
 		s.lastIntegrityScan = time.Time{}
 	} else if running {
 		now := time.Now()
-		if s.lastIntegrityScan.IsZero() || now.Sub(s.lastIntegrityScan) >= nftIntegrityScanInterval {
-			if err := s.MihomoNftTrafficService.EnsureRuleIntegrity(); err != nil {
+		if forceIntegrity || s.lastIntegrityScan.IsZero() || now.Sub(s.lastIntegrityScan) >= mihomoNftIntegrityScanInterval {
+			if err := s.MihomoNftTrafficService.EnsureRuleIntegrityWhenRunning(); err != nil {
 				logger.Warning("mihomo nft rule integrity scan failed: ", err)
 			}
-			if err := s.MihomoClientRateLimitService.EnsureRuleIntegrity(); err != nil {
+			if err := s.MihomoClientRateLimitService.EnsureRuleIntegrityWhenRunning(); err != nil {
 				logger.Warning("mihomo client rate limit nft integrity scan failed: ", err)
 			}
-			if err := s.MihomoClientPortBlockService.EnsureRuleIntegrity(); err != nil {
+			if err := s.MihomoClientPortBlockService.EnsureRuleIntegrityWhenRunning(); err != nil {
 				logger.Warning("mihomo client block nft integrity scan failed: ", err)
 			}
 			s.lastIntegrityScan = now
@@ -77,8 +107,25 @@ func (s *MihomoNftCoreSyncJob) Run() {
 	}
 
 	if running {
-		s.lastRecoverAt = time.Time{}
+		if s.runningSince.IsZero() {
+			s.runningSince = time.Now()
+		}
+		if time.Since(s.runningSince) >= mihomoCoreRecoveryStableDuration {
+			s.lastRecoverAt = time.Time{}
+			s.recoverRetryAfter = 0
+		}
 	}
 	s.lastRunning = running
 	s.initialized = true
+}
+
+func nextMihomoCoreRecoveryRetryInterval(current time.Duration) time.Duration {
+	if current <= 0 {
+		return managedCoreAutoRecoverRetryInterval
+	}
+	next := current * 2
+	if next > mihomoCoreRecoveryMaxRetryInterval {
+		return mihomoCoreRecoveryMaxRetryInterval
+	}
+	return next
 }

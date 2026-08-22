@@ -11,6 +11,8 @@ import (
 	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/util"
+
+	"gorm.io/gorm"
 )
 
 // ========================================
@@ -124,6 +126,10 @@ type ProManagerService struct {
 var (
 	proManagerInstance *ProManagerService
 	proManagerOnce     sync.Once
+	// Serializes default-chain runtime snapshots. SQLite serializes individual
+	// queries, not a multi-query config build, so this lock prevents concurrent
+	// generators from publishing stale or mixed snapshots.
+	singboxConfigGenerationMu sync.Mutex
 )
 
 // GetProManagerService 获取ProManager单例
@@ -265,6 +271,9 @@ func (s *ProManagerService) regenerateCoreConfig() {
 // actual generation or Runtime Store write error to callers that must verify
 // certificate propagation before scheduling a running Core restart.
 func (s *ProManagerService) RegenerateCoreConfig() error {
+	singboxConfigGenerationMu.Lock()
+	defer singboxConfigGenerationMu.Unlock()
+
 	if err := EnsureManagedCoreLayout(); err != nil {
 		return fmt.Errorf("初始化 core 目录结构失败: %w", err)
 	}
@@ -292,8 +301,18 @@ func (s *ProManagerService) RegenerateCoreConfig() error {
 
 // GenerateFullConfig 聚合所有信息并生成完整的 sing-box 配置
 func (s *ProManagerService) GenerateFullConfig() (*ProManagerSingBoxConfig, error) {
+	return s.GenerateFullConfigWithDB(database.GetDB())
+}
+
+// GenerateFullConfigWithDB builds a default-chain configuration from one
+// caller-owned database handle. It is used to validate subscription imports
+// before their short SQLite transaction commits.
+func (s *ProManagerService) GenerateFullConfigWithDB(db *gorm.DB) (*ProManagerSingBoxConfig, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database is not initialized")
+	}
 	// 获取基础配置 (DNS, Route, Log 等)
-	baseData, err := s.SettingService.GetConfig()
+	baseData, err := s.SettingService.GetConfigWithDB(db)
 	if err != nil {
 		return nil, fmt.Errorf("获取基础配置失败: %w", err)
 	}
@@ -308,19 +327,25 @@ func (s *ProManagerService) GenerateFullConfig() (*ProManagerSingBoxConfig, erro
 	if err := normalizeRouteRuleSetPlacement(config); err != nil {
 		return nil, fmt.Errorf("规范化路由规则集失败: %w", err)
 	}
-	if err := ensureCoreLogLevel(config); err != nil {
-		return nil, fmt.Errorf("规范化日志级别失败: %w", err)
+	coreLog, err := buildCurrentSingboxCoreLogConfig(db)
+	if err != nil {
+		return nil, fmt.Errorf("获取内核日志级别失败: %w", err)
 	}
+	config.Log = coreLog
 	if err := normalizeSingboxDNSConfig(config); err != nil {
 		return nil, fmt.Errorf("规范化 DNS 配置失败: %w", err)
 	}
+	if err := (&DnsServerService{}).ApplySelectedServerToCoreConfig(db, config); err != nil {
+		return nil, fmt.Errorf("应用选中的 DNS 服务器失败: %w", err)
+	}
 
 	// 聚合所有数据库对象
-	db := database.GetDB()
-
 	config.Inbounds, err = s.InboundService.GetAllConfig(db)
 	if err != nil {
 		return nil, fmt.Errorf("获取入站配置失败: %w", err)
+	}
+	if err := validateSingboxRuntimeTaggedObjects("inbound", config.Inbounds); err != nil {
+		return nil, fmt.Errorf("validate sing-box runtime inbounds failed: %w", err)
 	}
 
 	config.Outbounds, err = s.OutboundService.GetAllConfig(db)
@@ -333,6 +358,9 @@ func (s *ProManagerService) GenerateFullConfig() (*ProManagerSingBoxConfig, erro
 	if err != nil {
 		return nil, fmt.Errorf("sanitize sing-box outbounds failed: %w", err)
 	}
+	if err := validateSingboxRuntimeTaggedObjects("outbound", config.Outbounds); err != nil {
+		return nil, fmt.Errorf("validate sing-box runtime outbounds failed: %w", err)
+	}
 
 	config.Services, err = s.ServicesService.GetAllConfig(db)
 	if err != nil {
@@ -344,7 +372,7 @@ func (s *ProManagerService) GenerateFullConfig() (*ProManagerSingBoxConfig, erro
 		return nil, fmt.Errorf("获取端点配置失败: %w", err)
 	}
 
-	if err := s.applyServerTLSStore(config, outboundTLSStore); err != nil {
+	if err := s.applyServerTLSStore(db, config, outboundTLSStore); err != nil {
 		return nil, fmt.Errorf("apply server tls_store failed: %w", err)
 	}
 
@@ -379,6 +407,14 @@ func normalizeRouteRuleSetPlacement(config *ProManagerSingBoxConfig) error {
 		}
 	}
 
+	// sing-box's current remote rule-set schema stores the download route in
+	// http_client.detour. Migrate the legacy download_detour field while the
+	// configuration is being assembled so generated Core configs are always
+	// emitted in the current format.
+	if err := normalizeSingboxRouteRuleSetHTTPClients(routeMap); err != nil {
+		return err
+	}
+
 	// Always clear top-level rule_set in output.
 	config.RuleSets = nil
 
@@ -393,28 +429,67 @@ func normalizeRouteRuleSetPlacement(config *ProManagerSingBoxConfig) error {
 	return nil
 }
 
-func ensureCoreLogLevel(config *ProManagerSingBoxConfig) error {
-	if config == nil {
+func normalizeSingboxRouteRuleSetHTTPClients(routeMap map[string]interface{}) error {
+	if routeMap == nil {
 		return nil
 	}
-
-	logMap := map[string]interface{}{}
-	if len(config.Log) > 0 {
-		if err := json.Unmarshal(config.Log, &logMap); err != nil {
-			return err
+	raw, exists := routeMap["rule_set"]
+	if !exists || raw == nil {
+		return nil
+	}
+	items, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	for index, item := range items {
+		ruleSet, ok := item.(map[string]interface{})
+		if !ok || ruleSet == nil {
+			continue
 		}
-	}
+		typeValue, _ := ruleSet["type"].(string)
+		if !strings.EqualFold(strings.TrimSpace(typeValue), "remote") {
+			continue
+		}
 
-	level, hasLevel := logMap["level"].(string)
-	if !hasLevel || level == "" {
-		logMap["level"] = "panic"
-	}
+		legacyDetour := ""
+		if rawDetour, present := ruleSet["download_detour"]; present && rawDetour != nil {
+			value, ok := rawDetour.(string)
+			if !ok {
+				return fmt.Errorf("route.rule_set #%d has an invalid download_detour", index+1)
+			}
+			legacyDetour = strings.TrimSpace(value)
+		}
 
-	logData, err := json.Marshal(logMap)
-	if err != nil {
-		return err
+		if rawClient, present := ruleSet["http_client"]; present && rawClient != nil {
+			client, ok := rawClient.(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("route.rule_set #%d has an invalid http_client", index+1)
+			}
+			if rawDetour, present := client["detour"]; present && rawDetour != nil {
+				value, ok := rawDetour.(string)
+				if !ok {
+					return fmt.Errorf("route.rule_set #%d has an invalid http_client.detour", index+1)
+				}
+				value = strings.TrimSpace(value)
+				if value == "" {
+					delete(client, "detour")
+				} else {
+					client["detour"] = value
+				}
+			}
+			if _, present := client["detour"]; !present && legacyDetour != "" {
+				client["detour"] = legacyDetour
+			}
+			if len(client) == 0 {
+				delete(ruleSet, "http_client")
+			} else {
+				ruleSet["http_client"] = client
+			}
+		} else if legacyDetour != "" {
+			ruleSet["http_client"] = map[string]interface{}{"detour": legacyDetour}
+		}
+		delete(ruleSet, "download_detour")
 	}
-	config.Log = logData
 	return nil
 }
 
@@ -444,8 +519,8 @@ func normalizeSingboxDNSConfig(config *ProManagerSingBoxConfig) error {
 	return nil
 }
 
-func (s *ProManagerService) applyServerTLSStore(config *ProManagerSingBoxConfig, fallbackStore string) error {
-	enabled, err := s.SettingService.GetServerTLSStoreEnabled()
+func (s *ProManagerService) applyServerTLSStore(db *gorm.DB, config *ProManagerSingBoxConfig, fallbackStore string) error {
+	enabled, err := s.SettingService.GetServerTLSStoreEnabledWithDB(db)
 	if err != nil {
 		return err
 	}
@@ -463,7 +538,7 @@ func (s *ProManagerService) applyServerTLSStore(config *ProManagerSingBoxConfig,
 	}
 
 	if enabled {
-		store, err := s.SettingService.GetServerTLSStore()
+		store, err := s.SettingService.GetServerTLSStoreWithDB(db)
 		if err != nil {
 			return err
 		}
@@ -783,6 +858,7 @@ func stripClashOnlyTLSFields(outbound map[string]interface{}) {
 	if outbound == nil {
 		return
 	}
+	util.PromoteHysteria2ReceiveWindowsToSingbox(outbound)
 	delete(outbound, "mihomo_common")
 	delete(outbound, "mihomo_hy2")
 	delete(outbound, "mihomo_fast_open")

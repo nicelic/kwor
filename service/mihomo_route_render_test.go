@@ -1,6 +1,9 @@
 package service
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestBuildMihomoRuleProviders_ConvertsUpdateIntervalToSeconds(t *testing.T) {
 	cases := []struct {
@@ -135,6 +138,83 @@ func TestBuildMihomoRuleStrings_ExpandsNetworkAndPortCombinations(t *testing.T) 
 	}
 	if len(expected) != 0 {
 		t.Fatalf("missing combinations: %#v", expected)
+	}
+}
+
+func TestBuildMihomoRuleStrings_PreservesCombinationOrderWithoutIntermediateCopies(t *testing.T) {
+	rule := map[string]interface{}{
+		"action":   "route",
+		"outbound": "DIRECT",
+		"network":  []interface{}{"tcp", "udp"},
+		"port":     []interface{}{80, 443},
+	}
+
+	got, ok := buildMihomoRuleStrings(rule, nil, nil, nil, false)
+	if !ok {
+		t.Fatal("buildMihomoRuleStrings returned ok=false")
+	}
+	want := []string{
+		"AND,((NETWORK,TCP),(DST-PORT,80)),DIRECT",
+		"AND,((NETWORK,TCP),(DST-PORT,443)),DIRECT",
+		"AND,((NETWORK,UDP),(DST-PORT,80)),DIRECT",
+		"AND,((NETWORK,UDP),(DST-PORT,443)),DIRECT",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("generated combination count = %d, want %d", len(got), len(want))
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("combination #%d = %q, want %q", index+1, got[index], want[index])
+		}
+	}
+}
+
+func TestRenderMihomoRoutes_ReportsCombinationLimitInsteadOfSkippingRule(t *testing.T) {
+	values := make([]interface{}, 0, 23)
+	for index := 0; index < cap(values); index++ {
+		values = append(values, index+1)
+	}
+	result := renderMihomoRoutes(map[string]interface{}{
+		"final": "DIRECT",
+		"rules": []interface{}{map[string]interface{}{
+			"action":      "route",
+			"outbound":    "DIRECT",
+			"network":     []interface{}{"tcp", "udp"},
+			"port":        values,
+			"source_port": values,
+		}},
+	}, nil, nil, nil, "DIRECT", nil, nil)
+
+	if len(result.ValidationErrs) != 1 {
+		t.Fatalf("validation errors = %#v, want one combination-limit error", result.ValidationErrs)
+	}
+	if !strings.Contains(result.ValidationErrs[0], "combination safety limit") {
+		t.Fatalf("validation error = %q, want combination safety limit", result.ValidationErrs[0])
+	}
+}
+
+func TestNormalizeMihomoSnifferPreservesExplicitBooleanEnableAndFullPortRange(t *testing.T) {
+	sniffer := normalizeMihomoSniffer(true)
+	if sniffer == nil || sniffer["enable"] != true {
+		t.Fatalf("boolean sniffer enable = %#v, want an enabled sniffer", sniffer)
+	}
+	sniff, ok := sniffer["sniff"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("sniffer protocols = %#v, want a map", sniffer["sniff"])
+	}
+	for _, protocol := range []string{"HTTP", "TLS", "QUIC"} {
+		entry, ok := sniff[protocol].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s entry = %#v, want a map", protocol, sniff[protocol])
+		}
+		ports := toStringSlice(entry["ports"])
+		if len(ports) != 1 || ports[0] != "1-65535" {
+			t.Fatalf("%s ports = %#v, want [1-65535]", protocol, ports)
+		}
+	}
+
+	if legacy := normalizeMihomoSniffer(map[string]interface{}{"sniff": map[string]interface{}{}}); legacy != nil {
+		t.Fatalf("sniffer object without explicit enable must remain disabled, got %#v", legacy)
 	}
 }
 

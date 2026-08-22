@@ -212,7 +212,7 @@ export const subSelectorTagOptions = [
 ]
 
 export const defaultDns = {
-  final: "direct-dns",
+  final: "proxy-dns",
   rules: [],
   servers: [
     {

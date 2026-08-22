@@ -23,6 +23,9 @@
         <v-text-field
         :label="$t('types.anytls.idleInterval')"
         hide-details
+        type="number"
+        min="1"
+        step="any"
         :suffix="$t('date.s')"
         v-model="idleInterval">
         </v-text-field>
@@ -31,6 +34,9 @@
         <v-text-field
         :label="$t('types.anytls.idleTimeout')"
         hide-details
+        type="number"
+        min="1"
+        step="any"
         :suffix="$t('date.s')"
         v-model="idleTimeout">
         </v-text-field>
@@ -40,8 +46,9 @@
         :label="$t('types.anytls.minIdle')"
         type="number"
         min="0"
+        step="1"
         hide-details
-        v-model.number="minIdle">
+        v-model="minIdle">
         </v-text-field>
       </v-col>
     </v-row>
@@ -49,28 +56,13 @@
 </template>
 
 <script lang="ts">
+import { readSingboxDuration, writeSingboxDuration } from '@/plugins/singboxDuration'
+import { parseSingboxInteger } from '@/plugins/singboxInteger'
+
 export default {
   props: ['data', 'direction'],
   data() {
     return {}
-  },
-  methods: {
-    normalizeSeconds(v: string): string | undefined {
-      const raw = (v ?? '').toString().trim()
-      if (raw.length === 0) return undefined
-
-      const match = raw.match(/^(\d+)\s*s?$/i)
-      if (!match) return undefined
-
-      const value = parseInt(match[1], 10)
-      return value > 0 ? `${value}s` : undefined
-    },
-    parseSecondsForDisplay(v: any, defaultValue: number): string {
-      const raw = (v ?? '').toString().trim()
-      const match = raw.match(/^(\d+)\s*s?$/i)
-      if (!match) return `${defaultValue}`
-      return match[1]
-    },
   },
   computed: {
     padding_scheme: {
@@ -94,16 +86,16 @@ export default {
       }
     },
     idleInterval: {
-      get() { return this.parseSecondsForDisplay(this.data.idle_session_check_interval, 30) },
-      set(v:string) { this.data.idle_session_check_interval = this.normalizeSeconds(v) }
+      get() { return readSingboxDuration(this.data.idle_session_check_interval, 's') ?? 30 },
+      set(v:unknown) { this.data.idle_session_check_interval = writeSingboxDuration(v, 's', { minimum: 1 }) }
     },
     idleTimeout: {
-      get() { return this.parseSecondsForDisplay(this.data.idle_session_timeout, 30) },
-      set(v:string) { this.data.idle_session_timeout = this.normalizeSeconds(v) }
+      get() { return readSingboxDuration(this.data.idle_session_timeout, 's') ?? 30 },
+      set(v:unknown) { this.data.idle_session_timeout = writeSingboxDuration(v, 's', { minimum: 1 }) }
     },
     minIdle: {
-      get() { return this.data.min_idle_session != undefined ? this.data.min_idle_session : 0 },
-      set(v:number) { this.data.min_idle_session = v>0 ? v : undefined }
+      get() { return parseSingboxInteger(this.data.min_idle_session, { min: 0 }) ?? 0 },
+      set(v:unknown) { this.data.min_idle_session = parseSingboxInteger(v, { min: 0 }) }
     }
   }
 }

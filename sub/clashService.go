@@ -134,13 +134,13 @@ func normalizeMihomoClashSubscriptionOutbounds(outbounds *[]map[string]interface
 	}
 	for i := range *outbounds {
 		outbound := &(*outbounds)[i]
-		outType := strings.TrimSpace(firstString((*outbound)["type"]))
+		outType := strings.ToLower(strings.TrimSpace(firstString((*outbound)["type"])))
 		switch outType {
 		case "tuic":
+			delete(*outbound, "mihomo_fast_open")
 			delete(*outbound, "fast_open")
+			delete(*outbound, "fast-open")
 			delete(*outbound, "network")
-		case "hysteria2":
-			delete(*outbound, "fast_open")
 		}
 	}
 }
@@ -231,7 +231,7 @@ func (s *ClashService) loadClashExtension() (*clashExtensionContext, error) {
 		}
 		if i, ok := uiConfig["latencyTestInterval"].(string); ok && i != "" {
 			parsed := parseMihomoLatencyIntervalSeconds(i)
-			if parsed > 0 {
+			if parsed >= service.SubscriptionClashLatencyTestMinIntervalSeconds {
 				context.LatencyInterval = parsed
 			}
 		}
@@ -332,7 +332,7 @@ func parseMihomoLatencyIntervalSeconds(s string) int {
 	}
 
 	val, err := strconv.Atoi(num)
-	if err != nil || val <= 0 {
+	if err != nil || val < service.SubscriptionClashLatencyTestMinIntervalSeconds {
 		return 0
 	}
 	return val
@@ -890,9 +890,13 @@ func (s *ClashService) convertToClashMetaMap(outbounds *[]map[string]interface{}
 				proxy["plugin"] = plugin
 			}
 			if pluginOpts, ok := obMap["plugin_opts"]; ok && pluginOpts != nil {
-				proxy["plugin-opts"] = pluginOpts
+				proxy["plugin-opts"] = normalizeMihomoSSPluginOpts(pluginOpts)
+			}
+			if fingerprint := strings.TrimSpace(firstString(obMap["client_fingerprint"])); fingerprint != "" {
+				proxy["client-fingerprint"] = fingerprint
 			}
 		case "hysteria":
+			util.NormalizeHysteriaSubscriptionOutbound(obMap)
 			if auth, ok := obMap["auth_str"].(string); ok && auth != "" {
 				proxy["auth-str"] = auth
 			}
@@ -908,13 +912,19 @@ func (s *ClashService) convertToClashMetaMap(outbounds *[]map[string]interface{}
 			if down, ok := toInt(obMap["down_mbps"]); ok && down > 0 {
 				proxy["down"] = down
 			}
-			if recvWindowConn, ok := toInt(obMap["recv_window_conn"]); ok && recvWindowConn > 0 {
-				proxy["recv-window-conn"] = recvWindowConn
+			streamReceiveWindow, ok := toInt(obMap["stream_receive_window"])
+			if ok && streamReceiveWindow > 0 {
+				proxy["recv-window-conn"] = streamReceiveWindow
 			}
-			if recvWindow, ok := toInt(obMap["recv_window"]); ok && recvWindow > 0 {
-				proxy["recv-window"] = recvWindow
+			connectionReceiveWindow, ok := toInt(obMap["connection_receive_window"])
+			if ok && connectionReceiveWindow > 0 {
+				proxy["recv-window"] = connectionReceiveWindow
 			}
-			if disableMTUDiscovery, ok := toBool(obMap["disable_mtu_discovery"]); ok && disableMTUDiscovery {
+			if maxConcurrentStreams, ok := toInt(obMap["max_concurrent_streams"]); ok && maxConcurrentStreams > 0 {
+				proxy["max-concurrent-streams"] = maxConcurrentStreams
+			}
+			disablePathMTUDiscovery, ok := toBool(obMap["disable_path_mtu_discovery"])
+			if ok && disablePathMTUDiscovery {
 				proxy["disable-mtu-discovery"] = true
 			}
 			if clashMihomoFastOpenEnabled(obMap, outType) {
@@ -947,18 +957,14 @@ func (s *ClashService) convertToClashMetaMap(outbounds *[]map[string]interface{}
 			if hopInterval, ok := buildMihomoHopInterval(obMap["hop_interval"], obMap["hop_interval_max"]); ok {
 				proxy["hop-interval"] = hopInterval
 			}
-			if mihomoHy2, ok := obMap["mihomo_hy2"].(map[string]interface{}); ok {
-				if v, ok := toInt(mihomoHy2["initial_stream_receive_window"]); ok && v > 0 {
-					proxy["initial-stream-receive-window"] = v
-				}
-				if v, ok := toInt(mihomoHy2["max_stream_receive_window"]); ok && v > 0 {
-					proxy["max-stream-receive-window"] = v
-				}
-				if v, ok := toInt(mihomoHy2["initial_connection_receive_window"]); ok && v > 0 {
-					proxy["initial-connection-receive-window"] = v
-				}
-				if v, ok := toInt(mihomoHy2["max_connection_receive_window"]); ok && v > 0 {
-					proxy["max-connection-receive-window"] = v
+			for key, clashKey := range map[string]string{
+				"initial_stream_receive_window":     "initial-stream-receive-window",
+				"max_stream_receive_window":         "max-stream-receive-window",
+				"initial_connection_receive_window": "initial-connection-receive-window",
+				"max_connection_receive_window":     "max-connection-receive-window",
+			} {
+				if v, ok := util.Hysteria2ReceiveWindowValue(obMap, key); ok && v > 0 {
+					proxy[clashKey] = v
 				}
 			}
 			if clashMihomoFastOpenEnabled(obMap, outType) {
@@ -1144,7 +1150,7 @@ func (s *ClashService) convertToClashMetaMap(outbounds *[]map[string]interface{}
 			if disableSNI, ok := toBool(tlsMap["disable_sni"]); ok && disableSNI {
 				proxy["disable-sni"] = true
 			}
-			if outType != "anytls" && outType != "trusttunnel" {
+			if outType != "trusttunnel" {
 				if reality, ok := tlsMap["reality"].(map[string]interface{}); ok {
 					if realityEnabled, ok := toBool(reality["enabled"]); ok && realityEnabled {
 						realityOpts := map[string]interface{}{}
@@ -1180,6 +1186,7 @@ func (s *ClashService) convertToClashMetaMap(outbounds *[]map[string]interface{}
 					}
 				}
 			}
+			applyMihomoSpecialTLSProxyOptions(proxy, tlsMap)
 		}
 
 		if transport, ok := obMap["transport"].(map[string]interface{}); ok {
@@ -1314,6 +1321,57 @@ func (s *ClashService) convertToClashMetaMap(outbounds *[]map[string]interface{}
 	}
 	util.ApplySudokuCustomTablesFlowYAML(output)
 	return output, nil
+}
+
+func normalizeMihomoSSPluginOpts(raw interface{}) interface{} {
+	opts, ok := raw.(map[string]interface{})
+	if !ok || opts == nil {
+		return raw
+	}
+	result := make(map[string]interface{}, len(opts))
+	for key, value := range opts {
+		switch key {
+		case "version_hint":
+			key = "version-hint"
+		case "restls_script":
+			key = "restls-script"
+		}
+		result[key] = value
+	}
+	return result
+}
+
+func applyMihomoSpecialTLSProxyOptions(proxy, tlsMap map[string]interface{}) {
+	if proxy == nil || tlsMap == nil {
+		return
+	}
+	if opts, ok := tlsMap["shadow_tls_opts"].(map[string]interface{}); ok && opts != nil {
+		proxy["shadow-tls-opts"] = normalizeMihomoClashTLSOptionMap(opts, map[string]string{})
+	}
+	if opts, ok := tlsMap["restls_opts"].(map[string]interface{}); ok && opts != nil {
+		proxy["restls-opts"] = normalizeMihomoClashTLSOptionMap(opts, map[string]string{
+			"version_hint":  "version-hint",
+			"restls_script": "restls-script",
+		})
+	}
+	if opts, ok := tlsMap["jls_opts"].(map[string]interface{}); ok && opts != nil {
+		proxy["jls-opts"] = normalizeMihomoClashTLSOptionMap(opts, map[string]string{})
+	}
+}
+
+func normalizeMihomoClashTLSOptionMap(source map[string]interface{}, aliases map[string]string) map[string]interface{} {
+	result := make(map[string]interface{}, len(source))
+	for key, value := range source {
+		if strings.HasPrefix(key, "_") {
+			continue
+		}
+		outputKey := key
+		if alias, ok := aliases[key]; ok {
+			outputKey = alias
+		}
+		result[outputKey] = value
+	}
+	return result
 }
 
 func buildClashShadowTLSSSProxy(ssOutbound map[string]interface{}, shadowTLSOutbound map[string]interface{}, isMihomo bool) (map[string]interface{}, bool) {
@@ -1823,29 +1881,67 @@ func buildMihomoXHTTPOpts(transport map[string]interface{}) map[string]interface
 }
 
 func toInt(raw interface{}) (int, bool) {
+	maxInt := int64(^uint(0) >> 1)
+	minInt := -maxInt - 1
+	fromFloat := func(value float64) (int, bool) {
+		if math.IsNaN(value) || math.IsInf(value, 0) || math.Trunc(value) != value || value < float64(minInt) {
+			return 0, false
+		}
+		// float64 rounds MaxInt64 up to 2^63, which is outside int's range.
+		if strconv.IntSize == 64 {
+			if value >= float64(maxInt) {
+				return 0, false
+			}
+		} else if value > float64(maxInt) {
+			return 0, false
+		}
+		return int(value), true
+	}
+	fromUnsigned := func(value uint64) (int, bool) {
+		if value > uint64(maxInt) {
+			return 0, false
+		}
+		return int(value), true
+	}
+
 	switch value := raw.(type) {
 	case int:
 		return value, true
+	case int8:
+		return int(value), true
+	case int16:
+		return int(value), true
 	case int32:
 		return int(value), true
 	case int64:
+		if value < minInt || value > maxInt {
+			return 0, false
+		}
 		return int(value), true
+	case uint:
+		return fromUnsigned(uint64(value))
+	case uint8:
+		return fromUnsigned(uint64(value))
+	case uint16:
+		return fromUnsigned(uint64(value))
+	case uint32:
+		return fromUnsigned(uint64(value))
+	case uint64:
+		return fromUnsigned(value)
 	case float32:
-		return int(value), true
+		return fromFloat(float64(value))
 	case float64:
-		return int(value), true
+		return fromFloat(value)
 	case json.Number:
-		num, err := strconv.Atoi(string(value))
-		return num, err == nil
+		num, err := strconv.ParseInt(string(value), 10, 0)
+		return int(num), err == nil
 	case string:
 		value = strings.TrimSpace(value)
 		if value == "" {
 			return 0, false
 		}
-		num := 0
-		if _, err := fmt.Sscanf(value, "%d", &num); err == nil {
-			return num, true
-		}
+		num, err := strconv.ParseInt(value, 10, 0)
+		return int(num), err == nil
 	}
 	return 0, false
 }
@@ -2054,27 +2150,19 @@ func normalizeServerPorts(raw interface{}) []string {
 }
 
 func durationToSeconds(raw interface{}) (int, bool) {
-	switch value := raw.(type) {
-	case int:
+	if value, ok := toInt(raw); ok {
 		return value, value > 0
-	case int32:
-		return int(value), value > 0
-	case int64:
-		return int(value), value > 0
-	case float32:
-		return int(value), value > 0
-	case float64:
-		return int(value), value > 0
-	case string:
-		value = strings.TrimSpace(strings.ToLower(value))
-		if value == "" {
-			return 0, false
-		}
-		seconds := parseClashInterval(value)
-		return seconds, seconds > 0
-	default:
+	}
+	value, ok := raw.(string)
+	if !ok {
 		return 0, false
 	}
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return 0, false
+	}
+	seconds := parseClashInterval(value)
+	return seconds, seconds > 0
 }
 
 func buildMihomoHopInterval(raw interface{}, rawMax interface{}) (interface{}, bool) {
@@ -2160,35 +2248,27 @@ func parseMihomoHopIntervalRange(raw interface{}) (int, int, bool) {
 }
 
 func durationToMilliseconds(raw interface{}) (int, bool) {
-	switch value := raw.(type) {
-	case int:
+	if value, ok := toInt(raw); ok {
 		return value, value > 0
-	case int32:
-		return int(value), value > 0
-	case int64:
-		return int(value), value > 0
-	case float32:
-		return int(value), value > 0
-	case float64:
-		return int(value), value > 0
-	case string:
-		value = strings.TrimSpace(strings.ToLower(value))
-		if value == "" {
-			return 0, false
-		}
-		if strings.HasSuffix(value, "ms") {
-			num := strings.TrimSpace(strings.TrimSuffix(value, "ms"))
-			ms, err := strconv.Atoi(num)
-			return ms, err == nil && ms > 0
-		}
-		seconds := parseClashInterval(value)
-		if seconds <= 0 {
-			return 0, false
-		}
-		return seconds * 1000, true
-	default:
+	}
+	value, ok := raw.(string)
+	if !ok {
 		return 0, false
 	}
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return 0, false
+	}
+	if strings.HasSuffix(value, "ms") {
+		num := strings.TrimSpace(strings.TrimSuffix(value, "ms"))
+		ms, err := strconv.Atoi(num)
+		return ms, err == nil && ms > 0
+	}
+	seconds := parseClashInterval(value)
+	if seconds <= 0 {
+		return 0, false
+	}
+	return seconds * 1000, true
 }
 
 func normalizePEM(raw interface{}) (string, bool) {

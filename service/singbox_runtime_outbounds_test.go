@@ -60,3 +60,44 @@ func TestNormalizeSingboxRuntimeOutbounds_StripsUnsupportedFieldsAndExtractsStor
 		}
 	}
 }
+
+func TestNormalizeSingboxRuntimeOutboundsPromotesHysteria2ReceiveWindows(t *testing.T) {
+	raw := []json.RawMessage{json.RawMessage(`{
+		"type":"hysteria2",
+		"tag":"hy2-runtime",
+		"mihomo_hy2":{
+			"initial_stream_receive_window":38000000,
+			"max_stream_receive_window":70000000,
+			"initial_connection_receive_window":120000000,
+			"max_connection_receive_window":150000000
+		},
+		"mihomo_fast_open":true
+	}`)}
+
+	normalized, _, err := normalizeSingboxRuntimeOutbounds(raw)
+	if err != nil {
+		t.Fatalf("normalizeSingboxRuntimeOutbounds returned error: %v", err)
+	}
+	if len(normalized) != 1 {
+		t.Fatalf("expected one normalized outbound, got %d", len(normalized))
+	}
+	outbound := map[string]interface{}{}
+	if err := json.Unmarshal(normalized[0], &outbound); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	for key, want := range map[string]interface{}{
+		"initial_stream_receive_window":     float64(38000000),
+		"max_stream_receive_window":         float64(70000000),
+		"initial_connection_receive_window": float64(120000000),
+		"max_connection_receive_window":     float64(150000000),
+	} {
+		if got := outbound[key]; got != want {
+			t.Fatalf("%s = %#v, want %#v", key, got, want)
+		}
+	}
+	for _, key := range []string{"mihomo_hy2", "mihomo_fast_open", "fast_open", "fast-open"} {
+		if _, exists := outbound[key]; exists {
+			t.Fatalf("Mihomo-only key %q survived runtime sanitization: %#v", key, outbound)
+		}
+	}
+}

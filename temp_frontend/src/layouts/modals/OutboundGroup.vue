@@ -1,22 +1,37 @@
 <template>
-  <v-dialog v-model="dialogVisible" transition="dialog-bottom-transition" width="800" max-width="90vw">
+  <v-dialog v-model="dialogVisible" transition="dialog-bottom-transition" width="800" max-width="90vw" max-height="90vh" :persistent="operationBusy">
     <v-card class="rounded-lg">
       <v-card-title>
         <v-row align="center">
           <v-col cols="auto">{{ $t('actions.group') }}</v-col>
           <v-spacer></v-spacer>
           <v-col cols="auto">
-            <v-btn color="primary" variant="flat" @click="showAddDialog">
+            <v-btn color="primary" variant="flat" :disabled="operationBusy" @click="showAddDialog">
               {{ $t('actions.add') }}
             </v-btn>
           </v-col>
           <v-col cols="auto">
-            <v-icon icon="mdi-close" @click="$emit('close')"></v-icon>
+            <v-btn
+              icon="mdi-close"
+              size="small"
+              variant="text"
+              :disabled="operationBusy"
+              @click="dialogVisible = false"
+            >
+              <v-icon />
+              <v-tooltip activator="parent" location="top">{{ $t('actions.close') }}</v-tooltip>
+            </v-btn>
           </v-col>
         </v-row>
       </v-card-title>
       <v-divider></v-divider>
-      <v-card-text style="padding: 16px; min-height: 400px;">
+      <v-card-text style="padding: 16px; min-height: min(400px, calc(90vh - 92px)); max-height: calc(90vh - 92px); overflow-y: auto;">
+        <v-alert v-if="groupsLoadFailed && groups.length > 0" type="warning" variant="tonal" class="mb-3">
+          分组列表刷新失败，当前仍显示上次成功读取的数据。
+          <v-btn class="mt-2" size="small" variant="outlined" :loading="groupsLoading" :disabled="operationBusy" @click="loadGroups">
+            {{ $t('actions.update') }}
+          </v-btn>
+        </v-alert>
         <v-list v-if="groups.length > 0">
           <v-list-item
             v-for="(group, index) in groups"
@@ -35,8 +50,8 @@
               <div class="d-flex align-center outbound-group-prepend">
                 <div
                   class="outbound-group-drag-handle d-flex align-center justify-center mr-3"
-                  :class="{ 'outbound-group-drag-handle--disabled': groups.length < 2 || reordering }"
-                  :draggable="groups.length > 1 && !reordering"
+            :class="{ 'outbound-group-drag-handle--disabled': groups.length < 2 || operationBusy }"
+            :draggable="groups.length > 1 && !operationBusy"
                   @dragstart="handleDragStart(index)"
                   @dragend="handleDragEnd"
                 >
@@ -52,8 +67,8 @@
                 size="small"
                 color="error"
                 variant="text"
-                :disabled="reordering"
-                @click="confirmDelete(index)"
+                :disabled="operationBusy"
+                @click="confirmDelete(group.id)"
               >
                 <v-icon />
                 <v-tooltip activator="parent" location="top">{{ $t('actions.del') }}</v-tooltip>
@@ -63,7 +78,7 @@
                 size="small"
                 color="primary"
                 variant="text"
-                :disabled="reordering"
+                :disabled="operationBusy"
                 @click="showEditDialog(index)"
               >
                 <v-icon />
@@ -75,7 +90,7 @@
                 size="small"
                 color="info"
                 variant="text"
-                :disabled="reordering"
+                :disabled="operationBusy"
                 :loading="refreshingGroup === group.name"
                 @click="refreshSubscription(group)"
               >
@@ -94,16 +109,28 @@
                 {{ subscriptionChipLabel }}
               </v-chip>
               <v-chip
-                v-for="outbound in getGroupOutbounds(group)"
+                v-for="outbound in previewGroupOutbounds(group)"
                 :key="outbound"
                 size="small"
                 class="mr-1 mb-1"
               >
                 {{ outbound }}
               </v-chip>
+              <span
+                v-if="getGroupOutboundCount(group) > groupOutboundPreviewLimit"
+                class="text-caption ml-1"
+              >
+                还有 {{ getGroupOutboundCount(group) - groupOutboundPreviewLimit }} 个节点
+              </span>
             </v-list-item-subtitle>
           </v-list-item>
         </v-list>
+        <v-alert v-else-if="groupsLoadFailed" type="error" variant="tonal">
+          分组列表加载失败，请稍后重试。
+          <v-btn class="mt-2" size="small" variant="outlined" :loading="groupsLoading" :disabled="operationBusy" @click="loadGroups">
+            {{ $t('actions.update') }}
+          </v-btn>
+        </v-alert>
         <v-alert v-else type="info" variant="tonal">
           暂无分组，点击“添加”按钮创建新分组
         </v-alert>
@@ -111,17 +138,18 @@
     </v-card>
   </v-dialog>
 
-  <v-dialog v-model="editDialog" max-width="500">
+  <v-dialog v-model="editDialog" width="500" max-width="90vw" max-height="90vh" :persistent="operationBusy">
     <v-card class="rounded-lg">
       <v-card-title>
-        {{ editingIndex === -1 ? $t('actions.add') : $t('actions.edit') }}{{ $t('actions.group') }}
+        {{ editingGroupId === null ? $t('actions.add') : $t('actions.edit') }}{{ $t('actions.group') }}
       </v-card-title>
       <v-divider></v-divider>
-      <v-card-text style="padding: 16px;">
+      <v-card-text style="padding: 16px; max-height: calc(90vh - 152px); overflow-y: auto;">
         <v-row>
           <v-col cols="12">
             <v-text-field
               v-model="editingGroup.name"
+              :disabled="operationBusy"
               label="名称"
               variant="outlined"
               density="compact"
@@ -133,6 +161,7 @@
           <v-col cols="12">
             <v-text-field
               v-model="editingGroup.subscription_url"
+              :disabled="operationBusy"
               :label="subscriptionFieldLabel"
               :placeholder="subscriptionFieldPlaceholder"
               variant="outlined"
@@ -146,6 +175,7 @@
           <v-col cols="12">
             <v-switch
               v-model="editingGroup.allow_insecure"
+              :disabled="operationBusy"
               label="允许不安全连接（跳过证书校验）"
               color="warning"
               density="compact"
@@ -157,59 +187,78 @@
       <v-divider></v-divider>
       <v-card-actions>
         <v-spacer></v-spacer>
-        <v-btn color="primary" variant="outlined" @click="editDialog = false">
+        <v-btn color="primary" variant="outlined" :disabled="operationBusy" @click="editDialog = false">
           {{ $t('actions.close') }}
         </v-btn>
-        <v-btn color="primary" variant="flat" :loading="saving" @click="saveGroup">
+        <v-btn color="primary" variant="flat" :loading="saving" :disabled="operationBusy" @click="saveGroup">
           {{ $t('actions.save') }}
         </v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>
 
-  <v-dialog v-model="deleteDialog" max-width="400">
+  <v-dialog v-model="deleteDialog" width="400" max-width="90vw" max-height="90vh" :persistent="operationBusy">
     <v-card class="rounded-lg">
       <v-card-title>{{ $t('actions.del') }}</v-card-title>
       <v-divider></v-divider>
-      <v-card-text>{{ $t('confirm') }}</v-card-text>
+      <v-card-text class="outbound-group-delete-copy">
+        <template v-if="isMihomoNamespace">
+          删除分组会同时删除组内 Mihomo 节点；存在代理组、路由、入站或其它分组引用时不会删除。
+        </template>
+        <template v-else>
+          删除分组会删除组内出站节点；节点被路由、其它出站或其它分组引用时会拒绝删除。
+        </template>
+      </v-card-text>
       <v-card-actions>
         <v-spacer></v-spacer>
-        <v-btn color="success" variant="outlined" @click="deleteDialog = false">
+        <v-btn color="success" variant="outlined" :disabled="operationBusy" @click="deleteDialog = false">
           {{ $t('no') }}
         </v-btn>
-        <v-btn color="error" variant="outlined" @click="deleteGroup">
+        <v-btn color="error" variant="outlined" :loading="deleting" :disabled="operationBusy" @click="deleteGroup">
           {{ $t('yes') }}
         </v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>
 
-  <v-dialog v-model="refreshResultDialog" max-width="600">
+  <v-dialog v-model="refreshResultDialog" width="600" max-width="90vw" max-height="90vh" :persistent="operationBusy">
     <v-card class="rounded-lg">
       <v-card-title>刷新订阅结果</v-card-title>
       <v-divider></v-divider>
-      <v-card-text style="padding: 16px;">
+      <v-card-text style="padding: 16px; max-height: calc(90vh - 144px); overflow-y: auto;">
         <v-alert v-if="refreshResult.error" type="error" variant="tonal" class="mb-3">
           {{ refreshResult.error }}
         </v-alert>
         <div v-else>
+          <v-alert v-if="refreshResult.warning" type="warning" variant="tonal" class="mb-3">
+            {{ refreshResult.warning }}
+          </v-alert>
           <v-alert v-if="refreshResult.added.length > 0" type="success" variant="tonal" class="mb-2">
             <div class="font-weight-bold mb-1">新增节点 ({{ refreshResult.added.length }}):</div>
-            <v-chip v-for="node in refreshResult.added" :key="node" size="small" class="mr-1 mb-1" color="success">
+            <v-chip v-for="node in previewRefreshNodes(refreshResult.added)" :key="node" size="small" class="mr-1 mb-1" color="success">
               {{ node }}
             </v-chip>
+            <div v-if="refreshResult.added.length > refreshResultPreviewLimit" class="text-caption mt-1">
+              仅显示前 {{ refreshResultPreviewLimit }} 个节点标签
+            </div>
           </v-alert>
           <v-alert v-if="refreshResult.removed.length > 0" type="warning" variant="tonal" class="mb-2">
             <div class="font-weight-bold mb-1">删除节点 ({{ refreshResult.removed.length }}):</div>
-            <v-chip v-for="node in refreshResult.removed" :key="node" size="small" class="mr-1 mb-1" color="warning">
+            <v-chip v-for="node in previewRefreshNodes(refreshResult.removed)" :key="node" size="small" class="mr-1 mb-1" color="warning">
               {{ node }}
             </v-chip>
+            <div v-if="refreshResult.removed.length > refreshResultPreviewLimit" class="text-caption mt-1">
+              仅显示前 {{ refreshResultPreviewLimit }} 个节点标签
+            </div>
           </v-alert>
           <v-alert v-if="refreshResult.updated.length > 0" type="info" variant="tonal" class="mb-2">
             <div class="font-weight-bold mb-1">更新节点 ({{ refreshResult.updated.length }}):</div>
-            <v-chip v-for="node in refreshResult.updated" :key="node" size="small" class="mr-1 mb-1" color="info">
+            <v-chip v-for="node in previewRefreshNodes(refreshResult.updated)" :key="node" size="small" class="mr-1 mb-1" color="info">
               {{ node }}
             </v-chip>
+            <div v-if="refreshResult.updated.length > refreshResultPreviewLimit" class="text-caption mt-1">
+              仅显示前 {{ refreshResultPreviewLimit }} 个节点标签
+            </div>
           </v-alert>
           <v-alert
             v-if="refreshResult.added.length === 0 && refreshResult.removed.length === 0 && refreshResult.updated.length === 0"
@@ -222,7 +271,7 @@
       </v-card-text>
       <v-card-actions>
         <v-spacer></v-spacer>
-        <v-btn color="primary" variant="flat" @click="refreshResultDialog = false">
+        <v-btn color="primary" variant="flat" :disabled="operationBusy" @click="refreshResultDialog = false">
           确定
         </v-btn>
       </v-card-actions>
@@ -259,24 +308,42 @@ watch(dialogVisible, (newVal) => {
 })
 
 const groups = ref<OutboundGroup[]>([])
+const groupsLoading = ref(false)
+const groupsLoadFailed = ref(false)
 const draggedGroupIndex = ref<number | null>(null)
 const dragOverIndex = ref<number | null>(null)
 const reordering = ref(false)
 const editDialog = ref(false)
-const editingIndex = ref(-1)
+const editingGroupId = ref<number | null>(null)
 const editingGroup = ref<OutboundGroup>(createOutboundGroup())
 const saving = ref(false)
+const originalSubscription = ref({
+  url: '',
+  allowInsecure: false,
+})
 
 const deleteDialog = ref(false)
-const deletingIndex = ref(-1)
+const deletingGroupId = ref<number | null>(null)
+const deleting = ref(false)
 
 const refreshingGroup = ref('')
+const groupOutboundPreviewLimit = 80
+const refreshResultPreviewLimit = 80
 const refreshResultDialog = ref(false)
-const refreshResult = ref({
+type SubscriptionRefreshResult = {
+  added: string[]
+  removed: string[]
+  updated: string[]
+  error: string
+  warning: string
+}
+
+const refreshResult = ref<SubscriptionRefreshResult>({
   added: <string[]>[],
   removed: <string[]>[],
   updated: <string[]>[],
-  error: ''
+  error: '',
+  warning: ''
 })
 
 const isMihomoNamespace = computed(() => props.namespace === 'mihomo')
@@ -292,24 +359,88 @@ const subscriptionFieldPlaceholder = computed(() => (
 ))
 const subscriptionChipLabel = computed(() => isMihomoNamespace.value ? 'Clash 订阅' : '订阅链接')
 const refreshTooltip = computed(() => isMihomoNamespace.value ? '刷新 Clash 订阅' : '刷新订阅')
+const subscriptionBusy = computed(() => refreshingGroup.value !== '')
+const operationBusy = computed(() => (
+  saving.value
+  || deleting.value
+  || reordering.value
+  || subscriptionBusy.value
+))
+const isCommittedSubscriptionResult = (msg: { success: boolean, obj: any | null }) => msg.success || msg.obj?.committed === true
+const normalizeRefreshNodes = (raw: unknown): string[] => {
+  if (!Array.isArray(raw)) return []
+  const seen = new Set<string>()
+  const nodes: string[] = []
+  for (const value of raw) {
+    if (typeof value !== 'string') continue
+    const node = value.trim()
+    if (!node || seen.has(node)) continue
+    seen.add(node)
+    nodes.push(node)
+  }
+  return nodes
+}
+const normalizeRefreshResult = (raw: unknown, fallbackError = ''): SubscriptionRefreshResult => {
+  const result = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : {}
+  const error = typeof result.error === 'string' && result.error.trim() !== ''
+    ? result.error.trim()
+    : fallbackError
+  const warning = typeof result.warning === 'string' ? result.warning.trim() : ''
+  return {
+    added: normalizeRefreshNodes(result.added),
+    removed: normalizeRefreshNodes(result.removed),
+    updated: normalizeRefreshNodes(result.updated),
+    error,
+    warning,
+  }
+}
+const previewRefreshNodes = (nodes: unknown): string[] => normalizeRefreshNodes(nodes).slice(0, refreshResultPreviewLimit)
 
 const getGroupOutbounds = (group: OutboundGroup): string[] => {
   if (typeof group.outbounds === 'string') {
     try {
-      return JSON.parse(group.outbounds)
+      const parsed = JSON.parse(group.outbounds)
+      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : []
     } catch {
       return []
     }
   }
-  return group.outbounds as unknown as string[]
+  return Array.isArray(group.outbounds)
+    ? group.outbounds.filter((item): item is string => typeof item === 'string')
+    : []
+}
+
+const previewGroupOutbounds = (group: OutboundGroup): string[] => {
+  return getGroupOutbounds(group).slice(0, groupOutboundPreviewLimit)
+}
+
+const getGroupOutboundCount = (group: OutboundGroup): number => {
+  return getGroupOutbounds(group).length
 }
 
 const loadGroups = async () => {
-  const data = await store.value.loadOutboundGroups()
-  groups.value = data || []
+  groupsLoading.value = true
+  try {
+    const data = await store.value.loadOutboundGroups()
+    if (Array.isArray(data)) {
+      groups.value = data
+      groupsLoadFailed.value = false
+      return true
+    }
+  } catch {
+    // Keep the last known list visible when a refresh request fails.
+  } finally {
+    groupsLoading.value = false
+  }
+  groupsLoadFailed.value = true
+  push.warning({ title: '分组', message: '分组列表加载失败，请稍后重试。' })
+  return false
 }
 
 const saveGroupOrder = async (): Promise<boolean> => {
+  if (operationBusy.value) return false
   const ids = groups.value
     .map((group) => Number(group.id))
     .filter((id) => Number.isInteger(id) && id > 0)
@@ -332,7 +463,12 @@ const saveGroupOrder = async (): Promise<boolean> => {
     })
     if (msg.success && msg.obj) {
       store.value.setNewData(msg.obj)
-      groups.value = (msg.obj.outboundgroups ?? []) as OutboundGroup[]
+      if (Array.isArray(msg.obj.outboundgroups)) {
+        groups.value = msg.obj.outboundgroups as OutboundGroup[]
+        groupsLoadFailed.value = false
+      } else {
+        await loadGroups()
+      }
       push.success({
         title: '分组',
         message: '分组顺序已保存'
@@ -346,7 +482,7 @@ const saveGroupOrder = async (): Promise<boolean> => {
 }
 
 const handleDragStart = (index: number) => {
-  if (reordering.value || groups.value.length < 2) {
+  if (operationBusy.value || groups.value.length < 2) {
     return
   }
   draggedGroupIndex.value = index
@@ -354,7 +490,7 @@ const handleDragStart = (index: number) => {
 }
 
 const handleDragOver = (index: number) => {
-  if (draggedGroupIndex.value === null || reordering.value) {
+  if (draggedGroupIndex.value === null || operationBusy.value) {
     return
   }
   dragOverIndex.value = index
@@ -367,7 +503,7 @@ const handleDragEnd = () => {
 
 const handleDrop = async (index: number) => {
   const fromIndex = draggedGroupIndex.value
-  if (fromIndex === null || reordering.value) {
+  if (fromIndex === null || operationBusy.value) {
     handleDragEnd()
     return
   }
@@ -379,7 +515,8 @@ const handleDrop = async (index: number) => {
 
   const previousGroups = groups.value.slice()
   const [movedGroup] = groups.value.splice(fromIndex, 1)
-  groups.value.splice(index, 0, movedGroup)
+  const targetIndex = fromIndex < index ? index - 1 : index
+  groups.value.splice(targetIndex, 0, movedGroup)
   handleDragEnd()
 
   const success = await saveGroupOrder()
@@ -390,51 +527,81 @@ const handleDrop = async (index: number) => {
 }
 
 const showAddDialog = () => {
-  editingIndex.value = -1
+  if (operationBusy.value) return
+  editingGroupId.value = null
   editingGroup.value = createOutboundGroup()
+  originalSubscription.value = { url: '', allowInsecure: false }
   editDialog.value = true
 }
 const showEditDialog = (index: number) => {
-  editingIndex.value = index
+  if (operationBusy.value) return
   const group = groups.value[index]
+  const id = Number(group?.id)
+  if (!group || !Number.isInteger(id) || id <= 0) return
+  editingGroupId.value = id
   editingGroup.value = {
     ...group,
     outbounds: getGroupOutbounds(group),
     subscription_url: group.subscription_url || '',
     allow_insecure: group.allow_insecure || false
   }
+  originalSubscription.value = {
+    url: editingGroup.value.subscription_url || '',
+    allowInsecure: editingGroup.value.allow_insecure === true,
+  }
   editDialog.value = true
 }
 
 const saveGroup = async () => {
-  if (!editingGroup.value.name.trim()) return
+  if (operationBusy.value || !editingGroup.value.name.trim()) return
 
   saving.value = true
   try {
+    const subscriptionURL = editingGroup.value.subscription_url || ''
+    const action = editingGroupId.value === null ? 'new' : 'edit'
+    const shouldRefreshSubscription = subscriptionURL !== '' && (
+      action === 'new'
+      || subscriptionURL !== originalSubscription.value.url
+      || (editingGroup.value.allow_insecure === true) !== originalSubscription.value.allowInsecure
+    )
     const groupData = {
       ...editingGroup.value,
       outbounds: JSON.stringify(editingGroup.value.outbounds || []),
-      subscription_url: editingGroup.value.subscription_url || '',
-      allow_insecure: editingGroup.value.allow_insecure || false
+      subscription_url: shouldRefreshSubscription ? originalSubscription.value.url : subscriptionURL,
+      allow_insecure: shouldRefreshSubscription ? originalSubscription.value.allowInsecure : (editingGroup.value.allow_insecure || false)
     }
-    const action = editingIndex.value === -1 ? 'new' : 'edit'
-    const success = await store.value.save('outboundgroups', action, groupData)
+    const success = await store.value.save(saveObject.value, action, groupData)
     if (!success) return
 
-    if (editingGroup.value.subscription_url) {
-      if (action === 'new') {
-        await fetchAndSaveSubscription(
-          editingGroup.value.name,
-          editingGroup.value.subscription_url,
-          editingGroup.value.allow_insecure || false
-        )
-      } else {
-        await refreshSubscriptionByParams(
-          editingGroup.value.name,
-          editingGroup.value.subscription_url,
-          editingGroup.value.allow_insecure || false,
-          false
-        )
+    if (shouldRefreshSubscription) {
+      refreshingGroup.value = editingGroup.value.name
+      try {
+        let subscriptionSuccess = false
+        if (action === 'new') {
+          const msg = await fetchAndSaveSubscription(
+            editingGroup.value.name,
+            subscriptionURL,
+            editingGroup.value.allow_insecure || false
+          )
+          subscriptionSuccess = isCommittedSubscriptionResult(msg)
+        } else {
+          const msg = await refreshSubscriptionByParams(
+            editingGroup.value.name,
+            subscriptionURL,
+            editingGroup.value.allow_insecure || false,
+            false
+          )
+          subscriptionSuccess = isCommittedSubscriptionResult(msg)
+        }
+        if (!subscriptionSuccess) {
+          if (action === 'new') {
+            await store.value.save(saveObject.value, 'del', editingGroup.value.name)
+          }
+          await loadGroups()
+          return
+        }
+      } finally {
+        refreshingGroup.value = ''
       }
     }
 
@@ -451,7 +618,7 @@ const fetchAndSaveSubscription = async (groupName: string, url: string, allowIns
   formData.append('url', url)
   formData.append('allow_insecure', String(allowInsecure))
   const msg = await HttpUtils.post(fetchEndpoint.value, formData)
-  if (msg.success && msg.obj) {
+  if (isCommittedSubscriptionResult(msg) && msg.obj) {
     store.value.setNewData(msg.obj)
   }
   return msg
@@ -469,24 +636,16 @@ const refreshSubscriptionByParams = async (
   formData.append('allow_insecure', String(allowInsecure))
 
   const msg = await HttpUtils.post(refreshEndpoint.value, formData)
-  if (msg.success && msg.obj) {
+  if (isCommittedSubscriptionResult(msg) && msg.obj) {
     store.value.setNewData(msg.obj)
     if (showResult) {
-      refreshResult.value = msg.obj.result || {
-        added: [],
-        removed: [],
-        updated: [],
-        error: ''
-      }
+      const result = normalizeRefreshResult(msg.obj.result)
+      if (msg.obj.committed === true) result.warning = msg.msg || '订阅数据已保存，但运行配置未更新'
+      refreshResult.value = result
       refreshResultDialog.value = true
     }
   } else if (showResult) {
-    refreshResult.value = {
-      added: [],
-      removed: [],
-      updated: [],
-      error: msg.msg || '刷新订阅失败'
-    }
+    refreshResult.value = normalizeRefreshResult(null, msg.msg || '刷新订阅失败')
     refreshResultDialog.value = true
   }
 
@@ -494,7 +653,7 @@ const refreshSubscriptionByParams = async (
 }
 
 const refreshSubscription = async (group: OutboundGroup) => {
-  if (!group.subscription_url) return
+  if (operationBusy.value || !group.subscription_url) return
   refreshingGroup.value = group.name
   try {
     await refreshSubscriptionByParams(
@@ -509,17 +668,37 @@ const refreshSubscription = async (group: OutboundGroup) => {
   }
 }
 
-const confirmDelete = (index: number) => {
-  deletingIndex.value = index
+const confirmDelete = (groupId: number) => {
+  if (operationBusy.value) return
+  const id = Number(groupId)
+  if (!Number.isInteger(id) || id <= 0) return
+  deletingGroupId.value = id
   deleteDialog.value = true
 }
 
+watch(deleteDialog, (visible) => {
+  if (!visible && !deleting.value) deletingGroupId.value = null
+})
+
 const deleteGroup = async () => {
-  const groupName = groups.value[deletingIndex.value].name
-  const success = await store.value.save('outboundgroups', 'del', groupName)
-  if (success) {
+  const id = deletingGroupId.value
+  if (id == null || operationBusy.value) return
+  const group = groups.value.find((item) => Number(item.id) === id)
+  if (!group?.name) {
     deleteDialog.value = false
-    await loadGroups()
+    deletingGroupId.value = null
+    return
+  }
+  deleting.value = true
+  try {
+    const success = await store.value.save(saveObject.value, 'del', group.name)
+    if (success) {
+      deleteDialog.value = false
+      deletingGroupId.value = null
+      await loadGroups()
+    }
+  } finally {
+    deleting.value = false
   }
 }
 </script>
@@ -565,6 +744,8 @@ const deleteGroup = async () => {
 .outbound-group-sort-item--dragging {
   opacity: 0.72;
 }
+
+.outbound-group-delete-copy {
+  overflow-wrap: anywhere;
+}
 </style>
-
-

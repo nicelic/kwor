@@ -5,13 +5,15 @@ go 1.26.3
 require (
 	github.com/AdguardTeam/dnsproxy v0.81.4
 	github.com/AdguardTeam/golibs v0.35.13
+	github.com/andybalholm/brotli v1.2.2
 	github.com/coder/websocket v1.8.14
 	github.com/gin-contrib/gzip v1.2.5
 	github.com/gin-contrib/sessions v1.0.4
 	github.com/gin-gonic/gin v1.11.0
 	github.com/glebarez/sqlite v1.11.0
 	github.com/gofrs/uuid/v5 v5.4.0
-	github.com/klauspost/compress v1.18.0
+	github.com/golang/snappy v1.0.0
+	github.com/klauspost/compress v1.19.2
 	github.com/miekg/dns v1.1.72
 	github.com/op/go-logging v0.0.0-20160315200505-970db520ece7
 	github.com/quic-go/quic-go v0.59.0
@@ -19,11 +21,18 @@ require (
 	github.com/shirou/gopsutil/v4 v4.26.1
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
 	golang.org/x/net v0.53.0
+	golang.org/x/sync v0.20.0
 	golang.org/x/sys v0.43.0
 	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20241231184526-a9ab2273dd10
 	gopkg.in/yaml.v3 v3.0.1
 	gorm.io/gorm v1.31.1
 )
+
+replace github.com/andybalholm/brotli => ./compression/source/brotli
+
+replace github.com/golang/snappy => ./compression/source/snappy
+
+replace github.com/klauspost/compress => ./compression/source/klauspost/compress
 
 require (
 	github.com/ameshkov/dnscrypt/v2 v2.4.0 // indirect
@@ -73,7 +82,6 @@ require (
 	golang.org/x/crypto v0.50.0 // indirect
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
 	golang.org/x/mod v0.35.0 // indirect
-	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/tools v0.44.0 // indirect
 	gonum.org/v1/gonum v0.17.0 // indirect

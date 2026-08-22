@@ -48,12 +48,15 @@ func (s *StatsJob) Run() {
 	// Collect nftables-based traffic AFTER core stats transaction is fully committed.
 	// This avoids SQLite lock conflicts since CollectAndSaveTraffic uses its own transaction.
 	if enableTraffic {
-		if nftErr := s.StatsService.NftTrafficService.CollectAndSaveTraffic(); nftErr != nil {
+		trafficChanged, nftErr := s.StatsService.NftTrafficService.CollectAndSaveTrafficWithHistory(enableTraffic)
+		if nftErr != nil {
 			logger.Warning("nftables traffic collection failed: ", nftErr)
 		}
-	}
-	if blockErr := (&service.ClientPortBlockService{}).Reconcile((&service.CoreManagerService{}).IsRunning()); blockErr != nil {
-		logger.Warning("client block nft reconcile failed: ", blockErr)
+		if trafficChanged {
+			if blockErr := (&service.ClientPortBlockService{}).ReconcileAfterTraffic(); blockErr != nil {
+				logger.Warning("client block nft reconcile after traffic failed: ", blockErr)
+			}
+		}
 	}
 	if capErr := (&service.TrafficOverviewService{}).ReconcileTrafficCap(); capErr != nil {
 		logger.Warning("traffic cap reconcile failed: ", capErr)
@@ -65,11 +68,14 @@ func (s *StatsJob) Run() {
 	if refreshErr := mihomoNftSvc.RefreshPortHopRedirects(); refreshErr != nil {
 		logger.Warning("mihomo port hop refresh failed: ", refreshErr)
 	}
-	if nftErr := mihomoNftSvc.CollectAndSaveTraffic(); nftErr != nil {
+	mihomoTrafficChanged, nftErr := mihomoNftSvc.CollectAndSaveTrafficWithHistory(enableTraffic)
+	if nftErr != nil {
 		logger.Warning("mihomo nftables traffic collection failed: ", nftErr)
 	}
-	if blockErr := (&service.MihomoClientPortBlockService{}).Reconcile((&service.MihomoCoreManagerService{}).IsRunning()); blockErr != nil {
-		logger.Warning("mihomo client block nft reconcile failed: ", blockErr)
+	if mihomoTrafficChanged {
+		if blockErr := (&service.MihomoClientPortBlockService{}).ReconcileAfterTraffic(); blockErr != nil {
+			logger.Warning("mihomo client block nft reconcile failed: ", blockErr)
+		}
 	}
 }
 

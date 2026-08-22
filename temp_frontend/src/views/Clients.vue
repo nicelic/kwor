@@ -1,13 +1,33 @@
 <template>
-  <ClientModal
-    v-model="modal.visible"
-    :visible="modal.visible"
-    :id="modal.id"
-    :namespace="props.namespace"
-    :groups="groups"
-    :inboundTags="inboundTags"
-    @close="closeModal"
-  />
+  <template v-if="initializing">
+    <v-row align="center" justify="center" style="min-height: 240px;">
+      <v-col cols="12" class="text-center">
+        <v-progress-circular indeterminate color="primary" />
+        <div class="mt-3">{{ $t('loading') }}</div>
+      </v-col>
+    </v-row>
+  </template>
+  <template v-else-if="loadFailed">
+    <v-row align="center" justify="center" style="min-height: 240px;">
+      <v-col cols="12" sm="8" md="6">
+        <v-alert type="error" variant="tonal" :title="$t('failed')" class="text-center">
+          <v-btn color="primary" class="mt-2" prepend-icon="mdi-refresh" @click="initialize">
+            {{ $t('actions.update') }}
+          </v-btn>
+        </v-alert>
+      </v-col>
+    </v-row>
+  </template>
+  <template v-else>
+    <ClientModal
+      v-model="modal.visible"
+      :visible="modal.visible"
+      :id="modal.id"
+      :namespace="props.namespace"
+      :groups="groups"
+      :inboundTags="inboundTags"
+      @close="closeModal"
+    />
   <ClientBulk
     v-model="addBulkModal"
     :visible="addBulkModal"
@@ -31,19 +51,19 @@
     :namespace="props.namespace"
     @close="closeStats"
   />
-  <v-row justify="center" align="center">
+    <v-row justify="center" align="center">
     <v-col cols="auto">
-      <v-btn color="primary" @click="showModal(0)">{{ $t('actions.add') }}</v-btn>
+      <v-btn color="primary" :disabled="clientOperationBusy" @click="showModal(0)">{{ $t('actions.add') }}</v-btn>
     </v-col>
     <v-col cols="auto">
-      <v-menu v-model="actionMenu" :close-on-content-click="false" location="bottom center">
+      <v-menu v-model="actionMenu" :disabled="clientOperationBusy" :close-on-content-click="false" location="bottom center">
         <template v-slot:activator="{ props: menuProps }">
-          <v-btn v-bind="menuProps" hide-details variant="text" icon>
+          <v-btn v-bind="menuProps" hide-details variant="text" icon :disabled="clientOperationBusy">
             <v-icon icon="mdi-tools" color="primary" />
           </v-btn>
         </template>
         <v-list density="compact" nav>
-          <v-list-item link @click="addBulk">
+          <v-list-item link :disabled="clientOperationBusy" @click="addBulk">
             <template v-slot:prepend>
               <v-icon icon="mdi-account-multiple-plus"></v-icon>
             </template>
@@ -95,47 +115,45 @@
             </v-row>
           </v-container>
           <v-card-actions>
-            <v-card-actions>
-              <v-spacer></v-spacer>
-              <v-btn
-                color="blue-darken-1"
-                variant="outlined"
-                @click="clearFilter">
-                {{ $t('actions.del') }}
-              </v-btn>
-              <v-btn
-                color="blue-darken-1"
-                variant="tonal"
-                @click="doFilter">
-                {{ $t('actions.update') }}
-              </v-btn>
-            </v-card-actions>
+            <v-spacer></v-spacer>
+            <v-btn
+              color="blue-darken-1"
+              variant="outlined"
+              @click="clearFilter">
+              {{ $t('actions.del') }}
+            </v-btn>
+            <v-btn
+              color="blue-darken-1"
+              variant="tonal"
+              @click="doFilter">
+              {{ $t('actions.update') }}
+            </v-btn>
           </v-card-actions>
         </v-card>
       </v-menu>
     </v-col>
   </v-row>
-  <v-row>
-    <v-col cols="12">
+    <v-row>
+      <v-col cols="12">
       <v-data-table
         :headers="headers"
-        :items="filterSettings.enabled ? filterSettings.filteredClients : clients"
-        :hide-default-footer="filterSettings.enabled ? filterSettings.filteredClients.length <= 10 : clients.length <= 10"
+        :items="visibleClients"
+        :hide-default-footer="hideDefaultFooter"
         :items-per-page="itemPerPage"
         @update:items-per-page="setItemPerPage($event)"
         hide-no-data
         fixed-header
-        item-value="name"
+        item-value="id"
         :mobile="smAndDown"
         mobile-breakpoint="sm"
         width="100%"
-        class="elevation-3 rounded">
+        class="clients-table elevation-3 rounded">
         <template v-slot:item.inbounds="{ item }">
           <span>
-            <v-tooltip activator="parent" dir="ltr" location="start" v-if="item.inbounds != ''">
-              <span v-for="i in item.inbounds">{{ inbounds.find(inb => inb.id == i)?.tag }}<br /></span>
+            <v-tooltip activator="parent" dir="ltr" location="start" v-if="clientInboundIds(item).length > 0">
+              <span v-for="i in clientInboundIds(item)" :key="i">{{ inboundTagMap.get(Number(i)) ?? i }}<br /></span>
             </v-tooltip>
-            {{ item.inbounds?.length }}
+            {{ clientInboundIds(item).length }}
           </span>
         </template>
         <template v-slot:item.volume="{ item }">
@@ -166,68 +184,100 @@
         </template>
         <template v-slot:item.online="{ item }">
           <div class="text-start">
-            <template v-if="isOnline(item.name).value">
+            <template v-if="onlineNames.has(item.name)">
               <v-chip density="comfortable" size="small" color="success" variant="flat">{{ $t('online') }}</v-chip>
             </template>
             <template v-else>-</template>
           </div>
         </template>
         <template v-slot:item.actions="{ item }">
-          <v-menu
-            v-model="delOverlay[clients.findIndex(c => c.id == item.id)]"
-            :close-on-content-click="false"
-            location="top center">
-            <template v-slot:activator="{ props: menuProps }">
-              <v-icon
-                class="me-6"
-                color="error"
-                v-bind="menuProps">
-                mdi-delete
-              </v-icon>
-            </template>
-            <v-card :title="$t('actions.del')" rounded="lg">
-              <v-divider></v-divider>
-              <v-card-text>{{ $t('confirm') }}</v-card-text>
-              <v-card-actions>
-                <v-btn color="error" variant="outlined" @click="delClient(item.id)">{{ $t('yes') }}</v-btn>
-                <v-btn color="success" variant="outlined" @click="delOverlay[clients.findIndex(c => c.id == item.id)] = false">{{ $t('no') }}</v-btn>
-              </v-card-actions>
-            </v-card>
-          </v-menu>
-          <v-icon
-            class="me-3"
-            @click="showModal(item.id)">
-            mdi-pencil
-          </v-icon>
-          <v-icon
-            class="me-3"
-            @click="showQrCode(item.id)">
-            mdi-qrcode
-          </v-icon>
-          <v-icon class="me-3" icon="mdi-chart-line" @click="showStats(item.name)" v-if="enableTraffic">
-            <v-tooltip activator="parent" location="top" :text="$t('stats.graphTitle')"></v-tooltip>
-          </v-icon>
-          <v-icon
-            class="me-3"
-            :loading="syncLoading[item.name]"
-            @click="syncToSubManager(item.name)">
-            mdi-sync
-            <v-tooltip activator="parent" location="top" text="Sync to Sub Manager"></v-tooltip>
-          </v-icon>
+          <div class="d-flex align-center flex-wrap client-actions">
+            <v-menu
+              :model-value="delOverlay[item.id] === true"
+              :disabled="clientOperationBusy && deletingClientId !== item.id"
+              :persistent="deletingClientId === item.id"
+              @update:model-value="setDeleteOverlay(item.id, $event)"
+              :close-on-content-click="false"
+              location="top center">
+              <template v-slot:activator="{ props: menuProps }">
+                <v-tooltip location="top" :text="$t('actions.del')">
+                  <template #activator="{ props: tooltipProps }">
+                    <span class="client-action-tooltip" v-bind="tooltipProps">
+                      <v-btn
+                        v-bind="menuProps"
+                        icon="mdi-delete"
+                        size="small"
+                        variant="text"
+                        color="error"
+                        :disabled="clientOperationBusy" />
+                    </span>
+                  </template>
+                </v-tooltip>
+              </template>
+              <v-card :title="$t('actions.del')" rounded="lg">
+                <v-divider></v-divider>
+                <v-card-text>{{ $t('confirm') }}</v-card-text>
+                <v-card-actions>
+                  <v-btn color="error" variant="outlined" :loading="isDeletingClient(item.id)" :disabled="clientOperationBusy" @click="delClient(item.id)">{{ $t('yes') }}</v-btn>
+                  <v-btn color="success" variant="outlined" :disabled="clientOperationBusy" @click="setDeleteOverlay(item.id, false)">{{ $t('no') }}</v-btn>
+                </v-card-actions>
+              </v-card>
+            </v-menu>
+            <v-tooltip location="top" :text="$t('actions.edit')">
+              <template #activator="{ props: tooltipProps }">
+                <v-btn v-bind="tooltipProps" icon="mdi-pencil" size="small" variant="text" :disabled="clientOperationBusy" @click="showModal(item.id)" />
+              </template>
+            </v-tooltip>
+            <v-tooltip location="top" text="QrCode">
+              <template #activator="{ props: tooltipProps }">
+                <v-btn v-bind="tooltipProps" icon="mdi-qrcode" size="small" variant="text" :disabled="clientOperationBusy" @click="showQrCode(item.id)" />
+              </template>
+            </v-tooltip>
+            <v-tooltip v-if="enableTraffic" location="top" :text="$t('stats.graphTitle')">
+              <template #activator="{ props: tooltipProps }">
+                <v-btn v-bind="tooltipProps" icon="mdi-chart-line" size="small" variant="text" :disabled="clientOperationBusy" @click="showStats(item.name)" />
+              </template>
+            </v-tooltip>
+            <v-tooltip location="top" :text="$t('actions.syncToSubManager')">
+              <template #activator="{ props: tooltipProps }">
+                <v-btn
+                  v-bind="tooltipProps"
+                  icon="mdi-sync"
+                  size="small"
+                  variant="text"
+                  :color="item.autoSync ? 'primary' : undefined"
+                  :loading="syncLoading[item.id]"
+                  :disabled="clientOperationBusy || syncLoading[item.id]"
+                  @click="syncToSubManager(item)" />
+              </template>
+            </v-tooltip>
+          </div>
         </template>
       </v-data-table>
-    </v-col>
-  </v-row>
+      </v-col>
+    </v-row>
+  </template>
 </template>
 
-<style>
-.v-data-table__tr--mobile td {
+<style scoped>
+  .clients-table :deep(.v-data-table__tr--mobile td) {
   height: fit-content;
   min-height: 36px !important;
 }
 
-.v-data-table__tr--mobile td div {
-  width: max-content;
+  .clients-table :deep(.v-data-table__tr--mobile td div) {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.client-actions {
+  min-width: 248px;
+  gap: 2px;
+}
+
+.client-action-tooltip {
+  display: inline-flex;
 }
 </style>
 
@@ -238,7 +288,7 @@ import ClientBulk from '@/layouts/modals/ClientBulk.vue'
 import QrCode from '@/layouts/modals/QrCode.vue'
 import Stats from '@/layouts/modals/Stats.vue'
 import { Client } from '@/types/clients'
-import { computed, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { HumanReadable } from '@/plugins/utils'
 import { panelNowUnix } from '@/plugins/panelTime'
 import { i18n } from '@/locales'
@@ -254,17 +304,44 @@ const props = withDefaults(defineProps<{ namespace?: UiNamespace }>(), {
 
 const store = getNamespaceStore(props.namespace)
 const namespaceApi = getNamespaceApi(props.namespace)
+const initializing = ref(true)
+const loadFailed = ref(false)
+let componentActive = true
+
+const initialize = async () => {
+  const hadLoadedData = store.hasFullData
+  initializing.value = true
+  loadFailed.value = false
+  try {
+    const success = await store.loadData()
+    if (!componentActive) return
+    if (!success && !hadLoadedData) {
+      loadFailed.value = true
+    }
+  } catch {
+    if (componentActive && !hadLoadedData) loadFailed.value = true
+  } finally {
+    if (componentActive) initializing.value = false
+  }
+}
 
 const clients = computed((): any[] => {
   return store.clients
 })
 
-const isOnline = (cname: string) => computed(() => {
-  return store.onlines?.user ? store.onlines.user.includes(cname) : false
-})
+const onlineNames = computed(() => new Set(store.onlines?.user ?? []))
 
 const inbounds = computed((): any[] => {
   return store.inbounds ?? []
+})
+
+const inboundTagMap = computed(() => {
+  const map = new Map<number, string>()
+  for (const inbound of inbounds.value) {
+    const id = Number(inbound?.id)
+    if (id > 0) map.set(id, String(inbound?.tag ?? ''))
+  }
+  return map
 })
 
 const inboundTags = computed((): any[] => {
@@ -272,12 +349,6 @@ const inboundTags = computed((): any[] => {
   return inbounds.value?.filter(i => i.tag != '' && (i.user_management?.selectable ?? !!i.users)).map(i => {
     return { title: i.tag, value: i.id }
   })
-})
-
-const groups = computed((): string[] => {
-  if (!clients.value) return []
-  if (filterSettings?.value.enabled) return Array.from(new Set(filterSettings.value.filteredClients?.map(c => c.group)))
-  return Array.from(new Set(clients.value?.map(c => c.group)))
 })
 
 const enableTraffic = computed(() => {
@@ -291,8 +362,75 @@ const filterSettings = ref({
   state: '',
   group: '-',
   text: '',
-  filteredClients: <any[]>[],
 })
+
+const visibleClients = computed((): any[] => {
+  if (!filterSettings.value.enabled) return clients.value ?? []
+
+  let result = clients.value.slice()
+  if (filterSettings.value.group !== '-') {
+    result = result.filter(client => String(client.group ?? '') === filterSettings.value.group)
+  }
+  const query = filterSettings.value.text.trim().toLocaleLowerCase()
+  if (query) {
+    result = result.filter(client =>
+      String(client.name ?? '').toLocaleLowerCase().includes(query) ||
+      String(client.desc ?? '').toLocaleLowerCase().includes(query),
+    )
+  }
+  switch (filterSettings.value.state) {
+    case 'disable':
+      return result.filter(client => client.enable === false)
+    case 'expired':
+      return result.filter(client => client.expiry > 0 && client.expiry <= panelNowUnix())
+    case 'online':
+      return result.filter(client => onlineNames.value.has(client.name))
+    default:
+      return result
+  }
+})
+
+const groups = computed((): string[] => Array.from(new Set(clients.value.map(client => String(client.group ?? '')))))
+
+const normalizeClientInboundIds = (raw: unknown): Array<number | string> => {
+  const values = Array.isArray(raw)
+    ? raw
+    : typeof raw === 'string'
+      ? (() => {
+          try {
+            const parsed = JSON.parse(raw)
+            return Array.isArray(parsed) ? parsed : []
+          } catch {
+            return []
+          }
+        })()
+      : []
+  const ids: Array<number | string> = []
+  const seen = new Set<string>()
+  for (const value of values) {
+    const normalized = Number.isInteger(Number(value)) && Number(value) > 0 ? Number(value) : String(value ?? '').trim()
+    if (normalized === '' || seen.has(String(normalized))) continue
+    seen.add(String(normalized))
+    ids.push(normalized)
+  }
+  return ids
+}
+
+const clientInboundIdsByClientId = computed(() => {
+  const map = new Map<number, Array<number | string>>()
+  for (const client of clients.value) {
+    const id = Number(client?.id)
+    if (Number.isInteger(id) && id > 0) {
+      map.set(id, normalizeClientInboundIds(client?.inbounds))
+    }
+  }
+  return map
+})
+
+const clientInboundIds = (client: any): Array<number | string> => {
+  const id = Number(client?.id)
+  return clientInboundIdsByClientId.value.get(id) ?? normalizeClientInboundIds(client?.inbounds)
+}
 
 const filterItems = [
   { title: i18n.global.t('none'), value: '' },
@@ -305,19 +443,29 @@ const headers = [
   { title: i18n.global.t('client.name'), key: 'name' },
   { title: i18n.global.t('client.desc'), key: 'desc' },
   { title: i18n.global.t('client.group'), key: 'group' },
-  { title: i18n.global.t('pages.inbounds'), key: 'inbounds', width: 10 },
-  { title: i18n.global.t('actions.action'), key: 'actions', sortable: false },
+  { title: i18n.global.t('pages.inbounds'), key: 'inbounds', width: 100, minWidth: 100 },
+  { title: i18n.global.t('actions.action'), key: 'actions', sortable: false, width: 260, minWidth: 248, nowrap: true },
   { title: i18n.global.t('stats.volume'), key: 'volume' },
   { title: i18n.global.t('date.expiry'), key: 'expiry' },
   { title: i18n.global.t('online'), key: 'online' },
   { key: 'data-table-group', width: 0 },
 ]
 
-const itemPerPage = ref(localStorage.getItem(namespaceApi.itemsPerPageKey) || '10')
+const normalizeItemsPerPage = (raw: unknown): number => {
+  const parsed = Number(raw)
+  if (parsed === -1) return -1
+  return Number.isInteger(parsed) && parsed >= 1 ? parsed : 10
+}
+
+const itemPerPage = ref(normalizeItemsPerPage(localStorage.getItem(namespaceApi.itemsPerPageKey)))
+
+const hideDefaultFooter = computed(() => (
+  itemPerPage.value === -1 || visibleClients.value.length <= itemPerPage.value
+))
 
 const setItemPerPage = (items: number) => {
-  itemPerPage.value = items.toString()
-  localStorage.setItem(namespaceApi.itemsPerPageKey, items.toString())
+  itemPerPage.value = normalizeItemsPerPage(items)
+  localStorage.setItem(namespaceApi.itemsPerPageKey, itemPerPage.value.toString())
 }
 
 const modal = ref({
@@ -325,9 +473,31 @@ const modal = ref({
   id: 0,
 })
 
-const delOverlay = ref(new Array<boolean>(clients.value.length).fill(false))
+const delOverlay = reactive<Record<number, boolean>>({})
+const syncLoading = reactive<Record<number, boolean>>({})
+const deletingClientId = ref<number | null>(null)
+const clientOperationBusy = computed(() => (
+  deletingClientId.value !== null
+  || Object.values(syncLoading).some(Boolean)
+))
 
-const showModal = async (id: number) => {
+const isDeletingClient = (id: number) => deletingClientId.value === id
+
+const setDeleteOverlay = (id: number, open: boolean) => {
+  if (open) {
+    if (clientOperationBusy.value) return
+    for (const key of Object.keys(delOverlay)) {
+      if (Number(key) !== id) delete delOverlay[Number(key)]
+    }
+    delOverlay[id] = true
+    return
+  }
+  if (deletingClientId.value === id) return
+  delete delOverlay[id]
+}
+
+const showModal = (id: number) => {
+  if (clientOperationBusy.value) return
   modal.value.id = id
   modal.value.visible = true
 }
@@ -337,9 +507,14 @@ const closeModal = () => {
 }
 
 const delClient = async (id: number) => {
-  const index = clients.value.findIndex(c => c.id === id)
-  const success = await store.save('clients', 'del', id)
-  if (success) delOverlay.value[index] = false
+  if (clientOperationBusy.value || !Number.isInteger(id) || id <= 0) return
+  deletingClientId.value = id
+  try {
+    const success = await store.save('clients', 'del', id)
+    if (success) delete delOverlay[id]
+  } finally {
+    if (deletingClientId.value === id) deletingClientId.value = null
+  }
 }
 
 const qrcode = ref({
@@ -348,6 +523,7 @@ const qrcode = ref({
 })
 
 const showQrCode = (id: number) => {
+  if (clientOperationBusy.value) return
   qrcode.value.id = id
   qrcode.value.visible = true
 }
@@ -363,6 +539,7 @@ const stats = ref({
 })
 
 const showStats = (tag: string) => {
+  if (clientOperationBusy.value) return
   stats.value.tag = tag
   stats.value.visible = true
 }
@@ -372,26 +549,6 @@ const closeStats = () => {
 }
 
 const doFilter = () => {
-  let filteredClients = clients.value.slice()
-  if (filterSettings.value.group != '-') {
-    filteredClients = filteredClients.filter(c => c.group == filterSettings.value.group)
-  }
-  if (filterSettings.value.text.length > 0) {
-    const txt = filterSettings.value.text
-    filteredClients = filteredClients.filter(c => c.name.search(txt) != -1 || c.desc.search(txt) != -1)
-  }
-  switch (filterSettings.value.state) {
-    case 'disable':
-      filteredClients = filteredClients.filter(c => c.enable == false)
-      break
-    case 'expired':
-      filteredClients = filteredClients.filter(c => c.expiry > 0 && c.expiry <= panelNowUnix())
-      break
-    case 'online':
-      filteredClients = filteredClients.filter(c => store.onlines?.user?.includes(c.name))
-      break
-  }
-  filterSettings.value.filteredClients = filteredClients
   filterSettings.value.enabled = true
   filterMenu.value = false
 }
@@ -402,7 +559,6 @@ const clearFilter = () => {
     state: '',
     group: '-',
     text: '',
-    filteredClients: <any[]>[],
   }
   filterMenu.value = false
 }
@@ -410,6 +566,7 @@ const clearFilter = () => {
 const addBulkModal = ref(false)
 
 const addBulk = () => {
+  if (clientOperationBusy.value) return
   addBulkModal.value = true
   actionMenu.value = false
 }
@@ -418,24 +575,74 @@ const closeBulk = () => {
   addBulkModal.value = false
 }
 
-const syncLoading = reactive<Record<string, boolean>>({})
-
-const syncToSubManager = async (clientName: string) => {
-  syncLoading[clientName] = true
+const syncToSubManager = async (client: any) => {
+  const clientId = Number(client.id)
+  const clientName = String(client.name ?? '')
+  if (!Number.isInteger(clientId) || clientId <= 0 || clientOperationBusy.value) return
+  syncLoading[clientId] = true
   try {
-    const msg = await HttpUtils.post(namespaceApi.syncEndpoint, { name: clientName })
+    const msg = await HttpUtils.post(namespaceApi.syncEndpoint, { name: clientName }, { silentErrorToast: true })
     if (msg.success) {
-      const result = msg.obj
-      push.success({
-        message: clientName + (result.action === 'updated' ? ' updated' : ' synced'),
-        duration: 3000,
+      const result = msg.obj ?? {}
+      const count = Number.isFinite(Number(result.count)) ? Number(result.count) : 0
+      const refreshed = await store.loadData(true)
+      if (!refreshed) {
+        push.warning({
+          title: i18n.global.t('failed'),
+          message: i18n.global.t('actions.syncToSubManagerRefreshFailed'),
+          duration: 5000,
+        })
+      } else if (count === 0) {
+        push.warning({
+          title: i18n.global.t('success'),
+          message: i18n.global.t('actions.syncToSubManagerNoNodes', { name: clientName }),
+          duration: 5000,
+        })
+      } else {
+        push.success({
+          message: i18n.global.t('actions.syncToSubManagerSuccess', { name: clientName, count }),
+          duration: 3000,
+        })
+      }
+    } else if (msg.obj?.committed === true) {
+      const result = msg.obj?.result ?? {}
+      const count = Number.isFinite(Number(result.count)) ? Number(result.count) : 0
+      const autoSyncEnabled = msg.obj?.autoSyncEnabled === true
+      const refreshed = await store.loadData(true)
+      if (!refreshed) {
+        push.warning({
+          title: i18n.global.t('failed'),
+          message: i18n.global.t('actions.syncToSubManagerRefreshFailed'),
+          duration: 5000,
+        })
+      } else {
+        push.warning({
+          title: i18n.global.t('warning'),
+          message: autoSyncEnabled
+            ? i18n.global.t('actions.syncToSubManagerCommittedWithAuto', { name: clientName, count })
+            : i18n.global.t('actions.syncToSubManagerCommittedWithoutAuto', { name: clientName, count }),
+          duration: 7000,
+        })
+      }
+    } else if (msg.msg) {
+      push.warning({
+        title: i18n.global.t('failed'),
+        message: msg.msg,
+        duration: 5000,
       })
-      await store.loadData()
     }
   } finally {
-    syncLoading[clientName] = false
+    delete syncLoading[clientId]
   }
 }
+
+onMounted(() => {
+  void initialize()
+})
+
+onUnmounted(() => {
+  componentActive = false
+})
 
 const percent = (c: Client) => {
   return c.volume > 0 ? Math.round((c.up + c.down) * 100 / c.volume) : 0

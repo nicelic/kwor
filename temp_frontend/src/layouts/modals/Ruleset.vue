@@ -1,11 +1,11 @@
 <template>
-  <v-dialog transition="dialog-bottom-transition" width="800">
+  <v-dialog transition="dialog-bottom-transition" width="800" max-width="95vw">
     <v-card class="rounded-lg">
       <v-card-title>
         {{ $t('actions.' + title) + ' ' + $t('objects.ruleset') }}
       </v-card-title>
       <v-divider></v-divider>
-      <v-card-text style="padding: 0 16px;">
+      <v-card-text style="padding: 0 16px; max-height: 75vh; overflow-y: auto;">
         <v-row>
           <v-col cols="12" sm="6" md="4">
             <v-select
@@ -42,7 +42,7 @@
           </v-col>
         </v-row>
 
-        <v-row v-if="isInlineType">
+        <v-row v-if="isMihomoNamespace && isInlineType">
           <v-col cols="12">
             <v-textarea
               v-model="payloadText"
@@ -50,6 +50,19 @@
               hide-details
               rows="6"
               placeholder="one item per line"
+            ></v-textarea>
+          </v-col>
+        </v-row>
+
+        <v-row v-else-if="isDefaultInlineType">
+          <v-col cols="12">
+            <v-textarea
+              v-model="inlineRulesText"
+              label="Inline Rules JSON"
+              hide-details="auto"
+              rows="9"
+              :error-messages="inlineRulesError"
+              @update:model-value="inlineRulesError = ''"
             ></v-textarea>
           </v-col>
         </v-row>
@@ -92,11 +105,9 @@
           </v-col>
           <v-col v-else cols="12" sm="6" md="4">
             <v-text-field
-              v-model.number="update_intervals"
-              :suffix="$t('date.d')"
-              type="number"
-              min="0"
+              v-model="rule_set.update_interval"
               :label="$t('ruleset.interval')"
+              placeholder="1d"
               hide-details
             ></v-text-field>
           </v-col>
@@ -158,6 +169,8 @@ export default {
       title: 'add',
       loading: false,
       rule_set: <ruleset>{},
+      inlineRulesText: '[]',
+      inlineRulesError: '',
     }
   },
   methods: {
@@ -187,8 +200,14 @@ export default {
       if (this.isMihomoNamespace || value.type !== 'remote') {
         return value
       }
-      if (!value.download_detour) {
-        value.download_detour = this.getDefaultDirectTag()
+      const existingDetour = typeof value.http_client?.detour === 'string'
+        ? value.http_client.detour.trim()
+        : ''
+      if (!existingDetour && !value.download_detour) {
+        value.http_client = {
+          ...(value.http_client ?? {}),
+          detour: this.getDefaultDirectTag(),
+        }
       }
       if (!value.update_interval) {
         value.update_interval = '1d'
@@ -220,6 +239,14 @@ export default {
       next.update_interval = typeof next.update_interval === 'string' ? next.update_interval.trim() : undefined
       next.proxy = typeof next.proxy === 'string' ? next.proxy.trim() : undefined
       next.download_detour = typeof next.download_detour === 'string' ? next.download_detour.trim() : undefined
+      if (next.http_client && typeof next.http_client === 'object' && !Array.isArray(next.http_client)) {
+        next.http_client = { ...next.http_client }
+        if (typeof next.http_client.detour === 'string') {
+          next.http_client.detour = next.http_client.detour.trim()
+        }
+      } else if (next.http_client !== undefined) {
+        delete next.http_client
+      }
       next.payload = normalizePayloadEntries(next.payload)
 
       if (this.isMihomoNamespace) {
@@ -281,7 +308,7 @@ export default {
         next.type = 'local'
       } else if (next.type === 'http') {
         next.type = 'remote'
-      } else if (next.type !== 'local' && next.type !== 'remote') {
+      } else if (next.type !== 'local' && next.type !== 'remote' && next.type !== 'inline') {
         next.type = next.url ? 'remote' : 'local'
       }
 
@@ -300,20 +327,45 @@ export default {
       delete next.behavior
       delete next.payload
 
-      if (next.type === 'local') {
+      if (next.type === 'inline') {
+        delete next.path
         delete next.url
         delete next.download_detour
         delete next.update_interval
+        delete next.format
+        delete next.initial_path
+        delete next.http_client
+        if (!Array.isArray(next.rules)) {
+          next.rules = []
+        }
+      } else if (next.type === 'local') {
+        delete next.url
+        delete next.download_detour
+        delete next.update_interval
+        delete next.initial_path
+        delete next.http_client
+        delete next.rules
       } else {
         delete next.path
+        delete next.rules
+        if (!next.http_client?.detour && next.download_detour) {
+          next.http_client = { ...(next.http_client ?? {}), detour: next.download_detour }
+        }
+        delete next.download_detour
       }
 
       if (!next.path) delete next.path
       if (!next.url) delete next.url
       if (!next.download_detour) delete next.download_detour
+      if (next.http_client && Object.keys(next.http_client).length === 0) delete next.http_client
       if (!next.update_interval) delete next.update_interval
 
       return next
+    },
+    syncInlineRulesText() {
+      const rules = Array.isArray(this.rule_set.rules) ? this.rule_set.rules : []
+      this.inlineRulesText = JSON.stringify(rules, null, 2)
+      this.inlineRulesError = ''
     },
     updateData() {
       if (this.$props.index != -1) {
@@ -323,6 +375,7 @@ export default {
         this.title = 'add'
         this.rule_set = this.createDefaultRuleSet()
       }
+      this.syncInlineRulesText()
     },
     updateType(typeValue: string) {
       let next = this.normalizeRuleSet({
@@ -335,6 +388,7 @@ export default {
         next = this.applyDefaultRemoteDefaults(next)
       }
       this.rule_set = next
+      this.syncInlineRulesText()
     },
     updateFormat(formatValue: string) {
       this.rule_set = this.normalizeRuleSet({
@@ -347,15 +401,35 @@ export default {
         delete this.rule_set.proxy
         return
       }
-      delete this.rule_set.download_detour
+      if (this.rule_set.http_client && typeof this.rule_set.http_client === 'object') {
+        delete this.rule_set.http_client.detour
+        if (Object.keys(this.rule_set.http_client).length === 0) delete this.rule_set.http_client
+      }
     },
     closeModal() {
       this.$emit('close')
     },
     saveChanges() {
       this.loading = true
-      this.$emit('save', this.normalizeRuleSet(this.rule_set))
-      this.loading = false
+      try {
+        if (!this.isMihomoNamespace && this.rule_set.type === 'inline') {
+          let parsed: unknown
+          try {
+            parsed = JSON.parse(this.inlineRulesText)
+          } catch {
+            this.inlineRulesError = 'Inline rules must be valid JSON.'
+            return
+          }
+          if (!Array.isArray(parsed)) {
+            this.inlineRulesError = 'Inline rules must be a JSON array.'
+            return
+          }
+          this.rule_set.rules = parsed
+        }
+        this.$emit('save', this.normalizeRuleSet(this.rule_set))
+      } finally {
+        this.loading = false
+      }
     },
   },
   computed: {
@@ -364,6 +438,9 @@ export default {
     },
     isInlineType(): boolean {
       return this.rule_set.type === 'inline'
+    },
+    isDefaultInlineType(): boolean {
+      return !this.isMihomoNamespace && this.isInlineType
     },
     isFileType(): boolean {
       return this.rule_set.type === 'local' || this.rule_set.type === 'file'
@@ -384,6 +461,7 @@ export default {
         : [
           { title: this.$t('ruleset.local'), value: 'local' },
           { title: this.$t('ruleset.remote'), value: 'remote' },
+          { title: 'Inline', value: 'inline' },
         ]
     },
     formatItems(): string[] {
@@ -409,7 +487,11 @@ export default {
     },
     remoteProxy: {
       get(): string | undefined {
-        return this.isMihomoNamespace ? this.rule_set.proxy : this.rule_set.download_detour
+        if (this.isMihomoNamespace) return this.rule_set.proxy
+        const httpClient = this.rule_set.http_client
+        return typeof httpClient?.detour === 'string'
+          ? httpClient.detour
+          : this.rule_set.download_detour
       },
       set(value: string | undefined) {
         const normalized = typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
@@ -417,17 +499,15 @@ export default {
           this.rule_set.proxy = normalized
           return
         }
-        this.rule_set.download_detour = normalized
-      },
-    },
-    update_intervals: {
-      get(): number {
-        return this.rule_set.update_interval != undefined
-          ? parseInt(this.rule_set.update_interval.replace('d', ''))
-          : 0
-      },
-      set(value: number) {
-        this.rule_set.update_interval = value > 0 ? `${value}d` : undefined
+        if (!normalized) {
+          this.clearRemoteProxy()
+          return
+        }
+        this.rule_set.http_client = {
+          ...(this.rule_set.http_client ?? {}),
+          detour: normalized,
+        }
+        delete this.rule_set.download_detour
       },
     },
   },

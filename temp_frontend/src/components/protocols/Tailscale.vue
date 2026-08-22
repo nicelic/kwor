@@ -28,7 +28,7 @@
         <v-text-field v-model="data.hostname" :label="$t('types.ts.hostname')"></v-text-field>
       </v-col>
       <v-col cols="12" sm="6" md="4" v-if="optionUdpTimeout">
-        <v-text-field type="number" v-model.number="udpTimeout" min="1" :suffix="$t('date.s')" :label="$t('types.ts.udpTimeout')"></v-text-field>
+        <v-text-field type="number" v-model="udpTimeout" min="1" step="any" :suffix="$t('date.s')" :label="$t('types.ts.udpTimeout')"></v-text-field>
       </v-col>
     </v-row>
     <v-row v-if="optionExitNode">
@@ -84,6 +84,8 @@
 </template>
 
 <script lang="ts">
+import { readSingboxDuration, writeSingboxDuration } from '@/plugins/singboxDuration'
+
 export default {
   props: ['data'],
   data() {
@@ -135,8 +137,8 @@ export default {
       set(v: boolean) { this.$props.data.udp_timeout = v ? '30s' : undefined }
     },
     udpTimeout: {
-      get() { return this.$props.data?.udp_timeout? this.$props.data.udp_timeout.replace('s','') : '' },
-      set(v: number) { this.$props.data.udp_timeout = v>1 ? v + 's' : '30s' }
+      get() { return readSingboxDuration(this.$props.data?.udp_timeout, 's') ?? 30 },
+      set(v: unknown) { this.$props.data.udp_timeout = writeSingboxDuration(v, 's', { minimum: 1 }) ?? '30s' }
     },
     advertise_routes: {
       get() { return this.$props.data?.advertise_routes?.join(',') ?? "" },

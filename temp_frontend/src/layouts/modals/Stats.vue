@@ -1,5 +1,5 @@
 <template>
-  <v-dialog transition="dialog-bottom-transition" width="800">
+  <v-dialog v-model="dialogVisible" transition="dialog-bottom-transition" width="800" max-width="90vw" max-height="90vh">
     <v-card class="rounded-lg" :loading="loading">
       <v-card-title>
         <v-row>
@@ -7,19 +7,23 @@
             {{ $t("stats.graphTitle") }}
           </v-col>
           <v-spacer></v-spacer>
-          <v-col cols="auto"
-            ><v-icon icon="mdi-close" @click="$emit('close')"></v-icon
-          ></v-col>
+          <v-col cols="auto">
+            <v-tooltip location="top" :text="$t('actions.close')">
+              <template #activator="{ props: tooltipProps }">
+                <v-btn v-bind="tooltipProps" icon="mdi-close" density="compact" variant="text" @click="closeDialog" />
+              </template>
+            </v-tooltip>
+          </v-col>
         </v-row>
       </v-card-title>
       <v-divider></v-divider>
-      <v-card-text style="padding: 0 16px">
+      <v-card-text style="padding: 0 16px; max-height: calc(90vh - 92px); overflow-y: auto">
         <div style="text-align: center; margin: 5px">
           {{ $t("objects." + resource) + " : " + tag }}
         </div>
         <v-radio-group
           v-model="limit"
-          @change="loadData"
+          @change="changePeriod"
           density="compact"
           :loading="loading"
           inline
@@ -27,6 +31,7 @@
         >
           <v-radio
             v-for="p in periods"
+            :key="p.value"
             :label="p.title"
             :value="p.value"
           ></v-radio>
@@ -86,13 +91,17 @@ export default {
   components: {
     Line,
   },
-  props: ["visible", "resource", "tag", "namespace"],
+  props: ["modelValue", "visible", "resource", "tag", "namespace"],
+  emits: ["close", "update:modelValue"],
   data() {
     return {
       loading: false,
       loaded: false,
       alert: false,
       intervalId: <any>0,
+      pollingEnabled: false,
+      loadSeq: 0,
+      loadController: null as AbortController | null,
       limit: 1,
       periods: [
         { value: 1, title: i18n.global.n(1) + i18n.global.t("date.h") },
@@ -119,24 +128,16 @@ export default {
         plugins: {
           tooltip: {
             callbacks: {
-              text: (ctx: any) => {
-                const {
-                  axis = "xy",
-                  intersect,
-                  mode,
-                } = ctx.chart.options.interaction;
-                return (
-                  "Mode: " +
-                  mode +
-                  ", axis: " +
-                  axis +
-                  ", intersect: " +
-                  intersect
-                );
+              label: (ctx: any) => {
+                const value = Number(ctx.raw ?? 0);
+                return `${ctx.dataset?.label ?? ""}: ${HumanReadable.sizeFormat(Number.isFinite(value) ? value : 0)}`;
               },
               footer: (items: any[]) => {
                 return HumanReadable.sizeFormat(
-                  items.reduce((acc, c) => acc + c.raw, 0),
+                  items.reduce((acc, c) => {
+                    const value = Number(c.raw ?? 0);
+                    return acc + (Number.isFinite(value) ? value : 0);
+                  }, 0),
                 );
               },
             },
@@ -160,50 +161,119 @@ export default {
       usage: ref(<any>{}),
     };
   },
+  computed: {
+    dialogVisible: {
+      get(): boolean {
+        return this.$props.modelValue ?? this.$props.visible ?? false;
+      },
+      set(value: boolean) {
+        this.$emit("update:modelValue", value);
+        if (!value) this.$emit("close");
+      },
+    },
+  },
   methods: {
+    closeDialog() {
+      this.dialogVisible = false;
+    },
+    cancelPendingLoad() {
+      this.loadSeq += 1;
+      this.loadController?.abort();
+      this.loadController = null;
+    },
+    isCurrentLoad(controller: AbortController, requestSeq: number, resource: string, tag: string, namespace: string) {
+      return !controller.signal.aborted &&
+        this.loadController === controller &&
+        this.loadSeq === requestSeq &&
+        this.dialogVisible === true &&
+        this.$props.resource === resource &&
+        this.$props.tag === tag &&
+        (this.$props.namespace ?? "default") === namespace;
+    },
     stopPolling() {
       if (this.intervalId && this.intervalId != 0) {
-        clearInterval(this.intervalId);
+        clearTimeout(this.intervalId);
         this.intervalId = 0;
       }
+      this.pollingEnabled = false;
+    },
+    schedulePolling() {
+      if (!this.pollingEnabled || !this.dialogVisible) return;
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+      if (this.intervalId && this.intervalId != 0) clearTimeout(this.intervalId);
+      this.intervalId = setTimeout(() => {
+        this.intervalId = 0;
+        if (this.loading) {
+          this.schedulePolling();
+          return;
+        }
+        void this.loadData();
+      }, this.pollingIntervalMs());
     },
     startPolling() {
       this.stopPolling();
-      if (!this.$props.visible) {
+      if (!this.dialogVisible) {
         return;
       }
       if (typeof document !== "undefined" && document.visibilityState !== "visible") {
         return;
       }
-      this.intervalId = setInterval(() => {
-        this.loadData();
-      }, 10000);
+      this.pollingEnabled = true;
+      if (!this.loading) this.schedulePolling();
+    },
+    pollingIntervalMs() {
+      if (this.limit <= 6) return 10000;
+      if (this.limit <= 24) return 30000;
+      if (this.limit <= 240) return 60000;
+      return 300000;
+    },
+    changePeriod() {
+      this.loadData(true);
+      this.startPolling();
     },
     handleVisibilityChange() {
       if (document.visibilityState === "visible") {
-        if (this.$props.visible) {
-          this.loadData();
+        if (this.dialogVisible) {
+          this.loadData(true);
           this.startPolling();
         }
         return;
       }
       this.stopPolling();
+      this.cancelPendingLoad();
     },
-    async loadData() {
+    async loadData(replacePending = false) {
       if (this.loading) {
-        return;
+        if (!replacePending) return;
+        this.cancelPendingLoad();
       }
+      const controller = new AbortController();
+      const requestSeq = ++this.loadSeq;
+      const resource = String(this.$props.resource ?? "");
+      const tag = String(this.$props.tag ?? "");
+      const namespace = this.$props.namespace ?? "default";
+      this.loadController = controller;
       this.loading = true;
       try {
         const data = await HttpUtils.get("api/stats", {
-          resource: this.resource,
-          tag: this.tag,
+          resource,
+          tag,
           limit: this.limit,
-          namespace: this.namespace ?? "default",
-        });
-        if (data.success && data.obj) {
-          const obj = (<any[]>data.obj)
-            .slice()
+          namespace,
+        }, { signal: controller.signal });
+        if (!this.isCurrentLoad(controller, requestSeq, resource, tag, namespace)) return;
+        if (data.success && Array.isArray(data.obj)) {
+          const obj = data.obj
+            .filter((item: unknown): item is Record<string, unknown> => item !== null && typeof item === 'object' && !Array.isArray(item))
+            .map((item) => {
+              const traffic = Number(item.traffic ?? 0);
+              return {
+                dateTime: Number(item.dateTime),
+                direction: Boolean(item.direction),
+                traffic: Number.isFinite(traffic) ? traffic : 0,
+              };
+            })
+            .filter((item) => Number.isFinite(item.dateTime))
             .sort((a, b) => a.dateTime - b.dateTime);
           const l = String(i18n.global.locale) == "fa" ? "fa-IR" : "en-US";
           const labels = <string[]>[];
@@ -220,9 +290,9 @@ export default {
             }
             const point = grouped.get(bucket)!;
             if (item.direction) {
-              point.up = (point.up ?? 0) + Number(item.traffic ?? 0);
+              point.up = (point.up ?? 0) + item.traffic;
             } else {
-              point.down = (point.down ?? 0) + Number(item.traffic ?? 0);
+              point.down = (point.down ?? 0) + item.traffic;
             }
           }
           const buckets = Array.from(grouped.keys()).sort((a, b) => a - b);
@@ -257,8 +327,17 @@ export default {
           this.alert = true;
           this.loaded = false;
         }
+      } catch {
+        if (this.isCurrentLoad(controller, requestSeq, resource, tag, namespace)) {
+          this.alert = true;
+          this.loaded = false;
+        }
       } finally {
-        this.loading = false;
+        if (this.loadController === controller) {
+          this.loadController = null;
+          this.loading = false;
+          this.schedulePolling();
+        }
       }
     },
     genLable(step: number, locale: string) {
@@ -272,12 +351,13 @@ export default {
     },
   },
   watch: {
-    visible(v) {
+    dialogVisible(v) {
       if (v) {
         this.limit = 1;
-        this.loadData();
+        this.loadData(true);
         this.startPolling();
       } else {
+        this.cancelPendingLoad();
         this.loaded = false;
         this.alert = false;
         this.usage.labels = [];
@@ -288,6 +368,21 @@ export default {
         this.stopPolling();
       }
     },
+    tag() {
+      if (!this.dialogVisible) return;
+      this.loadData(true);
+      this.startPolling();
+    },
+    resource() {
+      if (!this.dialogVisible) return;
+      this.loadData(true);
+      this.startPolling();
+    },
+    namespace() {
+      if (!this.dialogVisible) return;
+      this.loadData(true);
+      this.startPolling();
+    },
   },
   mounted() {
     if (typeof document !== "undefined") {
@@ -296,6 +391,7 @@ export default {
   },
   beforeUnmount() {
     this.stopPolling();
+    this.cancelPendingLoad();
     if (typeof document !== "undefined") {
       document.removeEventListener("visibilitychange", this.handleVisibilityChange);
     }

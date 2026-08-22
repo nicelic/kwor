@@ -17,7 +17,7 @@
       </v-col>
     </v-row>
     <v-row>
-      <v-col cols="12" sm="6" md="4">
+      <v-col cols="12" sm="6" md="4" v-if="!isMihomoNamespace">
         <v-select
           hide-details
           :items="['4','4a','5']"
@@ -28,7 +28,7 @@
       <v-col cols="12" sm="6" md="4">
         <Network :data="data" />
       </v-col>
-      <v-col cols="12" sm="6" md="4">
+      <v-col cols="12" sm="6" md="4" v-if="!isMihomoNamespace">
         <UoT :data="data" />
       </v-col>
     </v-row>
@@ -40,11 +40,21 @@ import Network from '@/components/Network.vue'
 import UoT from '@/components/UoT.vue'
 
 export default {
-  props: ['data'],
+  props: ['data', 'namespace'],
   data() {
     return {}
   },
+  methods: {
+    sanitizeMihomoUnsupportedFields() {
+      if (!this.isMihomoNamespace) return
+      delete this.data.version
+      delete this.data.udp_over_tcp
+    },
+  },
   computed: {
+    isMihomoNamespace(): boolean {
+      return this.namespace === 'mihomo'
+    },
     username: {
       get(): string { return this.data.username?.length > 0 ? this.data.username : '' },
       set(v:string) { this.data.username = v.length > 0 ? v : undefined },
@@ -52,6 +62,17 @@ export default {
     password: {
       get(): string { return this.data.password?.length > 0 ? this.data.password : '' },
       set(v:string) { this.data.password = v.length > 0 ? v : undefined },
+    },
+  },
+  mounted() {
+    this.sanitizeMihomoUnsupportedFields()
+  },
+  watch: {
+    data() {
+      this.sanitizeMihomoUnsupportedFields()
+    },
+    namespace() {
+      this.sanitizeMihomoUnsupportedFields()
     },
   },
   components: { Network, UoT }

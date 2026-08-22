@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -50,10 +51,12 @@ const (
 	kernelProviderBBRPlus                    = "bbrplus"
 	kernelFailedCleanupDirName               = ".failed-cleanup"
 	kernelManagedDownloadTaskDeadline        = 60 * time.Minute
+	kernelCleanupTaskDeadline                = 150 * time.Minute
 	kernelDownloadProgressTTL                = 30 * time.Minute
 	kernelInstallStatusTTL                   = 30 * time.Minute
 	kernelUnknownPackageSizeEstimate   int64 = 50 * 1024 * 1024
 	kernelSourceForgeResponseMaxBytes  int64 = 8 * 1024 * 1024
+	kernelCommandOutputMaxBytes        int   = 8 * 1024 * 1024
 	kernelDebianNoninteractiveFrontend       = "DEBIAN_FRONTEND=noninteractive"
 )
 
@@ -62,6 +65,10 @@ var kernelFailedDownloadCleanupDelay = 5 * time.Second
 var kernelDownloadProgressStore = newKernelDownloadProgressStore()
 var kernelInstallStatusStore = newKernelInstallStatusStore()
 var kernelDownloadCleanupStore = newKernelDownloadCleanupScheduler()
+var kernelCleanupTaskManager = NewManagedDownloadTaskManagerWithOptions("kernel cleanup", ManagedDownloadTaskManagerOptions{
+	Deadline: kernelCleanupTaskDeadline,
+})
+var kernelCleanupTaskResultStore = newKernelCleanupTaskResultStateStore()
 var kernelOperationMu sync.Mutex
 var kernelDownloadTaskManager = NewManagedDownloadTaskManagerWithOptions("kernel package download", ManagedDownloadTaskManagerOptions{
 	Deadline: kernelManagedDownloadTaskDeadline,
@@ -340,6 +347,17 @@ type kernelInstallStatusSnapshotStore struct {
 	snapshot *KernelInstallStatus
 }
 
+type kernelCleanupTaskResultRecord struct {
+	operation string
+	result    *KernelCleanupPurgeResult
+	updatedAt time.Time
+}
+
+type kernelCleanupTaskResultStateStore struct {
+	mu      sync.Mutex
+	records map[string]kernelCleanupTaskResultRecord
+}
+
 type KernelCleanupPackageItem struct {
 	Name            string `json:"name"`
 	Status          string `json:"status"`
@@ -366,6 +384,15 @@ type KernelCleanupPurgeResult struct {
 	SystemCleanupDone     bool     `json:"systemCleanupDone"`
 	SystemCleanupWarnings []string `json:"systemCleanupWarnings,omitempty"`
 	SystemCleanupSummary  string   `json:"systemCleanupSummary,omitempty"`
+}
+
+// KernelCleanupTaskStatus is the browser-facing state for long-running purge
+// and auto-cleanup operations. The command itself runs outside the HTTP
+// request, so clients can reconnect without keeping a response open.
+type KernelCleanupTaskStatus struct {
+	ManagedDownloadTaskStatus
+	Operation string                    `json:"operation,omitempty"`
+	Result    *KernelCleanupPurgeResult `json:"result,omitempty"`
 }
 
 type kernelDownloadedMarker struct {
@@ -511,6 +538,58 @@ func newKernelDownloadCleanupScheduler() *kernelDownloadCleanupScheduler {
 
 func newKernelInstallStatusStore() *kernelInstallStatusSnapshotStore {
 	return &kernelInstallStatusSnapshotStore{}
+}
+
+func newKernelCleanupTaskResultStateStore() *kernelCleanupTaskResultStateStore {
+	return &kernelCleanupTaskResultStateStore{records: make(map[string]kernelCleanupTaskResultRecord)}
+}
+
+func cloneKernelCleanupPurgeResult(result *KernelCleanupPurgeResult) *KernelCleanupPurgeResult {
+	if result == nil {
+		return nil
+	}
+	clone := *result
+	clone.Requested = append([]string(nil), result.Requested...)
+	clone.Succeeded = append([]string(nil), result.Succeeded...)
+	clone.Failed = append([]string(nil), result.Failed...)
+	clone.SystemCleanupWarnings = append([]string(nil), result.SystemCleanupWarnings...)
+	return &clone
+}
+
+func (s *kernelCleanupTaskResultStateStore) set(id, operation string, result *KernelCleanupPurgeResult) {
+	if s == nil || strings.TrimSpace(id) == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.records[strings.TrimSpace(id)] = kernelCleanupTaskResultRecord{
+		operation: strings.TrimSpace(operation),
+		result:    cloneKernelCleanupPurgeResult(result),
+		updatedAt: time.Now(),
+	}
+}
+
+func (s *kernelCleanupTaskResultStateStore) get(id string) (string, *KernelCleanupPurgeResult) {
+	if s == nil {
+		return "", nil
+	}
+	trimmedID := strings.TrimSpace(id)
+	if trimmedID == "" {
+		return "", nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for key, record := range s.records {
+		if now.Sub(record.updatedAt) > managedDownloadTaskTTL {
+			delete(s.records, key)
+		}
+	}
+	record, ok := s.records[trimmedID]
+	if !ok {
+		return "", nil
+	}
+	return record.operation, cloneKernelCleanupPurgeResult(record.result)
 }
 
 func (s *kernelDownloadCleanupScheduler) markRunning(key string) {
@@ -1862,6 +1941,48 @@ func (s *KernelManagerService) PurgePackages(packages []string) (result *KernelC
 	return s.purgePackagesLocked(packages)
 }
 
+func (s *KernelManagerService) GetManagedCleanupTaskStatus(id string) *KernelCleanupTaskStatus {
+	task := kernelCleanupTaskManager.Get(id)
+	status := &KernelCleanupTaskStatus{ManagedDownloadTaskStatus: task}
+	if task.State == managedDownloadTaskIdle {
+		return status
+	}
+	status.Operation, status.Result = kernelCleanupTaskResultStore.get(task.ID)
+	return status
+}
+
+func (s *KernelManagerService) StartManagedCleanupPurge(packages []string) (*KernelCleanupTaskStatus, error) {
+	targets, err := normalizeKernelPurgeTargets(packages)
+	if err != nil {
+		return nil, err
+	}
+	fingerprint := "purge|" + strings.Join(targets, "\x00")
+	handle, task, created, err := kernelCleanupTaskManager.Start("kernel-cleanup-purge", fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	kernelCleanupTaskResultStore.set(task.ID, "purge", nil)
+	if !created {
+		return s.GetManagedCleanupTaskStatus(task.ID), nil
+	}
+	go func() {
+		defer finishManagedDownloadTaskPanic(handle, "failed", "kernel cleanup")
+		if !handle.MarkRunning("purging") {
+			handle.FinishCancelled("cancelled")
+			return
+		}
+		handle.SetPhase("purging", false)
+		result, runErr := s.PurgePackages(targets)
+		kernelCleanupTaskResultStore.set(handle.ID(), "purge", result)
+		if runErr != nil {
+			handle.FinishError("failed", runErr)
+			return
+		}
+		handle.FinishSuccess("completed")
+	}()
+	return s.GetManagedCleanupTaskStatus(task.ID), nil
+}
+
 func (s *KernelManagerService) purgePackagesLocked(packages []string) (result *KernelCleanupPurgeResult, err error) {
 	if err := kernelEnsureCleanupRuntime(); err != nil {
 		return nil, err
@@ -1980,6 +2101,33 @@ func (s *KernelManagerService) AutoCleanupPackages() (result *KernelCleanupPurge
 		return nil, err
 	}
 	return s.autoCleanupPackagesFromScanResult(scanResult)
+}
+
+func (s *KernelManagerService) StartManagedAutoCleanup() (*KernelCleanupTaskStatus, error) {
+	handle, task, created, err := kernelCleanupTaskManager.Start("kernel-cleanup-auto", "auto")
+	if err != nil {
+		return nil, err
+	}
+	kernelCleanupTaskResultStore.set(task.ID, "auto", nil)
+	if !created {
+		return s.GetManagedCleanupTaskStatus(task.ID), nil
+	}
+	go func() {
+		defer finishManagedDownloadTaskPanic(handle, "failed", "kernel auto cleanup")
+		if !handle.MarkRunning("scanning") {
+			handle.FinishCancelled("cancelled")
+			return
+		}
+		handle.SetPhase("cleaning", false)
+		result, runErr := s.AutoCleanupPackages()
+		kernelCleanupTaskResultStore.set(handle.ID(), "auto", result)
+		if runErr != nil {
+			handle.FinishError("failed", runErr)
+			return
+		}
+		handle.FinishSuccess("completed")
+	}()
+	return s.GetManagedCleanupTaskStatus(task.ID), nil
 }
 
 func (s *KernelManagerService) autoCleanupPackagesFromScanResult(scanResult *KernelCleanupScanResponse) (result *KernelCleanupPurgeResult, err error) {
@@ -3294,6 +3442,40 @@ func detectKernelLinuxSystemFamily(fields map[string]string) string {
 	return detectSystemPlatformFamily(fields["ID"], fields["ID_LIKE"])
 }
 
+type kernelCommandOutputWriter struct {
+	mu        sync.Mutex
+	buffer    bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (w *kernelCommandOutputWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.limit <= 0 {
+		w.truncated = true
+		return len(p), nil
+	}
+	remaining := w.limit - w.buffer.Len()
+	if remaining <= 0 {
+		w.truncated = true
+		return len(p), nil
+	}
+	if len(p) > remaining {
+		_, _ = w.buffer.Write(p[:remaining])
+		w.truncated = true
+		return len(p), nil
+	}
+	_, _ = w.buffer.Write(p)
+	return len(p), nil
+}
+
+func (w *kernelCommandOutputWriter) snapshot() (string, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buffer.String(), w.truncated
+}
+
 func runKernelCommandWithTimeout(timeout time.Duration, command string, args ...string) error {
 	_, err := runKernelCommandOutput(timeout, command, args...)
 	return err
@@ -3307,14 +3489,21 @@ func runKernelCommandOutput(timeout time.Duration, command string, args ...strin
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, command, args...)
-	output, err := cmd.CombinedOutput()
+	outputWriter := &kernelCommandOutputWriter{limit: kernelCommandOutputMaxBytes}
+	cmd.Stdout = outputWriter
+	cmd.Stderr = outputWriter
+	err := cmd.Run()
+	output, outputTruncated := outputWriter.snapshot()
 	if ctx.Err() == context.DeadlineExceeded {
 		return "", fmt.Errorf("command timed out: %s %s", command, strings.Join(args, " "))
 	}
-	if err != nil {
-		return "", fmt.Errorf("command failed (%s %s): %w: %s", command, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	if outputTruncated {
+		return output, fmt.Errorf("command output exceeded %d bytes: %s %s", kernelCommandOutputMaxBytes, command, strings.Join(args, " "))
 	}
-	return strings.TrimSpace(string(output)), nil
+	if err != nil {
+		return "", fmt.Errorf("command failed (%s %s): %w: %s", command, strings.Join(args, " "), err, strings.TrimSpace(output))
+	}
+	return strings.TrimSpace(output), nil
 }
 
 func fetchSourceForgeFileEntries(relativePath string) ([]sourceForgeFileEntry, error) {

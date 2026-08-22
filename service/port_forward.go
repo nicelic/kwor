@@ -21,6 +21,7 @@ import (
 	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/util/common"
+	"golang.org/x/sync/singleflight"
 	"gorm.io/gorm"
 )
 
@@ -48,6 +49,8 @@ const (
 	portForwardPortSpecMaxRunes        = 512
 	portForwardTargetIPMaxRunes        = 253
 	portForwardRateLimitMaxMbps        = 1000000
+	portForwardRuleMaxCount            = 500
+	portForwardIdleVerifyInterval      = 5 * time.Minute
 )
 
 var (
@@ -55,18 +58,25 @@ var (
 
 	portForwardStateMu sync.Mutex
 	portForwardState   = struct {
-		lastRenderHash string
-		lastLayout     string
-		lastReconcile  time.Time
-		warnings       []string
-		nftSnapshot    *portForwardNftSnapshot
-		lastError      string
+		lastRenderHash      string
+		lastLayout          string
+		lastReconcile       time.Time
+		lastActiveRuleCount int
+		warnings            []string
+		nftSnapshot         *portForwardNftSnapshot
+		lastError           string
 	}{}
 	portForwardOverviewRuntimeMu sync.RWMutex
 	portForwardOverviewRuntime   struct {
-		lastSyncAt int64
-		warnings   []string
-		lastError  string
+		lastSyncAt        int64
+		kernelIPv4Forward bool
+		kernelIPv6Forward bool
+		totalUp           int64
+		totalDown         int64
+		totalTraffic      int64
+		rules             []PortForwardRuntimeRuleView
+		warnings          []string
+		lastError         string
 	}
 
 	portForwardCounterBlockRe         = regexp.MustCompile(`(?ms)counter\s+([A-Za-z0-9_][A-Za-z0-9_-]*)\s*\{[^{}]*?packets\s+(\d+)\s+bytes\s+(\d+)\s*\}`)
@@ -75,6 +85,7 @@ var (
 	portForwardReconcileLocked = func(s *PortForwardService, minGap time.Duration) error {
 		return s.reconcileLocked(minGap)
 	}
+	portForwardOverviewFlight singleflight.Group
 )
 
 type PortForwardService struct {
@@ -150,6 +161,35 @@ type PortForwardOverview struct {
 	RuntimeConflicts        []PortForwardRuntimeConflict `json:"runtimeConflicts"`
 	Warnings                []string                     `json:"warnings,omitempty"`
 	Error                   string                       `json:"error,omitempty"`
+}
+
+// PortForwardRuntimeOverview is intentionally limited to fields refreshed by
+// the page poller. It is served from a process-local snapshot and does not
+// read SQLite, start nft commands, or scan /proc.
+type PortForwardRuntimeOverview struct {
+	LastSyncAt        int64                        `json:"lastSyncAt"`
+	KernelIPv4Forward bool                         `json:"kernelIPv4Forward"`
+	KernelIPv6Forward bool                         `json:"kernelIPv6Forward"`
+	TotalUp           int64                        `json:"totalUp"`
+	TotalDown         int64                        `json:"totalDown"`
+	TotalTraffic      int64                        `json:"totalTraffic"`
+	RuntimeConflicts  []PortForwardRuntimeConflict `json:"runtimeConflicts"`
+	Rules             []PortForwardRuntimeRuleView `json:"rules"`
+	Warnings          []string                     `json:"warnings,omitempty"`
+	Error             string                       `json:"error,omitempty"`
+}
+
+type PortForwardRuntimeRuleView struct {
+	RuleID              uint   `json:"ruleId"`
+	CurrentUp           int64  `json:"currentUp"`
+	CurrentDown         int64  `json:"currentDown"`
+	CurrentTotal        int64  `json:"currentTotal"`
+	TrafficNextResetAt  int64  `json:"trafficNextResetAt"`
+	TrafficLastResetAt  int64  `json:"trafficLastResetAt"`
+	TrafficLimitReached bool   `json:"trafficLimitReached"`
+	TrafficExpired      bool   `json:"trafficExpired"`
+	TrafficBlocked      bool   `json:"trafficBlocked"`
+	TrafficBlockReason  string `json:"trafficBlockReason"`
 }
 
 type normalizedPortForwardRule struct {
@@ -515,6 +555,20 @@ func mergePortForwardWarnings(primary []string, secondary []string) []string {
 }
 
 func (s *PortForwardService) GetOverview() (*PortForwardOverview, error) {
+	value, err, _ := portForwardOverviewFlight.Do("port-forward-overview", func() (interface{}, error) {
+		return s.getOverview()
+	})
+	if err != nil {
+		return nil, err
+	}
+	overview, ok := value.(*PortForwardOverview)
+	if !ok || overview == nil {
+		return nil, common.NewError("port forwarding overview is unavailable")
+	}
+	return overview, nil
+}
+
+func (s *PortForwardService) getOverview() (*PortForwardOverview, error) {
 	supported, ready, available, capabilityErr := portForwardCapabilityStatus()
 
 	rows, err := loadPortForwardRulesLocked()
@@ -525,6 +579,7 @@ func (s *PortForwardService) GetOverview() (*PortForwardOverview, error) {
 	if err != nil {
 		return nil, err
 	}
+	storePortForwardRuntimeSnapshot(rows, trafficRuntime)
 	limitStates := loadPortForwardLimitStateMap()
 
 	views := make([]PortForwardRuleView, 0, len(rows))
@@ -557,9 +612,9 @@ func (s *PortForwardService) GetOverview() (*PortForwardOverview, error) {
 		}
 	}
 
-	lastSyncAt, runtimeWarnings, runtimeError := portForwardRuntimeOverviewSnapshot()
+	runtimeSnapshot := portForwardRuntimeOverviewSnapshot()
 
-	runtimeConflicts := collectPortForwardRuntimeConflicts(rows)
+	runtimeConflicts := loadPortForwardRuntimeConflicts(rows)
 	conflictsByRule := make(map[uint]int, len(runtimeConflicts))
 	for _, conflict := range runtimeConflicts {
 		conflictsByRule[conflict.RuleID]++
@@ -585,7 +640,7 @@ func (s *PortForwardService) GetOverview() (*PortForwardOverview, error) {
 		MeterProbeError:         capabilities.MeterProbeError,
 		LayoutPending:           nftCapabilityLayoutReconcilePending(),
 		LastApplyError:          nftCapabilityLayoutLastApplyError(),
-		LastSyncAt:              lastSyncAt,
+		LastSyncAt:              runtimeSnapshot.lastSyncAt,
 		KernelIPv4Forward:       readKernelForwardingEnabled("/proc/sys/net/ipv4/ip_forward"),
 		KernelIPv6Forward:       readKernelForwardingEnabled("/proc/sys/net/ipv6/conf/all/forwarding"),
 		EnabledCount:            enabledCount,
@@ -595,18 +650,75 @@ func (s *PortForwardService) GetOverview() (*PortForwardOverview, error) {
 		TotalTraffic:            addPortForwardTrafficBytes(trafficRuntime.OverviewUp, trafficRuntime.OverviewDown),
 		Rules:                   views,
 		RuntimeConflicts:        runtimeConflicts,
-		Warnings:                runtimeWarnings,
+		Warnings:                runtimeSnapshot.warnings,
 	}
 
-	if runtimeError != "" {
-		overview.Error = runtimeError
+	if runtimeSnapshot.lastError != "" {
+		overview.Error = runtimeSnapshot.lastError
 	} else if !ready {
 		overview.Error = capabilityErr
 	}
 	return overview, nil
 }
 
-func portForwardRuntimeOverviewSnapshot() (int64, []string, string) {
+// GetRuntimeOverview keeps the active-page polling path bounded. Full
+// overview reads are still used at entry, manual refresh, and after mutations.
+func (s *PortForwardService) GetRuntimeOverview() (*PortForwardRuntimeOverview, error) {
+	runtime := portForwardRuntimeOverviewSnapshot()
+	return &PortForwardRuntimeOverview{
+		LastSyncAt:        runtime.lastSyncAt,
+		KernelIPv4Forward: runtime.kernelIPv4Forward,
+		KernelIPv6Forward: runtime.kernelIPv6Forward,
+		TotalUp:           runtime.totalUp,
+		TotalDown:         runtime.totalDown,
+		TotalTraffic:      runtime.totalTraffic,
+		RuntimeConflicts:  portForwardRuntimeConflictSnapshot(),
+		Rules:             runtime.rules,
+		Warnings:          runtime.warnings,
+		Error:             runtime.lastError,
+	}, nil
+}
+
+type portForwardRuntimeSnapshot struct {
+	lastSyncAt        int64
+	kernelIPv4Forward bool
+	kernelIPv6Forward bool
+	totalUp           int64
+	totalDown         int64
+	totalTraffic      int64
+	rules             []PortForwardRuntimeRuleView
+	warnings          []string
+	lastError         string
+}
+
+func storePortForwardRuntimeSnapshot(rows []model.PortForwardRule, traffic portForwardTrafficRuntime) {
+	runtimeRules := make([]PortForwardRuntimeRuleView, 0, len(rows))
+	for _, row := range rows {
+		current := traffic.Rules[row.Id]
+		runtimeRules = append(runtimeRules, PortForwardRuntimeRuleView{
+			RuleID:              row.Id,
+			CurrentUp:           current.UsedUpBytes,
+			CurrentDown:         current.UsedDownBytes,
+			CurrentTotal:        addPortForwardTrafficBytes(current.UsedUpBytes, current.UsedDownBytes),
+			TrafficNextResetAt:  current.NextResetAt,
+			TrafficLastResetAt:  current.LastResetAt,
+			TrafficLimitReached: current.LimitReached,
+			TrafficExpired:      current.Expired,
+			TrafficBlocked:      row.Enabled && current.BlockReason != "",
+			TrafficBlockReason:  current.BlockReason,
+		})
+	}
+	portForwardOverviewRuntimeMu.Lock()
+	portForwardOverviewRuntime.kernelIPv4Forward = readKernelForwardingEnabled("/proc/sys/net/ipv4/ip_forward")
+	portForwardOverviewRuntime.kernelIPv6Forward = readKernelForwardingEnabled("/proc/sys/net/ipv6/conf/all/forwarding")
+	portForwardOverviewRuntime.totalUp = traffic.OverviewUp
+	portForwardOverviewRuntime.totalDown = traffic.OverviewDown
+	portForwardOverviewRuntime.totalTraffic = addPortForwardTrafficBytes(traffic.OverviewUp, traffic.OverviewDown)
+	portForwardOverviewRuntime.rules = runtimeRules
+	portForwardOverviewRuntimeMu.Unlock()
+}
+
+func portForwardRuntimeOverviewSnapshot() portForwardRuntimeSnapshot {
 	if portForwardStateMu.TryLock() {
 		lastSyncAt := int64(0)
 		if !portForwardState.lastReconcile.IsZero() {
@@ -620,16 +732,35 @@ func portForwardRuntimeOverviewSnapshot() (int64, []string, string) {
 		portForwardOverviewRuntime.lastSyncAt = lastSyncAt
 		portForwardOverviewRuntime.warnings = append([]string(nil), warnings...)
 		portForwardOverviewRuntime.lastError = lastError
+		result := portForwardRuntimeSnapshot{
+			lastSyncAt:        portForwardOverviewRuntime.lastSyncAt,
+			kernelIPv4Forward: portForwardOverviewRuntime.kernelIPv4Forward,
+			kernelIPv6Forward: portForwardOverviewRuntime.kernelIPv6Forward,
+			totalUp:           portForwardOverviewRuntime.totalUp,
+			totalDown:         portForwardOverviewRuntime.totalDown,
+			totalTraffic:      portForwardOverviewRuntime.totalTraffic,
+			rules:             append([]PortForwardRuntimeRuleView(nil), portForwardOverviewRuntime.rules...),
+			warnings:          append([]string(nil), portForwardOverviewRuntime.warnings...),
+			lastError:         portForwardOverviewRuntime.lastError,
+		}
 		portForwardOverviewRuntimeMu.Unlock()
-		return lastSyncAt, warnings, lastError
+		return result
 	}
 
 	portForwardOverviewRuntimeMu.RLock()
-	lastSyncAt := portForwardOverviewRuntime.lastSyncAt
-	warnings := append([]string(nil), portForwardOverviewRuntime.warnings...)
-	lastError := portForwardOverviewRuntime.lastError
+	result := portForwardRuntimeSnapshot{
+		lastSyncAt:        portForwardOverviewRuntime.lastSyncAt,
+		kernelIPv4Forward: portForwardOverviewRuntime.kernelIPv4Forward,
+		kernelIPv6Forward: portForwardOverviewRuntime.kernelIPv6Forward,
+		totalUp:           portForwardOverviewRuntime.totalUp,
+		totalDown:         portForwardOverviewRuntime.totalDown,
+		totalTraffic:      portForwardOverviewRuntime.totalTraffic,
+		rules:             append([]PortForwardRuntimeRuleView(nil), portForwardOverviewRuntime.rules...),
+		warnings:          append([]string(nil), portForwardOverviewRuntime.warnings...),
+		lastError:         portForwardOverviewRuntime.lastError,
+	}
 	portForwardOverviewRuntimeMu.RUnlock()
-	return lastSyncAt, warnings, lastError
+	return result
 }
 
 func (s *PortForwardService) UpsertRule(payload PortForwardRulePayload) error {
@@ -663,6 +794,14 @@ func (s *PortForwardService) UpsertRule(payload PortForwardRulePayload) error {
 				return err
 			}
 			previous = row
+		} else {
+			var count int64
+			if err := tx.Model(&model.PortForwardRule{}).Count(&count).Error; err != nil {
+				return err
+			}
+			if count >= portForwardRuleMaxCount {
+				return common.NewError("port forwarding rules are limited to ", strconv.Itoa(portForwardRuleMaxCount))
+			}
 		}
 		if err := validatePortForwardRuleOverlap(tx, payload.ID, normalized); err != nil {
 			return err
@@ -842,6 +981,7 @@ func (s *PortForwardService) CleanupOnShutdown() {
 	portForwardState.lastRenderHash = ""
 	portForwardState.lastLayout = ""
 	portForwardState.lastReconcile = time.Time{}
+	portForwardState.lastActiveRuleCount = 0
 	portForwardState.warnings = nil
 	portForwardState.lastError = ""
 	portForwardState.nftSnapshot = nil
@@ -857,6 +997,14 @@ func (s *PortForwardService) reconcileLocked(minGap time.Duration) error {
 
 	now := time.Now()
 	if minGap > 0 && !portForwardState.lastReconcile.IsZero() && now.Sub(portForwardState.lastReconcile) < minGap {
+		return nil
+	}
+
+	// Once a stable empty configuration has removed all managed nft tables,
+	// polling every five seconds cannot change the host state. Rule saves still
+	// reconcile immediately, so this skips only idle work with no rules.
+	if minGap > 0 && !portForwardState.lastReconcile.IsZero() &&
+		portForwardState.lastActiveRuleCount == 0 && now.Sub(portForwardState.lastReconcile) < portForwardIdleVerifyInterval {
 		return nil
 	}
 
@@ -896,6 +1044,7 @@ func (s *PortForwardService) renderLocked(force bool) error {
 	if err != nil {
 		return err
 	}
+	storePortForwardRuntimeSnapshot(rows, trafficRuntime)
 	trafficBlocks := portForwardTrafficBlockReasons(rows, trafficRuntime)
 
 	layout := nftCapabilityLayoutSignature()
@@ -944,6 +1093,7 @@ func (s *PortForwardService) renderLocked(force bool) error {
 		portForwardState.warnings = nil
 		portForwardState.lastRenderHash = hash
 		portForwardState.lastLayout = layout
+		portForwardState.lastActiveRuleCount = 0
 		return nil
 	}
 
@@ -967,6 +1117,7 @@ func (s *PortForwardService) renderLocked(force bool) error {
 	portForwardState.warnings = renderWarnings
 	portForwardState.lastRenderHash = computePortForwardRenderHashWithTrafficBlocks(rows, trafficBlocks)
 	portForwardState.lastLayout = layout
+	portForwardState.lastActiveRuleCount = len(activeRows)
 	return nil
 }
 
@@ -987,6 +1138,7 @@ func rollbackManagedPortForwardRender(renderErr error) error {
 	portForwardState.warnings = nil
 	portForwardState.lastRenderHash = ""
 	portForwardState.lastLayout = ""
+	portForwardState.lastActiveRuleCount = 0
 	portForwardState.nftSnapshot = nil
 	if cleanupErr != nil {
 		return wrapPortForwardRollbackError(renderErr, "remove partially rendered forwarding tables failed: "+cleanupErr.Error())

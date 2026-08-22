@@ -420,6 +420,7 @@
             </v-col>
             <v-col cols="12" sm="6" md="4">
               <v-switch color="primary" v-model="subShowInfo" :label="$t('setting.subInfo')" hide-details />
+			  <div class="text-caption text-medium-emphasis mt-1">{{ $t('setting.subInfoHint') }}</div>
             </v-col>
           </v-row>
           <v-row>
@@ -458,6 +459,7 @@
             </v-col>
             <v-col cols="12" sm="6" md="4">
               <v-text-field v-model="settings.subURI" :label="$t('setting.subUri')" hide-details></v-text-field>
+			  <div class="text-caption text-medium-emphasis mt-1">{{ $t('setting.subUriHint') }}</div>
             </v-col>
           </v-row>
           <v-alert type="info" variant="tonal" density="compact" class="mt-3">
@@ -545,7 +547,7 @@
         </v-window-item>
 
         <v-window-item value="t9">
-          <SettingsOptimizationManageVue :active="tab === 't9'" />
+          <SettingsOptimizationManageVue v-if="tab === 't9'" :active="true" />
         </v-window-item>
 
         <v-window-item value="t10">
@@ -665,20 +667,21 @@ import { FindDiff } from '@/plugins/utils'
 import { formatPanelDateTime, refreshPanelTimeContext } from '@/plugins/panelTime'
 import { confirm } from '@/plugins/confirm'
 import { push } from 'notivue'
-import SettingsTrafficManageVue from '@/components/SettingsTrafficManage.vue'
-import SettingsFirewallManageVue from '@/components/SettingsFirewallManage.vue'
-import SettingsPortForwardManageVue from '@/components/SettingsPortForwardManage.vue'
-import SettingsOptimizationManageVue from '@/components/SettingsOptimizationManage.vue'
-import SettingsAcmeManageVue from '@/components/SettingsAcmeManage.vue'
-import SettingsReverseProxyManageVue from '@/components/SettingsReverseProxyManage.vue'
-import SettingsKernelManageVue from '@/components/SettingsKernelManage.vue'
 
+const SettingsTrafficManageVue = defineAsyncComponent(() => import('@/components/SettingsTrafficManage.vue'))
+const SettingsFirewallManageVue = defineAsyncComponent(() => import('@/components/SettingsFirewallManage.vue'))
+const SettingsPortForwardManageVue = defineAsyncComponent(() => import('@/components/SettingsPortForwardManage.vue'))
+const SettingsOptimizationManageVue = defineAsyncComponent(() => import('@/components/SettingsOptimizationManage.vue'))
+const SettingsAcmeManageVue = defineAsyncComponent(() => import('@/components/SettingsAcmeManage.vue'))
+const SettingsReverseProxyManageVue = defineAsyncComponent(() => import('@/components/SettingsReverseProxyManage.vue'))
+const SettingsKernelManageVue = defineAsyncComponent(() => import('@/components/SettingsKernelManage.vue'))
 const SubJsonExtVue = defineAsyncComponent(() => import('@/components/SubJsonExt.vue'))
 const SubClashExtVue = defineAsyncComponent(() => import('@/components/SubClashExt.vue'))
 
 const locale = useLocale()
 const tab = ref('t1')
 const loading: Ref = inject('loading') ?? ref(false)
+let settingsPageMounted = false
 type SettingsLoadState = 'idle' | 'loading' | 'ready' | 'error'
 type SystemTimeZoneLoadState = 'idle' | 'loading' | 'ready' | 'error'
 type RuleSetSourceEntry = {
@@ -737,6 +740,7 @@ const subClashDraftLoadState = ref<SubscriptionDraftLoadState>('idle')
 const subJsonDraftLoadError = ref('')
 const subClashDraftLoadError = ref('')
 const subscriptionDraftLoadRequestSequence: Record<'json' | 'clash', number> = { json: 0, clash: 0 }
+const subscriptionDraftAbortControllers: Record<'json' | 'clash', AbortController | null> = { json: null, clash: null }
 const subJsonResetPending = ref(false)
 const subClashResetPending = ref(false)
 const subscriptionDraftGeneration = ref(0)
@@ -846,6 +850,8 @@ const panelAllVersionsLoaded = ref(false)
 const panelUpdateFeedback = ref('')
 const panelUpdateFeedbackType = ref<'success' | 'error' | 'info' | 'warning'>('info')
 let panelVersionsRequest: Promise<void> | null = null
+let panelUpdateStatusRequestSequence = 0
+let panelUpdatePollingGeneration = 0
 const panelReconnectTimerId = ref<number | null>(null)
 const panelUninstallPollTimerId = ref<number | null>(null)
 const panelUpdateTaskPollTimerId = ref<number | null>(null)
@@ -1279,9 +1285,23 @@ const loadSubscriptionDraft = async (target: 'json' | 'clash', retryAfterRevisio
 	if (currentState === 'loading' || currentState === 'ready') return currentState === 'ready'
 
 	const requestSequence = ++subscriptionDraftLoadRequestSequence[target]
+	subscriptionDraftAbortControllers[target]?.abort()
+	const abortController = new AbortController()
+	subscriptionDraftAbortControllers[target] = abortController
 	setSubscriptionDraftLoadState(target, 'loading')
-	const msg = await HttpUtils.get(`api/subscription-settings-snapshot?kind=${target}`, {}, { timeout: 15000, silentErrorToast: true })
-	if (requestSequence !== subscriptionDraftLoadRequestSequence[target]) return false
+	let msg: Msg
+	try {
+		msg = await HttpUtils.get(`api/subscription-settings-snapshot?kind=${target}`, {}, {
+			timeout: 15000,
+			signal: abortController.signal,
+			silentErrorToast: true,
+		})
+	} finally {
+		if (subscriptionDraftAbortControllers[target] === abortController) {
+			subscriptionDraftAbortControllers[target] = null
+		}
+	}
+	if (requestSequence !== subscriptionDraftLoadRequestSequence[target] || abortController.signal.aborted) return false
 	if (!msg.success || !isSubscriptionSettingsSnapshot(msg.obj, target)) {
 		setSubscriptionDraftLoadState(target, 'error', String(msg.msg || i18n.global.t('setting.subscriptionExtensionLoadFailed')))
 		return false
@@ -1416,6 +1436,7 @@ const retryLoadSystemTimeZone = () => {
 }
 
 onMounted(() => {
+  settingsPageMounted = true
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', handlePanelUpdateTaskVisibilityChange)
   }
@@ -1574,7 +1595,8 @@ const normalizePanelUpdateStatus = (raw: any): PanelUpdateStatus | null => {
 }
 
 const isPanelUpdatePollingAllowed = () => (
-  tab.value === 't1'
+  settingsPageMounted
+  && tab.value === 't1'
   && (typeof document === 'undefined' || document.visibilityState === 'visible')
 )
 
@@ -1613,9 +1635,15 @@ const applyPanelUpdateStatus = (raw: any) => {
 }
 
 const loadPanelUpdateStatus = async () => {
+  if (!isPanelUpdatePollingAllowed()) return
+  const requestSequence = ++panelUpdateStatusRequestSequence
+  const pollingGeneration = panelUpdatePollingGeneration
   panelStatusLoading.value = true
   try {
     const msg = await HttpUtils.get('api/panel-update-status', {}, { silentAuthCheck: true })
+    if (requestSequence !== panelUpdateStatusRequestSequence
+      || pollingGeneration !== panelUpdatePollingGeneration
+      || !isPanelUpdatePollingAllowed()) return
     if (msg.success) {
       applyPanelUpdateStatus(msg.obj)
       if (panelUninstallFailed.value) {
@@ -1632,7 +1660,9 @@ const loadPanelUpdateStatus = async () => {
       }
     }
   } finally {
-    panelStatusLoading.value = false
+    if (requestSequence === panelUpdateStatusRequestSequence && settingsPageMounted) {
+      panelStatusLoading.value = false
+    }
   }
 }
 
@@ -1869,8 +1899,10 @@ const clearPanelUninstallStatusTimer = () => {
 const pollPanelUpdateTask = async (): Promise<void> => {
   if (panelUpdateTaskRequest) return panelUpdateTaskRequest
   if (!isPanelUpdatePollingAllowed()) return
+  const pollingGeneration = panelUpdatePollingGeneration
   const request = (async () => {
     const msg = await HttpUtils.get('api/panel-update-status', {}, { silentAuthCheck: true })
+    if (pollingGeneration !== panelUpdatePollingGeneration || !isPanelUpdatePollingAllowed()) return
     if (!msg.success) {
       schedulePanelUpdateTaskPolling()
       return
@@ -1901,11 +1933,22 @@ const startPanelUpdateTaskPolling = () => {
 const handlePanelUpdateTaskVisibilityChange = () => {
   if (typeof document === 'undefined') return
   if (document.visibilityState !== 'visible') {
+    panelUpdatePollingGeneration += 1
+    panelUpdateStatusRequestSequence += 1
+    panelStatusLoading.value = false
     clearPanelUpdateTaskPolling()
+    clearPanelUninstallStatusTimer()
+    clearPanelReconnectTimer()
     return
   }
   if (tab.value === 't1') {
-    void loadPanelUpdateStatus()
+    if (panelUninstallOverlay.value && panelUninstalling.value) {
+      startPanelUninstallStatusPolling()
+    } else if (panelRestartOverlay.value) {
+      startPanelReconnectPolling()
+    } else {
+      void loadPanelUpdateStatus()
+    }
   }
 }
 
@@ -1940,10 +1983,14 @@ const stopPanelUpdateTask = async () => {
 
 const startPanelUninstallStatusPolling = () => {
   clearPanelUninstallStatusTimer()
+  if (!isPanelUpdatePollingAllowed()) return
+  const pollingGeneration = panelUpdatePollingGeneration
 
   const poll = async () => {
+    if (pollingGeneration !== panelUpdatePollingGeneration || !isPanelUpdatePollingAllowed()) return
     try {
       const msg = await HttpUtils.get('api/panel-update-status', {}, { silentAuthCheck: true })
+      if (pollingGeneration !== panelUpdatePollingGeneration || !isPanelUpdatePollingAllowed()) return
       if (msg.success) {
         panelUpdateStatus.value = msg.obj ?? null
         if (panelUninstallFailed.value) {
@@ -1958,7 +2005,9 @@ const startPanelUninstallStatusPolling = () => {
     } catch {
       // 原生卸载成功后连接会中断；遮罩保持，避免已确认的操作被误判为失败。
     }
-    panelUninstallPollTimerId.value = window.setTimeout(poll, 2000)
+    if (pollingGeneration === panelUpdatePollingGeneration && isPanelUpdatePollingAllowed()) {
+      panelUninstallPollTimerId.value = window.setTimeout(poll, 2000)
+    }
   }
 
   panelUninstallPollTimerId.value = window.setTimeout(poll, 1200)
@@ -1966,14 +2015,18 @@ const startPanelUninstallStatusPolling = () => {
 
 const startPanelReconnectPolling = () => {
   clearPanelReconnectTimer()
+  if (!isPanelUpdatePollingAllowed()) return
+  const pollingGeneration = panelUpdatePollingGeneration
   panelRestartOverlay.value = true
 
   const poll = async () => {
+    if (pollingGeneration !== panelUpdatePollingGeneration || !isPanelUpdatePollingAllowed()) return
     try {
       const [sessionMsg, statusMsg] = await Promise.all([
         HttpUtils.get('api/session', {}, { silentAuthCheck: true }),
         HttpUtils.get('api/panel-update-status', {}, { silentAuthCheck: true }),
       ])
+      if (pollingGeneration !== panelUpdatePollingGeneration || !isPanelUpdatePollingAllowed()) return
 
       if (!sessionMsg.success && sessionMsg.failureKind === 'api') {
         clearPanelReconnectTimer()
@@ -2005,7 +2058,9 @@ const startPanelReconnectPolling = () => {
       // 等待面板恢复连接
     }
 
-    panelReconnectTimerId.value = window.setTimeout(poll, 4000)
+    if (pollingGeneration === panelUpdatePollingGeneration && isPanelUpdatePollingAllowed()) {
+      panelReconnectTimerId.value = window.setTimeout(poll, 4000)
+    }
   }
 
   panelReconnectTimerId.value = window.setTimeout(poll, 6000)
@@ -2096,14 +2151,37 @@ const persistSubscriptionDraft = (target: 'json' | 'clash', requireValid = false
 }
 
 watch(tab, (value, previous) => {
-	if (previous === 't3') persistSubscriptionDraft('json')
-	if (previous === 't4') persistSubscriptionDraft('clash')
-	if (previous === 't1') clearPanelUpdateTaskPolling()
+	if (previous === 't3') {
+		persistSubscriptionDraft('json')
+		if (subJsonDraftLoadState.value === 'loading') setSubscriptionDraftLoadState('json', 'idle')
+		subscriptionDraftLoadRequestSequence.json += 1
+		subscriptionDraftAbortControllers.json?.abort()
+	}
+	if (previous === 't4') {
+		persistSubscriptionDraft('clash')
+		if (subClashDraftLoadState.value === 'loading') setSubscriptionDraftLoadState('clash', 'idle')
+		subscriptionDraftLoadRequestSequence.clash += 1
+		subscriptionDraftAbortControllers.clash?.abort()
+	}
+	if (previous === 't1') {
+		panelUpdatePollingGeneration += 1
+		panelUpdateStatusRequestSequence += 1
+		panelStatusLoading.value = false
+		clearPanelUpdateTaskPolling()
+		clearPanelUninstallStatusTimer()
+		clearPanelReconnectTimer()
+	}
 	if (value === 't3') void loadSubscriptionDraft('json')
 	if (value === 't4') void loadSubscriptionDraft('clash')
 	if (value === 't1') {
-		void loadPanelUpdateStatus()
-		if (panelUpdateTaskActive.value) startPanelUpdateTaskPolling()
+		if (panelUninstallOverlay.value && panelUninstalling.value) {
+			startPanelUninstallStatusPolling()
+		} else if (panelRestartOverlay.value) {
+			startPanelReconnectPolling()
+		} else {
+			void loadPanelUpdateStatus()
+			if (panelUpdateTaskActive.value) startPanelUpdateTaskPolling()
+		}
 	}
 })
 
@@ -2114,11 +2192,19 @@ watch(() => settings.value.timeLocation, value => {
 })
 
 onBeforeUnmount(() => {
+  settingsPageMounted = false
+  panelUpdatePollingGeneration += 1
+  panelUpdateStatusRequestSequence += 1
+  panelStatusLoading.value = false
   const settingsRequestWasLoading = settingsLoadState.value === 'loading'
   settingsLoadRequestSequence += 1
   systemTimeZoneRequestSequence += 1
 	subscriptionDraftLoadRequestSequence.json += 1
 	subscriptionDraftLoadRequestSequence.clash += 1
+	if (subJsonDraftLoadState.value === 'loading') setSubscriptionDraftLoadState('json', 'idle')
+	if (subClashDraftLoadState.value === 'loading') setSubscriptionDraftLoadState('clash', 'idle')
+	subscriptionDraftAbortControllers.json?.abort()
+	subscriptionDraftAbortControllers.clash?.abort()
 	if (tab.value === 't3') persistSubscriptionDraft('json')
 	if (tab.value === 't4') persistSubscriptionDraft('clash')
   clearPanelReconnectTimer()

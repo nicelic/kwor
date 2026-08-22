@@ -153,7 +153,7 @@ func TestWritePanelUpdateScriptIncludesRuntimeVerificationAndFailureLog(t *testi
 		"wait_for_target_runtime()",
 		"if \"$TARGET_BIN\" start >> \"$LOG_PATH\" 2>&1 && wait_for_target_runtime; then",
 		"if wait_for_target_runtime; then",
-		"cp -f \"$LOG_PATH\" \"$LAST_LOG_PATH\"",
+		"tail -c 131072 \"$LOG_PATH\" > \"$LAST_LOG_PATH\"",
 		"Promanager_data",
 		"UPDATE_SUCCESS=1",
 	} {
@@ -167,10 +167,45 @@ func TestWritePanelUpdateScriptIncludesRuntimeVerificationAndFailureLog(t *testi
 		"/proc/$pid/cmdline",
 		"\"$TARGET_BIN\" stop",
 		"trap 'cleanup",
+		"cp -f \"$LOG_PATH\" \"$LAST_LOG_PATH\"",
 	} {
 		if strings.Contains(content, forbidden) {
 			t.Fatalf("script contains unsafe legacy process handling %q", forbidden)
 		}
+	}
+}
+
+func TestPanelUpdateLogViewReadsBoundedTail(t *testing.T) {
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "panel-update-last.log")
+	line := strings.Repeat("x", 800) + "\n"
+	content := "EARLY-LOG-MARKER\n" + strings.Repeat(line, 200) + "LATEST-LOG-MARKER\n"
+	if err := os.WriteFile(logPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write oversized log failed: %v", err)
+	}
+
+	tail, tooLong, err := readPanelUpdateLogTailBytes(logPath, panelUpdateLastLogMaxBytes)
+	if err != nil {
+		t.Fatalf("read bounded log tail failed: %v", err)
+	}
+	if !tooLong || len(tail) > panelUpdateLastLogMaxBytes {
+		t.Fatalf("unexpected bounded tail result: tooLong=%t bytes=%d", tooLong, len(tail))
+	}
+	if strings.Contains(string(tail), "EARLY-LOG-MARKER") || !strings.Contains(string(tail), "LATEST-LOG-MARKER") {
+		previewStart := len(tail) - 128
+		if previewStart < 0 {
+			previewStart = 0
+		}
+		t.Fatalf("tail did not retain the expected end of the log: %q", string(tail[previewStart:]))
+	}
+
+	view, err := loadPanelUpdateLogView(logPath)
+	if err != nil {
+		t.Fatalf("load panel update log view failed: %v", err)
+	}
+	joined := strings.Join(view.Lines, "\n")
+	if !view.TooLong || strings.Contains(joined, "EARLY-LOG-MARKER") || !strings.Contains(joined, "LATEST-LOG-MARKER") {
+		t.Fatalf("log view did not expose the bounded tail: %#v", view)
 	}
 }
 

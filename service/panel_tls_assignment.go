@@ -192,6 +192,42 @@ func GetAssignedCertificateRecordIDs(settingService *SettingService, target Pane
 	return resolved, nil
 }
 
+// GetAssignedCertificateRecordIDsReadOnly resolves the current certificate
+// assignment without normalizing legacy settings or writing them back. It is
+// used by lightweight URI generation paths that must remain read-only.
+func GetAssignedCertificateRecordIDsReadOnly(settingService *SettingService, target PanelSelfSignedTarget) ([]uint, error) {
+	if settingService == nil {
+		return []uint{}, nil
+	}
+	rawList, err := settingService.getString(panelAssignedCertificateRecordIDsKey(target))
+	if err != nil {
+		return nil, err
+	}
+	parsedFromList, parsedListOK := parseAssignedCertificateRecordIDs(rawList)
+	if !parsedListOK {
+		parsedFromList = []uint{}
+	}
+	filteredFromList, err := filterExistingCertificateRecordIDs(parsedFromList)
+	if err != nil {
+		return nil, err
+	}
+	legacyID, err := readLegacyAssignedCertificateRecordID(settingService, target)
+	if err != nil {
+		return nil, err
+	}
+	if len(filteredFromList) > 0 {
+		return filteredFromList, nil
+	}
+	if legacyID == 0 {
+		return []uint{}, nil
+	}
+	filteredLegacy, err := filterExistingCertificateRecordIDs([]uint{legacyID})
+	if err != nil {
+		return nil, err
+	}
+	return filteredLegacy, nil
+}
+
 func SetAssignedCertificateRecordIDs(settingService *SettingService, target PanelSelfSignedTarget, ids []uint) error {
 	if settingService == nil {
 		return nil

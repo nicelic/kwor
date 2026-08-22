@@ -54,7 +54,7 @@ const mihomoNamespaceApi: NamespaceApiConfig = {
   itemsPerPageKey: 'mihomo-items-per-page',
   subscriptionPathPrefix: 'mihomo/',
   supportsSubscriptionQr: true,
-  portHopTypes: ['hysteria', 'hysteria2'],
+  portHopTypes: ['hysteria2'],
   showCoreControlsOnInbounds: true,
   core: {
     modalButtonLabel: 'coreManager.mihomoTitle',

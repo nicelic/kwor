@@ -4,6 +4,7 @@
     transition="dialog-bottom-transition"
     width="760"
     max-width="95vw"
+    max-height="90vh"
   >
     <v-card class="rounded-lg core-modal-card">
       <v-card-title>
@@ -28,20 +29,23 @@
       <v-card-text class="core-modal-body">
         <div class="d-flex align-center flex-wrap mb-2 core-modal-summary" style="gap: 8px;">
           <span class="text-h6 font-weight-bold">{{ singboxCore.coreName }}</span>
-          <v-btn icon size="x-small" variant="text" @click="openReleasePage">
-            <v-icon size="18">mdi-open-in-new</v-icon>
-            <v-tooltip activator="parent" location="top">{{ t('coreManager.releasePage') }}</v-tooltip>
-          </v-btn>
-          <v-btn
-            icon
-            size="x-small"
-            variant="text"
-            :loading="statusLoading"
-            @click="refreshAll(true)"
-          >
-            <v-icon size="18">mdi-refresh</v-icon>
-            <v-tooltip activator="parent" location="top">{{ t('refresh') }}</v-tooltip>
-          </v-btn>
+          <v-tooltip location="top" :text="t('coreManager.releasePage')">
+            <template #activator="{ props: tooltipProps }">
+              <v-btn v-bind="tooltipProps" icon="mdi-open-in-new" size="x-small" variant="text" @click="openReleasePage" />
+            </template>
+          </v-tooltip>
+          <v-tooltip location="top" :text="t('refresh')">
+            <template #activator="{ props: tooltipProps }">
+              <v-btn
+                v-bind="tooltipProps"
+                icon="mdi-refresh"
+                size="x-small"
+                variant="text"
+                :loading="statusLoading"
+                @click="refreshAll(true)"
+              />
+            </template>
+          </v-tooltip>
           <v-chip
             v-if="platform"
             variant="tonal"
@@ -139,6 +143,21 @@
         >
           {{ feedbackMsg }}
         </v-alert>
+
+        <v-row align="center" class="mb-4">
+          <v-col cols="12" sm="6" class="core-mobile-full">
+            <v-select
+              v-model="coreLogLevel"
+              :items="coreLogLevelItems"
+              :label="t('coreManager.logLevel')"
+              variant="outlined"
+              density="compact"
+              hide-details
+              :disabled="coreLogLevelSaving || coreDownloadTaskActive || startingCore || stoppingCore || restartingCore || deletingCore"
+              @update:model-value="saveCoreLogLevel"
+            />
+          </v-col>
+        </v-row>
 
         <v-card v-if="downloading" variant="outlined" rounded="lg" class="mb-4">
           <v-card-text>
@@ -266,7 +285,8 @@
               density="compact"
               hide-details
               clearable
-              @blur="() => saveDownloadPreference()"
+              @update:model-value="onCustomDownloadURLChanged"
+              @blur="saveDownloadPreference"
             ></v-text-field>
           </v-col>
           <v-col cols="auto" class="core-action-col">
@@ -293,6 +313,7 @@
               variant="outlined"
               divided
               class="w-100"
+              @update:model-value="onDownloadTargetSelectionChanged"
             >
               <v-btn value="amd64" class="text-none flex-grow-1">amd64</v-btn>
               <v-btn value="arm64" class="text-none flex-grow-1">arm64</v-btn>
@@ -309,6 +330,7 @@
               variant="outlined"
               divided
               class="w-100"
+              @update:model-value="onDownloadTargetSelectionChanged"
             >
               <v-btn value="glibc" class="text-none flex-grow-1">glibc</v-btn>
               <v-btn value="musl" class="text-none flex-grow-1">musl</v-btn>
@@ -330,12 +352,15 @@
               density="compact"
               hide-details
               :label="t('coreManager.enableAutoCheck')"
+              :loading="autoCheckSaving"
+              :disabled="autoCheckSaving || autoUpdateSaving || intervalSaving"
+              @update:model-value="saveAutoCheckEnabled"
             ></v-switch>
           </v-col>
           <v-col cols="12" sm="4">
             <v-text-field
               v-model="autoCheckIntervalInput"
-              :disabled="!autoCheckEnabled"
+              :disabled="!autoCheckEnabled || autoCheckSaving || autoUpdateSaving || intervalSaving"
               :label="t('coreManager.checkInterval')"
               suffix="h"
               variant="outlined"
@@ -349,8 +374,9 @@
               color="primary"
               variant="flat"
               size="small"
-              :loading="autoCheckSaving"
-              @click="saveAutoCheckSettings"
+              :disabled="!autoCheckEnabled || autoCheckSaving || autoUpdateSaving || intervalSaving"
+              :loading="intervalSaving"
+              @click="saveAutoCheckInterval"
             >
               {{ t('actions.save') }}
             </v-btn>
@@ -366,6 +392,8 @@
               hide-details
               :label="t('coreManager.enableAutoUpdate')"
               :disabled="autoUpdateSwitchDisabled"
+              :loading="autoUpdateSaving"
+              @update:model-value="saveAutoUpdateEnabled"
             ></v-switch>
           </v-col>
           <v-col cols="12" sm="5">
@@ -574,6 +602,7 @@ const singboxCore = {
   updateSettingsEndpoint: 'api/core-update-settings',
   updateAckEndpoint: 'api/core-update-ack',
   downloadPreferenceEndpoint: 'api/core-download-preference',
+  logLevelEndpoint: 'api/core-log-level',
   downloadEndpoint: 'api/coreDownload',
   startEndpoint: 'api/coreStart',
   stopEndpoint: 'api/coreStop',
@@ -593,6 +622,17 @@ const coreRunning = ref(false)
 const installed = ref(false)
 const compatible = ref(false)
 const installedChannel = ref<'stable' | 'alpha' | ''>('')
+const coreLogLevel = ref('panic')
+const confirmedCoreLogLevel = ref('panic')
+const coreLogLevelSaving = ref(false)
+const coreLogLevelItems = [
+  { title: 'panic', value: 'panic' },
+  { title: 'fatal', value: 'fatal' },
+  { title: 'error', value: 'error' },
+  { title: 'warn', value: 'warn' },
+  { title: 'info', value: 'info' },
+  { title: 'debug', value: 'debug' },
+]
 
 const remoteLoading = ref(false)
 const remoteLoaded = ref(false)
@@ -639,8 +679,20 @@ const versionList = ref<any[]>([])
 const hasMoreVersions = ref(false)
 const loadingMoreVersions = ref(false)
 const versionRequestSeq = ref(0)
+const modalSessionSeq = ref(0)
+let refreshRequestSeq = 0
+let coreStatusRequestSeq = 0
+let coreUpdateInfoRequestSeq = 0
+let coreDownloadRecoveryRequestSeq = 0
 const customDownloadURL = ref('')
 const preferenceSaving = ref(false)
+const userEditedDownloadTarget = ref(false)
+const userEditedDownloadPreference = ref(false)
+let downloadPreferenceSaveQueued = false
+let downloadPreferenceTargetSaveQueued = false
+let downloadPreferenceChangeVersion = 0
+let downloadPreferenceSaveWorker: Promise<void> | null = null
+let targetSelectionMadeBeforeStatus = false
 
 const downloading = ref(false)
 const downloadingVersion = ref('')
@@ -652,6 +704,8 @@ const stoppingCore = ref(false)
 const restartingCore = ref(false)
 const deletingCore = ref(false)
 const autoCheckSaving = ref(false)
+const autoUpdateSaving = ref(false)
+const intervalSaving = ref(false)
 const feedbackMsg = ref('')
 const feedbackType = ref<'success' | 'error' | 'info'>('info')
 let downloadFeedbackTimer: number | null = null
@@ -670,6 +724,22 @@ const autoUpdateLastAttemptAt = ref(0)
 const autoUpdateLastSuccessAt = ref(0)
 const autoUpdateError = ref('')
 const autoUpdateErrorAt = ref(0)
+
+const isCurrentModalSession = (session: number) => (
+  dialogVisible.value && modalSessionSeq.value === session
+)
+
+const invalidateModalRequests = () => {
+  modalSessionSeq.value += 1
+  refreshRequestSeq += 1
+  coreStatusRequestSeq += 1
+  coreUpdateInfoRequestSeq += 1
+  coreDownloadRecoveryRequestSeq += 1
+  versionRequestSeq.value += 1
+  statusLoading.value = false
+  remoteLoading.value = false
+  loadingMoreVersions.value = false
+}
 
 type CoreDownloadProgress = {
   id: string
@@ -905,7 +975,7 @@ const autoUpdateLastSuccessDisplay = computed(() => (
   autoUpdateLastSuccessAt.value > 0 ? formatPanelDateTime(autoUpdateLastSuccessAt.value * 1000) : ''
 ))
 const autoUpdateSwitchDisabled = computed(() => (
-  autoCheckSaving.value || autoUpdateDisabled.value
+  !autoCheckEnabled.value || autoCheckSaving.value || autoUpdateSaving.value || intervalSaving.value || autoUpdateDisabled.value
 ))
 const autoUpdateDisabledReasonText = computed(() => (
   autoUpdateDisabled.value ? autoUpdateDisableReason.value.trim() : ''
@@ -1061,22 +1131,16 @@ const buildCurrentDownloadPreference = (): CoreDownloadPreference => {
   }
 }
 
-const buildDownloadPreferenceFormData = (includeTarget = true) => {
-  const preference = buildCurrentDownloadPreference()
+const buildDownloadPreferenceFormData = (preference: CoreDownloadPreference, includeTarget: boolean) => {
   const formData = new FormData()
   formData.append('custom_url', preference.customUrl || '')
   if (!includeTarget) {
     return formData
   }
-  if (preference.target?.os) {
-    formData.append('target_os', preference.target.os)
-  }
-  if (preference.target?.arch) {
-    formData.append('target_arch', preference.target.arch)
-  }
-  if (preference.target?.libc) {
-    formData.append('target_libc', preference.target.libc)
-  }
+  // 明确提交空值，避免用户清空目标后后端保留旧的架构或 libc。
+  formData.append('target_os', preference.target?.os || '')
+  formData.append('target_arch', preference.target?.arch || '')
+  formData.append('target_libc', preference.target?.libc || '')
   return formData
 }
 
@@ -1090,8 +1154,10 @@ const applyDownloadPreference = (preference: CoreDownloadPreference | undefined 
 }
 
 const applyStatusDownloadState = (status: any) => {
-  applyDownloadPreference(status?.downloadPreference)
-  if (!status?.downloadPreference?.customUrl && !customDownloadURL.value) {
+  if (!userEditedDownloadPreference.value) {
+    applyDownloadPreference(status?.downloadPreference)
+  }
+  if (!userEditedDownloadPreference.value && !status?.downloadPreference?.customUrl && !customDownloadURL.value) {
     const legacyPreference = readLegacyLinuxTargetPreference()
     if (legacyPreference?.customUrl) {
       customDownloadURL.value = legacyPreference.customUrl
@@ -1103,15 +1169,18 @@ const applyStatusDownloadState = (status: any) => {
   } else if (versionList.value.length === 0 && !remoteLoaded.value) {
     selectedChannel.value = 'stable'
   }
-  const installedTarget = status?.installedTarget as CoreDownloadTarget | undefined
-  if (installedTarget && (installedTarget.arch || installedTarget.os)) {
-    applyTargetSelection(installedTarget)
+  if (userEditedDownloadTarget.value) {
     return
   }
   const preferredTarget = status?.downloadPreference?.target as CoreDownloadTarget | undefined
   if (preferredTarget && (preferredTarget.arch || preferredTarget.os || preferredTarget.libc)) {
     applyTargetSelection(preferredTarget)
     applyDefaultTargetSelection()
+    return
+  }
+  const installedTarget = status?.installedTarget as CoreDownloadTarget | undefined
+  if (installedTarget && (installedTarget.arch || installedTarget.os)) {
+    applyTargetSelection(installedTarget)
     return
   }
   if (status?.installed === true && status?.compatible !== true && (selectedLinuxArch.value || selectedLinuxLibc.value)) {
@@ -1121,31 +1190,89 @@ const applyStatusDownloadState = (status: any) => {
   applyDefaultTargetSelection()
 }
 
-const saveDownloadPreference = async (includeTarget = false) => {
-  if (preferenceSaving.value) {
-    return
+const canSaveQueuedDownloadPreference = (includeTarget: boolean) => {
+  if (!includeTarget || !showLinuxArchSelector.value || !selectedLinuxArch.value) {
+    return true
   }
+  return runtimeTargetOS.value !== ''
+}
+
+const flushDownloadPreferenceSaveQueue = async () => {
   preferenceSaving.value = true
   try {
-    const data = await HttpUtils.post(
-      singboxCore.downloadPreferenceEndpoint,
-      buildDownloadPreferenceFormData(includeTarget),
-      { silentAuthCheck: true },
-    )
-    if (data.success && data.obj) {
-      applyDownloadPreference(data.obj as CoreDownloadPreference)
-    } else if (!data.success && data.msg) {
-      feedbackMsg.value = data.msg || t('coreManager.downloadPreferenceSaveFailed')
-      feedbackType.value = 'error'
+    while (downloadPreferenceSaveQueued) {
+      const includeTarget = downloadPreferenceTargetSaveQueued
+      if (!canSaveQueuedDownloadPreference(includeTarget)) {
+        return
+      }
+      downloadPreferenceSaveQueued = false
+      downloadPreferenceTargetSaveQueued = false
+      const changeVersion = downloadPreferenceChangeVersion
+      const preference = buildCurrentDownloadPreference()
+      try {
+        const data = await HttpUtils.post(
+          singboxCore.downloadPreferenceEndpoint,
+          buildDownloadPreferenceFormData(preference, includeTarget),
+          { silentAuthCheck: true },
+        )
+        if (changeVersion !== downloadPreferenceChangeVersion) {
+          continue
+        }
+        if (data.success && data.obj) {
+          applyDownloadPreference(data.obj as CoreDownloadPreference)
+        } else if (!data.success && data.msg) {
+          feedbackMsg.value = data.msg || t('coreManager.downloadPreferenceSaveFailed')
+          feedbackType.value = 'error'
+        }
+      } catch (error: any) {
+        if (changeVersion !== downloadPreferenceChangeVersion) {
+          continue
+        }
+        feedbackMsg.value = t('coreManager.downloadPreferenceSaveFailedWithReason', {
+          reason: error.message || t('coreManager.unknown'),
+        })
+        feedbackType.value = 'error'
+      }
     }
-  } catch (error: any) {
-    feedbackMsg.value = t('coreManager.downloadPreferenceSaveFailedWithReason', {
-      reason: error.message || t('coreManager.unknown'),
-    })
-    feedbackType.value = 'error'
   } finally {
     preferenceSaving.value = false
+    downloadPreferenceSaveWorker = null
   }
+}
+
+const startDownloadPreferenceSaveWorker = () => {
+  if (downloadPreferenceSaveWorker || !downloadPreferenceSaveQueued) {
+    return
+  }
+  downloadPreferenceSaveWorker = Promise.resolve().then(flushDownloadPreferenceSaveQueue)
+}
+
+const queueDownloadPreferenceSave = (includeTarget = false) => {
+  downloadPreferenceSaveQueued = true
+  downloadPreferenceTargetSaveQueued = downloadPreferenceTargetSaveQueued || includeTarget
+  downloadPreferenceChangeVersion += 1
+  startDownloadPreferenceSaveWorker()
+}
+
+const onDownloadTargetSelectionChanged = () => {
+  if (!dialogVisible.value) {
+    return
+  }
+  userEditedDownloadTarget.value = true
+  userEditedDownloadPreference.value = true
+  targetSelectionMadeBeforeStatus = runtimeTargetOS.value === ''
+  queueDownloadPreferenceSave(true)
+}
+
+const onCustomDownloadURLChanged = () => {
+  if (dialogVisible.value) {
+    userEditedDownloadPreference.value = true
+  }
+}
+
+const saveDownloadPreference = () => {
+  userEditedDownloadPreference.value = true
+  queueDownloadPreferenceSave()
 }
 
 watch(
@@ -1153,8 +1280,12 @@ watch(
   (newValue) => {
     dialogVisible.value = newValue
     if (newValue) {
+      modalSessionSeq.value += 1
       resetRemoteVersions()
       selectedChannel.value = 'stable'
+      userEditedDownloadTarget.value = false
+      userEditedDownloadPreference.value = false
+      targetSelectionMadeBeforeStatus = false
       clearLinuxTargetSelection()
       if (downloadProgressSessionId.value) {
         startDownloadProgressPolling(downloadProgressSessionId.value)
@@ -1163,7 +1294,9 @@ watch(
         void recoverCoreDownloadTask()
       }
       void refreshAll()
+      return
     }
+    invalidateModalRequests()
   },
 )
 
@@ -1197,6 +1330,7 @@ watch([selectedLinuxArch, selectedLinuxLibc], () => {
 })
 
 const close = () => {
+  invalidateModalRequests()
   stopDownloadProgressPolling()
   emit('close')
   emit('update:modelValue', false)
@@ -1279,7 +1413,7 @@ const makeDownloadSessionId = () => {
 
 const stopDownloadProgressPolling = () => {
   if (downloadProgressTimerId.value != null) {
-    window.clearInterval(downloadProgressTimerId.value)
+    window.clearTimeout(downloadProgressTimerId.value)
     downloadProgressTimerId.value = null
   }
 }
@@ -1328,9 +1462,10 @@ const pollDownloadProgress = async (): Promise<void> => {
   if (!sessionId) {
     return
   }
+  const modalSession = modalSessionSeq.value
   const request = (async () => {
     const data = await HttpUtils.get(singboxCore.progressEndpoint, { id: sessionId }, { silentAuthCheck: true })
-    if (sessionId !== downloadProgressSessionId.value.trim()) return
+    if (!isCurrentModalSession(modalSession) || sessionId !== downloadProgressSessionId.value.trim()) return
     if (!data.success) {
       return
     }
@@ -1354,20 +1489,37 @@ const pollDownloadProgress = async (): Promise<void> => {
   }
 }
 
+const scheduleDownloadProgressPolling = (delay = 800) => {
+  if (!dialogVisible.value || !coreDownloadTaskActive.value || !downloadProgressSessionId.value.trim()) return
+  if (downloadProgressTimerId.value != null) window.clearTimeout(downloadProgressTimerId.value)
+  downloadProgressTimerId.value = window.setTimeout(async () => {
+    downloadProgressTimerId.value = null
+    try {
+      await pollDownloadProgress()
+    } catch {
+      // The next scheduled pass will retry transient transport failures.
+    } finally {
+      if (dialogVisible.value && coreDownloadTaskActive.value && !isTerminalCoreDownload(downloadProgress.value)) {
+        scheduleDownloadProgressPolling()
+      }
+    }
+  }, delay)
+}
+
 const startDownloadProgressPolling = (sessionId: string) => {
   stopDownloadProgressPolling()
   downloadProgressSessionId.value = sessionId.trim()
   if (!downloadProgressSessionId.value || !dialogVisible.value) {
     return
   }
-  downloadProgressTimerId.value = window.setInterval(() => {
-    void pollDownloadProgress()
-  }, 800)
-  void pollDownloadProgress()
+  void pollDownloadProgress().finally(() => scheduleDownloadProgressPolling())
 }
 
 const recoverCoreDownloadTask = async (allowTerminal = false) => {
+  const requestId = ++coreDownloadRecoveryRequestSeq
+  const modalSession = modalSessionSeq.value
   const data = await HttpUtils.get(singboxCore.progressEndpoint, {}, { silentAuthCheck: true })
+  if (requestId !== coreDownloadRecoveryRequestSeq || !isCurrentModalSession(modalSession)) return
   if (!data.success || !data.obj) return
   const nextProgress = normalizeCoreDownloadProgress(data.obj)
   if (nextProgress.id === '' || nextProgress.state === 'idle') return
@@ -1383,6 +1535,9 @@ const recoverCoreDownloadTask = async (allowTerminal = false) => {
 }
 
 const handleVisibilityChange = () => {
+  if (!dialogVisible.value) {
+    return
+  }
   if (document.visibilityState === 'visible') {
     if (dialogVisible.value && downloadProgressSessionId.value) {
       startDownloadProgressPolling(downloadProgressSessionId.value)
@@ -1396,6 +1551,8 @@ const handleVisibilityChange = () => {
 }
 
 const refreshAll = async (forceUpdateCheck = false) => {
+  const requestId = ++refreshRequestSeq
+  const modalSession = modalSessionSeq.value
   statusLoading.value = true
   try {
     await Promise.all([
@@ -1403,7 +1560,9 @@ const refreshAll = async (forceUpdateCheck = false) => {
       loadCoreUpdateInfo(forceUpdateCheck),
     ])
   } finally {
-    statusLoading.value = false
+    if (requestId === refreshRequestSeq && isCurrentModalSession(modalSession)) {
+      statusLoading.value = false
+    }
   }
 }
 
@@ -1417,9 +1576,11 @@ const resetVersionDisplay = () => {
 }
 
 const loadCoreStatus = async () => {
+  const requestId = ++coreStatusRequestSeq
+  const modalSession = modalSessionSeq.value
   try {
     const data = await HttpUtils.get(singboxCore.statusEndpoint)
-    if (data.success && data.obj) {
+    if (requestId === coreStatusRequestSeq && isCurrentModalSession(modalSession) && data.success && data.obj) {
       installed.value = data.obj.installed === true
       compatible.value = data.obj.compatible === true
       localVersion.value = data.obj.localVersion || ''
@@ -1428,10 +1589,54 @@ const loadCoreStatus = async () => {
       platform.value = data.obj.platform || ''
       installedTarget.value = data.obj.installedTarget || null
       installedChannel.value = normalizeInstalledChannel(data.obj.installedChannel)
+      if (coreLogLevelItems.some((item) => item.value === data.obj.logLevel)) {
+        coreLogLevel.value = data.obj.logLevel
+        confirmedCoreLogLevel.value = data.obj.logLevel
+      }
+      if (targetSelectionMadeBeforeStatus && selectedLinuxArch.value && showLinuxLibcSelector.value && !selectedLinuxLibc.value) {
+        selectedLinuxLibc.value = 'glibc'
+      }
+      targetSelectionMadeBeforeStatus = false
       applyStatusDownloadState(data.obj)
+      if (downloadPreferenceSaveQueued && !downloadPreferenceSaveWorker) {
+        startDownloadPreferenceSaveWorker()
+      }
     }
   } catch (error) {
     console.error('Failed to load core status:', error)
+  }
+}
+
+const saveCoreLogLevel = async (level: string | null) => {
+  const previousLevel = confirmedCoreLogLevel.value
+  if (!coreLogLevelItems.some((item) => item.value === level) || coreLogLevelSaving.value) {
+    coreLogLevel.value = previousLevel
+    return
+  }
+
+  coreLogLevelSaving.value = true
+  try {
+    const data = await HttpUtils.post(singboxCore.logLevelEndpoint, { level })
+    if (data.success && data.obj) {
+      coreLogLevel.value = data.obj.level
+      confirmedCoreLogLevel.value = data.obj.level
+      feedbackMsg.value = t('coreManager.logLevelSaved')
+      feedbackType.value = 'success'
+      return
+    }
+    feedbackMsg.value = data.msg || t('coreManager.logLevelSaveFailed')
+    feedbackType.value = 'error'
+    coreLogLevel.value = previousLevel
+    await loadCoreStatus()
+  } catch (error: any) {
+    feedbackMsg.value = t('coreManager.logLevelSaveFailedWithReason', {
+      reason: error.message || t('coreManager.unknown'),
+    })
+    feedbackType.value = 'error'
+    coreLogLevel.value = previousLevel
+    await loadCoreStatus()
+  } finally {
+    coreLogLevelSaving.value = false
   }
 }
 
@@ -1441,6 +1646,7 @@ const loadRemoteVersions = async (append: boolean) => {
   }
 
   const requestId = ++versionRequestSeq.value
+  const modalSession = modalSessionSeq.value
   const requestOffset = append ? versionList.value.length : 0
   const requestLimit = append ? nextRemoteLoadCount.value : 5
   if (append) {
@@ -1457,7 +1663,7 @@ const loadRemoteVersions = async (append: boolean) => {
       ...getVersionTargetQuery(),
     })
 
-    if (requestId !== versionRequestSeq.value) {
+    if (requestId !== versionRequestSeq.value || !isCurrentModalSession(modalSession)) {
       return
     }
 
@@ -1485,7 +1691,7 @@ const loadRemoteVersions = async (append: boolean) => {
       selectedVersion.value = ''
     }
   } catch (error) {
-    if (requestId !== versionRequestSeq.value) {
+    if (requestId !== versionRequestSeq.value || !isCurrentModalSession(modalSession)) {
       return
     }
     console.error('Failed to fetch remote versions:', error)
@@ -1495,15 +1701,15 @@ const loadRemoteVersions = async (append: boolean) => {
       selectedVersion.value = ''
     }
   } finally {
-    if (requestId === versionRequestSeq.value) {
+    if (requestId === versionRequestSeq.value && isCurrentModalSession(modalSession)) {
       remoteLoaded.value = true
     }
     if (append) {
-      if (requestId === versionRequestSeq.value) {
+      if (requestId === versionRequestSeq.value && isCurrentModalSession(modalSession)) {
         loadingMoreVersions.value = false
       }
     } else {
-      if (requestId === versionRequestSeq.value) {
+      if (requestId === versionRequestSeq.value && isCurrentModalSession(modalSession)) {
         remoteLoading.value = false
       }
     }
@@ -1528,12 +1734,14 @@ const applyCoreUpdateInfo = (info: any) => {
 }
 
 const loadCoreUpdateInfo = async (forceCheck: boolean) => {
+  const requestId = ++coreUpdateInfoRequestSeq
+  const modalSession = modalSessionSeq.value
   try {
     const data = await HttpUtils.get(
       singboxCore.updateInfoEndpoint,
       forceCheck ? { force: 'true' } : {},
     )
-    if (data.success && data.obj) {
+    if (requestId === coreUpdateInfoRequestSeq && isCurrentModalSession(modalSession) && data.success && data.obj) {
       applyCoreUpdateInfo(data.obj)
     }
   } catch (error) {
@@ -1553,37 +1761,97 @@ const normalizeIntervalHours = (raw: string): number | null => {
   return value
 }
 
-const saveAutoCheckSettings = async () => {
-  const intervalHours = normalizeIntervalHours(autoCheckIntervalInput.value)
-  if (autoCheckEnabled.value && intervalHours == null) {
-    feedbackMsg.value = t('coreManager.intervalInvalid')
-    feedbackType.value = 'error'
-    return
-  }
-
+const saveAutoCheckEnabled = async (enabled: boolean | null) => {
   autoCheckSaving.value = true
   clearDownloadFeedback()
   try {
     const data = await HttpUtils.post(singboxCore.updateSettingsEndpoint, {
-      enabled: autoCheckEnabled.value ? 'true' : 'false',
-      interval: String(intervalHours ?? 12),
-      auto_update_enabled: autoUpdateEnabled.value ? 'true' : 'false',
+      action: 'auto_check',
+      enabled: enabled === true ? 'true' : 'false',
     })
     if (data.success && data.obj) {
       applyCoreUpdateInfo(data.obj)
       feedbackMsg.value = t('coreManager.autoCheckSaved')
       feedbackType.value = 'success'
     } else {
+      await loadCoreUpdateInfo(false)
       feedbackMsg.value = data.msg || t('coreManager.autoCheckSaveFailed')
       feedbackType.value = 'error'
     }
   } catch (error: any) {
+    await loadCoreUpdateInfo(false)
     feedbackMsg.value = t('coreManager.autoCheckSaveFailedWithReason', {
       reason: error.message || t('coreManager.unknown'),
     })
     feedbackType.value = 'error'
   } finally {
     autoCheckSaving.value = false
+  }
+}
+
+const saveAutoUpdateEnabled = async (enabled: boolean | null) => {
+  if (!autoCheckEnabled.value) {
+    return
+  }
+  autoUpdateSaving.value = true
+  clearDownloadFeedback()
+  try {
+    const data = await HttpUtils.post(singboxCore.updateSettingsEndpoint, {
+      action: 'auto_update',
+      auto_update_enabled: enabled === true ? 'true' : 'false',
+    })
+    if (data.success && data.obj) {
+      applyCoreUpdateInfo(data.obj)
+      feedbackMsg.value = t('coreManager.autoCheckSaved')
+      feedbackType.value = 'success'
+    } else {
+      await loadCoreUpdateInfo(false)
+      feedbackMsg.value = data.msg || t('coreManager.autoCheckSaveFailed')
+      feedbackType.value = 'error'
+    }
+  } catch (error: any) {
+    await loadCoreUpdateInfo(false)
+    feedbackMsg.value = t('coreManager.autoCheckSaveFailedWithReason', {
+      reason: error.message || t('coreManager.unknown'),
+    })
+    feedbackType.value = 'error'
+  } finally {
+    autoUpdateSaving.value = false
+  }
+}
+
+const saveAutoCheckInterval = async () => {
+  const intervalHours = normalizeIntervalHours(autoCheckIntervalInput.value)
+  if (intervalHours == null) {
+    feedbackMsg.value = t('coreManager.intervalInvalid')
+    feedbackType.value = 'error'
+    return
+  }
+
+  intervalSaving.value = true
+  clearDownloadFeedback()
+  try {
+    const data = await HttpUtils.post(singboxCore.updateSettingsEndpoint, {
+      action: 'interval',
+      interval: String(intervalHours),
+    })
+    if (data.success && data.obj) {
+      applyCoreUpdateInfo(data.obj)
+      feedbackMsg.value = t('coreManager.autoCheckSaved')
+      feedbackType.value = 'success'
+    } else {
+      await loadCoreUpdateInfo(false)
+      feedbackMsg.value = data.msg || t('coreManager.autoCheckSaveFailed')
+      feedbackType.value = 'error'
+    }
+  } catch (error: any) {
+    await loadCoreUpdateInfo(false)
+    feedbackMsg.value = t('coreManager.autoCheckSaveFailedWithReason', {
+      reason: error.message || t('coreManager.unknown'),
+    })
+    feedbackType.value = 'error'
+  } finally {
+    intervalSaving.value = false
   }
 }
 
@@ -1827,10 +2095,13 @@ onMounted(() => {
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', handleVisibilityChange)
   }
-  void recoverCoreDownloadTask()
+  if (dialogVisible.value) {
+    void recoverCoreDownloadTask()
+  }
 })
 
 onBeforeUnmount(() => {
+  invalidateModalRequests()
   stopDownloadProgressPolling()
   if (downloadFeedbackTimer != null) {
     window.clearTimeout(downloadFeedbackTimer)
@@ -1843,9 +2114,17 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+.core-modal-card {
+  display: flex;
+  flex-direction: column;
+  max-height: 90vh;
+}
+
 .core-modal-body {
-  min-height: 450px;
+  flex: 1 1 auto;
+  min-height: 0;
   padding: 20px;
+  overflow-y: auto;
 }
 
 .core-path-chip {

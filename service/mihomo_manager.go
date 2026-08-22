@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/logger"
+	"gorm.io/gorm"
 )
 
 type MihomoManagerService struct {
@@ -16,12 +18,22 @@ type MihomoManagerService struct {
 	MihomoOutboundService
 }
 
+var mihomoServerConfigRegenerationMu sync.Mutex
+
 func NewMihomoManagerService() *MihomoManagerService {
 	return &MihomoManagerService{}
 }
 
 func (s *MihomoManagerService) GenerateServerDocument() (map[string]interface{}, error) {
-	baseData, err := s.MihomoConfigService.GetConfig()
+	return s.generateServerDocument(database.GetDB())
+}
+
+func (s *MihomoManagerService) generateServerDocument(db *gorm.DB) (map[string]interface{}, error) {
+	if db == nil {
+		return nil, fmt.Errorf("mihomo config generation requires a database connection")
+	}
+
+	baseData, err := s.MihomoConfigService.GetConfigWithDB(db)
 	if err != nil {
 		return nil, fmt.Errorf("get mihomo base config failed: %w", err)
 	}
@@ -31,16 +43,22 @@ func (s *MihomoManagerService) GenerateServerDocument() (map[string]interface{},
 		if err := json.Unmarshal([]byte(baseData), &base); err != nil {
 			return nil, fmt.Errorf("parse mihomo base config failed: %w", err)
 		}
+		// Legacy records can predate route-save validation. Refuse to replace the
+		// active YAML with one that silently drops an inbound-scoped rule.
+		if err := validateMihomoConfigInboundReferences(db, json.RawMessage(baseData)); err != nil {
+			return nil, fmt.Errorf("invalid mihomo route inbound reference: %w", err)
+		}
 	}
 
 	document := copyMihomoGeneralConfig(base)
+	if err := applyCurrentMihomoCoreLogLevel(db, document); err != nil {
+		return nil, fmt.Errorf("get mihomo core log level failed: %w", err)
+	}
 	route := requireRouteMap(base)
 	applyMihomoRouteGeneralConfig(document, route)
 	if dns := buildMihomoDNSDocument(base["dns"]); len(dns) > 0 {
 		document["dns"] = dns
 	}
-
-	db := database.GetDB()
 
 	var outbounds []model.MihomoOutbound
 	if err := db.Model(model.MihomoOutbound{}).Order("id ASC").Find(&outbounds).Error; err != nil {
@@ -108,6 +126,20 @@ func (s *MihomoManagerService) GenerateServerDocument() (map[string]interface{},
 	listeners := make([]interface{}, 0, len(inbounds))
 
 	for _, inbound := range inbounds {
+		if inbound.TlsId > 0 {
+			if inbound.Tls == nil {
+				return nil, fmt.Errorf("mihomo inbound %s references missing TLS configuration %d", inbound.Tag, inbound.TlsId)
+			}
+			if err := validateMihomoTLSMode(inbound.Tls); err != nil {
+				return nil, fmt.Errorf("mihomo inbound %s references invalid TLS configuration: %w", inbound.Tag, err)
+			}
+			if err := validateMihomoInboundTLSMode(&inbound); err != nil {
+				return nil, fmt.Errorf("mihomo inbound %s has invalid TLS binding: %w", inbound.Tag, err)
+			}
+			if err := normalizeMihomoTLSOutboundReferences(inbound.Tls, proxyResult); err != nil {
+				return nil, fmt.Errorf("mihomo inbound %s has invalid TLS outbound reference: %w", inbound.Tag, err)
+			}
+		}
 		if strings.EqualFold(strings.TrimSpace(inbound.Type), "shadowquic") {
 			if err := repairMihomoShadowQUICInboundClientCredentials(db, inbound.Id); err != nil {
 				return nil, fmt.Errorf("repair mihomo shadowquic client credentials for %s failed: %w", inbound.Tag, err)
@@ -157,6 +189,9 @@ func (s *MihomoManagerService) GenerateServerDocument() (map[string]interface{},
 		return nil, fmt.Errorf("invalid mihomo route config: %s", strings.Join(routeResult.ValidationErrs, "; "))
 	}
 	routeResult.SubRules = pruneRedundantMihomoListenerRules(listeners, routeResult)
+	if err := validateMihomoRenderedRouteSize(routeResult); err != nil {
+		return nil, err
+	}
 	if len(routeResult.Rules) > 0 {
 		rules := make([]interface{}, 0, len(routeResult.Rules))
 		for _, rule := range routeResult.Rules {
@@ -175,24 +210,51 @@ func (s *MihomoManagerService) GenerateServerDocument() (map[string]interface{},
 	return normalizeMihomoDocument(document), nil
 }
 
-func (s *MihomoManagerService) RegenerateServerConfig() error {
-	if err := EnsureManagedCoreLayout(); err != nil {
-		return err
+func (s *MihomoManagerService) renderServerConfig(db *gorm.DB) ([]byte, error) {
+	document, err := s.generateServerDocument(db)
+	if err != nil {
+		return nil, err
 	}
 
-	document, err := s.GenerateServerDocument()
+	rawByTag, err := loadMihomoRawClashYAMLByTag(db)
 	if err != nil {
-		return err
-	}
-
-	rawByTag, err := loadMihomoRawClashYAMLByTag(database.GetDB())
-	if err != nil {
-		return fmt.Errorf("load mihomo raw clash yaml failed: %w", err)
+		return nil, fmt.Errorf("load mihomo raw clash yaml failed: %w", err)
 	}
 
 	yamlData, err := renderMihomoDocumentYAML(document, rawByTag)
 	if err != nil {
-		return fmt.Errorf("marshal mihomo yaml failed: %w", err)
+		return nil, fmt.Errorf("marshal mihomo yaml failed: %w", err)
+	}
+	if len(yamlData) > maxMihomoGeneratedYAMLBytes {
+		return nil, fmt.Errorf("generated mihomo server.yaml exceeds the %d byte safety limit", maxMihomoGeneratedYAMLBytes)
+	}
+	return yamlData, nil
+}
+
+// ValidateServerConfig performs the same parse, conversion and size checks as
+// the runtime writer without touching the active server.yaml file.
+func (s *MihomoManagerService) ValidateServerConfig(db *gorm.DB) error {
+	_, err := s.renderServerConfig(db)
+	return err
+}
+
+func (s *MihomoManagerService) RegenerateServerConfig() error {
+	mihomoServerConfigRegenerationMu.Lock()
+	defer mihomoServerConfigRegenerationMu.Unlock()
+
+	yamlData, err := s.renderServerConfig(database.GetDB())
+	if err != nil {
+		return err
+	}
+	return s.writeRenderedServerConfig(yamlData)
+}
+
+func (s *MihomoManagerService) writeRenderedServerConfig(yamlData []byte) error {
+	if len(yamlData) > maxMihomoGeneratedYAMLBytes {
+		return fmt.Errorf("generated mihomo server.yaml exceeds the %d byte safety limit", maxMihomoGeneratedYAMLBytes)
+	}
+	if err := EnsureManagedCoreLayout(); err != nil {
+		return err
 	}
 
 	coreDir := GetManagedCoreRootDir()
@@ -205,6 +267,20 @@ func (s *MihomoManagerService) RegenerateServerConfig() error {
 	}
 
 	logger.Infof("[Mihomo] wrote server config: %s", filePath)
+	return nil
+}
+
+func validateMihomoRenderedRouteSize(result *mihomoRouteRenderResult) error {
+	if result == nil {
+		return nil
+	}
+	count := len(result.Rules)
+	for _, rules := range result.SubRules {
+		count += len(rules)
+	}
+	if count > maxMihomoRouteRenderedRules {
+		return fmt.Errorf("mihomo route generation exceeds the %d generated-rule safety limit", maxMihomoRouteRenderedRules)
+	}
 	return nil
 }
 

@@ -178,13 +178,14 @@ export default {
       delete this.$props.data['health-check']
     },
     parseNonNegativeInteger(raw: unknown): number | undefined {
-      if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) {
-        return Math.floor(raw)
+      if (typeof raw === 'number' && Number.isSafeInteger(raw) && raw >= 0) {
+        return raw
       }
       if (typeof raw === 'string') {
         const trimmed = raw.trim()
         if (/^\d+$/.test(trimmed)) {
-          return parseInt(trimmed, 10)
+          const value = Number(trimmed)
+          return Number.isSafeInteger(value) ? value : undefined
         }
       }
       return undefined
@@ -262,10 +263,18 @@ export default {
     },
     congestionController: {
       get(): string {
-        return this.$props.data.congestion_controller ?? 'bbr'
+        const value = typeof this.$props.data.congestion_controller === 'string'
+          ? this.$props.data.congestion_controller.trim().toLowerCase()
+          : ''
+        return ['bbr', 'cubic', 'new_reno'].includes(value) ? value : ''
       },
       set(v: string) {
-        this.$props.data.congestion_controller = v && v.trim() !== '' ? v : 'bbr'
+        const value = typeof v === 'string' ? v.trim().toLowerCase() : ''
+        if (['bbr', 'cubic', 'new_reno'].includes(value)) {
+          this.$props.data.congestion_controller = value
+          return
+        }
+        delete this.$props.data.congestion_controller
       }
     },
     reuseOptionsEnabled: {

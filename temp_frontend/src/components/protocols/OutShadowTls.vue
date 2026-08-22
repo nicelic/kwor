@@ -39,7 +39,9 @@
           <v-text-field
           :label="$t('out.port')"
           type="number"
-          min="0"
+          min="1"
+          max="65535"
+          step="1"
           hide-details
           v-model.number="handshakeServerPort">
           </v-text-field>
@@ -115,7 +117,7 @@
                 hide-details
                 type="number"
                 min="1"
-                v-model.number="ssConfig.multiplex.max_connections">
+                v-model.number="muxMaxConnections">
               </v-text-field>
             </v-col>
             <v-col cols="12" sm="6" md="3">
@@ -124,7 +126,7 @@
                 hide-details
                 type="number"
                 min="1"
-                v-model.number="ssConfig.multiplex.min_streams">
+                v-model.number="muxMinStreams">
               </v-text-field>
             </v-col>
           </template>
@@ -165,6 +167,7 @@
 
 <script lang="ts">
 import RandomUtil from '@/plugins/randomUtil'
+import { parseSingboxInteger } from '@/plugins/singboxInteger'
 
 export default {
   props: ['data'],
@@ -195,6 +198,12 @@ export default {
     }
   },
   methods: {
+    parseValidPort(value: unknown): number | undefined {
+      if (value === '' || value === null || value === undefined) return undefined
+      if (typeof value === 'string' && !/^\d+$/.test(value.trim())) return undefined
+      const port = Number(value)
+      return Number.isSafeInteger(port) && port >= 1 && port <= 65535 ? port : undefined
+    },
     changeMethod(ssMethod: string) {
       if (ssMethod.startsWith('2022')) {
         this.ssConfig.password = ssMethod == "2022-blake3-aes-128-gcm" ? RandomUtil.randomShadowsocksPassword(16) : RandomUtil.randomShadowsocksPassword(32)
@@ -282,17 +291,12 @@ export default {
     },
     handshakeServerPort: {
       get(): number {
-        const handshakePort = this.$props.data.handshake?.server_port
-        if (typeof handshakePort === 'number' && handshakePort > 0) {
-          return handshakePort
-        }
-        if (typeof this.$props.data.server_port === 'number' && this.$props.data.server_port > 0) {
-          return this.$props.data.server_port
-        }
-        return 443
+        return this.parseValidPort(this.$props.data.handshake?.server_port)
+          ?? this.parseValidPort(this.$props.data.server_port)
+          ?? 443
       },
       set(v: number) {
-        const port = Number.isFinite(Number(v)) && Number(v) > 0 ? Math.floor(Number(v)) : 443
+        const port = this.parseValidPort(v) ?? 443
         if (!this.$props.data.handshake) {
           this.$props.data.handshake = { server: '', server_port: port }
         }
@@ -325,6 +329,28 @@ export default {
         }
       }
     },
+    muxMaxConnections: {
+      get(): number | '' {
+        return parseSingboxInteger(this.ssConfig.multiplex?.max_connections, { min: 1 }) ?? ''
+      },
+      set(newValue: unknown) {
+        const normalized = parseSingboxInteger(newValue, { min: 1 })
+        if (!this.ssConfig.multiplex) this.ssConfig.multiplex = { enabled: true }
+        if (normalized === undefined) delete this.ssConfig.multiplex.max_connections
+        else this.ssConfig.multiplex.max_connections = normalized
+      },
+    },
+    muxMinStreams: {
+      get(): number | '' {
+        return parseSingboxInteger(this.ssConfig.multiplex?.min_streams, { min: 1 }) ?? ''
+      },
+      set(newValue: unknown) {
+        const normalized = parseSingboxInteger(newValue, { min: 1 })
+        if (!this.ssConfig.multiplex) this.ssConfig.multiplex = { enabled: true }
+        if (normalized === undefined) delete this.ssConfig.multiplex.min_streams
+        else this.ssConfig.multiplex.min_streams = normalized
+      },
+    },
     brutalEnable: {
       get(): boolean { return this.ssConfig.multiplex?.brutal ? this.ssConfig.multiplex.brutal.enabled : false },
       set(newValue: boolean) { 
@@ -333,18 +359,18 @@ export default {
       }
     },
     downMbps: {
-      get() { return this.ssConfig.multiplex?.brutal?.down_mbps ?? 1000 },
-      set(newValue: any) { 
+      get() { return parseSingboxInteger(this.ssConfig.multiplex?.brutal?.down_mbps, { min: 0 }) ?? 1000 },
+      set(newValue: unknown) {
         if (this.ssConfig.multiplex?.brutal) {
-          this.ssConfig.multiplex.brutal.down_mbps = newValue.length != 0 ? newValue : 1000
+          this.ssConfig.multiplex.brutal.down_mbps = parseSingboxInteger(newValue, { min: 0 }) ?? 1000
         }
       }
     },
     upMbps: {
-      get() { return this.ssConfig.multiplex?.brutal?.up_mbps ?? 1000 },
-      set(newValue: any) {
+      get() { return parseSingboxInteger(this.ssConfig.multiplex?.brutal?.up_mbps, { min: 0 }) ?? 1000 },
+      set(newValue: unknown) {
         if (this.ssConfig.multiplex?.brutal) {
-          this.ssConfig.multiplex.brutal.up_mbps = newValue.length != 0 ? newValue : 1000
+          this.ssConfig.multiplex.brutal.up_mbps = parseSingboxInteger(newValue, { min: 0 }) ?? 1000
         }
       }
     },

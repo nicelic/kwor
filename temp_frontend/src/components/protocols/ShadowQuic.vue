@@ -3,15 +3,26 @@
     <template v-if="isInbound">
       <v-card subtitle="jls-upstream">
         <v-row>
-          <v-col cols="12" sm="6" md="4">
+          <v-col cols="12">
             <v-text-field
+              class="jls-upstream-field"
               :model-value="jlsAddr"
               label="addr"
               placeholder="www.example.com:443"
-              hint="required, supports [IPv6]:port"
+              hint="addr（域名/IP:端口，回落转发的上游域名、地址）；必填，支持 [IPv6]:端口"
               persistent-hint
               required
               @update:model-value="jlsAddr = $event"
+            />
+          </v-col>
+          <v-col cols="12">
+            <v-text-field
+              class="jls-upstream-field"
+              :model-value="jlsSni"
+              label="sni"
+              hint="sni（客户端tls握手sni，不填写时由addr决定）"
+              persistent-hint
+              @update:model-value="jlsSni = $event"
             />
           </v-col>
           <v-col v-if="hasMissingJlsProxy" cols="12">
@@ -39,6 +50,7 @@
               hide-details
               min="0"
               type="number"
+              :placeholder="option.placeholder"
               :suffix="option.unit"
               :label="option.label"
               :model-value="readField('jls', option.key)"
@@ -56,6 +68,7 @@
             <v-text-field
               v-else
               hide-details
+              :placeholder="option.placeholder"
               :label="option.label"
               :model-value="readField('jls', option.key)"
               @update:model-value="setField('jls', option.key, $event, option.kind)"
@@ -96,6 +109,24 @@
           @update:model-value="setField('root', 'max_open_streams', $event, 'number')"
         />
       </v-col>
+      <v-col cols="12" sm="6" md="4">
+        <v-text-field
+          hide-details
+          label="up"
+          placeholder="Mbps"
+          :model-value="readStringField('root', 'up')"
+          @update:model-value="setField('root', 'up', $event, 'string')"
+        />
+      </v-col>
+      <v-col cols="12" sm="6" md="4">
+        <v-text-field
+          hide-details
+          label="down"
+          placeholder="Mbps"
+          :model-value="readStringField('root', 'down')"
+          @update:model-value="setField('root', 'down', $event, 'string')"
+        />
+      </v-col>
     </v-row>
 
     <v-row v-else-if="!isInbound">
@@ -133,7 +164,7 @@
           @update:model-value="setField('root', option.key, $event, option.kind)"
         />
         <v-select
-          v-else-if="option.kind === 'list' && isInbound"
+          v-else-if="option.kind === 'list' && (isInbound || option.items)"
           chips
           clearable
           closable-chips
@@ -170,6 +201,7 @@
           hide-details
           min="0"
           type="number"
+          :placeholder="option.placeholder"
           :suffix="option.unit"
           :label="option.label"
           :model-value="readField('root', option.key)"
@@ -178,6 +210,7 @@
         <v-text-field
           v-else
           hide-details
+          :placeholder="option.placeholder"
           :label="option.label"
           :model-value="readField('root', option.key)"
           @update:model-value="setField('root', option.key, $event, option.kind)"
@@ -223,8 +256,14 @@
 </template>
 
 <script lang="ts">
-import { getNamespaceStore } from '@/store/uiNamespace'
-import { normalizeShadowQuicBBRProfile, shadowQuicBBRProfileItems } from '@/plugins/shadowQuic'
+import HttpUtils from '@/plugins/httputil'
+import {
+  createShadowQuicInboundDefaultOptions,
+  normalizeShadowQuicBBRProfile,
+  normalizeShadowQuicJlsUpstreamAddr,
+  shadowQuicJlsSniFromAddr,
+  shadowQuicBBRProfileItems,
+} from '@/plugins/shadowQuic'
 
 type ShadowQuicFieldKind = 'string' | 'number' | 'boolean' | 'list' | 'single-list' | 'select' | 'proxy'
 type ShadowQuicOption = {
@@ -234,23 +273,51 @@ type ShadowQuicOption = {
   items?: string[]
   defaultValue?: string | number | boolean | string[]
   defaultEnabled?: boolean
+  placeholder?: string
   unit?: string
 }
 
+const shadowQuicInboundDefaults = createShadowQuicInboundDefaultOptions()
+const initializedShadowQuicInboundDefaults = new WeakSet<object>()
+const initializedShadowQuicClientDefaults = new WeakSet<object>()
+const shadowQuicCongestionControllerItems = ['cubic', 'new_reno', 'bbr']
+const shadowQuicOutboundReceiveWindowDefaults = {
+  recv_window_conn: 25000000,
+  recv_window: 99000000,
+} as const
+
+function formatBytePlaceholder(value: number): string {
+  return `${value}_${value / 1000000}MB`
+}
+
 const inboundRootOptionDefinitions: ShadowQuicOption[] = [
-  { key: 'alpn', label: 'alpn', kind: 'list', items: ['h3', 'h2', 'http/1.1'], defaultValue: ['h3'], defaultEnabled: true },
-  { key: 'quic_versions', label: 'quic-versions', kind: 'list', items: ['v1', 'v2'], defaultValue: ['v2'], defaultEnabled: true },
-  { key: 'zero_rtt', label: 'zero-rtt', kind: 'boolean', defaultValue: true, defaultEnabled: true },
-  { key: 'congestion_controller', label: 'congestion-controller', kind: 'select', items: ['cubic', 'new_reno', 'bbr'], defaultValue: 'bbr' },
-  { key: 'up', label: 'up', kind: 'string' },
-  { key: 'down', label: 'down', kind: 'string' },
+  { key: 'alpn', label: 'alpn', kind: 'list', items: ['h3', 'h2', 'http/1.1'], defaultValue: [...shadowQuicInboundDefaults.alpn], defaultEnabled: true },
+  { key: 'quic_versions', label: 'quic-versions', kind: 'list', items: ['v1', 'v2'], defaultValue: [...shadowQuicInboundDefaults.quic_versions], defaultEnabled: true },
+  { key: 'zero_rtt', label: 'zero-rtt', kind: 'boolean', defaultValue: shadowQuicInboundDefaults.zero_rtt, defaultEnabled: true },
+  { key: 'congestion_controller', label: 'congestion-controller', kind: 'select', items: shadowQuicCongestionControllerItems, defaultValue: shadowQuicInboundDefaults.congestion_controller, defaultEnabled: true },
+  { key: 'up', label: 'up', kind: 'string', defaultValue: shadowQuicInboundDefaults.up, defaultEnabled: true, placeholder: 'Mbps' },
+  { key: 'down', label: 'down', kind: 'string', defaultValue: shadowQuicInboundDefaults.down, defaultEnabled: true, placeholder: 'Mbps' },
   { key: 'ignore_client_bandwidth', label: 'ignore-client-bandwidth', kind: 'boolean', defaultValue: false },
-  { key: 'cwnd', label: 'cwnd', kind: 'number', defaultValue: 32 },
+  { key: 'cwnd', label: 'cwnd', kind: 'number', defaultValue: shadowQuicInboundDefaults.cwnd, defaultEnabled: true },
   { key: 'bbr_profile', label: 'bbr-profile', kind: 'select', items: ['standard', 'conservative', 'aggressive'], defaultValue: 'standard' },
-  { key: 'max_idle_time', label: 'max-idle-time', kind: 'number', defaultValue: 120000, unit: 'ms' },
-  { key: 'max_datagram_frame_size', label: 'max-datagram-frame-size', kind: 'number', defaultValue: 1400, defaultEnabled: true },
-  { key: 'recv_window_conn', label: 'recv-window-conn', kind: 'number', defaultValue: 0 },
-  { key: 'recv_window', label: 'recv-window', kind: 'number', defaultValue: 0 },
+  { key: 'max_idle_time', label: 'max-idle-time', kind: 'number', defaultValue: shadowQuicInboundDefaults.max_idle_time, defaultEnabled: true, unit: 'ms' },
+  { key: 'max_datagram_frame_size', label: 'max-datagram-frame-size', kind: 'number', defaultValue: shadowQuicInboundDefaults.max_datagram_frame_size, defaultEnabled: true },
+  {
+    key: 'recv_window_conn',
+    label: 'recv-window-conn',
+    kind: 'number',
+    defaultValue: shadowQuicInboundDefaults.recv_window_conn,
+    defaultEnabled: true,
+    placeholder: formatBytePlaceholder(shadowQuicInboundDefaults.recv_window_conn),
+  },
+  {
+    key: 'recv_window',
+    label: 'recv-window',
+    kind: 'number',
+    defaultValue: shadowQuicInboundDefaults.recv_window,
+    defaultEnabled: true,
+    placeholder: formatBytePlaceholder(shadowQuicInboundDefaults.recv_window),
+  },
   { key: 'disable_mtu_discovery', label: 'disable-mtu-discovery', kind: 'boolean', defaultValue: false },
 ]
 
@@ -258,6 +325,8 @@ const clientTemplateOptionDefinitions: ShadowQuicOption[] = [
   { key: 'udp_over_stream', label: 'udp-over-stream', kind: 'boolean', defaultValue: false },
   { key: 'keep_alive_interval', label: 'keep-alive-interval', kind: 'number', defaultValue: 10000, unit: 'ms' },
   { key: 'max_open_streams', label: 'max-open-streams', kind: 'number', defaultValue: 1024 },
+  { key: 'up', label: 'up', kind: 'string', defaultValue: shadowQuicInboundDefaults.up, placeholder: 'Mbps' },
+  { key: 'down', label: 'down', kind: 'string', defaultValue: shadowQuicInboundDefaults.down, placeholder: 'Mbps' },
 ]
 
 const outboundRootOptionDefinitions: ShadowQuicOption[] = [
@@ -267,32 +336,53 @@ const outboundRootOptionDefinitions: ShadowQuicOption[] = [
   { key: 'udp_over_stream', label: 'udp-over-stream', kind: 'boolean', defaultValue: false },
   { key: 'zero_rtt', label: 'zero-rtt', kind: 'boolean', defaultValue: false },
   { key: 'keep_alive_interval', label: 'keep-alive-interval（毫秒）', kind: 'number', defaultValue: 0 },
-  { key: 'congestion_controller', label: 'congestion-controller', kind: 'string' },
+  { key: 'congestion_controller', label: 'congestion-controller', kind: 'select', items: shadowQuicCongestionControllerItems },
   { key: 'up', label: '上行带宽', kind: 'string' },
   { key: 'down', label: '下行带宽', kind: 'string' },
   { key: 'cwnd', label: 'cwnd', kind: 'number', defaultValue: 0 },
   { key: 'bbr_profile', label: 'bbr-profile', kind: 'select', items: [...shadowQuicBBRProfileItems], defaultValue: 'aggressive' },
   { key: 'max_datagram_frame_size', label: 'max-datagram-frame-size', kind: 'number', defaultValue: 0 },
   { key: 'max_open_streams', label: 'max-open-streams', kind: 'number', defaultValue: 0 },
-  { key: 'recv_window_conn', label: 'recv-window-conn', kind: 'number', defaultValue: 0 },
-  { key: 'recv_window', label: 'recv-window', kind: 'number', defaultValue: 0 },
+  {
+    key: 'recv_window_conn',
+    label: 'recv-window-conn',
+    kind: 'number',
+    defaultValue: shadowQuicOutboundReceiveWindowDefaults.recv_window_conn,
+    placeholder: formatBytePlaceholder(shadowQuicOutboundReceiveWindowDefaults.recv_window_conn),
+  },
+  {
+    key: 'recv_window',
+    label: 'recv-window',
+    kind: 'number',
+    defaultValue: shadowQuicOutboundReceiveWindowDefaults.recv_window,
+    placeholder: formatBytePlaceholder(shadowQuicOutboundReceiveWindowDefaults.recv_window),
+  },
   { key: 'disable_mtu_discovery', label: 'disable-mtu-discovery', kind: 'boolean', defaultValue: false },
 ]
 
 const jlsOptionDefinitions: ShadowQuicOption[] = [
-  { key: 'sni', label: 'sni', kind: 'string' },
   { key: 'proxy', label: 'proxy', kind: 'proxy' },
-  { key: 'rate_limit', label: 'rate-limit', kind: 'number', defaultValue: 0 },
+  {
+    key: 'rate_limit',
+    label: 'rate-limit',
+    kind: 'number',
+    defaultValue: shadowQuicInboundDefaults.jls_upstream.rate_limit,
+    defaultEnabled: true,
+    placeholder: '204800即25KB/s',
+  },
 ]
 
 export default {
   props: {
     direction: { type: String, required: true },
     data: { type: Object, required: true },
+    namespace: { type: String, default: 'default' },
+    initializeClientDefaults: { type: Boolean, default: false },
   },
   data() {
     return {
       optionMenu: false,
+      mihomoRouteTargets: <string[]>['DIRECT'],
       boolItems: [
         { title: 'true', value: true },
         { title: 'false', value: false },
@@ -331,15 +421,20 @@ export default {
       },
       set(raw: unknown) {
         const value = this.normalizeString(raw)
-        if (value === '') {
-          const upstream = this.readJlsUpstream()
-          if (upstream) {
-            delete upstream.addr
-            this.cleanupJlsUpstream()
-          }
-          return
-        }
         this.ensureJlsUpstream().addr = value
+      },
+    },
+    jlsSni: {
+      get(): string {
+        const upstream = this.readJlsUpstream()
+        if (upstream && Object.prototype.hasOwnProperty.call(upstream, 'sni')) {
+          return typeof upstream.sni === 'string' ? upstream.sni : ''
+        }
+        return shadowQuicJlsSniFromAddr(upstream?.addr)
+      },
+      set(raw: unknown) {
+        const value = this.normalizeString(raw)
+        this.ensureJlsUpstream().sni = value
       },
     },
     jlsProxy: {
@@ -350,30 +445,14 @@ export default {
       },
       set(raw: unknown) {
         const value = this.normalizeJlsProxyTarget(raw)
-        if (value === '') {
-          const upstream = this.readJlsUpstream()
-          if (upstream) {
-            delete upstream.proxy
-            this.cleanupJlsUpstream()
-          }
-          return
-        }
         this.ensureJlsUpstream().proxy = value
       },
     },
     mihomoProxyTargets(): string[] {
-      const store = getNamespaceStore('mihomo') as any
-      const tags = [
-        'DIRECT',
-        ...(store.outbounds?.map((outbound: any) => (
-          this.normalizeJlsProxyTarget(outbound?.type === 'direct' ? 'DIRECT' : outbound?.tag)
-        )) ?? []),
-        ...(store.outboundgroups?.map((group: any) => group?.tag ?? group?.name) ?? []),
-      ]
       const seen = new Set<string>()
-      return tags
+      return this.mihomoRouteTargets
         .map((tag: unknown) => this.normalizeJlsProxyTarget(tag))
-        .filter((tag: string) => tag !== '' && !seen.has(tag) && Boolean(seen.add(tag)))
+        .filter((tag: string) => tag !== '' && tag !== 'REJECT' && tag !== 'REJECT-DROP' && !seen.has(tag) && Boolean(seen.add(tag)))
     },
     hasMissingJlsProxy(): boolean {
       const proxy = this.jlsProxy
@@ -387,6 +466,12 @@ export default {
     normalizeJlsProxyTarget(raw: unknown): string {
       const value = this.normalizeString(raw)
       return value.toLowerCase() === 'direct' ? 'DIRECT' : value
+    },
+    async loadMihomoProxyTargets() {
+      if (!this.isInbound || this.$props.namespace !== 'mihomo') return
+      const msg = await HttpUtils.get('api/mihomo-route-targets', {}, { silentErrorToast: true })
+      if (!msg.success) return
+      this.mihomoRouteTargets = Array.isArray(msg.obj?.routeTargets) ? msg.obj.routeTargets : ['DIRECT']
     },
     normalizeList(raw: unknown): string[] {
       const values = Array.isArray(raw)
@@ -433,6 +518,9 @@ export default {
       const value = this.readField(scope, key)
       return typeof value === 'string' ? value : undefined
     },
+    emptyValueForKind(kind: ShadowQuicFieldKind): string | string[] {
+      return kind === 'list' || kind === 'single-list' ? [] : ''
+    },
     readBoolean(scope: 'root' | 'jls', key: string): boolean {
       return this.fieldTarget(scope)?.[key] === true
     },
@@ -447,6 +535,7 @@ export default {
       const target = this.fieldTarget(scope, enabled)
       if (!target) return
       if (!enabled) {
+        // 只有这里的显式选项开关才会关闭控件；清空输入由 setField 保留空占位。
         delete target[option.key]
         if (scope === 'jls') this.cleanupJlsUpstream()
         return
@@ -470,28 +559,20 @@ export default {
       }
       if (kind === 'list') {
         const values = this.normalizeList(raw)
-        if (values.length === 0) {
-          delete target[key]
-        } else {
-          target[key] = values
-        }
+        target[key] = values
       } else if (kind === 'single-list') {
         const value = this.normalizeString(raw)
-        if (value === '') {
-          delete target[key]
-        } else {
-          target[key] = [value]
-        }
+        target[key] = value === '' ? [] : [value]
       } else if (kind === 'number') {
         const text = typeof raw === 'string' ? raw.trim() : raw
         if (text === '' || text === null || text === undefined) {
-          delete target[key]
+          target[key] = this.emptyValueForKind(kind)
         } else {
           const numberValue = Number(text)
-          if (!Number.isFinite(numberValue) || numberValue < 0) {
-            delete target[key]
+          if (!Number.isSafeInteger(numberValue) || numberValue < 0) {
+            target[key] = this.emptyValueForKind(kind)
           } else {
-            target[key] = Math.trunc(numberValue)
+            target[key] = numberValue
           }
         }
       } else {
@@ -500,7 +581,7 @@ export default {
           value = normalizeShadowQuicBBRProfile(value)
         }
         if (value === '') {
-          delete target[key]
+          target[key] = this.emptyValueForKind(kind)
         } else {
           target[key] = value
         }
@@ -511,25 +592,27 @@ export default {
       if (!Object.prototype.hasOwnProperty.call(target, option.key)) return
       const value = target[option.key]
       if (option.kind === 'boolean') {
-        if (typeof value !== 'boolean') delete target[option.key]
+        if (typeof value !== 'boolean') target[option.key] = false
         return
       }
       if (option.kind === 'list') {
         const normalized = this.normalizeList(value).filter((item) => !option.items || option.items.includes(item))
-        if (normalized.length === 0) delete target[option.key]
-        else target[option.key] = normalized
+        target[option.key] = normalized
         return
       }
       if (option.kind === 'single-list') {
         const normalized = this.normalizeList(value).filter((item) => !option.items || option.items.includes(item))
-        if (normalized.length === 0) delete target[option.key]
-        else target[option.key] = [normalized[0]]
+        target[option.key] = normalized.length === 0 ? [] : [normalized[0]]
         return
       }
       if (option.kind === 'number') {
+        if (value === null || value === undefined || (typeof value === 'string' && value.trim() === '')) {
+          target[option.key] = this.emptyValueForKind(option.kind)
+          return
+        }
         const numberValue = Number(value)
-        if (!Number.isFinite(numberValue) || numberValue < 0) delete target[option.key]
-        else target[option.key] = Math.trunc(numberValue)
+        if (!Number.isSafeInteger(numberValue) || numberValue < 0) target[option.key] = this.emptyValueForKind(option.kind)
+        else target[option.key] = numberValue
         return
       }
       if (option.kind === 'select') {
@@ -537,19 +620,21 @@ export default {
         if (option.key === 'bbr_profile') {
           normalized = normalizeShadowQuicBBRProfile(value)
         }
-        if (normalized === '' || (option.items && !option.items.includes(normalized))) {
-          delete target[option.key]
-        } else {
-          target[option.key] = normalized
-        }
+        target[option.key] = normalized !== '' && (!option.items || option.items.includes(normalized))
+          ? normalized
+          : this.emptyValueForKind(option.kind)
         return
       }
       const normalized = this.normalizeString(value)
-      if (normalized === '') delete target[option.key]
-      else target[option.key] = normalized
+      target[option.key] = normalized
     },
     initializeDefaults() {
-      if (this.isInbound && Number(this.value.id ?? 0) === 0) {
+      if (
+        this.isInbound &&
+        Number(this.value.id ?? 0) === 0 &&
+        !initializedShadowQuicInboundDefaults.has(this.value)
+      ) {
+		initializedShadowQuicInboundDefaults.add(this.value)
         for (const option of this.inboundRootOptionDefinitions) {
           if (!option.defaultEnabled || this.hasField('root', option.key)) continue
           const target = this.fieldTarget('root', true)
@@ -558,10 +643,19 @@ export default {
             ? [...option.defaultValue]
             : option.defaultValue
         }
+        for (const option of this.jlsOptionDefinitions) {
+          if (!option.defaultEnabled || this.hasField('jls', option.key)) continue
+          const target = this.fieldTarget('jls', true)
+          if (!target) continue
+          target[option.key] = Array.isArray(option.defaultValue)
+            ? [...option.defaultValue]
+            : option.defaultValue
+        }
       }
-      if (this.isClientTemplate) {
+      if (this.isClientTemplate && this.$props.initializeClientDefaults && !initializedShadowQuicClientDefaults.has(this.value)) {
+        initializedShadowQuicClientDefaults.add(this.value)
         for (const option of this.clientTemplateOptionDefinitions) {
-          if (this.hasField('root', option.key)) continue
+          if (option.defaultValue === undefined || this.hasField('root', option.key)) continue
           const target = this.fieldTarget('root', true)
           if (!target) continue
           target[option.key] = Array.isArray(option.defaultValue)
@@ -581,10 +675,12 @@ export default {
 
       for (const option of this.rootOptionDefinitions) {
         const hyphenKey = option.key.replaceAll('_', '-')
-        if (!Object.prototype.hasOwnProperty.call(this.value, option.key) && Object.prototype.hasOwnProperty.call(this.value, hyphenKey)) {
-          this.value[option.key] = this.value[hyphenKey]
+        if (hyphenKey !== option.key) {
+          if (!Object.prototype.hasOwnProperty.call(this.value, option.key) && Object.prototype.hasOwnProperty.call(this.value, hyphenKey)) {
+            this.value[option.key] = this.value[hyphenKey]
+          }
+          delete this.value[hyphenKey]
         }
-        delete this.value[hyphenKey]
         this.normalizeOptionValue(this.value, option)
       }
 
@@ -592,24 +688,24 @@ export default {
       if (upstream) {
         for (const option of this.jlsOptionDefinitions) {
           const hyphenKey = option.key.replaceAll('_', '-')
-          if (!Object.prototype.hasOwnProperty.call(upstream, option.key) && Object.prototype.hasOwnProperty.call(upstream, hyphenKey)) {
-            upstream[option.key] = upstream[hyphenKey]
+          if (hyphenKey !== option.key) {
+            if (!Object.prototype.hasOwnProperty.call(upstream, option.key) && Object.prototype.hasOwnProperty.call(upstream, hyphenKey)) {
+              upstream[option.key] = upstream[hyphenKey]
+            }
+            delete upstream[hyphenKey]
           }
-          delete upstream[hyphenKey]
           this.normalizeOptionValue(upstream, option)
         }
         delete upstream.quic_version_probe
         delete upstream['quic-version-probe']
         if (Object.prototype.hasOwnProperty.call(upstream, 'proxy')) {
           const proxy = this.normalizeJlsProxyTarget(upstream.proxy)
-          if (proxy === '') delete upstream.proxy
-          else upstream.proxy = proxy
+          upstream.proxy = proxy
         }
         for (const key of ['addr', 'sni', 'proxy']) {
           if (!Object.prototype.hasOwnProperty.call(upstream, key)) continue
           const normalized = this.normalizeString(upstream[key])
-          if (normalized === '') delete upstream[key]
-          else upstream[key] = normalized
+          upstream[key] = normalized
         }
         this.cleanupJlsUpstream()
       }
@@ -630,12 +726,23 @@ export default {
   mounted() {
     this.initializeDefaults()
     this.sanitize()
+    void this.loadMihomoProxyTargets()
   },
   watch: {
     data() {
       this.initializeDefaults()
       this.sanitize()
     },
+    initializeClientDefaults() {
+      this.initializeDefaults()
+    },
   },
 }
 </script>
+
+<style scoped>
+.jls-upstream-field :deep(.v-messages__message) {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+</style>

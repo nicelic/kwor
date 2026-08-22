@@ -25,6 +25,23 @@ const tlsStoreValues = ['system', 'mozilla', 'chrome', 'none']
 const QUIXOTICHEART_GITHUB_SOURCE = 'quixoticheart_github'
 const SINGBOX_ALLOWED_RULE_SET_EXTENSIONS = new Set(['.srs', '.json'])
 const SUBSCRIPTION_EXTENSION_MAX_BYTES = 4 * 1024 * 1024
+const SUBSCRIPTION_RULE_SET_PROBE_DEBOUNCE_MS = 160
+const SUBSCRIPTION_RULE_SET_PROBE_BATCH_SIZE = 32
+const SUBSCRIPTION_UI_MAX_RULE_ROWS = 64
+const SUBSCRIPTION_UI_MAX_DNS_ROUTE_ROWS = 32
+const SUBSCRIPTION_UI_MAX_VALUES_PER_ROW = 128
+const SUBSCRIPTION_UI_MAX_VALUE_LENGTH = 2048
+
+export function jsonSubscriptionDNSUsesPath(value: unknown): boolean {
+  const type = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  return type === 'https' || type === 'h3'
+}
+
+export function normalizeJSONSubscriptionDNSPath(value: unknown): string {
+  const path = typeof value === 'string' ? value.trim() : ''
+  if (!path) return '/dns-query'
+  return path.startsWith('/') ? path : `/${path}`
+}
 
 // Comment cleaned to avoid mojibake.
 
@@ -413,6 +430,14 @@ type DnsRouteRow = {
   ruleSet: string[]
 }
 
+type RuleSetProbeBatchEntry = {
+  rawName: string
+  prefix: 'geosite' | 'geoip'
+  typeLabel: string
+  source: string
+  sourceBinding: RuleSetSourceBinding
+}
+
 const customRuleRouteValues: CustomRuleRoute[] = ['reject', 'direct', 'proxy']
 const ruleRowKindValues: RuleRowKind[] = ['custom', 'ruleset']
 const ruleSetScopeValues: RuleSetScope[] = ['domain', 'ip']
@@ -454,6 +479,67 @@ function normalizeCustomRuleValues(input: any): string[] {
     result.push(val)
   }
   return result
+}
+
+function hasSubscriptionUIValueBoundsError(values: any): boolean {
+  if (!Array.isArray(values) || values.length > SUBSCRIPTION_UI_MAX_VALUES_PER_ROW) return true
+  return values.some((item) => typeof item === 'string' && item.length > SUBSCRIPTION_UI_MAX_VALUE_LENGTH)
+}
+
+function hasSubscriptionUIRowBoundsError(ruleRows: any, dnsRouteRows: any): boolean {
+  if (!Array.isArray(ruleRows) || !Array.isArray(dnsRouteRows)) return true
+  if (ruleRows.length > SUBSCRIPTION_UI_MAX_RULE_ROWS || dnsRouteRows.length > SUBSCRIPTION_UI_MAX_DNS_ROUTE_ROWS) return true
+  return ruleRows.some((row) => hasSubscriptionUIValueBoundsError(row?.values))
+    || dnsRouteRows.some((row) => hasSubscriptionUIValueBoundsError(row?.ruleSet))
+}
+
+function hasRawSubscriptionUIValueBoundsError(values: any): boolean {
+  if (Array.isArray(values)) {
+    if (values.length > SUBSCRIPTION_UI_MAX_VALUES_PER_ROW) return true
+    return values.some((item) => typeof item === 'string' && item.length > SUBSCRIPTION_UI_MAX_VALUE_LENGTH)
+  }
+  return typeof values === 'string' && values.length > SUBSCRIPTION_UI_MAX_VALUE_LENGTH
+}
+
+function hasSubscriptionUIConfigBoundsError(config: any, dnsRules: any): boolean {
+  const uiConfig = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+
+  if (Array.isArray(uiConfig.ruleRows)) {
+    if (uiConfig.ruleRows.length > SUBSCRIPTION_UI_MAX_RULE_ROWS) return true
+    if (uiConfig.ruleRows.some((row: any) => hasRawSubscriptionUIValueBoundsError(row?.values))) return true
+  } else {
+    const hasCustomRows = Array.isArray(uiConfig.customRuleRows)
+    const customRows = hasCustomRows ? uiConfig.customRuleRows : []
+    if (customRows.length > SUBSCRIPTION_UI_MAX_RULE_ROWS) return true
+    if (customRows.some((row: any) => hasRawSubscriptionUIValueBoundsError(row?.values))) return true
+
+    let legacyRuleRows = customRows.length
+    const legacyKeys = hasCustomRows
+      ? ['blockRuleSet', 'blockRuleSetIp', 'proxyRuleSet', 'proxyRuleSetIp', 'directRuleSet', 'directRuleSetIp']
+      : ['customBlockValue', 'customDirectValue', 'customProxyValue', 'blockRuleSet', 'blockRuleSetIp', 'proxyRuleSet', 'proxyRuleSetIp', 'directRuleSet', 'directRuleSetIp']
+    for (const key of legacyKeys) {
+      const values = uiConfig[key]
+      if (hasRawSubscriptionUIValueBoundsError(values)) return true
+      if (Array.isArray(values) ? values.some((item) => typeof item === 'string' && item.trim()) : typeof values === 'string' && values.trim()) {
+        legacyRuleRows += 1
+        if (legacyRuleRows > SUBSCRIPTION_UI_MAX_RULE_ROWS) return true
+      }
+    }
+  }
+
+  if (Array.isArray(uiConfig.dnsRouteRows)) {
+    if (uiConfig.dnsRouteRows.length > SUBSCRIPTION_UI_MAX_DNS_ROUTE_ROWS) return true
+    return uiConfig.dnsRouteRows.some((row: any) => hasRawSubscriptionUIValueBoundsError(row?.ruleSet))
+  }
+
+  let managedDnsRouteRows = 0
+  for (const rule of Array.isArray(dnsRules) ? dnsRules : []) {
+    if (!isDnsRuleSetRouteRule(rule) && !isDnsQueryTypeRouteRule(rule)) continue
+    managedDnsRouteRows += 1
+    if (managedDnsRouteRows > SUBSCRIPTION_UI_MAX_DNS_ROUTE_ROWS) return true
+    if (isDnsRuleSetRouteRule(rule) && hasRawSubscriptionUIValueBoundsError(rule?.rule_set)) return true
+  }
+  return false
 }
 
 function normalizeRuleRowKind(input: any): RuleRowKind {
@@ -1099,7 +1185,12 @@ function normalizeSubJsonDns(parsed: any) {
 
   if (!Array.isArray(dns.servers)) dns.servers = []
   if (!Array.isArray(dns.rules)) dns.rules = []
-  if (typeof dns.final !== 'string' || !dns.final.trim()) dns.final = 'direct-dns'
+  if (typeof dns.final !== 'string' || !dns.final.trim()) dns.final = 'proxy-dns'
+
+  for (const server of dns.servers) {
+    if (!server || typeof server !== 'object' || !jsonSubscriptionDNSUsesPath(server.type)) continue
+    server.path = normalizeJSONSubscriptionDNSPath(server.path)
+  }
 
   dns.rules = dns.rules.filter((r: any) => !isDeprecatedDnsClashModeRule(r))
 
@@ -1116,7 +1207,7 @@ function normalizeSubJsonDns(parsed: any) {
 
   const fakeipEnabled = dns.servers.some((server: any) => server?.type === 'fakeip')
   if (!fakeipEnabled && dns.final === 'fakeip') {
-    dns.final = 'direct-dns'
+    dns.final = 'proxy-dns'
   }
   const uiRows = parsed?._uiConfig?.dnsRouteRows
   if (Array.isArray(uiRows)) {
@@ -1208,6 +1299,10 @@ function normalizeSubJsonClashApiDetour(parsed: any) {
 export const SubJsonExtMixin = {
   created(this: any) {
 	this._probeAbortController = new AbortController()
+	this._probeDebounceTimer = null
+	this._probeBatch = new Map<string, RuleSetProbeBatchEntry>()
+	this._probeBatchRunning = false
+	this._ruleRegenerationPending = false
     this._dirtyTrackingBaseline = null
     this._dirtyTrackingReady = false
     this._dirtyTrackingPending = false
@@ -1224,6 +1319,7 @@ export const SubJsonExtMixin = {
   beforeUnmount(this: any) {
 	this.autoMatchRunToken = (this.autoMatchRunToken || 0) + 1
 	this._probeAbortController?.abort()
+	if (this._probeDebounceTimer != null) window.clearTimeout(this._probeDebounceTimer)
     if (this._dirtyTrackingTimer != null && typeof window !== 'undefined') {
       window.clearTimeout(this._dirtyTrackingTimer)
     }
@@ -1240,6 +1336,7 @@ export const SubJsonExtMixin = {
 		const raw = typeof v === 'string' ? v : ''
 		this._rawSource = raw
 		if (!raw.trim()) {
+		  this.formRowsTooLarge = false
 		  this.subJsonExt = {}
 		  this._parseError = ''
 		  return
@@ -1249,6 +1346,13 @@ export const SubJsonExtMixin = {
 		  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
 			throw new Error(String(i18n.global.t('subscriptionEditor.jsonTopLevel')))
 		  }
+		  if (hasSubscriptionUIConfigBoundsError(parsed._uiConfig, parsed?.dns?.rules)) {
+			this.formRowsTooLarge = true
+			this.subJsonExt = {}
+			this._parseError = ''
+			return
+		  }
+		  this.formRowsTooLarge = false
           if (parsed._uiConfig && typeof parsed._uiConfig === 'object' && parsed._uiConfig.routeFinal !== undefined) {
             parsed._uiConfig.routeFinal = normalizeRouteFinalValue(parsed._uiConfig.routeFinal)
           }
@@ -1266,6 +1370,7 @@ export const SubJsonExtMixin = {
           }
 		  this._parseError = ''
 		} catch (error: any) {
+		  this.formRowsTooLarge = false
 		  this._parseError = String(i18n.global.t('subscriptionEditor.jsonParseFailed', { error: String(error?.message || error) }))
 		  this.subJsonExt = {}
         }
@@ -1306,16 +1411,16 @@ export const SubJsonExtMixin = {
         } finally {
           this._suspendRuleRegeneration = false
         }
-        this.regenerateRuleConfig()
+        this.scheduleRuleRegeneration()
       },
       immediate: true,
     },
 
     ruleSetSource(this: any) {
       this.onRuleSetSourceChanged()
-      this.regenerateRuleConfig()
+      this.scheduleRuleRegeneration()
     },
-    ruleRows: {
+      ruleRows: {
       handler(this: any, rows: any[], oldRows: any[]) {
         if (this._suspendRuleRegeneration) return
         const previousRowsForValidation = this.getPreviousRuleRowsForValidation(oldRows)
@@ -1329,6 +1434,14 @@ export const SubJsonExtMixin = {
           return row
         })
 
+        if (withSplitRows.length > SUBSCRIPTION_UI_MAX_RULE_ROWS || withSplitRows.some((row: any) => hasSubscriptionUIValueBoundsError(row.values))) {
+          push.warning({
+            title: String(i18n.global.t('subscriptionEditor.probeTitle')),
+            message: `规则行最多 ${SUBSCRIPTION_UI_MAX_RULE_ROWS} 条，每行最多 ${SUBSCRIPTION_UI_MAX_VALUES_PER_ROW} 项且单项不超过 ${SUBSCRIPTION_UI_MAX_VALUE_LENGTH} 个字符`,
+            duration: 5000,
+          })
+          return
+        }
         const constrained = this.applyRuleNameConstraints(withSplitRows)
         const finalRows = constrained.rows
 
@@ -1339,16 +1452,24 @@ export const SubJsonExtMixin = {
           return
         }
 
-        this.regenerateRuleConfig()
+        this.scheduleRuleRegeneration()
         this.validateNewRuleRowEntries(finalRows, previousRowsForValidation)
         this.captureRuleRowsValidationSnapshot(finalRows)
       },
       deep: true,
     },
-    dnsRouteRows: {
+      dnsRouteRows: {
       handler(this: any, rows: any[]) {
         if (this._suspendRuleRegeneration) return
 
+        if (rows.length > SUBSCRIPTION_UI_MAX_DNS_ROUTE_ROWS || rows.some((row: any) => hasSubscriptionUIValueBoundsError(row?.ruleSet))) {
+          push.warning({
+            title: String(i18n.global.t('subscriptionEditor.probeTitle')),
+            message: `DNS 路由最多 ${SUBSCRIPTION_UI_MAX_DNS_ROUTE_ROWS} 条，每行最多 ${SUBSCRIPTION_UI_MAX_VALUES_PER_ROW} 项且单项不超过 ${SUBSCRIPTION_UI_MAX_VALUE_LENGTH} 个字符`,
+            duration: 5000,
+          })
+          return
+        }
         const normalizedRows = normalizeDnsRouteRows(rows, this.enableFakeip === true)
         const withSplitRows = normalizedRows.map((row: DnsRouteRow) => {
           if (row.kind !== 'rule-set') return row
@@ -1364,26 +1485,45 @@ export const SubJsonExtMixin = {
           return
         }
 
-        this.regenerateRuleConfig()
+        this.scheduleRuleRegeneration()
       },
       deep: true,
     },
-    updateMethod(this: any) { this.regenerateRuleConfig() },
-    updateInterval(this: any) { this.regenerateRuleConfig() },
-    routeFinal(this: any) { this.regenerateRuleConfig() },
-    enableSniff(this: any) { this.regenerateRuleConfig() },
-    enableHijackDns(this: any) { this.regenerateRuleConfig() },
-    enableRejectQuic(this: any) { this.regenerateRuleConfig() },
-    enableReject443Udp(this: any) { this.regenerateRuleConfig() },
-    latencyTestUrl(this: any) { this.regenerateRuleConfig() },
-    latencyTestInterval(this: any) { this.regenerateRuleConfig() },
-    latencyTolerance(this: any) { this.regenerateRuleConfig() },
+    updateMethod(this: any) { this.scheduleRuleRegeneration() },
+    updateInterval(this: any) { this.scheduleRuleRegeneration() },
+    routeFinal(this: any) { this.scheduleRuleRegeneration() },
+    enableSniff(this: any) { this.scheduleRuleRegeneration() },
+    enableHijackDns(this: any) { this.scheduleRuleRegeneration() },
+    enableRejectQuic(this: any) { this.scheduleRuleRegeneration() },
+    enableReject443Udp(this: any) { this.scheduleRuleRegeneration() },
+    latencyTestUrl(this: any) { this.scheduleRuleRegeneration() },
+    latencyTestInterval(this: any) { this.scheduleRuleRegeneration() },
+    latencyTolerance(this: any) { this.scheduleRuleRegeneration() },
 
   },
   methods: {
+	scheduleRuleRegeneration(this: any) {
+	  if (this._ruleRegenerationPending || this._suspendRuleRegeneration || this._editorSourcePending) return
+	  this._ruleRegenerationPending = true
+	  queueMicrotask(() => {
+		this._ruleRegenerationPending = false
+		this.regenerateRuleConfig()
+	  })
+	},
 	getDirtyTrackingSnapshot(this: any): string {
 	  try {
-		return JSON.stringify(this.subJsonExt || {})
+		// TLS store controls live beside subJsonExt in the draft settings object.
+		// Include them in the same snapshot so changing only these hidden controls
+		// marks the subscription tab dirty and reaches the parent save flow.
+		return JSON.stringify({
+		  extension: this.subJsonExt || {},
+		  tlsStores: {
+			serverEnabled: this.settings?.serverTlsStoreEnabled ?? '',
+			serverStore: this.settings?.serverTlsStore ?? '',
+			clientEnabled: this.settings?.clientTlsStoreEnabled ?? '',
+			clientStore: this.settings?.clientTlsStore ?? '',
+		  },
+		})
 	  } catch {
 		return ''
 	  }
@@ -1438,7 +1578,7 @@ export const SubJsonExtMixin = {
 	isDirty(this: any): boolean {
 	  return this._dirty === true
 	},
-	validateAndSerialize(this: any) {
+    validateAndSerialize(this: any) {
 	  const dirty = this._dirty === true
 	  if (!dirty) {
 		return { ok: true, dirty: false, value: this._rawSource || '' }
@@ -1448,6 +1588,17 @@ export const SubJsonExtMixin = {
 	  }
 	  if (this._parseError) {
 		return { ok: false, dirty: true, value: this._rawSource || '', error: this._parseError }
+	  }
+	  if (this.formRowsTooLarge === true) {
+		const value = this._rawSource || ''
+		if (new TextEncoder().encode(value).length > SUBSCRIPTION_EXTENSION_MAX_BYTES) {
+		  return { ok: false, dirty: true, value, error: String(i18n.global.t('subscriptionEditor.configTooLarge')) }
+		}
+		this.settings.subJsonExt = value
+		return { ok: true, dirty: true, value }
+	  }
+	  if (hasSubscriptionUIRowBoundsError(this.ruleRows, this.dnsRouteRows)) {
+		return { ok: false, dirty: true, value: this._rawSource || '', error: `规则行最多 ${SUBSCRIPTION_UI_MAX_RULE_ROWS} 条，DNS 路由最多 ${SUBSCRIPTION_UI_MAX_DNS_ROUTE_ROWS} 条；每行最多 ${SUBSCRIPTION_UI_MAX_VALUES_PER_ROW} 项且单项不超过 ${SUBSCRIPTION_UI_MAX_VALUE_LENGTH} 个字符` }
 	  }
 	  if (Object.keys(this.subJsonExt || {}).length === 0) {
 		const requiresEmptyWrite = String(this._rawSource || '').trim() !== ''
@@ -1556,7 +1707,7 @@ export const SubJsonExtMixin = {
           dns.servers.splice(fakeipIndex, 1)
         }
         if (dns.final === 'fakeip') {
-          dns.final = 'direct-dns'
+          dns.final = 'proxy-dns'
         }
         this.dnsRouteRows = this.getNormalizedDnsRouteRows().map((row: DnsRouteRow) => {
           if (row.server === 'fakeip') {
@@ -1632,6 +1783,7 @@ export const SubJsonExtMixin = {
 	  this._resetRequested = true
 	  this._editorSourcePending = false
 	  this._uiConfigLoaded = false
+	  this.formRowsTooLarge = false
 	  this.captureRuleRowsValidationSnapshot(this.ruleRows)
 	  this.settings.serverTlsStoreEnabled = 'true'
 	  this.settings.serverTlsStore = 'chrome'
@@ -1654,6 +1806,27 @@ export const SubJsonExtMixin = {
           })
           return
         }
+		if (hasSubscriptionUIConfigBoundsError(result._uiConfig, result?.dns?.rules)) {
+		  if (new TextEncoder().encode(data).length > SUBSCRIPTION_EXTENSION_MAX_BYTES) {
+			push.warning({
+			  title: i18n.global.t('error'),
+			  message: i18n.global.t('subscriptionEditor.configTooLarge'),
+			  duration: 3000,
+			})
+			return
+		  }
+		  this._parseError = ''
+		  this._resetRequested = false
+		  this._editorSourcePending = true
+		  this.formRowsTooLarge = true
+		  this.subJsonExt = {}
+		  this._rawSource = data
+		  this.settings.subJsonExt = data
+		  this.enableEditor = false
+		  this.markUserDirty()
+		  return
+		}
+		this.formRowsTooLarge = false
         normalizeSubJsonDns(result)
 		normalizeDefaultDomainResolver(result)
 		normalizeTunPlatform(result)
@@ -1749,6 +1922,7 @@ export const SubJsonExtMixin = {
     },
     insertRuleRow(this: any, index: number) {
       const rows = normalizeRuleRows(this.ruleRows)
+	  if (rows.length >= SUBSCRIPTION_UI_MAX_RULE_ROWS) return
       const safeIndex = Number.isInteger(index)
         ? Math.max(-1, Math.min(index, rows.length - 1))
         : rows.length - 1
@@ -1839,6 +2013,7 @@ export const SubJsonExtMixin = {
     },
     insertDnsRouteRow(this: any, index: number) {
       const rows = this.getNormalizedDnsRouteRows()
+	  if (rows.length >= SUBSCRIPTION_UI_MAX_DNS_ROUTE_ROWS) return
       const safeIndex = Number.isInteger(index)
         ? Math.max(-1, Math.min(index, rows.length - 1))
         : rows.length - 1
@@ -1872,6 +2047,8 @@ export const SubJsonExtMixin = {
     onRuleSetSourceChanged(this: any) {
       if (this._suspendRuleRegeneration) return
       this.autoMatchRunToken = (this.autoMatchRunToken || 0) + 1
+      this._probeAbortController?.abort()
+      this._probeAbortController = new AbortController()
       this.clearAutoMatchedRuleSetUrlsForGlobalSourceRows()
       this.autoMatchAllRuleSetEntries(true)
     },
@@ -1987,7 +2164,67 @@ export const SubJsonExtMixin = {
     ) {
       const source = normalizeRuleSetSourceSelection(sourceContext?.source)
       const sourceBinding: RuleSetSourceBinding = sourceContext?.sourceBinding === 'override' ? 'override' : 'global'
-	  void this.tryAutoMatchRuleSetEntry(rawName, prefix, typeLabel, { source, sourceBinding })
+	  const cleanName = isHttpRuleSetInput(rawName) ? extractRuleSetNameFromUrl(rawName) : normalizeName(rawName)
+	  if (!cleanName) return
+	  const key = `${sourceBinding}:${prefix}:${cleanName}:${source}`
+	  this._probeBatch.set(key, { rawName, prefix, typeLabel, source, sourceBinding })
+	  if (this._probeDebounceTimer != null) window.clearTimeout(this._probeDebounceTimer)
+	  this._probeDebounceTimer = window.setTimeout(() => {
+		this._probeDebounceTimer = null
+		void this.flushAutoMatchProbeBatch()
+	  }, SUBSCRIPTION_RULE_SET_PROBE_DEBOUNCE_MS)
+    },
+    async flushAutoMatchProbeBatch(this: any) {
+	  if (this._probeBatchRunning || this._probeBatch.size === 0) return
+	  this._probeBatchRunning = true
+	  const token = this.autoMatchRunToken || 0
+	  const entries = Array.from(this._probeBatch.values()) as RuleSetProbeBatchEntry[]
+	  this._probeBatch.clear()
+	  try {
+		for (let offset = 0; offset < entries.length; offset += SUBSCRIPTION_RULE_SET_PROBE_BATCH_SIZE) {
+		  if (token !== (this.autoMatchRunToken || 0) || this._probeAbortController?.signal?.aborted) return
+		  const chunk = entries.slice(offset, offset + SUBSCRIPTION_RULE_SET_PROBE_BATCH_SIZE)
+		  const results = await probeSubscriptionRuleSets(chunk.map((entry: RuleSetProbeBatchEntry) => {
+			const fromUrl = isHttpRuleSetInput(entry.rawName)
+			const cleanName = fromUrl ? extractRuleSetNameFromUrl(entry.rawName) : normalizeName(entry.rawName)
+			return {
+			  id: `${entry.sourceBinding}:${entry.prefix}:${cleanName}`,
+			  kind: 'json',
+			  sourceId: entry.source,
+			  scope: entry.prefix === 'geoip' ? 'ip' : 'domain',
+			  name: fromUrl ? undefined : cleanName,
+			  url: fromUrl ? entry.rawName.trim() : undefined,
+			  allowFallback: entry.sourceBinding === 'global',
+			}
+		  }), this._probeAbortController?.signal)
+		  if (token !== (this.autoMatchRunToken || 0) || this._probeAbortController?.signal?.aborted) return
+		  results.forEach((probe: any, index: number) => {
+			const entry = chunk[index]
+			if (!entry) return
+			const fromUrl = isHttpRuleSetInput(entry.rawName)
+			const cleanName = fromUrl ? extractRuleSetNameFromUrl(entry.rawName) : normalizeName(entry.rawName)
+			const key = fromUrl ? '' : getRuleSetAutoMatchKey(entry.prefix, cleanName, entry.source, entry.sourceBinding)
+			if (!probe?.valid) {
+			  if (key && this.autoMatchedRuleSetUrls?.[key]) {
+				const next = { ...this.autoMatchedRuleSetUrls }
+				delete next[key]
+				this.autoMatchedRuleSetUrls = next
+			  }
+			  return
+			}
+			const matchedSource = probe.sourceId || entry.source
+			const matchedUrl = probe.url || (fromUrl ? entry.rawName.trim() : '')
+			if (!key || !matchedUrl) return
+			const current = this.autoMatchedRuleSetUrls?.[key]
+			if (current?.url === matchedUrl && current?.source === matchedSource) return
+			this.autoMatchedRuleSetUrls = { ...(this.autoMatchedRuleSetUrls || {}), [key]: { url: matchedUrl, source: matchedSource } }
+		  })
+		}
+		this.regenerateRuleConfig()
+	  } finally {
+		this._probeBatchRunning = false
+		if (this._probeBatch.size > 0 && token === (this.autoMatchRunToken || 0)) void this.flushAutoMatchProbeBatch()
+	  }
     },
     async tryAutoMatchRuleSetEntry(
       this: any,
@@ -1995,60 +2232,9 @@ export const SubJsonExtMixin = {
       prefix: 'geosite' | 'geoip',
       typeLabel: string,
       sourceContext: { source: string; sourceBinding: RuleSetSourceBinding }
-    ) {
-      const fromUrl = isHttpRuleSetInput(rawName)
-      const cleanName = fromUrl ? extractRuleSetNameFromUrl(rawName) : normalizeName(rawName)
-      if (!cleanName) return
-
-      const token = this.autoMatchRunToken || 0
-      const currentSource = normalizeRuleSetSourceSelection(sourceContext?.source)
-      const sourceBinding: RuleSetSourceBinding = sourceContext?.sourceBinding === 'override' ? 'override' : 'global'
-      const allowFallback = sourceBinding === 'global'
-	  const probeId = `${sourceBinding}:${prefix}:${cleanName}`
-	  const [probe] = await probeSubscriptionRuleSets([{
-	    id: probeId,
-	    kind: 'json',
-	    sourceId: currentSource,
-	    scope: prefix === 'geoip' ? 'ip' : 'domain',
-	    name: fromUrl ? undefined : cleanName,
-	    url: fromUrl ? rawName.trim() : undefined,
-	    allowFallback,
-	  }], this._probeAbortController?.signal)
-	  if (token !== (this.autoMatchRunToken || 0) || this._probeAbortController?.signal?.aborted) return
-
-	  const key = fromUrl ? '' : getRuleSetAutoMatchKey(prefix, cleanName, currentSource, sourceBinding)
-	  if (!probe?.valid) {
-	    if (key && this.autoMatchedRuleSetUrls?.[key]) {
-	      const next = { ...this.autoMatchedRuleSetUrls }
-	      delete next[key]
-	      this.autoMatchedRuleSetUrls = next
-	      this.regenerateRuleConfig()
-	    }
-	    push.warning({
-	      title: String(i18n.global.t('subscriptionEditor.probeTitle')),
-	      message: String(i18n.global.t('subscriptionEditor.probeFailed', { type: typeLabel, name: cleanName, error: probe?.error || 'Unavailable' })),
-	      duration: 4000,
-	    })
-	    return
-	  }
-
-	  const matchedSource = probe.sourceId || currentSource
-	  const matchedUrl = probe.url || (fromUrl ? rawName.trim() : '')
-	  push.success({
-	    title: String(i18n.global.t('subscriptionEditor.probeTitle')),
-	    message: allowFallback && currentSource && matchedSource !== currentSource
-	      ? String(i18n.global.t('subscriptionEditor.probeFallback', { type: typeLabel, name: cleanName, source: this.getRuleSetSourceTitle(matchedSource) }))
-	      : String(i18n.global.t('subscriptionEditor.probeAvailable', { type: typeLabel, name: cleanName })),
-	    duration: 3000,
-	  })
-	  if (!key || !matchedUrl) return
-	  const current = this.autoMatchedRuleSetUrls?.[key]
-	  if (current?.url === matchedUrl && current?.source === matchedSource) return
-	  this.autoMatchedRuleSetUrls = {
-	    ...(this.autoMatchedRuleSetUrls || {}),
-	    [key]: { url: matchedUrl, source: matchedSource },
-	  }
-	  this.regenerateRuleConfig()
+	) {
+	  // Kept as a compatibility entry point for callers that validate one row.
+	  this.scheduleAutoMatchForEntry(rawName, prefix, typeLabel, sourceContext)
     },
     updateJson(this: any) {
       if (this.subJsonExt?.route_final !== undefined) {
@@ -2441,6 +2627,7 @@ export const SubJsonExtMixin = {
     },
     editorData(this: any): string {
 	  if (this._parseError) return this._rawSource || ''
+	  if (this.formRowsTooLarge) return this._rawSource || ''
       if (Object.keys(this.subJsonExt).length === 0) return ''
 	  return JSON.stringify(this.subJsonExt, null, 2)
     },
@@ -2496,7 +2683,8 @@ export const SubJsonExtMixin = {
     },
     enableLog: {
       get(this: any): boolean {
-        return this.subJsonExt?.log !== undefined
+        const value = this.subJsonExt?.log
+        return value !== null && typeof value === 'object' && !Array.isArray(value)
       },
       set(this: any, v: boolean) {
         if (v) {
@@ -2509,7 +2697,8 @@ export const SubJsonExtMixin = {
     },
     enableDns: {
       get(this: any): boolean {
-        return this.subJsonExt?.dns !== undefined
+        const value = this.subJsonExt?.dns
+        return value !== null && typeof value === 'object' && !Array.isArray(value)
       },
       set(this: any, v: boolean) {
         if (v) {
@@ -2522,7 +2711,7 @@ export const SubJsonExtMixin = {
     },
     enableInb: {
       get(this: any): boolean {
-        return this.subJsonExt?.inbounds !== undefined
+        return Array.isArray(this.subJsonExt?.inbounds)
       },
       set(this: any, v: boolean) {
         if (v) {
@@ -2535,7 +2724,8 @@ export const SubJsonExtMixin = {
     },
     enableExp: {
       get(this: any): boolean {
-        return this.subJsonExt?.experimental !== undefined
+        const value = this.subJsonExt?.experimental
+        return value !== null && typeof value === 'object' && !Array.isArray(value)
       },
       set(this: any, v: boolean) {
         if (v) {
@@ -2548,7 +2738,8 @@ export const SubJsonExtMixin = {
     },
     enableSubClashApi: {
       get(this: any): boolean {
-        return this.subJsonExt?.experimental?.clash_api !== undefined
+        const value = this.subJsonExt?.experimental?.clash_api
+        return value !== null && typeof value === 'object' && !Array.isArray(value)
       },
       set(this: any, v: boolean) {
         if (v) {
@@ -2665,7 +2856,7 @@ export const SubJsonExtMixin = {
     },
     final: {
       get(this: any): string {
-        return this.subJsonExt?.dns?.final ?? 'direct-dns'
+        return this.subJsonExt?.dns?.final ?? 'proxy-dns'
       },
       set(this: any, v: string) {
         if (this.subJsonExt?.dns) this.subJsonExt.dns.final = v

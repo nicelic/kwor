@@ -2,6 +2,9 @@ package util
 
 import (
 	"encoding/json"
+	"io"
+	"math"
+	"net"
 	"os"
 	"strings"
 
@@ -11,13 +14,27 @@ import (
 	"github.com/alireza0/s-ui/database/model"
 )
 
+const maxTLSPEMFileBytes int64 = 2 * 1024 * 1024
+
 // readPemFile 读取 PEM 文件并返回行数组
 func readPemFile(path string) []string {
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		logger.Warningf("failed to read PEM file %s: %v", path, err)
 		return nil
 	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, maxTLSPEMFileBytes+1))
+	if err != nil {
+		logger.Warningf("failed to read PEM file %s: %v", path, err)
+		return nil
+	}
+	if int64(len(data)) > maxTLSPEMFileBytes {
+		logger.Warningf("PEM file %s exceeds the %d byte limit", path, maxTLSPEMFileBytes)
+		return nil
+	}
+
 	content := strings.TrimSpace(string(data))
 	if content == "" {
 		return nil
@@ -37,6 +54,7 @@ func hasNonEmptySlice(value interface{}) bool {
 }
 
 func positiveIntFromAny(value interface{}) (int, bool) {
+	maxInt := int64(^uint(0) >> 1)
 	switch v := value.(type) {
 	case int:
 		return v, v > 0
@@ -47,11 +65,18 @@ func positiveIntFromAny(value interface{}) (int, bool) {
 	case int32:
 		return int(v), v > 0
 	case int64:
-		return int(v), v > 0
+		return int(v), v > 0 && v <= maxInt
 	case float32:
-		return int(v), v > 0
+		value := float64(v)
+		if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) || math.Trunc(value) != value || value > float64(maxInt) {
+			return 0, false
+		}
+		return int(value), true
 	case float64:
-		return int(v), v > 0
+		if v <= 0 || math.IsNaN(v) || math.IsInf(v, 0) || math.Trunc(v) != v || v > float64(maxInt) {
+			return 0, false
+		}
+		return int(v), true
 	default:
 		return 0, false
 	}
@@ -89,12 +114,11 @@ func FillOutJson(i *model.Inbound, hostname string) error {
 		// ShadowQUIC has native sni/alpn fields and must never inherit mihomo_TLS.
 		delete(outJson, "tls")
 	} else if i.TlsId > 0 {
-		addTls(&outJson, i.Tls)
+		addTls(&outJson, i.Tls, i.Type)
 	} else {
-		// ShadowTLS 的客户端配置使用 out_json.tls（包含 utls/fingerprint），
-		// 不能在这里清空，否则会导致前端保存后被重置。
-		if i.Type != "shadowtls" {
-			delete(outJson, "tls")
+		delete(outJson, "tls")
+		if strings.EqualFold(strings.TrimSpace(i.Type), "shadowsocks") {
+			clearMihomoShadowsocksPlugin(outJson)
 		}
 	}
 
@@ -155,7 +179,11 @@ func FillOutJson(i *model.Inbound, hostname string) error {
 }
 
 // addTls function
-func addTls(out *map[string]interface{}, tls *model.Tls) {
+func addTls(out *map[string]interface{}, tls *model.Tls, inboundType ...string) {
+	if out == nil || tls == nil {
+		return
+	}
+
 	var tlsServer, tlsConfig map[string]interface{}
 	err := json.Unmarshal(tls.Server, &tlsServer)
 	if err != nil {
@@ -163,6 +191,29 @@ func addTls(out *map[string]interface{}, tls *model.Tls) {
 	}
 	err = json.Unmarshal(tls.Client, &tlsConfig)
 	if err != nil {
+		return
+	}
+	if tlsServer == nil {
+		tlsServer = map[string]interface{}{}
+	}
+	if tlsConfig == nil {
+		tlsConfig = map[string]interface{}{}
+	}
+
+	mode := tls.Mode
+	if mode == "" {
+		mode = model.NormalizeMihomoTlsMode("", tls.Server, tls.Client)
+	}
+	if len(inboundType) > 0 && strings.EqualFold(strings.TrimSpace(inboundType[0]), "shadowsocks") {
+		clearMihomoShadowsocksPlugin(*out)
+	}
+	if mode == model.MihomoTlsModeShadowTLS || mode == model.MihomoTlsModeRestls || mode == model.MihomoTlsModeJLS {
+		if len(inboundType) > 0 && strings.EqualFold(strings.TrimSpace(inboundType[0]), "shadowsocks") {
+			addMihomoShadowsocksWrapper(out, tlsConfig, tlsServer, mode)
+			return
+		}
+		addMihomoWrapperTLS(tlsConfig, tlsServer, mode)
+		(*out)["tls"] = tlsConfig
 		return
 	}
 
@@ -215,20 +266,33 @@ func addTls(out *map[string]interface{}, tls *model.Tls) {
 	if cipherSuites, ok := tlsServer["cipher_suites"]; ok {
 		tlsConfig["cipher_suites"] = cipherSuites
 	}
-	if reality, ok := tlsServer["reality"].(map[string]interface{}); ok && reality["enabled"].(bool) {
-		realityConfig := tlsConfig["reality"].(map[string]interface{})
-		realityConfig["enabled"] = true
-		if shortIDs, ok := reality["short_id"].([]interface{}); ok && len(shortIDs) > 0 {
-			realityConfig["short_id"] = shortIDs[common.RandomInt(len(shortIDs))]
+	if reality, ok := tlsServer["reality"].(map[string]interface{}); ok {
+		realityEnabled, enabledOK := reality["enabled"].(bool)
+		if enabledOK && realityEnabled {
+			realityConfig, configOK := tlsConfig["reality"].(map[string]interface{})
+			if !configOK || realityConfig == nil {
+				realityConfig = map[string]interface{}{}
+			}
+			realityConfig["enabled"] = true
+			if shortIDs, ok := reality["short_id"].([]interface{}); ok && len(shortIDs) > 0 {
+				realityConfig["short_id"] = shortIDs[common.RandomInt(len(shortIDs))]
+			}
+			tlsConfig["reality"] = realityConfig
 		}
-		tlsConfig["reality"] = realityConfig
 	}
-	if ech, ok := tlsServer["ech"].(map[string]interface{}); ok && ech["enabled"].(bool) {
-		echConfig := tlsConfig["ech"].(map[string]interface{})
-		echConfig["enabled"] = true
-		echConfig["pq_signature_schemes_enabled"] = ech["pq_signature_schemes_enabled"]
-		echConfig["dynamic_record_sizing_disabled"] = ech["dynamic_record_sizing_disabled"]
-		tlsConfig["ech"] = echConfig
+
+	if ech, ok := tlsServer["ech"].(map[string]interface{}); ok {
+		echEnabled, enabledOK := ech["enabled"].(bool)
+		if enabledOK && echEnabled {
+			echConfig, configOK := tlsConfig["ech"].(map[string]interface{})
+			if !configOK || echConfig == nil {
+				echConfig = map[string]interface{}{}
+			}
+			echConfig["enabled"] = true
+			echConfig["pq_signature_schemes_enabled"] = ech["pq_signature_schemes_enabled"]
+			echConfig["dynamic_record_sizing_disabled"] = ech["dynamic_record_sizing_disabled"]
+			tlsConfig["ech"] = echConfig
+		}
 	}
 
 	// mTLS: 当 client_authentication 不为 "no" 时，从 tls.Client 中读取客户端证书/密钥
@@ -271,6 +335,197 @@ func addTls(out *map[string]interface{}, tls *model.Tls) {
 	delete(tlsConfig, "store")
 
 	(*out)["tls"] = tlsConfig
+}
+
+func addMihomoShadowsocksWrapper(out *map[string]interface{}, client, server map[string]interface{}, mode string) {
+	if out == nil {
+		return
+	}
+	pluginOpts := map[string]interface{}{}
+	wrapperHost := ""
+	if value := strings.TrimSpace(firstStringFromAny(client["server_name"])); value != "" {
+		wrapperHost = value
+	}
+	var wrapper map[string]interface{}
+	switch mode {
+	case model.MihomoTlsModeShadowTLS:
+		wrapper, _ = server["shadow_tls"].(map[string]interface{})
+	case model.MihomoTlsModeRestls:
+		wrapper, _ = server["res_tls"].(map[string]interface{})
+	case model.MihomoTlsModeJLS:
+		wrapper, _ = server["jls_config"].(map[string]interface{})
+	}
+	if wrapper != nil {
+		if wrapperHost == "" {
+			wrapperHost = strings.TrimSpace(firstStringFromAny(wrapper["sni"]))
+		}
+		if wrapperHost == "" {
+			wrapperHost = mihomoWrapperHost(firstStringFromAny(wrapper["dest"]))
+		}
+		if wrapperHost == "" {
+			if handshake, ok := wrapper["handshake"].(map[string]interface{}); ok && handshake != nil {
+				wrapperHost = mihomoWrapperHost(firstStringFromAny(handshake["dest"]))
+			}
+		}
+	}
+	if wrapperHost != "" {
+		pluginOpts["host"] = wrapperHost
+	}
+	switch mode {
+	case model.MihomoTlsModeShadowTLS:
+		if wrapper != nil {
+			if version, ok := positiveIntFromAny(wrapper["version"]); ok {
+				pluginOpts["version"] = version
+			}
+		}
+		if opts, ok := client["shadow_tls_opts"].(map[string]interface{}); ok && opts != nil {
+			if password := strings.TrimSpace(firstStringFromAny(opts["password"])); password != "" {
+				pluginOpts["password"] = password
+			}
+			if version, ok := positiveIntFromAny(opts["version"]); ok {
+				pluginOpts["version"] = version
+			}
+		}
+		(*out)["plugin"] = "shadow-tls"
+	case model.MihomoTlsModeRestls:
+		if opts, ok := client["restls_opts"].(map[string]interface{}); ok && opts != nil {
+			if password := strings.TrimSpace(firstStringFromAny(opts["password"])); password != "" {
+				pluginOpts["password"] = password
+			}
+			if hint := strings.TrimSpace(firstStringFromAny(opts["version_hint"])); hint != "" {
+				pluginOpts["version_hint"] = hint
+			}
+			if script := firstStringFromAny(opts["restls_script"]); script != "" {
+				pluginOpts["restls_script"] = script
+			}
+		}
+		if script := firstStringFromAnyMap(wrapper, "restls_script"); script != "" {
+			pluginOpts["restls_script"] = script
+		}
+		(*out)["plugin"] = "restls"
+	case model.MihomoTlsModeJLS:
+		if opts, ok := client["jls_opts"].(map[string]interface{}); ok && opts != nil {
+			for _, key := range []string{"username", "password"} {
+				if value := strings.TrimSpace(firstStringFromAny(opts[key])); value != "" {
+					pluginOpts[key] = value
+				}
+			}
+		}
+		if wrapper != nil {
+			if alpn, ok := wrapper["alpn"]; ok {
+				pluginOpts["alpn"] = alpn
+			}
+		}
+		(*out)["plugin"] = "jls"
+	}
+	if len(pluginOpts) > 0 {
+		(*out)["plugin_opts"] = pluginOpts
+	}
+	if utls, ok := client["utls"].(map[string]interface{}); ok && utls != nil {
+		if fingerprint := strings.TrimSpace(firstStringFromAny(utls["fingerprint"])); fingerprint != "" {
+			(*out)["client_fingerprint"] = fingerprint
+		}
+	}
+	delete(*out, "tls")
+}
+
+func firstStringFromAnyMap(value map[string]interface{}, key string) string {
+	if value == nil {
+		return ""
+	}
+	return firstStringFromAny(value[key])
+}
+
+func mihomoWrapperHost(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		return strings.Trim(host, "[]")
+	}
+	if strings.HasPrefix(value, "[") {
+		if end := strings.Index(value, "]"); end > 1 {
+			return value[1:end]
+		}
+	}
+	if strings.Count(value, ":") == 1 {
+		return strings.TrimSpace(strings.SplitN(value, ":", 2)[0])
+	}
+	return value
+}
+
+func addMihomoWrapperTLS(client map[string]interface{}, server map[string]interface{}, mode string) {
+	if client == nil {
+		return
+	}
+	client["enabled"] = true
+	serverName := strings.TrimSpace(firstStringFromAny(server["server_name"]))
+	var wrapper map[string]interface{}
+	switch mode {
+	case model.MihomoTlsModeShadowTLS:
+		wrapper, _ = server["shadow_tls"].(map[string]interface{})
+	case model.MihomoTlsModeRestls:
+		wrapper, _ = server["res_tls"].(map[string]interface{})
+	case model.MihomoTlsModeJLS:
+		wrapper, _ = server["jls_config"].(map[string]interface{})
+	}
+	if serverName == "" && wrapper != nil {
+		serverName = strings.TrimSpace(firstStringFromAny(wrapper["sni"]))
+		if serverName == "" {
+			serverName = mihomoWrapperHost(firstStringFromAny(wrapper["dest"]))
+		}
+		if serverName == "" {
+			if handshake, ok := wrapper["handshake"].(map[string]interface{}); ok && handshake != nil {
+				serverName = mihomoWrapperHost(firstStringFromAny(handshake["dest"]))
+			}
+		}
+	}
+	if serverName != "" && strings.TrimSpace(firstStringFromAny(client["server_name"])) == "" {
+		client["server_name"] = serverName
+	}
+	if mode == model.MihomoTlsModeJLS && wrapper != nil {
+		if _, exists := client["alpn"]; !exists {
+			if alpn := wrapper["alpn"]; alpn != nil {
+				client["alpn"] = alpn
+			}
+		}
+	}
+
+	// The internal snake_case fields stay inside the reusable TLS template.
+	// Clash/Mihomo projection converts them to the official hyphenated keys.
+	switch mode {
+	case model.MihomoTlsModeShadowTLS:
+		if opts, ok := client["shadow_tls_opts"].(map[string]interface{}); ok && opts != nil {
+			client["shadow_tls_opts"] = opts
+		}
+	case model.MihomoTlsModeRestls:
+		if opts, ok := client["restls_opts"].(map[string]interface{}); ok && opts != nil {
+			if strings.TrimSpace(firstStringFromAny(opts["restls_script"])) == "" && wrapper != nil {
+				if script := strings.TrimSpace(firstStringFromAny(wrapper["restls_script"])); script != "" {
+					opts["restls_script"] = script
+				}
+			}
+			client["restls_opts"] = opts
+		}
+	case model.MihomoTlsModeJLS:
+		if opts, ok := client["jls_opts"].(map[string]interface{}); ok && opts != nil {
+			client["jls_opts"] = opts
+		}
+	}
+}
+
+func clearMihomoShadowsocksPlugin(out map[string]interface{}) {
+	if out == nil {
+		return
+	}
+	plugin := strings.ToLower(strings.TrimSpace(firstStringFromAny(out["plugin"])))
+	if plugin != "shadow-tls" && plugin != "shadowtls" && plugin != "restls" && plugin != "res-tls" && plugin != "jls" {
+		return
+	}
+	for _, key := range []string{"plugin", "plugin_opts", "plugin-opts", "client_fingerprint", "client-fingerprint"} {
+		delete(out, key)
+	}
 }
 
 // Protocol-specific functions
@@ -354,8 +609,8 @@ func shadowQUICOut(out *map[string]interface{}, inbound map[string]interface{}) 
 		return
 	}
 
-	// The listener owns these protocol fields. Remove a previously generated
-	// client value before copying the current server-side configuration.
+	// The listener owns these shared protocol fields. Client up/down bandwidth
+	// values remain in out_json and are not overwritten by listener settings.
 	for _, key := range []string{
 		"sni",
 		"alpn",
@@ -365,8 +620,6 @@ func shadowQUICOut(out *map[string]interface{}, inbound map[string]interface{}) 
 		"zero-rtt",
 		"congestion_controller",
 		"congestion-controller",
-		"up",
-		"down",
 		"cwnd",
 		"bbr_profile",
 		"bbr-profile",
@@ -407,8 +660,6 @@ func shadowQUICOut(out *map[string]interface{}, inbound map[string]interface{}) 
 	if controller, ok := NormalizeMihomoShadowQUICCongestionController(firstShadowQUICValue(inbound, "congestion_controller", "congestion-controller")); ok {
 		(*out)["congestion_controller"] = controller
 	}
-	copyShadowQUICBandwidth(inbound, *out, "up", "up")
-	copyShadowQUICBandwidth(inbound, *out, "down", "down")
 	copyShadowQUICNonNegativeInt(inbound, *out, "cwnd", "cwnd")
 	if profile, ok := NormalizeMihomoBBRProfile(firstShadowQUICValue(inbound, "bbr_profile", "bbr-profile")); ok {
 		(*out)["bbr_profile"] = profile
@@ -877,6 +1128,14 @@ func sshOut(out *map[string]interface{}, inbound map[string]interface{}) {
 
 func naiveOut(out *map[string]interface{}, inbound map[string]interface{}) {
 	delete(*out, "network")
+
+	quicCongestionControl := strings.ToLower(strings.TrimSpace(firstStringFromAny((*out)["quic_congestion_control"])))
+	switch quicCongestionControl {
+	case "bbr", "bbr2", "cubic", "reno":
+		(*out)["quic_congestion_control"] = quicCongestionControl
+	default:
+		delete(*out, "quic_congestion_control")
+	}
 }
 
 func snellOut(out *map[string]interface{}, inbound map[string]interface{}) {

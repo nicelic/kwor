@@ -37,6 +37,7 @@
             size="x-small"
             variant="text"
             :loading="statusLoading"
+            :disabled="statusLoading || coreControlBusy"
             @click="refreshAll(true)"
           >
             <v-icon size="18">mdi-refresh</v-icon>
@@ -56,7 +57,7 @@
             variant="tonal"
             size="small"
             prepend-icon="mdi-delete"
-            :disabled="!installed || downloading || coreDownloadTaskActive || startingCore || stoppingCore || restartingCore || deletingCore"
+            :disabled="!installed || downloading || coreDownloadTaskActive || coreControlBusy"
             :loading="deletingCore"
             @click="deleteCore"
           >
@@ -140,6 +141,21 @@
           {{ feedbackMsg }}
         </v-alert>
 
+        <v-row align="center" class="mb-4">
+          <v-col cols="12" sm="6" class="core-mobile-full">
+            <v-select
+              v-model="coreLogLevel"
+              :items="coreLogLevelItems"
+              :label="t('coreManager.logLevel')"
+              variant="outlined"
+              density="compact"
+              hide-details
+              :disabled="coreLogLevelSaving || coreControlBusy || coreDownloadTaskActive"
+              @update:model-value="saveCoreLogLevel"
+            />
+          </v-col>
+        </v-row>
+
         <v-card v-if="downloading" variant="outlined" rounded="lg" class="mb-4">
           <v-card-text>
             <div class="text-caption text-medium-emphasis mb-2">
@@ -221,7 +237,7 @@
               color="primary"
               variant="flat"
               :prepend-icon="coreDownloadTaskActive ? (coreDownloadTaskApplying ? 'mdi-progress-wrench' : 'mdi-stop') : 'mdi-download'"
-              :disabled="coreDownloadTaskStopping || coreDownloadTaskApplying || (!coreDownloadTaskActive && (!canDownloadSelectedVersion || downloading))"
+              :disabled="coreControlBusy || coreDownloadTaskStopping || coreDownloadTaskApplying || (!coreDownloadTaskActive && (!canDownloadSelectedVersion || downloading))"
               @click="coreDownloadTaskActive ? stopCoreDownload() : downloadCore()"
             >
               {{ coreDownloadTaskActive ? coreDownloadStopLabel : t('coreManager.download') }}
@@ -274,7 +290,7 @@
               color="secondary"
               variant="flat"
               prepend-icon="mdi-link-variant-plus"
-              :disabled="coreDownloadTaskActive || !canDownloadCustom || downloading"
+              :disabled="coreControlBusy || coreDownloadTaskActive || !canDownloadCustom || downloading"
               @click="downloadCoreFromCustomURL"
             >
               {{ t('coreManager.customDownload') }}
@@ -329,12 +345,15 @@
               density="compact"
               hide-details
               :label="t('coreManager.enableAutoCheck')"
+              :loading="autoCheckSaving"
+              :disabled="autoCheckSaving || autoUpdateSaving || intervalSaving"
+              @update:model-value="saveAutoCheckEnabled"
             ></v-switch>
           </v-col>
           <v-col cols="12" sm="4">
             <v-text-field
               v-model="autoCheckIntervalInput"
-              :disabled="!autoCheckEnabled"
+              :disabled="!autoCheckEnabled || autoCheckSaving || autoUpdateSaving || intervalSaving"
               :label="t('coreManager.checkInterval')"
               suffix="h"
               variant="outlined"
@@ -348,8 +367,9 @@
               color="primary"
               variant="flat"
               size="small"
-              :loading="autoCheckSaving"
-              @click="saveAutoCheckSettings"
+              :disabled="!autoCheckEnabled || autoCheckSaving || autoUpdateSaving || intervalSaving"
+              :loading="intervalSaving"
+              @click="saveAutoCheckInterval"
             >
               {{ t('actions.save') }}
             </v-btn>
@@ -365,6 +385,8 @@
               hide-details
               :label="t('coreManager.enableAutoUpdate')"
               :disabled="autoUpdateSwitchDisabled"
+              :loading="autoUpdateSaving"
+              @update:model-value="saveAutoUpdateEnabled"
             ></v-switch>
           </v-col>
           <v-col cols="12" sm="5">
@@ -452,7 +474,7 @@
                   variant="flat"
                   size="small"
                   prepend-icon="mdi-play"
-                  :disabled="coreDownloadTaskActive || coreRunning || !coreReady"
+                  :disabled="coreDownloadTaskActive || coreControlBusy || coreRunning || !coreReady"
                   :loading="startingCore"
                   @click="startCore"
                 >
@@ -463,7 +485,7 @@
                   variant="flat"
                   size="small"
                   prepend-icon="mdi-stop"
-                  :disabled="coreDownloadTaskActive || !coreRunning"
+                  :disabled="coreDownloadTaskActive || coreControlBusy || !coreRunning"
                   :loading="stoppingCore"
                   @click="stopCore"
                 >
@@ -474,7 +496,7 @@
                   variant="flat"
                   size="small"
                   prepend-icon="mdi-restart"
-                  :disabled="coreDownloadTaskActive || !coreRunning || !coreReady"
+                  :disabled="coreDownloadTaskActive || coreControlBusy || !coreRunning || !coreReady"
                   :loading="restartingCore"
                   @click="restartCore"
                 >
@@ -573,6 +595,7 @@ const mihomoCore = {
   updateSettingsEndpoint: 'api/mihomo-core-update-settings',
   updateAckEndpoint: 'api/mihomo-core-update-ack',
   downloadPreferenceEndpoint: 'api/mihomo-core-download-preference',
+  logLevelEndpoint: 'api/mihomo-core-log-level',
   downloadEndpoint: 'api/mihomo-coreDownload',
   startEndpoint: 'api/mihomo-coreStart',
   stopEndpoint: 'api/mihomo-coreStop',
@@ -585,6 +608,8 @@ const supportsPrereleaseChannel = computed(() => true)
 const showLinuxArchSelector = computed(() => true)
 
 const statusLoading = ref(false)
+const statusRequestSeq = ref(0)
+const updateInfoRequestSeq = ref(0)
 const localVersion = ref('')
 const versionInfo = ref('')
 const platform = ref('')
@@ -592,6 +617,16 @@ const coreRunning = ref(false)
 const installed = ref(false)
 const compatible = ref(false)
 const installedChannel = ref<'stable' | 'alpha' | ''>('')
+const coreLogLevel = ref('silent')
+const confirmedCoreLogLevel = ref('silent')
+const coreLogLevelSaving = ref(false)
+const coreLogLevelItems = [
+  { title: 'silent', value: 'silent' },
+  { title: 'error', value: 'error' },
+  { title: 'warning', value: 'warning' },
+  { title: 'info', value: 'info' },
+  { title: 'debug', value: 'debug' },
+]
 
 const remoteLoading = ref(false)
 const remoteLoaded = ref(false)
@@ -654,14 +689,34 @@ const downloadingVersion = ref('')
 const downloadProgressSessionId = ref('')
 const downloadProgressTimerId = ref<number | null>(null)
 let downloadProgressRequest: Promise<void> | null = null
+let downloadProgressController: AbortController | null = null
+let recoverDownloadProgressController: AbortController | null = null
 const startingCore = ref(false)
 const stoppingCore = ref(false)
 const restartingCore = ref(false)
 const deletingCore = ref(false)
 const autoCheckSaving = ref(false)
+const autoUpdateSaving = ref(false)
+const intervalSaving = ref(false)
 const feedbackMsg = ref('')
 const feedbackType = ref<'success' | 'error' | 'info'>('info')
 let downloadFeedbackTimer: number | null = null
+const coreActionTimers = new Set<number>()
+
+const scheduleCoreAction = (callback: () => void, delay: number) => {
+  const timer = window.setTimeout(() => {
+    coreActionTimers.delete(timer)
+    callback()
+  }, delay)
+  coreActionTimers.add(timer)
+}
+
+const clearCoreActionTimers = () => {
+  for (const timer of coreActionTimers) {
+    window.clearTimeout(timer)
+  }
+  coreActionTimers.clear()
+}
 
 const autoCheckEnabled = ref(false)
 const autoCheckIntervalInput = ref('12')
@@ -742,6 +797,9 @@ const canDownloadSelectedVersion = computed(() => (
   Boolean(selectedVersion.value) && hasCompleteLinuxTargetSelection.value
 ))
 const coreReady = computed(() => installed.value && compatible.value)
+const coreControlBusy = computed(() => (
+  startingCore.value || stoppingCore.value || restartingCore.value || deletingCore.value
+))
 
 const latestRemoteVersion = computed(() => {
   if (versionList.value.length === 0) {
@@ -910,7 +968,7 @@ const autoUpdateLastSuccessDisplay = computed(() => (
   autoUpdateLastSuccessAt.value > 0 ? formatPanelDateTime(autoUpdateLastSuccessAt.value * 1000) : ''
 ))
 const autoUpdateSwitchDisabled = computed(() => (
-  autoCheckSaving.value || autoUpdateDisabled.value
+  !autoCheckEnabled.value || autoCheckSaving.value || autoUpdateSaving.value || intervalSaving.value || autoUpdateDisabled.value
 ))
 const autoUpdateDisabledReasonText = computed(() => (
   autoUpdateDisabled.value ? autoUpdateDisableReason.value.trim() : ''
@@ -1197,6 +1255,8 @@ watch([selectedLinuxArch, selectedAmd64Level], () => {
 
 const close = () => {
   stopDownloadProgressPolling()
+  recoverDownloadProgressController?.abort()
+  recoverDownloadProgressController = null
   emit('close')
   emit('update:modelValue', false)
 }
@@ -1278,9 +1338,11 @@ const makeDownloadSessionId = () => {
 
 const stopDownloadProgressPolling = () => {
   if (downloadProgressTimerId.value != null) {
-    window.clearInterval(downloadProgressTimerId.value)
+    window.clearTimeout(downloadProgressTimerId.value)
     downloadProgressTimerId.value = null
   }
+	downloadProgressController?.abort()
+	downloadProgressController = null
 }
 
 const isTerminalCoreDownload = (progress: CoreDownloadProgress) => (
@@ -1325,7 +1387,10 @@ const pollDownloadProgress = async (): Promise<void> => {
     return
   }
   const request = (async () => {
-    const data = await HttpUtils.get(mihomoCore.progressEndpoint, { id: sessionId }, { silentAuthCheck: true })
+		const controller = new AbortController()
+		downloadProgressController = controller
+		const data = await HttpUtils.get(mihomoCore.progressEndpoint, { id: sessionId }, { silentAuthCheck: true, signal: controller.signal })
+		if (controller.signal.aborted || downloadProgressController !== controller) return
     if (sessionId !== downloadProgressSessionId.value.trim()) return
     if (!data.success) {
       return
@@ -1350,20 +1415,39 @@ const pollDownloadProgress = async (): Promise<void> => {
   }
 }
 
+const scheduleDownloadProgressPolling = (delay = 800) => {
+  if (!dialogVisible.value || !coreDownloadTaskActive.value || !downloadProgressSessionId.value.trim()) return
+  if (downloadProgressTimerId.value != null) window.clearTimeout(downloadProgressTimerId.value)
+  downloadProgressTimerId.value = window.setTimeout(async () => {
+    downloadProgressTimerId.value = null
+    try {
+      await pollDownloadProgress()
+    } catch {
+      // The next scheduled pass will retry transient transport failures.
+    } finally {
+      if (dialogVisible.value && coreDownloadTaskActive.value && !isTerminalCoreDownload(downloadProgress.value)) {
+        scheduleDownloadProgressPolling()
+      }
+    }
+  }, delay)
+}
+
 const startDownloadProgressPolling = (sessionId: string) => {
   stopDownloadProgressPolling()
   downloadProgressSessionId.value = sessionId.trim()
   if (!downloadProgressSessionId.value || !dialogVisible.value) {
     return
   }
-  downloadProgressTimerId.value = window.setInterval(() => {
-    void pollDownloadProgress()
-  }, 800)
-  void pollDownloadProgress()
+  void pollDownloadProgress().finally(() => scheduleDownloadProgressPolling())
 }
 
 const recoverCoreDownloadTask = async (allowTerminal = false) => {
-  const data = await HttpUtils.get(mihomoCore.progressEndpoint, {}, { silentAuthCheck: true })
+	if (!dialogVisible.value) return
+	recoverDownloadProgressController?.abort()
+	const controller = new AbortController()
+	recoverDownloadProgressController = controller
+	const data = await HttpUtils.get(mihomoCore.progressEndpoint, {}, { silentAuthCheck: true, signal: controller.signal })
+	if (controller.signal.aborted || recoverDownloadProgressController !== controller) return
   if (!data.success || !data.obj) return
   const nextProgress = normalizeCoreDownloadProgress(data.obj)
   if (nextProgress.id === '' || nextProgress.state === 'idle') return
@@ -1383,10 +1467,12 @@ const handleVisibilityChange = () => {
     if (dialogVisible.value && downloadProgressSessionId.value) {
       startDownloadProgressPolling(downloadProgressSessionId.value)
     }
-    void recoverCoreDownloadTask()
+		if (dialogVisible.value) void recoverCoreDownloadTask()
     return
   }
   stopDownloadProgressPolling()
+  recoverDownloadProgressController?.abort()
+  recoverDownloadProgressController = null
 }
 
 const refreshAll = async (forceUpdateCheck = false) => {
@@ -1411,8 +1497,10 @@ const resetVersionDisplay = () => {
 }
 
 const loadCoreStatus = async () => {
+  const requestId = ++statusRequestSeq.value
   try {
     const data = await HttpUtils.get(mihomoCore.statusEndpoint)
+    if (requestId !== statusRequestSeq.value || !dialogVisible.value) return
     if (data.success && data.obj) {
       installed.value = data.obj.installed === true
       compatible.value = data.obj.compatible === true
@@ -1422,10 +1510,47 @@ const loadCoreStatus = async () => {
       platform.value = data.obj.platform || ''
       installedTarget.value = data.obj.installedTarget || null
       installedChannel.value = normalizeInstalledChannel(data.obj.installedChannel)
+      if (coreLogLevelItems.some((item) => item.value === data.obj.logLevel)) {
+        coreLogLevel.value = data.obj.logLevel
+        confirmedCoreLogLevel.value = data.obj.logLevel
+      }
       applyStatusDownloadState(data.obj)
     }
   } catch (error) {
     console.error('Failed to load core status:', error)
+  }
+}
+
+const saveCoreLogLevel = async (level: string | null) => {
+  const previousLevel = confirmedCoreLogLevel.value
+  if (!coreLogLevelItems.some((item) => item.value === level) || coreLogLevelSaving.value) {
+    coreLogLevel.value = previousLevel
+    return
+  }
+
+  coreLogLevelSaving.value = true
+  try {
+    const data = await HttpUtils.post(mihomoCore.logLevelEndpoint, { level })
+    if (data.success && data.obj) {
+      coreLogLevel.value = data.obj.level
+      confirmedCoreLogLevel.value = data.obj.level
+      feedbackMsg.value = t('coreManager.logLevelSaved')
+      feedbackType.value = 'success'
+      return
+    }
+    feedbackMsg.value = data.msg || t('coreManager.logLevelSaveFailed')
+    feedbackType.value = 'error'
+    coreLogLevel.value = previousLevel
+    await loadCoreStatus()
+  } catch (error: any) {
+    feedbackMsg.value = t('coreManager.logLevelSaveFailedWithReason', {
+      reason: error.message || t('coreManager.unknown'),
+    })
+    feedbackType.value = 'error'
+    coreLogLevel.value = previousLevel
+    await loadCoreStatus()
+  } finally {
+    coreLogLevelSaving.value = false
   }
 }
 
@@ -1522,11 +1647,13 @@ const applyCoreUpdateInfo = (info: any) => {
 }
 
 const loadCoreUpdateInfo = async (forceCheck: boolean) => {
+  const requestId = ++updateInfoRequestSeq.value
   try {
     const data = await HttpUtils.get(
       mihomoCore.updateInfoEndpoint,
       forceCheck ? { force: 'true' } : {},
     )
+    if (requestId !== updateInfoRequestSeq.value || !dialogVisible.value) return
     if (data.success && data.obj) {
       applyCoreUpdateInfo(data.obj)
     }
@@ -1547,37 +1674,100 @@ const normalizeIntervalHours = (raw: string): number | null => {
   return value
 }
 
-const saveAutoCheckSettings = async () => {
-  const intervalHours = normalizeIntervalHours(autoCheckIntervalInput.value)
-  if (autoCheckEnabled.value && intervalHours == null) {
-    feedbackMsg.value = t('coreManager.intervalInvalid')
-    feedbackType.value = 'error'
-    return
-  }
-
+const saveAutoCheckEnabled = async (enabled: boolean | null) => {
   autoCheckSaving.value = true
   clearDownloadFeedback()
   try {
     const data = await HttpUtils.post(mihomoCore.updateSettingsEndpoint, {
-      enabled: autoCheckEnabled.value ? 'true' : 'false',
-      interval: String(intervalHours ?? 12),
-      auto_update_enabled: autoUpdateEnabled.value ? 'true' : 'false',
+      action: 'auto_check',
+      enabled: enabled === true ? 'true' : 'false',
     })
     if (data.success && data.obj) {
       applyCoreUpdateInfo(data.obj)
       feedbackMsg.value = t('coreManager.autoCheckSaved')
       feedbackType.value = 'success'
     } else {
+      await loadCoreUpdateInfo(false)
       feedbackMsg.value = data.msg || t('coreManager.autoCheckSaveFailed')
       feedbackType.value = 'error'
     }
   } catch (error: any) {
+    await loadCoreUpdateInfo(false)
     feedbackMsg.value = t('coreManager.autoCheckSaveFailedWithReason', {
       reason: error.message || t('coreManager.unknown'),
     })
     feedbackType.value = 'error'
   } finally {
     autoCheckSaving.value = false
+  }
+}
+
+const saveAutoUpdateEnabled = async (enabled: boolean | null) => {
+  if (!autoCheckEnabled.value) {
+    // Keep the switch truthful when auto-check is disabled; no update request
+    // is valid until the prerequisite setting is enabled.
+    autoUpdateEnabled.value = false
+    return
+  }
+  autoUpdateSaving.value = true
+  clearDownloadFeedback()
+  try {
+    const data = await HttpUtils.post(mihomoCore.updateSettingsEndpoint, {
+      action: 'auto_update',
+      auto_update_enabled: enabled === true ? 'true' : 'false',
+    })
+    if (data.success && data.obj) {
+      applyCoreUpdateInfo(data.obj)
+      feedbackMsg.value = t('coreManager.autoCheckSaved')
+      feedbackType.value = 'success'
+    } else {
+      await loadCoreUpdateInfo(false)
+      feedbackMsg.value = data.msg || t('coreManager.autoCheckSaveFailed')
+      feedbackType.value = 'error'
+    }
+  } catch (error: any) {
+    await loadCoreUpdateInfo(false)
+    feedbackMsg.value = t('coreManager.autoCheckSaveFailedWithReason', {
+      reason: error.message || t('coreManager.unknown'),
+    })
+    feedbackType.value = 'error'
+  } finally {
+    autoUpdateSaving.value = false
+  }
+}
+
+const saveAutoCheckInterval = async () => {
+  const intervalHours = normalizeIntervalHours(autoCheckIntervalInput.value)
+  if (intervalHours == null) {
+    feedbackMsg.value = t('coreManager.intervalInvalid')
+    feedbackType.value = 'error'
+    return
+  }
+
+  intervalSaving.value = true
+  clearDownloadFeedback()
+  try {
+    const data = await HttpUtils.post(mihomoCore.updateSettingsEndpoint, {
+      action: 'interval',
+      interval: String(intervalHours),
+    })
+    if (data.success && data.obj) {
+      applyCoreUpdateInfo(data.obj)
+      feedbackMsg.value = t('coreManager.autoCheckSaved')
+      feedbackType.value = 'success'
+    } else {
+      await loadCoreUpdateInfo(false)
+      feedbackMsg.value = data.msg || t('coreManager.autoCheckSaveFailed')
+      feedbackType.value = 'error'
+    }
+  } catch (error: any) {
+    await loadCoreUpdateInfo(false)
+    feedbackMsg.value = t('coreManager.autoCheckSaveFailedWithReason', {
+      reason: error.message || t('coreManager.unknown'),
+    })
+    feedbackType.value = 'error'
+  } finally {
+    intervalSaving.value = false
   }
 }
 
@@ -1699,7 +1889,7 @@ const startCore = async () => {
       feedbackMsg.value = data.msg || t('coreManager.startFailed')
       feedbackType.value = 'error'
     }
-    setTimeout(() => {
+    scheduleCoreAction(() => {
       void loadCoreStatus()
     }, 1500)
   } catch (error: any) {
@@ -1708,7 +1898,7 @@ const startCore = async () => {
     })
     feedbackType.value = 'error'
   } finally {
-    setTimeout(() => {
+    scheduleCoreAction(() => {
       startingCore.value = false
     }, 1500)
   }
@@ -1727,7 +1917,7 @@ const stopCore = async () => {
       feedbackMsg.value = data.msg || t('coreManager.stopFailed')
       feedbackType.value = 'error'
     }
-    setTimeout(() => {
+    scheduleCoreAction(() => {
       void loadCoreStatus()
     }, 1500)
   } catch (error: any) {
@@ -1736,7 +1926,7 @@ const stopCore = async () => {
     })
     feedbackType.value = 'error'
   } finally {
-    setTimeout(() => {
+    scheduleCoreAction(() => {
       stoppingCore.value = false
     }, 1500)
   }
@@ -1757,7 +1947,7 @@ const restartCore = async () => {
       feedbackMsg.value = data.msg || t('coreManager.restartFailed')
       feedbackType.value = 'error'
     }
-    setTimeout(() => {
+    scheduleCoreAction(() => {
       void loadCoreStatus()
     }, 2500)
   } catch (error: any) {
@@ -1766,7 +1956,7 @@ const restartCore = async () => {
     })
     feedbackType.value = 'error'
   } finally {
-    setTimeout(() => {
+    scheduleCoreAction(() => {
       restartingCore.value = false
     }, 2500)
   }
@@ -1819,11 +2009,16 @@ onMounted(() => {
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', handleVisibilityChange)
   }
-  void recoverCoreDownloadTask()
 })
 
 onBeforeUnmount(() => {
   stopDownloadProgressPolling()
+
+  clearCoreActionTimers()
+  statusRequestSeq.value += 1
+  updateInfoRequestSeq.value += 1
+	recoverDownloadProgressController?.abort()
+	recoverDownloadProgressController = null
   if (downloadFeedbackTimer != null) {
     window.clearTimeout(downloadFeedbackTimer)
     downloadFeedbackTimer = null

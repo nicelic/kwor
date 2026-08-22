@@ -137,6 +137,50 @@ func TestCloneAcmeActionResultKeepsUTF8SafeOutputSummary(t *testing.T) {
 	}
 }
 
+func TestBoundedAcmeOutputAndLogKeepUTF8MemoryBounds(t *testing.T) {
+	output := &boundedAcmeOutput{}
+	for index := 0; index < 300; index++ {
+		output.AppendLine(strings.Repeat("签发输出", 1024))
+	}
+	outputText := output.String()
+	if !utf8.ValidString(outputText) {
+		t.Fatalf("bounded command output is not valid UTF-8: %q", outputText)
+	}
+	if len(outputText) > acmeCommandOutputMaxBytes+128 {
+		t.Fatalf("bounded command output exceeded limit: %d", len(outputText))
+	}
+
+	previousStore := acmeLogSessionStore
+	acmeLogSessionStore = newAcmeLogStore()
+	t.Cleanup(func() { acmeLogSessionStore = previousStore })
+
+	session := acmeLogSessionStore.start("bounded-log", "受限日志")
+	for index := 0; index < acmeLogMaxLines+100; index++ {
+		session.append(strings.Repeat("日志行", 2048))
+	}
+	view := acmeLogSessionStore.get("bounded-log")
+	if view == nil || len(view.Lines) == 0 {
+		t.Fatalf("expected bounded log session: %#v", view)
+	}
+	if len(view.Lines) > acmeLogMaxLines {
+		t.Fatalf("log line limit was not enforced: %d", len(view.Lines))
+	}
+	for _, line := range view.Lines {
+		if !utf8.ValidString(line) {
+			t.Fatalf("bounded log line is not valid UTF-8: %q", line)
+		}
+	}
+
+	first := acmeLogSessionStore.getAfter("bounded-log", 0)
+	if first == nil || first.LineNext != len(view.Lines) {
+		t.Fatalf("unexpected incremental log cursor: %#v", first)
+	}
+	second := acmeLogSessionStore.getAfter("bounded-log", first.LineNext)
+	if second == nil || len(second.Lines) != 0 {
+		t.Fatalf("expected no duplicate log lines after cursor: %#v", second)
+	}
+}
+
 func TestAcmeLogSessionEnsureManagedOperationCreatesSyncHandle(t *testing.T) {
 	previousStore := acmeLogSessionStore
 	acmeLogSessionStore = newAcmeLogStore()

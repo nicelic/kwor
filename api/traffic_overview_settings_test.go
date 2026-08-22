@@ -337,6 +337,27 @@ func TestGetTrafficOverviewVnstatInstallStatusReturnsIdleWhenNoTaskExists(t *tes
 	}
 }
 
+func TestGetTrafficOverviewVnstatRemovalStatusReturnsIdleWhenNoTaskExists(t *testing.T) {
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest("GET", "/api/traffic-overview-vnstat-removal-status", nil)
+
+	apiSvc := &ApiService{}
+	apiSvc.GetTrafficOverviewVnstatRemovalStatus(ctx)
+
+	msg := decodeAPIMessage(t, rec.Body.String())
+	if !msg.Success {
+		t.Fatalf("expected success response, got error: %s", msg.Msg)
+	}
+	payload, ok := msg.Obj.(map[string]interface{})
+	if !ok {
+		t.Fatalf("unexpected obj payload: %#v", msg.Obj)
+	}
+	if state, _ := payload["state"].(string); state != "idle" {
+		t.Fatalf("removal status state=%q, want idle; payload=%#v", state, payload)
+	}
+}
+
 func initTrafficOverviewAPITestDB(t *testing.T) {
 	t.Helper()
 

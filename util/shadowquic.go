@@ -8,33 +8,54 @@ import (
 	"strings"
 )
 
-// ValidateMihomoShadowQUICJLSUpstreamAddr validates the only required
-// ShadowQUIC listener protocol field. net.SplitHostPort deliberately keeps
-// IPv6 bracket rules aligned with the address syntax Mihomo accepts.
-func ValidateMihomoShadowQUICJLSUpstreamAddr(raw string) error {
+// NormalizeMihomoShadowQUICJLSUpstreamAddr adds the default port and returns
+// the host used when the TLS SNI is omitted.
+func NormalizeMihomoShadowQUICJLSUpstreamAddr(raw string) (string, string, error) {
 	addr := strings.TrimSpace(raw)
 	if addr == "" {
-		return fmt.Errorf("shadowquic jls-upstream.addr is required")
+		return "", "", fmt.Errorf("shadowquic jls-upstream.addr is required")
+	}
+	if strings.HasPrefix(addr, "[") {
+		closing := strings.IndexByte(addr, ']')
+		if closing < 0 {
+			return "", "", fmt.Errorf("shadowquic jls-upstream.addr must use a valid bracketed IPv6 address")
+		}
+		suffix := addr[closing+1:]
+		if suffix == "" {
+			addr += ":443"
+		} else if !strings.HasPrefix(suffix, ":") || suffix[1:] == "" || strings.Trim(suffix[1:], "0123456789") != "" {
+			return "", "", fmt.Errorf("shadowquic jls-upstream.addr must be host:port or [IPv6]:port")
+		}
+	} else {
+		lastColon := strings.LastIndexByte(addr, ':')
+		if lastColon < 0 || lastColon == len(addr)-1 || strings.Trim(addr[lastColon+1:], "0123456789") != "" {
+			addr += ":443"
+		}
 	}
 
 	host, portText, err := net.SplitHostPort(addr)
 	if err != nil || strings.TrimSpace(host) == "" {
-		return fmt.Errorf("shadowquic jls-upstream.addr must be host:port or [IPv6]:port")
+		return "", "", fmt.Errorf("shadowquic jls-upstream.addr must be host:port or [IPv6]:port")
 	}
 	if strings.HasPrefix(addr, "[") {
 		ip := net.ParseIP(host)
 		if ip == nil || !strings.Contains(host, ":") {
-			return fmt.Errorf("shadowquic jls-upstream.addr must use a valid bracketed IPv6 address")
+			return "", "", fmt.Errorf("shadowquic jls-upstream.addr must use a valid bracketed IPv6 address")
 		}
 	}
 	if portText == "" || strings.Trim(portText, "0123456789") != "" {
-		return fmt.Errorf("shadowquic jls-upstream.addr port must be between 1 and 65535")
+		return "", "", fmt.Errorf("shadowquic jls-upstream.addr port must be between 1 and 65535")
 	}
 	port, err := strconv.Atoi(portText)
 	if err != nil || port < 1 || port > 65535 {
-		return fmt.Errorf("shadowquic jls-upstream.addr port must be between 1 and 65535")
+		return "", "", fmt.Errorf("shadowquic jls-upstream.addr port must be between 1 and 65535")
 	}
-	return nil
+	return addr, host, nil
+}
+
+func ValidateMihomoShadowQUICJLSUpstreamAddr(raw string) error {
+	_, _, err := NormalizeMihomoShadowQUICJLSUpstreamAddr(raw)
+	return err
 }
 
 // SanitizeMihomoShadowQUICOutbound keeps the internal raw outbound limited to
@@ -59,11 +80,15 @@ func SanitizeMihomoShadowQUICOutbound(outbound map[string]interface{}) {
 
 	copyShadowQUICString(outbound, clean, "sni", "sni")
 	copyShadowQUICStringSlice(outbound, clean, "alpn", "alpn")
-	copyShadowQUICStringSlice(outbound, clean, "quic_versions", "quic_versions", "quic-versions")
+	if versions := NormalizeMihomoShadowQUICVersions(firstShadowQUICValue(outbound, "quic_versions", "quic-versions")); len(versions) > 0 {
+		clean["quic_versions"] = versions
+	}
 	copyShadowQUICBool(outbound, clean, "udp_over_stream", "udp_over_stream", "udp-over-stream")
 	copyShadowQUICBool(outbound, clean, "zero_rtt", "zero_rtt", "zero-rtt")
 	copyShadowQUICNonNegativeInt(outbound, clean, "keep_alive_interval", "keep_alive_interval", "keep-alive-interval")
-	copyShadowQUICString(outbound, clean, "congestion_controller", "congestion_controller", "congestion-controller")
+	if controller, ok := NormalizeMihomoShadowQUICCongestionController(firstShadowQUICValue(outbound, "congestion_controller", "congestion-controller")); ok {
+		clean["congestion_controller"] = controller
+	}
 	copyShadowQUICBandwidth(outbound, clean, "up", "up")
 	copyShadowQUICBandwidth(outbound, clean, "down", "down")
 	copyShadowQUICNonNegativeInt(outbound, clean, "cwnd", "cwnd")
@@ -202,6 +227,18 @@ func NormalizeMihomoShadowQUICVersions(raw interface{}) []string {
 		}
 	}
 	return result
+}
+
+// NormalizeMihomoClientIPVersion keeps the values accepted by Mihomo proxy
+// configuration. It is shared by ShadowQUIC's client template and renderer.
+func NormalizeMihomoClientIPVersion(raw interface{}) (string, bool) {
+	value := strings.ToLower(strings.TrimSpace(shadowQUICString(raw)))
+	switch value {
+	case "dual", "ipv4", "ipv6", "ipv4-prefer", "ipv6-prefer":
+		return value, true
+	default:
+		return "", false
+	}
 }
 
 // NormalizeMihomoShadowQUICCongestionController accepts the algorithms
@@ -394,7 +431,7 @@ func sanitizeMihomoShadowQUICCommonFields(raw interface{}) map[string]interface{
 	if udp, ok := common["udp"].(bool); ok {
 		clean["udp"] = udp
 	}
-	if ipVersion := strings.TrimSpace(shadowQUICString(common["ip_version"])); ipVersion != "" {
+	if ipVersion, ok := NormalizeMihomoClientIPVersion(common["ip_version"]); ok {
 		clean["ip_version"] = ipVersion
 	}
 	if routingMark, ok := shadowQUICNonNegativeInt(common["routing_mark"]); ok {
@@ -414,7 +451,7 @@ func applyMihomoShadowQUICCommonFields(proxy map[string]interface{}, raw interfa
 	if udp, ok := common["udp"].(bool); ok {
 		proxy["udp"] = udp
 	}
-	if ipVersion := strings.TrimSpace(shadowQUICString(common["ip_version"])); ipVersion != "" {
+	if ipVersion, ok := NormalizeMihomoClientIPVersion(common["ip_version"]); ok {
 		proxy["ip-version"] = ipVersion
 	}
 	if routingMark, ok := shadowQUICNonNegativeInt(common["routing_mark"]); ok {

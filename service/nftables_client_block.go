@@ -38,18 +38,39 @@ func (s *ClientPortBlockService) EnsureRuleIntegrity() error {
 	if !(&CoreManagerService{}).IsRunning() {
 		return nil
 	}
+	return s.EnsureRuleIntegrityWhenRunning()
+}
+
+// EnsureRuleIntegrityWhenRunning avoids another core status command when the
+// caller already confirmed the core is running.
+func (s *ClientPortBlockService) EnsureRuleIntegrityWhenRunning() error {
+	if !IsSystemPlatformLinux() || !nftSupported() {
+		return nil
+	}
 	return s.Reconcile(true)
 }
 
 func (s *ClientPortBlockService) Reconcile(applyRules bool) error {
+	return s.reconcile(applyRules, true)
+}
+
+// ReconcileAfterTraffic applies block additions or removals after a measured
+// default-chain traffic change. Rule integrity remains the responsibility of
+// the dedicated Core sync job, so this path does not repeatedly inspect nft.
+func (s *ClientPortBlockService) ReconcileAfterTraffic() error {
+	return s.reconcile(true, false)
+}
+
+func (s *ClientPortBlockService) reconcile(applyRules bool, verifyExistingRules bool) error {
 	db := database.GetDB()
 	desired, err := s.collectDesiredBlockedPorts(db)
 	if err != nil {
 		return err
 	}
 
+	rulesChanged := false
 	if applyRules {
-		err = s.reconcileWithRules(db, desired)
+		rulesChanged, err = s.reconcileWithRules(db, desired, verifyExistingRules)
 	} else {
 		err = s.reconcileStateOnly(db, desired)
 	}
@@ -57,7 +78,7 @@ func (s *ClientPortBlockService) Reconcile(applyRules bool) error {
 		return err
 	}
 
-	if applyRules && len(desired) > 0 {
+	if applyRules && rulesChanged {
 		if err := flushConntrackTable(); err != nil {
 			logger.Warning("flush conntrack after client block apply failed: ", err)
 		}
@@ -85,10 +106,6 @@ func (s *ClientPortBlockService) CleanupOnShutdown() {
 }
 
 func (s *ClientPortBlockService) reconcileStateOnly(tx *gorm.DB, desired map[int]clientBlockedPortSpec) error {
-	if err := deleteRulesByCommentPrefix(singboxBlockNftRuleComments.prefix); err != nil {
-		return err
-	}
-
 	var states []model.ClientPortBlockState
 	if err := tx.Find(&states).Error; err != nil {
 		return err
@@ -112,6 +129,9 @@ func (s *ClientPortBlockService) reconcileStateOnly(tx *gorm.DB, desired map[int
 		spec := desired[port]
 		encodedRanges := encodePortRangesJSON(spec.Ranges)
 		if st, ok := existing[port]; ok {
+			if st.Tag == spec.Tag && st.PortRanges == encodedRanges && st.InHandle == 0 && st.OutHandle == 0 {
+				continue
+			}
 			if err := tx.Model(st).Updates(map[string]interface{}{
 				"tag":         spec.Tag,
 				"port_ranges": encodedRanges,
@@ -141,14 +161,27 @@ func (s *ClientPortBlockService) reconcileStateOnly(tx *gorm.DB, desired map[int
 	return nil
 }
 
-func (s *ClientPortBlockService) reconcileWithRules(tx *gorm.DB, desired map[int]clientBlockedPortSpec) error {
+func (s *ClientPortBlockService) reconcileWithRules(tx *gorm.DB, desired map[int]clientBlockedPortSpec, verifyExistingRules bool) (bool, error) {
+	rulesChanged := false
 	var states []model.ClientPortBlockState
 	if err := tx.Find(&states).Error; err != nil {
-		return err
+		return false, err
 	}
 	existing := make(map[int]*model.ClientPortBlockState, len(states))
 	for i := range states {
 		existing[states[i].Port] = &states[i]
+	}
+	var inHandles, outHandles map[string]int
+	if verifyExistingRules {
+		var err error
+		inHandles, err = snapshotManagedRuleHandles(nftChainIn, singboxBlockNftRuleComments.prefix)
+		if err != nil {
+			return false, err
+		}
+		outHandles, err = snapshotManagedRuleHandles(nftChainOut, singboxBlockNftRuleComments.prefix)
+		if err != nil {
+			return false, err
+		}
 	}
 
 	for _, state := range states {
@@ -159,8 +192,12 @@ func (s *ClientPortBlockService) reconcileWithRules(tx *gorm.DB, desired map[int
 			logger.Warning("failed to remove obsolete client block nft rules for port ", state.Port, ": ", err)
 		}
 		if err := tx.Delete(&state).Error; err != nil {
-			return err
+			return rulesChanged, err
 		}
+		portTag := strconv.Itoa(state.Port)
+		delete(inHandles, singboxBlockNftRuleComments.in(portTag))
+		delete(outHandles, singboxBlockNftRuleComments.out(portTag))
+		rulesChanged = true
 	}
 
 	validComments := make(map[string]struct{}, len(desired)*2)
@@ -173,16 +210,32 @@ func (s *ClientPortBlockService) reconcileWithRules(tx *gorm.DB, desired map[int
 		encodedRanges := encodePortRangesJSON(spec.Ranges)
 
 		if st, ok := existing[port]; ok {
-			st.Tag = spec.Tag
 			desiredRanges := normalizeNftPortRanges(spec.Ranges)
 			currentRanges := decodePortRangesJSON(st.PortRanges)
 			rangesChanged := !portRangeSlicesEqual(currentRanges, desiredRanges)
-
-			if err := s.tryRecoverHandles(tx, st); err != nil {
-				logger.Warning("recover client block handles failed for port ", st.Port, ": ", err)
+			if !rangesChanged && !verifyExistingRules {
+				if st.Tag != spec.Tag || st.PortRanges != encodedRanges {
+					if err := tx.Model(st).Updates(map[string]interface{}{
+						"tag":         spec.Tag,
+						"port_ranges": encodedRanges,
+						"updated_at":  time.Now(),
+					}).Error; err != nil {
+						return rulesChanged, err
+					}
+				}
+				continue
 			}
-			inOk := ruleHandleExists(nftChainIn, st.InHandle)
-			outOk := ruleHandleExists(nftChainOut, st.OutHandle)
+
+			originalInHandle := st.InHandle
+			originalOutHandle := st.OutHandle
+			inHandle, inOk := inHandles[singboxBlockNftRuleComments.in(portTag)]
+			outHandle, outOk := outHandles[singboxBlockNftRuleComments.out(portTag)]
+			if inOk {
+				st.InHandle = inHandle
+			}
+			if outOk {
+				st.OutHandle = outHandle
+			}
 			if rangesChanged || !inOk || !outOk {
 				if err := s.removeRulesFromState(st); err != nil {
 					logger.Warning("failed to clear broken client block rules for port ", st.Port, ": ", err)
@@ -195,20 +248,25 @@ func (s *ClientPortBlockService) reconcileWithRules(tx *gorm.DB, desired map[int
 					"out_handle":  outHandle,
 					"updated_at":  time.Now(),
 				}).Error; err != nil {
-					return err
+					return rulesChanged, err
 				}
+				rulesChanged = true
 				if ensureErr != nil {
-					return ensureErr
+					return rulesChanged, ensureErr
 				}
 				continue
 			}
 
-			if err := tx.Model(st).Updates(map[string]interface{}{
-				"tag":         spec.Tag,
-				"port_ranges": encodedRanges,
-				"updated_at":  time.Now(),
-			}).Error; err != nil {
-				return err
+			if st.Tag != spec.Tag || st.PortRanges != encodedRanges || originalInHandle != st.InHandle || originalOutHandle != st.OutHandle {
+				if err := tx.Model(st).Updates(map[string]interface{}{
+					"tag":         spec.Tag,
+					"port_ranges": encodedRanges,
+					"in_handle":   st.InHandle,
+					"out_handle":  st.OutHandle,
+					"updated_at":  time.Now(),
+				}).Error; err != nil {
+					return rulesChanged, err
+				}
 			}
 			continue
 		}
@@ -225,17 +283,22 @@ func (s *ClientPortBlockService) reconcileWithRules(tx *gorm.DB, desired map[int
 			CreatedAt:  now,
 		}
 		if err := tx.Create(&next).Error; err != nil {
-			return err
+			return rulesChanged, err
 		}
+		rulesChanged = true
 		if ensureErr != nil {
-			return ensureErr
+			return rulesChanged, ensureErr
 		}
 	}
 
-	if err := s.cleanupOrphanRules(validComments); err != nil {
-		logger.Warning("cleanup orphan client block nft rules failed: ", err)
+	if verifyExistingRules {
+		if orphanRulesChanged, err := s.cleanupOrphanRules(validComments, inHandles, outHandles); err != nil {
+			logger.Warning("cleanup orphan client block nft rules failed: ", err)
+		} else if orphanRulesChanged {
+			rulesChanged = true
+		}
 	}
-	return nil
+	return rulesChanged, nil
 }
 
 func (s *ClientPortBlockService) ensureBlockRules(port int, ranges []portRange) (int, int, error) {
@@ -287,34 +350,27 @@ func (s *ClientPortBlockService) removeRulesFromState(state *model.ClientPortBlo
 	return firstErr
 }
 
-func (s *ClientPortBlockService) cleanupOrphanRules(validComments map[string]struct{}) error {
-	if !nftSupported() || !nftTableExists() {
-		return nil
-	}
-
-	chains := []string{nftChainIn, nftChainOut}
+func (s *ClientPortBlockService) cleanupOrphanRules(validComments map[string]struct{}, inHandles map[string]int, outHandles map[string]int) (bool, error) {
 	var firstErr error
-	for _, chain := range chains {
-		rules, err := listRuleCommentsByPrefix(chain, singboxBlockNftRuleComments.prefix)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		for _, rule := range rules {
-			if _, ok := validComments[rule.comment]; ok {
+	changed := false
+	cleanupChain := func(chain string, handles map[string]int) {
+		for comment, handle := range handles {
+			if _, ok := validComments[comment]; ok {
 				continue
 			}
-			if err := deleteRuleByHandle(chain, rule.handle); err != nil {
-				logger.Warning("failed to delete orphan client block nft rule ", rule.comment, " handle ", rule.handle, ": ", err)
+			if err := deleteRuleByHandle(chain, handle); err != nil && !nftObjectMissing(err) {
+				logger.Warning("failed to delete orphan client block nft rule ", comment, " handle ", handle, ": ", err)
 				if firstErr == nil {
 					firstErr = err
 				}
+				continue
 			}
+			changed = true
 		}
 	}
-	return firstErr
+	cleanupChain(nftChainIn, inHandles)
+	cleanupChain(nftChainOut, outHandles)
+	return changed, firstErr
 }
 
 func (s *ClientPortBlockService) tryRecoverHandles(tx *gorm.DB, state *model.ClientPortBlockState) error {
@@ -390,8 +446,7 @@ func (s *ClientPortBlockService) collectDesiredBlockedPorts(tx *gorm.DB) (map[in
 	nowUnix := time.Now().Unix()
 	var clients []model.Client
 	if err := tx.Model(&model.Client{}).
-		Select("enable, inbounds, volume, expiry, up, down").
-		Where("enable = ?", true).
+		Select("enable, depleted, inbounds, volume, expiry, up, down").
 		Find(&clients).Error; err != nil {
 		return nil, err
 	}
@@ -399,8 +454,9 @@ func (s *ClientPortBlockService) collectDesiredBlockedPorts(tx *gorm.DB) (map[in
 	desired := make(map[int]clientBlockedPortSpec)
 	for _, client := range clients {
 		used := client.Up + client.Down
-		evaluation := evaluateClientAccess(client.Enable, used, client.Volume, client.Expiry, nowUnix)
-		if !evaluation.Blocked {
+		evaluation := evaluateClientAccess(true, used, client.Volume, client.Expiry, nowUnix)
+		shouldBlock := (client.Enable && evaluation.Blocked) || (!client.Enable && client.Depleted)
+		if !shouldBlock {
 			continue
 		}
 

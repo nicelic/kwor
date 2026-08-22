@@ -86,11 +86,16 @@ func TestClientLimitCleanupOrphanRulesDeletesOnlyInvalidComments(t *testing.T) {
 	err := (&ClientRateLimitService{}).cleanupOrphanRules(map[string]struct{}{
 		singboxLimitNftRuleComments.in("30000"):  {},
 		singboxLimitNftRuleComments.out("30000"): {},
+	}, map[string]int{
+		singboxLimitNftRuleComments.in("30000"): 10,
+		singboxLimitNftRuleComments.in("40000"): 11,
+	}, map[string]int{
+		singboxLimitNftRuleComments.out("30000"): 20,
+		singboxLimitNftRuleComments.out("40000"): 21,
 	})
 	if err != nil {
 		t.Fatalf("cleanupOrphanRules failed: %v", err)
 	}
-
 	if len(deleted) != 2 || deleted[0] != 11 || deleted[1] != 21 {
 		t.Fatalf("unexpected deleted handles: %v", deleted)
 	}

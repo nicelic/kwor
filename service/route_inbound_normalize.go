@@ -71,11 +71,11 @@ func hasShadowTLSSSConfig(options map[string]interface{}) bool {
 		return false
 	}
 
-	if asMap, ok := ssConfig.(map[string]interface{}); ok {
-		return len(asMap) > 0
-	}
-
-	return true
+	// The runtime splitter only accepts a non-nil object; an empty object still
+	// produces the internal ShadowTLS pair. Keep routing aliases and runtime-tag
+	// validation on that same definition.
+	asMap, ok := ssConfig.(map[string]interface{})
+	return ok && asMap != nil
 }
 
 func buildInboundTagAliasMap(db *gorm.DB) (map[string]string, error) {

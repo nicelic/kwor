@@ -1,5 +1,5 @@
 <template>
-  <v-dialog transition="dialog-bottom-transition" width="800">
+  <v-dialog v-model="dialogVisible" transition="dialog-bottom-transition" width="800" max-width="95vw" max-height="90vh" :persistent="saving">
     <v-card class="rounded-lg" :loading="loading">
       <v-card-title>
         {{ $t('actions.' + title) + ' ' + $t('objects.client') }}
@@ -11,8 +11,16 @@
         type="card, text, divider, list-item-two-line"
         v-if="loading">
       </v-skeleton-loader>
-      <v-card-text style="padding: 0 16px; overflow-y: scroll;">
-        <v-container style="padding: 0;" :hidden="loading">
+      <v-card-text style="padding: 0 16px; max-height: calc(90vh - 150px); overflow-y: auto;">
+        <v-alert v-if="loadError" class="ma-4" type="error" variant="tonal">
+          <div class="d-flex align-center flex-wrap" style="gap: 8px;">
+            <span>无法读取用户详情，未加载任何可保存的数据。</span>
+            <v-btn color="primary" size="small" variant="outlined" @click="updateData(id ?? 0)">
+              {{ $t('actions.update') }}
+            </v-btn>
+          </div>
+        </v-alert>
+        <v-container v-else style="padding: 0;" :hidden="loading">
           <v-tabs
             v-model="tab"
             align-tabs="center">
@@ -58,14 +66,25 @@
                     @blur="trimServerIp"
                     @keydown.enter="trimServerIp">
                     <template v-slot:append>
-                      <v-icon @click="refreshServerIps" icon="mdi-refresh" v-tooltip:top="$t('refresh')" :class="{ rotating: loadingIps }" />
+                      <v-tooltip location="top" :text="$t('refresh')">
+                        <template #activator="{ props: tooltipProps }">
+                          <v-btn
+                            v-bind="tooltipProps"
+                            icon="mdi-refresh"
+                            density="compact"
+                            variant="text"
+                            :disabled="loadingIps"
+                            :class="{ rotating: loadingIps }"
+                            @click="refreshServerIps(true)" />
+                        </template>
+                      </v-tooltip>
                     </template>
                   </v-combobox>
                 </v-col>
               </v-row>
               <v-row>
                 <v-col cols="12" sm="6" md="4">
-                  <v-text-field v-model.number="Volume" type="number" min="0" :label="$t('stats.volume')" suffix="GiB" hide-details></v-text-field>
+                  <v-text-field v-model="volumeInput" type="number" min="0" step="0.01" :label="$t('stats.volume')" suffix="GiB" hide-details></v-text-field>
                 </v-col>
                 <v-col cols="12" sm="6" md="4">
                   <DatePick :expiry="expDate" picker-type="date" submit-mode="day-end" @submit="setDate" />
@@ -91,12 +110,16 @@
                     <div>
                       {{ $t('stats.usage') }}: {{ volumeUsage }}
                     </div>
-                    <v-btn density="compact" variant="text" icon="mdi-restore" @click="requestTrafficReset">
-                      <v-tooltip activator="parent" location="top">
-                        {{ $t('client.resetTraffic') }}
-                      </v-tooltip>
-                      <v-icon />
-                    </v-btn>
+                    <v-tooltip location="top" :text="$t('client.resetTraffic')">
+                      <template #activator="{ props: tooltipProps }">
+                        <v-btn
+                          v-bind="tooltipProps"
+                          density="compact"
+                          variant="text"
+                          icon="mdi-restore"
+                          @click="requestTrafficReset" />
+                      </template>
+                    </v-tooltip>
                   </div>
                   <v-progress-linear
                     v-model="percent"
@@ -122,7 +145,16 @@
                     chips
                     hide-details>
                     <template v-slot:append>
-                      <v-icon @click="setAllInbounds" icon="mdi-set-all" v-tooltip:top="$t('all')" />
+                      <v-tooltip location="top" :text="$t('all')">
+                        <template #activator="{ props: tooltipProps }">
+                          <v-btn
+                            v-bind="tooltipProps"
+                            icon="mdi-set-all"
+                            density="compact"
+                            variant="text"
+                            @click="setAllInbounds" />
+                        </template>
+                      </v-tooltip>
                     </template>
                   </v-select>
                 </v-col>
@@ -134,10 +166,19 @@
                   <v-btn variant="tonal" @click="shuffle()">{{ $t('reset') + ' - ' + $t('all') }}<v-icon icon="mdi-refresh" /></v-btn>
                 </v-col>
               </v-row>
-              <v-row v-for="key in configKeys">
+              <v-row v-for="key in configKeys" :key="key">
                 <v-col cols="12" md="3" align="end" align-self="center">
                   {{ key }}
-                  <v-icon @click="shuffle(key)" icon="mdi-refresh" v-tooltip:top="$t('reset')" />
+                  <v-tooltip location="top" :text="$t('reset')">
+                    <template #activator="{ props: tooltipProps }">
+                      <v-btn
+                        v-bind="tooltipProps"
+                        icon="mdi-refresh"
+                        density="compact"
+                        variant="text"
+                        @click="shuffle(key)" />
+                    </template>
+                  </v-tooltip>
                 </v-col>
                 <v-col>
                   <template v-if="showsUsernameField(key) || clientConfig[key].password != undefined || clientConfig[key].uuid != undefined || clientConfig[key].psk != undefined">
@@ -173,6 +214,15 @@
                     </v-row>
                   </template>
                   <v-text-field
+                    v-if="namespace === 'default' && key == 'vmess'"
+                    v-model.number="clientConfig[key].alterId"
+                    label="Alter ID"
+                    type="number"
+                    min="0"
+                    step="1"
+                    hide-details>
+                  </v-text-field>
+                  <v-text-field
                     v-if="key == 'vless'"
                     label="Flow"
                     v-model="clientConfig[key].flow"
@@ -188,16 +238,16 @@
               </v-row>
             </v-window-item>
             <v-window-item value="t3">
-              <v-row v-for="(lnk, index) in links">
+              <v-row v-for="(lnk, index) in links" :key="`local-${index}-${lnk.uri}`">
                 <v-col cols="auto">{{ index + 1 }}</v-col>
-                <v-col style="direction: ltr; overflow-y: hidden;">{{ lnk.uri }}</v-col>
+                <v-col class="client-link" dir="ltr">{{ lnk.uri }}</v-col>
               </v-row>
               <v-row>
                 <v-col>
                   <v-btn color="primary" @click="extLinks.push({ type: 'external', uri: '' })">{{ $t('actions.add') }} {{ $t('client.external') }}</v-btn>
                 </v-col>
               </v-row>
-              <v-row v-for="(lnk, index) in extLinks">
+              <v-row v-for="(lnk, index) in extLinks" :key="`external-${index}`">
                 <v-col>
                   <v-text-field
                     dir="ltr"
@@ -213,7 +263,7 @@
                   <v-btn color="primary" @click="subLinks.push({ type: 'sub', uri: '' })">{{ $t('actions.add') }} {{ $t('client.sub') }}</v-btn>
                 </v-col>
               </v-row>
-              <v-row v-for="(lnk, index) in subLinks">
+              <v-row v-for="(lnk, index) in subLinks" :key="`sub-${index}`">
                 <v-col>
                   <v-text-field
                     dir="ltr"
@@ -233,6 +283,7 @@
         <v-btn
           color="primary"
           variant="outlined"
+          :disabled="loading"
           @click="closeModal">
           {{ $t('actions.close') }}
         </v-btn>
@@ -240,6 +291,7 @@
           color="primary"
           variant="tonal"
           :loading="loading"
+          :disabled="loading || loadError"
           @click="saveChanges">
           {{ $t('actions.save') }}
         </v-btn>
@@ -249,7 +301,7 @@
 </template>
 
 <script lang="ts">
-import { createClient, updateConfigs, Link, shuffleConfigs, getConfigKeys, supportsEditableUsernameField } from '@/types/clients'
+import { clientVolumeBytesToGiB, clientVolumeGiBToBytes, createClient, updateConfigs, Link, shuffleConfigs, getConfigKeys, supportsEditableUsernameField } from '@/types/clients'
 import DatePick from '@/components/DateTime.vue'
 import { HumanReadable } from '@/plugins/utils'
 import HttpUtils from '@/plugins/httputil'
@@ -258,6 +310,10 @@ import { push } from 'notivue'
 
 export default {
   props: {
+    modelValue: {
+      type: Boolean,
+      default: undefined,
+    },
     visible: Boolean,
     id: Number,
     inboundTags: Array,
@@ -267,22 +323,33 @@ export default {
       default: 'default',
     },
   },
-  emits: ['close'],
+  emits: ['close', 'update:modelValue'],
   data() {
     return {
       client: createClient(),
       initialClientName: '',
       title: 'add',
       loading: false,
+      saving: false,
+      loadError: false,
       loadingIps: false,
       tab: 't1',
-      clientConfig: <any>[],
+      clientConfig: <any>{},
       links: <Link[]>[],
       extLinks: <Link[]>[],
       subLinks: <Link[]>[],
       serverIpList: <string[]>[],
       inboundIpMap: <Record<number, string>>{},
+      volumeInput: '',
+      serverIpManuallySet: false,
+      initialServerIp: '',
+      initialFirstInboundId: 0,
+      lastSelectedFirstInboundId: 0,
+      pendingAutoServerIpUpdate: false,
       speedLimitInput: '',
+      serverIpsLoadedAt: 0,
+      ipsRequestSequence: 0,
+      clientRequestSequence: 0,
     }
   },
   methods: {
@@ -343,13 +410,22 @@ export default {
       return true
     },
     async updateData(id: number) {
+      const requestSequence = ++this.clientRequestSequence
       this.loading = true
+      this.loadError = false
       try {
+        let newData: any
         if (id > 0) {
-          const newData = await getNamespaceStore(this.namespace).loadClients(id)
+          newData = await getNamespaceStore(this.namespace).loadClients(id)
+          if (requestSequence !== this.clientRequestSequence || !this.dialogVisible) return
+          if (Number(newData?.id) !== id) {
+            this.loadError = true
+            return
+          }
           this.client = createClient(newData, this.namespace)
           this.title = 'edit'
         } else {
+          if (requestSequence !== this.clientRequestSequence || !this.dialogVisible) return
           this.client = createClient(undefined, this.namespace)
           this.title = 'add'
         }
@@ -358,26 +434,44 @@ export default {
         this.links = this.client.links?.filter(l => l.type == 'local') ?? []
         this.extLinks = this.client.links?.filter(l => l.type == 'external') ?? []
         this.subLinks = this.client.links?.filter(l => l.type == 'sub') ?? []
+        this.volumeInput = this.client.volume > 0 ? String(clientVolumeBytesToGiB(this.client.volume)) : ''
+        this.serverIpManuallySet = false
+        this.initialServerIp = this.client.serverIp || ''
+        const inboundIds = this.normalizeInboundIds(this.client.inbounds)
+        this.client.inbounds = inboundIds
+        this.initialFirstInboundId = Number(inboundIds[0] ?? 0)
+        this.lastSelectedFirstInboundId = this.initialFirstInboundId
+        this.pendingAutoServerIpUpdate = false
         this.speedLimitInput = this.client.speedLimitMbps > 0 ? String(this.client.speedLimitMbps) : ''
         this.tab = 't1'
         void this.refreshServerIps()
-        void this.fetchInboundIps()
+      } catch {
+        if (requestSequence === this.clientRequestSequence && this.dialogVisible) {
+          this.loadError = true
+        }
       } finally {
-        this.loading = false
+        if (requestSequence === this.clientRequestSequence) {
+          this.loading = false
+        }
       }
     },
-    async refreshServerIps() {
+    async refreshServerIps(force = false) {
+      const requestSequence = ++this.ipsRequestSequence
       this.loadingIps = true
       try {
         const namespaceApi = getNamespaceApi(this.namespace)
+        const shouldRefreshServerIps = force || this.serverIpsLoadedAt <= 0 || Date.now() - this.serverIpsLoadedAt >= 30000
         const [serverIpsMsg, inboundIpsMsg] = await Promise.all([
-          HttpUtils.get('api/server-ips?verify=true'),
+          shouldRefreshServerIps ? HttpUtils.get(`api/server-ips?verify=true${force ? '&refresh=true' : ''}`) : Promise.resolve(null),
           HttpUtils.get(namespaceApi.inboundIpsEndpoint),
         ])
 
-        const serverIps: string[] = []
-        if (serverIpsMsg.success && Array.isArray(serverIpsMsg.obj)) {
-          serverIps.push(...serverIpsMsg.obj)
+        if (requestSequence !== this.ipsRequestSequence || !this.$props.visible) return
+
+        const serverIps: string[] = shouldRefreshServerIps ? [] : [...this.serverIpList]
+        if (serverIpsMsg?.success && Array.isArray(serverIpsMsg.obj)) {
+          serverIps.splice(0, serverIps.length, ...serverIpsMsg.obj)
+          this.serverIpsLoadedAt = Date.now()
         }
 
         if (inboundIpsMsg.success && Array.isArray(inboundIpsMsg.obj)) {
@@ -388,6 +482,10 @@ export default {
               serverIps.push(item.server)
             }
           }
+          const initialInboundIp = ipMap[this.initialFirstInboundId]
+          if (!this.serverIpManuallySet && this.initialServerIp && initialInboundIp) {
+            this.serverIpManuallySet = this.initialServerIp !== initialInboundIp
+          }
           this.inboundIpMap = ipMap
         }
 
@@ -396,31 +494,19 @@ export default {
       } catch (e) {
         console.error('Failed to fetch server IPs:', e)
       } finally {
-        this.loadingIps = false
-      }
-    },
-    async fetchInboundIps() {
-      try {
-        const msg = await HttpUtils.get(getNamespaceApi(this.namespace).inboundIpsEndpoint)
-        if (msg.success && Array.isArray(msg.obj)) {
-          const ipMap: Record<number, string> = {}
-          for (const item of msg.obj) {
-            ipMap[item.id] = item.server
-          }
-          this.inboundIpMap = ipMap
-          this.autoSetFirstInboundIp()
-        }
-      } catch (e) {
-        console.error('Failed to fetch inbound IPs:', e)
+        if (requestSequence === this.ipsRequestSequence) this.loadingIps = false
       }
     },
     autoSetFirstInboundIp() {
-      if (this.client.inbounds.length > 0 && !this.client.serverIp) {
-        const firstInboundId = this.client.inbounds[0]
-        const firstInboundIp = this.inboundIpMap[firstInboundId]
-        if (firstInboundIp) {
-          this.client.serverIp = firstInboundIp
-        }
+      const inboundIds = this.normalizeInboundIds(this.client.inbounds)
+      if (inboundIds.length === 0 || this.serverIpManuallySet) return
+      this.client.inbounds = inboundIds
+      const firstInboundId = inboundIds[0]
+      const firstInboundIp = this.inboundIpMap[firstInboundId]
+      if (!firstInboundIp) return
+      if (!this.client.serverIp || this.pendingAutoServerIpUpdate || this.client.serverIp === firstInboundIp) {
+        this.client.serverIp = firstInboundIp
+        this.pendingAutoServerIpUpdate = false
       }
     },
     trimServerIp() {
@@ -451,21 +537,37 @@ export default {
       }
       return Math.max(1, Math.floor(parsed))
     },
-    closeModal() {
-      this.updateData(0)
+    closeModal(force = false) {
+      if (this.saving && !force) return
+      this.clientRequestSequence += 1
+      this.ipsRequestSequence += 1
+      this.loadingIps = false
+      this.$emit('update:modelValue', false)
       this.$emit('close')
     },
     async saveChanges() {
-      if (!this.$props.visible) return
+      if (!this.dialogVisible || this.loading || this.loadError) return
 
       const store = getNamespaceStore(this.namespace)
       const clientId = this.$props.id ?? 0
+      this.client.name = String(this.client.name ?? '').trim()
+      if (this.client.name === '') {
+        push.error({ message: '用户名称不能为空' })
+        return
+      }
       const isDuplicateName = store.checkClientName(clientId, this.client.name)
       if (isDuplicateName) return
       if (!this.validateMihomoSnellInboundBindings(clientId, this.clientInbounds)) return
 
       this.loading = true
+      this.saving = true
       try {
+        const normalizedVolume = clientVolumeGiBToBytes(this.volumeInput)
+        if (normalizedVolume === null) {
+          push.error({ message: '流量上限必须是大于等于 0 的数字' })
+          return
+        }
+        this.client.volume = normalizedVolume
         const normalizedSpeedLimit = this.normalizeSpeedLimitMbps(this.speedLimitInput)
         if (normalizedSpeedLimit == null) {
           push.error({
@@ -476,13 +578,14 @@ export default {
         this.client.speedLimitMbps = normalizedSpeedLimit
         this.client.config = updateConfigs(this.clientConfig, this.client.name, this.initialClientName, this.namespace)
         this.client.links = [
-          ...this.extLinks.filter(l => l.uri != ''),
-          ...this.subLinks.filter(l => l.uri != ''),
+          ...this.extLinks.map(l => ({ ...l, type: 'external' as const, uri: String(l.uri ?? '').trim() })).filter(l => l.uri !== ''),
+          ...this.subLinks.map(l => ({ ...l, type: 'sub' as const, uri: String(l.uri ?? '').trim() })).filter(l => l.uri !== ''),
         ]
         const success = await store.save('clients', clientId == 0 ? 'new' : 'edit', this.client)
-        if (success) this.closeModal()
+        if (success) this.closeModal(true)
       } finally {
         this.loading = false
+        this.saving = false
       }
     },
     requestTrafficReset() {
@@ -504,6 +607,18 @@ export default {
     },
   },
   computed: {
+    dialogVisible: {
+      get(): boolean {
+        return this.$props.modelValue ?? this.$props.visible ?? false
+      },
+      set(value: boolean) {
+        if (value) {
+          this.$emit('update:modelValue', true)
+          return
+        }
+        this.closeModal()
+      },
+    },
     configKeys(): string[] {
       return getConfigKeys(this.clientConfig, this.namespace)
     },
@@ -530,14 +645,6 @@ export default {
         this.client.expiry = v
       },
     },
-    Volume: {
-      get() {
-        return this.client.volume == 0 ? 0 : (this.client.volume / (1024 ** 3))
-      },
-      set(v: number) {
-        this.client.volume = v > 0 ? v * (1024 ** 3) : 0
-      },
-    },
     ResetDay: {
       get() {
         return this.client.extra == 0 ? 0 : this.client.extra
@@ -551,6 +658,8 @@ export default {
         return this.client.serverIp || ''
       },
       set(v: string | null) {
+        this.serverIpManuallySet = true
+        this.pendingAutoServerIpUpdate = false
         this.client.serverIp = v ? v.trim() : ''
       },
     },
@@ -582,20 +691,38 @@ export default {
     visible(newValue) {
       if (newValue) {
         this.updateData(this.$props.id ?? 0)
+        return
       }
+      this.clientRequestSequence += 1
+      this.ipsRequestSequence += 1
+      this.loading = false
+      this.loadingIps = false
+      this.loadError = false
+    },
+    id(newId, oldId) {
+      if (!this.dialogVisible || Number(newId ?? 0) === Number(oldId ?? 0)) return
+      this.updateData(Number(newId ?? 0))
     },
     clientInbounds: {
       handler(newInbounds: number[], oldInbounds?: number[]) {
-        if (newInbounds.length > 0) {
-          const firstInboundId = newInbounds[0]
-          const firstInboundIp = this.inboundIpMap[firstInboundId]
+        const previousFirstInboundId = this.lastSelectedFirstInboundId || Number(oldInbounds?.[0] ?? 0)
+        const previousFirstIp = this.inboundIpMap[previousFirstInboundId]
+        const followsInbound = !this.serverIpManuallySet && (
+          !this.client.serverIp
+          || this.client.serverIp === previousFirstIp
+          || (previousFirstIp === undefined && this.client.serverIp === this.initialServerIp)
+        )
+        const firstInboundId = Number(newInbounds[0] ?? 0)
+        const firstInboundIp = this.inboundIpMap[firstInboundId]
+        if (followsInbound) {
           if (firstInboundIp) {
-            const oldFirstIp = oldInbounds && oldInbounds.length > 0 ? this.inboundIpMap[oldInbounds[0]] : null
-            if (!this.client.serverIp || this.client.serverIp === oldFirstIp) {
-              this.client.serverIp = firstInboundIp
-            }
+            this.client.serverIp = firstInboundIp
+            this.pendingAutoServerIpUpdate = false
+          } else if (firstInboundId > 0) {
+            this.pendingAutoServerIpUpdate = true
           }
         }
+        this.lastSelectedFirstInboundId = firstInboundId
       },
       deep: true,
     },
@@ -607,6 +734,12 @@ export default {
 <style scoped>
 .rotating {
   animation: spin 1s linear infinite;
+}
+
+.client-link {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 @keyframes spin {

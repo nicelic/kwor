@@ -66,7 +66,15 @@ func collectPortForwardListenerClaims(db *gorm.DB) ([]portForwardListenerClaim, 
 	}
 
 	reverseRules := make([]model.ReverseProxyRule, 0)
-	if err := db.Where("enabled = ?", true).Find(&reverseRules).Error; err != nil {
+	if err := db.Select(
+		"id",
+		"name",
+		"enabled",
+		"listen_protocol",
+		"listen_protocol_alias",
+		"listen_port",
+		"listen_http_version_strategy",
+	).Where("enabled = ?", true).Find(&reverseRules).Error; err != nil {
 		return nil, err
 	}
 	for _, row := range reverseRules {
@@ -96,14 +104,14 @@ func collectPortForwardListenerClaims(db *gorm.DB) ([]portForwardListenerClaim, 
 	}
 
 	defaultInbounds := make([]model.Inbound, 0)
-	if err := db.Find(&defaultInbounds).Error; err != nil {
+	if err := db.Select("type", "tag", "options", "addrs", "out_json").Find(&defaultInbounds).Error; err != nil {
 		return nil, err
 	}
 	for _, inbound := range defaultInbounds {
 		appendPortForwardInboundClaims(&claims, false, inbound.Type, inbound.Tag, inbound.Options, inbound.Addrs, inbound.OutJson)
 	}
 	mihomoInbounds := make([]model.MihomoInbound, 0)
-	if err := db.Find(&mihomoInbounds).Error; err != nil {
+	if err := db.Select("type", "tag", "options", "addrs", "out_json").Find(&mihomoInbounds).Error; err != nil {
 		return nil, err
 	}
 	for _, inbound := range mihomoInbounds {
@@ -323,7 +331,17 @@ func validatePortForwardListenerClaimsAgainstActiveRules(db *gorm.DB) error {
 		return err
 	}
 	rules := make([]model.PortForwardRule, 0)
-	if err := db.Where("enabled = ?", true).Find(&rules).Error; err != nil {
+	if err := db.Select(
+		"id",
+		"name",
+		"family",
+		"protocol",
+		"local_port_mode",
+		"local_port_spec",
+		"local_port_start",
+		"local_port_count",
+		"local_port_end",
+	).Where("enabled = ?", true).Find(&rules).Error; err != nil {
 		return err
 	}
 	for _, rule := range rules {

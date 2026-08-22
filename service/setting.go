@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alireza0/s-ui/config"
@@ -18,12 +19,10 @@ import (
 	"github.com/alireza0/s-ui/util/common"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var defaultConfig = `{
-  "log": {
-    "level": "info"
-  },
   "dns": {
     "servers": [
       {
@@ -58,9 +57,6 @@ var defaultConfig = `{
 }`
 
 var defaultMihomoConfig = `{
-  "log": {
-    "level": "info"
-  },
   "dns": {
     "nameserver": [
       "tls://1.1.1.1#disable-ipv6=true",
@@ -159,7 +155,49 @@ var supportedTimeLocationSet = func() map[string]struct{} {
 const (
 	sessionMaxAgeMaxMinutes  = 72 * 60
 	defaultSessionMaxAgeUnit = "d"
+	sessionMaxAgeCacheTTL    = time.Minute
+	trafficAgeCacheTTL       = time.Minute
 )
+
+var cachedSessionMaxAge = struct {
+	sync.RWMutex
+	loaded    bool
+	value     int
+	expiresAt time.Time
+}{}
+
+var cachedTrafficAge = struct {
+	sync.RWMutex
+	loaded    bool
+	value     int
+	expiresAt time.Time
+}{}
+
+func init() {
+	database.RegisterDBResetHook(InvalidateSessionMaxAgeCache)
+	database.RegisterDBResetHook(InvalidateTrafficAgeCache)
+}
+
+// InvalidateSessionMaxAgeCache is called only after settings changes commit,
+// so session refreshes never retain a value from a rolled-back transaction.
+func InvalidateSessionMaxAgeCache() {
+	cachedSessionMaxAge.Lock()
+	cachedSessionMaxAge.loaded = false
+	cachedSessionMaxAge.value = 0
+	cachedSessionMaxAge.expiresAt = time.Time{}
+	cachedSessionMaxAge.Unlock()
+}
+
+// InvalidateTrafficAgeCache is called after settings writes commit, keeping
+// frequent stats and API reads from repeatedly waiting on SQLite's one pooled
+// connection.
+func InvalidateTrafficAgeCache() {
+	cachedTrafficAge.Lock()
+	cachedTrafficAge.loaded = false
+	cachedTrafficAge.value = 0
+	cachedTrafficAge.expiresAt = time.Time{}
+	cachedTrafficAge.Unlock()
+}
 
 var supportedTimeLocationLowerMap = func() map[string]string {
 	set := make(map[string]string, len(supportedTimeLocations))
@@ -268,6 +306,8 @@ var defaultValueMap = map[string]string{
 	"coreAutoCheckEnabled":              "false",
 	"coreAutoCheckIntervalHours":        "12",
 	"coreAutoCheckLastAt":               "0",
+	"coreAutoCheckFirstAt":              "0",
+	"coreAutoCheckFirstTimeZone":        "",
 	"coreAutoCheckLatestStable":         "",
 	"coreAutoCheckLatestAlpha":          "",
 	"coreAutoCheckPendingStable":        "",
@@ -282,6 +322,8 @@ var defaultValueMap = map[string]string{
 	"mihomoCoreAutoCheckEnabled":        "false",
 	"mihomoCoreAutoCheckIntervalHours":  "12",
 	"mihomoCoreAutoCheckLastAt":         "0",
+	"mihomoCoreAutoCheckFirstAt":        "0",
+	"mihomoCoreAutoCheckFirstTimeZone":  "",
 	"mihomoCoreAutoCheckLatestStable":   "",
 	"mihomoCoreAutoCheckLatestAlpha":    "",
 	"mihomoCoreAutoCheckPendingStable":  "",
@@ -293,6 +335,8 @@ var defaultValueMap = map[string]string{
 	"mihomoCoreAutoUpdateErrorAt":       "0",
 	"mihomoCoreAutoUpdateDisableReason": "",
 	"mihomoCoreDownloadPreference":      "{}",
+	"singboxCoreLogLevel":               defaultSingboxCoreLogLevel,
+	"mihomoCoreLogLevel":                defaultMihomoCoreLogLevel,
 	"subGroupAutoUpdateEnabled":         "false",
 	"subGroupAutoUpdateIntervalMinutes": "5",
 	"subGroupAutoUpdateLastAt":          "0",
@@ -793,7 +837,13 @@ func (s *SettingService) ensureSettingsSnapshotDefaults() error {
 	for _, row := range rows {
 		existing[row.Key] = struct{}{}
 	}
+	missing := make([]model.Setting, 0)
+	keys := make([]string, 0, len(defaultValueMap))
 	for key := range defaultValueMap {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
 		if key == "timeLocation" {
 			continue
 		}
@@ -804,8 +854,24 @@ func (s *SettingService) ensureSettingsSnapshotDefaults() error {
 		if err != nil {
 			return err
 		}
-		if err := s.saveSetting(key, value); err != nil {
+		missing = append(missing, model.Setting{Key: key, Value: value})
+	}
+	if len(missing) > 0 {
+		if err := db.Transaction(func(tx *gorm.DB) error {
+			return tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "key"}},
+				DoNothing: true,
+			}).Create(&missing).Error
+		}); err != nil {
 			return err
+		}
+		for _, setting := range missing {
+			if isSubscriptionRenderSettingKey(setting.Key) {
+				invalidateSubscriptionRuntimeSettings()
+			}
+			if setting.Key == "sessionMaxAge" {
+				InvalidateSessionMaxAgeCache()
+			}
 		}
 	}
 	if _, err := s.ensureSubPathSetting(); err != nil {
@@ -852,6 +918,7 @@ func (s *SettingService) ResetSettings() error {
 		markLastUpdate(time.Now().Unix())
 		InvalidatePanelTimeLocationCache()
 		invalidateSubscriptionRuntimeSettings()
+		InvalidateSessionMaxAgeCache()
 	}
 	return err
 }
@@ -906,10 +973,16 @@ func (s *SettingService) saveSetting(key string, value string) error {
 		saveErr = db.Save(setting).Error
 	}
 	if saveErr == nil {
+		if key == "sessionMaxAge" {
+			InvalidateSessionMaxAgeCache()
+		}
+		if key == "trafficAge" {
+			InvalidateTrafficAgeCache()
+		}
 		if key == "timeLocation" {
 			InvalidatePanelTimeLocationCache()
 		}
-		if isSubscriptionRuntimeSettingsKey(key) {
+		if isSubscriptionRenderSettingKey(key) {
 			invalidateSubscriptionRuntimeSettings()
 		}
 	}
@@ -959,6 +1032,9 @@ func (s *SettingService) setString(key string, value string) error {
 
 // SaveSetting is the exported version of saveSetting for external callers (e.g., cmd first-run setup)
 func (s *SettingService) SaveSetting(key string, value string) error {
+	if key == "config" {
+		return s.SetConfig(value)
+	}
 	return s.setString(key, value)
 }
 
@@ -1067,7 +1143,28 @@ func (s *SettingService) GetSecret() ([]byte, error) {
 }
 
 func (s *SettingService) GetSessionMaxAge() (int, error) {
-	return s.getInt("sessionMaxAge")
+	now := time.Now()
+	cachedSessionMaxAge.RLock()
+	if cachedSessionMaxAge.loaded && now.Before(cachedSessionMaxAge.expiresAt) {
+		value := cachedSessionMaxAge.value
+		cachedSessionMaxAge.RUnlock()
+		return value, nil
+	}
+	cachedSessionMaxAge.RUnlock()
+
+	cachedSessionMaxAge.Lock()
+	defer cachedSessionMaxAge.Unlock()
+	if cachedSessionMaxAge.loaded && now.Before(cachedSessionMaxAge.expiresAt) {
+		return cachedSessionMaxAge.value, nil
+	}
+	value, err := s.getInt("sessionMaxAge")
+	if err != nil {
+		return 0, err
+	}
+	cachedSessionMaxAge.loaded = true
+	cachedSessionMaxAge.value = value
+	cachedSessionMaxAge.expiresAt = now.Add(sessionMaxAgeCacheTTL)
+	return value, nil
 }
 
 func (s *SettingService) GetEffectiveSessionMaxAgeMinutes() (int, error) {
@@ -1079,7 +1176,28 @@ func (s *SettingService) GetEffectiveSessionMaxAgeMinutes() (int, error) {
 }
 
 func (s *SettingService) GetTrafficAge() (int, error) {
-	return s.getInt("trafficAge")
+	now := time.Now()
+	cachedTrafficAge.RLock()
+	if cachedTrafficAge.loaded && now.Before(cachedTrafficAge.expiresAt) {
+		value := cachedTrafficAge.value
+		cachedTrafficAge.RUnlock()
+		return value, nil
+	}
+	cachedTrafficAge.RUnlock()
+
+	cachedTrafficAge.Lock()
+	defer cachedTrafficAge.Unlock()
+	if cachedTrafficAge.loaded && now.Before(cachedTrafficAge.expiresAt) {
+		return cachedTrafficAge.value, nil
+	}
+	value, err := s.getInt("trafficAge")
+	if err != nil {
+		return 0, err
+	}
+	cachedTrafficAge.loaded = true
+	cachedTrafficAge.value = value
+	cachedTrafficAge.expiresAt = now.Add(trafficAgeCacheTTL)
+	return value, nil
 }
 
 func (s *SettingService) GetTimeLocation() (*time.Location, error) {
@@ -1143,23 +1261,22 @@ func (s *SettingService) GetSubURI() (string, error) {
 }
 
 func (s *SettingService) GetFinalSubURI(host string) (string, error) {
-	allSetting, err := s.GetAllSetting()
+	endpoint, err := s.loadSubscriptionEndpointSettings()
 	if err != nil {
 		return "", err
 	}
-	SubURI := (*allSetting)["subURI"]
-	if SubURI != "" {
-		return SubURI, nil
+	if endpoint.uri != "" {
+		return endpoint.uri, nil
 	}
 	protocol := "http"
-	subAssignedIDs, subAssignErr := GetAssignedCertificateRecordIDs(s, PanelSelfSignedTargetSub)
+	subAssignedIDs, subAssignErr := GetAssignedCertificateRecordIDsReadOnly(s, PanelSelfSignedTargetSub)
 	if subAssignErr == nil && len(subAssignedIDs) > 0 {
 		protocol = "https"
 	}
-	if (*allSetting)["subDomain"] != "" {
-		host = (*allSetting)["subDomain"]
+	if endpoint.domain != "" {
+		host = endpoint.domain
 	}
-	portNumber := strings.TrimSpace((*allSetting)["subPort"])
+	portNumber := endpoint.port
 	port := ""
 	if portNumber != "" {
 		port = ":" + portNumber
@@ -1172,11 +1289,73 @@ func (s *SettingService) GetFinalSubURI(host string) (string, error) {
 		host = "[" + host + "]"
 	}
 
-	return protocol + "://" + host + port + (*allSetting)["subPath"], nil
+	return protocol + "://" + host + port + endpoint.path, nil
+}
+
+type subscriptionEndpointSettings struct {
+	uri    string
+	domain string
+	port   string
+	path   string
+}
+
+// loadSubscriptionEndpointSettings reads only the settings needed to build a
+// subscription URL. It deliberately avoids GetAllSetting because subscription
+// extensions can be several MiB and are irrelevant to URI generation.
+func (s *SettingService) loadSubscriptionEndpointSettings() (subscriptionEndpointSettings, error) {
+	db := database.GetDB()
+	if db == nil {
+		return subscriptionEndpointSettings{}, common.NewError("database is not ready")
+	}
+
+	keys := []string{"subURI", "subDomain", "subPort", "subPath"}
+	rows := make([]model.Setting, 0, len(keys))
+	if err := db.Select("key", "value").Where("key IN ?", keys).Find(&rows).Error; err != nil {
+		return subscriptionEndpointSettings{}, err
+	}
+	values := make(map[string]string, len(rows))
+	for _, row := range rows {
+		values[row.Key] = row.Value
+	}
+
+	endpoint := subscriptionEndpointSettings{
+		uri:    strings.TrimSpace(values["subURI"]),
+		domain: strings.TrimSpace(values["subDomain"]),
+		port:   strings.TrimSpace(values["subPort"]),
+		path:   strings.TrimSpace(values["subPath"]),
+	}
+	if endpoint.uri != "" {
+		return endpoint, nil
+	}
+	if endpoint.port == "" {
+		port, err := s.ensureSubPortSetting()
+		if err != nil {
+			return subscriptionEndpointSettings{}, err
+		}
+		endpoint.port = strings.TrimSpace(port)
+	}
+	if endpoint.path == "" {
+		path, err := s.ensureSubPathSetting()
+		if err != nil {
+			return subscriptionEndpointSettings{}, err
+		}
+		endpoint.path = path
+	}
+	return endpoint, nil
 }
 
 func (s *SettingService) GetConfig() (string, error) {
-	value, err := s.getString("config")
+	return s.GetConfigWithDB(database.GetDB())
+}
+
+// GetConfigWithDB reads the sanitized default-chain config through the caller's
+// database handle. Runtime validation inside a transaction must use this path
+// instead of recursively acquiring SQLite's single pooled connection.
+func (s *SettingService) GetConfigWithDB(db *gorm.DB) (string, error) {
+	if db == nil {
+		return "", common.NewError("database is not ready")
+	}
+	value, err := s.getStringTx(db, "config")
 	if err != nil {
 		return "", err
 	}
@@ -1189,11 +1368,35 @@ func (s *SettingService) GetConfig() (string, error) {
 }
 
 func (s *SettingService) SetConfig(config string) error {
-	sanitized, err := sanitizeSingboxConfigJSON(json.RawMessage(config))
+	db := database.GetDB()
+	if db == nil {
+		return common.NewError("database is not ready")
+	}
+	changed := false
+	err := db.Transaction(func(tx *gorm.DB) error {
+		currentRevision, err := ensureSingboxConfigRevisionState(tx)
+		if err != nil {
+			return err
+		}
+		if err := validateSingboxConfigRouteBounds(json.RawMessage(config), tx); err != nil {
+			return err
+		}
+		if err := s.SaveConfig(tx, json.RawMessage(config)); err != nil {
+			return err
+		}
+		if _, err := bumpSingboxConfigRevision(tx, currentRevision); err != nil {
+			return err
+		}
+		changed = true
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	return s.setString("config", string(sanitized))
+	if changed {
+		markLastUpdate(time.Now().Unix())
+	}
+	return nil
 }
 
 func (s *SettingService) SaveConfig(tx *gorm.DB, config json.RawMessage) error {
@@ -1201,12 +1404,11 @@ func (s *SettingService) SaveConfig(tx *gorm.DB, config json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-
 	configs, err := json.MarshalIndent(sanitized, "", "  ")
 	if err != nil {
 		return err
 	}
-	return tx.Model(model.Setting{}).Where("key = ?", "config").Update("value", string(configs)).Error
+	return upsertSetting(tx, "config", string(configs))
 }
 
 func (s *SettingService) Save(tx *gorm.DB, data json.RawMessage) error {
@@ -1252,15 +1454,60 @@ func (s *SettingService) Save(tx *gorm.DB, data json.RawMessage) error {
 }
 
 func (s *SettingService) GetSubJsonExt() (string, error) {
-	return s.getSubscriptionRuntimeSetting("subJsonExt")
+	// Subscription extensions may be several MiB. Do not retain them in the
+	// runtime settings cache after a request finishes.
+	return s.getString("subJsonExt")
 }
 
 func (s *SettingService) GetServerTLSStoreEnabled() (bool, error) {
 	return s.getBool("serverTlsStoreEnabled")
 }
 
+// GetServerTLSStoreEnabledWithDB reads the setting through a caller-owned
+// handle so runtime preflight can stay inside one SQLite transaction.
+func (s *SettingService) GetServerTLSStoreEnabledWithDB(db *gorm.DB) (bool, error) {
+	if db == nil {
+		return false, common.NewError("database is not ready")
+	}
+	value, err := s.getStringTx(db, "serverTlsStoreEnabled")
+	if err != nil {
+		return false, err
+	}
+	parsed, parseErr := strconv.ParseBool(strings.TrimSpace(value))
+	if parseErr == nil {
+		return parsed, nil
+	}
+	defaultValue, ok := defaultValueMap["serverTlsStoreEnabled"]
+	if !ok {
+		return false, parseErr
+	}
+	parsed, defaultErr := strconv.ParseBool(strings.TrimSpace(defaultValue))
+	if defaultErr != nil {
+		return false, parseErr
+	}
+	logger.Warningf("invalid bool setting %q=%q, fallback to default %q", "serverTlsStoreEnabled", value, defaultValue)
+	return parsed, nil
+}
+
 func (s *SettingService) GetServerTLSStore() (string, error) {
 	store, err := s.getString("serverTlsStore")
+	if err != nil {
+		return "", err
+	}
+	normalized := normalizeCertificateStoreValue(store)
+	if normalized == "" {
+		return "chrome", nil
+	}
+	return normalized, nil
+}
+
+// GetServerTLSStoreWithDB is the transaction-safe counterpart used while a
+// sing-box runtime snapshot is validated before commit.
+func (s *SettingService) GetServerTLSStoreWithDB(db *gorm.DB) (string, error) {
+	if db == nil {
+		return "", common.NewError("database is not ready")
+	}
+	store, err := s.getStringTx(db, "serverTlsStore")
 	if err != nil {
 		return "", err
 	}
@@ -1302,7 +1549,9 @@ func (s *SettingService) ResolveSubscriptionTLSStore(fallback string) string {
 }
 
 func (s *SettingService) GetSubClashExt() (string, error) {
-	return s.getSubscriptionRuntimeSetting("subClashExt")
+	// Subscription extensions may be several MiB. Do not retain them in the
+	// runtime settings cache after a request finishes.
+	return s.getString("subClashExt")
 }
 
 func normalizeAutoSyncClientIDs(ids []uint) []uint {
@@ -1349,13 +1598,65 @@ func (s *SettingService) getAutoSyncClientIDs(key string) ([]uint, error) {
 	return normalizeAutoSyncClientIDs(ids), nil
 }
 
-func (s *SettingService) setAutoSyncClientIDs(key string, ids []uint) error {
+// saveAutoSyncClientIDsTx updates one namespace's auto-sync registry while
+// holding the caller's SQLite transaction. Keeping the read/modify/write in
+// one transaction prevents two concurrent row actions from losing each
+// other's client ID.
+func (s *SettingService) saveAutoSyncClientIDsTx(tx *gorm.DB, key string, ids []uint) (bool, error) {
+	if tx == nil {
+		return false, common.NewError("database transaction is not ready")
+	}
 	normalized := normalizeAutoSyncClientIDs(ids)
 	raw, err := json.Marshal(normalized)
 	if err != nil {
+		return false, err
+	}
+
+	currentRevision, err := ensureSettingsRevisionState(tx)
+	if err != nil {
+		return false, err
+	}
+	var current model.Setting
+	lookupErr := tx.Where("key = ?", key).First(&current).Error
+	if lookupErr == nil && current.Value == string(raw) {
+		return false, nil
+	}
+	if lookupErr != nil && !database.IsNotFound(lookupErr) {
+		return false, lookupErr
+	}
+	if err := upsertSetting(tx, key, string(raw)); err != nil {
+		return false, err
+	}
+	updated := tx.Model(&model.SettingsState{}).
+		Where("id = ? AND revision = ?", 1, currentRevision).
+		Update("revision", gorm.Expr("revision + ?", 1))
+	if updated.Error != nil {
+		return false, updated.Error
+	}
+	if updated.RowsAffected != 1 {
+		return false, common.NewError("设置版本更新冲突")
+	}
+	return true, nil
+}
+
+func (s *SettingService) saveAutoSyncClientIDs(key string, ids []uint, markRevision func()) error {
+	db := database.GetDB()
+	if db == nil {
+		return common.NewError("database is not ready")
+	}
+	changed := false
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var err error
+		changed, err = s.saveAutoSyncClientIDsTx(tx, key, ids)
+		return err
+	})
+	if err != nil {
 		return err
 	}
-	return s.setString(key, string(raw))
+	if changed && markRevision != nil {
+		markRevision()
+	}
+	return nil
 }
 
 func toggleAutoSyncClientID(ids []uint, clientID uint, enabled bool) []uint {
@@ -1383,16 +1684,22 @@ func (s *SettingService) GetSubManagerAutoSyncClientIDs() ([]uint, error) {
 }
 
 func (s *SettingService) SetSubManagerAutoSyncClient(clientID uint, enabled bool) error {
-	ids, err := s.GetSubManagerAutoSyncClientIDs()
-	if err != nil {
-		return err
-	}
-	ids = toggleAutoSyncClientID(ids, clientID, enabled)
-	return s.setAutoSyncClientIDs("subManagerAutoSyncClientIds", ids)
+	return s.updateAutoSyncClientID("subManagerAutoSyncClientIds", clientID, enabled, func() {
+		markLastUpdate(time.Now().Unix())
+	})
+}
+
+// SetSubManagerAutoSyncClientTx updates the default-chain auto-sync registry
+// inside an existing transaction. Callers must mark the appropriate polling
+// revision after the surrounding transaction commits.
+func (s *SettingService) SetSubManagerAutoSyncClientTx(tx *gorm.DB, clientID uint, enabled bool) (bool, error) {
+	return s.updateAutoSyncClientIDTx(tx, "subManagerAutoSyncClientIds", clientID, enabled)
 }
 
 func (s *SettingService) SaveSubManagerAutoSyncClientIDs(ids []uint) error {
-	return s.setAutoSyncClientIDs("subManagerAutoSyncClientIds", ids)
+	return s.saveAutoSyncClientIDs("subManagerAutoSyncClientIds", ids, func() {
+		markLastUpdate(time.Now().Unix())
+	})
 }
 
 func (s *SettingService) GetSubManagerAutoSyncMihomoClientIDs() ([]uint, error) {
@@ -1400,16 +1707,67 @@ func (s *SettingService) GetSubManagerAutoSyncMihomoClientIDs() ([]uint, error) 
 }
 
 func (s *SettingService) SetSubManagerAutoSyncMihomoClient(clientID uint, enabled bool) error {
-	ids, err := s.GetSubManagerAutoSyncMihomoClientIDs()
-	if err != nil {
-		return err
-	}
-	ids = toggleAutoSyncClientID(ids, clientID, enabled)
-	return s.setAutoSyncClientIDs("subManagerAutoSyncMihomoClientIds", ids)
+	return s.updateAutoSyncClientID("subManagerAutoSyncMihomoClientIds", clientID, enabled, func() {
+		markMihomoLastUpdate(time.Now().Unix())
+	})
+}
+
+// SetSubManagerAutoSyncMihomoClientTx updates the Mihomo auto-sync registry
+// inside an existing transaction. Callers must mark the appropriate polling
+// revision after the surrounding transaction commits.
+func (s *SettingService) SetSubManagerAutoSyncMihomoClientTx(tx *gorm.DB, clientID uint, enabled bool) (bool, error) {
+	return s.updateAutoSyncClientIDTx(tx, "subManagerAutoSyncMihomoClientIds", clientID, enabled)
 }
 
 func (s *SettingService) SaveSubManagerAutoSyncMihomoClientIDs(ids []uint) error {
-	return s.setAutoSyncClientIDs("subManagerAutoSyncMihomoClientIds", ids)
+	return s.saveAutoSyncClientIDs("subManagerAutoSyncMihomoClientIds", ids, func() {
+		markMihomoLastUpdate(time.Now().Unix())
+	})
+}
+
+func (s *SettingService) updateAutoSyncClientID(key string, clientID uint, enabled bool, markRevision func()) error {
+	if clientID == 0 {
+		return nil
+	}
+	db := database.GetDB()
+	if db == nil {
+		return common.NewError("database is not ready")
+	}
+	changed := false
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var err error
+		changed, err = s.updateAutoSyncClientIDTx(tx, key, clientID, enabled)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if changed && markRevision != nil {
+		markRevision()
+	}
+	return nil
+}
+
+func (s *SettingService) updateAutoSyncClientIDTx(tx *gorm.DB, key string, clientID uint, enabled bool) (bool, error) {
+	if tx == nil {
+		return false, common.NewError("database transaction is not ready")
+	}
+	if clientID == 0 {
+		return false, nil
+	}
+	raw, err := s.getStringTx(tx, key)
+	if err != nil {
+		return false, err
+	}
+	var ids []uint
+	if trimmed := strings.TrimSpace(raw); trimmed != "" {
+		if err := json.Unmarshal([]byte(trimmed), &ids); err != nil {
+			logger.Warningf("invalid auto sync client id list for %s: %v", key, err)
+			ids = []uint{}
+		}
+	}
+	ids = toggleAutoSyncClientID(ids, clientID, enabled)
+	return s.saveAutoSyncClientIDsTx(tx, key, ids)
 }
 
 func (s *SettingService) getStringTx(tx *gorm.DB, key string) (string, error) {

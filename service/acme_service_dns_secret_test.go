@@ -162,13 +162,39 @@ func TestSanitizeDNSAccountEnvForProviderDropsOtherProviderFields(t *testing.T) 
 
 func TestAcmeDNSProviderCatalogMatchesOfficialDefinitions(t *testing.T) {
 	expectedFields := map[string][]string{
-		"dns_ali":         {"Ali_Key", "Ali_Secret"},
-		"dns_tencent":     {"Tencent_SecretId", "Tencent_SecretKey"},
-		"dns_cf":          {"CF_Token", "CF_Account_ID", "CF_Zone_ID", "CF_Email", "CF_Key"},
-		"dns_aws":         {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DNS_SLOWRATE"},
-		"dns_huaweicloud": {"HUAWEICLOUD_Username", "HUAWEICLOUD_Password", "HUAWEICLOUD_DomainName", "HUAWEICLOUD_Region"},
-		"dns_gd":          {"GD_Key", "GD_Secret"},
-		"dns_vercel":      {"VERCEL_TOKEN"},
+		"dns_ali":           {"Ali_Key", "Ali_Secret"},
+		"dns_tencent":       {"Tencent_SecretId", "Tencent_SecretKey"},
+		"dns_cf":            {"CF_Token", "CF_Account_ID", "CF_Zone_ID", "CF_Email", "CF_Key"},
+		"dns_aws":           {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DNS_SLOWRATE"},
+		"dns_huaweicloud":   {"HUAWEICLOUD_Username", "HUAWEICLOUD_Password", "HUAWEICLOUD_DomainName", "HUAWEICLOUD_Region"},
+		"dns_gd":            {"GD_Key", "GD_Secret"},
+		"dns_vercel":        {"VERCEL_TOKEN"},
+		"dns_spaceship":     {"SPACESHIP_API_KEY", "SPACESHIP_API_SECRET", "SPACESHIP_ROOT_DOMAIN"},
+		"dns_gcloud":        {"CLOUDSDK_ACTIVE_CONFIG_NAME"},
+		"dns_azure":         {"AZUREDNS_SUBSCRIPTIONID", "AZUREDNS_TENANTID", "AZUREDNS_APPID", "AZUREDNS_CLIENTSECRET", "AZUREDNS_MANAGEDIDENTITY", "AZUREDNS_BEARERTOKEN"},
+		"dns_oci":           {"OCI_CLI_TENANCY", "OCI_CLI_USER", "OCI_CLI_REGION", "OCI_CLI_KEY_FILE", "OCI_CLI_KEY"},
+		"dns_nsone":         {"NS1_Key"},
+		"dns_linode_v4":     {"LINODE_V4_API_KEY"},
+		"dns_dgon":          {"DO_API_KEY"},
+		"dns_vultr":         {"VULTR_API_KEY"},
+		"dns_namecheap":     {"NAMECHEAP_API_KEY", "NAMECHEAP_USERNAME", "NAMECHEAP_SOURCEIP"},
+		"dns_gandi_livedns": {"GANDI_LIVEDNS_TOKEN", "GANDI_LIVEDNS_KEY"},
+		"dns_porkbun":       {"PORKBUN_API_KEY", "PORKBUN_SECRET_API_KEY"},
+		"dns_namecom":       {"Namecom_Username", "Namecom_Token"},
+		"dns_njalla":        {"NJALLA_Token"},
+		"dns_cloudns":       {"CLOUDNS_AUTH_ID", "CLOUDNS_SUB_AUTH_ID", "CLOUDNS_AUTH_PASSWORD"},
+		"dns_he":            {"HE_Username", "HE_Password"},
+		"dns_me":            {"ME_Key", "ME_Secret"},
+		"dns_constellix":    {"CONSTELLIX_Key", "CONSTELLIX_Secret"},
+		"dns_freedns":       {"FREEDNS_User", "FREEDNS_Password"},
+		"dns_zoneedit":      {"ZONEEDIT_ID", "ZONEEDIT_Token"},
+		"dns_rage4":         {"RAGE4_USERNAME", "RAGE4_TOKEN"},
+		"dns_yc":            {"YC_Zone_ID", "YC_Folder_ID", "YC_SA_ID", "YC_SA_Key_ID", "YC_SA_Key_File_Path", "YC_SA_Key_File_PEM_b64"},
+		"dns_duckdns":       {"DuckDNS_Token"},
+		"dns_dynu":          {"Dynu_ClientId", "Dynu_Secret"},
+		"dns_volcengine":    {"Volcengine_ACCESS_KEY_ID", "Volcengine_SECRET_ACCESS_KEY", "Volcengine_SESSION_TOKEN"},
+		"dns_baidu":         {"Baidu_AK", "Baidu_SK", "Baidu_API_Preference"},
+		"dns_west_cn":       {"WEST_Username", "WEST_Key"},
 	}
 	expectedRequired := map[string]map[string]bool{
 		"dns_ali": {
@@ -204,6 +230,119 @@ func TestAcmeDNSProviderCatalogMatchesOfficialDefinitions(t *testing.T) {
 		"dns_vercel": {
 			"VERCEL_TOKEN": true,
 		},
+		"dns_spaceship": {
+			"SPACESHIP_API_KEY":     true,
+			"SPACESHIP_API_SECRET":  true,
+			"SPACESHIP_ROOT_DOMAIN": false,
+		},
+		"dns_gcloud": {
+			"CLOUDSDK_ACTIVE_CONFIG_NAME": false,
+		},
+		"dns_azure": {
+			"AZUREDNS_SUBSCRIPTIONID":  true,
+			"AZUREDNS_TENANTID":        false,
+			"AZUREDNS_APPID":           false,
+			"AZUREDNS_CLIENTSECRET":    false,
+			"AZUREDNS_MANAGEDIDENTITY": false,
+			"AZUREDNS_BEARERTOKEN":     false,
+		},
+		"dns_oci": {
+			"OCI_CLI_TENANCY":  false,
+			"OCI_CLI_USER":     false,
+			"OCI_CLI_REGION":   false,
+			"OCI_CLI_KEY_FILE": false,
+			"OCI_CLI_KEY":      false,
+		},
+		"dns_nsone": {
+			"NS1_Key": true,
+		},
+		"dns_linode_v4": {
+			"LINODE_V4_API_KEY": true,
+		},
+		"dns_dgon": {
+			"DO_API_KEY": true,
+		},
+		"dns_vultr": {
+			"VULTR_API_KEY": true,
+		},
+		"dns_namecheap": {
+			"NAMECHEAP_API_KEY":  true,
+			"NAMECHEAP_USERNAME": true,
+			"NAMECHEAP_SOURCEIP": false,
+		},
+		"dns_gandi_livedns": {
+			"GANDI_LIVEDNS_TOKEN": false,
+			"GANDI_LIVEDNS_KEY":   false,
+		},
+		"dns_porkbun": {
+			"PORKBUN_API_KEY":        true,
+			"PORKBUN_SECRET_API_KEY": true,
+		},
+		"dns_namecom": {
+			"Namecom_Username": true,
+			"Namecom_Token":    true,
+		},
+		"dns_njalla": {
+			"NJALLA_Token": true,
+		},
+		"dns_cloudns": {
+			"CLOUDNS_AUTH_ID":       false,
+			"CLOUDNS_SUB_AUTH_ID":   false,
+			"CLOUDNS_AUTH_PASSWORD": true,
+		},
+		"dns_he": {
+			"HE_Username": true,
+			"HE_Password": true,
+		},
+		"dns_me": {
+			"ME_Key":    true,
+			"ME_Secret": true,
+		},
+		"dns_constellix": {
+			"CONSTELLIX_Key":    true,
+			"CONSTELLIX_Secret": true,
+		},
+		"dns_freedns": {
+			"FREEDNS_User":     true,
+			"FREEDNS_Password": true,
+		},
+		"dns_zoneedit": {
+			"ZONEEDIT_ID":    true,
+			"ZONEEDIT_Token": true,
+		},
+		"dns_rage4": {
+			"RAGE4_USERNAME": true,
+			"RAGE4_TOKEN":    true,
+		},
+		"dns_yc": {
+			"YC_Zone_ID":             false,
+			"YC_Folder_ID":           false,
+			"YC_SA_ID":               false,
+			"YC_SA_Key_ID":           false,
+			"YC_SA_Key_File_Path":    false,
+			"YC_SA_Key_File_PEM_b64": false,
+		},
+		"dns_duckdns": {
+			"DuckDNS_Token": true,
+		},
+		"dns_dynu": {
+			"Dynu_ClientId": true,
+			"Dynu_Secret":   true,
+		},
+		"dns_volcengine": {
+			"Volcengine_ACCESS_KEY_ID":     true,
+			"Volcengine_SECRET_ACCESS_KEY": true,
+			"Volcengine_SESSION_TOKEN":     false,
+		},
+		"dns_baidu": {
+			"Baidu_AK":             true,
+			"Baidu_SK":             true,
+			"Baidu_API_Preference": false,
+		},
+		"dns_west_cn": {
+			"WEST_Username": true,
+			"WEST_Key":      true,
+		},
 	}
 	if len(defaultAcmeDNSProviderCatalog) != len(expectedFields) {
 		t.Fatalf("unexpected DNS provider catalog size: got=%d want=%d", len(defaultAcmeDNSProviderCatalog), len(expectedFields))
@@ -231,6 +370,144 @@ func TestAcmeDNSProviderCatalogMatchesOfficialDefinitions(t *testing.T) {
 	region := huawei.Fields[len(huawei.Fields)-1]
 	if region.Required || region.Placeholder != "cn-north-4" {
 		t.Fatalf("unexpected HuaweiCloud Region definition: %#v", region)
+	}
+
+	spaceship, _ := lookupAcmeDNSProvider("dns_spaceship")
+	rootDomain := spaceship.Fields[len(spaceship.Fields)-1]
+	if rootDomain.Required || rootDomain.Placeholder != "example.com" {
+		t.Fatalf("unexpected Spaceship root domain definition: %#v", rootDomain)
+	}
+}
+
+func TestEnsureAcmeDNSProviderScript(t *testing.T) {
+	homeDir := t.TempDir()
+	if err := ensureAcmeDNSProviderScript(homeDir, "dns_spaceship"); err == nil {
+		t.Fatal("expected missing Spaceship dnsapi script to be rejected")
+	}
+	if err := os.MkdirAll(filepath.Join(homeDir, "dnsapi"), 0o755); err != nil {
+		t.Fatalf("create dnsapi directory failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(homeDir, "dnsapi", "dns_spaceship.sh"), []byte("dns"), 0o644); err != nil {
+		t.Fatalf("write Spaceship dnsapi script failed: %v", err)
+	}
+	if err := ensureAcmeDNSProviderScript(homeDir, "dns_spaceship"); err != nil {
+		t.Fatalf("expected Spaceship dnsapi script accepted: %v", err)
+	}
+	if err := ensureAcmeDNSProviderScript(homeDir, "dns_custom"); err != nil {
+		t.Fatalf("custom dnsapi provider should retain compatibility: %v", err)
+	}
+}
+
+func TestValidateDNSProviderEnvSpaceship(t *testing.T) {
+	provider, ok := lookupAcmeDNSProvider("dns_spaceship")
+	if !ok {
+		t.Fatal("dns_spaceship provider not found")
+	}
+	if err := validateDNSProviderEnv(provider, map[string]string{
+		"SPACESHIP_API_KEY":     "api-key",
+		"SPACESHIP_API_SECRET":  "api-secret",
+		"SPACESHIP_ROOT_DOMAIN": "example.com",
+	}); err != nil {
+		t.Fatalf("expected Spaceship credentials valid, got err=%v", err)
+	}
+	if err := validateDNSProviderEnv(provider, map[string]string{
+		"SPACESHIP_API_KEY": "api-key",
+	}); err == nil {
+		t.Fatal("expected missing Spaceship API secret rejected")
+	}
+}
+
+func TestValidateDNSProviderEnvAlternativeCredentialModes(t *testing.T) {
+	tests := []struct {
+		providerCode string
+		env          map[string]string
+		wantErr      bool
+	}{
+		{
+			providerCode: "dns_azure",
+			env: map[string]string{
+				"AZUREDNS_SUBSCRIPTIONID": "subscription-id",
+				"AZUREDNS_TENANTID":       "tenant-id",
+				"AZUREDNS_APPID":          "app-id",
+				"AZUREDNS_CLIENTSECRET":   "client-secret",
+			},
+		},
+		{
+			providerCode: "dns_azure",
+			env: map[string]string{
+				"AZUREDNS_SUBSCRIPTIONID":  "subscription-id",
+				"AZUREDNS_MANAGEDIDENTITY": "true",
+			},
+		},
+		{
+			providerCode: "dns_azure",
+			env: map[string]string{
+				"AZUREDNS_SUBSCRIPTIONID": "subscription-id",
+			},
+			wantErr: true,
+		},
+		{
+			providerCode: "dns_gandi_livedns",
+			env:          map[string]string{"GANDI_LIVEDNS_TOKEN": "token"},
+		},
+		{
+			providerCode: "dns_gandi_livedns",
+			env:          map[string]string{},
+			wantErr:      true,
+		},
+		{
+			providerCode: "dns_cloudns",
+			env: map[string]string{
+				"CLOUDNS_SUB_AUTH_ID":   "sub-auth-id",
+				"CLOUDNS_AUTH_PASSWORD": "password",
+			},
+		},
+		{
+			providerCode: "dns_cloudns",
+			env:          map[string]string{"CLOUDNS_AUTH_PASSWORD": "password"},
+			wantErr:      true,
+		},
+		{
+			providerCode: "dns_yc",
+			env: map[string]string{
+				"YC_Zone_ID":             "zone-id",
+				"YC_SA_ID":               "service-account-id",
+				"YC_SA_Key_ID":           "key-id",
+				"YC_SA_Key_File_PEM_b64": "base64-private-key",
+			},
+		},
+		{
+			providerCode: "dns_yc",
+			env: map[string]string{
+				"YC_Folder_ID": "folder-id",
+				"YC_SA_ID":     "service-account-id",
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.providerCode, func(t *testing.T) {
+			provider, ok := lookupAcmeDNSProvider(test.providerCode)
+			if !ok {
+				t.Fatalf("provider %q not found", test.providerCode)
+			}
+			err := validateDNSProviderEnv(provider, test.env)
+			if test.wantErr && err == nil {
+				t.Fatal("expected validation error")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("expected credentials valid, got err=%v", err)
+			}
+		})
+	}
+}
+
+func TestIsAcmeSecretEnvKeyMasksPrivateKeyFileValues(t *testing.T) {
+	for _, key := range []string{"YC_SA_Key_File_PEM_b64", "OCI_CLI_KEY_FILE"} {
+		if !isAcmeSecretEnvKey(key) {
+			t.Fatalf("expected %q to be treated as secret", key)
+		}
 	}
 }
 
@@ -799,8 +1076,12 @@ func TestGetOverviewReturnsAccountsAndCertificatesWhenUnsupportedOS(t *testing.T
 	if len(overview.DNSAccounts) == 0 {
 		t.Fatal("expected dns accounts in overview")
 	}
-	if len(overview.Certificates) == 0 {
-		t.Fatal("expected certificates in overview")
+	certificates, err := certificateInventory.ListPage(1, 20, "")
+	if err != nil {
+		t.Fatalf("list certificate page failed: %v", err)
+	}
+	if len(certificates.Items) == 0 {
+		t.Fatal("expected certificates in certificate page")
 	}
 	if runtime.GOOS != "linux" {
 		if overview.Supported {

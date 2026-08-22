@@ -2,7 +2,7 @@
   <div class="firewall-page">
     <v-row class="mb-4">
       <v-col cols="12" xl="8">
-        <v-card class="firewall-hero" rounded="xl" :loading="loading && !overview.available">
+        <v-card class="firewall-hero" rounded="xl" :loading="loading && !hasLoaded">
           <div class="firewall-hero__bg"></div>
           <v-card-text class="firewall-hero__content">
             <div class="firewall-hero__title-row">
@@ -35,7 +35,7 @@
                     v-else-if="!overview.nftables.installed"
                     color="primary"
                     prepend-icon="mdi-download"
-                    :disabled="loading || installingNftables"
+                  :disabled="!hasLoaded || loading || installingNftables || hasFirewallWriteInProgress"
                     @click="installNftables">
                     下载 nftables
                   </v-btn>
@@ -60,7 +60,7 @@
                   <div class="text-caption text-medium-emphasis mb-1">总开关</div>
                   <v-switch
                     :model-value="switchEnabled"
-                    :disabled="!overview.available || switchBusy || hasActiveNftablesInstall"
+                    :disabled="!hasLoaded || !overview.available || hasFirewallWriteInProgress || hasActiveNftablesInstall"
                     :loading="switchBusy"
                     color="success"
                     inset
@@ -73,13 +73,13 @@
             <div class="firewall-hero__chips">
               <v-chip
                 size="small"
-                :color="overview.enabled ? 'success' : 'grey'"
+                   :color="!hasLoaded ? 'info' : overview.enabled ? 'success' : 'grey'"
                 variant="flat"
                 :class="[
                   'firewall-hero-chip',
-                  overview.enabled ? 'firewall-hero-chip--running' : 'firewall-hero-chip--stopped',
-                ]">
-                {{ overview.enabled ? '运行中' : '已关闭' }}
+                   !hasLoaded ? 'firewall-hero-chip--loading' : overview.enabled ? 'firewall-hero-chip--running' : 'firewall-hero-chip--stopped',
+                 ]">
+                 {{ !hasLoaded ? '加载中' : overview.enabled ? '运行中' : '已关闭' }}
               </v-chip>
               <v-chip size="small" color="info" variant="flat" class="firewall-hero-chip firewall-hero-chip--ports">
                 当前保留 {{ formatPortList(overview.defaultPorts.active) }}
@@ -107,7 +107,7 @@
                   max="65535"
                   hide-details="auto"
                   class="firewall-ssh-port-input"
-                  :disabled="savingSSHPort || switchingSSHProxy || !overview.sshConfig.supported"
+                    :disabled="!hasLoaded || hasFirewallWriteInProgress || !overview.sshConfig.supported || !!overview.sshConfig.error"
                   :error="sshPortInputTouched && !sshPortInputValid"
                   :error-messages="sshPortInputTouched && !sshPortInputValid ? ['端口必须是 1-65535 的正整数'] : []"
                   @focus="onSSHPortFocus"
@@ -122,7 +122,7 @@
                   color="primary"
                   prepend-icon="mdi-content-save-outline"
                   :loading="savingSSHPort"
-                  :disabled="!canSaveSSHPort || switchingSSHProxy"
+                    :disabled="!hasLoaded || !canSaveSSHPort || hasFirewallWriteInProgress || !!overview.sshConfig.error"
                   @click="saveSSHPort">
                   保存
                 </v-btn>
@@ -139,7 +139,7 @@
                   </div>
                   <v-switch
                     :model-value="sshProxySwitch"
-                    :disabled="switchingSSHProxy || savingSSHPort || !overview.sshConfig.supported"
+                    :disabled="!hasLoaded || hasFirewallWriteInProgress || !overview.sshConfig.supported || !!overview.sshConfig.error"
                     :loading="switchingSSHProxy"
                     color="success"
                     hide-details
@@ -245,10 +245,11 @@
                   {{ systemRuleStatusLabel('ssh') }}
                 </v-chip>
                 <v-btn
-                  size="small"
-                  variant="text"
-                  color="warning"
-                  :loading="systemRuleBusyKey === 'ssh'"
+                   size="small"
+                   variant="text"
+                   color="warning"
+                   :disabled="!hasLoaded || hasFirewallWriteInProgress"
+                   :loading="systemRuleBusyKey === 'ssh'"
                   @click="setSystemRuleReserved('ssh', !overview.defaultPorts.sshReserved)">
                   {{ overview.defaultPorts.sshReserved ? '移除保留' : '恢复保留' }}
                 </v-btn>
@@ -273,10 +274,11 @@
                   {{ systemRuleStatusLabel('sub') }}
                 </v-chip>
                 <v-btn
-                  size="small"
-                  variant="text"
-                  color="warning"
-                  :loading="systemRuleBusyKey === 'sub'"
+                   size="small"
+                   variant="text"
+                   color="warning"
+                   :disabled="!hasLoaded || hasFirewallWriteInProgress"
+                   :loading="systemRuleBusyKey === 'sub'"
                   @click="setSystemRuleReserved('sub', !overview.defaultPorts.subReserved)">
                   {{ overview.defaultPorts.subReserved ? '移除保留' : '恢复保留' }}
                 </v-btn>
@@ -295,6 +297,30 @@
     </v-row>
 
     <v-alert
+      v-if="loadError"
+      type="error"
+      variant="tonal"
+      density="comfortable"
+      class="mb-4">
+      <div class="d-flex align-center justify-space-between flex-wrap ga-3">
+        <span>{{ loadError }}</span>
+        <v-btn variant="text" prepend-icon="mdi-refresh" :loading="loading" @click="fetchOverview(false)">
+          重新加载
+        </v-btn>
+      </div>
+    </v-alert>
+    <v-alert
+      v-else-if="!hasLoaded"
+      type="info"
+      variant="tonal"
+      density="comfortable"
+      class="mb-4">
+      <div class="d-flex align-center ga-2">
+        <v-progress-circular indeterminate size="18" width="2" />
+        <span>正在读取防火墙概览</span>
+      </div>
+    </v-alert>
+    <v-alert
       v-if="overview.error"
       type="warning"
       variant="tonal"
@@ -308,7 +334,7 @@
         <div>
           <div class="text-subtitle-1 font-weight-medium">规则列表</div>
           <div class="text-caption text-medium-emphasis mt-1">
-            支持 IPv4 / IPv6 / 双栈、端口段，以及源 IP / CIDR 限制。监听状态会随页面轮询自动刷新。
+            支持 IPv4 / IPv6 / 双栈、端口段，以及源 IP / CIDR 的屏蔽或放行策略。监听状态会随页面轮询自动刷新。
           </div>
         </div>
         <div class="d-flex align-center ga-2">
@@ -317,13 +343,14 @@
             color="info"
             prepend-icon="mdi-refresh"
             :loading="refreshing"
+            :disabled="!hasLoaded || refreshing || hasFirewallWriteInProgress"
             @click="refreshOverview">
             立即刷新
           </v-btn>
           <v-btn
             color="primary"
             prepend-icon="mdi-plus"
-            :disabled="!overview.enabled"
+            :disabled="!hasLoaded || !overview.enabled || hasFirewallWriteInProgress"
             @click="openRuleDialog()">
             新建规则
           </v-btn>
@@ -384,7 +411,16 @@
           </template>
 
           <template #item.sourceSpec="{ item }">
-            <span>{{ item.sourceSpec || (isIcmpProtocol(item.protocol) ? '-' : '任意来源') }}</span>
+            <div class="firewall-source-cell">
+              <v-chip
+                v-if="sourceModeForRule(item)"
+                size="x-small"
+                :color="sourceModeForRule(item) === 'block' ? 'error' : 'success'"
+                variant="tonal">
+                {{ sourceModeForRule(item) === 'block' ? '只屏蔽' : '只放行' }}
+              </v-chip>
+              <span>{{ item.sourceSpec || (isIcmpProtocol(item.protocol) ? '-' : '任意来源') }}</span>
+            </div>
           </template>
 
           <template #item.listenerState="{ item }">
@@ -445,26 +481,30 @@
           </template>
 
           <template #item.actions="{ item }">
-            <div class="d-flex align-center ga-3">
-              <v-icon
-                size="18"
-                :color="item.canEdit ? 'primary' : 'grey'"
-                :class="{ 'firewall-action--disabled': !item.canEdit }"
-                @click="item.canEdit && openRuleDialog(item)">
-                mdi-pencil
-              </v-icon>
-              <v-icon
-                size="18"
-                :color="item.canDelete ? 'error' : 'grey'"
-                :class="{ 'firewall-action--disabled': !item.canDelete }"
-                @click="item.canDelete && removeRule(item)">
-                mdi-delete
-              </v-icon>
+            <div class="d-flex align-center ga-1">
+              <v-btn
+                icon="mdi-pencil"
+                size="small"
+                variant="text"
+                color="primary"
+                aria-label="编辑规则"
+                title="编辑规则"
+                :disabled="!hasLoaded || !overview.enabled || !item.canEdit || hasFirewallWriteInProgress"
+                @click="openRuleDialog(item)" />
+              <v-btn
+                icon="mdi-delete"
+                size="small"
+                variant="text"
+                color="error"
+                aria-label="删除规则"
+                title="删除规则"
+                :disabled="!hasLoaded || !item.canDelete || (!overview.enabled && item.origin !== 'system') || hasFirewallWriteInProgress"
+                @click="removeRule(item)" />
             </div>
           </template>
         </v-data-table>
 
-        <div v-if="filteredRules.length === 0" class="firewall-empty">
+        <div v-if="hasLoaded && filteredRules.length === 0" class="firewall-empty">
           <v-icon size="38" color="grey">mdi-shield-off-outline</v-icon>
           <div class="text-subtitle-2 mt-2">
             {{ overview.enabled ? '当前没有匹配到规则' : '防火墙关闭后仅停止下发 nftables 规则，当前规则记录会保留' }}
@@ -488,12 +528,13 @@
             label="更新周期(分钟)"
             type="number"
             min="1"
+            :disabled="hasFirewallWriteInProgress"
             hide-details />
           <v-btn
             variant="tonal"
             color="secondary"
             prepend-icon="mdi-content-save-outline"
-            :disabled="!geoSettingsDirty"
+            :disabled="!hasLoaded || !geoSettingsDirty || hasFirewallWriteInProgress"
             :loading="savingGeoSettings"
             @click="saveGeoSettings">
             保存周期
@@ -503,12 +544,14 @@
             color="info"
             prepend-icon="mdi-database-sync-outline"
             :loading="geoRefreshing"
+            :disabled="!hasLoaded || hasFirewallWriteInProgress"
             @click="refreshGeoRules">
             立即更新
           </v-btn>
           <v-btn
             color="primary"
             prepend-icon="mdi-plus"
+            :disabled="!hasLoaded || hasFirewallWriteInProgress"
             @click="openGeoRuleDialog()">
             新建 GeoIP 规则
           </v-btn>
@@ -522,7 +565,7 @@
           type="info"
           density="comfortable"
           class="mb-4 firewall-geo__note">
-          GeoIP 规则会先于上方放行规则进行匹配；同端口选择“只放行”时，会把该端口变成来源白名单，仅允许命中国家访问，其余来源会直接丢弃，后面的普通放行规则不会再接管这部分流量。规则文件缓存目录：Promanager_data/geoip。当前最近一次全局刷新：{{ geoLastRefreshLabel }}。
+          手工源地址策略优先于 GeoIP：明确命中的 IP 以“只屏蔽”或“只放行”为准；“只屏蔽”未命中的来源会继续交给 GeoIP 和普通规则。同端口选择 GeoIP“只放行”时，会把该端口变成国家来源白名单，其余来源会直接丢弃。规则文件缓存目录：Promanager_data/geoip。当前最近一次全局刷新：{{ geoLastRefreshLabel }}。
         </v-alert>
 
         <v-row class="mb-2">
@@ -635,24 +678,30 @@
           </template>
 
           <template #item.actions="{ item }">
-            <div class="d-flex align-center ga-3">
-              <v-icon
-                size="18"
+            <div class="d-flex align-center ga-1">
+              <v-btn
+                icon="mdi-pencil"
+                size="small"
+                variant="text"
                 color="primary"
-                @click="openGeoRuleDialog(item)">
-                mdi-pencil
-              </v-icon>
-              <v-icon
-                size="18"
+                aria-label="编辑 GeoIP 规则"
+                title="编辑 GeoIP 规则"
+                :disabled="!hasLoaded || hasFirewallWriteInProgress"
+                @click="openGeoRuleDialog(item)" />
+              <v-btn
+                icon="mdi-delete"
+                size="small"
+                variant="text"
                 color="error"
-                @click="removeGeoRule(item)">
-                mdi-delete
-              </v-icon>
+                aria-label="删除 GeoIP 规则"
+                title="删除 GeoIP 规则"
+                :disabled="!hasLoaded || hasFirewallWriteInProgress"
+                @click="removeGeoRule(item)" />
             </div>
           </template>
         </v-data-table>
 
-        <div v-if="filteredGeoRules.length === 0" class="firewall-empty">
+        <div v-if="hasLoaded && filteredGeoRules.length === 0" class="firewall-empty">
           <v-icon size="38" color="grey">mdi-map-search-outline</v-icon>
           <div class="text-subtitle-2 mt-2">
             {{ overview.geoRuleCount > 0 ? '当前筛选条件下没有 GeoIP 规则' : '还没有来源 IP 识别规则，可按端口或端口范围创建' }}
@@ -661,7 +710,7 @@
       </v-card-text>
     </v-card>
 
-    <v-dialog v-model="dialogVisible" max-width="760">
+    <v-dialog v-model="dialogVisible" max-width="760" :fullscreen="smAndDown" :persistent="savingRule" scrollable>
       <v-card rounded="xl" :loading="savingRule">
         <v-card-title>{{ editingRule.id > 0 ? '编辑防火墙规则' : '新建防火墙规则' }}</v-card-title>
         <v-divider />
@@ -708,6 +757,16 @@
           </v-row>
           <v-row class="mt-1">
             <v-col cols="12">
+              <v-select
+                v-model="editingRule.sourceMode"
+                :items="sourceModeItems"
+                :disabled="!editingRuleNeedsSource"
+                label="源地址策略"
+                hide-details />
+            </v-col>
+          </v-row>
+          <v-row class="mt-1">
+            <v-col cols="12">
               <v-textarea
                 v-model="editingRule.description"
                 label="备注"
@@ -717,20 +776,20 @@
             </v-col>
           </v-row>
           <v-alert variant="tonal" type="info" density="comfortable" class="mt-4">
-            规则保存后会立即重建面板自己的防火墙链；界面保留不可编辑也不可删除，SSH 和订阅保留可在页面主卡片里按需移除或恢复。
+            规则保存后会立即重建面板自己的防火墙链；源地址策略为“不设置”时忽略上方源地址，SSH 和订阅保留可在页面主卡片里按需移除或恢复。
           </v-alert>
         </v-card-text>
         <v-card-actions>
           <v-spacer />
-          <v-btn variant="text" @click="closeRuleDialog">取消</v-btn>
-          <v-btn color="primary" variant="tonal" :loading="savingRule" @click="saveRule">
+          <v-btn variant="text" :disabled="savingRule" @click="closeRuleDialog">取消</v-btn>
+          <v-btn color="primary" variant="tonal" :loading="savingRule" :disabled="savingRule" @click="saveRule">
             保存
           </v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
 
-    <v-dialog v-model="geoDialogVisible" max-width="900">
+    <v-dialog v-model="geoDialogVisible" max-width="900" :fullscreen="smAndDown" :persistent="savingGeoRule" scrollable>
       <v-card rounded="xl" :loading="savingGeoRule">
         <v-card-title>{{ editingGeoRule.id > 0 ? '编辑 GeoIP 规则' : '新建 GeoIP 规则' }}</v-card-title>
         <v-divider />
@@ -847,8 +906,8 @@
         </v-card-text>
         <v-card-actions>
           <v-spacer />
-          <v-btn variant="text" @click="closeGeoRuleDialog">取消</v-btn>
-          <v-btn color="primary" variant="tonal" :loading="savingGeoRule" @click="saveGeoRule">
+          <v-btn variant="text" :disabled="savingGeoRule" @click="closeGeoRuleDialog">取消</v-btn>
+          <v-btn color="primary" variant="tonal" :loading="savingGeoRule" :disabled="savingGeoRule" @click="saveGeoRule">
             保存
           </v-btn>
         </v-card-actions>
@@ -882,6 +941,7 @@ type FirewallRule = {
   protocol: string
   portSpec: string
   sourceSpec: string
+  sourceMode: string
   canEdit: boolean
   canDelete: boolean
   listenerState: FirewallRuleListenerState
@@ -1030,6 +1090,7 @@ type FirewallRuleForm = {
   protocol: string
   portSpec: string
   sourceSpec: string
+  sourceMode: string
 }
 
 type FirewallGeoRuleForm = {
@@ -1130,6 +1191,7 @@ const createEmptyRuleForm = (): FirewallRuleForm => ({
   protocol: 'tcp_udp',
   portSpec: '',
   sourceSpec: '',
+  sourceMode: '',
 })
 
 const createEmptyGeoRuleForm = (): FirewallGeoRuleForm => ({
@@ -1146,6 +1208,8 @@ const createEmptyGeoRuleForm = (): FirewallGeoRuleForm => ({
 })
 
 const loading = ref(false)
+const hasLoaded = ref(false)
+const loadError = ref('')
 const refreshing = ref(false)
 const switchBusy = ref(false)
 const installingNftables = ref(false)
@@ -1184,6 +1248,13 @@ const dialogVisible = ref(false)
 const geoDialogVisible = ref(false)
 const pollTimer = ref<number | null>(null)
 const overviewRequest = ref<Promise<Msg> | null>(null)
+let overviewAbortController: AbortController | null = null
+let overviewRequestToken = 0
+let overviewMutationToken = 0
+let runtimeAbortController: AbortController | null = null
+let runtimeRequestToken = 0
+let runtimePollCount = 0
+let pollingGeneration = 0
 const geoSearchText = ref('')
 const geoFamilyFilter = ref('all')
 const geoActionFilter = ref('all')
@@ -1198,7 +1269,7 @@ const headers = [
   { title: '规则', key: 'name' },
   { title: '协议', key: 'protocol', sortable: false },
   { title: '端口', key: 'portSpec', sortable: false },
-  { title: '源地址', key: 'sourceSpec', sortable: false },
+  { title: '源地址策略', key: 'sourceSpec', sortable: false },
   { title: '监听状态', key: 'listenerState', sortable: false, width: 360 },
   { title: '双栈', key: 'family', sortable: false },
   { title: '来源', key: 'origin', sortable: false },
@@ -1243,6 +1314,12 @@ const protocolItems = [
   { title: 'ICMP v6', value: 'icmp_v6' },
 ]
 
+const sourceModeItems = [
+  { title: '不设置', value: '' },
+  { title: '只屏蔽', value: 'block' },
+  { title: '只放行', value: 'allow' },
+]
+
 const geoProtocolItems = protocolItems.filter(item => !['any', 'icmp', 'icmp_v4', 'icmp_v6'].includes(item.value))
 
 const geoActionItems = [
@@ -1268,13 +1345,21 @@ const emptyListenerState = (): FirewallRuleListenerState => ({
   listeners: [],
 })
 
+const parseStrictPositiveInteger = (value: unknown): number | null => {
+  const normalized = String(value ?? '').trim()
+  if (!/^\d+$/.test(normalized)) return null
+  const parsed = Number(normalized)
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return null
+  return parsed
+}
+
 const normalizeNumberArray = (value: unknown): number[] => {
   if (!Array.isArray(value)) return []
   const result: number[] = []
   const seen = new Set<number>()
   for (const item of value) {
-    const parsed = Number.parseInt(String(item ?? '').trim(), 10)
-    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535 || seen.has(parsed)) {
+    const parsed = parseStrictPositiveInteger(item)
+    if (parsed == null || parsed > 65535 || seen.has(parsed)) {
       continue
     }
     seen.add(parsed)
@@ -1318,7 +1403,7 @@ const sshPortBaseline = computed(() => {
   return 22
 })
 
-const sshPortInputValue = computed(() => Number.parseInt(String(sshPortInput.value || '').trim(), 10))
+const sshPortInputValue = computed(() => parseStrictPositiveInteger(sshPortInput.value) ?? 0)
 
 const sshPortInputValid = computed(() => {
   const value = sshPortInputValue.value
@@ -1391,6 +1476,19 @@ const hasTerminalNftablesInstallTask = computed(() => (
   nftablesInstallTask.value.id !== ''
   && ['error', 'cancelled', 'timed_out'].includes(nftablesInstallTask.value.state)
 ))
+const hasFirewallWriteInProgress = computed(() => (
+  switchBusy.value
+  || installingNftables.value
+  || nftablesStopRequestPending.value
+  || savingSSHPort.value
+  || switchingSSHProxy.value
+  || systemRuleBusyKey.value !== ''
+  || savingRule.value
+  || savingGeoRule.value
+  || savingGeoSettings.value
+  || geoRefreshing.value
+  || hasActiveNftablesInstall.value
+))
 const showNftablesInstallTask = computed(() => (
   (overview.value.nftables.supported && !overview.value.nftables.installed)
   || hasActiveNftablesInstall.value
@@ -1416,6 +1514,12 @@ const geoDialogUsesCustomSources = computed(() => editingGeoRule.value.customSou
 const isIcmpProtocol = (protocol: string) => ['icmp', 'icmp_v4', 'icmp_v6'].includes(protocol)
 const ruleNeedsListenerTracking = (rule: Pick<FirewallRule, 'protocol' | 'portSpec'>) => !isIcmpProtocol(rule.protocol) && String(rule.portSpec || '').trim().length > 0
 
+const sourceModeForRule = (rule: Pick<FirewallRule, 'sourceMode' | 'sourceSpec'>) => {
+  const mode = String(rule.sourceMode || '').trim().toLowerCase()
+  if (mode === 'block' || mode === 'allow') return mode
+  return String(rule.sourceSpec || '').trim() ? 'allow' : ''
+}
+
 const normalizeRuleFamilyForSubmit = (protocol: string, family: string) => {
   if (protocol === 'icmp') return 'dual'
   if (protocol === 'icmp_v4') return 'ipv4'
@@ -1432,7 +1536,7 @@ const rulePortPlaceholder = computed(() => {
 })
 const ruleSourcePlaceholder = computed(() => {
   if (isIcmpProtocol(editingRule.value.protocol)) return 'ICMP rules do not use source filters'
-  return '留空表示任意来源，例如：1.2.3.4/32, 2001:db8::/64'
+  return '例如：1.2.3.4/32, 2001:db8::/64'
 })
 
 const filteredRules = computed(() => {
@@ -1452,6 +1556,7 @@ const filteredRules = computed(() => {
       rule.description,
       rule.portSpec,
       rule.sourceSpec,
+      sourceModeForRule(rule),
       rule.origin,
     ].some(value => (value || '').toLowerCase().includes(keyword))
   })
@@ -1736,6 +1841,9 @@ const applyOverview = (raw: any) => {
       ...item,
       temporaryType: typeof item?.temporaryType === 'string' ? item.temporaryType : '',
       temporaryExpireAt: Number(item?.temporaryExpireAt ?? 0),
+      sourceMode: typeof item?.sourceMode === 'string'
+        ? item.sourceMode
+        : (String(item?.sourceSpec || '').trim() ? 'allow' : ''),
       canEdit: item?.canEdit === true,
       canDelete: item?.canDelete === true,
       listenerState: normalizeListenerState(item?.listenerState ?? emptyListenerState()),
@@ -1752,6 +1860,26 @@ const applyOverview = (raw: any) => {
   syncGeoIntervalInput()
   syncSSHInputsFromOverview()
   systemRuleBusyKey.value = ''
+  hasLoaded.value = true
+  loadError.value = ''
+}
+
+// A write response is authoritative for the current page. Invalidate any
+// overview request that started before or during the write so a stale GET
+// cannot restore the previous rule/port state afterward.
+const beginOverviewMutation = () => {
+  overviewMutationToken++
+  overviewRequestToken++
+  const controller = overviewAbortController
+  overviewAbortController = null
+  overviewRequest.value = null
+  loading.value = false
+  controller?.abort()
+}
+
+const applyMutationOverview = (raw: any) => {
+  beginOverviewMutation()
+  applyOverview(raw)
 }
 
 const fetchOverview = async (silent = false) => {
@@ -1760,11 +1888,21 @@ const fetchOverview = async (silent = false) => {
   }
   if (!silent) {
     loading.value = true
+    loadError.value = ''
   }
+  overviewAbortController?.abort()
+  const controller = new AbortController()
+  overviewAbortController = controller
+  const token = ++overviewRequestToken
+  const mutationToken = overviewMutationToken
   const request = (async () => {
-    const msg = await HttpUtils.get('api/firewall-overview')
-    if (msg.success && msg.obj) {
-      applyOverview(msg.obj)
+    const msg = await HttpUtils.get('api/firewall-overview', {}, { silentErrorToast: silent, signal: controller.signal })
+    if (token === overviewRequestToken && mutationToken === overviewMutationToken && !controller.signal.aborted) {
+      if (msg.success && msg.obj) {
+        applyOverview(msg.obj)
+      } else if (msg.failureKind !== 'cancelled') {
+        loadError.value = msg.msg || '防火墙概览加载失败'
+      }
     }
     return msg
   })()
@@ -1772,11 +1910,37 @@ const fetchOverview = async (silent = false) => {
   try {
     return await request
   } finally {
-    if (overviewRequest.value === request) {
+    const isCurrentRequest = overviewRequest.value === request
+    if (isCurrentRequest) {
       overviewRequest.value = null
     }
-    if (!silent) {
+    if (overviewAbortController === controller) {
+      overviewAbortController = null
+    }
+    if (!silent && isCurrentRequest) {
       loading.value = false
+    }
+  }
+}
+
+const refreshRuntime = async () => {
+  runtimeAbortController?.abort()
+  const controller = new AbortController()
+  runtimeAbortController = controller
+  const token = ++runtimeRequestToken
+  try {
+    const msg = await HttpUtils.get('api/firewall-runtime', {}, { silentErrorToast: true, signal: controller.signal })
+    if (!msg.success || !msg.obj || token !== runtimeRequestToken || controller.signal.aborted) return msg
+    const raw = msg.obj
+    overview.value = {
+      ...overview.value,
+      lastSyncAt: Number(raw.lastSyncAt ?? overview.value.lastSyncAt),
+      error: typeof raw.error === 'string' && raw.error.trim() ? raw.error : undefined,
+    }
+    return msg
+  } finally {
+    if (runtimeAbortController === controller) {
+      runtimeAbortController = null
     }
   }
 }
@@ -1904,6 +2068,7 @@ const installNftables = async () => {
   completedNftablesTaskID = ''
   resetNftablesInstallTask()
   installingNftables.value = true
+  beginOverviewMutation()
   try {
     const msg = await HttpUtils.post('api/firewall-nftables-install', {}, {
       headers: {
@@ -1928,6 +2093,7 @@ const stopNftablesInstall = async () => {
   if (!id || !nftablesInstallTask.value.canCancel || nftablesStopRequestPending.value) return
   nftablesStopRequestPending.value = true
   nftablesInstallTask.value = { ...nftablesInstallTask.value, state: 'stopping', canCancel: false, stopRequested: true, phase: '正在停止' }
+  beginOverviewMutation()
   try {
     const msg = await HttpUtils.post('api/firewall-nftables-install-stop', { id }, {
       headers: { 'Content-Type': 'application/json' },
@@ -1954,10 +2120,15 @@ const onToggleFirewall = async (nextValue: boolean | null) => {
   }
   if (nextValue === switchEnabled.value) return
 
+  let firewallSwitchMessage = nextValue
+    ? '开启后会按当前面板规则重建防火墙链，仅放行系统保留端口和面板已配置规则，并扫描系统已有放行规则供展示，是否继续？'
+    : '关闭后会删除面板自己的防火墙链，但保留当前规则记录，是否继续？'
+  if (nextValue && !overview.value.defaultPorts.sshReserved) {
+    firewallSwitchMessage += '\n当前 SSH 系统保留已移除，开启后不会自动放行 SSH，可能导致新的远程 SSH 连接无法建立。'
+  }
+
   const confirmed = await confirm({
-    message: nextValue
-      ? '开启后会按当前面板规则重建防火墙链，仅放行系统保留端口和面板已配置规则，并扫描系统已有放行规则供展示，是否继续？'
-      : '关闭后会删除面板自己的防火墙链，但保留当前规则记录，是否继续？',
+    message: firewallSwitchMessage,
     severity: 'warning',
     confirmText: confirmAction(nextValue ? 'enable' : 'disable'),
   })
@@ -1966,6 +2137,7 @@ const onToggleFirewall = async (nextValue: boolean | null) => {
     return
   }
 
+  beginOverviewMutation()
   switchBusy.value = true
   try {
     const msg = await HttpUtils.post('api/firewall-switch', { enabled: nextValue }, {
@@ -1974,7 +2146,7 @@ const onToggleFirewall = async (nextValue: boolean | null) => {
       },
     })
     if (msg.success && msg.obj) {
-      applyOverview(msg.obj)
+      applyMutationOverview(msg.obj)
       push.success({
         duration: 4000,
         message: nextValue ? '防火墙已开启并完成规则应用' : '防火墙已关闭并停止下发规则',
@@ -2010,8 +2182,20 @@ const saveSSHPort = async () => {
     return
   }
 
+  const sshPortConfirmNotes: string[] = []
+  if (overview.value.enabled && !overview.value.defaultPorts.sshReserved) {
+    sshPortConfirmNotes.push('当前防火墙已开启，但 SSH 系统保留已移除；新端口不会被项目防火墙自动放行。')
+  }
+  if (overview.value.sshConfig.ports.length > 1) {
+    sshPortConfirmNotes.push('检测到多个 SSH 端口；本次只修改主配置端口，不会删除 sshd_config.d 等文件中的其他 Port。')
+  }
+  const sshPortConfirmMessage = [
+    `确认将 SSH 端口改为 ${nextPort}，并重启 SSH 服务使其生效吗？`,
+    ...sshPortConfirmNotes,
+  ].join('\n')
+
   const confirmed = await confirm({
-    message: `确认将 SSH 端口改为 ${nextPort}，并重启 SSH 服务使其生效吗？`,
+    message: sshPortConfirmMessage,
     severity: 'warning',
     confirmText: confirmAction('save'),
   })
@@ -2025,6 +2209,7 @@ const saveSSHPort = async () => {
     return
   }
 
+  beginOverviewMutation()
   savingSSHPort.value = true
   try {
     const msg = await HttpUtils.post('api/firewall-ssh-port', { port: nextPort }, {
@@ -2033,7 +2218,7 @@ const saveSSHPort = async () => {
       },
     })
     if (msg.success && msg.obj) {
-      applyOverview(msg.obj)
+      applyMutationOverview(msg.obj)
       syncSSHInputsFromOverview(true)
       push.success({
         duration: 4000,
@@ -2056,6 +2241,7 @@ const onToggleSSHProxy = async (nextValue: boolean | null) => {
   }
 
   sshProxySwitch.value = nextValue
+  beginOverviewMutation()
   switchingSSHProxy.value = true
   try {
     const msg = await HttpUtils.post('api/firewall-ssh-proxy', { enabled: nextValue }, {
@@ -2064,7 +2250,7 @@ const onToggleSSHProxy = async (nextValue: boolean | null) => {
       },
     })
     if (msg.success && msg.obj) {
-      applyOverview(msg.obj)
+      applyMutationOverview(msg.obj)
       push.success({
         duration: 4000,
         message: nextValue ? 'SSH 代理能力已开启并重启 SSH 服务' : 'SSH 代理能力已关闭并重启 SSH 服务',
@@ -2089,6 +2275,7 @@ const openRuleDialog = (rule?: FirewallRule) => {
         protocol: normalizedProtocol,
         portSpec: rule.portSpec || '',
         sourceSpec: rule.sourceSpec || '',
+        sourceMode: sourceModeForRule(rule),
       }
     : createEmptyRuleForm()
   editingRule.value.family = normalizeRuleFamilyForSubmit(editingRule.value.protocol, editingRule.value.family)
@@ -2118,6 +2305,14 @@ const saveRule = async () => {
       })
       return
     }
+    const sourceMode = String(editingRule.value.sourceMode || '').trim().toLowerCase()
+    if (editingRuleNeedsSource.value && sourceMode && !String(editingRule.value.sourceSpec || '').trim()) {
+      push.warning({
+        duration: 4000,
+        message: '选择源地址策略后必须填写至少一个源 IP/CIDR',
+      })
+      return
+    }
     const normalizedFamily = normalizeRuleFamilyForSubmit(normalizedProtocol, editingRule.value.family)
     const payload = {
       id: editingRule.value.id || 0,
@@ -2127,14 +2322,16 @@ const saveRule = async () => {
       protocol: normalizedProtocol,
       portSpec: editingRuleNeedsPort.value ? editingRule.value.portSpec : '',
       sourceSpec: editingRuleNeedsSource.value ? editingRule.value.sourceSpec : '',
+      sourceMode: editingRuleNeedsSource.value ? sourceMode : '',
     }
+    beginOverviewMutation()
     const msg = await HttpUtils.post('api/firewall-rule', payload, {
       headers: {
         'Content-Type': 'application/json',
       },
     })
     if (msg.success && msg.obj) {
-      applyOverview(msg.obj)
+      applyMutationOverview(msg.obj)
       dialogVisible.value = false
       push.success({
         duration: 4000,
@@ -2156,13 +2353,14 @@ const removeRule = async (rule: FirewallRule) => {
   })
   if (!confirmed) return
 
+  beginOverviewMutation()
   const msg = await HttpUtils.post('api/firewall-rule-delete', { id: rule.id }, {
     headers: {
       'Content-Type': 'application/json',
     },
   })
   if (msg.success && msg.obj) {
-    applyOverview(msg.obj)
+    applyMutationOverview(msg.obj)
     push.success({
       duration: 4000,
       message: '防火墙规则已删除',
@@ -2183,6 +2381,7 @@ const setSystemRuleReserved = async (systemKey: string, enabled: boolean) => {
   if (!confirmed || systemRuleBusyKey.value !== '') return
 
   systemRuleBusyKey.value = systemKey
+  beginOverviewMutation()
   try {
     const msg = await HttpUtils.post('api/firewall-system-rule', { systemKey, enabled }, {
       headers: {
@@ -2190,7 +2389,7 @@ const setSystemRuleReserved = async (systemKey: string, enabled: boolean) => {
       },
     })
     if (msg.success && msg.obj) {
-      applyOverview(msg.obj)
+      applyMutationOverview(msg.obj)
       push.success({
         duration: 4000,
         message: `${systemKey === 'ssh' ? 'SSH' : '订阅'} 已${actionLabel}`,
@@ -2242,6 +2441,7 @@ const saveGeoRule = async () => {
   }
 
   savingGeoRule.value = true
+  beginOverviewMutation()
   try {
     const payload = {
       id: editingGeoRule.value.id || 0,
@@ -2261,7 +2461,7 @@ const saveGeoRule = async () => {
       },
     })
     if (msg.success && msg.obj) {
-      applyOverview(msg.obj)
+      applyMutationOverview(msg.obj)
       geoDialogVisible.value = false
       push.success({
         duration: 4000,
@@ -2281,13 +2481,14 @@ const removeGeoRule = async (rule: FirewallGeoRule) => {
   })
   if (!confirmed) return
 
+  beginOverviewMutation()
   const msg = await HttpUtils.post('api/firewall-geo-rule-delete', { id: rule.id }, {
     headers: {
       'Content-Type': 'application/json',
     },
   })
   if (msg.success && msg.obj) {
-    applyOverview(msg.obj)
+    applyMutationOverview(msg.obj)
     push.success({
       duration: 4000,
       message: 'GeoIP 规则已删除，缓存文件也已同步清理',
@@ -2297,6 +2498,7 @@ const removeGeoRule = async (rule: FirewallGeoRule) => {
 
 const refreshGeoRules = async () => {
   geoRefreshing.value = true
+  beginOverviewMutation()
   try {
     const msg = await HttpUtils.post('api/firewall-geo-refresh', {}, {
       headers: {
@@ -2304,7 +2506,7 @@ const refreshGeoRules = async () => {
       },
     })
     if (msg.success && msg.obj) {
-      applyOverview(msg.obj)
+      applyMutationOverview(msg.obj)
       push.success({
         duration: 4000,
         message: 'GeoIP 规则已完成热更新',
@@ -2316,8 +2518,8 @@ const refreshGeoRules = async () => {
 }
 
 const saveGeoSettings = async () => {
-  const intervalMinutes = Number.parseInt(String(geoIntervalInput.value || '').trim(), 10)
-  if (!Number.isFinite(intervalMinutes) || intervalMinutes <= 0) {
+  const intervalMinutes = parseStrictPositiveInteger(geoIntervalInput.value)
+  if (intervalMinutes == null) {
     push.warning({
       duration: 4000,
       message: '更新周期必须是大于 0 的分钟数',
@@ -2326,6 +2528,7 @@ const saveGeoSettings = async () => {
   }
 
   savingGeoSettings.value = true
+  beginOverviewMutation()
   try {
     const msg = await HttpUtils.post('api/firewall-geo-settings', { intervalMinutes }, {
       headers: {
@@ -2333,7 +2536,7 @@ const saveGeoSettings = async () => {
       },
     })
     if (msg.success && msg.obj) {
-      applyOverview(msg.obj)
+      applyMutationOverview(msg.obj)
       syncGeoIntervalInput(true)
       push.success({
         duration: 4000,
@@ -2346,34 +2549,64 @@ const saveGeoSettings = async () => {
 }
 
 const stopPolling = () => {
+  pollingGeneration++
   if (pollTimer.value != null) {
     window.clearTimeout(pollTimer.value)
     pollTimer.value = null
   }
 }
 
-const schedulePolling = (delay = 10000) => {
-  stopPolling()
+const clearPollingTimer = () => {
+  if (pollTimer.value != null) {
+    window.clearTimeout(pollTimer.value)
+    pollTimer.value = null
+  }
+}
+
+const schedulePolling = (delay = 10000, generation = pollingGeneration) => {
+  clearPollingTimer()
+  if (generation !== pollingGeneration) return
   if (!props.active) return
   if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
   pollTimer.value = window.setTimeout(async () => {
     pollTimer.value = null
-    const msg = await fetchOverview(true)
-    schedulePolling(msg.success ? 10000 : 30000)
+    if (generation !== pollingGeneration || !props.active || (typeof document !== 'undefined' && document.visibilityState !== 'visible')) return
+    runtimePollCount++
+    const msg = runtimePollCount % 6 === 0
+      ? await fetchOverview(true)
+      : await refreshRuntime()
+    if (generation !== pollingGeneration) return
+    schedulePolling(msg.success ? 10000 : 30000, generation)
   }, delay)
 }
 
-const startPolling = () => schedulePolling()
+const startPolling = () => {
+  stopPolling()
+  runtimePollCount = 0
+  schedulePolling(10000, pollingGeneration)
+}
+
+const abortOverviewRequest = () => {
+  overviewRequestToken++
+  overviewAbortController?.abort()
+  overviewAbortController = null
+  overviewRequest.value = null
+  loading.value = false
+  runtimeRequestToken++
+  runtimeAbortController?.abort()
+  runtimeAbortController = null
+}
 
 const handleVisibilityChange = () => {
   if (document.visibilityState === 'visible') {
     if (!props.active) return
-    void fetchOverview(true)
+    void fetchOverview(hasLoaded.value)
 		void recoverNftablesInstall()
     startPolling()
     return
   }
   stopPolling()
+	abortOverviewRequest()
 	clearNftablesInstallPolling()
 }
 
@@ -2394,23 +2627,27 @@ watch(() => editingRule.value.protocol, protocol => {
   editingRule.value.family = normalizeRuleFamilyForSubmit(protocol, editingRule.value.family)
   editingRule.value.portSpec = ''
   editingRule.value.sourceSpec = ''
+  editingRule.value.sourceMode = ''
 })
 
 watch(() => props.active, (active) => {
   if (active) {
-    void fetchOverview(true)
+    void fetchOverview(hasLoaded.value)
 		void recoverNftablesInstall()
     startPolling()
     return
   }
   stopPolling()
+	abortOverviewRequest()
 	clearNftablesInstallPolling()
 })
 
 onMounted(() => {
-  void fetchOverview()
-	void recoverNftablesInstall()
-  startPolling()
+  if (props.active) {
+    void fetchOverview()
+		void recoverNftablesInstall()
+    startPolling()
+  }
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', handleVisibilityChange)
   }
@@ -2418,6 +2655,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   stopPolling()
+	abortOverviewRequest()
 	clearNftablesInstallPolling()
   if (typeof document !== 'undefined') {
     document.removeEventListener('visibilitychange', handleVisibilityChange)
@@ -2687,6 +2925,18 @@ onBeforeUnmount(() => {
 
 .firewall-listener-cell {
   min-width: 0;
+}
+
+.firewall-source-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
+}
+
+.firewall-source-cell > span {
+  overflow-wrap: anywhere;
 }
 
 .firewall-listener-list {

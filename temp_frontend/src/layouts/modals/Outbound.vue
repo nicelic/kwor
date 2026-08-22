@@ -1,11 +1,12 @@
 <template>
-  <v-dialog transition="dialog-bottom-transition" width="800">
-    <v-card class="rounded-lg">
+  <v-dialog transition="dialog-bottom-transition" width="800" max-width="90vw" max-height="90vh" :persistent="loading">
+    <v-card class="rounded-lg" :loading="loading">
       <v-card-title>
         {{ $t('actions.' + title) + " " + $t('objects.outbound') }}
       </v-card-title>
       <v-divider></v-divider>
-      <v-card-text style="padding: 0 16px; overflow-y: scroll;">
+      <v-card-text style="padding: 0 16px; max-height: calc(90vh - 152px); overflow-y: auto;">
+        <div :style="{ pointerEvents: loading ? 'none' : 'auto' }" :aria-busy="loading">
         <v-container style="padding: 0;">
           <v-tabs
             v-model="tab"
@@ -38,7 +39,7 @@
                   v-model="outbound.server">
                   </v-text-field>
                 </v-col>
-                <v-col cols="12" sm="6" md="4" v-if="outbound.type == outTypes.Hysteria">
+                <v-col cols="12" sm="6" md="4" v-if="outbound.type == outTypes.Hysteria && namespace !== 'mihomo'">
                   <v-text-field
                   :label="$t('types.lb.interval')"
                   type="number"
@@ -86,34 +87,35 @@
                   </v-text-field>
                 </v-col>
               </v-row>
-              <Socks v-if="outbound.type == outTypes.SOCKS" :data="outbound" />
-              <Http v-if="outbound.type == outTypes.HTTP" :data="outbound" />
+              <Socks v-if="outbound.type == outTypes.SOCKS" :data="outbound" :namespace="namespace" />
+              <Direct v-if="outbound.type == outTypes.Direct" :data="outbound" />
+              <Http v-if="outbound.type == outTypes.HTTP" :data="outbound" :namespace="namespace" />
               <Snell v-if="outbound.type == outTypes.Snell" direction="out" :data="outbound" />
               <Shadowsocks v-if="outbound.type == outTypes.Shadowsocks" direction="out" :data="outbound" />
-              <Vmess v-if="outbound.type == outTypes.VMess" :data="outbound" />
-              <Trojan v-if="outbound.type == outTypes.Trojan" :data="outbound" />
+              <Vmess v-if="outbound.type == outTypes.VMess" :data="outbound" :namespace="namespace" />
+              <Trojan v-if="outbound.type == outTypes.Trojan" :data="outbound" :namespace="namespace" />
               <Hysteria v-if="outbound.type == outTypes.Hysteria" direction="out" :data="outbound" :namespace="namespace" />
               <ShadowTls v-if="outbound.type == outTypes.ShadowTLS" :data="outbound" />
               <ShadowQuic v-if="outbound.type == outTypes.ShadowQUIC" direction="out" :data="outbound" />
-              <Vless v-if="outbound.type == outTypes.VLESS" :data="outbound" />
+              <Vless v-if="outbound.type == outTypes.VLESS" :data="outbound" :namespace="namespace" />
               <Tuic v-if="outbound.type == outTypes.TUIC" direction="out" :data="outbound" :namespace="namespace" />
               <Hysteria2 v-if="outbound.type == outTypes.Hysteria2" direction="out" :data="outbound" :namespace="namespace" :hide-port-hop-editors="true" />
               <AnyTls v-if="outbound.type == outTypes.AnyTls" :data="outbound" direction="out" />
               <Mieru v-if="outbound.type == outTypes.Mieru" :data="outbound" direction="out" />
               <Sudoku v-if="outbound.type == outTypes.Sudoku" :data="outbound" direction="out" />
-              <TrustTunnel v-if="outbound.type == outTypes.TrustTunnel" :data="outbound" direction="out" />
+              <TrustTunnel v-if="outbound.type == outTypes.TrustTunnel" :data="outbound" direction="out" :namespace="namespace" />
               <Tor v-if="outbound.type == outTypes.Tor" :data="outbound" />
               <Ssh v-if="outbound.type == outTypes.SSH" :data="outbound" :namespace="namespace" />
               <Selector v-if="outbound.type == outTypes.Selector" :data="outbound" :tags="tags" :namespace="namespace" />
               <UrlTest v-if="outbound.type == outTypes.URLTest" :data="outbound" :tags="tags" :namespace="namespace" />
 
               <Transport
-                v-if="Object.hasOwn(outbound,'transport') && outbound.type != outTypes.Mieru"
+                v-if="showOutboundTransportEditor"
                 :data="outbound"
                 :namespace="namespace"
               />
-              <OutTLS v-if="Object.hasOwn(outbound,'tls')" :outbound="outbound" :namespace="namespace" />
-              <Multiplex v-if="Object.hasOwn(outbound,'multiplex')" direction="out" :data="outbound" />
+              <OutTLS v-if="showOutboundTlsEditor" :outbound="outbound" :namespace="namespace" />
+              <Multiplex v-if="showOutboundMultiplexEditor" direction="out" :data="outbound" />
               <Dial v-if="!NoDial.includes(outbound.type)" :dial="outbound" :namespace="namespace" />
             </v-window-item>
             <v-window-item value="t2">
@@ -122,18 +124,20 @@
                   <v-text-field v-model="link" :label="$t('client.external')" hide-details />
                 </v-col>
                 <v-col cols="12" align="center">
-                  <v-btn hide-details variant="tonal" :loading="loading" @click="linkConvert">{{ $t('submit') }}</v-btn>
+                  <v-btn hide-details variant="tonal" :loading="loading" :disabled="loading" @click="linkConvert">{{ $t('submit') }}</v-btn>
                 </v-col>
               </v-row>
             </v-window-item>
           </v-window>
         </v-container>
+        </div>
       </v-card-text>
       <v-card-actions>
         <v-spacer></v-spacer>
         <v-btn
           color="primary"
           variant="outlined"
+          :disabled="loading"
           @click="closeModal"
         >
           {{ $t('actions.close') }}
@@ -142,6 +146,7 @@
           color="primary"
           variant="tonal"
           :loading="loading"
+          :disabled="loading"
           @click="saveChanges"
         >
           {{ $t('actions.save') }}
@@ -182,7 +187,8 @@ import Mieru from '@/components/protocols/Mieru.vue'
 import Sudoku from '@/components/protocols/Sudoku.vue'
 import TrustTunnel from '@/components/protocols/TrustTunnel.vue'
 import { applyHopIntervalInput, formatHopIntervalInput, parseHopIntervalInput, parseHopIntervalSeconds } from '@/plugins/hopInterval'
-import { normalizePortRangeInput, parseServerPortInput, pickPrimaryPort } from '@/plugins/portRange'
+import { normalizePortRangeInput, normalizeServerPortInput, pickPrimaryPort } from '@/plugins/portRange'
+import { parseSingboxInteger } from '@/plugins/singboxInteger'
 import { getNamespaceStore } from '@/store/uiNamespace'
 import { validateShadowQuicOutbound } from '@/plugins/shadowQuic'
 import { push } from 'notivue'
@@ -217,9 +223,9 @@ export default {
     initMihomoProtocolDefaults() {
       if (this.namespace !== 'mihomo') return
       if ([this.outTypes.Hysteria2, this.outTypes.TUIC].includes(this.outbound.type)) {
-        if (this.outbound.mihomo_fast_open === undefined) {
-          this.outbound.mihomo_fast_open = false
-        }
+        delete this.outbound.mihomo_fast_open
+        delete this.outbound.fast_open
+        delete this.outbound['fast-open']
         return
       }
       if (this.outbound.type !== this.outTypes.Hysteria) return
@@ -270,7 +276,7 @@ export default {
       this.$emit('close')
     },
     async saveChanges() {
-      if (!this.$props.visible) return
+      if (!this.$props.visible || this.loading) return
       this.applyHy2HopIntervalInput()
       // check duplicate tag
       const store = getNamespaceStore(this.namespace)
@@ -295,12 +301,28 @@ export default {
       }
     },
     async linkConvert() {
+      if (this.loading || this.link.length === 0) return
       if (this.link.length>0){
         this.loading = true
         try {
           const msg = await HttpUtils.post('api/linkConvert', { link: this.link })
           if (msg.success) {
-            this.outbound = createOutbound(msg.obj.type, msg.obj)
+            const convertedType = typeof msg.obj?.type === 'string' ? msg.obj.type.trim().toLowerCase() : ''
+            if (!convertedType || !Object.values(this.outTypes).includes(convertedType)) {
+              push.warning({ title: '协议不支持', message: '链接转换返回了当前编辑器不支持的协议。' })
+              return
+            }
+            const unsupportedTypes = this.namespace === 'mihomo'
+              ? this.mihomoUnsupportedTypes
+              : this.defaultUnsupportedTypes
+            if (unsupportedTypes.includes(convertedType)) {
+              push.warning({
+                title: '协议不支持',
+                message: `${convertedType} 不能添加到当前出站管理。`
+              })
+              return
+            }
+            this.outbound = createOutbound(convertedType, { ...msg.obj, type: convertedType })
             this.initMihomoProtocolDefaults()
             this.syncHy2HopIntervalInput()
             this.tab = "t1"
@@ -349,7 +371,7 @@ export default {
       },
       set(v: string) {
         const input = typeof v === 'string' ? v : String(v ?? '')
-        this.outbound.server_port = parseServerPortInput(input)
+        this.outbound.server_port = normalizeServerPortInput(input)
       }
     },
     hyServerPortInput: {
@@ -366,7 +388,7 @@ export default {
       },
       set(v: string) {
         const input = typeof v === 'string' ? v : String(v ?? '')
-        this.outbound.server_port = parseServerPortInput(input)
+        this.outbound.server_port = normalizeServerPortInput(input)
       }
     },
     hyServerPortRangeInput: {
@@ -390,11 +412,32 @@ export default {
       get(): number {
         return parseHopIntervalSeconds(this.outbound.hop_interval)
       },
-      set(v: number) {
-        const raw = Number(v)
-        const seconds = Number.isFinite(raw) ? Math.floor(raw) : 0
+      set(v: unknown) {
+        const seconds = parseSingboxInteger(v, { min: 1 }) ?? 0
         this.outbound.hop_interval = seconds > 0 ? `${seconds}s` : undefined
       }
+    },
+    showOutboundTransportEditor(): boolean {
+      return [this.outTypes.VMess, this.outTypes.Trojan, this.outTypes.VLESS].includes(this.outbound.type)
+        || (this.outbound.type !== this.outTypes.Mieru && Object.hasOwn(this.outbound, 'transport'))
+    },
+    showOutboundMultiplexEditor(): boolean {
+      return [this.outTypes.Shadowsocks, this.outTypes.VMess, this.outTypes.Trojan, this.outTypes.VLESS].includes(this.outbound.type)
+        || Object.hasOwn(this.outbound, 'multiplex')
+    },
+    showOutboundTlsEditor(): boolean {
+      return [
+        this.outTypes.HTTP,
+        this.outTypes.VMess,
+        this.outTypes.Trojan,
+        this.outTypes.Hysteria,
+        this.outTypes.ShadowTLS,
+        this.outTypes.VLESS,
+        this.outTypes.TUIC,
+        this.outTypes.Hysteria2,
+        this.outTypes.AnyTls,
+        this.outTypes.TrustTunnel,
+      ].includes(this.outbound.type) || Object.hasOwn(this.outbound, 'tls')
     }
   },
   watch: {

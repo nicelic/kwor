@@ -222,12 +222,14 @@ export const defaultTunInet4Address = "198.18.0.1/30"
 export const defaultTunInet6Address = "fdfe:dcba:9876::1/126"
 export const defaultFakeIpRange = "198.18.0.1/15"
 export const defaultFakeIpRange6 = "fc00::/18"
+export const defaultFakeIpTtlSeconds = 60
 
 export const defaultClashConfig: Record<string, any> = {
   "mixed-port": 7890,
   "allow-lan": false,
   "mode": "rule",
-  "log-level": "info",
+  "ipv6": true,
+  "log-level": "silent",
   "external-controller": "127.0.0.1:9090",
   "unified-delay": true,
   "tcp-concurrent": true,
@@ -243,7 +245,7 @@ export const defaultClashConfig: Record<string, any> = {
     "strict-route": true,
     "auto-detect-interface": true,
     "recvmsgx": true,
-    "sendmsgx": false,
+    "sendmsgx": true,
     "inet4-address": [defaultTunInet4Address],
     "inet6-address": [defaultTunInet6Address],
     "dns-hijack": ["any:53"],
@@ -263,11 +265,12 @@ export const defaultClashConfig: Record<string, any> = {
   "dns": {
     "enable": true,
     "ipv6": false,
-    "prefer-h3": false,
+    "prefer-h3": true,
     "use-system-hosts": false,
     "enhanced-mode": "fake-ip",
     "fake-ip-range": defaultFakeIpRange,
     "fake-ip-range6": defaultFakeIpRange6,
+    "fake-ip-ttl": defaultFakeIpTtlSeconds,
     "default-nameserver": ["udp://223.5.5.5", "udp://223.6.6.6"],
     "nameserver": [
       `udp://8.8.8.8${clashNodeSelectorSuffix}`,

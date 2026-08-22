@@ -250,6 +250,28 @@ func (a *reverseProxyDNSAdmission) takeRateToken(client string) bool {
 	return true
 }
 
+func (a *reverseProxyDNSAdmission) pruneExpiredClients(now time.Time) {
+	if a == nil {
+		return
+	}
+	for index := range a.shards {
+		shard := &a.shards[index]
+		shard.mu.Lock()
+		for shard.lru != nil && shard.lru.Len() > 0 {
+			oldest, _ := shard.lru.Back().Value.(string)
+			state := shard.clients[oldest]
+			if state != nil && now.Sub(state.updatedAt) < reverseProxyDNSAdmissionClientTTL {
+				break
+			}
+			if state != nil && state.element != nil {
+				shard.lru.Remove(state.element)
+			}
+			delete(shard.clients, oldest)
+		}
+		shard.mu.Unlock()
+	}
+}
+
 func reverseProxyDNSClientAddress(dctx *dnsproxy.DNSContext) netip.Addr {
 	if dctx == nil {
 		return netip.Addr{}
@@ -404,19 +426,11 @@ var reverseProxyDNSRuntime = &reverseProxyDNSRuntimeManager{
 	retry:   make(map[string]reverseProxyDNSRetryState),
 }
 
-func (m *reverseProxyDNSRuntimeManager) sync(service *ReverseProxyService, rows []model.ReverseProxyRule) error {
+func (m *reverseProxyDNSRuntimeManager) sync(service *ReverseProxyService, rows []model.ReverseProxyRule, revision uint64) error {
 	if m == nil {
 		return nil
 	}
-	revision := uint64(0)
 	certificateGeneration := currentReverseProxyCertificateGeneration()
-	if service != nil {
-		currentRevision, err := service.peekReverseProxyRevision()
-		if err != nil {
-			return err
-		}
-		revision = currentRevision
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.retry == nil {
@@ -638,6 +652,23 @@ func (m *reverseProxyDNSRuntimeManager) needsSync(revision uint64, now time.Time
 		}
 	}
 	return false
+}
+
+func (m *reverseProxyDNSRuntimeManager) pruneAdmissionClients(now time.Time) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	handlers := make([]*reverseProxyDNSRuleHandler, 0, len(m.running))
+	for _, instance := range m.running {
+		if instance != nil && instance.handler != nil {
+			handlers = append(handlers, instance.handler)
+		}
+	}
+	m.mu.Unlock()
+	for _, handler := range handlers {
+		handler.pruneAdmissionClients(now)
+	}
 }
 
 func (m *reverseProxyDNSRuntimeManager) noteRetryLocked(key string, runtimeErr error, now time.Time) {
@@ -1031,6 +1062,28 @@ func (h *reverseProxyDNSRuleHandler) routeForRuleLocked(row *model.ReverseProxyR
 	return nil
 }
 
+func (h *reverseProxyDNSRuleHandler) pruneAdmissionClients(now time.Time) {
+	if h == nil {
+		return
+	}
+	h.mu.RLock()
+	routes := make(map[*reverseProxyDNSRoute]struct{}, len(h.routesByRule)+1)
+	if h.defaultRoute != nil {
+		routes[h.defaultRoute] = struct{}{}
+	}
+	for _, route := range h.routesByRule {
+		if route != nil {
+			routes[route] = struct{}{}
+		}
+	}
+	h.mu.RUnlock()
+	for route := range routes {
+		if route != nil && route.admission != nil {
+			route.admission.pruneExpiredClients(now)
+		}
+	}
+}
+
 type reverseProxyDNSRouteReplacement struct {
 	row      *model.ReverseProxyRule
 	old      *reverseProxyDNSRoute
@@ -1319,7 +1372,12 @@ func buildReverseProxyDNSRoute(row *model.ReverseProxyRule) (*reverseProxyDNSRou
 			closeReverseProxyDNSUpstreams(upstreams)
 			return nil, err
 		}
-		ups, err := dnsupstream.AddressToUpstream(address, opts.Clone())
+		var ups dnsupstream.Upstream
+		if targetAlias == reverseProxyDNSProtocolDoH || targetAlias == reverseProxyDNSProtocolDoHH3 {
+			ups, err = newReverseProxyDNSCompressedHTTPUpstream(address, opts.Clone(), targetAlias == reverseProxyDNSProtocolDoHH3)
+		} else {
+			ups, err = dnsupstream.AddressToUpstream(address, opts.Clone())
+		}
 		if err != nil {
 			closeReverseProxyDNSUpstreams(upstreams)
 			return nil, err
@@ -1530,7 +1588,7 @@ func buildReverseProxyDNSFallbackUpstreamConfig(row *model.ReverseProxyRule) (*d
 	if len(lines) == 0 {
 		return nil, nil
 	}
-	config, err := dnsproxy.ParseUpstreamsConfig(lines, buildReverseProxyDNSFallbackUpstreamOptions(row))
+	config, err := buildReverseProxyDNSCompressedFallbackUpstreamConfig(lines, buildReverseProxyDNSFallbackUpstreamOptions(row))
 	if err != nil {
 		if config != nil {
 			_ = config.Close()
@@ -2330,8 +2388,8 @@ func translateReverseProxyDNSError(row *model.ReverseProxyRule, err error) error
 	return common.NewError(message)
 }
 
-func syncReverseProxyDNSRuntime(service *ReverseProxyService, rows []model.ReverseProxyRule) error {
-	err := reverseProxyDNSRuntime.sync(service, rows)
+func syncReverseProxyDNSRuntimeAtRevision(service *ReverseProxyService, rows []model.ReverseProxyRule, revision uint64) error {
+	err := reverseProxyDNSRuntime.sync(service, rows, revision)
 	reverseProxyRuntime.reconcileRuleStates(rows)
 	return err
 }

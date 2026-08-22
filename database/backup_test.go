@@ -205,6 +205,57 @@ func TestGetDbPreservesReverseProxySettingsSingleton(t *testing.T) {
 	}
 }
 
+func TestGetDbPreservesDnsServers(t *testing.T) {
+	previousDB := db
+	sourcePath := filepath.Join(t.TempDir(), "dns-servers-source.db")
+	if err := InitDB(sourcePath); err != nil {
+		t.Fatalf("init source database: %v", err)
+	}
+	sourceSQL, err := GetDB().DB()
+	if err != nil {
+		t.Fatalf("access source database handle: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sourceSQL.Close()
+		db = previousDB
+	})
+
+	expected := model.DnsServer{
+		Type:    "https",
+		Tag:     "dns-backup",
+		Options: []byte("{\"server\":\"1.1.1.1\",\"server_port\":443,\"path\":\"/dns-query\"}"),
+	}
+	if err := GetDB().Create(&expected).Error; err != nil {
+		t.Fatalf("save DNS server: %v", err)
+	}
+
+	contents, err := GetDb("changes,stats")
+	if err != nil {
+		t.Fatalf("create DNS server backup: %v", err)
+	}
+	backupPath := filepath.Join(t.TempDir(), "dns-servers-backup.db")
+	if err := os.WriteFile(backupPath, contents, 0o600); err != nil {
+		t.Fatalf("write backup database: %v", err)
+	}
+	backupDB, err := gorm.Open(sqlite.Open(backupPath), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open backup database: %v", err)
+	}
+	backupSQL, err := backupDB.DB()
+	if err != nil {
+		t.Fatalf("access backup database handle: %v", err)
+	}
+	defer backupSQL.Close()
+
+	var restored model.DnsServer
+	if err := backupDB.Where("tag = ?", expected.Tag).First(&restored).Error; err != nil {
+		t.Fatalf("load DNS server from backup: %v", err)
+	}
+	if restored.Type != expected.Type || string(restored.Options) != string(expected.Options) {
+		t.Fatalf("DNS server changed in backup: got=%#v want=%#v", restored, expected)
+	}
+}
+
 func TestGetDbPreservesSettingsStateSingleton(t *testing.T) {
 	previousDB := db
 	sourcePath := filepath.Join(t.TempDir(), "settings-state-source.db")

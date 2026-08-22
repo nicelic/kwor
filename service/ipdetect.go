@@ -12,6 +12,14 @@ import (
 // IPDetectService 用于检测本机可用的公网IP
 type IPDetectService struct{}
 
+type outboundIPSnapshot struct {
+	mu        sync.Mutex
+	ips       []string
+	expiresAt time.Time
+	loading   bool
+	wait      chan struct{}
+}
+
 // IPInfo 存储IP信息
 type IPInfo struct {
 	IP       string `json:"ip"`
@@ -20,6 +28,10 @@ type IPInfo struct {
 }
 
 const ipCheckResponseMaxBytes int64 = 64 * 1024
+const outboundIPCacheTTL = 30 * time.Second
+const outboundIPProbeTimeout = 8 * time.Second
+
+var cachedOutboundIPs outboundIPSnapshot
 
 // 用于验证IP的远程API列表（按优先级排序）
 var ipCheckAPIs = []string{
@@ -154,7 +166,18 @@ func (s *IPDetectService) VerifyPublicIP(sourceIP string) (string, bool) {
 
 // queryAPI 查询单个API获取出口IP
 func (s *IPDetectService) queryAPI(client *http.Client, apiURL string) (string, bool) {
-	resp, err := client.Get(apiURL)
+	return s.queryAPIWithContext(context.Background(), client, apiURL)
+}
+
+func (s *IPDetectService) queryAPIWithContext(ctx context.Context, client *http.Client, apiURL string) (string, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return "", false
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", false
 	}
@@ -249,9 +272,18 @@ func (s *IPDetectService) GetDefaultOutboundIP() (string, bool) {
 	client := &http.Client{
 		Timeout: 2 * time.Second,
 	}
+	return s.getDefaultOutboundIPWithContext(context.Background(), client)
+}
 
+func (s *IPDetectService) getDefaultOutboundIPWithContext(ctx context.Context, client *http.Client) (string, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for _, apiURL := range ipCheckAPIs {
-		ip, ok := s.queryAPI(client, apiURL)
+		if ctx.Err() != nil {
+			return "", false
+		}
+		ip, ok := s.queryAPIWithContext(ctx, client, apiURL)
 		if ok {
 			return ip, true
 		}
@@ -260,10 +292,44 @@ func (s *IPDetectService) GetDefaultOutboundIP() (string, bool) {
 	return "", false
 }
 
-// GetOutboundIPs 通过外部API获取真实的出口IP（IPv4和IPv6）
-// 这个方法不依赖本地网卡检测，直接查询外部API获取真实出口IP
-// 返回：IPv4列表在前，IPv6列表在后
-func (s *IPDetectService) GetOutboundIPs() []string {
+// GetOutboundIPs 通过外部API获取真实的出口IP（IPv4和IPv6）。
+// forceRefresh 跳过已完成的缓存，但会加入正在进行的探测，避免并发重复访问外部服务。
+// 返回：IPv4列表在前，IPv6列表在后。
+func (s *IPDetectService) GetOutboundIPs(forceRefresh bool) []string {
+	now := time.Now()
+	cachedOutboundIPs.mu.Lock()
+	if !forceRefresh && now.Before(cachedOutboundIPs.expiresAt) {
+		ips := append([]string(nil), cachedOutboundIPs.ips...)
+		cachedOutboundIPs.mu.Unlock()
+		return ips
+	}
+	if cachedOutboundIPs.loading {
+		wait := cachedOutboundIPs.wait
+		cachedOutboundIPs.mu.Unlock()
+		<-wait
+		cachedOutboundIPs.mu.Lock()
+		ips := append([]string(nil), cachedOutboundIPs.ips...)
+		cachedOutboundIPs.mu.Unlock()
+		return ips
+	}
+	cachedOutboundIPs.loading = true
+	cachedOutboundIPs.wait = make(chan struct{})
+	cachedOutboundIPs.mu.Unlock()
+
+	ips := s.loadOutboundIPs()
+
+	cachedOutboundIPs.mu.Lock()
+	cachedOutboundIPs.ips = append(cachedOutboundIPs.ips[:0], ips...)
+	cachedOutboundIPs.expiresAt = time.Now().Add(outboundIPCacheTTL)
+	cachedOutboundIPs.loading = false
+	close(cachedOutboundIPs.wait)
+	cachedOutboundIPs.wait = nil
+	cachedOutboundIPs.mu.Unlock()
+
+	return append([]string(nil), ips...)
+}
+
+func (s *IPDetectService) loadOutboundIPs() []string {
 	var ipv4List []string
 	var ipv6List []string
 	var mu sync.Mutex
@@ -273,13 +339,18 @@ func (s *IPDetectService) GetOutboundIPs() []string {
 	client := &http.Client{
 		Timeout: 5 * time.Second,
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), outboundIPProbeTimeout)
+	defer cancel()
 
 	// 并发获取IPv4地址
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for _, apiURL := range ipv4CheckAPIs {
-			ip, ok := s.queryAPI(client, apiURL)
+			if ctx.Err() != nil {
+				return
+			}
+			ip, ok := s.queryAPIWithContext(ctx, client, apiURL)
 			if ok {
 				parsedIP := net.ParseIP(ip)
 				// 确保返回的是IPv4地址
@@ -308,7 +379,10 @@ func (s *IPDetectService) GetOutboundIPs() []string {
 	go func() {
 		defer wg.Done()
 		for _, apiURL := range ipv6CheckAPIs {
-			ip, ok := s.queryAPI(client, apiURL)
+			if ctx.Err() != nil {
+				return
+			}
+			ip, ok := s.queryAPIWithContext(ctx, client, apiURL)
 			if ok {
 				parsedIP := net.ParseIP(ip)
 				// 确保返回的是IPv6地址
@@ -333,6 +407,16 @@ func (s *IPDetectService) GetOutboundIPs() []string {
 	}()
 
 	wg.Wait()
+	if len(ipv4List) == 0 && len(ipv6List) == 0 && ctx.Err() == nil {
+		if ip, ok := s.getDefaultOutboundIPWithContext(ctx, client); ok {
+			parsedIP := net.ParseIP(ip)
+			if parsedIP != nil && parsedIP.To4() != nil {
+				ipv4List = append(ipv4List, ip)
+			} else if parsedIP != nil {
+				ipv6List = append(ipv6List, ip)
+			}
+		}
+	}
 
 	// IPv4在前，IPv6在后
 	return append(ipv4List, ipv6List...)

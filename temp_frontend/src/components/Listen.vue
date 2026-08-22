@@ -16,8 +16,9 @@
         type="number"
         min="1"
         max="65535"
+        step="1"
         required
-        v-model.number="data.listen_port"
+        v-model="listenPort"
         @blur="onListenPortBlur"></v-text-field>
       </v-col>
     </v-row>
@@ -26,7 +27,7 @@
         <v-select
         :label="$t('listen.detourText')"
         hide-details
-        :items="inTags"
+        :items="detourTags"
         v-model="data.detour">
         </v-select>
       </v-col>
@@ -62,7 +63,13 @@
         <v-card>
           <v-list>
             <v-list-item v-if="!disableDetourOption">
-              <v-switch v-model="optionDetour" color="primary" :label="$t('listen.detour')" hide-details></v-switch>
+              <v-switch
+                v-model="optionDetour"
+                color="primary"
+                :label="$t('listen.detour')"
+                :disabled="!optionDetour && !canEnableDetour"
+                hide-details
+              ></v-switch>
             </v-list-item>
             <v-list-item v-if="!disableTcpOptions">
               <v-switch v-model="optionTCP" color="primary" :label="$t('listen.tcpOptions')" hide-details></v-switch>
@@ -78,6 +85,9 @@
 </template>
 
 <script lang="ts">
+import { readSingboxDuration, writeSingboxDuration } from '@/plugins/singboxDuration'
+import { parseSingboxInteger } from '@/plugins/singboxInteger'
+
 export default {
   props: {
     data: { type: Object, required: true },
@@ -117,33 +127,76 @@ export default {
     showOptionsMenu(): boolean {
       return !this.disableDetourOption || !this.disableTcpOptions || !this.disableUdpOptions
     },
+    eligibleDetourTags(): string[] {
+      const currentTag = typeof this.$props.data?.tag === 'string'
+        ? this.$props.data.tag.trim()
+        : ''
+      const source = Array.isArray(this.$props.inTags) ? this.$props.inTags : []
+      return [...new Set(source
+        .filter((tag: unknown): tag is string => typeof tag === 'string')
+        .map((tag: string) => tag.trim())
+        .filter((tag: string) => tag.length > 0 && tag !== currentTag))]
+    },
+    detourTags(): string[] {
+      const currentDetour = typeof this.$props.data?.detour === 'string'
+        ? this.$props.data.detour.trim()
+        : ''
+      if (currentDetour && !this.eligibleDetourTags.includes(currentDetour)) {
+        return [currentDetour, ...this.eligibleDetourTags]
+      }
+      return this.eligibleDetourTags
+    },
+    canEnableDetour(): boolean {
+      return this.eligibleDetourTags.length > 0
+    },
     udpTimeout: {
-      get() { return this.$props.data.udp_timeout ? parseInt(this.$props.data.udp_timeout.replace('m','')) : 5 },
-      set(newValue:number) { this.$props.data.udp_timeout = newValue > 0 ? newValue + 'm' : '5m' }
+      get() { return readSingboxDuration(this.$props.data.udp_timeout, 'm') ?? 5 },
+      set(newValue:unknown) { this.$props.data.udp_timeout = writeSingboxDuration(newValue, 'm', { minimum: 1 }) ?? '5m' }
+    },
+    listenPort: {
+      get() { return parseSingboxInteger(this.$props.data.listen_port, { min: 1, max: 65535 }) ?? '' },
+      set(value:unknown) { this.$props.data.listen_port = parseSingboxInteger(value, { min: 1, max: 65535 }) }
     },
     optionTCP: {
       get(): boolean { 
-        return this.$props.data.tcp_fast_open != undefined && 
+        return this.$props.data.tcp_fast_open != undefined ||
                this.$props.data.tcp_multi_path != undefined
       },
       set(v:boolean) {
-        this.$props.data.tcp_fast_open = v ? false : undefined
-        this.$props.data.tcp_multi_path = v ? false : undefined
+        if (v) {
+          this.$props.data.tcp_fast_open = false
+          this.$props.data.tcp_multi_path = false
+          return
+        }
+        delete this.$props.data.tcp_fast_open
+        delete this.$props.data.tcp_multi_path
       }
     },
     optionUDP: {
       get(): boolean { 
-        return this.$props.data.udp_fragment != undefined &&
+        return this.$props.data.udp_fragment != undefined ||
                this.$props.data.udp_timeout != undefined
       },
       set(v:boolean) {
-        this.$props.data.udp_fragment = v ? false : undefined
-        this.$props.data.udp_timeout = v ? '5m' : undefined 
+        if (v) {
+          this.$props.data.udp_fragment = false
+          this.$props.data.udp_timeout = '5m'
+          return
+        }
+        delete this.$props.data.udp_fragment
+        delete this.$props.data.udp_timeout
       }
     },
     optionDetour: {
       get(): boolean { return this.$props.data.detour != undefined },
-      set(v:boolean) { this.$props.data.detour = v ? this.inTags[0]?? '' : undefined }
+      set(v:boolean) {
+        if (!v) {
+          delete this.$props.data.detour
+          return
+        }
+        const detour = this.eligibleDetourTags[0]
+        if (detour) this.$props.data.detour = detour
+      }
     }
   },
   watch: {

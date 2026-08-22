@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"os"
 	"strings"
 	"sync"
@@ -34,6 +35,11 @@ type SystemLinuxDNSOptimizationOverview struct {
 }
 
 func (s *SystemLinuxDNSOptimizationService) GetOverview() (*SystemLinuxDNSOptimizationOverview, error) {
+	return s.GetOverviewContext(context.Background())
+}
+
+// GetOverviewContext is intentionally read-only and never waits for DNS saves.
+func (s *SystemLinuxDNSOptimizationService) GetOverviewContext(ctx context.Context) (*SystemLinuxDNSOptimizationOverview, error) {
 	overview := &SystemLinuxDNSOptimizationOverview{
 		Supported: IsSystemPlatformLinux(),
 	}
@@ -50,21 +56,19 @@ func (s *SystemLinuxDNSOptimizationService) GetOverview() (*SystemLinuxDNSOptimi
 	if err != nil {
 		return nil, err
 	}
+	if err := validateSystemOptimizationContent(content); err != nil {
+		return nil, err
+	}
 	content = normalizeManagedLinuxDNSContent(content)
 
 	activeNameServers := make([]string, 0)
 	if pathEntryExists(path) {
-		raw, readErr := os.ReadFile(path)
+		raw, readErr := readSystemOptimizationTextFile(path)
 		if readErr != nil {
 			overview.Error = common.NewError("读取 resolv.conf 失败: ", readErr).Error()
 		} else {
-			activeNameServers = extractActiveLinuxNameServers(string(raw))
-			content = normalizeManagedLinuxDNSContent(string(raw))
-			if content != "" {
-				if err := s.setString(systemLinuxDNSContentKey, content); err != nil {
-					return nil, err
-				}
-			}
+			activeNameServers = extractActiveLinuxNameServers(raw)
+			content = normalizeManagedLinuxDNSContent(raw)
 		}
 	} else if strings.TrimSpace(content) == "" {
 		overview.Error = "未找到 /etc/resolv.conf"
@@ -80,7 +84,7 @@ func (s *SystemLinuxDNSOptimizationService) GetOverview() (*SystemLinuxDNSOptimi
 	overview.ActiveNameServers = activeNameServers
 
 	if pathEntryExists(path) {
-		immutable, immutableErr := detectFileImmutable(path)
+		immutable, immutableErr := detectFileImmutableContext(ctx, path)
 		if immutableErr == nil {
 			overview.Immutable = immutable
 		}
@@ -92,6 +96,10 @@ func (s *SystemLinuxDNSOptimizationService) GetOverview() (*SystemLinuxDNSOptimi
 }
 
 func (s *SystemLinuxDNSOptimizationService) SaveContent(content string) error {
+	return s.SaveContentContext(context.Background(), content)
+}
+
+func (s *SystemLinuxDNSOptimizationService) SaveContentContext(ctx context.Context, content string) error {
 	systemLinuxDNSOptimizationMu.Lock()
 	defer systemLinuxDNSOptimizationMu.Unlock()
 
@@ -99,12 +107,15 @@ func (s *SystemLinuxDNSOptimizationService) SaveContent(content string) error {
 		return common.NewError("Linux DNS 修改仅支持 Linux")
 	}
 
+	if err := validateSystemOptimizationContent(content); err != nil {
+		return err
+	}
 	normalized := normalizeManagedLinuxDNSContent(content)
 	if strings.TrimSpace(normalized) == "" {
 		return common.NewError("resolv.conf 内容不能为空")
 	}
 
-	path, err := s.applyManagedLinuxDNSContentLocked(normalized)
+	path, err := s.applyManagedLinuxDNSContentLocked(ctx, normalized)
 	if err != nil {
 		return err
 	}
@@ -123,6 +134,10 @@ func (s *SystemLinuxDNSOptimizationService) SaveContent(content string) error {
 }
 
 func (s *SystemLinuxDNSOptimizationService) SaveNameServers(nameServersText string) error {
+	return s.SaveNameServersContext(context.Background(), nameServersText)
+}
+
+func (s *SystemLinuxDNSOptimizationService) SaveNameServersContext(ctx context.Context, nameServersText string) error {
 	systemLinuxDNSOptimizationMu.Lock()
 	defer systemLinuxDNSOptimizationMu.Unlock()
 
@@ -130,6 +145,9 @@ func (s *SystemLinuxDNSOptimizationService) SaveNameServers(nameServersText stri
 		return common.NewError("Linux DNS 修改仅支持 Linux")
 	}
 
+	if err := validateSystemOptimizationNameServersInput(nameServersText); err != nil {
+		return err
+	}
 	path := s.resolveLinuxDNSConfigPath()
 	baseContent, err := s.loadCurrentLinuxDNSContent(path)
 	if err != nil {
@@ -139,7 +157,7 @@ func (s *SystemLinuxDNSOptimizationService) SaveNameServers(nameServersText stri
 	nameServers := normalizeLinuxNameServerInput(nameServersText)
 	nextContent := replaceActiveLinuxNameServers(baseContent, nameServers)
 
-	appliedPath, err := s.applyManagedLinuxDNSContentLocked(nextContent)
+	appliedPath, err := s.applyManagedLinuxDNSContentLocked(ctx, nextContent)
 	if err != nil {
 		return err
 	}
@@ -152,7 +170,7 @@ func (s *SystemLinuxDNSOptimizationService) SaveNameServers(nameServersText stri
 	return s.setString(systemLinuxDNSPathKey, appliedPath)
 }
 
-func (s *SystemLinuxDNSOptimizationService) applyManagedLinuxDNSContentLocked(content string) (string, error) {
+func (s *SystemLinuxDNSOptimizationService) applyManagedLinuxDNSContentLocked(ctx context.Context, content string) (string, error) {
 	path := s.resolveLinuxDNSConfigPath()
 	if strings.TrimSpace(path) == "" {
 		return "", common.NewError("resolv.conf 路径为空")
@@ -166,6 +184,7 @@ func (s *SystemLinuxDNSOptimizationService) applyManagedLinuxDNSContentLocked(co
 	if err := rewriteManagedFileWithImmutable(path, content, managedFileRewriteOptions{
 		DisplayName:                      "resolv.conf",
 		IgnoreUnsupportedUnlockOnSymlink: true,
+		Context:                          ctx,
 	}); err != nil {
 		return "", err
 	}
@@ -324,22 +343,18 @@ func (s *SystemLinuxDNSOptimizationService) resolveManagedLinuxDNSNameServersInp
 	if err != nil {
 		return "", err
 	}
+	if err := validateSystemOptimizationNameServersInput(savedInput); err != nil {
+		return "", err
+	}
 
 	normalizedSavedInput := normalizeLinuxNameServerInputText(savedInput)
 	if normalizedSavedInput != "" {
 		if areLinuxNameServerListsEqual(normalizeLinuxNameServerInput(normalizedSavedInput), nameServers) {
 			return normalizedSavedInput, nil
 		}
-		if err := s.setString(systemLinuxDNSNameServersInputKey, ""); err != nil {
-			return "", err
-		}
 	}
 
-	rebuilt := buildLinuxDNSNameServersInputFromContent(content, nameServers)
-	if err := s.persistManagedLinuxDNSNameServersInput(content, nameServers, rebuilt); err != nil {
-		return "", err
-	}
-	return rebuilt, nil
+	return buildLinuxDNSNameServersInputFromContent(content, nameServers), nil
 }
 
 func (s *SystemLinuxDNSOptimizationService) persistManagedLinuxDNSNameServersInput(content string, nameServers []string, rawInput string) error {
@@ -389,11 +404,11 @@ func replaceActiveLinuxNameServers(content string, nameServers []string) string 
 
 func (s *SystemLinuxDNSOptimizationService) loadCurrentLinuxDNSContent(path string) (string, error) {
 	if pathEntryExists(path) {
-		raw, err := os.ReadFile(path)
+		raw, err := readSystemOptimizationTextFile(path)
 		if err != nil {
 			return "", common.NewError("读取 resolv.conf 失败: ", err)
 		}
-		return normalizeManagedLinuxDNSContent(string(raw)), nil
+		return normalizeManagedLinuxDNSContent(raw), nil
 	}
 
 	content, err := s.getString(systemLinuxDNSContentKey)

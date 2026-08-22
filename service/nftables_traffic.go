@@ -42,6 +42,7 @@ type inboundTrafficSample struct {
 	originalInHandle       int
 	originalOutHandle      int
 	originalRedirectHandle int
+	stateChanged           bool
 	delta                  inboundDelta
 }
 
@@ -52,8 +53,58 @@ var portHopRefreshState = struct {
 	last: map[uint]time.Time{},
 }
 
+// defaultInboundNftMutationMu serializes default-chain inbound rule changes.
+// It intentionally does not cover Mihomo or other nft users: both core chains
+// retain independent lifecycle and state models.
+var defaultInboundNftMutationMu sync.Mutex
+
+func runDefaultInboundNftMutation(fn func() error) error {
+	defaultInboundNftMutationMu.Lock()
+	defer defaultInboundNftMutationMu.Unlock()
+	return fn()
+}
+
 func (s *NftTrafficService) IsNftTableReady() bool {
 	return nftTableExists()
+}
+
+// ApplyInboundNftAction keeps the core-state decision and the matching rule
+// mutation under one default-chain lock. A Core transition cannot otherwise
+// slip between a save seeing "stopped" and its cleanup of old rules.
+func (s *NftTrafficService) ApplyInboundNftAction(db *gorm.DB, action *InboundNftAction) error {
+	if action == nil {
+		return nil
+	}
+	if db == nil {
+		return errors.New("default inbound nft action requires a database")
+	}
+	return runDefaultInboundNftMutation(func() error {
+		coreRunning := (&CoreManagerService{}).IsRunning()
+		var err error
+		switch action.Kind {
+		case "upsert":
+			if coreRunning {
+				err = s.updateInboundRules(db, action.InboundID, action.Tag, action.Port, action.PortHopRange)
+			} else {
+				err = s.UpsertInboundStateOnly(db, action.InboundID, action.Tag, action.Port, action.PortHopRange)
+			}
+		case "remove":
+			if coreRunning {
+				err = s.removeInboundRules(db, action.InboundID)
+			} else {
+				err = s.RemoveInboundStateOnly(db, action.InboundID)
+			}
+		default:
+			return errors.New("unknown inbound nft action: " + action.Kind)
+		}
+		if err != nil {
+			return err
+		}
+		if !coreRunning {
+			s.cleanupOnShutdown()
+		}
+		return nil
+	})
 }
 
 // EnsureRuleIntegrity verifies inbound nftables rules are still present and
@@ -67,6 +118,21 @@ func (s *NftTrafficService) EnsureRuleIntegrity() error {
 	if !coreSvc.IsRunning() {
 		return nil
 	}
+	return s.EnsureRuleIntegrityWhenRunning()
+}
+
+// EnsureRuleIntegrityWhenRunning is for callers that already checked the core
+// state in the current synchronization pass.
+func (s *NftTrafficService) EnsureRuleIntegrityWhenRunning() error {
+	return runDefaultInboundNftMutation(func() error {
+		return s.ensureRuleIntegrityWhenRunning()
+	})
+}
+
+func (s *NftTrafficService) ensureRuleIntegrityWhenRunning() error {
+	if !IsSystemPlatformLinux() || !nftSupported() {
+		return nil
+	}
 
 	db := database.GetDB()
 	var inbounds []model.Inbound
@@ -75,6 +141,34 @@ func (s *NftTrafficService) EnsureRuleIntegrity() error {
 	}
 	if len(inbounds) == 0 {
 		return nil
+	}
+	managedInboundIDs := make([]uint, 0, len(inbounds))
+	for _, inbound := range inbounds {
+		if inbound.Id > 0 && extractPort(inbound.Options) > 0 {
+			managedInboundIDs = append(managedInboundIDs, inbound.Id)
+		}
+	}
+	var states []model.InboundTrafficState
+	if len(managedInboundIDs) > 0 {
+		if err := db.Where("inbound_id IN ?", managedInboundIDs).Find(&states).Error; err != nil {
+			return err
+		}
+	}
+	statesByInboundID := make(map[uint]model.InboundTrafficState, len(states))
+	for _, state := range states {
+		statesByInboundID[state.InboundId] = state
+	}
+	inHandles, err := snapshotManagedRuleHandles(nftChainIn, singboxNftRuleComments.prefix)
+	if err != nil {
+		return err
+	}
+	outHandles, err := snapshotManagedRuleHandles(nftChainOut, singboxNftRuleComments.prefix)
+	if err != nil {
+		return err
+	}
+	redirectRules, err := snapshotManagedRedirectRules(singboxNftRuleComments.prefix)
+	if err != nil {
+		return err
 	}
 
 	validComments := make(map[string]struct{}, len(inbounds)*3)
@@ -97,7 +191,8 @@ func (s *NftTrafficService) EnsureRuleIntegrity() error {
 			continue
 		}
 		portHopRange := extractPortHopRange(inbound.Options)
-		if err := s.ensureInboundRuleIntegrity(db, &inbound, port, portHopRange); err != nil {
+		state, stateFound := statesByInboundID[inbound.Id]
+		if err := s.ensureInboundRuleIntegrity(db, &inbound, port, portHopRange, state, stateFound, inHandles, outHandles, redirectRules); err != nil {
 			logger.Warning("nft rule integrity check failed for inbound ", inbound.Tag, ": ", err)
 			if firstErr == nil {
 				firstErr = err
@@ -105,7 +200,7 @@ func (s *NftTrafficService) EnsureRuleIntegrity() error {
 		}
 	}
 
-	if err := s.cleanupOrphanInboundRules(validComments); err != nil {
+	if err := s.cleanupOrphanInboundRules(validComments, inHandles, outHandles, redirectRules.comments); err != nil {
 		logger.Warning("cleanup orphan inbound nft rules failed: ", err)
 		if firstErr == nil {
 			firstErr = err
@@ -120,38 +215,24 @@ type chainRuleComment struct {
 	comment string
 }
 
-func (s *NftTrafficService) cleanupOrphanInboundRules(validComments map[string]struct{}) error {
-	if !nftSupported() || !nftTableExists() {
-		return nil
-	}
-
-	chains := []string{nftChainIn, nftChainOut}
+func (s *NftTrafficService) cleanupOrphanInboundRules(validComments map[string]struct{}, inHandles map[string]int, outHandles map[string]int, redirectComments map[string]struct{}) error {
 	var firstErr error
-	for _, chain := range chains {
-		rules, err := listRuleCommentsByPrefix(chain, singboxNftRuleComments.prefix)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		for _, rule := range rules {
-			if _, ok := validComments[rule.comment]; ok {
+	cleanupChain := func(chain string, handles map[string]int) {
+		for comment, handle := range handles {
+			if _, ok := validComments[comment]; ok {
 				continue
 			}
-			if err = deleteRuleByHandle(chain, rule.handle); err != nil {
-				logger.Warning("failed to delete orphan inbound nft rule ", rule.comment, " handle ", rule.handle, ": ", err)
+			if err := deleteRuleByHandle(chain, handle); err != nil && !nftObjectMissing(err) {
+				logger.Warning("failed to delete orphan inbound nft rule ", comment, " handle ", handle, ": ", err)
 				if firstErr == nil {
 					firstErr = err
 				}
 			}
 		}
 	}
-	redirectComments, err := listNftRedirectCommentsByPrefix(singboxNftRuleComments.prefix)
-	if err != nil && firstErr == nil {
-		firstErr = err
-	}
-	for _, comment := range redirectComments {
+	cleanupChain(nftChainIn, inHandles)
+	cleanupChain(nftChainOut, outHandles)
+	for comment := range redirectComments {
 		if _, ok := validComments[comment]; ok {
 			continue
 		}
@@ -162,46 +243,42 @@ func (s *NftTrafficService) cleanupOrphanInboundRules(validComments map[string]s
 	return firstErr
 }
 
-func (s *NftTrafficService) ensureInboundRuleIntegrity(tx *gorm.DB, inbound *model.Inbound, port int, portHopRange string) error {
+func (s *NftTrafficService) ensureInboundRuleIntegrity(tx *gorm.DB, inbound *model.Inbound, port int, portHopRange string, state model.InboundTrafficState, stateFound bool, inHandles map[string]int, outHandles map[string]int, redirectRules *managedRedirectRuleSnapshot) error {
 	if inbound == nil || inbound.Id == 0 || port <= 0 {
 		return nil
 	}
 
-	var state model.InboundTrafficState
-	result := tx.Where("inbound_id = ?", inbound.Id).First(&state)
-	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+	if !stateFound {
 		return s.SetupInboundRules(tx, inbound.Id, inbound.Tag, port, portHopRange)
-	}
-	if result.Error != nil {
-		return result.Error
 	}
 
 	// Keep DB state aligned to the current inbound definition.
 	if state.Tag != inbound.Tag || state.Port != port || state.PortHopRange != portHopRange {
-		return s.UpdateInboundRules(tx, inbound.Id, inbound.Tag, port, portHopRange)
+		return s.updateInboundRules(tx, inbound.Id, inbound.Tag, port, portHopRange)
 	}
 
-	s.tryRecoverHandles(tx, &state)
+	originalInHandle := state.InHandle
+	originalOutHandle := state.OutHandle
 	missing := false
 
-	if state.InHandle <= 0 {
-		missing = true
-	} else if _, err := getChainRuleBytesByHandle(nftChainIn, state.InHandle); err != nil {
+	if handle, ok := inHandles[singboxNftRuleComments.in(inbound.Tag)]; ok {
+		state.InHandle = handle
+	} else {
 		missing = true
 	}
 
-	if state.OutHandle <= 0 {
-		missing = true
-	} else if _, err := getChainRuleBytesByHandle(nftChainOut, state.OutHandle); err != nil {
+	if handle, ok := outHandles[singboxNftRuleComments.out(inbound.Tag)]; ok {
+		state.OutHandle = handle
+	} else {
 		missing = true
 	}
 
 	if portHopRange != "" {
 		comment := singboxNftRuleComments.redirect(inbound.Tag)
-		if !nftRedirectRuleExistsByComment(comment) {
+		if redirectRules == nil || !redirectRules.valid[comment] {
 			missing = true
 		}
-	} else if state.RedirectHandle > 0 || nftRedirectRuleExistsInAnyLayout(singboxNftRuleComments.redirect(inbound.Tag)) {
+	} else if state.RedirectHandle > 0 || redirectRules.hasComment(singboxNftRuleComments.redirect(inbound.Tag)) {
 		if err := deleteNftRedirectRulesByComment(singboxNftRuleComments.redirect(inbound.Tag)); err != nil {
 			logger.Warning("failed to delete stale redirect rule for inbound ", inbound.Tag, ": ", err)
 		}
@@ -215,6 +292,13 @@ func (s *NftTrafficService) ensureInboundRuleIntegrity(tx *gorm.DB, inbound *mod
 	}
 
 	if !missing {
+		if state.InHandle != originalInHandle || state.OutHandle != originalOutHandle {
+			return tx.Model(&state).Updates(map[string]interface{}{
+				"in_handle":  state.InHandle,
+				"out_handle": state.OutHandle,
+				"updated_at": time.Now(),
+			}).Error
+		}
 		return nil
 	}
 
@@ -237,7 +321,7 @@ func (s *NftTrafficService) ensureInboundRuleIntegrity(tx *gorm.DB, inbound *mod
 // Call after the inbound is saved to the DB (so we have its ID).
 func (s *NftTrafficService) SetupInboundRules(tx *gorm.DB, inboundId uint, tag string, port int, portHopRange string) error {
 	if port <= 0 {
-		return nil
+		return s.removeInboundRules(tx, inboundId)
 	}
 
 	// Check if rules already exist for this inbound
@@ -310,6 +394,12 @@ func (s *NftTrafficService) SetupInboundRules(tx *gorm.DB, inboundId uint, tag s
 // RemoveInboundRules deletes nftables rules and the InboundTrafficState for the given inbound.
 // Also removes all ClientInboundTrafficState records for this inbound.
 func (s *NftTrafficService) RemoveInboundRules(tx *gorm.DB, inboundId uint) error {
+	return runDefaultInboundNftMutation(func() error {
+		return s.removeInboundRules(tx, inboundId)
+	})
+}
+
+func (s *NftTrafficService) removeInboundRules(tx *gorm.DB, inboundId uint) error {
 	var state model.InboundTrafficState
 	result := tx.Where("inbound_id = ?", inboundId).First(&state)
 	if result.Error != nil {
@@ -400,8 +490,14 @@ func (s *NftTrafficService) RemoveInboundStateOnly(tx *gorm.DB, inboundId uint) 
 // UpdateInboundRules handles inbound edits (port, tag, port_hop_range).
 // Port/port_hop_range changes recreate rules; tag-only changes update mappings when possible.
 func (s *NftTrafficService) UpdateInboundRules(tx *gorm.DB, inboundId uint, tag string, newPort int, portHopRange string) error {
+	return runDefaultInboundNftMutation(func() error {
+		return s.updateInboundRules(tx, inboundId, tag, newPort, portHopRange)
+	})
+}
+
+func (s *NftTrafficService) updateInboundRules(tx *gorm.DB, inboundId uint, tag string, newPort int, portHopRange string) error {
 	if newPort <= 0 {
-		return s.RemoveInboundRules(tx, inboundId)
+		return s.removeInboundRules(tx, inboundId)
 	}
 
 	var existing model.InboundTrafficState
@@ -745,6 +841,12 @@ func (s *NftTrafficService) getCurrentInboundBytes(tx *gorm.DB, inboundId uint) 
 // RefreshPortHopRedirects refreshes REDIRECT rules based on each inbound's port_hop_interval.
 // This runs independently from traffic statistics collection.
 func (s *NftTrafficService) RefreshPortHopRedirects() error {
+	return runDefaultInboundNftMutation(func() error {
+		return s.refreshPortHopRedirects()
+	})
+}
+
+func (s *NftTrafficService) refreshPortHopRedirects() error {
 	if !IsSystemPlatformLinux() || !nftSupported() {
 		return nil
 	}
@@ -851,10 +953,10 @@ func (s *NftTrafficService) RefreshPortHopRedirects() error {
 			continue
 		}
 		if result.RowsAffected == 0 {
+			// A newer save may already have installed a rule with the same stable
+			// comment. Do not delete by comment here: that would erase the newer
+			// rule and leave the inbound unreachable until a later reconciliation.
 			logger.Warning("skip stale port hop redirect result for inbound ", state.Tag)
-			if err := deleteNftRedirectRulesByComment(singboxNftRuleComments.redirect(state.Tag)); err != nil {
-				logger.Warning("failed to remove stale nftables REDIRECT rule for inbound ", state.Tag, ": ", err)
-			}
 			continue
 		}
 		markPortHopRefreshed(state.InboundId, now)
@@ -865,72 +967,111 @@ func (s *NftTrafficService) RefreshPortHopRedirects() error {
 
 // CollectAndSaveTraffic reads nftables counters, computes deltas, and writes
 // Stats records for both inbounds (resource="inbound") and clients (resource="client").
-func (s *NftTrafficService) CollectAndSaveTraffic() error {
+func (s *NftTrafficService) CollectAndSaveTraffic() (bool, error) {
+	return s.collectAndSaveTraffic(nil)
+}
+
+// CollectAndSaveTrafficWithHistory lets the serialized runtime sampler reuse
+// its one trafficAge read for both Core chains without changing the legacy
+// no-argument method contract.
+func (s *NftTrafficService) CollectAndSaveTrafficWithHistory(saveTraffic bool) (bool, error) {
+	return s.collectAndSaveTraffic(&saveTraffic)
+}
+
+func (s *NftTrafficService) collectAndSaveTraffic(saveTrafficOverride *bool) (bool, error) {
 	if !IsSystemPlatformLinux() || !nftSupported() {
 		setOnlines(nil, nil, nil)
-		return nil
+		return false, nil
+	}
+	samplingEpoch, samplingAllowed := captureRuntimeTrafficSamplingEpoch()
+	if !samplingAllowed {
+		return false, nil
 	}
 
 	coreSvc := &CoreManagerService{}
 	if !coreSvc.IsRunning() {
 		setOnlines(nil, nil, nil)
-		return nil
+		return false, nil
 	}
 
 	db := database.GetDB()
 
 	var states []model.InboundTrafficState
 	if err := db.Find(&states).Error; err != nil {
-		return err
+		return false, err
 	}
 
 	if len(states) == 0 {
 		// Legacy self-heal: old deployments may have inbounds but no nft state rows yet.
 		s.InitOnStartup()
 		if err := db.Find(&states).Error; err != nil {
-			return err
+			return false, err
 		}
 		if len(states) == 0 {
 			setOnlines(nil, nil, nil)
-			return nil
+			return false, nil
 		}
 	}
 
 	saveTraffic := true
-	if trafficAge, err := (&SettingService{}).GetTrafficAge(); err == nil {
+	if saveTrafficOverride != nil {
+		saveTraffic = *saveTrafficOverride
+	} else if trafficAge, err := (&SettingService{}).GetTrafficAge(); err == nil {
 		saveTraffic = trafficAge > 0
 	} else {
 		logger.Warning("failed to load trafficAge for nft collection: ", err)
 	}
 	if saveTraffic {
 		if err := EnsureHistoryStorageReady(); err != nil {
-			return err
+			return false, err
+		}
+		if err := runtimeTrafficStats.ensureReady(); err != nil {
+			return false, err
 		}
 	}
 
 	// nft commands can take seconds on a busy host. Read all counters before opening
 	// the SQLite transaction so the single database connection remains available.
-	samples := make([]inboundTrafficSample, 0, len(states))
+	// Keep the two chain snapshots out of the same window as rule replacement.
+	// A concurrent save, restart or integrity repair otherwise makes a single
+	// missing handle fall back to per-inbound nft reads for the whole batch.
+	var samples []inboundTrafficSample
+	if err := runDefaultInboundNftMutation(func() error {
+		samples = s.readInboundTrafficSamples(states)
+		return nil
+	}); err != nil {
+		return false, err
+	}
 	snapshots := make(map[uint]inboundCounterSnapshot, len(states))
-	for i := range states {
-		sample, ok := s.readInboundTrafficSample(states[i])
-		if !ok {
-			snapshots[states[i].InboundId] = inboundCounterSnapshot{
-				inBytes:  states[i].InBytes,
-				outBytes: states[i].OutBytes,
-			}
-			continue
+	for _, state := range states {
+		snapshots[state.InboundId] = inboundCounterSnapshot{
+			inBytes:  state.InBytes,
+			outBytes: state.OutBytes,
 		}
-		samples = append(samples, sample)
+	}
+	hasStateUpdates := false
+	for _, sample := range samples {
+		if sample.stateChanged {
+			hasStateUpdates = true
+		}
 		snapshots[sample.state.InboundId] = inboundCounterSnapshot{
 			inBytes:  sample.delta.currentIn,
 			outBytes: sample.delta.currentOut,
 		}
 	}
+	if !hasStateUpdates {
+		setOnlines(nil, nil, nil)
+		return false, nil
+	}
+	if !runtimeTrafficSamplingEpochUnchanged(samplingEpoch) {
+		return false, nil
+	}
 
+	unlockJournalTransaction := lockTrafficRuntimeJournalTransaction()
+	defer unlockJournalTransaction()
 	tx := db.Begin()
 	if tx.Error != nil {
-		return tx.Error
+		return false, tx.Error
 	}
 	committed := false
 	defer func() {
@@ -941,6 +1082,7 @@ func (s *NftTrafficService) CollectAndSaveTraffic() error {
 
 	now := time.Now().Unix()
 	deltas := make([]inboundDelta, 0, len(samples))
+	historySamples := make([]model.Stats, 0, len(samples)*2)
 	inboundOnlineSet := make(map[string]struct{})
 	for _, sample := range samples {
 		result := tx.Model(&model.InboundTrafficState{}).
@@ -963,7 +1105,7 @@ func (s *NftTrafficService) CollectAndSaveTraffic() error {
 				"updated_at":      time.Now(),
 			})
 		if result.Error != nil {
-			return result.Error
+			return false, result.Error
 		}
 		if result.RowsAffected == 0 {
 			continue
@@ -976,47 +1118,142 @@ func (s *NftTrafficService) CollectAndSaveTraffic() error {
 		deltas = append(deltas, delta)
 		inboundOnlineSet[delta.tag] = struct{}{}
 		if saveTraffic && delta.deltaIn > 0 {
-			if err := upsertStatsTraffic(tx, model.Stats{
+			historySamples = append(historySamples, model.Stats{
 				DateTime:  now,
 				Resource:  "inbound",
 				Tag:       delta.tag,
 				Direction: true,
 				Traffic:   delta.deltaIn,
-			}); err != nil {
-				return err
-			}
+			})
 		}
 		if saveTraffic && delta.deltaOut > 0 {
-			if err := upsertStatsTraffic(tx, model.Stats{
+			historySamples = append(historySamples, model.Stats{
 				DateTime:  now,
 				Resource:  "inbound",
 				Tag:       delta.tag,
 				Direction: false,
 				Traffic:   delta.deltaOut,
-			}); err != nil {
-				return err
-			}
+			})
 		}
 	}
 
 	userOnlines := []string{}
 	if len(deltas) > 0 {
 		if err := s.ensureClientBindings(tx, snapshots); err != nil {
-			return err
+			return false, err
 		}
 		var err error
-		userOnlines, err = s.writeClientStats(tx, deltas, now, saveTraffic)
+		userOnlines, err = s.writeClientStats(tx, deltas, now, saveTraffic, &historySamples)
 		if err != nil {
-			return err
+			return false, err
 		}
+	}
+	journalStage, journalErr := stageTrafficRuntimeStatsForTransaction(tx, historySamples)
+	if journalErr != nil {
+		return false, journalErr
+	}
+	if !runtimeTrafficSamplingEpochUnchanged(samplingEpoch) {
+		discardStagedTrafficRuntimeStats(journalStage)
+		return false, nil
 	}
 
 	if err := tx.Commit().Error; err != nil {
-		return err
+		discardStagedTrafficRuntimeStats(journalStage)
+		return false, err
 	}
 	committed = true
+	if commitStagedTrafficRuntimeStats(journalStage) {
+		if err := runtimeTrafficStats.flush(); err != nil {
+			logger.Warning("flush traffic runtime journal at capacity threshold failed: ", err)
+		}
+	}
 	setOnlines(tagsFromSet(inboundOnlineSet), userOnlines, nil)
-	return nil
+	return len(deltas) > 0, nil
+}
+
+// readInboundTrafficSamples batches normal counter reads into one nft command
+// per direction. A failed snapshot falls back to the existing per-inbound
+// recovery path so externally removed rules still self-heal correctly.
+func (s *NftTrafficService) readInboundTrafficSamples(states []model.InboundTrafficState) []inboundTrafficSample {
+	if len(states) == 0 {
+		return nil
+	}
+
+	prepared := make([]model.InboundTrafficState, len(states))
+	originalByInboundID := make(map[uint]model.InboundTrafficState, len(states))
+	inputHandles := make([]int, 0, len(states))
+	outputHandles := make([]int, 0, len(states))
+	for i := range states {
+		prepared[i] = states[i]
+		originalByInboundID[states[i].InboundId] = states[i]
+		if prepared[i].InHandle <= 0 || prepared[i].OutHandle <= 0 {
+			s.recoverHandles(&prepared[i])
+		}
+		inputHandles = append(inputHandles, prepared[i].InHandle)
+		outputHandles = append(outputHandles, prepared[i].OutHandle)
+	}
+
+	inputBytes, inputErr := getChainRuleBytesByHandles(nftChainIn, inputHandles)
+	outputBytes, outputErr := getChainRuleBytesByHandles(nftChainOut, outputHandles)
+	if inputErr != nil || outputErr != nil {
+		if inputErr != nil {
+			logger.Warning("failed to batch-read nft input counters: ", inputErr)
+		}
+		if outputErr != nil {
+			logger.Warning("failed to batch-read nft output counters: ", outputErr)
+		}
+		return s.readInboundTrafficSamplesIndividually(states)
+	}
+
+	samples := make([]inboundTrafficSample, 0, len(prepared))
+	for _, state := range prepared {
+		currentIn, inOK := inputBytes[state.InHandle]
+		currentOut, outOK := outputBytes[state.OutHandle]
+		if !inOK || !outOK {
+			return s.readInboundTrafficSamplesIndividually(states)
+		}
+		samples = append(samples, newInboundTrafficSample(state, originalByInboundID[state.InboundId], currentIn, currentOut))
+	}
+	return samples
+}
+
+func (s *NftTrafficService) readInboundTrafficSamplesIndividually(states []model.InboundTrafficState) []inboundTrafficSample {
+	samples := make([]inboundTrafficSample, 0, len(states))
+	for _, state := range states {
+		sample, ok := s.readInboundTrafficSample(state)
+		if ok {
+			samples = append(samples, sample)
+		}
+	}
+	return samples
+}
+
+func newInboundTrafficSample(state model.InboundTrafficState, original model.InboundTrafficState, currentIn int64, currentOut int64) inboundTrafficSample {
+	deltaIn := currentIn - original.InBytes
+	deltaOut := currentOut - original.OutBytes
+	if deltaIn < 0 {
+		deltaIn = currentIn
+	}
+	if deltaOut < 0 {
+		deltaOut = currentOut
+	}
+	return inboundTrafficSample{
+		state:                  state,
+		originalInBytes:        original.InBytes,
+		originalOutBytes:       original.OutBytes,
+		originalInHandle:       original.InHandle,
+		originalOutHandle:      original.OutHandle,
+		originalRedirectHandle: original.RedirectHandle,
+		stateChanged:           state.InHandle != original.InHandle || state.OutHandle != original.OutHandle || state.RedirectHandle != original.RedirectHandle || currentIn != original.InBytes || currentOut != original.OutBytes,
+		delta: inboundDelta{
+			inboundId:  state.InboundId,
+			tag:        state.Tag,
+			deltaIn:    deltaIn,
+			deltaOut:   deltaOut,
+			currentIn:  currentIn,
+			currentOut: currentOut,
+		},
+	}
 }
 
 func (s *NftTrafficService) readInboundTrafficSample(state model.InboundTrafficState) (inboundTrafficSample, bool) {
@@ -1061,6 +1298,11 @@ func (s *NftTrafficService) readInboundTrafficSample(state model.InboundTrafficS
 		deltaOut = currentOut
 	}
 	sample.state = state
+	sample.stateChanged = state.InHandle != sample.originalInHandle ||
+		state.OutHandle != sample.originalOutHandle ||
+		state.RedirectHandle != sample.originalRedirectHandle ||
+		currentIn != sample.originalInBytes ||
+		currentOut != sample.originalOutBytes
 	sample.delta = inboundDelta{
 		inboundId:  state.InboundId,
 		tag:        state.Tag,
@@ -1074,7 +1316,7 @@ func (s *NftTrafficService) readInboundTrafficSample(state model.InboundTrafficS
 
 // writeClientStats aggregates inbound deltas for each client's active bindings
 // and writes Stats records with resource="client".
-func (s *NftTrafficService) writeClientStats(tx *gorm.DB, deltas []inboundDelta, now int64, saveTraffic bool) ([]string, error) {
+func (s *NftTrafficService) writeClientStats(tx *gorm.DB, deltas []inboundDelta, now int64, saveTraffic bool, historySamples *[]model.Stats) ([]string, error) {
 	// Build inbound delta map
 	deltaMap := make(map[uint]*inboundDelta)
 	for i := range deltas {
@@ -1163,15 +1405,13 @@ func (s *NftTrafficService) writeClientStats(tx *gorm.DB, deltas []inboundDelta,
 		userOnlineSet[name] = struct{}{}
 		if agg.upTotal > 0 {
 			if saveTraffic {
-				if err := upsertStatsTraffic(tx, model.Stats{
+				*historySamples = append(*historySamples, model.Stats{
 					DateTime:  now,
 					Resource:  "client",
 					Tag:       name,
 					Direction: true,
 					Traffic:   agg.upTotal,
-				}); err != nil {
-					return nil, err
-				}
+				})
 			}
 			// Update client.up
 			if err := tx.Model(&model.Client{}).Where("id = ?", clientId).
@@ -1181,15 +1421,13 @@ func (s *NftTrafficService) writeClientStats(tx *gorm.DB, deltas []inboundDelta,
 		}
 		if agg.downTotal > 0 {
 			if saveTraffic {
-				if err := upsertStatsTraffic(tx, model.Stats{
+				*historySamples = append(*historySamples, model.Stats{
 					DateTime:  now,
 					Resource:  "client",
 					Tag:       name,
 					Direction: false,
 					Traffic:   agg.downTotal,
-				}); err != nil {
-					return nil, err
-				}
+				})
 			}
 			// Update client.down
 			if err := tx.Model(&model.Client{}).Where("id = ?", clientId).
@@ -1312,6 +1550,13 @@ func parsePortHopInterval(raw string) (time.Duration, bool) {
 // InboundTrafficState records. Also creates rules for inbounds that don't have
 // state records yet.
 func (s *NftTrafficService) InitOnStartup() {
+	_ = runDefaultInboundNftMutation(func() error {
+		s.initOnStartup()
+		return nil
+	})
+}
+
+func (s *NftTrafficService) initOnStartup() {
 	if !nftSupported() {
 		logger.Info("nftables not supported on this platform, skipping traffic rule initialization")
 		return
@@ -1424,6 +1669,13 @@ func (s *NftTrafficService) InitOnStartup() {
 // CleanupOnShutdown removes all nftables rules created by this service.
 // Should be called when the program is stopping.
 func (s *NftTrafficService) CleanupOnShutdown() {
+	_ = runDefaultInboundNftMutation(func() error {
+		s.cleanupOnShutdown()
+		return nil
+	})
+}
+
+func (s *NftTrafficService) cleanupOnShutdown() {
 	portHopRefreshState.mu.Lock()
 	portHopRefreshState.last = map[uint]time.Time{}
 	portHopRefreshState.mu.Unlock()

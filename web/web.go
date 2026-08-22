@@ -13,6 +13,9 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -97,6 +100,64 @@ func (s *Server) SetCoreManagers(coreManager *service.CoreManagerService, mihomo
 	s.mihomoManager = mihomoManager
 }
 
+// debugCoreEnvironmentCheck is kept as a function variable so route tests can
+// exercise the handler without pretending the test binary is the VS Code F5
+// executable. Production requests always use the real detector below.
+var debugCoreEnvironmentCheck = isVSCodeF5LocalDebugEnvironment
+
+// isVSCodeF5LocalDebugEnvironment is the security gate for the two temporary
+// Core inspection URLs. It deliberately requires the Windows F5 binary layout,
+// debug mode, and a workspace-relative working directory; this feature must
+// never become available in a release binary or a non-VSCode deployment.
+func isVSCodeF5LocalDebugEnvironment() bool {
+	if runtime.GOOS != "windows" || !config.IsDebug() {
+		return false
+	}
+	executablePath, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	workingDir, err := os.Getwd()
+	if err != nil {
+		return false
+	}
+	expectedExecutable := filepath.Join(filepath.Clean(workingDir), ".vscode", "bin", "kwor-dev.exe")
+	return strings.EqualFold(filepath.Clean(executablePath), filepath.Clean(expectedExecutable))
+}
+
+func isStrictLocalDebugRequest(c *gin.Context) bool {
+	if c == nil || c.Request == nil || !debugCoreEnvironmentCheck() {
+		return false
+	}
+	host := c.Request.Host
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+	if host != "127.0.0.1" {
+		return false
+	}
+	remoteHost, _, err := net.SplitHostPort(c.Request.RemoteAddr)
+	return err == nil && remoteHost == "127.0.0.1"
+}
+
+// serveLocalDebugCoreConfig exposes the persisted final Core config only to a
+// logged-in VS Code F5 request from the local IPv4 loopback address. It never
+// regenerates config or materializes/cleans any disk file.
+func serveLocalDebugCoreConfig(c *gin.Context, canonicalPath string, contentType string, fileName string) {
+	if !isStrictLocalDebugRequest(c) || !api.IsLogin(c) {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	data, err := service.ReadStoredManagedRuntimeCoreFile(canonicalPath)
+	if err != nil {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	c.Header("Content-Disposition", `inline; filename="`+fileName+`"`)
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.Data(http.StatusOK, contentType, data)
+}
+
 func (s *Server) initRouter() (*gin.Engine, error) {
 	if config.IsDebug() {
 		gin.SetMode(gin.DebugMode)
@@ -172,12 +233,27 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	group_api := engine.Group(base_url + "api")
 	api.NewAPIHandlerWithCoreManagers(group_api, apiv2, s.coreManager, s.mihomoManager)
 
+	// VS Code F5-only, authenticated, read-only inspection endpoints. These are
+	// intentionally outside the API groups and are never registered as writes.
+	engine.GET(base_url+"s", func(c *gin.Context) {
+		serveLocalDebugCoreConfig(c, service.GetSingboxConfigPath(), "text/plain; charset=utf-8", "config.json")
+	})
+	engine.GET(base_url+"m", func(c *gin.Context) {
+		serveLocalDebugCoreConfig(c, service.GetMihomoConfigPath(), "text/plain; charset=utf-8", "server.yaml")
+	})
+
 	// Serve index.html as the entry point
 	// Handle all other routes by serving index.html
 	// Anti-probe: wrong base path returns delayed fake 504
 	engine.NoRoute(func(c *gin.Context) {
 		path := c.Request.URL.Path
 		trimmedBase := strings.TrimSuffix(base_url, "/")
+		if path == base_url+"s" || path == base_url+"m" {
+			// The debug inspection endpoints are intentionally GET-only; do not
+			// let SPA fallback turn a non-GET probe into a page response.
+			c.Status(http.StatusNotFound)
+			return
+		}
 
 		if middleware.IsLocalWhitelistHost(c.Request.Host) {
 			if trimmedBase != base_url && path == trimmedBase {
@@ -295,9 +371,11 @@ func (s *Server) Start() (err error) {
 		TLSConfig:         serverTLSConfig,
 		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 15 * time.Second,
-		WriteTimeout:      20 * time.Second,
-		MaxHeaderBytes:    64 << 10,
-		ConnState:         s.trackTLSConn,
+		// Kernel catalog APIs may wait up to 45 seconds for the bounded
+		// SourceForge request; long mutations use background task status APIs.
+		WriteTimeout:   60 * time.Second,
+		MaxHeaderBytes: 64 << 10,
+		ConnState:      s.trackTLSConn,
 	}
 
 	go func() {

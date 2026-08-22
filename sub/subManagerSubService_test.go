@@ -41,6 +41,44 @@ func TestBuildSubManagerRuntimeOutbounds_PassThroughTypes(t *testing.T) {
 	}
 }
 
+func TestBuildSubManagerRuntimeOutboundsClonesNestedPassThroughFields(t *testing.T) {
+	raw := []map[string]interface{}{
+		{
+			"type": "trojan",
+			"tag":  "trojan-node",
+			"tls": map[string]interface{}{
+				"server_name": "source.example.com",
+				"utls":        map[string]interface{}{"fingerprint": "chrome"},
+			},
+			"transport": map[string]interface{}{
+				"type":    "ws",
+				"headers": map[string]interface{}{"Host": "source.example.com"},
+			},
+		},
+	}
+
+	outbounds, _ := buildSubManagerRuntimeOutbounds(raw)
+	if len(outbounds) != 1 {
+		t.Fatalf("expected one pass-through runtime outbound, got %#v", outbounds)
+	}
+
+	outbounds[0]["tls"].(map[string]interface{})["server_name"] = "mutated.example.com"
+	outbounds[0]["tls"].(map[string]interface{})["utls"].(map[string]interface{})["fingerprint"] = "firefox"
+	outbounds[0]["transport"].(map[string]interface{})["headers"].(map[string]interface{})["Host"] = "mutated.example.com"
+
+	sourceTLS := raw[0]["tls"].(map[string]interface{})
+	if got, _ := sourceTLS["server_name"].(string); got != "source.example.com" {
+		t.Fatalf("sub-manager runtime expansion mutated source TLS: %#v", sourceTLS)
+	}
+	if got, _ := sourceTLS["utls"].(map[string]interface{})["fingerprint"].(string); got != "chrome" {
+		t.Fatalf("sub-manager runtime expansion mutated source nested TLS: %#v", sourceTLS)
+	}
+	sourceTransport := raw[0]["transport"].(map[string]interface{})
+	if got, _ := sourceTransport["headers"].(map[string]interface{})["Host"].(string); got != "source.example.com" {
+		t.Fatalf("sub-manager runtime expansion mutated source transport: %#v", sourceTransport)
+	}
+}
+
 func TestBuildSubManagerRuntimeOutbounds_ExpandsMixed(t *testing.T) {
 	raw := []map[string]interface{}{
 		{
@@ -152,5 +190,43 @@ func TestBuildSubManagerRuntimeOutbounds_ShadowTLSNoSsConfig(t *testing.T) {
 	}
 	if _, ok := outbounds[0]["handshake"]; ok {
 		t.Fatalf("shadowtls outbound should not contain handshake: %#v", outbounds[0])
+	}
+}
+
+func TestBuildSubManagerRuntimeOutbounds_MihomoShadowsocksShadowTLSPlugin(t *testing.T) {
+	raw := []map[string]interface{}{
+		{
+			"type":               "shadowsocks",
+			"tag":                "mihomo-ss-shadowtls",
+			"server":             "203.0.113.10",
+			"server_port":        443,
+			"method":             "2022-blake3-aes-128-gcm",
+			"password":           "ss-pass",
+			"plugin":             "shadow-tls",
+			"plugin_opts":        map[string]interface{}{"host": "addons.mozilla.org", "version": 3, "password": "shadow-pass"},
+			"client_fingerprint": "safari",
+		},
+	}
+
+	outbounds, tags := buildSubManagerRuntimeOutbounds(raw)
+	if len(outbounds) != 2 || len(tags) != 1 || tags[0] != "mihomo-ss-shadowtls" {
+		t.Fatalf("unexpected expanded outbounds=%#v tags=%#v", outbounds, tags)
+	}
+	if outbounds[0]["type"] != "shadowsocks" || outbounds[0]["detour"] != "mihomo-ss-shadowtls-out" {
+		t.Fatalf("unexpected Shadowsocks detour outbound: %#v", outbounds[0])
+	}
+	if _, exists := outbounds[0]["plugin"]; exists {
+		t.Fatalf("sing-box Shadowsocks outbound must not retain plugin: %#v", outbounds[0])
+	}
+	if outbounds[1]["type"] != "shadowtls" || outbounds[1]["tag"] != "mihomo-ss-shadowtls-out" || outbounds[1]["password"] != "shadow-pass" {
+		t.Fatalf("unexpected ShadowTLS outbound: %#v", outbounds[1])
+	}
+	tls, ok := outbounds[1]["tls"].(map[string]interface{})
+	if !ok || tls["server_name"] != "addons.mozilla.org" {
+		t.Fatalf("unexpected ShadowTLS TLS settings: %#v", outbounds[1]["tls"])
+	}
+	utls, ok := tls["utls"].(map[string]interface{})
+	if !ok || utls["fingerprint"] != "safari" {
+		t.Fatalf("unexpected ShadowTLS uTLS settings: %#v", tls["utls"])
 	}
 }

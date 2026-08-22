@@ -38,6 +38,12 @@ func TestBuildMixedSubscriptionOutboundPair(t *testing.T) {
 		"password":     "secret",
 		"network":      "tcp",
 		"udp_over_tcp": true,
+		"tls": map[string]interface{}{
+			"server_name": "source.example.com",
+			"utls": map[string]interface{}{
+				"fingerprint": "chrome",
+			},
+		},
 	}
 
 	socks, http := BuildMixedSubscriptionOutboundPair(source)
@@ -57,6 +63,24 @@ func TestBuildMixedSubscriptionOutboundPair(t *testing.T) {
 	}
 	if source["type"] != "mixed" || source["tag"] != "mixed-proxy" {
 		t.Fatalf("mixed source was mutated: %#v", source)
+	}
+
+	socksTLS, _ := socks["tls"].(map[string]interface{})
+	socksTLS["server_name"] = "socks.example.com"
+	socksUTLS, _ := socksTLS["utls"].(map[string]interface{})
+	socksUTLS["fingerprint"] = "firefox"
+
+	httpTLS, _ := http["tls"].(map[string]interface{})
+	if got, _ := httpTLS["server_name"].(string); got != "source.example.com" {
+		t.Fatalf("HTTP variant reused SOCKS TLS map: %#v", httpTLS)
+	}
+	httpUTLS, _ := httpTLS["utls"].(map[string]interface{})
+	if got, _ := httpUTLS["fingerprint"].(string); got != "chrome" {
+		t.Fatalf("HTTP variant reused SOCKS nested uTLS map: %#v", httpUTLS)
+	}
+	sourceTLS, _ := source["tls"].(map[string]interface{})
+	if got, _ := sourceTLS["server_name"].(string); got != "source.example.com" {
+		t.Fatalf("source reused a variant TLS map: %#v", sourceTLS)
 	}
 }
 
@@ -108,6 +132,19 @@ func TestSupportsMihomoSubscriptionTypes(t *testing.T) {
 	}
 	if SupportsMihomoSubscriptionClashProxyType("tor") {
 		t.Fatalf("expected tor clash proxy type to be unsupported by mihomo")
+	}
+}
+
+func TestSupportsMihomoRuntimeListenerType(t *testing.T) {
+	for _, inboundType := range []string{"mixed", "socks", "http", "redirect", "tproxy", "tun", "snell", "shadowsocks", "shadowquic", "vmess", "vless", "trojan", "anytls", "tuic", "hysteria2", "mieru", "sudoku", "trusttunnel"} {
+		if !SupportsMihomoRuntimeListenerType(inboundType) {
+			t.Fatalf("expected %s to be accepted as a Mihomo runtime listener", inboundType)
+		}
+	}
+	for _, inboundType := range []string{"direct", "naive", "ssh", "hysteria", "shadowtls"} {
+		if SupportsMihomoRuntimeListenerType(inboundType) {
+			t.Fatalf("expected %s to be rejected as a Mihomo runtime listener", inboundType)
+		}
 	}
 }
 

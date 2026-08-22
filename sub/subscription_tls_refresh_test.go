@@ -30,6 +30,121 @@ type testCertificateMaterial struct {
 	fingerprintWithColons string
 }
 
+func TestRefreshSubscriptionOutboundTLSUpdatesMihomoShadowsocksPlugin(t *testing.T) {
+	outbound := map[string]interface{}{
+		"type":   "shadowsocks",
+		"plugin": "restls",
+		"plugin_opts": map[string]interface{}{
+			"password": "old",
+		},
+	}
+	tlsConfig := &model.Tls{
+		Mode:   model.MihomoTlsModeShadowTLS,
+		Server: mustRawJSON(t, map[string]interface{}{"shadow_tls": map[string]interface{}{"version": 3, "handshake": map[string]interface{}{"dest": "edge.example.com:443"}}}),
+		Client: mustRawJSON(t, map[string]interface{}{"shadow_tls_opts": map[string]interface{}{"version": 3, "password": "new"}}),
+	}
+	refreshSubscriptionOutboundTLS(outbound, tlsConfig)
+	if outbound["plugin"] != "shadow-tls" {
+		t.Fatalf("plugin = %#v", outbound["plugin"])
+	}
+	opts, ok := outbound["plugin_opts"].(map[string]interface{})
+	if !ok || opts["host"] != "edge.example.com" || opts["password"] != "new" {
+		t.Fatalf("plugin_opts = %#v", outbound["plugin_opts"])
+	}
+}
+
+func TestRefreshSubscriptionOutboundTLSClearsMihomoShadowsocksPlugin(t *testing.T) {
+	outbound := map[string]interface{}{
+		"type":        "shadowsocks",
+		"plugin":      "jls",
+		"plugin_opts": map[string]interface{}{"username": "u"},
+	}
+	refreshSubscriptionOutboundTLS(outbound, nil)
+	if _, exists := outbound["plugin"]; exists {
+		t.Fatalf("stale plugin retained: %#v", outbound)
+	}
+	if _, exists := outbound["plugin_opts"]; exists {
+		t.Fatalf("stale plugin_opts retained: %#v", outbound)
+	}
+}
+
+func TestRefreshSubscriptionOutboundTLSRemovesStaleRealityOnWrapperSwitch(t *testing.T) {
+	outbound := map[string]interface{}{
+		"type": "vless",
+		"tls": map[string]interface{}{
+			"enabled": true,
+			"reality": map[string]interface{}{"enabled": true, "short_id": "old"},
+			"ech":     map[string]interface{}{"enabled": true},
+		},
+	}
+	tlsConfig := &model.Tls{
+		Mode:   model.MihomoTlsModeRestls,
+		Server: mustRawJSON(t, map[string]interface{}{"res_tls": map[string]interface{}{"dest": "edge.example.com:443", "password": "p"}}),
+		Client: mustRawJSON(t, map[string]interface{}{"restls_opts": map[string]interface{}{"password": "p", "version_hint": "tls13"}}),
+	}
+	refreshSubscriptionOutboundTLS(outbound, tlsConfig)
+	tlsMap, ok := outbound["tls"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("tls map missing: %#v", outbound)
+	}
+	if _, exists := tlsMap["reality"]; exists {
+		t.Fatalf("stale reality retained: %#v", tlsMap)
+	}
+	if _, exists := tlsMap["ech"]; exists {
+		t.Fatalf("stale ech retained: %#v", tlsMap)
+	}
+	if tlsMap["server_name"] != "edge.example.com" {
+		t.Fatalf("wrapper SNI fallback missing: %#v", tlsMap)
+	}
+}
+
+func TestRefreshSubscriptionOutboundTLSCreatesMissingWrapperTLSMap(t *testing.T) {
+	outbound := map[string]interface{}{
+		"type": "vless",
+	}
+	tlsConfig := &model.Tls{
+		Mode:   model.MihomoTlsModeRestls,
+		Server: mustRawJSON(t, map[string]interface{}{"enabled": true, "res_tls": map[string]interface{}{"dest": "edge.example.com:443", "password": "p"}}),
+		Client: mustRawJSON(t, map[string]interface{}{"server_name": "cdn.example.com", "restls_opts": map[string]interface{}{"password": "p", "version_hint": "tls13"}}),
+	}
+
+	refreshSubscriptionOutboundTLS(outbound, tlsConfig)
+
+	tlsMap, ok := outbound["tls"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected refresh to create tls map: %#v", outbound)
+	}
+	if tlsMap["enabled"] != true || tlsMap["server_name"] != "cdn.example.com" {
+		t.Fatalf("unexpected refreshed TLS envelope: %#v", tlsMap)
+	}
+	if _, ok := tlsMap["restls_opts"].(map[string]interface{}); !ok {
+		t.Fatalf("expected Restls options in created TLS map: %#v", tlsMap)
+	}
+}
+
+func TestRefreshSubscriptionOutboundTLSFallsBackToServerALPN(t *testing.T) {
+	outbound := map[string]interface{}{
+		"type": "trusttunnel",
+		"tls": map[string]interface{}{
+			"enabled": true,
+			"alpn":    []interface{}{"old"},
+		},
+	}
+	tlsConfig := &model.Tls{
+		Mode:   model.MihomoTlsModeTLS,
+		Server: mustRawJSON(t, map[string]interface{}{"enabled": true, "alpn": []interface{}{"h2"}}),
+		Client: mustRawJSON(t, map[string]interface{}{"insecure": true}),
+	}
+
+	refreshSubscriptionOutboundTLS(outbound, tlsConfig)
+
+	tlsMap := asMap(t, outbound["tls"])
+	alpn := asStringSliceValue(t, tlsMap["alpn"])
+	if len(alpn) != 1 || alpn[0] != "h2" {
+		t.Fatalf("expected server ALPN fallback, got %#v", tlsMap["alpn"])
+	}
+}
+
 func buildLeafCertificateMaterial(t *testing.T, commonName string, serial int64) testCertificateMaterial {
 	t.Helper()
 

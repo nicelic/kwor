@@ -253,9 +253,6 @@ func mihomoEditableMergeSchema(outType string) map[string]*outboundMergeSchemaNo
 		if supportsMihomoClientFingerprint(outType) {
 			tlsSchema["utls"] = mergeBranch(mergeSchemaLeaves("enabled", "fingerprint"))
 		}
-		if outType == "anytls" {
-			delete(tlsSchema, "reality")
-		}
 		schema = mergeSchemaMaps(schema, map[string]*outboundMergeSchemaNode{
 			"tls": mergeBranch(tlsSchema),
 		})
@@ -276,16 +273,29 @@ func mihomoEditableMergeSchema(outType string) map[string]*outboundMergeSchemaNo
 func protocolEditableMergeSchema(outType string) map[string]*outboundMergeSchemaNode {
 	switch strings.TrimSpace(outType) {
 	case "direct":
-		return nil
+		return mergeSchemaLeaves("override_address", "override_port")
 	case "socks":
-		return mergeSchemaLeaves("server", "server_port", "version", "username", "password", "network")
+		return mergeSchemaMaps(
+			mergeSchemaLeaves("server", "server_port", "version", "username", "password", "network"),
+			map[string]*outboundMergeSchemaNode{
+				"udp_over_tcp": mergeBranch(mergeSchemaLeaves("enabled", "version")),
+			},
+		)
 	case "http":
 		return mergeSchemaLeaves("server", "server_port", "username", "password", "path", "headers")
 	case "shadowsocks":
 		return mergeSchemaMaps(
 			mergeSchemaLeaves("server", "server_port", "method", "password", "network"),
 			map[string]*outboundMergeSchemaNode{
-				"multiplex": mergeBranch(outboundMultiplexMergeSchema),
+				"multiplex":    mergeBranch(outboundMultiplexMergeSchema),
+				"udp_over_tcp": mergeBranch(mergeSchemaLeaves("enabled", "version")),
+			},
+		)
+	case "snell":
+		return mergeSchemaMaps(
+			mergeSchemaLeaves("server", "server_port", "psk", "version", "udp", "reuse"),
+			map[string]*outboundMergeSchemaNode{
+				"obfs_opts": mergeBranch(mergeSchemaLeaves("mode", "host")),
 			},
 		)
 	case "vmess":
@@ -318,6 +328,8 @@ func protocolEditableMergeSchema(outType string) map[string]*outboundMergeSchema
 		return mergeSchemaLeaves(
 			"server",
 			"server_port",
+			"server_ports",
+			"hop_interval",
 			"up_mbps",
 			"down_mbps",
 			"obfs",
@@ -350,13 +362,23 @@ func protocolEditableMergeSchema(outType string) map[string]*outboundMergeSchema
 		return mergeSchemaLeaves(
 			"server",
 			"server_port",
+			"token",
 			"uuid",
 			"password",
 			"mihomo_fast_open",
 			"congestion_control",
 			"udp_relay_mode",
+			"udp_over_stream",
+			"udp_over_stream_version",
 			"zero_rtt_handshake",
 			"heartbeat",
+			"request_timeout",
+			"max_open_streams",
+			"max_udp_relay_packet_size",
+			"cwnd",
+			"ip",
+			"disable_mtu_discovery",
+			"max_datagram_frame_size",
 			"network",
 		)
 	case "hysteria2":
@@ -447,6 +469,7 @@ func protocolEditableMergeSchema(outType string) map[string]*outboundMergeSchema
 		return mergeSchemaLeaves(
 			"server",
 			"server_port",
+			"username",
 			"user",
 			"password",
 			"private_key",
@@ -455,6 +478,9 @@ func protocolEditableMergeSchema(outType string) map[string]*outboundMergeSchema
 			"host_key",
 			"host_key_algorithms",
 			"client_version",
+			"cipher",
+			"mac",
+			"kex_algorithm",
 		)
 	case "selector":
 		return mergeSchemaLeaves("outbounds", "default", "interrupt_exist_connections")

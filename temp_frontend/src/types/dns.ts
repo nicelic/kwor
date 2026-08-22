@@ -57,6 +57,25 @@ export function createDnsServer<T extends DnsServer>(type: string, json?: Partia
   return defaultObject
 }
 
+export function normalizeDnsServerHttpPath(server: DnsServer): DnsServer {
+  if (server.type !== DnsTypes.HTTPS && server.type !== DnsTypes.HTTP3) {
+    return server
+  }
+
+  if (server.path == null) {
+    return { ...server, path: '/dns-query' }
+  }
+  if (typeof server.path !== 'string') {
+    return server
+  }
+
+  const path = server.path.trim()
+  return {
+    ...server,
+    path: path === '' ? '/dns-query' : path.startsWith('/') ? path : `/${path}`,
+  }
+}
+
 interface generalDnsRule {
   invert: boolean
   action: 'route' | 'route-options' | 'reject' | 'predefined'
@@ -97,7 +116,7 @@ export interface logicalDnsRule extends generalDnsRule {
 export interface dnsRule extends generalDnsRule {
   inbound?: string[]
   ip_version?: 4 | 6
-  query_type?: string
+  query_type?: string[]
   network?: string[]
   auth_user?: string[]
   protocol?: string[]
@@ -108,8 +127,8 @@ export interface dnsRule extends generalDnsRule {
   source_ip_cidr?: string[]
   source_ip_is_private?: boolean
   ip_cidr?: string[]
-  ip_is_private: boolean
-  ip_accept_any: boolean
+  ip_is_private?: boolean
+  ip_accept_any?: boolean
   source_port?: number[]
   source_port_range?: string[]
   port?: number[]
@@ -124,4 +143,5 @@ export interface dnsRule extends generalDnsRule {
   rule_set?: string[]
   rule_set_ip_cidr_match_source?: boolean
   rule_set_ip_cidr_accept_empty?: boolean
+  match_response?: boolean
 }

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"net"
 	"os"
 	"os/exec"
@@ -78,6 +79,13 @@ type SystemMTUOptimizationOverview struct {
 }
 
 func (s *SystemMTUOptimizationService) GetOverview() (*SystemMTUOptimizationOverview, error) {
+	return s.GetOverviewContext(context.Background())
+}
+
+// GetOverviewContext only reads the current host state. It does not acquire the
+// mutation mutex, otherwise a routine page refresh could wait behind an MTU
+// rollback, a systemd reload, or another privileged write operation.
+func (s *SystemMTUOptimizationService) GetOverviewContext(ctx context.Context) (*SystemMTUOptimizationOverview, error) {
 	enabled, err := s.getBool(systemMTUEnabledKey)
 	if err != nil {
 		return nil, err
@@ -131,14 +139,14 @@ func (s *SystemMTUOptimizationService) GetOverview() (*SystemMTUOptimizationOver
 	}
 	var detectErr error
 	if iface == "" {
-		iface, detectErr = detectDefaultInterfaceName()
+		iface, detectErr = detectDefaultInterfaceNameContext(ctx)
 	}
 	if detectErr != nil {
 		overview.Supported = false
 		issues = append(issues, "默认网卡检测失败: "+strings.TrimSpace(detectErr.Error()))
 	} else {
 		overview.Interface = iface
-		currentMTU, currentErr := detectInterfaceMTUValue(iface)
+		currentMTU, currentErr := detectInterfaceMTUValueContext(ctx, iface)
 		if currentErr != nil {
 			issues = append(issues, "读取网卡 MTU 失败: "+strings.TrimSpace(currentErr.Error()))
 		} else {
@@ -153,12 +161,12 @@ func (s *SystemMTUOptimizationService) GetOverview() (*SystemMTUOptimizationOver
 		}
 	}
 
-	systemctlPath, systemctlErr := resolveOperationalSystemctl()
+	systemctlPath, systemctlErr := resolveOperationalSystemctlContext(ctx)
 	if systemctlErr != nil {
 		overview.Supported = false
 		issues = append(issues, strings.TrimSpace(systemctlErr.Error()))
 	} else {
-		unitState, activeState, stateErr := readSystemdUnitStatus(systemctlPath, managedMTUServiceUnit)
+		unitState, activeState, stateErr := readSystemdUnitStatusContext(ctx, systemctlPath, managedMTUServiceUnit)
 		if stateErr != nil {
 			issues = append(issues, "读取 systemd 状态失败: "+strings.TrimSpace(stateErr.Error()))
 		} else {
@@ -942,6 +950,10 @@ func isMissingSystemdUnitError(err error) bool {
 }
 
 func resolveOperationalSystemctl() (string, error) {
+	return resolveOperationalSystemctlContext(context.Background())
+}
+
+func resolveOperationalSystemctlContext(ctx context.Context) (string, error) {
 	if !pathEntryExists("/run/systemd/system") {
 		return "", common.NewError("当前环境没有运行中的 systemd 管理器，MTU 持久化不可用")
 	}
@@ -949,7 +961,7 @@ func resolveOperationalSystemctl() (string, error) {
 	if err != nil {
 		return "", common.NewError("未找到 systemctl，MTU 持久化不可用")
 	}
-	output, err := runCommandOutputWithTimeout(5*time.Second, systemctlPath, "show", "--property=Version", "--value")
+	output, err := runOptimizationCommandOutputWithTimeout(ctx, 5*time.Second, systemctlPath, "show", "--property=Version", "--value")
 	if err != nil {
 		return "", common.NewError("无法连接 systemd 管理器: ", err)
 	}
@@ -960,7 +972,11 @@ func resolveOperationalSystemctl() (string, error) {
 }
 
 func readSystemdUnitStatus(systemctlPath string, unit string) (string, string, error) {
-	output, err := runCommandOutputWithTimeout(5*time.Second, systemctlPath, "show", "-p", "LoadState", "-p", "UnitFileState", "-p", "ActiveState", unit)
+	return readSystemdUnitStatusContext(context.Background(), systemctlPath, unit)
+}
+
+func readSystemdUnitStatusContext(ctx context.Context, systemctlPath string, unit string) (string, string, error) {
+	output, err := runOptimizationCommandOutputWithTimeout(ctx, 5*time.Second, systemctlPath, "show", "-p", "LoadState", "-p", "UnitFileState", "-p", "ActiveState", unit)
 	if err != nil {
 		return "", "", err
 	}
@@ -999,8 +1015,12 @@ func parseSystemdUnitStatus(output string) (string, string) {
 }
 
 func detectDefaultInterfaceName() (string, error) {
+	return detectDefaultInterfaceNameContext(context.Background())
+}
+
+func detectDefaultInterfaceNameContext(ctx context.Context) (string, error) {
 	if ipPath, err := exec.LookPath("ip"); err == nil {
-		output, routeErr := runCommandOutputWithTimeout(8*time.Second, ipPath, "-o", "route", "show", "to", "default")
+		output, routeErr := runOptimizationCommandOutputWithTimeout(ctx, 8*time.Second, ipPath, "-o", "route", "show", "to", "default")
 		if routeErr == nil {
 			iface := parseMTUDefaultInterfaceFromIPRouteOutput(output)
 			if iface != "" {
@@ -1102,6 +1122,10 @@ func sanitizeInterfaceName(name string) string {
 }
 
 func detectInterfaceMTUValue(iface string) (int, error) {
+	return detectInterfaceMTUValueContext(context.Background(), iface)
+}
+
+func detectInterfaceMTUValueContext(ctx context.Context, iface string) (int, error) {
 	iface = sanitizeInterfaceName(iface)
 	if iface == "" {
 		return 0, common.NewError("网卡名称为空")
@@ -1121,7 +1145,7 @@ func detectInterfaceMTUValue(iface string) (int, error) {
 	}
 
 	if ipPath, pathErr := exec.LookPath("ip"); pathErr == nil {
-		output, cmdErr := runCommandOutputWithTimeout(8*time.Second, ipPath, "link", "show", "dev", iface)
+		output, cmdErr := runOptimizationCommandOutputWithTimeout(ctx, 8*time.Second, ipPath, "link", "show", "dev", iface)
 		if cmdErr == nil {
 			match := mtuPattern.FindStringSubmatch(output)
 			if len(match) == 2 {

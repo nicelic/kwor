@@ -236,6 +236,58 @@ func TestRuleSetProbeTimeoutSizeConcurrencyAndCacheExpiry(t *testing.T) {
 	}
 }
 
+func TestRuleSetProbeRejectsExcessInFlightBatches(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"rules":[{"domain":["example.com"]}]}`))
+	}))
+	defer server.Close()
+
+	resolver := &probeTestResolver{addresses: [][]netip.Addr{{netip.MustParseAddr("127.0.0.1")}}}
+	engine := service.NewSubscriptionRuleSetProbeEngine(service.SubscriptionRuleSetProbeEngineOptions{
+		Resolver:           resolver,
+		AllowAddress:       func(netip.Addr) bool { return true },
+		Timeout:            time.Second,
+		Concurrency:        1,
+		CacheEntries:       8,
+		CacheTTL:           time.Minute,
+		MaxInFlightBatches: 1,
+	})
+	request := service.SubscriptionRuleSetProbeRequest{Items: []service.SubscriptionRuleSetProbeItem{{
+		ID: "one", Kind: "json", Scope: "domain", URL: probeTestURL(t, server.URL, "rules.test") + "/domain.json",
+	}}}
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := engine.Probe(context.Background(), request)
+		firstDone <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first probe did not occupy the in-flight batch slot")
+	}
+
+	if _, err := engine.Probe(context.Background(), request); err == nil || !strings.Contains(err.Error(), "请求过多") {
+		t.Fatalf("second probe error = %v, want overload rejection", err)
+	}
+
+	close(release)
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first probe failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first probe did not finish after release")
+	}
+}
+
 func TestRuleSetProbeTLSCertificateValidation(t *testing.T) {
 	handler := http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")

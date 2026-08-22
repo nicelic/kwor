@@ -21,8 +21,6 @@ func normalizeMihomoListenerCompatFields(listener map[string]interface{}, listen
 		normalizeMihomoSnellListener(listener)
 	case "tuic":
 		normalizeMihomoTUICListener(listener)
-	case "shadowtls":
-		normalizeMihomoShadowTLSListener(listener)
 	case "shadowquic":
 		normalizeMihomoShadowQUICListener(listener)
 	case "shadowsocks":
@@ -251,53 +249,6 @@ func normalizeMihomoShadowsocksListener(listener map[string]interface{}) {
 	delete(listener, "network")
 }
 
-func normalizeMihomoShadowTLSListener(listener map[string]interface{}) {
-	shadowTLSPassword := strings.TrimSpace(firstString(listener["password"]))
-	ssConfig, _ := listener["ss_config"].(map[string]interface{})
-	if ssConfig != nil {
-		if cipher := strings.TrimSpace(firstString(ssConfig["cipher"])); cipher != "" {
-			listener["cipher"] = cipher
-		} else if method := strings.TrimSpace(firstString(ssConfig["method"])); method != "" {
-			listener["method"] = method
-		}
-		if password := strings.TrimSpace(firstString(ssConfig["password"])); password != "" {
-			listener["password"] = password
-		}
-		if multiplex, ok := ssConfig["multiplex"].(map[string]interface{}); ok && multiplex != nil {
-			listener["multiplex"] = multiplex
-		}
-	}
-
-	shadowTLS := map[string]interface{}{
-		"enable": true,
-	}
-	if version, ok := toInt(listener["version"]); ok && version > 0 {
-		shadowTLS["version"] = version
-	}
-	if shadowTLSPassword != "" {
-		shadowTLS["password"] = shadowTLSPassword
-	}
-	if users, ok := listener["users"].([]interface{}); ok && len(users) > 0 {
-		shadowTLS["users"] = users
-	}
-	if handshake := normalizeMihomoShadowTLSHandshake(listener["handshake"]); len(handshake) > 0 {
-		shadowTLS["handshake"] = handshake
-	}
-
-	listener["type"] = "shadowsocks"
-	listener["shadow-tls"] = shadowTLS
-	delete(listener, "version")
-	delete(listener, "users")
-	delete(listener, "handshake")
-	delete(listener, "handshake_for_server_name")
-	delete(listener, "strict_mode")
-	delete(listener, "wildcard_sni")
-	delete(listener, "ss_config")
-
-	normalizeMihomoShadowsocksListener(listener)
-	normalizeMihomoListenerMuxOption(listener)
-}
-
 func normalizeMihomoShadowQUICListener(listener map[string]interface{}) {
 	if listener == nil {
 		return
@@ -443,52 +394,6 @@ func firstNonNil(values ...interface{}) interface{} {
 		}
 	}
 	return nil
-}
-
-func normalizeMihomoShadowTLSHandshake(raw interface{}) map[string]interface{} {
-	handshake, ok := raw.(map[string]interface{})
-	if !ok || handshake == nil {
-		return nil
-	}
-
-	normalized := map[string]interface{}{}
-	if dest := strings.TrimSpace(firstString(handshake["dest"])); dest != "" {
-		normalized["dest"] = dest
-	} else {
-		server := strings.TrimSpace(firstString(handshake["server"]))
-		serverPort, _ := toInt(handshake["server_port"])
-		if server != "" && serverPort > 0 {
-			normalized["dest"] = fmt.Sprintf("%s:%d", server, serverPort)
-		} else if server != "" {
-			normalized["dest"] = server
-		}
-	}
-
-	if len(normalized) == 0 {
-		return nil
-	}
-	return normalized
-}
-
-func normalizeMihomoShadowTLSHandshakeForServerName(raw interface{}) map[string]interface{} {
-	handshakeMap, ok := raw.(map[string]interface{})
-	if !ok || handshakeMap == nil {
-		return nil
-	}
-
-	normalized := map[string]interface{}{}
-	for serverName, value := range handshakeMap {
-		handshake := normalizeMihomoShadowTLSHandshake(value)
-		if len(handshake) == 0 {
-			continue
-		}
-		normalized[serverName] = handshake
-	}
-
-	if len(normalized) == 0 {
-		return nil
-	}
-	return normalized
 }
 
 func normalizeMihomoVMessListener(listener map[string]interface{}) {
@@ -708,6 +613,12 @@ func normalizeMihomoTunListener(listener map[string]interface{}) {
 	delete(listener, "interface_name")
 	delete(listener, "address")
 	delete(listener, "udp_timeout")
+	// TUN listeners do not expose a TCP/UDP listen socket. Older records may
+	// still carry generic listen fields (or the build-time `port` projection),
+	// so remove all of them before server.yaml is rendered.
+	delete(listener, "listen")
+	delete(listener, "listen_port")
+	delete(listener, "port")
 }
 
 func normalizeMihomoTProxyListener(listener map[string]interface{}) {
@@ -1019,10 +930,10 @@ func normalizeMihomoHysteria2ReceiveWindows(dst map[string]interface{}, src map[
 		return
 	}
 
-	copyIfMissingMapped(dst, src, "initial-stream-receive-window", "initial-stream-receive-window", "initial_stream_receive_window")
-	copyIfMissingMapped(dst, src, "max-stream-receive-window", "max-stream-receive-window", "max_stream_receive_window")
-	copyIfMissingMapped(dst, src, "initial-connection-receive-window", "initial-connection-receive-window", "initial_connection_receive_window")
-	copyIfMissingMapped(dst, src, "max-connection-receive-window", "max-connection-receive-window", "max_connection_receive_window")
+	copyMihomoHysteria2ReceiveWindow(dst, src, "initial-stream-receive-window", "initial-stream-receive-window", "initial_stream_receive_window")
+	copyMihomoHysteria2ReceiveWindow(dst, src, "max-stream-receive-window", "max-stream-receive-window", "max_stream_receive_window")
+	copyMihomoHysteria2ReceiveWindow(dst, src, "initial-connection-receive-window", "initial-connection-receive-window", "initial_connection_receive_window")
+	copyMihomoHysteria2ReceiveWindow(dst, src, "max-connection-receive-window", "max-connection-receive-window", "max_connection_receive_window")
 
 	delete(dst, "initial_stream_receive_window")
 	delete(dst, "max_stream_receive_window")
@@ -1030,14 +941,20 @@ func normalizeMihomoHysteria2ReceiveWindows(dst map[string]interface{}, src map[
 	delete(dst, "max_connection_receive_window")
 }
 
-func copyIfMissingMapped(dst map[string]interface{}, src map[string]interface{}, dstKey string, srcKeys ...string) {
-	if _, exists := dst[dstKey]; exists {
-		return
+func copyMihomoHysteria2ReceiveWindow(dst map[string]interface{}, src map[string]interface{}, dstKey string, srcKeys ...string) {
+	if value, exists := dst[dstKey]; exists {
+		if normalized, ok := toInt(value); ok && normalized > 0 {
+			dst[dstKey] = normalized
+			return
+		}
+		delete(dst, dstKey)
 	}
 	for _, srcKey := range srcKeys {
-		if value, ok := src[srcKey]; ok && value != nil {
-			dst[dstKey] = value
-			return
+		if value, ok := src[srcKey]; ok {
+			if normalized, ok := toInt(value); ok && normalized > 0 {
+				dst[dstKey] = normalized
+				return
+			}
 		}
 	}
 }

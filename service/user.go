@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/alireza0/s-ui/database"
@@ -104,16 +105,35 @@ func (s *UserService) GetUsers() (*[]model.User, error) {
 	return &users, nil
 }
 
-func (s *UserService) ChangePass(id string, oldPass string, newUser string, newPass string) error {
+func (s *UserService) ChangePass(id string, oldPass string, newUser string, newPass string) (string, error) {
+	newUser = strings.TrimSpace(newUser)
+	if newUser == "" {
+		return "", common.NewError("username can not be empty")
+	}
+	if newPass == "" {
+		return "", common.NewError("password can not be empty")
+	}
 	db := database.GetDB()
 	user := &model.User{}
 	err := db.Model(model.User{}).Where("id = ? AND password = ?", id, oldPass).First(user).Error
 	if err != nil || database.IsNotFound(err) {
-		return err
+		return "", err
 	}
+	var duplicate model.User
+	err = db.Model(model.User{}).Where("username = ? AND id <> ?", newUser, user.Id).First(&duplicate).Error
+	if err == nil {
+		return "", common.NewError("username already exists")
+	}
+	if !database.IsNotFound(err) {
+		return "", err
+	}
+	oldUsername := user.Username
 	user.Username = newUser
 	user.Password = newPass
-	return db.Save(user).Error
+	if err := db.Save(user).Error; err != nil {
+		return "", err
+	}
+	return oldUsername, nil
 }
 
 func (s *UserService) LoadTokens() ([]byte, error) {
@@ -169,7 +189,16 @@ func (s *UserService) AddToken(username string, expiry int64, desc string) (stri
 	return token.Token, nil
 }
 
-func (s *UserService) DeleteToken(id string) error {
+func (s *UserService) DeleteToken(username string, id string) error {
 	db := database.GetDB()
-	return db.Model(model.Tokens{}).Where("id = ?", id).Delete(&model.Tokens{}).Error
+	result := db.Model(model.Tokens{}).
+		Where("id = ? AND user_id = (select id from users where username = ?)", id, username).
+		Delete(&model.Tokens{})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return common.NewError("token not found")
+	}
+	return nil
 }

@@ -31,7 +31,9 @@
           hide-details
           type="number"
           min=1
-          v-model.number="data.listen_port">
+          max="65535"
+          step="1"
+          v-model="listenPort">
         </v-text-field>
       </v-col>
       <v-col cols="12" sm="6" md="4" v-if="data.udp_timeout != undefined">
@@ -39,7 +41,8 @@
           label="UDP Timeout"
           hide-details
           type="number"
-          min=0
+          min="0"
+          step="any"
           :suffix="$t('date.m')"
           v-model.number="udp_timeout">
         </v-text-field>
@@ -52,7 +55,8 @@
           hide-details
           type="number"
           min=1
-          v-model.number="data.workers">
+          step="1"
+          v-model="workers">
         </v-text-field>
       </v-col>
       <v-col cols="12" sm="6" md="4" v-if="data.mtu != undefined">
@@ -61,7 +65,9 @@
           hide-details
           type="number"
           min=0
-          v-model.number="data.mtu">
+          max="65535"
+          step="1"
+          v-model="mtu">
         </v-text-field>
       </v-col>
     </v-row>
@@ -117,6 +123,8 @@
 
 <script lang="ts">
 import Peer from '@/components/WgPeer.vue'
+import { readSingboxDuration, writeSingboxDuration } from '@/plugins/singboxDuration'
+import { parseSingboxByteList, parseSingboxInteger } from '@/plugins/singboxInteger'
 
 export default {
   props: ['data'],
@@ -140,7 +148,7 @@ export default {
       this.$emit('newWgKey')
     },
     getWgPubKey() {
-      const privKey = this.$props.data.private_key
+      const privKey = typeof this.$props.data.private_key === 'string' ? this.$props.data.private_key : ''
       if (privKey.length == 0) return
       this.$emit('getWgPubKey', privKey)
     },
@@ -170,17 +178,32 @@ export default {
       get() { return this.$props.data.address?.join(',') },
       set(v:string) { this.$props.data.address = v.length > 0 ? v.split(',') : undefined }
     },
+    listenPort: {
+      get() { return parseSingboxInteger(this.$props.data.listen_port, { min: 1, max: 65535 }) ?? '' },
+      set(v:unknown) { this.$props.data.listen_port = parseSingboxInteger(v, { min: 1, max: 65535 }) }
+    },
+    workers: {
+      get() { return parseSingboxInteger(this.$props.data.workers, { min: 1 }) ?? '' },
+      set(v:unknown) { this.$props.data.workers = parseSingboxInteger(v, { min: 1 }) }
+    },
+    mtu: {
+      get() { return parseSingboxInteger(this.$props.data.mtu, { min: 0, max: 65535 }) ?? '' },
+      set(v:unknown) { this.$props.data.mtu = parseSingboxInteger(v, { min: 0, max: 65535 }) }
+    },
     reserved: {
       get() { return this.$props.data.reserved?.join(',') },
-      set(v:string) { 
-        if(!v.endsWith(',')) {
-          this.$props.data.reserved = v.length > 0 ? v.split(',').map(str => parseInt(str, 10)) : []
+      set(v:string) {
+        if (v.trim() === '') {
+          this.$props.data.reserved = undefined
+          return
         }
+        const values = parseSingboxByteList(v)
+        if (values) this.$props.data.reserved = values
       }
     },
     udp_timeout: {
-      get() { return this.$props.data.udp_timeout ? parseInt(this.$props.data.udp_timeout.replace('m','')) : 5 },
-      set(v:number) { this.$props.data.udp_timeout = v > 0 ? v + 'm' : '5m' }
+      get() { return readSingboxDuration(this.$props.data.udp_timeout, 'm') ?? 5 },
+      set(v:number) { this.$props.data.udp_timeout = writeSingboxDuration(v, 'm') ?? '5m' }
     },
     public_key: {
       get() { return this.$props.data.ext?.public_key?? '' },

@@ -5,7 +5,7 @@
         <v-switch color="primary" :label="$t('tls.enable')" v-model="tlsEnable" hide-details></v-switch>
       </v-col>
     </v-row>
-    <template v-if="tls.enabled">
+    <template v-if="tlsEditorEnabled">
       <v-row>
         <v-col cols="12" sm="6" md="4">
           <v-switch color="primary" :label="$t('tls.disableSni')" v-model="disable_sni" hide-details></v-switch>
@@ -59,7 +59,7 @@
             v-model="tls.server_name">
           </v-text-field>
         </v-col>
-        <v-col cols="12" sm="6" md="4" v-if="tls.alpn">
+        <v-col cols="12" sm="6" md="4" v-if="tls.alpn !== undefined">
           <v-select
             hide-details
             label="ALPN"
@@ -70,7 +70,7 @@
         </v-col>
       </v-row>
       <v-row>
-        <v-col cols="12" sm="6" md="4" v-if="tls.min_version">
+        <v-col cols="12" sm="6" md="4" v-if="tls.min_version !== undefined">
           <v-select
             hide-details
             :label="$t('tls.minVer')"
@@ -78,7 +78,7 @@
             v-model="tls.min_version">
           </v-select>
         </v-col>
-        <v-col cols="12" sm="6" md="4" v-if="tls.max_version">
+        <v-col cols="12" sm="6" md="4" v-if="tls.max_version !== undefined">
           <v-select
             hide-details
             :label="$t('tls.maxVer')"
@@ -124,7 +124,7 @@
           </v-text-field>
         </v-col>
       </v-row>
-      <template v-if="tls.ech != undefined">
+      <template v-if="supportsECH && tls.ech != undefined">
         <v-row>
           <v-col class="v-card-subtitle">ECH</v-col>
         </v-row>
@@ -164,7 +164,7 @@
           </v-col>
         </v-row>
       </template>
-      <v-row v-if="tls.fragment != undefined">
+      <v-row v-if="supportsFragment && tls.fragment != undefined">
         <v-col cols="12" sm="6" md="4">
           <v-switch color="primary" :label="$t('tls.fragment')" v-model="tls.fragment" hide-details></v-switch>
         </v-col>
@@ -177,13 +177,14 @@
           hide-details
           type="number"
           min=0
+          step="any"
           :suffix="$t('date.ms')"
           v-model.number="fragmentFallbackDelay">
           </v-text-field>
         </v-col>
       </v-row>
     </template>
-    <v-card-actions v-if="tls.enabled">
+    <v-card-actions v-if="tlsEditorEnabled">
       <v-spacer></v-spacer>
       <v-menu v-model="menu" :close-on-content-click="false" location="start">
           <template v-slot:activator="{ props }">
@@ -215,10 +216,10 @@
               <v-list-item v-if="supportsReality">
                 <v-switch v-model="optionReality" color="primary" label="Reality" hide-details></v-switch>
               </v-list-item>
-              <v-list-item>
+              <v-list-item v-if="supportsECH">
                 <v-switch v-model="optionEch" color="primary" label="ECH" hide-details></v-switch>
               </v-list-item>
-              <v-list-item>
+              <v-list-item v-if="supportsFragment">
                 <v-switch v-model="optionFragment" color="primary" :label="$t('tls.fragment')" hide-details></v-switch>
               </v-list-item>
             </v-list>
@@ -230,6 +231,10 @@
 
 <script lang="ts">
 import { oTls, defaultOutTls } from '@/types/tls'
+import { readSingboxDuration, writeSingboxDuration } from '@/plugins/singboxDuration'
+
+const cloneTlsDefault = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
+
 export default {
   props: {
     outbound: {
@@ -239,6 +244,14 @@ export default {
     namespace: {
       type: String,
       default: 'default',
+    },
+    protocol: {
+      type: String,
+      default: '',
+    },
+    tlsRequired: {
+      type: Boolean,
+      default: false,
     },
   },
   data() {
@@ -287,18 +300,37 @@ export default {
     }
   },
   created() {
-    const tls = this.$props.outbound?.tls
-    if (!tls) return
-    delete tls.tls_store
-    delete tls.store
-    this.sanitizeMihomoUnsupportedFields()
+    this.syncTlsEditorState()
   },
   watch: {
+    outbound() {
+      this.syncTlsEditorState()
+    },
     'outbound.type'() {
-      this.sanitizeMihomoUnsupportedFields()
+      this.syncTlsEditorState()
+    },
+    namespace() {
+      this.syncTlsEditorState()
+    },
+    protocol() {
+      this.syncTlsEditorState()
     },
   },
   methods: {
+    syncTlsEditorState() {
+      const tls = this.$props.outbound?.tls
+      if (!tls || typeof tls !== 'object' || Array.isArray(tls)) {
+        this.usePath = 0
+        this.useEchPath = 0
+        return
+      }
+      this.usePath = tls.certificate ? 1 : 0
+      this.useEchPath = tls.ech?.config ? 1 : 0
+      if (this.tlsRequired) delete tls.enabled
+      delete tls.tls_store
+      delete tls.store
+      this.sanitizeMihomoUnsupportedFields()
+    },
     sanitizeMihomoUnsupportedFields() {
       if (!this.isMihomoNamespace || !this.$props.outbound?.tls) return
       if (!this.supportsClientFingerprint) {
@@ -307,26 +339,56 @@ export default {
       if (!this.supportsReality) {
         delete this.$props.outbound.tls.reality
       }
+      if (!this.supportsECH) {
+        delete this.$props.outbound.tls.ech
+      }
+      if (!this.supportsFragment) {
+        delete this.$props.outbound.tls.fragment
+        delete this.$props.outbound.tls.fragment_fallback_delay
+        delete this.$props.outbound.tls.record_fragment
+      }
     },
   },
   computed: {
     tls(): oTls {
-      return <oTls> this.$props.outbound.tls
+      const tls = this.$props.outbound?.tls
+      return tls && typeof tls === 'object' && !Array.isArray(tls) ? <oTls>tls : <oTls>{}
     },
     isMihomoNamespace(): boolean {
       return this.namespace === 'mihomo'
     },
+    outboundType(): string {
+      const protocol = typeof this.protocol === 'string' ? this.protocol.trim().toLowerCase() : ''
+      if (protocol) return protocol
+      return typeof this.$props.outbound?.type === 'string'
+        ? this.$props.outbound.type.trim().toLowerCase()
+        : ''
+    },
     supportsClientFingerprint(): boolean {
       if (!this.isMihomoNamespace) return true
-      return ['vmess', 'vless', 'trojan', 'anytls', 'shadowtls'].includes(this.$props.outbound?.type)
+      return ['vmess', 'vless', 'trojan', 'anytls', 'shadowtls', 'trusttunnel'].includes(this.outboundType)
     },
     supportsReality(): boolean {
       if (!this.isMihomoNamespace) return true
-      return this.$props.outbound?.type !== 'anytls'
+      return this.outboundType !== 'trusttunnel'
+    },
+    supportsECH(): boolean {
+      if (!this.isMihomoNamespace) return true
+      return this.outboundType !== 'trusttunnel'
+    },
+    supportsFragment(): boolean {
+      return !this.isMihomoNamespace
     },
     tlsEnable: {
       get() { return Object.hasOwn(this.tls, 'enabled') ? this.tls.enabled : false },
-      set(newValue: boolean) { this.$props.outbound.tls = newValue ? { enabled: true } : { enabled: false } }
+      set(newValue: boolean) {
+        const tls = this.$props.outbound.tls
+        if (!tls || typeof tls !== 'object' || Array.isArray(tls)) {
+          this.$props.outbound.tls = { enabled: newValue }
+          return
+        }
+        tls.enabled = newValue
+      }
     },
     disable_sni: {
       get() { return this.tls.disable_sni ?? false },
@@ -337,11 +399,32 @@ export default {
       set(newValue: boolean) { this.$props.outbound.tls.insecure = newValue ? true : undefined }
     },
     tlsOptional(): boolean {
-      return !['hysteria','hysteria2','tuic','shadowtls', 'anytls'].includes(this.$props.outbound.type)
+      return !this.tlsRequired && !['hysteria','hysteria2','tuic','shadowtls', 'anytls'].includes(this.outboundType)
+    },
+    tlsEditorEnabled(): boolean {
+      const rawTls = this.$props.outbound?.tls
+      if (!rawTls || typeof rawTls !== 'object' || Array.isArray(rawTls)) return false
+
+      // TLS-required protocols historically allowed a client TLS object without
+      // an explicit enabled marker. Keep that object's controls editable while
+      // preserving an explicit false value as disabled.
+      return this.tlsRequired || this.tls.enabled === true || (!this.tlsOptional && this.tls.enabled === undefined)
     },
     echConfigText: {
       get(): string { return this.tls.ech?.config ? this.tls.ech.config.join('\n') : '' },
-      set(newValue:string) { if (this.tls.ech) this.tls.ech.config = newValue.split('\n') }
+      set(newValue:string) {
+        if (!this.tls.ech) return
+        const config = newValue
+          .replace(/\r\n/g, '\n')
+          .split('\n')
+          .map((line: string) => line.trim())
+          .filter((line: string) => line.length > 0)
+        if (config.length > 0) {
+          this.tls.ech.config = config
+        } else {
+          delete this.tls.ech.config
+        }
+      }
     },
     optionCert: {
       get(): boolean { return this.tls.certificate != undefined || this.tls.certificate_path != undefined },
@@ -361,7 +444,7 @@ export default {
     },
     optionALPN: {
       get(): boolean { return this.tls.alpn != undefined },
-      set(v:boolean) { this.$props.outbound.tls.alpn = v ? defaultOutTls.alpn : undefined }
+      set(v:boolean) { this.$props.outbound.tls.alpn = v ? cloneTlsDefault(defaultOutTls.alpn) : undefined }
     },
     optionMinV: {
       get(): boolean { return this.tls.min_version != undefined },
@@ -373,7 +456,7 @@ export default {
     },
     optionCS: {
       get(): boolean { return this.tls.cipher_suites != undefined },
-      set(v:boolean) { this.$props.outbound.tls.cipher_suites = v ? defaultOutTls.cipher_suites : undefined }
+      set(v:boolean) { this.$props.outbound.tls.cipher_suites = v ? cloneTlsDefault(defaultOutTls.cipher_suites) : undefined }
     },
     optionFP: {
       get(): boolean { return this.supportsClientFingerprint && this.tls.utls != undefined },
@@ -382,7 +465,7 @@ export default {
           delete this.$props.outbound.tls.utls
           return
         }
-        this.$props.outbound.tls.utls = v ? defaultOutTls.utls : undefined
+        this.$props.outbound.tls.utls = v ? cloneTlsDefault(defaultOutTls.utls) : undefined
       }
     },
     optionReality: {
@@ -392,12 +475,18 @@ export default {
           delete this.$props.outbound.tls.reality
           return
         }
-        this.$props.outbound.tls.reality = v ? defaultOutTls.reality : undefined
+        this.$props.outbound.tls.reality = v ? cloneTlsDefault(defaultOutTls.reality) : undefined
       }
     },
     optionEch: {
-      get(): boolean { return this.tls.ech != undefined },
-      set(v:boolean) { this.$props.outbound.tls.ech = v ? defaultOutTls.ech : undefined }
+      get(): boolean { return this.supportsECH && this.tls.ech != undefined },
+      set(v:boolean) {
+        if (!this.supportsECH) {
+          delete this.$props.outbound.tls.ech
+          return
+        }
+        this.$props.outbound.tls.ech = v ? cloneTlsDefault(defaultOutTls.ech) : undefined
+      }
     },
     optionFragment: {
       get(): boolean { return this.tls.fragment != undefined },
@@ -412,8 +501,8 @@ export default {
       }
     },
     fragmentFallbackDelay: {
-      get(): number { return parseInt(this.tls.fragment_fallback_delay?.replace('ms','')?? '500')?? 500 },
-      set(v:number) { this.$props.outbound.tls.fragment_fallback_delay = v>0 ? `${v}ms` : undefined }
+      get(): number { return readSingboxDuration(this.tls.fragment_fallback_delay, 'ms') ?? 500 },
+      set(v:number) { this.$props.outbound.tls.fragment_fallback_delay = writeSingboxDuration(v, 'ms') }
     }
   }
 }

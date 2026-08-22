@@ -62,26 +62,31 @@ const routes = [
         path: '/rules',
         name: 'pages.rules',
         component: () => import('@/views/Rules.vue'),
+        meta: { skipGlobalDataPolling: true },
       },
       {
         path: '/tls',
         name: 'pages.tls',
         component: () => import('@/views/Tls.vue'),
+        meta: { skipGlobalDataPolling: true },
       },
       {
         path: '/basics',
         name: 'pages.basics',
         component: () => import('@/views/Basics.vue'),
+        meta: { skipGlobalDataPolling: true },
       },
       {
         path: '/dns',
         name: 'pages.dns',
         component: () => import('@/views/Dns.vue'),
+        meta: { skipGlobalDataPolling: true },
       },
       {
         path: '/admins',
         name: 'pages.admins',
         component: () => import('@/views/Admins.vue'),
+        meta: { skipGlobalDataPolling: true },
       },
       {
         path: '/mihomo_inbounds',
@@ -102,16 +107,19 @@ const routes = [
         path: '/mihomo_tls',
         name: 'mihomo_TLS 设置',
         component: () => import('@/views/MihomoTls.vue'),
+        meta: { skipGlobalDataPolling: true },
       },
       {
         path: '/mihomo_rules',
         name: 'mihomo_路由列表',
         component: () => import('@/views/MihomoRules.vue'),
+        meta: { skipGlobalDataPolling: true },
       },
       {
         path: '/mihomo_dns',
         name: 'mihomo_DNS',
         component: () => import('@/views/MihomoDns.vue'),
+        meta: { skipGlobalDataPolling: true },
       },
       {
         path: '/settings',
@@ -134,9 +142,14 @@ registerLoginNavigator(async () => {
   }
 })
 
-let intervalId: any
+let dataRefreshTimerId: number | undefined
+let dataRefreshGeneration = 0
 let dataPollingEnabled = false
 let globalDataRefreshPromise: Promise<void> | null = null
+let globalDataRefreshScopeKey = ''
+let globalDataRefreshRetryPending = false
+const defaultDataPollingRoutes = new Set(['/submanager', '/inbounds', '/clients', '/outbounds', '/services', '/endpoints', '/basics'])
+const mihomoDataPollingRoutes = new Set(['/mihomo_inbounds', '/mihomo_clients', '/mihomo_outbounds'])
 const sessionKeepaliveFallbackIntervalMs = 30_000
 const sessionKeepaliveMinIntervalMs = 15_000
 const sessionKeepaliveMaxIntervalMs = 60_000
@@ -147,21 +160,63 @@ let sessionDeadlineAt: number | null = null
 let sessionKeepaliveRedirecting = false
 
 const stopDataInterval = () => {
-  if (!intervalId) return
-  clearInterval(intervalId)
-  intervalId = undefined
+  dataRefreshGeneration += 1
+  if (dataRefreshTimerId == null) return
+  window.clearTimeout(dataRefreshTimerId)
+  dataRefreshTimerId = undefined
 }
 
+const dataPollingScopeForPath = (path: string) => {
+  return {
+    defaultChain: defaultDataPollingRoutes.has(path),
+    mihomo: mihomoDataPollingRoutes.has(path),
+  }
+}
+
+const currentDataPollingScope = () => dataPollingScopeForPath(router.currentRoute.value.path)
+
 const refreshGlobalData = async () => {
-  if (globalDataRefreshPromise) return globalDataRefreshPromise
+  const scope = currentDataPollingScope()
+  const scopeKey = (scope.defaultChain ? 'default' : '') + '|' + (scope.mihomo ? 'mihomo' : '')
+  if (globalDataRefreshPromise) {
+    if (globalDataRefreshScopeKey !== scopeKey) globalDataRefreshRetryPending = true
+    return globalDataRefreshPromise
+  }
 
   globalDataRefreshPromise = (async () => {
-    await Data().loadData()
-    await MihomoData().loadData()
+    if (scope.defaultChain) await Data().loadData()
+    if (scope.mihomo) await MihomoData().loadData()
   })().finally(() => {
+    const retry = globalDataRefreshRetryPending
     globalDataRefreshPromise = null
+    globalDataRefreshScopeKey = ''
+    globalDataRefreshRetryPending = false
+    if (retry && dataPollingEnabled && isPageVisible()) scheduleDataRefresh(0)
   })
+  globalDataRefreshScopeKey = scopeKey
   return globalDataRefreshPromise
+}
+
+const scheduleDataRefresh = (delayMs: number) => {
+  if (dataRefreshTimerId != null) return
+  const pageVisible = typeof document === 'undefined' || document.visibilityState === 'visible'
+  if (!dataPollingEnabled || !pageVisible) {
+    stopDataInterval()
+    return
+  }
+  const generation = dataRefreshGeneration
+  dataRefreshTimerId = window.setTimeout(async () => {
+    dataRefreshTimerId = undefined
+    if (generation !== dataRefreshGeneration || !dataPollingEnabled || !isPageVisible()) return
+    try {
+      await refreshGlobalData()
+    } catch {
+      // Keep the chained poll alive after a transient request failure. The
+      // stores retain their last successful data until the next pass.
+    } finally {
+      if (generation === dataRefreshGeneration) scheduleDataRefresh(30_000)
+    }
+  }, delayMs)
 }
 
 const syncDataInterval = () => {
@@ -170,11 +225,7 @@ const syncDataInterval = () => {
     stopDataInterval()
     return
   }
-  if (intervalId) return
-  void refreshGlobalData()
-  intervalId = setInterval(() => {
-    void refreshGlobalData()
-  }, 10000)
+  scheduleDataRefresh(0)
 }
 
 type SessionProbeState = 'authenticated' | 'unauthenticated' | 'unreachable'
@@ -372,7 +423,10 @@ router.beforeEach(async (to) => {
 
   if (requiresAuth && isAuthenticated) {
     await ensurePanelTimeContext()
+    const scope = dataPollingScopeForPath(to.path)
     dataPollingEnabled = !to.matched.some(record => record.meta.skipGlobalDataPolling)
+      && (scope.defaultChain || scope.mihomo)
+    stopDataInterval()
     syncDataInterval()
     startAuthenticatedPolling()
     updateSessionDeadline(session.deadlineAt)

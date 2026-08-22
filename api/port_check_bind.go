@@ -21,7 +21,7 @@ var (
 	udpRangesNoIndexKey   = regexp.MustCompile(`^udp_ranges\[\]\[(id|tag|range)\]$`)
 )
 
-const portCheckRequestMaxBytes int64 = 1024 * 1024
+const portCheckRequestMaxBytes int64 = 64 * 1024
 
 func bindPortCheckRequest(c *gin.Context) (service.PortCheckRequest, error) {
 	req := service.PortCheckRequest{}
@@ -57,7 +57,7 @@ func parsePortCheckRequestBody(body []byte) (service.PortCheckRequest, error) {
 	if jsonErr == nil {
 		req.SinglePorts = sanitizePortList(req.SinglePorts)
 		req.UDPRanges = sanitizeUDPRangeItems(req.UDPRanges)
-		return req, nil
+		return req, service.ValidatePortCheckRequest(req)
 	}
 
 	values, err := url.ParseQuery(raw)
@@ -68,7 +68,7 @@ func parsePortCheckRequestBody(body []byte) (service.PortCheckRequest, error) {
 	if !ok {
 		return req, fmt.Errorf("invalid port occupancy payload")
 	}
-	return decoded, nil
+	return decoded, service.ValidatePortCheckRequest(decoded)
 }
 
 func decodePortCheckRequestValues(values url.Values) (service.PortCheckRequest, bool) {

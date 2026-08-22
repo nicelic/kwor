@@ -211,26 +211,53 @@ func TestConvertToClashMeta_Hysteria2RangeHopIntervalFormatsRangeString(t *testi
 
 func TestConvertToClashMeta_HysteriaUsesNewQUICFields(t *testing.T) {
 	proxy := singleProxyFromOutbound(t, map[string]interface{}{
+		"type":                       "hysteria",
+		"tag":                        "hy1-new-quic",
+		"server":                     "example.com",
+		"server_port":                443,
+		"auth_str":                   "pwd",
+		"up_mbps":                    30,
+		"down_mbps":                  200,
+		"stream_receive_window":      38000000,
+		"connection_receive_window":  150000000,
+		"max_concurrent_streams":     1024,
+		"disable_path_mtu_discovery": true,
+	})
+
+	if got := asIntValue(t, proxy["recv-window-conn"]); got != 38000000 {
+		t.Fatalf("unexpected recv-window-conn: %v", got)
+	}
+	if got := asIntValue(t, proxy["recv-window"]); got != 150000000 {
+		t.Fatalf("unexpected recv-window: %v", got)
+	}
+	if got := asIntValue(t, proxy["max-concurrent-streams"]); got != 1024 {
+		t.Fatalf("unexpected max-concurrent-streams: %v", got)
+	}
+	if got, _ := proxy["disable-mtu-discovery"].(bool); !got {
+		t.Fatalf("expected disable-mtu-discovery=true, got %v", proxy["disable-mtu-discovery"])
+	}
+}
+
+func TestConvertToClashMeta_HysteriaPreservesLegacyQUICFields(t *testing.T) {
+	proxy := singleProxyFromOutbound(t, map[string]interface{}{
 		"type":                  "hysteria",
-		"tag":                   "hy1-new-quic",
+		"tag":                   "hy1-legacy-quic",
 		"server":                "example.com",
 		"server_port":           443,
 		"auth_str":              "pwd",
-		"up_mbps":               30,
-		"down_mbps":             200,
 		"recv_window_conn":      25000000,
 		"recv_window":           67108864,
 		"disable_mtu_discovery": true,
 	})
 
 	if got := asIntValue(t, proxy["recv-window-conn"]); got != 25000000 {
-		t.Fatalf("unexpected recv-window-conn: %v", got)
+		t.Fatalf("unexpected legacy recv-window-conn: %v", got)
 	}
 	if got := asIntValue(t, proxy["recv-window"]); got != 67108864 {
-		t.Fatalf("unexpected recv-window: %v", got)
+		t.Fatalf("unexpected legacy recv-window: %v", got)
 	}
 	if got, _ := proxy["disable-mtu-discovery"].(bool); !got {
-		t.Fatalf("expected disable-mtu-discovery=true, got %v", proxy["disable-mtu-discovery"])
+		t.Fatalf("expected legacy disable-mtu-discovery=true, got %v", proxy["disable-mtu-discovery"])
 	}
 }
 
@@ -394,7 +421,22 @@ func TestConvertToClashMeta_Hysteria2FastOpenDefaultsDisabled(t *testing.T) {
 	}
 }
 
-func TestConvertToClashMeta_AnyTLSIdleFieldsAndNoReality(t *testing.T) {
+func TestConvertToClashMeta_Hysteria2FastOpenEnabled(t *testing.T) {
+	proxy := singleProxyFromOutbound(t, map[string]interface{}{
+		"type":             "hysteria2",
+		"tag":              "hy2-fast-open-enabled",
+		"server":           "example.com",
+		"server_port":      443,
+		"password":         "pwd",
+		"mihomo_fast_open": true,
+	})
+
+	if got, _ := proxy["fast-open"].(bool); !got {
+		t.Fatalf("expected fast-open=true when mihomo_fast_open=true, got %v", proxy["fast-open"])
+	}
+}
+
+func TestConvertToClashMeta_AnyTLSIdleFieldsAndReality(t *testing.T) {
 	proxy := singleProxyFromOutbound(t, map[string]interface{}{
 		"type":                        "anytls",
 		"tag":                         "anytls-node",
@@ -428,8 +470,9 @@ func TestConvertToClashMeta_AnyTLSIdleFieldsAndNoReality(t *testing.T) {
 	if got, _ := proxy["sni"].(string); got != "anytls.example.com" {
 		t.Fatalf("unexpected sni: %v", proxy["sni"])
 	}
-	if _, exists := proxy["reality-opts"]; exists {
-		t.Fatalf("anytls should not emit reality-opts: %#v", proxy["reality-opts"])
+	realityOpts, exists := proxy["reality-opts"].(map[string]interface{})
+	if !exists || realityOpts["public-key"] != "should-not-export" || realityOpts["short-id"] != "abcd" {
+		t.Fatalf("expected anytls reality-opts: %#v", proxy["reality-opts"])
 	}
 }
 
@@ -1349,6 +1392,30 @@ func TestConvertToClashMeta_IncludeNamedSelectorGroups(t *testing.T) {
 	nodeSelectorEntries := asStringSliceValue(t, nodeSelectorGroup["proxies"])
 	requireEntry(nodeSelectorEntries, clashAutoSelectorTag)
 	requireEntry(nodeSelectorEntries, "node-1")
+}
+
+func TestMihomoClashIntegerConversionsRejectFractionalValues(t *testing.T) {
+	for _, raw := range []interface{}{float64(1200.5), float32(8.5), "1200.5", "1200x"} {
+		if value, ok := toInt(raw); ok {
+			t.Fatalf("toInt(%#v) accepted lossy value %d", raw, value)
+		}
+		if value, ok := durationToSeconds(raw); ok {
+			t.Fatalf("durationToSeconds(%#v) accepted lossy value %d", raw, value)
+		}
+		if value, ok := durationToMilliseconds(raw); ok {
+			t.Fatalf("durationToMilliseconds(%#v) accepted lossy value %d", raw, value)
+		}
+	}
+
+	if value, ok := toInt(float64(1200)); !ok || value != 1200 {
+		t.Fatalf("integral float conversion = (%d, %v), want (1200, true)", value, ok)
+	}
+	if value, ok := durationToSeconds("30s"); !ok || value != 30 {
+		t.Fatalf("second duration conversion = (%d, %v), want (30, true)", value, ok)
+	}
+	if value, ok := durationToMilliseconds("150ms"); !ok || value != 150 {
+		t.Fatalf("millisecond duration conversion = (%d, %v), want (150, true)", value, ok)
+	}
 }
 
 func TestConvertToClashMeta_SkipsUnsupportedRuntimeOutboundTypes(t *testing.T) {

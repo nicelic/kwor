@@ -15,7 +15,7 @@
     </v-row>
     <Http v-if="Transport.type == trspTypes.HTTP" :transport="Transport" :namespace="namespace" />
     <H2 v-if="Transport.type == trspTypes.H2" :transport="Transport" />
-    <WebSocket v-if="Transport.type == trspTypes.WebSocket" :transport="Transport" :namespace="namespace" />
+    <WebSocket v-if="Transport.type == trspTypes.WebSocket" :transport="Transport" :namespace="namespace" :scope="scope" />
     <GRPC v-if="Transport.type == trspTypes.gRPC" :transport="Transport" :namespace="namespace" />
     <HttpUpgrade v-if="Transport.type == trspTypes.HTTPUpgrade" :transport="Transport" />
     <XHTTP v-if="Transport.type == trspTypes.XHTTP" :transport="Transport" />
@@ -43,6 +43,10 @@ export default {
       type: String,
       default: 'default',
     },
+    scope: {
+      type: String,
+      default: 'outbound',
+    },
   },
   data() {
     return {
@@ -65,6 +69,9 @@ export default {
   computed: {
     isMihomo(): boolean {
       return this.$props.namespace === 'mihomo'
+    },
+    isMihomoInbound(): boolean {
+      return this.isMihomo && this.$props.scope === 'inbound'
     },
     supportsXHTTP(): boolean {
       const proto = typeof this.$props.data?.type === 'string'
@@ -95,12 +102,18 @@ export default {
       }
       return this.availableTransportTypes[0]
     },
-    Transport() {
-      return <Transport>this.$props.data.transport
+    Transport(): Transport {
+      const transport = this.$props.data.transport
+      return transport && typeof transport === 'object' && !Array.isArray(transport)
+        ? <Transport>transport
+        : <Transport>{}
     },
     tpEnable: {
-      get() { return Object.hasOwn(this.$props.data.transport, 'type') },
-      set(newValue: boolean) { this.$props.data.transport = newValue ? { type: this.defaultTransportType } : {} }
+      get() { return Object.hasOwn(this.Transport, 'type') },
+      set(newValue: boolean) {
+        if (newValue) this.$props.data.transport = { type: this.defaultTransportType }
+        else delete this.$props.data.transport
+      }
     },
     transportType: {
       get() { return this.Transport.type },
@@ -177,23 +190,55 @@ export default {
         return
       }
 
+      if (rawType === TrspTypes.WebSocket) {
+        const legacyHost = typeof transport.host === 'string'
+          ? transport.host.trim()
+          : Array.isArray(transport.host)
+            ? transport.host.find((value): value is string => typeof value === 'string' && value.trim().length > 0)?.trim() ?? ''
+            : ''
+        const headersRaw = transport.headers
+        const headers: HeaderMap = (headersRaw && typeof headersRaw === 'object' && !Array.isArray(headersRaw))
+          ? { ...(headersRaw as HeaderMap) }
+          : {}
+        const existingHostKey = Object.keys(headers).find((key) => key.toLowerCase() === 'host')
+        if (!existingHostKey && legacyHost.length > 0) {
+          headers.Host = legacyHost
+        } else if (existingHostKey && existingHostKey !== 'Host') {
+          headers.Host = headers[existingHostKey]
+          delete headers[existingHostKey]
+        }
+        if (Object.keys(headers).length > 0) transport.headers = headers
+        else delete transport.headers
+        delete transport.host
+      }
+
       if (rawType === TrspTypes.H2) {
         const hostValues = this.normalizeHeaderValues((transport.headers as HeaderMap | undefined)?.Host)
         if ((!Array.isArray(transport.host) || transport.host.length === 0) && hostValues.length > 0) {
           transport.host = hostValues
         }
       }
+
+      if (this.isMihomoInbound) {
+        delete transport.v2ray_http_upgrade
+        delete transport.v2ray_http_upgrade_fast_open
+      }
     },
     ensureAllowedTransportType() {
       const transport = this.$props.data.transport as Record<string, unknown>
       if (!transport || typeof transport !== 'object') return
 
-      const currentType = typeof transport.type === 'string' ? transport.type : ''
-      if (!currentType) return
+      const currentType = typeof transport.type === 'string' ? transport.type.trim().toLowerCase() : ''
+      if (!currentType) {
+        delete this.$props.data.transport
+        return
+      }
 
       if (!this.availableTransportTypes.includes(currentType)) {
         this.$props.data.transport = { type: this.defaultTransportType }
+        return
       }
+      transport.type = currentType
     },
     sanitizeTransportState() {
       this.sanitizeMihomoTransportCompatibility()
@@ -205,6 +250,9 @@ export default {
   },
   watch: {
     namespace() {
+      this.sanitizeTransportState()
+    },
+    scope() {
       this.sanitizeTransportState()
     },
     data: {

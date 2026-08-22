@@ -156,8 +156,9 @@ func TestMihomoClientRateLimitCollectDesiredPortLimits(t *testing.T) {
 	}, nil)
 	createMihomoInbound(t, db, 2, "mieru-b", map[string]interface{}{
 		"listen_port": 33000,
-		"port_range":  "33010-33011",
-	}, nil)
+	}, map[string]interface{}{
+		"port_range": "33010:33011",
+	})
 
 	mustCreateMihomoClient(t, db, model.MihomoClient{
 		Enable:         true,

@@ -26,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	compressionalgorithm "github.com/alireza0/s-ui/compression/Compression-algorithm"
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/logger"
@@ -443,13 +444,14 @@ func normalizeReverseProxyEDNSCustomIPv4(raw string) (string, bool) {
 }
 
 type reverseProxyRuntimeState struct {
-	lastSyncAt            time.Time
-	lastRenderKey         string
-	warnings              []string
-	revision              uint64
-	certificateGeneration uint64
-	nextRetryAt           time.Time
-	retryDelay            time.Duration
+	lastSyncAt                  time.Time
+	lastCertificateBalancePrune time.Time
+	lastRenderKey               string
+	warnings                    []string
+	revision                    uint64
+	certificateGeneration       uint64
+	nextRetryAt                 time.Time
+	retryDelay                  time.Duration
 }
 
 type reverseProxyRuleRuntimeState struct {
@@ -583,6 +585,9 @@ type reverseProxyListenerGroup struct {
 	protocol                   string
 	socketKind                 string
 	listenHTTPVersionStrategy  string
+	h3ListenerAvailable        bool
+	h3AvailabilityKnown        bool
+	h3ServingCount             int
 	server                     *http.Server
 	listener                   net.Listener
 	h3Server                   *http3.Server
@@ -592,6 +597,7 @@ type reverseProxyListenerGroup struct {
 	h3Servers                  []*http3.Server
 	packetConns                []net.PacketConn
 	rules                      []*model.ReverseProxyRule
+	ruleMatchData              map[uint]reverseProxyRuleMatchData
 	service                    *ReverseProxyService
 	certBindingsByRule         map[uint][]*reverseProxyRuleCertificateBinding
 	orderedCertBindings        []*reverseProxyRuleCertificateBinding
@@ -617,6 +623,13 @@ type reverseProxyListenerGroup struct {
 	requestLimiters            map[uint]*reverseProxyAdjustableLimiter
 	upstreamLimiters           map[uint]*reverseProxyAdjustableLimiter
 	nextConnID                 uint64
+}
+
+type reverseProxyRuleMatchData struct {
+	serverNames []string
+	listenAlias string
+	pathPrefix  string
+	dnsPath     string
 }
 
 type reverseProxyCertificateHint struct {
@@ -875,6 +888,9 @@ func noteReverseProxyCertificateInventoryChanged() uint64 {
 	reverseProxyRuntime.overviewMu.Lock()
 	reverseProxyRuntime.configuration = nil
 	reverseProxyRuntime.overviewMu.Unlock()
+	// Certificate changes are already committed before this notification. Wake
+	// the independent monitor so listener bindings do not wait for its 30s tick.
+	WakeReverseProxyRuntime()
 	return generation
 }
 
@@ -890,6 +906,10 @@ func (r *reverseProxyRuntimeManager) reportRuleState(ruleID uint, status string,
 	r.ruleStateMu.Lock()
 	if r.ruleStates == nil {
 		r.ruleStates = make(map[uint]reverseProxyRuleRuntimeState)
+	}
+	if current, exists := r.ruleStates[ruleID]; exists && current.status == status && current.lastError == lastError {
+		r.ruleStateMu.Unlock()
+		return
 	}
 	r.ruleStates[ruleID] = reverseProxyRuleRuntimeState{status: status, lastError: lastError, updatedAt: time.Now()}
 	r.ruleStateMu.Unlock()
@@ -1032,7 +1052,8 @@ func (s *ReverseProxyService) GetOverview() (*ReverseProxyOverview, error) {
 }
 
 // GetRuntimeOverview never reads rules, certificate material, or the complete
-// SQLite configuration.  It is the endpoint used by the four-second UI poll.
+// SQLite configuration. It is the endpoint used by the successful 10-second
+// UI runtime poll.
 func (s *ReverseProxyService) GetRuntimeOverview() (*ReverseProxyRuntimeOverview, error) {
 	revision := uint64(0)
 	reverseProxyRuntime.overviewMu.RLock()
@@ -1750,11 +1771,12 @@ func (s *ReverseProxyService) SyncIfNeeded(minGap time.Duration) (syncErr error)
 	if err := reverseProxyRuntime.SyncIfNeeded(s, minGap); err != nil {
 		return err
 	}
+	revision := reverseProxyRuntime.currentRevision()
+	now := time.Now()
+	if reverseProxyRuntime.maintainCertificateBalance(now) {
+		reverseProxyDNSRuntime.pruneAdmissionClients(now)
+	}
 	if minGap > 0 {
-		revision, err := s.peekReverseProxyRevision()
-		if err != nil {
-			return err
-		}
 		if !reverseProxyDNSRuntime.needsSync(revision, time.Now()) {
 			return nil
 		}
@@ -1767,7 +1789,7 @@ func (s *ReverseProxyService) SyncIfNeeded(minGap time.Duration) (syncErr error)
 			return err
 		}
 	}
-	return syncReverseProxyDNSRuntime(s, loaded.Rules)
+	return syncReverseProxyDNSRuntimeAtRevision(s, loaded.Rules, revision)
 }
 
 func (s *ReverseProxyService) refreshReverseProxyConfigurationSnapshotIfStale() error {
@@ -1797,6 +1819,10 @@ func (s *ReverseProxyService) refreshReverseProxyConfigurationSnapshotIfStale() 
 }
 
 func (s *ReverseProxyService) StartRuntime() error {
+	defer func() {
+		reverseProxyRuntimeMonitor.AllowAfterDatabaseRestore()
+		reverseProxyRuntimeMonitor.Start(s)
+	}()
 	if err := s.CertificateInventoryService.BackfillIssuedAlgorithms(100); err != nil {
 		return err
 	}
@@ -1814,13 +1840,17 @@ func (s *ReverseProxyService) StartRuntime() error {
 			return err
 		}
 	}
-	if err := syncReverseProxyDNSRuntime(s, loaded.Rules); err != nil {
+	if err := syncReverseProxyDNSRuntimeAtRevision(s, loaded.Rules, loaded.Settings.Revision); err != nil {
 		return err
 	}
-	return s.publishReverseProxyConfigurationSnapshot(&loaded.Settings, loaded.Rules)
+	if err := s.publishReverseProxyConfigurationSnapshot(&loaded.Settings, loaded.Rules); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *ReverseProxyService) StopRuntime() error {
+	reverseProxyRuntimeMonitor.StopAndWait()
 	httpErr := reverseProxyRuntime.Stop()
 	dnsErr := stopReverseProxyDNSRuntime()
 	reverseProxyRuntime.resetRuleStates()
@@ -1843,7 +1873,7 @@ func (s *ReverseProxyService) syncAllRuntimeNow() error {
 			return errors.Join(httpErr, loadErr)
 		}
 	}
-	dnsErr := syncReverseProxyDNSRuntime(s, loaded.Rules)
+	dnsErr := syncReverseProxyDNSRuntimeAtRevision(s, loaded.Rules, loaded.Settings.Revision)
 	var retryHTTPErr error
 	// HTTP reconciliation runs first so HTTP -> DNS changes can release their
 	// TCP socket before DNS binds it. The inverse transition releases the old
@@ -2420,6 +2450,11 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		return reverseProxyNormalizedRule{}, err
 	}
 	normalized.httpVersionStrategy = httpVersionStrategy
+	if normalized.listenProtocol == reverseProxyProtocolHTTPS &&
+		!reverseProxyIsWebSocketAlias(normalized.listenProtocolAlias) &&
+		reverseProxyIsWebSocketAlias(normalized.targetProtocolAlias) {
+		return reverseProxyNormalizedRule{}, common.NewError("strict HTTPS H2/H3 listener cannot proxy a websocket target; use WSS or HTTP listener")
+	}
 	normalized.upstreamTLSVerify = reverseProxyPayloadTLSVerify(payload.UpstreamTLSVerify, payload.upstreamTLSVerifyDecoded, payload.upstreamTLSVerifySet, normalized.targetProtocol == reverseProxyProtocolHTTPS)
 
 	if normalized.listenProtocol == reverseProxyProtocolHTTPS {
@@ -2502,7 +2537,16 @@ func (s *ReverseProxyService) validateNormalizedRule(db *gorm.DB, row reversePro
 	}
 
 	rows := make([]model.ReverseProxyRule, 0)
-	if err := db.Where("id <> ?", row.id).Find(&rows).Error; err != nil {
+	if err := db.Select(
+		"id",
+		"listen_port",
+		"listen_protocol",
+		"listen_protocol_alias",
+		"listen_http_version_strategy",
+		"host_list",
+		"path_prefix",
+		"listen_dns_path",
+	).Where("id <> ?", row.id).Find(&rows).Error; err != nil {
 		return err
 	}
 	for _, existing := range rows {
@@ -2528,7 +2572,6 @@ func (s *ReverseProxyService) validateNormalizedRule(db *gorm.DB, row reversePro
 		}
 		if existing.ListenProtocol != row.listenProtocol {
 			return common.NewError("reverse proxy listener conflicts with existing reverse proxy listener on the same port")
-			continue
 		}
 		if !reverseProxyExistingNormalizedHTTPConditionsOverlap(&existing, row) {
 			continue
@@ -2620,16 +2663,31 @@ func validateReverseProxyCertificateReferences(db *gorm.DB, certificateIDs []uin
 	if db == nil {
 		return common.NewError("database is not ready")
 	}
+	requested := make(map[uint]struct{}, len(certificateIDs))
 	for _, certificateID := range certificateIDs {
 		if certificateID == 0 {
 			return common.NewError("certificate id is required")
 		}
-		row := &model.CertificateRecord{}
-		if err := db.Select("id").Where("id = ?", certificateID).First(row).Error; err != nil {
-			if database.IsNotFound(err) {
-				return common.NewError("certificate not found")
-			}
-			return err
+		requested[certificateID] = struct{}{}
+	}
+	ids := make([]uint, 0, len(requested))
+	for certificateID := range requested {
+		ids = append(ids, certificateID)
+	}
+	type certificateIDRow struct {
+		ID uint `gorm:"column:id"`
+	}
+	rows := make([]certificateIDRow, 0, len(ids))
+	if err := db.Model(&model.CertificateRecord{}).Select("id").Where("id IN ?", ids).Find(&rows).Error; err != nil {
+		return err
+	}
+	found := make(map[uint]struct{}, len(rows))
+	for _, row := range rows {
+		found[row.ID] = struct{}{}
+	}
+	for certificateID := range requested {
+		if _, exists := found[certificateID]; !exists {
+			return common.NewError("certificate not found")
 		}
 	}
 	return nil
@@ -2716,7 +2774,16 @@ func (s *ReverseProxyService) validateNormalizedDNSRuleMetadata(db *gorm.DB, row
 	}
 
 	rows := make([]model.ReverseProxyRule, 0)
-	if err := db.Where("id <> ?", row.id).Find(&rows).Error; err != nil {
+	if err := db.Select(
+		"id",
+		"listen_port",
+		"listen_protocol",
+		"listen_protocol_alias",
+		"listen_http_version_strategy",
+		"host_list",
+		"path_prefix",
+		"listen_dns_path",
+	).Where("id <> ?", row.id).Find(&rows).Error; err != nil {
 		return err
 	}
 	for _, existing := range rows {
@@ -2979,8 +3046,11 @@ func repairReverseProxyRowsTx(db *gorm.DB, rows []model.ReverseProxyRule) error 
 }
 
 func (s *ReverseProxyService) allocateNextDisplayIDTx(db *gorm.DB) (uint64, error) {
-	rows := make([]model.ReverseProxyRule, 0)
-	if err := db.Where("display_id > 0").Order("display_id asc").Find(&rows).Error; err != nil {
+	type displayIDRow struct {
+		DisplayID uint64 `gorm:"column:display_id"`
+	}
+	rows := make([]displayIDRow, 0)
+	if err := db.Model(&model.ReverseProxyRule{}).Select("display_id").Where("display_id > 0").Order("display_id asc").Find(&rows).Error; err != nil {
 		return 0, err
 	}
 	used := make(map[uint64]struct{}, len(rows))
@@ -3243,6 +3313,47 @@ func reverseProxyHTTPListenerUsesSockets(protocol string, listenStrategy string)
 		}
 	}
 	return true, false
+}
+
+// reverseProxyHTTPSListenerNextProtos describes the protocols that the TCP
+// side of a TLS listener may negotiate.  HTTP/1.1 is deliberately limited to
+// WSS routes because ordinary HTTPS, H2-only, and H2+H3 routes must not expose
+// an HTTP/1.1 service on the secure listener.
+func reverseProxyHTTPSListenerNextProtos(rules []*model.ReverseProxyRule) []string {
+	hasWebSocket := false
+	hasHTTP2 := false
+	for _, rule := range rules {
+		if rule == nil {
+			continue
+		}
+		alias := normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
+		if reverseProxyIsWebSocketAlias(alias) {
+			hasWebSocket = true
+			continue
+		}
+		hasHTTP2 = true
+	}
+	if !hasHTTP2 && hasWebSocket {
+		return []string{"http/1.1"}
+	}
+	if hasWebSocket {
+		return []string{"h2", "http/1.1"}
+	}
+	return []string{"h2"}
+}
+
+// reverseProxyRequireHTTP2ALPN rejects TLS clients that do not offer H2.  A
+// TLS client without ALPN can otherwise be accepted by net/http and handled
+// as HTTP/1.1 even when NextProtos contains only "h2".
+func reverseProxyRequireHTTP2ALPN(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+	if hello != nil {
+		for _, protocol := range hello.SupportedProtos {
+			if protocol == "h2" {
+				return nil, nil
+			}
+		}
+	}
+	return nil, errors.New("reverse proxy HTTPS listener requires ALPN h2")
 }
 
 const (
@@ -3889,6 +4000,40 @@ func (r *reverseProxyRuntimeManager) SyncIfNeeded(service *ReverseProxyService, 
 	return r.reconcileLocked(service, minGap, false)
 }
 
+func (r *reverseProxyRuntimeManager) currentRevision() uint64 {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	revision := r.state.revision
+	r.mu.Unlock()
+	return revision
+}
+
+func (r *reverseProxyRuntimeManager) maintainCertificateBalance(now time.Time) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	if !r.state.lastCertificateBalancePrune.IsZero() && now.Sub(r.state.lastCertificateBalancePrune) < reverseProxyCertBalanceCleanupGap {
+		r.mu.Unlock()
+		return false
+	}
+	groups := make([]*reverseProxyListenerGroup, 0, len(r.groups))
+	for _, group := range r.groups {
+		if group != nil {
+			groups = append(groups, group)
+		}
+	}
+	r.state.lastCertificateBalancePrune = now
+	r.mu.Unlock()
+	for _, group := range groups {
+		group.pruneCertificateBalanceStates(now)
+		group.pruneExpiredCachedUpstreams(now)
+	}
+	return true
+}
+
 func (r *reverseProxyRuntimeManager) SyncNow(service *ReverseProxyService) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -3913,6 +4058,7 @@ func (r *reverseProxyRuntimeManager) Stop() error {
 	r.resetMismatchTable()
 	r.state.lastRenderKey = ""
 	r.state.lastSyncAt = time.Now()
+	r.state.lastCertificateBalancePrune = time.Time{}
 	r.state.warnings = nil
 	r.state.revision = 0
 	r.state.certificateGeneration = 0
@@ -3985,7 +4131,8 @@ func (r *reverseProxyRuntimeManager) reconcileLocked(service *ReverseProxyServic
 		}
 	}
 	configurationChanged := renderKey != r.state.lastRenderKey
-	if !configurationChanged && !resourcesChanged {
+	http3HealthNeedsReconcile := reverseProxyHTTP3HealthNeedsReconcile(r.groups)
+	if !configurationChanged && !resourcesChanged && !http3HealthNeedsReconcile {
 		r.state.lastSyncAt = now
 		if settings != nil {
 			r.state.revision = settings.Revision
@@ -4178,6 +4325,7 @@ func (r *reverseProxyRuntimeManager) reconcileLocked(service *ReverseProxyServic
 		warnings = append(warnings, group.warnings...)
 	}
 	r.groups = nextGroups
+	refreshReverseProxyHTTP3AvailabilityLocked(r.groups)
 	if len(failedGroups) == 0 {
 		r.state.lastRenderKey = renderKey
 		r.state.nextRetryAt = time.Time{}
@@ -4425,6 +4573,70 @@ func reverseProxyListenerGroupKey(row *model.ReverseProxyRule, socketKind string
 	return reverseProxyListenerKey(reverseProxyListenerGroupProtocol(row), row.ListenPort, socketKind, listenIPs)
 }
 
+func reverseProxyHTTP3ListenerGroupKey(protocol string, port int, listenIPs []string) string {
+	return reverseProxyListenerKey(protocol, port, reverseProxySocketKindUDP, strings.Join(listenIPs, ","))
+}
+
+func reverseProxyListenerGroupIsHTTP3(group *reverseProxyListenerGroup) bool {
+	if group == nil {
+		return false
+	}
+	group.mu.RLock()
+	defer group.mu.RUnlock()
+	return strings.EqualFold(group.protocol, reverseProxyProtocolHTTPS) && group.socketKind == reverseProxySocketKindUDP
+}
+
+// refreshReverseProxyHTTP3AvailabilityLocked links the TCP H2 listener to the
+// matching UDP H3 listener. H2 and H3 are separate listener groups, so the
+// presence of an H2 group alone must never be enough to advertise Alt-Svc.
+// The caller holds reverseProxyRuntime.mu.
+func refreshReverseProxyHTTP3AvailabilityLocked(groups map[string]*reverseProxyListenerGroup) {
+	for _, tcpGroup := range groups {
+		if tcpGroup == nil {
+			continue
+		}
+		tcpGroup.mu.RLock()
+		protocol := tcpGroup.protocol
+		socketKind := tcpGroup.socketKind
+		strategy := tcpGroup.listenHTTPVersionStrategy
+		port := tcpGroup.listenPort
+		listenIPs := append([]string(nil), tcpGroup.listenIPs...)
+		tcpGroup.mu.RUnlock()
+		if !strings.EqualFold(protocol, reverseProxyProtocolHTTPS) ||
+			socketKind != reverseProxySocketKindTCP ||
+			strategy != reverseProxyListenHTTPVersionH2H3 {
+			continue
+		}
+
+		available := false
+		udpGroup := groups[reverseProxyHTTP3ListenerGroupKey(protocol, port, listenIPs)]
+		if udpGroup != nil {
+			udpGroup.mu.RLock()
+			available = !udpGroup.closed && udpGroup.h3AvailabilityKnown && udpGroup.h3ListenerAvailable && len(udpGroup.packetConns) > 0
+			udpGroup.mu.RUnlock()
+		}
+		tcpGroup.mu.Lock()
+		tcpGroup.h3AvailabilityKnown = true
+		tcpGroup.h3ListenerAvailable = available
+		tcpGroup.mu.Unlock()
+	}
+}
+
+func reverseProxyHTTP3HealthNeedsReconcile(groups map[string]*reverseProxyListenerGroup) bool {
+	for _, group := range groups {
+		if group == nil || !reverseProxyListenerGroupIsHTTP3(group) {
+			continue
+		}
+		group.mu.RLock()
+		unhealthy := !group.closed && group.h3AvailabilityKnown && !group.h3ListenerAvailable
+		group.mu.RUnlock()
+		if unhealthy {
+			return true
+		}
+	}
+	return false
+}
+
 func reverseProxyListenerSocketKindFromKey(key string) string {
 	parts := strings.SplitN(strings.TrimSpace(key), "|", 4)
 	if len(parts) >= 3 && (parts[2] == reverseProxySocketKindTCP || parts[2] == reverseProxySocketKindUDP) {
@@ -4468,6 +4680,7 @@ func reverseProxyListenerGroupNeedsRestart(group *reverseProxyListenerGroup, rul
 		group.listenPort != first.ListenPort ||
 		!strings.EqualFold(group.protocol, desiredProtocol) ||
 		!reverseProxyListenIPSetsEqual(group.listenIPs, desiredIPs) ||
+		(group.socketKind == reverseProxySocketKindUDP && group.h3AvailabilityKnown && !group.h3ListenerAvailable) ||
 		reverseProxyListenerGroupStaticResourceRestartRequired(group.protocol, group.socketKind, group.resources, reverseProxyResources.current())
 }
 
@@ -4485,7 +4698,8 @@ func reverseProxyListenerGroupRestartNeedsClosingExisting(group *reverseProxyLis
 		!reverseProxyListenIPSetsEqual(group.listenIPs, desiredIPs) {
 		return false
 	}
-	return reverseProxyListenerGroupStaticResourceRestartRequired(group.protocol, group.socketKind, group.resources, reverseProxyResources.current())
+	return (group.socketKind == reverseProxySocketKindUDP && group.h3AvailabilityKnown && !group.h3ListenerAvailable) ||
+		reverseProxyListenerGroupStaticResourceRestartRequired(group.protocol, group.socketKind, group.resources, reverseProxyResources.current())
 }
 
 func reverseProxyListenerGroupStaticResourceRestartRequired(protocol string, socketKind string, previous ReverseProxyResourceSettings, current ReverseProxyResourceSettings) bool {
@@ -4899,6 +5113,7 @@ func (s *ReverseProxyService) newListenerGroup(key string, rules []*model.Revers
 		return &reverseProxyListenerGroup{
 			key:                 key,
 			service:             s,
+			ruleMatchData:       make(map[uint]reverseProxyRuleMatchData),
 			upstreamByRule:      make(map[uint]*reverseProxyCachedUpstream),
 			connectionCounts:    make(map[uint]reverseProxyConnectionCounts),
 			localConnIDs:        make(map[net.Conn]string),
@@ -4929,7 +5144,9 @@ func (s *ReverseProxyService) newListenerGroup(key string, rules []*model.Revers
 		listenPort:          first.ListenPort,
 		protocol:            reverseProxyListenerGroupProtocol(first),
 		socketKind:          socketKind,
+		h3AvailabilityKnown: socketKind == reverseProxySocketKindUDP && strings.EqualFold(reverseProxyListenerGroupProtocol(first), reverseProxyProtocolHTTPS),
 		rules:               rules,
+		ruleMatchData:       buildReverseProxyRuleMatchData(rules),
 		service:             s,
 		certBindingsByRule:  make(map[uint][]*reverseProxyRuleCertificateBinding),
 		orderedCertBindings: make([]*reverseProxyRuleCertificateBinding, 0),
@@ -4971,6 +5188,12 @@ func (s *ReverseProxyService) newListenerGroup(key string, rules []*model.Revers
 	group.listenHTTPVersionStrategy = reverseProxyGroupListenHTTPVersionStrategy(group.protocol, socketKind, rules)
 	enableTCP := socketKind == reverseProxySocketKindTCP
 	enableUDP := socketKind == reverseProxySocketKindUDP
+	if enableTCP && group.protocol == reverseProxyProtocolHTTPS && group.listenHTTPVersionStrategy == reverseProxyListenHTTPVersionH2H3 {
+		// Keep advertising disabled until reconciliation links this TCP group to
+		// a real UDP/H3 group. This closes the short startup window where the H2
+		// server can accept requests before the paired UDP group is registered.
+		group.h3AvailabilityKnown = true
+	}
 	group.configureRuleLimitersLocked(rules, resources)
 
 	handler := group.newHandler()
@@ -5014,10 +5237,24 @@ func (s *ReverseProxyService) newListenerGroup(key string, rules []*model.Revers
 				},
 			}
 			if group.protocol == reverseProxyProtocolHTTPS {
+				nextProtos := reverseProxyHTTPSListenerNextProtos(rules)
 				tlsConfig := &tls.Config{
 					GetCertificate: group.getCertificate,
 					MinVersion:     tls.VersionTLS12,
-					NextProtos:     []string{"h2", "http/1.1"},
+					NextProtos:     nextProtos,
+				}
+				requiresHTTP2 := false
+				for _, protocol := range nextProtos {
+					if protocol == "h2" {
+						requiresHTTP2 = true
+					}
+					if protocol == "http/1.1" {
+						requiresHTTP2 = false
+						break
+					}
+				}
+				if requiresHTTP2 {
+					tlsConfig.GetConfigForClient = reverseProxyRequireHTTP2ALPN
 				}
 				if err := http2.ConfigureServer(server, &http2.Server{MaxConcurrentStreams: resources.HTTP2MaxConcurrentStreams}); err != nil {
 					_ = listener.Close()
@@ -5076,10 +5313,14 @@ func (s *ReverseProxyService) newListenerGroup(key string, rules []*model.Revers
 			}
 			group.packetConns = append(group.packetConns, packetConn)
 			group.h3Servers = append(group.h3Servers, h3Server)
+			group.h3ServingCount++
+			group.h3ListenerAvailable = true
 			go func(srv *http3.Server, conn net.PacketConn) {
-				if serveErr := srv.Serve(conn); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+				serveErr := srv.Serve(conn)
+				if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 					logger.Warning("reverse proxy http3 server serve failed: ", serveErr)
 				}
+				group.noteHTTP3ServerStopped()
 			}(h3Server, packetConn)
 		}
 	}
@@ -5157,22 +5398,46 @@ func reverseProxyListenBindsForNetwork(protocol string, port int, listenIPs []st
 }
 
 func reverseProxyAltSvcValue(port int) string {
+	if port <= 0 || port > 65535 {
+		port = 443
+	}
 	return fmt.Sprintf(`h3=":%d"; ma=%d`, port, reverseProxyAltSvcMaxAgeSeconds)
 }
 
-func (g *reverseProxyListenerGroup) http3AdvertisementHeader(host string, sni string, protoMajor int) string {
-	if g == nil || !strings.EqualFold(strings.TrimSpace(g.protocol), reverseProxyProtocolHTTPS) {
+func reverseProxyHTTP3ExternalPort(rawHost string) int {
+	rawHost = strings.TrimSpace(rawHost)
+	if rawHost != "" {
+		if _, portText, err := net.SplitHostPort(rawHost); err == nil {
+			if port, parseErr := strconv.Atoi(strings.TrimSpace(portText)); parseErr == nil && port > 0 && port <= 65535 {
+				return port
+			}
+		}
+	}
+	return 443
+}
+
+func (g *reverseProxyListenerGroup) http3AdvertisementHeader(host string, sni string, protoMajor int, externalPort int) string {
+	if g == nil {
 		return ""
 	}
-	strategy, err := normalizeReverseProxyListenHTTPVersionStrategy(g.listenHTTPVersionStrategy, g.protocol)
+	g.mu.RLock()
+	protocol := g.protocol
+	strategy, err := normalizeReverseProxyListenHTTPVersionStrategy(g.listenHTTPVersionStrategy, protocol)
 	if err != nil || strategy == reverseProxyListenHTTPVersionH3Only {
+		g.mu.RUnlock()
+		return ""
+	}
+	if !strings.EqualFold(strings.TrimSpace(protocol), reverseProxyProtocolHTTPS) {
+		g.mu.RUnlock()
 		return ""
 	}
 
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	requireSNI := strings.EqualFold(g.protocol, reverseProxyProtocolHTTPS)
+	requireSNI := strings.EqualFold(protocol, reverseProxyProtocolHTTPS)
+	h3AvailabilityKnown := g.h3AvailabilityKnown
+	h3ListenerAvailable := g.h3ListenerAvailable
 	originMatched := false
+	webSocketMatched := false
+	advertiseHTTP3 := false
 	for _, rule := range g.rules {
 		matched, _ := g.ruleRequestNameMatchLocked(rule, host, sni, requireSNI)
 		if !matched {
@@ -5180,14 +5445,29 @@ func (g *reverseProxyListenerGroup) http3AdvertisementHeader(host string, sni st
 		}
 		originMatched = true
 		listenAlias := normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
-		if rule.AdvertiseHTTP3 && !reverseProxyIsWebSocketAlias(listenAlias) && strategy == reverseProxyListenHTTPVersionH2H3 {
-			if protoMajor < 3 {
-				return reverseProxyAltSvcValue(g.listenPort)
-			}
-			return ""
+		targetAlias := normalizeReverseProxyProtocolAlias(rule.TargetProtocolAlias, rule.TargetProtocol)
+		if reverseProxyIsWebSocketAlias(listenAlias) || reverseProxyIsWebSocketAlias(targetAlias) {
+			webSocketMatched = true
+			continue
+		}
+		if rule.AdvertiseHTTP3 && strategy == reverseProxyListenHTTPVersionH2H3 {
+			advertiseHTTP3 = true
 		}
 	}
+	g.mu.RUnlock()
 	if !originMatched {
+		return ""
+	}
+	if h3AvailabilityKnown && !h3ListenerAvailable {
+		return "clear"
+	}
+	if webSocketMatched {
+		return "clear"
+	}
+	if advertiseHTTP3 && protoMajor < 3 {
+		return reverseProxyAltSvcValue(externalPort)
+	}
+	if advertiseHTTP3 {
 		return ""
 	}
 	// Clear a cached alternative service even on an existing H3 connection.
@@ -5253,6 +5533,7 @@ func (s *ReverseProxyService) refreshListenerGroup(group *reverseProxyListenerGr
 	group.mu.Lock()
 	previousRules := append([]*model.ReverseProxyRule(nil), group.rules...)
 	group.rules = rules
+	group.ruleMatchData = buildReverseProxyRuleMatchData(rules)
 	if len(rules) > 0 {
 		group.listenIPs = reverseProxyHTTPRuntimeListenIPs(rules[0])
 		group.listenHTTPVersionStrategy = reverseProxyGroupListenHTTPVersionStrategy(group.protocol, group.socketKind, rules)
@@ -5308,6 +5589,28 @@ func (g *reverseProxyListenerGroup) acquireCachedUpstream(ruleID uint) *reverseP
 	upstream.refs++
 	g.mu.Unlock()
 	return upstream
+}
+
+// pruneExpiredCachedUpstreams gives idle transports a bounded lifetime even
+// when a rule receives no further requests. Request-time lookup still expires
+// entries promptly; this maintenance path releases abandoned idle pools.
+func (g *reverseProxyListenerGroup) pruneExpiredCachedUpstreams(now time.Time) {
+	if g == nil {
+		return
+	}
+	expired := make([]*reverseProxyCachedUpstream, 0)
+	g.mu.Lock()
+	for ruleID, upstream := range g.upstreamByRule {
+		if upstream == nil || upstream.ResolvedAt.IsZero() || now.Sub(upstream.ResolvedAt) < reverseProxyUpstreamResolveCacheTTL {
+			continue
+		}
+		delete(g.upstreamByRule, ruleID)
+		expired = append(expired, upstream)
+	}
+	g.mu.Unlock()
+	for _, upstream := range expired {
+		g.disposeCachedUpstream(upstream)
+	}
 }
 
 func (g *reverseProxyListenerGroup) storeCachedUpstream(ruleID uint, upstream *reverseProxyCachedUpstream) {
@@ -5939,6 +6242,7 @@ func (g *reverseProxyListenerGroup) newHandler() http.Handler {
 			return
 		}
 		host := reverseProxyNormalizeRequestHost(r.Host)
+		externalPort := reverseProxyHTTP3ExternalPort(r.Host)
 		path := normalizeReverseProxyPath(r.URL.Path, true)
 		sni := ""
 		if r.TLS != nil {
@@ -5956,7 +6260,7 @@ func (g *reverseProxyListenerGroup) newHandler() http.Handler {
 				}
 				status = http.StatusMisdirectedRequest
 			} else if nameMatched {
-				if altSvc := g.http3AdvertisementHeader(host, sni, r.ProtoMajor); altSvc != "" {
+				if altSvc := g.http3AdvertisementHeader(host, sni, r.ProtoMajor, externalPort); altSvc != "" {
 					w.Header().Set("Alt-Svc", altSvc)
 				}
 			}
@@ -5969,12 +6273,22 @@ func (g *reverseProxyListenerGroup) newHandler() http.Handler {
 		}
 		listenAlias := normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
 		targetAlias := normalizeReverseProxyProtocolAlias(rule.TargetProtocolAlias, rule.TargetProtocol)
+		g.mu.RLock()
+		strictHTTPS2 := strings.EqualFold(g.protocol, reverseProxyProtocolHTTPS) && g.socketKind == reverseProxySocketKindTCP
+		g.mu.RUnlock()
+		if strictHTTPS2 && !reverseProxyIsWebSocketAlias(listenAlias) && r.ProtoMajor != 2 {
+			http.Error(w, http.StatusText(http.StatusHTTPVersionNotSupported), http.StatusHTTPVersionNotSupported)
+			return
+		}
+		altSvc := g.http3AdvertisementHeader(host, sni, r.ProtoMajor, externalPort)
 		if (reverseProxyIsWebSocketAlias(listenAlias) || reverseProxyIsWebSocketAlias(targetAlias)) && !reverseProxyIsWebSocketUpgradeRequest(r) {
+			if altSvc != "" {
+				w.Header().Set("Alt-Svc", altSvc)
+			}
 			w.Header().Set("Upgrade", "websocket")
 			http.Error(w, http.StatusText(http.StatusUpgradeRequired), http.StatusUpgradeRequired)
 			return
 		}
-		altSvc := g.http3AdvertisementHeader(host, sni, r.ProtoMajor)
 		if connID := g.connectionIDFromContext(r.Context()); connID != "" {
 			if !g.registerLocalConnectionRule(rule.Id, connID) {
 				w.Header().Set("Retry-After", "1")
@@ -6051,7 +6365,7 @@ func (g *reverseProxyListenerGroup) findRuleWithSelection(host string, sni strin
 			continue
 		}
 		nameMatched = true
-		if !reverseProxyRuleRequestPathMatch(rule, path) {
+		if !g.ruleRequestPathMatchLocked(rule, path) {
 			continue
 		}
 		hostIP := reverseProxyParseIPLiteral(reverseProxyNormalizeServerName(host))
@@ -6075,15 +6389,16 @@ func (g *reverseProxyListenerGroup) ruleRequestNameMatchWithSelectionLocked(rule
 	if rule == nil {
 		return false, false
 	}
+	candidates := g.ruleServerNamesLocked(rule)
 	host = reverseProxyNormalizeServerName(host)
 	sni = reverseProxyNormalizeServerName(sni)
 	hostIP := reverseProxyParseIPLiteral(host)
 	sniIP := reverseProxyParseIPLiteral(sni)
 	if !requireSNI {
 		if hostIP != nil {
-			return len(reverseProxyRuleServerNames(rule)) == 0, true
+			return len(candidates) == 0, true
 		}
-		matched := host != "" && len(reverseProxyRuleServerNames(rule)) > 0 && reverseProxyRequestNameMatchesAny(reverseProxyRuleServerNames(rule), host)
+		matched := host != "" && len(candidates) > 0 && reverseProxyRequestNameMatchesAny(candidates, host)
 		return matched, matched
 	}
 	if sni == "" || sniIP != nil {
@@ -6111,7 +6426,6 @@ func (g *reverseProxyListenerGroup) ruleRequestNameMatchWithSelectionLocked(rule
 		matched := g.ruleHasMatchingIPCertificateLocked(rule, requestedIP)
 		return matched, matched
 	}
-	candidates := reverseProxyRuleServerNames(rule)
 	if len(candidates) == 0 || host == "" || hostIP != nil {
 		return false, false
 	}
@@ -6128,6 +6442,63 @@ func (g *reverseProxyListenerGroup) ruleRequestNameMatchWithSelectionLocked(rule
 		return false, true
 	}
 	return true, true
+}
+
+func buildReverseProxyRuleMatchData(rules []*model.ReverseProxyRule) map[uint]reverseProxyRuleMatchData {
+	data := make(map[uint]reverseProxyRuleMatchData, len(rules))
+	for _, rule := range rules {
+		if rule == nil || rule.Id == 0 {
+			continue
+		}
+		listenAlias := normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
+		matchData := reverseProxyRuleMatchData{
+			serverNames: reverseProxyRuleServerNames(rule),
+			listenAlias: listenAlias,
+			pathPrefix:  reverseProxyNormalizePathPrefix(rule.PathPrefix),
+		}
+		if reverseProxyIsHTTPDNSAlias(listenAlias) {
+			matchData.dnsPath = reverseProxyDNSRulePath(rule)
+		}
+		data[rule.Id] = matchData
+	}
+	return data
+}
+
+func (g *reverseProxyListenerGroup) ruleServerNamesLocked(rule *model.ReverseProxyRule) []string {
+	if g == nil || rule == nil {
+		return nil
+	}
+	if rule.Id != 0 {
+		if data, exists := g.ruleMatchData[rule.Id]; exists {
+			return data.serverNames
+		}
+	}
+	return reverseProxyRuleServerNames(rule)
+}
+
+func (g *reverseProxyListenerGroup) ruleRequestPathMatchLocked(rule *model.ReverseProxyRule, path string) bool {
+	if g == nil || rule == nil {
+		return false
+	}
+	data, exists := g.ruleMatchData[rule.Id]
+	if !exists || rule.Id == 0 {
+		return reverseProxyRuleRequestPathMatch(rule, path)
+	}
+	if reverseProxyIsHTTPDNSAlias(data.listenAlias) {
+		actual := normalizeReverseProxyDNSPath(path)
+		if actual == "" {
+			actual = "/"
+		}
+		return actual == data.dnsPath
+	}
+	if data.pathPrefix == "" {
+		return true
+	}
+	actual := normalizeReverseProxyPath(path, true)
+	if actual == "" {
+		actual = "/"
+	}
+	return actual == data.pathPrefix || strings.HasPrefix(actual, data.pathPrefix+"/")
 }
 
 func (g *reverseProxyListenerGroup) ruleHasCertificateSelectionLocked(rule *model.ReverseProxyRule, selection reverseProxyCertificateSelection, serverName string) bool {
@@ -7129,13 +7500,21 @@ func reverseProxyResponseBodyEligible(resp *http.Response, plan reverseProxyResp
 	if !plan.Enabled || resp == nil || resp.Body == nil {
 		return false
 	}
-	if resp.StatusCode == http.StatusSwitchingProtocols {
+	if (resp.StatusCode >= 100 && resp.StatusCode < 200) || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusResetContent || resp.StatusCode == http.StatusNotModified {
+		return false
+	}
+	if resp.Request != nil {
+		if resp.Request.Method == http.MethodHead || resp.Request.Header.Get("Range") != "" {
+			return false
+		}
+	}
+	if resp.Header.Get("Content-Range") != "" {
 		return false
 	}
 	if !reverseProxyResponseMayContainOriginReferences(resp.Header.Get("Content-Type")) {
 		return false
 	}
-	contentEncoding := strings.TrimSpace(resp.Header.Get("Content-Encoding"))
+	contentEncoding := strings.TrimSpace(strings.Join(resp.Header.Values("Content-Encoding"), ","))
 	if contentEncoding != "" && !strings.EqualFold(contentEncoding, "identity") {
 		return false
 	}
@@ -7169,7 +7548,7 @@ func reverseProxyRewriteResponseBodyWithLimits(resp *http.Response, plan reverse
 	}
 	body := make([]byte, int(expectedLength))
 	readCount, err := io.ReadFull(originalBody, body)
-	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+	if err != nil {
 		_ = originalBody.Close()
 		if release != nil {
 			release()
@@ -7294,6 +7673,19 @@ func reverseProxyApplyBoundedBodyReplacements(body []byte, replacements []revers
 }
 
 func (g *reverseProxyListenerGroup) forwardRequest(w http.ResponseWriter, r *http.Request, rule *model.ReverseProxyRule, altSvc string) {
+	if decoded, err := reverseProxyPrepareRequestCompression(r, reverseProxyEffectiveRuleMemoryLimit(rule)); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, compressionalgorithm.ErrUnsupportedEncoding) {
+			status = http.StatusUnsupportedMediaType
+			// RFC 7694 uses Accept-Encoding on a 415 response to tell the
+			// client which request content codings this endpoint accepts.
+			w.Header().Set("Accept-Encoding", compressionalgorithm.UpstreamAcceptEncoding())
+		}
+		http.Error(w, http.StatusText(status), status)
+		return
+	} else if decoded {
+		defer r.Body.Close()
+	}
 	targetURL, transportBundle, err := g.buildUpstream(rule, r.Context())
 	if err != nil {
 		reverseProxyRuntime.reportRuleState(rule.Id, "upstream_error", err.Error())
@@ -7336,8 +7728,11 @@ func (g *reverseProxyListenerGroup) forwardRequest(w http.ResponseWriter, r *htt
 		}
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		if err := reverseProxyDecodeUpstreamResponse(resp, reverseProxyEffectiveRuleMemoryLimit(rule)); err != nil {
+			return err
+		}
+		resp.Header.Del("Alt-Svc")
 		if altSvc != "" {
-			resp.Header.Del("Alt-Svc")
 			resp.Header.Set("Alt-Svc", altSvc)
 		}
 		reverseProxyRewriteResponseHeaders(resp.Header, rewritePlan)
@@ -7367,8 +7762,12 @@ func (g *reverseProxyListenerGroup) forwardRequest(w http.ResponseWriter, r *htt
 		} {
 			req.Header.Del(header)
 		}
-		if bodyRewriteEnabled {
+		if bodyRewriteEnabled || req.Method == http.MethodHead || req.Header.Get("Range") != "" || reverseProxyIsWebSocketUpgradeRequest(r) {
 			req.Header.Set("Accept-Encoding", "identity")
+		} else {
+			// API passthrough skips body rewriting, but target-side content
+			// negotiation still follows the project's fixed algorithm order.
+			req.Header.Set("Accept-Encoding", compressionalgorithm.UpstreamAcceptEncoding())
 		}
 		forwardedScheme := reverseProxyRequestScheme(r, rule.ListenProtocol)
 		clientIP := extractRemoteIP(r.RemoteAddr)
@@ -7381,7 +7780,14 @@ func (g *reverseProxyListenerGroup) forwardRequest(w http.ResponseWriter, r *htt
 		// after Director returns.  Setting it here would duplicate that address.
 	}
 	reverseProxyRuntime.reportRuleState(rule.Id, "running", "")
-	proxy.ServeHTTP(w, r)
+	compressedWriter := compressionalgorithm.NewHTTPResponseWriter(w, compressionalgorithm.HTTPResponseOptions{
+		Request: r,
+		Level:   reverseProxyCompressionLevel,
+		Enabled: true,
+		MinSize: compressionalgorithm.DefaultMinimumResponseSize,
+	})
+	defer compressedWriter.Close()
+	proxy.ServeHTTP(compressedWriter, r)
 }
 
 func reverseProxyBuildForwardedHeader(clientIP string, host string, scheme string) string {
@@ -7753,7 +8159,7 @@ func (s *ReverseProxyService) buildRoundTripper(group *reverseProxyListenerGroup
 		}
 		transport := &http.Transport{
 			DialContext:           reverseProxyFixedAddressDialContextWithTracking(dialer, address, port, acquire),
-			DisableCompression:    false,
+			DisableCompression:    true,
 			DisableKeepAlives:     false,
 			MaxConnsPerHost:       maxConnections,
 			MaxIdleConns:          maxIdleConnections,
@@ -7789,7 +8195,7 @@ func (s *ReverseProxyService) buildRoundTripper(group *reverseProxyListenerGroup
 		}
 		transport := &http.Transport{
 			DialContext:           reverseProxyFixedAddressDialContextWithTracking(dialer, address, port, acquire),
-			DisableCompression:    false,
+			DisableCompression:    true,
 			DisableKeepAlives:     false,
 			ForceAttemptHTTP2:     true,
 			MaxConnsPerHost:       maxConnections,
@@ -7996,6 +8402,26 @@ func probeReverseProxyHTTP3(ctx context.Context, address string, port int, serve
 	return conn.CloseWithError(0, "")
 }
 
+func (g *reverseProxyListenerGroup) noteHTTP3ServerStopped() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	if g.closed {
+		g.mu.Unlock()
+		return
+	}
+	if g.h3ServingCount > 0 {
+		g.h3ServingCount--
+	}
+	if g.h3ServingCount == 0 {
+		g.h3ListenerAvailable = false
+	}
+	g.h3AvailabilityKnown = true
+	g.mu.Unlock()
+	WakeReverseProxyRuntime()
+}
+
 func (g *reverseProxyListenerGroup) shutdown() error {
 	if g == nil {
 		return nil
@@ -8051,6 +8477,7 @@ func (g *reverseProxyListenerGroup) shutdown() error {
 	for _, selection := range selections {
 		g.releaseCertificateSelection(selection)
 	}
+	g.clearCertificateBalanceStates()
 	for _, limiter := range ruleLimiters {
 		limiter.Release()
 	}

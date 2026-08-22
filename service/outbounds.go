@@ -25,6 +25,12 @@ func normalizeOutboundRawPayload(data json.RawMessage) json.RawMessage {
 	}
 
 	delete(payload, "id")
+	if value, ok := payload["type"].(string); ok {
+		payload["type"] = strings.ToLower(strings.TrimSpace(value))
+	}
+	if value, ok := payload["tag"].(string); ok {
+		payload["tag"] = strings.TrimSpace(value)
+	}
 	normalized, err := json.Marshal(payload)
 	if err != nil {
 		return append(json.RawMessage(nil), data...)
@@ -54,7 +60,7 @@ func (o *OutboundService) GetAll() (*[]map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	var data []map[string]interface{}
+	data := make([]map[string]interface{}, 0, len(outbounds))
 	for _, outbound := range outbounds {
 		outboundJSON, err := resolveOutboundJSON(outbound)
 		if err != nil {
@@ -196,32 +202,37 @@ func (s *OutboundService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 
 	switch act {
 	case "new", "edit":
-		var outbound model.Outbound
-		err = outbound.UnmarshalJSON(data)
+		normalizedData, identity, err := validateAndNormalizeSingboxOutboundPayload(data, act)
 		if err != nil {
 			return err
 		}
-		incomingRaw := normalizeOutboundRawPayload(data)
+		var outbound model.Outbound
+		err = outbound.UnmarshalJSON(normalizedData)
+		if err != nil {
+			return err
+		}
+		outbound.Id = identity.ID
+		outbound.Type = identity.Type
+		outbound.Tag = identity.Tag
+		incomingRaw := normalizeOutboundRawPayload(normalizedData)
+		oldTag := ""
+		var previousRuntimeTags []string
 		if act == "edit" {
 			existing := &model.Outbound{}
-			query := tx.Model(model.Outbound{})
-			if outbound.Id != 0 {
-				query = query.Where("id = ?", outbound.Id)
-			} else {
-				query = query.Where("tag = ?", outbound.Tag)
+			if err := tx.Model(model.Outbound{}).Where("id = ?", outbound.Id).First(existing).Error; err != nil {
+				return err
 			}
-			if err := query.First(existing).Error; err == nil {
-				if existing.Type == outbound.Type {
-					if baseRaw, resolveErr := resolveOutboundJSON(existing); resolveErr == nil {
-						outbound.RawOutbound = mergeEditableOutboundRawPayload(baseRaw, data, "default", outbound.Type)
-					} else {
-						outbound.RawOutbound = incomingRaw
-					}
+			oldTag = strings.TrimSpace(existing.Tag)
+			previousRuntimeTags, err = singboxRuntimeOutboundTags(existing)
+			if err != nil {
+				return err
+			}
+			if existing.Type == outbound.Type {
+				if baseRaw, resolveErr := resolveOutboundJSON(existing); resolveErr == nil {
+					outbound.RawOutbound = mergeEditableOutboundRawPayload(baseRaw, incomingRaw, "default", outbound.Type)
 				} else {
 					outbound.RawOutbound = incomingRaw
 				}
-			} else if !database.IsNotFound(err) {
-				return err
 			} else {
 				outbound.RawOutbound = incomingRaw
 			}
@@ -231,15 +242,64 @@ func (s *OutboundService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 		if len(outbound.RawOutbound) == 0 {
 			outbound.RawOutbound = incomingRaw
 		}
+		// RawOutbound is the authoritative editable/runtime payload. Keeping the
+		// same options JSON in both columns doubles memory and SQLite I/O for
+		// imported node collections; Options remains only for legacy rows without
+		// RawOutbound.
+		outbound.Options = nil
 
 		err = tx.Save(&outbound).Error
 		if err != nil {
 			return err
 		}
+		currentRuntimeTags, err := singboxRuntimeOutboundTags(&outbound)
+		if err != nil {
+			return err
+		}
+		resolved, err := resolveOutboundJSON(&outbound)
+		if err != nil {
+			return err
+		}
+		payload := map[string]interface{}{}
+		if err := json.Unmarshal(resolved, &payload); err != nil {
+			return err
+		}
+		if err := validateSingboxOutboundPayloadReferences(tx, &outbound, payload); err != nil {
+			return err
+		}
+		if err := validateSingboxStoredRuntimeOutboundTags(tx); err != nil {
+			return err
+		}
+		if oldTag != "" && oldTag != strings.TrimSpace(outbound.Tag) {
+			if err := replaceSingboxOutboundTagInPanelGroups(tx, oldTag, outbound.Tag); err != nil {
+				return err
+			}
+		}
+		removedRuntimeTags := removedSingboxRuntimeTags(previousRuntimeTags, currentRuntimeTags)
+		if len(removedRuntimeTags) > 0 {
+			if err := validateSingboxOutboundRemovalReferences(tx, removedRuntimeTags, nil); err != nil {
+				return err
+			}
+		}
 	case "del":
 		var tag string
 		err = json.Unmarshal(data, &tag)
 		if err != nil {
+			return err
+		}
+		tag = strings.TrimSpace(tag)
+		var existing model.Outbound
+		if err := tx.Where("tag = ?", tag).First(&existing).Error; err != nil {
+			return err
+		}
+		removedRuntimeTags, err := singboxRuntimeOutboundTags(&existing)
+		if err != nil {
+			return err
+		}
+		if err := removeSingboxOutboundTagFromPanelGroups(tx, tag); err != nil {
+			return err
+		}
+		if err := validateSingboxOutboundRemovalReferences(tx, removedRuntimeTags, nil); err != nil {
 			return err
 		}
 		err = tx.Where("tag = ?", tag).Delete(model.Outbound{}).Error

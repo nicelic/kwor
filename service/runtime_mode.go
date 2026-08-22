@@ -24,6 +24,11 @@ var managedCoreRuntimeModeCache struct {
 	mode managedCoreRuntimeMode
 }
 
+var kworSystemdHostCache struct {
+	once      sync.Once
+	available bool
+}
+
 func getManagedCoreRuntimeMode() managedCoreRuntimeMode {
 	managedCoreRuntimeModeCache.once.Do(func() {
 		managedCoreRuntimeModeCache.mode = detectManagedCoreRuntimeMode()
@@ -93,17 +98,20 @@ func RunningInsideDocker() bool {
 // isKworSystemdHost verifies that a reachable system manager exists. Some
 // non-systemd Linux distributions ship a systemctl compatibility binary.
 func isKworSystemdHost() bool {
-	if runtime.GOOS != "linux" || runningInsideContainer() {
-		return false
-	}
-	if _, err := os.Stat("/run/systemd/system"); err != nil {
-		return false
-	}
-	systemctl, err := exec.LookPath("systemctl")
-	if err != nil {
-		return false
-	}
-	return runCommandWithTimeout(shortSystemCommandTimeout, systemctl, "show-environment") == nil
+	kworSystemdHostCache.once.Do(func() {
+		if runtime.GOOS != "linux" || runningInsideContainer() {
+			return
+		}
+		if _, err := os.Stat("/run/systemd/system"); err != nil {
+			return
+		}
+		systemctl, err := exec.LookPath("systemctl")
+		if err != nil {
+			return
+		}
+		kworSystemdHostCache.available = runCommandWithTimeout(shortSystemCommandTimeout, systemctl, "show-environment") == nil
+	})
+	return kworSystemdHostCache.available
 }
 
 func shouldUseDirectManagedCoreRuntime() bool {

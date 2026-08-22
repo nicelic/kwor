@@ -2,6 +2,8 @@ package sub
 
 import (
 	"encoding/json"
+	"math"
+	"strings"
 
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
@@ -48,8 +50,8 @@ func loadMihomoSubscriptionData(subID string) (*model.Client, []*model.Inbound, 
 		return nil, nil, err
 	}
 
-	var inboundIDs []uint
-	if err := json.Unmarshal(mihomoClient.Inbounds, &inboundIDs); err != nil {
+	inboundIDs, err := util.ParseInboundIDs(mihomoClient.Inbounds)
+	if err != nil {
 		return nil, nil, err
 	}
 
@@ -66,7 +68,11 @@ func loadMihomoSubscriptionData(subID string) (*model.Client, []*model.Inbound, 
 		if mihomoInbound == nil {
 			continue
 		}
-		if util.IsSubscriptionServerOnlyInboundType(mihomoInbound.Type) {
+		// The user binding can outlive an old protocol record. Only emit
+		// inbounds that Mihomo can still materialize as listeners; proxy-only
+		// protocol types such as SSH belong to manually configured outbounds,
+		// not a server-side client subscription.
+		if !util.SupportsMihomoRuntimeListenerType(mihomoInbound.Type) {
 			continue
 		}
 
@@ -113,8 +119,16 @@ func normalizeMihomoSubscriptionOutJSON(inbound *model.Inbound) error {
 	util.StripSubscriptionOutboundPanelFields(outbound)
 
 	migrateLegacyMihomoCommonFields(outbound, inbound.Type)
-	if inbound.Type == "shadowtls" {
-		sanitizeMihomoShadowTLSSubscriptionOutJSON(outbound)
+	sanitizeMihomoSubscriptionTLSFields(outbound)
+	sanitizeMihomoSubscriptionGRPCFields(outbound)
+	sanitizeMihomoSubscriptionReceiveWindows(outbound, inbound.Type)
+	if strings.EqualFold(strings.TrimSpace(inbound.Type), "hysteria2") {
+		util.EnsureHysteria2MihomoReceiveWindows(outbound)
+	}
+	sanitizeMihomoSubscriptionCommonFields(outbound)
+	if ssConfig, ok := outbound["ss_config"].(map[string]interface{}); ok && ssConfig != nil {
+		sanitizeMihomoSubscriptionMultiplexFields(ssConfig, "multiplex")
+		sanitizeMihomoSubscriptionCommonFields(ssConfig)
 	}
 	if inbound.Type == "shadowquic" {
 		// ShadowQUIC never uses mihomo_TLS. Clear legacy relation state before
@@ -122,6 +136,22 @@ func normalizeMihomoSubscriptionOutJSON(inbound *model.Inbound) error {
 		inbound.TlsId = 0
 		inbound.Tls = nil
 		util.SanitizeMihomoShadowQUICInboundTemplate(outbound)
+	}
+	if inbound.Type == "hysteria2" {
+		if _, exists := outbound["mihomo_fast_open"]; !exists {
+			if value, ok := outbound["fast_open"].(bool); ok {
+				outbound["mihomo_fast_open"] = value
+			} else if value, ok := outbound["fast-open"].(bool); ok {
+				outbound["mihomo_fast_open"] = value
+			}
+		}
+		delete(outbound, "fast_open")
+		delete(outbound, "fast-open")
+	}
+	if inbound.Type == "tuic" {
+		delete(outbound, "mihomo_fast_open")
+		delete(outbound, "fast_open")
+		delete(outbound, "fast-open")
 	}
 
 	if inbound.Type == "tuic" {
@@ -134,13 +164,6 @@ func normalizeMihomoSubscriptionOutJSON(inbound *model.Inbound) error {
 		delete(outbound, "heartbeat")
 		delete(outbound, "heartbeat_interval")
 		delete(outbound, "network")
-		if _, exists := outbound["mihomo_fast_open"]; !exists {
-			if fastOpen, existsFastOpen := outbound["fast_open"]; existsFastOpen {
-				outbound["mihomo_fast_open"] = fastOpen
-			}
-		}
-		delete(outbound, "fast_open")
-
 		fullInbound, err := inbound.MarshalFull()
 		if err != nil {
 			return err
@@ -167,32 +190,215 @@ func normalizeMihomoSubscriptionOutJSON(inbound *model.Inbound) error {
 	return nil
 }
 
-func sanitizeMihomoShadowTLSSubscriptionOutJSON(outbound map[string]interface{}) {
-	if outbound == nil {
-		return
-	}
-	ssConfig, ok := outbound["ss_config"].(map[string]interface{})
-	if !ok || ssConfig == nil {
-		return
-	}
-	delete(ssConfig, "network")
-}
-
 func migrateLegacyMihomoCommonFields(outbound map[string]interface{}, inboundType string) {
 	if outbound == nil {
 		return
 	}
 
-	if inboundType == "shadowtls" {
-		ssConfig, ok := outbound["ss_config"].(map[string]interface{})
-		if !ok || ssConfig == nil {
-			return
-		}
-		migrateLegacyMihomoCommonStore(ssConfig, inboundType)
+	migrateLegacyMihomoCommonStore(outbound, inboundType)
+}
+
+func sanitizeMihomoSubscriptionTLSFields(outbound map[string]interface{}) {
+	if outbound == nil {
 		return
 	}
+	tls, ok := outbound["tls"].(map[string]interface{})
+	if !ok || tls == nil {
+		return
+	}
+	delete(tls, "fragment")
+	delete(tls, "fragment_fallback_delay")
+	delete(tls, "record_fragment")
+}
 
-	migrateLegacyMihomoCommonStore(outbound, inboundType)
+func sanitizeMihomoSubscriptionGRPCFields(outbound map[string]interface{}) {
+	if outbound == nil {
+		return
+	}
+	transport, ok := outbound["transport"].(map[string]interface{})
+	if !ok || transport == nil {
+		return
+	}
+	grpcKeys := []string{"grpc_user_agent", "ping_interval", "max_connections", "min_streams", "max_streams"}
+	transportType, _ := transport["type"].(string)
+	if !strings.EqualFold(strings.TrimSpace(transportType), "grpc") {
+		for _, key := range grpcKeys {
+			delete(transport, key)
+		}
+		return
+	}
+	for _, key := range []string{"ping_interval", "max_connections"} {
+		if value, exists := transport[key]; exists {
+			if normalized, ok := normalizePositiveIntValue(value); ok {
+				transport[key] = normalized
+			} else {
+				delete(transport, key)
+			}
+		}
+	}
+	for _, key := range []string{"min_streams", "max_streams"} {
+		if value, exists := transport[key]; exists {
+			if normalized, ok := normalizeNonNegativeIntValue(value); ok {
+				transport[key] = normalized
+			} else {
+				delete(transport, key)
+			}
+		}
+	}
+}
+
+func sanitizeMihomoSubscriptionReceiveWindows(outbound map[string]interface{}, inboundType string) {
+	if outbound == nil {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(inboundType), "hysteria2") {
+		delete(outbound, "mihomo_hy2")
+		return
+	}
+	raw, exists := outbound["mihomo_hy2"]
+	if !exists {
+		return
+	}
+	options, ok := raw.(map[string]interface{})
+	if !ok || options == nil {
+		delete(outbound, "mihomo_hy2")
+		return
+	}
+	clean := make(map[string]interface{}, 4)
+	for _, key := range []string{
+		"initial_stream_receive_window",
+		"max_stream_receive_window",
+		"initial_connection_receive_window",
+		"max_connection_receive_window",
+	} {
+		if value, ok := normalizePositiveIntValue(options[key]); ok {
+			clean[key] = value
+		}
+	}
+	if len(clean) == 0 {
+		delete(outbound, "mihomo_hy2")
+		return
+	}
+	outbound["mihomo_hy2"] = clean
+}
+
+func sanitizeMihomoSubscriptionCommonFields(root map[string]interface{}) {
+	if root == nil {
+		return
+	}
+	common, ok := root["mihomo_common"].(map[string]interface{})
+	if !ok || common == nil {
+		return
+	}
+	if value, exists := common["udp"]; exists {
+		if _, ok := value.(bool); !ok {
+			delete(common, "udp")
+		}
+	}
+	if value, exists := common["ip_version"]; exists {
+		if normalized, ok := util.NormalizeMihomoClientIPVersion(value); ok {
+			common["ip_version"] = normalized
+		} else {
+			delete(common, "ip_version")
+		}
+	}
+	if value, exists := common["routing_mark"]; exists {
+		if normalized, ok := normalizeNonNegativeIntValue(value); ok {
+			common["routing_mark"] = normalized
+		} else {
+			delete(common, "routing_mark")
+		}
+	}
+	sanitizeMihomoSubscriptionMultiplexFields(common, "smux")
+	if len(common) == 0 {
+		delete(root, "mihomo_common")
+	}
+}
+
+func sanitizeMihomoSubscriptionMultiplexFields(root map[string]interface{}, key string) {
+	if root == nil || key == "" {
+		return
+	}
+	rawMux, exists := root[key]
+	if !exists {
+		return
+	}
+	mux, ok := rawMux.(map[string]interface{})
+	if !ok || mux == nil {
+		delete(root, key)
+		return
+	}
+	if value, exists := mux["enabled"]; exists {
+		if normalized, ok := value.(bool); ok {
+			mux["enabled"] = normalized
+		} else {
+			delete(mux, "enabled")
+		}
+	}
+	if value, exists := mux["protocol"]; exists {
+		protocol, ok := value.(string)
+		protocol = strings.ToLower(strings.TrimSpace(protocol))
+		if !ok || (protocol != "smux" && protocol != "yamux" && protocol != "h2mux") {
+			delete(mux, "protocol")
+		} else {
+			mux["protocol"] = protocol
+		}
+	}
+	for _, key := range []string{"max_connections", "min_streams", "max_streams"} {
+		if value, exists := mux[key]; exists {
+			if normalized, ok := normalizeNonNegativeIntValue(value); ok {
+				mux[key] = normalized
+			} else {
+				delete(mux, key)
+			}
+		}
+	}
+	for _, key := range []string{"statistic", "only_tcp", "padding"} {
+		if value, exists := mux[key]; exists {
+			if normalized, ok := value.(bool); ok {
+				mux[key] = normalized
+			} else {
+				delete(mux, key)
+			}
+		}
+	}
+	if value, exists := mux["only-tcp"]; exists {
+		if _, normalizedExists := mux["only_tcp"]; !normalizedExists {
+			if normalized, ok := value.(bool); ok {
+				mux["only_tcp"] = normalized
+			}
+		}
+		delete(mux, "only-tcp")
+	}
+	if rawBrutal, exists := mux["brutal"]; exists {
+		brutal, ok := rawBrutal.(map[string]interface{})
+		if !ok || brutal == nil {
+			delete(mux, "brutal")
+		} else {
+			if value, exists := brutal["enabled"]; exists {
+				if normalized, ok := value.(bool); ok {
+					brutal["enabled"] = normalized
+				} else {
+					delete(brutal, "enabled")
+				}
+			}
+			for _, key := range []string{"up_mbps", "down_mbps"} {
+				if value, exists := brutal[key]; exists {
+					if normalized, ok := normalizeNonNegativeIntValue(value); ok {
+						brutal[key] = normalized
+					} else {
+						delete(brutal, key)
+					}
+				}
+			}
+			if len(brutal) == 0 {
+				delete(mux, "brutal")
+			}
+		}
+	}
+	if len(mux) == 0 {
+		delete(root, key)
+	}
 }
 
 func migrateLegacyMihomoCommonStore(root map[string]interface{}, inboundType string) {
@@ -247,17 +453,30 @@ func migrateLegacyMihomoCommonStore(root map[string]interface{}, inboundType str
 }
 
 func normalizePositiveIntValue(raw interface{}) (int, bool) {
+	value, ok := normalizeNonNegativeIntValue(raw)
+	return value, ok && value > 0
+}
+
+func normalizeNonNegativeIntValue(raw interface{}) (int, bool) {
+	maxInt := int64(^uint(0) >> 1)
 	switch value := raw.(type) {
 	case int:
-		return value, value > 0
+		return value, value >= 0
 	case int32:
-		return int(value), value > 0
+		return int(value), value >= 0
 	case int64:
-		return int(value), value > 0
+		return int(value), value >= 0 && value <= maxInt
 	case float32:
-		return int(value), value > 0
+		parsed := float64(value)
+		if parsed < 0 || math.IsNaN(parsed) || math.IsInf(parsed, 0) || math.Trunc(parsed) != parsed || parsed > float64(maxInt) {
+			return 0, false
+		}
+		return int(parsed), true
 	case float64:
-		return int(value), value > 0
+		if value < 0 || math.IsNaN(value) || math.IsInf(value, 0) || math.Trunc(value) != value || value > float64(maxInt) {
+			return 0, false
+		}
+		return int(value), true
 	default:
 		return 0, false
 	}

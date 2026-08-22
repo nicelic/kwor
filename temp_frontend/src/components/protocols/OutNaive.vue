@@ -63,6 +63,8 @@
 </template>
 
 <script lang="ts">
+import { parseSingboxInteger } from '@/plugins/singboxInteger'
+
 export default {
   props: ['data'],
   data() {
@@ -84,19 +86,15 @@ export default {
     }
   },
   methods: {
-    ensureDefaults() {
-      if (this.$props.data.quic === undefined) {
-        this.$props.data.quic = false
+    sanitizeCongestionControl() {
+      const value = typeof this.$props.data.quic_congestion_control === 'string'
+        ? this.$props.data.quic_congestion_control.trim().toLowerCase()
+        : ''
+      if (['bbr', 'bbr2', 'cubic', 'reno'].includes(value)) {
+        this.$props.data.quic_congestion_control = value
+        return
       }
-      if (typeof this.$props.data.insecure_concurrency !== 'number') {
-        this.$props.data.insecure_concurrency = 0
-      }
-      if (this.$props.data.quic_congestion_control === undefined) {
-        this.$props.data.quic_congestion_control = 'bbr2'
-      }
-      if (this.$props.data.udp_over_tcp === undefined) {
-        this.$props.data.udp_over_tcp = false
-      }
+      delete this.$props.data.quic_congestion_control
     },
     syncExtraHeadersText() {
       this.extraHeadersError = ''
@@ -144,21 +142,23 @@ export default {
     },
     insecureConcurrency: {
       get(): number {
-        return typeof this.$props.data.insecure_concurrency === 'number'
-          ? this.$props.data.insecure_concurrency
-          : 0
+        return parseSingboxInteger(this.$props.data.insecure_concurrency, { min: 0 }) ?? 0
       },
-      set(v: number) {
-        const value = Number.isFinite(Number(v)) && Number(v) >= 0 ? Math.floor(Number(v)) : 0
-        this.$props.data.insecure_concurrency = value
+      set(v: unknown) {
+        const value = parseSingboxInteger(v, { min: 0 })
+        if (value === undefined) delete this.$props.data.insecure_concurrency
+        else this.$props.data.insecure_concurrency = value
       }
     },
     quicCongestionControl: {
-      get(): string {
-        return this.$props.data.quic_congestion_control ?? 'bbr2'
-      },
+      get(): string { return this.$props.data.quic_congestion_control ?? '' },
       set(v: string) {
-        this.$props.data.quic_congestion_control = typeof v === 'string' ? v : 'bbr2'
+        const value = typeof v === 'string' ? v.trim().toLowerCase() : ''
+        if (['bbr', 'bbr2', 'cubic', 'reno'].includes(value)) {
+          this.$props.data.quic_congestion_control = value
+          return
+        }
+        delete this.$props.data.quic_congestion_control
       }
     },
     udpOverTcpVersion: {
@@ -203,7 +203,7 @@ export default {
   watch: {
     data: {
       handler() {
-        this.ensureDefaults()
+        this.sanitizeCongestionControl()
         this.syncExtraHeadersText()
       },
       immediate: true,

@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -19,6 +20,20 @@ type ClientService struct {
 	NftTrafficService
 }
 
+func normalizeClientArrayFields(client *model.Client) {
+	if client == nil {
+		return
+	}
+	if len(bytes.TrimSpace(client.Inbounds)) == 0 || bytes.Equal(bytes.TrimSpace(client.Inbounds), []byte("null")) {
+		client.Inbounds = json.RawMessage("[]")
+	}
+	if len(bytes.TrimSpace(client.Links)) == 0 || bytes.Equal(bytes.TrimSpace(client.Links), []byte("null")) {
+		client.Links = json.RawMessage("[]")
+	}
+}
+
+const maxClientBulkCount = 100
+
 func (s *ClientService) Get(id string) (*[]model.Client, error) {
 	if id == "" {
 		return s.GetAll()
@@ -28,10 +43,13 @@ func (s *ClientService) Get(id string) (*[]model.Client, error) {
 
 func (s *ClientService) getById(id string) (*[]model.Client, error) {
 	db := database.GetDB()
-	var client []model.Client
+	client := make([]model.Client, 0)
 	err := db.Model(model.Client{}).Where("id in ?", strings.Split(id, ",")).Scan(&client).Error
 	if err != nil {
 		return nil, err
+	}
+	for i := range client {
+		normalizeClientArrayFields(&client[i])
 	}
 
 	return &client, nil
@@ -39,13 +57,27 @@ func (s *ClientService) getById(id string) (*[]model.Client, error) {
 
 func (s *ClientService) GetAll() (*[]model.Client, error) {
 	db := database.GetDB()
-	var clients []model.Client
+	clients := make([]model.Client, 0)
 	err := db.Model(model.Client{}).
 		Select("`id`, `enable`, `name`, `desc`, `group`, `inbounds`, `up`, `down`, `volume`, `expiry`, `speed_limit_mbps`").
 		Order("id ASC").
 		Scan(&clients).Error
 	if err != nil {
 		return nil, err
+	}
+	for i := range clients {
+		normalizeClientArrayFields(&clients[i])
+	}
+	autoSyncIDs, err := (&SettingService{}).GetSubManagerAutoSyncClientIDs()
+	if err != nil {
+		return nil, err
+	}
+	autoSyncSet := make(map[uint]struct{}, len(autoSyncIDs))
+	for _, id := range autoSyncIDs {
+		autoSyncSet[id] = struct{}{}
+	}
+	for i := range clients {
+		_, clients[i].AutoSync = autoSyncSet[clients[i].Id]
 	}
 	return &clients, nil
 }
@@ -59,6 +91,27 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 		var client model.Client
 		err = json.Unmarshal(data, &client)
 		if err != nil {
+			return nil, err
+		}
+		normalizeClientArrayFields(&client)
+		if act == "new" {
+			client.Id = 0
+		} else if client.Id == 0 {
+			return nil, common.NewError("client id is required for edit")
+		}
+		editingID := uint(0)
+		if act == "edit" {
+			editingID = client.Id
+		}
+		if err = validateClientNames(tx, []*model.Client{&client}, editingID); err != nil {
+			return nil, err
+		}
+		clientInboundSelections, normalizeErr := normalizeClientInboundSelections([]*model.Client{&client})
+		if normalizeErr != nil {
+			return nil, normalizeErr
+		}
+		clientInboundIDs := clientInboundSelections[0]
+		if err = validateClientInboundTargets(tx, clientInboundIDs); err != nil {
 			return nil, err
 		}
 		client.Volume = normalizeClientVolume(client.Volume)
@@ -89,14 +142,12 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 				return nil, txErr
 			}
 		} else {
-			err = json.Unmarshal(client.Inbounds, &inboundIds)
-			if err != nil {
-				return nil, err
-			}
+			inboundIds = clientInboundIDs
 		}
 		nowUnix := time.Now().Unix()
 		manualTrafficReset := client.TrafficResetRequested && act == "edit"
 		if oldClient != nil {
+			client.Depleted = oldClient.Depleted
 			if manualTrafficReset {
 				client.Up = 0
 				client.Down = 0
@@ -111,14 +162,17 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 				client.LastReset = oldClient.LastReset
 			}
 
-			accessSettingsChanged := manualTrafficReset ||
-				oldClient.Volume != client.Volume ||
-				oldClient.Expiry != client.Expiry ||
-				oldClient.Extra != client.Extra
-			oldEvaluation := evaluateClientAccess(true, oldClient.Up+oldClient.Down, oldClient.Volume, oldClient.Expiry, nowUnix)
 			evaluation := evaluateClientAccess(true, client.Up+client.Down, client.Volume, client.Expiry, nowUnix)
-			if accessSettingsChanged && !oldClient.Enable && !client.Enable && oldEvaluation.Blocked && !evaluation.Blocked {
-				client.Enable = true
+			if oldClient.Depleted {
+				if evaluation.Blocked {
+					client.Enable = false
+					client.Depleted = true
+				} else {
+					client.Enable = true
+					client.Depleted = false
+				}
+			} else {
+				client.Depleted = false
 			}
 			if oldClient.Enable != client.Enable {
 				var oldInboundIDs []uint
@@ -139,11 +193,8 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 		}
 
 		// Sync client-inbound traffic bindings (for nftables-based per-client stats)
-		var clientInboundIds []uint
-		if jsonErr := json.Unmarshal(client.Inbounds, &clientInboundIds); jsonErr == nil {
-			if queueErr := s.NftTrafficService.QueueSyncClientBindings(tx, client.Id, clientInboundIds); queueErr != nil {
-				logger.Warning("failed to queue client traffic binding sync for ", client.Name, ": ", queueErr)
-			}
+		if queueErr := s.NftTrafficService.QueueSyncClientBindings(tx, client.Id, clientInboundIDs); queueErr != nil {
+			logger.Warning("failed to queue client traffic binding sync for ", client.Name, ": ", queueErr)
 		}
 
 		// Manual reset keeps the current nft baselines aligned with the UI counters.
@@ -159,21 +210,48 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 		if err != nil {
 			return nil, err
 		}
-		for _, client := range clients {
-			if client == nil {
-				continue
-			}
-			client.ServerIp = util.NormalizeSubscriptionServerHost(client.ServerIp)
+		if len(clients) == 0 {
+			return nil, common.NewError("at least one client is required")
 		}
-		err = json.Unmarshal(clients[0].Inbounds, &inboundIds)
-		if err != nil {
+		if len(clients) > maxClientBulkCount {
+			return nil, common.NewErrorf("bulk client count must be between 1 and %d", maxClientBulkCount)
+		}
+		if err = validateClientNames(tx, clients, 0); err != nil {
 			return nil, err
+		}
+		clientInboundSelections, normalizeErr := normalizeClientInboundSelections(clients)
+		if normalizeErr != nil {
+			return nil, normalizeErr
+		}
+		for _, selection := range clientInboundSelections {
+			inboundIds = common.UnionUintArray(inboundIds, selection)
+		}
+		if err = validateClientInboundTargets(tx, inboundIds); err != nil {
+			return nil, err
+		}
+		for _, client := range clients {
+			normalizeClientArrayFields(client)
+			client.Id = 0
+			client.ServerIp = util.NormalizeSubscriptionServerHost(client.ServerIp)
 		}
 		err = s.updateLinksWithFixedInbounds(tx, clients, hostname)
 		if err != nil {
 			return nil, err
 		}
+		nowUnix := time.Now().Unix()
 		for _, client := range clients {
+			client.Volume = normalizeClientVolume(client.Volume)
+			client.Expiry = normalizeClientExpiry(client.Expiry)
+			client.Extra = normalizeClientResetDay(client.Extra)
+			if client.Up < 0 {
+				client.Up = 0
+			}
+			if client.Down < 0 {
+				client.Down = 0
+			}
+			if client.LastReset == 0 {
+				client.LastReset = nowUnix
+			}
 			client.SpeedLimitMbps = normalizeClientSpeedLimitMbps(client.SpeedLimitMbps)
 		}
 		err = tx.Save(clients).Error
@@ -182,12 +260,9 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 		}
 
 		// Sync traffic bindings for all bulk-added clients
-		for _, client := range clients {
-			var clientInboundIds []uint
-			if jsonErr := json.Unmarshal(client.Inbounds, &clientInboundIds); jsonErr == nil {
-				if queueErr := s.NftTrafficService.QueueSyncClientBindings(tx, client.Id, clientInboundIds); queueErr != nil {
-					logger.Warning("failed to queue client traffic binding sync for ", client.Name, ": ", queueErr)
-				}
+		for index, client := range clients {
+			if queueErr := s.NftTrafficService.QueueSyncClientBindings(tx, client.Id, clientInboundSelections[index]); queueErr != nil {
+				logger.Warning("failed to queue client traffic binding sync for ", client.Name, ": ", queueErr)
 			}
 		}
 
@@ -223,25 +298,136 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 	return inboundIds, nil
 }
 
-func (s *ClientService) updateLinksWithFixedInbounds(tx *gorm.DB, clients []*model.Client, hostname string) error {
-	var err error
-	var inbounds []model.Inbound
-	var inboundIds []uint
+func validateClientNames(tx *gorm.DB, clients []*model.Client, editingID uint) error {
+	if tx == nil {
+		return common.NewError("client transaction is nil")
+	}
 
-	err = json.Unmarshal(clients[0].Inbounds, &inboundIds)
+	seen := make(map[string]struct{}, len(clients))
+	for _, client := range clients {
+		if client == nil {
+			return common.NewError("client is nil")
+		}
+		client.Name = strings.TrimSpace(client.Name)
+		if client.Name == "" {
+			return common.NewError("client name is required")
+		}
+		if _, ok := seen[client.Name]; ok {
+			return common.NewErrorf("client name %q is duplicated in this request", client.Name)
+		}
+		seen[client.Name] = struct{}{}
+	}
+
+	for name := range seen {
+		query := tx.Model(&model.Client{}).Where("name = ?", name)
+		if editingID > 0 {
+			query = query.Where("id <> ?", editingID)
+		}
+		var count int64
+		if err := query.Count(&count).Error; err != nil {
+			return err
+		}
+		if count > 0 {
+			return common.NewErrorf("client name %q already exists", name)
+		}
+	}
+	return nil
+}
+
+func normalizeClientInboundSelections(clients []*model.Client) ([][]uint, error) {
+	selections := make([][]uint, len(clients))
+	for index, client := range clients {
+		if client == nil {
+			return nil, common.NewError("client is nil")
+		}
+		inboundIDs, err := util.ParseInboundIDs(client.Inbounds)
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := json.Marshal(inboundIDs)
+		if err != nil {
+			return nil, err
+		}
+		client.Inbounds = encoded
+		selections[index] = inboundIDs
+	}
+	return selections, nil
+}
+
+// validateClientInboundTargets mirrors the client-page selector at the final
+// database boundary. It blocks stale selections from another browser tab and
+// direct API calls from persisting absent or non-selectable default inbounds.
+func validateClientInboundTargets(tx *gorm.DB, inboundIDs []uint) error {
+	if tx == nil {
+		return common.NewError("client transaction is nil")
+	}
+	inboundIDs = dedupeUintIDs(inboundIDs)
+	if len(inboundIDs) == 0 {
+		return nil
+	}
+
+	var inbounds []model.Inbound
+	if err := tx.Model(model.Inbound{}).
+		Select("id", "tag", "type", "options").
+		Where("id IN ?", inboundIDs).
+		Find(&inbounds).Error; err != nil {
+		return err
+	}
+	byID := make(map[uint]model.Inbound, len(inbounds))
+	for _, inbound := range inbounds {
+		byID[inbound.Id] = inbound
+	}
+	for _, inboundID := range inboundIDs {
+		inbound, exists := byID[inboundID]
+		if !exists {
+			return fmt.Errorf("sing-box inbound id %d does not exist", inboundID)
+		}
+		shadowTLSVersion := uint(0)
+		if inbound.Type == "shadowtls" {
+			options := map[string]interface{}{}
+			if json.Unmarshal(inbound.Options, &options) == nil {
+				shadowTLSVersion = uint(util.ShadowTLSVersion(options["version"]))
+			}
+		}
+		if !buildSingboxInboundUserManagement(inbound.Type, shadowTLSVersion).Selectable {
+			return fmt.Errorf("sing-box inbound %q (%s) cannot be assigned to a client", inbound.Tag, inbound.Type)
+		}
+	}
+	return nil
+}
+
+func (s *ClientService) updateLinksWithFixedInbounds(tx *gorm.DB, clients []*model.Client, hostname string) error {
+	if len(clients) == 0 {
+		return nil
+	}
+
+	clientInboundIDs, err := normalizeClientInboundSelections(clients)
 	if err != nil {
 		return err
 	}
+	inboundIDs := make([]uint, 0)
+	for _, selection := range clientInboundIDs {
+		inboundIDs = common.UnionUintArray(inboundIDs, selection)
+	}
 
-	// Zero inbounds means removing local links only
-	if len(inboundIds) > 0 {
-		err = tx.Model(model.Inbound{}).Preload("Tls").Where("id in ? and type in ?", inboundIds, util.InboundTypeWithLink).Find(&inbounds).Error
-		if err != nil {
+	var inbounds []model.Inbound
+	if len(inboundIDs) > 0 {
+		if err := tx.Model(model.Inbound{}).Preload("Tls").Where("id in ? and type in ?", inboundIDs, util.InboundTypeWithLink).Find(&inbounds).Error; err != nil {
 			return err
 		}
-		inbounds = util.OrderBaseInboundValuesByIDs(inboundIds, inbounds)
 	}
+	inboundByID := make(map[uint]model.Inbound, len(inbounds))
+	for _, inbound := range inbounds {
+		inboundByID[inbound.Id] = inbound
+	}
+
 	for index, client := range clients {
+		selectedInbounds := make([]model.Inbound, 0, len(clientInboundIDs[index]))
+		for _, inboundID := range clientInboundIDs[index] {
+			if inbound, exists := inboundByID[inboundID]; exists {
+				selectedInbounds = append(selectedInbounds, inbound)
+			}
+		}
 		var clientLinks []map[string]string
 		err = json.Unmarshal(client.Links, &clientLinks)
 		if err != nil {
@@ -249,7 +435,7 @@ func (s *ClientService) updateLinksWithFixedInbounds(tx *gorm.DB, clients []*mod
 		}
 
 		newClientLinks := []map[string]string{}
-		for _, inbound := range inbounds {
+		for _, inbound := range selectedInbounds {
 			serverHost := util.ResolveSubscriptionServerHost(client.ServerIp, &inbound, hostname)
 			newLinks := util.LinkGenerator(client.Config, &inbound, serverHost)
 			for _, newLink := range newLinks {
@@ -417,7 +603,7 @@ func (s *ClientService) UpdateLinksByInboundChange(tx *gorm.DB, inbounds *[]mode
 
 // ResetTrafficBySchedule checks clients with Extra > 0 (traffic reset days)
 // and resets their traffic when the configured monthly reset boundary is reached.
-func (s *ClientService) ResetTrafficBySchedule() error {
+func (s *ClientService) ResetTrafficBySchedule() (bool, error) {
 	db := database.GetDB()
 	now := PanelNow()
 
@@ -426,23 +612,44 @@ func (s *ClientService) ResetTrafficBySchedule() error {
 		Where("extra > 0").
 		Find(&clients).Error
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if len(clients) == 0 {
-		return nil
+		return false, nil
 	}
 
+	resetClients := make([]model.Client, 0, len(clients))
 	for _, client := range clients {
-		if !shouldResetClientTrafficMonthly(client.LastReset, client.Extra, now) {
-			continue
+		if shouldResetClientTrafficMonthly(client.LastReset, client.Extra, now) {
+			resetClients = append(resetClients, client)
 		}
+	}
+	if len(resetClients) == 0 {
+		return false, nil
+	}
+	if err := FlushTrafficRuntimeJournal(); err != nil {
+		return false, fmt.Errorf("scheduled client traffic reset requires traffic journal flush: %w", err)
+	}
+
+	changed := false
+	for _, client := range resetClients {
 		logger.Info("Resetting traffic for client ", client.Name, " (reset days: ", client.Extra, ")")
 		if resetErr := s.NftTrafficService.ResetClientTraffic(db, client.Id); resetErr != nil {
 			logger.Warning("failed to reset traffic for client ", client.Name, ": ", resetErr)
+			continue
+		}
+		changed = true
+		if client.Depleted && (client.Expiry <= 0 || client.Expiry > now.Unix()) {
+			if err := db.Model(&model.Client{}).Where("id = ? AND depleted = ?", client.Id, true).Updates(map[string]interface{}{
+				"enable":   true,
+				"depleted": false,
+			}).Error; err != nil {
+				logger.Warning("failed to re-enable reset client ", client.Name, ": ", err)
+			}
 		}
 	}
-	return nil
+	return changed, nil
 }
 
 func (s *ClientService) DepleteClients() ([]uint, error) {
@@ -458,7 +665,7 @@ func (s *ClientService) DepleteClients() ([]uint, error) {
 		return nil, tx.Error
 	}
 
-	if err := tx.Model(model.Client{}).Where("enable = true AND ((volume >0 AND up+down > volume) OR (expiry > 0 AND expiry < ?))", now).Scan(&clients).Error; err != nil {
+	if err := tx.Model(model.Client{}).Where("enable = true AND ((volume > 0 AND up + down >= volume) OR (expiry > 0 AND expiry <= ?))", now).Scan(&clients).Error; err != nil {
 		tx.Rollback()
 		return nil, err
 	}
@@ -481,7 +688,7 @@ func (s *ClientService) DepleteClients() ([]uint, error) {
 
 	// Save changes
 	if len(changes) > 0 {
-		if err := tx.Model(model.Client{}).Where("enable = true AND ((volume >0 AND up+down > volume) OR (expiry > 0 AND expiry < ?))", now).Update("enable", false).Error; err != nil {
+		if err := tx.Model(model.Client{}).Where("enable = true AND ((volume > 0 AND up + down >= volume) OR (expiry > 0 AND expiry <= ?))", now).Updates(map[string]interface{}{"enable": false, "depleted": true}).Error; err != nil {
 			tx.Rollback()
 			return nil, err
 		}

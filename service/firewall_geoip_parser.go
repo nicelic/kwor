@@ -20,6 +20,19 @@ import (
 )
 
 const (
+	firewallGeoMaxCompressedRuleCount       = 100000
+	firewallGeoMaxLogicalRuleCount          = 100000
+	firewallGeoMaxIPSetRanges               = 100000
+	firewallGeoMaxTotalIPSetRanges          = 100000
+	firewallGeoMaxDecodedBytes        int64 = 64 * 1024 * 1024
+	firewallGeoMaxSRSDepth                  = 64
+	firewallGeoMaxJSONDepth                 = 64
+	firewallGeoMaxJSONCIDRsPerRule          = 4096
+	firewallGeoMaxJSONCIDRsTotal            = 100000
+	firewallGeoMaxJSONBytes                 = 8 * 1024 * 1024
+)
+
+const (
 	firewallGeoFormatSRS  = "srs"
 	firewallGeoFormatMRS  = "mrs"
 	firewallGeoFormatJSON = "json"
@@ -32,11 +45,62 @@ const (
 )
 
 type firewallGeoResolvedPrefixes struct {
-	All         []string
 	IPv4        []string
 	IPv6        []string
 	PrefixCount int
 	ContentHash string
+}
+
+type firewallGeoParserBudget struct {
+	ipSetRanges       uint64
+	candidatePrefixes int
+	jsonRules         int
+	jsonCIDRs         int
+}
+
+func (b *firewallGeoParserBudget) addIPSetRanges(count uint64) error {
+	if count > firewallGeoMaxTotalIPSetRanges || b.ipSetRanges > firewallGeoMaxTotalIPSetRanges-count {
+		return fmt.Errorf("total ip range count exceeds %d", firewallGeoMaxTotalIPSetRanges)
+	}
+	b.ipSetRanges += count
+	return nil
+}
+
+func (b *firewallGeoParserBudget) addIPRange(builder *netipx.IPSetBuilder, from netip.Addr, to netip.Addr) error {
+	if builder == nil {
+		return fmt.Errorf("missing ip set builder")
+	}
+	prefixes := netipx.IPRangeFrom(from, to).Prefixes()
+	if len(prefixes) == 0 {
+		return fmt.Errorf("invalid ip range")
+	}
+	if len(prefixes) > firewallGeoMaxPrefixCount || b.candidatePrefixes > firewallGeoMaxPrefixCount-len(prefixes) {
+		return fmt.Errorf("ip range expansion exceeds %d prefixes", firewallGeoMaxPrefixCount)
+	}
+	b.candidatePrefixes += len(prefixes)
+	for _, prefix := range prefixes {
+		builder.AddPrefix(prefix.Masked())
+	}
+	return nil
+}
+
+func (b *firewallGeoParserBudget) enterJSONRule(depth int) error {
+	if depth > firewallGeoMaxJSONDepth {
+		return fmt.Errorf("json rule nesting exceeds %d", firewallGeoMaxJSONDepth)
+	}
+	if b.jsonRules >= firewallGeoMaxCompressedRuleCount {
+		return fmt.Errorf("json rule count exceeds %d", firewallGeoMaxCompressedRuleCount)
+	}
+	b.jsonRules++
+	return nil
+}
+
+func (b *firewallGeoParserBudget) addJSONCIDR() error {
+	if b.jsonCIDRs >= firewallGeoMaxJSONCIDRsTotal {
+		return fmt.Errorf("json cidr count exceeds %d", firewallGeoMaxJSONCIDRsTotal)
+	}
+	b.jsonCIDRs++
+	return nil
 }
 
 // The SRS parser below is adapted from the user's provided sing-box
@@ -167,37 +231,44 @@ func parseFirewallGeoSRS(content []byte) (firewallGeoResolvedPrefixes, error) {
 	}
 	defer zr.Close()
 
-	br := bufio.NewReader(zr)
+	br := bufio.NewReader(io.LimitReader(zr, firewallGeoMaxDecodedBytes+1))
 	ruleCount, err := binary.ReadUvarint(br)
 	if err != nil {
 		return firewallGeoResolvedPrefixes{}, err
 	}
+	if ruleCount > firewallGeoMaxCompressedRuleCount {
+		return firewallGeoResolvedPrefixes{}, fmt.Errorf("srs rule count exceeds %d", firewallGeoMaxCompressedRuleCount)
+	}
 
 	var builder netipx.IPSetBuilder
+	budget := &firewallGeoParserBudget{}
 	for index := uint64(0); index < ruleCount; index++ {
-		if err := parseFirewallGeoSRSRule(br, &builder); err != nil {
+		if err := parseFirewallGeoSRSRule(br, &builder, budget, 0); err != nil {
 			return firewallGeoResolvedPrefixes{}, fmt.Errorf("read srs rule[%d]: %w", index, err)
 		}
 	}
 	return buildFirewallGeoResolvedPrefixes(&builder)
 }
 
-func parseFirewallGeoSRSRule(reader *bufio.Reader, builder *netipx.IPSetBuilder) error {
+func parseFirewallGeoSRSRule(reader *bufio.Reader, builder *netipx.IPSetBuilder, budget *firewallGeoParserBudget, depth int) error {
+	if depth > firewallGeoMaxSRSDepth {
+		return fmt.Errorf("srs rule nesting exceeds %d", firewallGeoMaxSRSDepth)
+	}
 	ruleType, err := reader.ReadByte()
 	if err != nil {
 		return err
 	}
 	switch ruleType {
 	case 0:
-		return parseFirewallGeoSRSDefaultRule(reader, builder)
+		return parseFirewallGeoSRSDefaultRule(reader, builder, budget)
 	case 1:
-		return parseFirewallGeoSRSLogicalRule(reader, builder)
+		return parseFirewallGeoSRSLogicalRule(reader, builder, budget, depth+1)
 	default:
 		return fmt.Errorf("unsupported srs rule type: %d", ruleType)
 	}
 }
 
-func parseFirewallGeoSRSDefaultRule(reader *bufio.Reader, builder *netipx.IPSetBuilder) error {
+func parseFirewallGeoSRSDefaultRule(reader *bufio.Reader, builder *netipx.IPSetBuilder, budget *firewallGeoParserBudget) error {
 	for {
 		itemType, err := reader.ReadByte()
 		if err != nil {
@@ -205,7 +276,7 @@ func parseFirewallGeoSRSDefaultRule(reader *bufio.Reader, builder *netipx.IPSetB
 		}
 		switch itemType {
 		case firewallGeoSRSRuleItemSourceIPCIDR, firewallGeoSRSRuleItemIPCIDR:
-			if err := readFirewallGeoSRSIPSet(reader, builder); err != nil {
+			if err := readFirewallGeoSRSIPSet(reader, builder, budget); err != nil {
 				return err
 			}
 		case firewallGeoSRSRuleItemFinal:
@@ -220,7 +291,7 @@ func parseFirewallGeoSRSDefaultRule(reader *bufio.Reader, builder *netipx.IPSetB
 	}
 }
 
-func parseFirewallGeoSRSLogicalRule(reader *bufio.Reader, builder *netipx.IPSetBuilder) error {
+func parseFirewallGeoSRSLogicalRule(reader *bufio.Reader, builder *netipx.IPSetBuilder, budget *firewallGeoParserBudget, depth int) error {
 	mode, err := reader.ReadByte()
 	if err != nil {
 		return err
@@ -232,8 +303,11 @@ func parseFirewallGeoSRSLogicalRule(reader *bufio.Reader, builder *netipx.IPSetB
 	if err != nil {
 		return err
 	}
+	if length > firewallGeoMaxLogicalRuleCount {
+		return fmt.Errorf("srs logical rule count exceeds %d", firewallGeoMaxLogicalRuleCount)
+	}
 	for index := uint64(0); index < length; index++ {
-		if err := parseFirewallGeoSRSRule(reader, builder); err != nil {
+		if err := parseFirewallGeoSRSRule(reader, builder, budget, depth); err != nil {
 			return fmt.Errorf("read logical rule[%d]: %w", index, err)
 		}
 	}
@@ -251,7 +325,7 @@ func readFirewallGeoSRSInvertFlag(reader *bufio.Reader) error {
 	return nil
 }
 
-func readFirewallGeoSRSIPSet(reader *bufio.Reader, builder *netipx.IPSetBuilder) error {
+func readFirewallGeoSRSIPSet(reader *bufio.Reader, builder *netipx.IPSetBuilder, budget *firewallGeoParserBudget) error {
 	version, err := reader.ReadByte()
 	if err != nil {
 		return err
@@ -264,6 +338,15 @@ func readFirewallGeoSRSIPSet(reader *bufio.Reader, builder *netipx.IPSetBuilder)
 	if err := binary.Read(reader, binary.BigEndian, &length); err != nil {
 		return err
 	}
+	if length > firewallGeoMaxIPSetRanges {
+		return fmt.Errorf("srs ip range count exceeds %d", firewallGeoMaxIPSetRanges)
+	}
+	if budget == nil {
+		return fmt.Errorf("missing srs parser budget")
+	}
+	if err := budget.addIPSetRanges(length); err != nil {
+		return err
+	}
 	for index := uint64(0); index < length; index++ {
 		from, err := readFirewallGeoSRSAddr(reader)
 		if err != nil {
@@ -273,7 +356,9 @@ func readFirewallGeoSRSIPSet(reader *bufio.Reader, builder *netipx.IPSetBuilder)
 		if err != nil {
 			return err
 		}
-		builder.AddRange(netipx.IPRangeFrom(from, to))
+		if err := budget.addIPRange(builder, from, to); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -282,6 +367,9 @@ func readFirewallGeoSRSAddr(reader *bufio.Reader) (netip.Addr, error) {
 	length, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return netip.Addr{}, err
+	}
+	if length != 4 && length != 16 {
+		return netip.Addr{}, fmt.Errorf("unsupported ip length: %d", length)
 	}
 	raw := make([]byte, length)
 	if _, err := io.ReadFull(reader, raw); err != nil {
@@ -296,9 +384,10 @@ func parseFirewallGeoMRS(content []byte) (firewallGeoResolvedPrefixes, error) {
 		return firewallGeoResolvedPrefixes{}, err
 	}
 	defer zr.Close()
+	limited := io.LimitReader(zr, firewallGeoMaxDecodedBytes+1)
 
 	var header [4]byte
-	if _, err := io.ReadFull(zr, header[:]); err != nil {
+	if _, err := io.ReadFull(limited, header[:]); err != nil {
 		return firewallGeoResolvedPrefixes{}, err
 	}
 	if header != firewallGeoMRSMagic {
@@ -306,7 +395,7 @@ func parseFirewallGeoMRS(content []byte) (firewallGeoResolvedPrefixes, error) {
 	}
 
 	behavior := make([]byte, 1)
-	if _, err := io.ReadFull(zr, behavior); err != nil {
+	if _, err := io.ReadFull(limited, behavior); err != nil {
 		return firewallGeoResolvedPrefixes{}, err
 	}
 	if behavior[0] != 1 {
@@ -314,28 +403,34 @@ func parseFirewallGeoMRS(content []byte) (firewallGeoResolvedPrefixes, error) {
 	}
 
 	var count int64
-	if err := binary.Read(zr, binary.BigEndian, &count); err != nil {
+	if err := binary.Read(limited, binary.BigEndian, &count); err != nil {
 		return firewallGeoResolvedPrefixes{}, err
 	}
 	if count < 0 {
 		return firewallGeoResolvedPrefixes{}, fmt.Errorf("invalid mrs count")
 	}
+	if count > firewallGeoMaxCompressedRuleCount {
+		return firewallGeoResolvedPrefixes{}, fmt.Errorf("mrs rule count exceeds %d", firewallGeoMaxCompressedRuleCount)
+	}
 
 	var extraLength int64
-	if err := binary.Read(zr, binary.BigEndian, &extraLength); err != nil {
+	if err := binary.Read(limited, binary.BigEndian, &extraLength); err != nil {
 		return firewallGeoResolvedPrefixes{}, err
 	}
 	if extraLength < 0 {
 		return firewallGeoResolvedPrefixes{}, fmt.Errorf("invalid mrs extra length")
 	}
+	if extraLength > firewallGeoMaxDecodedBytes {
+		return firewallGeoResolvedPrefixes{}, fmt.Errorf("mrs extra data exceeds %d MiB", firewallGeoMaxDecodedBytes/(1024*1024))
+	}
 	if extraLength > 0 {
-		if _, err := io.CopyN(io.Discard, zr, extraLength); err != nil {
+		if _, err := io.CopyN(io.Discard, limited, extraLength); err != nil {
 			return firewallGeoResolvedPrefixes{}, err
 		}
 	}
 
 	version := make([]byte, 1)
-	if _, err := io.ReadFull(zr, version); err != nil {
+	if _, err := io.ReadFull(limited, version); err != nil {
 		return firewallGeoResolvedPrefixes{}, err
 	}
 	if version[0] != 1 {
@@ -343,66 +438,116 @@ func parseFirewallGeoMRS(content []byte) (firewallGeoResolvedPrefixes, error) {
 	}
 
 	var length int64
-	if err := binary.Read(zr, binary.BigEndian, &length); err != nil {
+	if err := binary.Read(limited, binary.BigEndian, &length); err != nil {
 		return firewallGeoResolvedPrefixes{}, err
 	}
 	if length < 1 {
 		return firewallGeoResolvedPrefixes{}, fmt.Errorf("invalid mrs ipcidr length")
 	}
+	if length > firewallGeoMaxIPSetRanges {
+		return firewallGeoResolvedPrefixes{}, fmt.Errorf("mrs ip range count exceeds %d", firewallGeoMaxIPSetRanges)
+	}
+	budget := &firewallGeoParserBudget{}
+	if err := budget.addIPSetRanges(uint64(length)); err != nil {
+		return firewallGeoResolvedPrefixes{}, err
+	}
 
 	var builder netipx.IPSetBuilder
 	for index := int64(0); index < length; index++ {
 		var from16 [16]byte
-		if err := binary.Read(zr, binary.BigEndian, &from16); err != nil {
+		if err := binary.Read(limited, binary.BigEndian, &from16); err != nil {
 			return firewallGeoResolvedPrefixes{}, err
 		}
 		var to16 [16]byte
-		if err := binary.Read(zr, binary.BigEndian, &to16); err != nil {
+		if err := binary.Read(limited, binary.BigEndian, &to16); err != nil {
 			return firewallGeoResolvedPrefixes{}, err
 		}
 		from := netip.AddrFrom16(from16).Unmap()
 		to := netip.AddrFrom16(to16).Unmap()
-		builder.AddRange(netipx.IPRangeFrom(from, to))
+		if err := budget.addIPRange(&builder, from, to); err != nil {
+			return firewallGeoResolvedPrefixes{}, err
+		}
 	}
 
 	return buildFirewallGeoResolvedPrefixes(&builder)
 }
 
 func parseFirewallGeoJSON(content []byte) (firewallGeoResolvedPrefixes, error) {
-	var root map[string]any
+	if len(content) > firewallGeoMaxJSONBytes {
+		return firewallGeoResolvedPrefixes{}, fmt.Errorf("json ruleset exceeds %d MiB", firewallGeoMaxJSONBytes/(1024*1024))
+	}
 	decoder := json.NewDecoder(bytes.NewReader(content))
 	decoder.UseNumber()
-	if err := decoder.Decode(&root); err != nil {
+	token, err := decoder.Token()
+	if err != nil {
 		return firewallGeoResolvedPrefixes{}, err
 	}
-
-	rawRules, exists := root["rules"]
-	if !exists {
-		return firewallGeoResolvedPrefixes{}, fmt.Errorf("missing rules array")
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return firewallGeoResolvedPrefixes{}, fmt.Errorf("json ruleset root must be an object")
 	}
-	for key := range root {
+
+	var builder netipx.IPSetBuilder
+	budget := &firewallGeoParserBudget{}
+	foundRules := false
+	for decoder.More() {
+		keyToken, keyErr := decoder.Token()
+		if keyErr != nil {
+			return firewallGeoResolvedPrefixes{}, keyErr
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return firewallGeoResolvedPrefixes{}, fmt.Errorf("invalid json ruleset field")
+		}
 		switch key {
-		case "version", "rules":
+		case "version":
+			var version any
+			if err := decoder.Decode(&version); err != nil {
+				return firewallGeoResolvedPrefixes{}, err
+			}
+		case "rules":
+			if foundRules {
+				return firewallGeoResolvedPrefixes{}, fmt.Errorf("duplicate rules array")
+			}
+			foundRules = true
+			delimiter, err := decoder.Token()
+			if err != nil {
+				return firewallGeoResolvedPrefixes{}, err
+			}
+			if value, ok := delimiter.(json.Delim); !ok || value != '[' {
+				return firewallGeoResolvedPrefixes{}, fmt.Errorf("invalid json rules array")
+			}
+			for index := 0; decoder.More(); index++ {
+				var rule any
+				if err := decoder.Decode(&rule); err != nil {
+					return firewallGeoResolvedPrefixes{}, err
+				}
+				if err := parseFirewallGeoJSONRule(rule, &builder, budget, 0); err != nil {
+					return firewallGeoResolvedPrefixes{}, fmt.Errorf("read json rule[%d]: %w", index, err)
+				}
+			}
+			if _, err := decoder.Token(); err != nil {
+				return firewallGeoResolvedPrefixes{}, err
+			}
 		default:
 			return firewallGeoResolvedPrefixes{}, fmt.Errorf("unsupported json ruleset field: %s", key)
 		}
 	}
-
-	rules, ok := rawRules.([]any)
-	if !ok {
-		return firewallGeoResolvedPrefixes{}, fmt.Errorf("invalid json rules array")
+	if _, err := decoder.Token(); err != nil {
+		return firewallGeoResolvedPrefixes{}, err
 	}
-
-	var builder netipx.IPSetBuilder
-	for index, rule := range rules {
-		if err := parseFirewallGeoJSONRule(rule, &builder); err != nil {
-			return firewallGeoResolvedPrefixes{}, fmt.Errorf("read json rule[%d]: %w", index, err)
-		}
+	if !foundRules {
+		return firewallGeoResolvedPrefixes{}, fmt.Errorf("missing rules array")
 	}
 	return buildFirewallGeoResolvedPrefixes(&builder)
 }
 
-func parseFirewallGeoJSONRule(raw any, builder *netipx.IPSetBuilder) error {
+func parseFirewallGeoJSONRule(raw any, builder *netipx.IPSetBuilder, budget *firewallGeoParserBudget, depth int) error {
+	if budget == nil {
+		return fmt.Errorf("missing json parser budget")
+	}
+	if err := budget.enterJSONRule(depth); err != nil {
+		return err
+	}
 	rule, ok := raw.(map[string]any)
 	if !ok {
 		return fmt.Errorf("invalid json rule object")
@@ -425,7 +570,7 @@ func parseFirewallGeoJSONRule(raw any, builder *netipx.IPSetBuilder) error {
 			return fmt.Errorf("invalid json logical children")
 		}
 		for index, child := range children {
-			if err := parseFirewallGeoJSONRule(child, builder); err != nil {
+			if err := parseFirewallGeoJSONRule(child, builder, budget, depth+1); err != nil {
 				return fmt.Errorf("read logical child[%d]: %w", index, err)
 			}
 		}
@@ -447,6 +592,12 @@ func parseFirewallGeoJSONRule(raw any, builder *netipx.IPSetBuilder) error {
 			return fmt.Errorf("%s: %w", key, err)
 		}
 		for _, value := range values {
+			if collected >= firewallGeoMaxJSONCIDRsPerRule {
+				return fmt.Errorf("json rule cidr count exceeds %d", firewallGeoMaxJSONCIDRsPerRule)
+			}
+			if err := budget.addJSONCIDR(); err != nil {
+				return err
+			}
 			if err := addFirewallGeoPrefixString(builder, value); err != nil {
 				return fmt.Errorf("%s: %w", key, err)
 			}
@@ -495,10 +646,12 @@ func parseFirewallGeoJSONBool(raw any) bool {
 }
 
 func parseFirewallGeoTXT(content []byte) (firewallGeoResolvedPrefixes, error) {
-	lines := strings.Split(strings.ReplaceAll(string(content), "\r\n", "\n"), "\n")
+	scanner := bufio.NewScanner(bytes.NewReader(content))
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	var builder netipx.IPSetBuilder
 	count := 0
-	for _, line := range lines {
+	for scanner.Scan() {
+		line := scanner.Text()
 		entry := strings.TrimSpace(line)
 		if entry == "" || strings.HasPrefix(entry, "#") {
 			continue
@@ -529,6 +682,9 @@ func parseFirewallGeoTXT(content []byte) (firewallGeoResolvedPrefixes, error) {
 			return firewallGeoResolvedPrefixes{}, fmt.Errorf("invalid txt rule line %q: %w", entry, err)
 		}
 		count++
+	}
+	if err := scanner.Err(); err != nil {
+		return firewallGeoResolvedPrefixes{}, err
 	}
 	if count == 0 {
 		return firewallGeoResolvedPrefixes{}, fmt.Errorf("txt ruleset contains no valid ip prefixes")
@@ -566,16 +722,17 @@ func buildFirewallGeoResolvedPrefixes(builder *netipx.IPSetBuilder) (firewallGeo
 	if len(prefixes) == 0 {
 		return firewallGeoResolvedPrefixes{}, fmt.Errorf("ruleset contains no usable ip prefixes")
 	}
+	if len(prefixes) > firewallGeoMaxPrefixCount {
+		return firewallGeoResolvedPrefixes{}, fmt.Errorf("ruleset prefix count exceeds %d", firewallGeoMaxPrefixCount)
+	}
 
 	result := firewallGeoResolvedPrefixes{
-		All:  make([]string, 0, len(prefixes)),
 		IPv4: make([]string, 0, len(prefixes)),
 		IPv6: make([]string, 0, len(prefixes)),
 	}
 	hashBuilder := strings.Builder{}
 	for _, prefix := range prefixes {
 		value := prefix.Masked().String()
-		result.All = append(result.All, value)
 		if prefix.Addr().Is4() {
 			result.IPv4 = append(result.IPv4, value)
 		} else {
@@ -585,7 +742,7 @@ func buildFirewallGeoResolvedPrefixes(builder *netipx.IPSetBuilder) (firewallGeo
 		hashBuilder.WriteByte('\n')
 	}
 	sum := sha256.Sum256([]byte(hashBuilder.String()))
-	result.PrefixCount = len(result.All)
+	result.PrefixCount = len(result.IPv4) + len(result.IPv6)
 	result.ContentHash = hex.EncodeToString(sum[:])
 	return result, nil
 }

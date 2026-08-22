@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/alireza0/s-ui/database/model"
+	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/util"
 )
 
@@ -102,7 +103,11 @@ func sanitizeMihomoMieruInboundPortRange(inbound *model.MihomoInbound) (string, 
 	if err != nil {
 		return "", err
 	}
-
+	if normalizedRange != "" {
+		if err := validateMihomoManagedPortRange(normalizedRange, "mieru port range"); err != nil {
+			return "", err
+		}
+	}
 	delete(options, "port_bindings")
 	if normalizedRange == "" {
 		delete(options, mihomoMieruPortRangeOptionKey)
@@ -122,7 +127,7 @@ func sanitizeMihomoMieruInboundPortRange(inbound *model.MihomoInbound) (string, 
 }
 
 func resolveMihomoInboundRedirectSpec(inbound *model.MihomoInbound) (string, bool) {
-	if inbound == nil {
+	if inbound == nil || !isSupportedMihomoInboundType(inbound.Type) {
 		return "", false
 	}
 	if inbound.Type == "mieru" {
@@ -131,5 +136,13 @@ func resolveMihomoInboundRedirectSpec(inbound *model.MihomoInbound) (string, boo
 		}
 		return extractMihomoMieruPortRangeFromOutJSON(inbound.OutJson), true
 	}
-	return extractPortHopRange(inbound.Options), false
+	if !strings.EqualFold(strings.TrimSpace(inbound.Type), "hysteria2") {
+		return "", false
+	}
+	portHopRange, err := normalizeMihomoPortHopRange(extractPortHopRange(inbound.Options))
+	if err != nil {
+		logger.Warning("skip invalid mihomo hysteria2 port hop range for inbound ", inbound.Tag, ": ", err)
+		return "", false
+	}
+	return portHopRange, false
 }

@@ -39,10 +39,12 @@ func sanitizeSingboxRuntimeOutbound(outbound map[string]interface{}) string {
 
 	protocol := strings.ToLower(strings.TrimSpace(firstString(outbound["type"])))
 
+	util.PromoteHysteria2ReceiveWindowsToSingbox(outbound)
 	delete(outbound, "mihomo_common")
 	delete(outbound, "mihomo_hy2")
 	delete(outbound, "mihomo_fast_open")
 	delete(outbound, "fast_open")
+	delete(outbound, "fast-open")
 
 	util.SanitizeSingboxSubscriptionOutbound(outbound)
 

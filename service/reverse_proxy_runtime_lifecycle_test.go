@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
@@ -58,6 +59,8 @@ func newReverseProxyLifecycleTestConn(localIP string, localPort int, remoteIP st
 }
 
 func TestReverseProxyCertificateBalanceRuntimePrunesReleasedEntry(t *testing.T) {
+	baseline := reverseProxyCertificateBalanceEntryCount.Load()
+	t.Cleanup(func() { reverseProxyCertificateBalanceEntryCount.Store(baseline) })
 	binding := &reverseProxyRuleCertificateBinding{
 		RuleID:              7,
 		CertificateRecordID: 11,
@@ -87,10 +90,44 @@ func TestReverseProxyCertificateBalanceRuntimePrunesReleasedEntry(t *testing.T) 
 	if remaining != 0 || entries != 0 {
 		t.Fatalf("released stale certificate balance entry must be pruned, groups=%d entries=%d", remaining, entries)
 	}
+	if got := reverseProxyCertificateBalanceEntryCount.Load(); got != baseline {
+		t.Fatalf("pruned certificate balance entry must release its process-wide slot: got %d want %d", got, baseline)
+	}
+}
+
+func TestReverseProxyCertificateBalanceUsesProcessWideBudget(t *testing.T) {
+	baseline := reverseProxyCertificateBalanceEntryCount.Load()
+	t.Cleanup(func() { reverseProxyCertificateBalanceEntryCount.Store(baseline) })
+	reverseProxyCertificateBalanceEntryCount.Store(reverseProxyRuntimeTableMaxEntries)
+
+	binding := &reverseProxyRuleCertificateBinding{
+		RuleID:              8,
+		CertificateRecordID: 12,
+		Certificate:         &tls.Certificate{},
+		Leaf:                reverseProxyTestLeafState("budget.example"),
+	}
+	group := &reverseProxyListenerGroup{key: "https|8443"}
+	selected, selection, err := group.selectBalancedCertificate([]*reverseProxyRuleCertificateBinding{binding}, "budget.example")
+	if err != nil || selected != binding {
+		t.Fatalf("selection should stay available when diagnostics are full: selected=%#v err=%v", selected, err)
+	}
+	if selection.CertificateRecordID != 0 {
+		t.Fatalf("full process-wide diagnostic budget must not create another tracked selection: %#v", selection)
+	}
+	shard := group.certificateBalanceShard("budget.example")
+	shard.mu.Lock()
+	entries := shard.entries
+	shard.mu.Unlock()
+	if entries != 0 {
+		t.Fatalf("full process-wide diagnostic budget must not create a shard state: %d", entries)
+	}
 }
 
 func TestReverseProxyCertificateBalanceEvictionKeepsNewSelectionReachable(t *testing.T) {
-	oldState := &reverseProxyCertificateBalanceRuntimeState{UpdatedAtUnix: time.Now().Unix()}
+	baseline := reverseProxyCertificateBalanceEntryCount.Load()
+	t.Cleanup(func() { reverseProxyCertificateBalanceEntryCount.Store(baseline) })
+	reverseProxyCertificateBalanceEntryCount.Store(1)
+	oldState := &reverseProxyCertificateBalanceRuntimeState{UpdatedAtUnix: time.Now().Unix(), globalSlot: true}
 	group := &reverseProxyListenerGroup{key: "https|443"}
 	shard := group.certificateBalanceShard("new.example")
 	lru := list.New()
@@ -123,6 +160,8 @@ func TestReverseProxyCertificateBalanceEvictionKeepsNewSelectionReachable(t *tes
 }
 
 func TestReverseProxyPendingTLSEvictionReleasesCertificateBalanceLease(t *testing.T) {
+	baseline := reverseProxyCertificateBalanceEntryCount.Load()
+	t.Cleanup(func() { reverseProxyCertificateBalanceEntryCount.Store(baseline) })
 	binding := &reverseProxyRuleCertificateBinding{
 		RuleID:              19,
 		CertificateRecordID: 29,
@@ -189,6 +228,8 @@ func TestReverseProxyPendingTLSEvictionReleasesCertificateBalanceLease(t *testin
 }
 
 func TestReverseProxyUnboundTLSSelectionReleasesCertificateBalanceLease(t *testing.T) {
+	baseline := reverseProxyCertificateBalanceEntryCount.Load()
+	t.Cleanup(func() { reverseProxyCertificateBalanceEntryCount.Store(baseline) })
 	binding := &reverseProxyRuleCertificateBinding{
 		RuleID:              31,
 		CertificateRecordID: 41,
@@ -211,6 +252,25 @@ func TestReverseProxyUnboundTLSSelectionReleasesCertificateBalanceLease(t *testi
 	shard.mu.Unlock()
 	if active != 0 {
 		t.Fatalf("unbound TLS selection leaked its certificate balance lease: active=%d", active)
+	}
+}
+
+func TestReverseProxyMaintenancePrunesExpiredCachedUpstream(t *testing.T) {
+	cleaned := 0
+	group := &reverseProxyListenerGroup{
+		upstreamByRule: map[uint]*reverseProxyCachedUpstream{
+			44: {
+				ResolvedAt:   time.Now().Add(-reverseProxyUpstreamResolveCacheTTL - time.Second),
+				RoundTripper: http.DefaultTransport,
+				Cleanup: func() {
+					cleaned++
+				},
+			},
+		},
+	}
+	group.pruneExpiredCachedUpstreams(time.Now())
+	if _, exists := group.upstreamByRule[44]; exists || cleaned != 1 {
+		t.Fatalf("maintenance must release an expired idle upstream transport: present=%v cleaned=%d", exists, cleaned)
 	}
 }
 

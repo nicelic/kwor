@@ -62,7 +62,7 @@ func TestCollectInboundLimitRanges_MieruIncludesListenPortRangeAndBindings(t *te
 	})
 }
 
-func TestCollectMihomoInboundLimitRanges_MieruAndHysteria2(t *testing.T) {
+func TestCollectMihomoInboundLimitRanges_IncludesListenAndActiveRanges(t *testing.T) {
 	t.Run("mieru from options", func(t *testing.T) {
 		inbound := &model.MihomoInbound{
 			Type:    "mieru",
@@ -83,7 +83,7 @@ func TestCollectMihomoInboundLimitRanges_MieruAndHysteria2(t *testing.T) {
 		inbound := &model.MihomoInbound{
 			Type:    "mieru",
 			Options: json.RawMessage(`{"listen_port":31100}`),
-			OutJson: json.RawMessage(`{"port_range":"21000-25000"}`),
+			OutJson: json.RawMessage(`{"port_range":"21000:25000"}`),
 		}
 
 		ranges := collectMihomoInboundLimitRanges(inbound)

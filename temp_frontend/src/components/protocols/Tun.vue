@@ -10,7 +10,7 @@
         <v-text-field v-model="data.interface_name" :label="$t('types.tun.ifName')" placeholder="tun0" hide-details clearable @click:clear="delete data.interface_name"></v-text-field>
       </v-col>
       <v-col cols="12" sm="6" md="4">
-        <v-text-field type="number" v-model.number="data.mtu" label="MTU" hide-details></v-text-field>
+        <v-text-field type="number" v-model="mtu" min="576" max="65535" step="1" label="MTU" hide-details></v-text-field>
       </v-col>
     </v-row>
     <v-row>
@@ -19,7 +19,8 @@
           type="number"
           v-model.number="udpTimeout"
           label="UDP timeout"
-          min="1"
+          min="0"
+          step="any"
           :suffix="$t('date.m')"
           hide-details>
         </v-text-field>
@@ -51,6 +52,8 @@
 </template>
 
 <script lang="ts">
+import { readSingboxDuration, writeSingboxDuration } from '@/plugins/singboxDuration'
+import { parseSingboxInteger } from '@/plugins/singboxInteger'
 
 export default {
   props: ['data'],
@@ -65,8 +68,12 @@ export default {
       set(v:string) { this.$props.data.address = v.length > 0 ? v.split(',') : undefined }
     },
     udpTimeout: {
-      get() { return this.$props.data.udp_timeout ? parseInt(this.$props.data.udp_timeout.replace('m','')) : 5 },
-      set(v:number) { this.$props.data.udp_timeout = v > 0 ? v + 'm' : '5m' }
+      get() { return readSingboxDuration(this.$props.data.udp_timeout, 'm') ?? 5 },
+      set(v:number) { this.$props.data.udp_timeout = writeSingboxDuration(v, 'm') ?? '5m' }
+    },
+    mtu: {
+      get() { return parseSingboxInteger(this.$props.data.mtu, { min: 576, max: 65535 }) ?? '' },
+      set(value:unknown) { this.$props.data.mtu = parseSingboxInteger(value, { min: 576, max: 65535 }) }
     },
     autoRoute: {
       get() { return this.$props.data.auto_route ?? false },

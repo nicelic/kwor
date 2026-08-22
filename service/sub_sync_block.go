@@ -32,6 +32,27 @@ func blockSubSyncInboundBySubOutbound(tx *gorm.DB, record *model.SubOutbound) er
 	return blockSubSyncInbound(tx, record.SourceType, record.SourceClientId, record.SourceInboundId)
 }
 
+// disableAutoSyncBySubOutbound turns off the whole client's automatic sync
+// registration when a managed subscription node is manually deleted. The
+// registry update stays inside the caller's transaction so the deleted node,
+// block record and auto-sync state cannot diverge.
+func disableAutoSyncBySubOutbound(tx *gorm.DB, record *model.SubOutbound) error {
+	if record == nil || record.SourceClientId == 0 {
+		return nil
+	}
+	settings := &SettingService{}
+	switch record.SourceType {
+	case subOutboundSourceClient:
+		_, err := settings.SetSubManagerAutoSyncClientTx(tx, record.SourceClientId, false)
+		return err
+	case subOutboundSourceMihomoClient:
+		_, err := settings.SetSubManagerAutoSyncMihomoClientTx(tx, record.SourceClientId, false)
+		return err
+	default:
+		return nil
+	}
+}
+
 func loadBlockedSubSyncInboundIDs(tx *gorm.DB, sourceType string, clientID uint) (map[uint]struct{}, error) {
 	result := make(map[uint]struct{})
 	if tx == nil || !supportsSubSyncBlockSourceType(sourceType) || clientID == 0 {

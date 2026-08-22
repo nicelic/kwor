@@ -24,6 +24,9 @@ func TestSubOutboundDelete_RecordsBlockedAutoSyncTarget(t *testing.T) {
 	if err := db.Create(record).Error; err != nil {
 		t.Fatalf("create suboutbound failed: %v", err)
 	}
+	if err := (&SettingService{}).SaveSubManagerAutoSyncClientIDs([]uint{11}); err != nil {
+		t.Fatalf("save default auto sync ids failed: %v", err)
+	}
 
 	rawTag, err := json.Marshal(record.Tag)
 	if err != nil {
@@ -55,6 +58,59 @@ func TestSubOutboundDelete_RecordsBlockedAutoSyncTarget(t *testing.T) {
 	}
 	if blockCount != 1 {
 		t.Fatalf("expected one sub sync block record, got %d", blockCount)
+	}
+	autoSyncIDs, err := (&SettingService{}).GetSubManagerAutoSyncClientIDs()
+	if err != nil {
+		t.Fatalf("load default auto sync ids failed: %v", err)
+	}
+	if len(autoSyncIDs) != 0 {
+		t.Fatalf("expected manual delete to disable default auto sync, got %#v", autoSyncIDs)
+	}
+}
+
+func TestSubOutboundDelete_DisablesMihomoAutoSyncForManagedClient(t *testing.T) {
+	db := setupSubSyncBlockTestDB(t, "sub-sync-block-delete-mihomo.db")
+
+	record := &model.SubOutbound{
+		Type:            "direct",
+		Tag:             "mihomo_sub_node_a",
+		Options:         json.RawMessage(`{}`),
+		SourceType:      subOutboundSourceMihomoClient,
+		SourceClientId:  12,
+		SourceInboundId: 23,
+	}
+	if err := db.Create(record).Error; err != nil {
+		t.Fatalf("create mihomo suboutbound failed: %v", err)
+	}
+	if err := (&SettingService{}).SaveSubManagerAutoSyncMihomoClientIDs([]uint{12}); err != nil {
+		t.Fatalf("save mihomo auto sync ids failed: %v", err)
+	}
+
+	rawTag, err := json.Marshal(record.Tag)
+	if err != nil {
+		t.Fatalf("marshal mihomo tag failed: %v", err)
+	}
+	tx := db.Begin()
+	if tx.Error != nil {
+		t.Fatalf("begin tx failed: %v", tx.Error)
+	}
+	BeginManagedRuntimeHookScope(tx)
+	if err := (&SubOutboundService{}).Save(tx, "del", rawTag); err != nil {
+		DiscardManagedRuntimeHookScope(tx)
+		tx.Rollback()
+		t.Fatalf("delete mihomo suboutbound failed: %v", err)
+	}
+	DiscardManagedRuntimeHookScope(tx)
+	if err := tx.Commit().Error; err != nil {
+		t.Fatalf("commit tx failed: %v", err)
+	}
+
+	autoSyncIDs, err := (&SettingService{}).GetSubManagerAutoSyncMihomoClientIDs()
+	if err != nil {
+		t.Fatalf("load mihomo auto sync ids failed: %v", err)
+	}
+	if len(autoSyncIDs) != 0 {
+		t.Fatalf("expected manual delete to disable mihomo auto sync, got %#v", autoSyncIDs)
 	}
 }
 

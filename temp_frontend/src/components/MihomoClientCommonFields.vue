@@ -5,7 +5,7 @@
         <v-select
           hide-details
           label="UDP"
-          :items="boolItems"
+          :items="udpItems"
           v-model="udpValue">
         </v-select>
       </v-col>
@@ -38,6 +38,7 @@
           hide-details
           type="number"
           min="0"
+          step="1"
           label="Routing Mark"
           v-model.number="routingMarkValue">
         </v-text-field>
@@ -68,6 +69,7 @@
             hide-details
             type="number"
             min="0"
+            step="1"
             :label="$t('mux.maxConn')"
             v-model.number="muxMaxConnections">
           </v-text-field>
@@ -77,6 +79,7 @@
             hide-details
             type="number"
             min="0"
+            step="1"
             :label="$t('mux.minStr')"
             v-model.number="muxMinStreams">
           </v-text-field>
@@ -86,6 +89,7 @@
             hide-details
             type="number"
             min="0"
+            step="1"
             :label="$t('mux.maxStr')"
             v-model.number="muxMaxStreams">
           </v-text-field>
@@ -129,6 +133,7 @@
             hide-details
             type="number"
             min="0"
+            step="1"
             :label="$t('stats.upload')"
             :suffix="$t('stats.Mbps')"
             v-model.number="muxBrutalUpMbps">
@@ -139,6 +144,7 @@
             hide-details
             type="number"
             min="0"
+            step="1"
             :label="$t('stats.download')"
             :suffix="$t('stats.Mbps')"
             v-model.number="muxBrutalDownMbps">
@@ -192,6 +198,9 @@ type MihomoSMux = oMultiplex & {
   only_tcp?: boolean
 }
 
+const mihomoIPVersionItems = ['dual', 'ipv4', 'ipv6', 'ipv4-prefer', 'ipv6-prefer'] as const
+type MihomoIPVersion = typeof mihomoIPVersionItems[number]
+
 export default {
   props: {
     data: {
@@ -210,7 +219,12 @@ export default {
         { title: 'true', value: true },
         { title: 'false', value: false },
       ],
-      ipVersionItems: ['dual', 'ipv4', 'ipv6', 'ipv4-prefer', 'ipv6-prefer'],
+      udpItems: [
+        { title: '', value: null },
+        { title: 'true', value: true },
+        { title: 'false', value: false },
+      ],
+      ipVersionItems: mihomoIPVersionItems,
       muxProtocols: ['smux', 'yamux', 'h2mux'],
       bbrProfileItems: [
         { title: 'conservative（保守）', value: 'conservative' },
@@ -236,6 +250,113 @@ export default {
         return profile
       }
       return ''
+    },
+    normalizeMihomoIPVersion(value: unknown): MihomoIPVersion | undefined {
+      const normalized = typeof value === 'string' ? value.trim().toLowerCase() : ''
+      return mihomoIPVersionItems.includes(normalized as MihomoIPVersion)
+        ? normalized as MihomoIPVersion
+        : undefined
+    },
+    normalizeRoutingMark(value: unknown): number | undefined {
+      if (value === '' || value === null || value === undefined) return undefined
+      const normalized = Number(value)
+      if (!Number.isSafeInteger(normalized) || normalized < 0) return undefined
+      return normalized
+    },
+    normalizeBoolean(value: unknown): boolean | undefined {
+      return value === true || value === false ? value : undefined
+    },
+    sanitizeSMuxFields(data: GenericData) {
+      const legacyMux = this.isRecord(data.mux) ? data.mux : undefined
+      const mux = this.isRecord(data.smux) ? data.smux : legacyMux
+      delete data.mux
+      if (!mux || mux.enabled === false) {
+        delete data.smux
+        return
+      }
+
+      data.smux = mux
+      if (mux.enabled !== undefined && this.normalizeBoolean(mux.enabled) === undefined) {
+        delete mux.enabled
+      }
+      if (mux.protocol !== undefined && !this.isMuxProtocol(mux.protocol)) {
+        delete mux.protocol
+      }
+      for (const key of ['max_connections', 'min_streams', 'max_streams']) {
+        if (mux[key] === undefined) continue
+        const normalized = this.normalizeRoutingMark(mux[key])
+        if (normalized === undefined) delete mux[key]
+        else mux[key] = normalized
+      }
+
+      for (const key of ['statistic', 'only_tcp', 'padding']) {
+        if (mux[key] === undefined) continue
+        const normalized = this.normalizeBoolean(mux[key])
+        if (normalized === undefined) delete mux[key]
+        else mux[key] = normalized
+      }
+      if (mux['only-tcp'] !== undefined) {
+        if (mux.only_tcp === undefined) {
+          const normalized = this.normalizeBoolean(mux['only-tcp'])
+          if (normalized !== undefined) mux.only_tcp = normalized
+        }
+        delete mux['only-tcp']
+      }
+
+      if (!this.isRecord(mux.brutal)) {
+        if (mux.brutal !== undefined) delete mux.brutal
+      } else if (mux.brutal.enabled !== true) {
+        delete mux.brutal
+      } else {
+        for (const key of ['up_mbps', 'down_mbps']) {
+          if (mux.brutal[key] === undefined) continue
+          const normalized = this.normalizeRoutingMark(mux.brutal[key])
+          if (normalized === undefined) delete mux.brutal[key]
+          else mux.brutal[key] = normalized
+        }
+      }
+      if (Object.keys(mux).length === 0) {
+        delete data.smux
+      }
+    },
+    sanitizeCurrentData() {
+      const data = this.$props.data as GenericData
+      if (!this.isRecord(data)) return
+
+      if (data.udp !== undefined && typeof data.udp !== 'boolean') {
+        delete data.udp
+      }
+      if (data.ip_version !== undefined) {
+        const ipVersion = this.normalizeMihomoIPVersion(data.ip_version)
+        if (ipVersion === undefined) delete data.ip_version
+        else data.ip_version = ipVersion
+      }
+      if (data.routing_mark !== undefined) {
+        const routingMark = this.normalizeRoutingMark(data.routing_mark)
+        if (routingMark === undefined) delete data.routing_mark
+        else data.routing_mark = routingMark
+      }
+      for (const key of ['tcp_fast_open', 'tcp_multi_path']) {
+        if (data[key] === undefined) continue
+        const normalized = this.normalizeBoolean(data[key])
+        if (normalized === undefined) delete data[key]
+        else data[key] = normalized
+      }
+      if (this.showBBRProfileOption) {
+        const bbrProfile = this.normalizeMihomoBBRProfile(data.bbr_profile)
+        if (bbrProfile === '') delete data.bbr_profile
+        else data.bbr_profile = bbrProfile
+      } else {
+        delete data.bbr_profile
+      }
+      delete data['bbr-profile']
+      this.sanitizeSMuxFields(data)
+
+      if (this.isShadowQUIC) {
+        for (const key of ['tcp_fast_open', 'tcp_multi_path', 'smux', 'bbr_profile', 'bbr-profile']) {
+          delete data[key]
+        }
+      }
     },
     ensureSMuxBooleanDefaults(mux: MihomoSMux) {
       if (typeof mux.statistic !== 'boolean') {
@@ -275,6 +396,7 @@ export default {
     },
   },
   mounted() {
+    this.sanitizeCurrentData()
     if (this.hasActiveSMux()) {
       this.ensureSMux()
     }
@@ -303,27 +425,32 @@ export default {
     },
     optionUDP: {
       get(): boolean {
-        return this.$props.data.udp !== undefined
+        return this.$props.data.udp === true || this.$props.data.udp === false
       },
       set(v: boolean) {
         if (v) {
-          this.$props.data.udp = false
+          this.$props.data.udp = true
           return
         }
         delete this.$props.data.udp
       },
     },
     udpValue: {
-      get(): boolean {
-        return this.$props.data.udp === true
+      get(): boolean | null {
+        const value = this.$props.data.udp
+        return value === true || value === false ? value : null
       },
-      set(v: boolean) {
-        this.$props.data.udp = v === true
+      set(v: boolean | null) {
+        if (v === true || v === false) {
+          this.$props.data.udp = v
+          return
+        }
+        delete this.$props.data.udp
       },
     },
     optionIPVersion: {
       get(): boolean {
-        return typeof this.$props.data.ip_version === 'string'
+        return this.normalizeMihomoIPVersion(this.$props.data.ip_version) !== undefined
       },
       set(v: boolean) {
         if (v) {
@@ -334,13 +461,11 @@ export default {
       },
     },
     ipVersionValue: {
-      get(): string {
-        return typeof this.$props.data.ip_version === 'string' && this.$props.data.ip_version.trim() !== ''
-          ? this.$props.data.ip_version
-          : 'dual'
+      get(): MihomoIPVersion {
+        return this.normalizeMihomoIPVersion(this.$props.data.ip_version) ?? 'dual'
       },
-      set(v: string) {
-        this.$props.data.ip_version = typeof v === 'string' && v.trim() !== '' ? v : 'dual'
+      set(v: MihomoIPVersion | null) {
+        this.$props.data.ip_version = this.normalizeMihomoIPVersion(v) ?? 'dual'
       },
     },
     optionTFO: {
@@ -385,7 +510,7 @@ export default {
     },
     optionRoutingMark: {
       get(): boolean {
-        return this.$props.data.routing_mark !== undefined
+        return this.normalizeRoutingMark(this.$props.data.routing_mark) !== undefined
       },
       set(v: boolean) {
         if (v) {
@@ -397,10 +522,15 @@ export default {
     },
     routingMarkValue: {
       get(): number {
-        return typeof this.$props.data.routing_mark === 'number' ? this.$props.data.routing_mark : 0
+        return this.normalizeRoutingMark(this.$props.data.routing_mark) ?? 0
       },
       set(v: number) {
-        this.$props.data.routing_mark = Number.isFinite(v) ? v : 0
+        const normalized = this.normalizeRoutingMark(v)
+        if (normalized === undefined) {
+          delete this.$props.data.routing_mark
+          return
+        }
+        this.$props.data.routing_mark = normalized
       },
     },
     showBBRProfileOption(): boolean {
@@ -452,40 +582,47 @@ export default {
       },
       set(v: MuxProtocol | undefined) {
         const mux = this.ensureSMux()
-        mux.protocol = this.isMuxProtocol(v) ? v : undefined
+        if (this.isMuxProtocol(v)) mux.protocol = v
+        else delete mux.protocol
       },
     },
     muxMaxConnections: {
       get(): number {
         const mux = this.$props.data.smux
-        if (!this.isRecord(mux) || typeof mux.max_connections !== 'number') return 0
-        return mux.max_connections
+        if (!this.isRecord(mux)) return 0
+        return this.normalizeRoutingMark(mux.max_connections) ?? 0
       },
       set(v: number) {
         const mux = this.ensureSMux()
-        mux.max_connections = Number.isFinite(v) && v >= 0 ? v : undefined
+        const normalized = this.normalizeRoutingMark(v)
+        if (normalized === undefined) delete mux.max_connections
+        else mux.max_connections = normalized
       },
     },
     muxMinStreams: {
       get(): number {
         const mux = this.$props.data.smux
-        if (!this.isRecord(mux) || typeof mux.min_streams !== 'number') return 0
-        return mux.min_streams
+        if (!this.isRecord(mux)) return 0
+        return this.normalizeRoutingMark(mux.min_streams) ?? 0
       },
       set(v: number) {
         const mux = this.ensureSMux()
-        mux.min_streams = Number.isFinite(v) && v >= 0 ? v : undefined
+        const normalized = this.normalizeRoutingMark(v)
+        if (normalized === undefined) delete mux.min_streams
+        else mux.min_streams = normalized
       },
     },
     muxMaxStreams: {
       get(): number {
         const mux = this.$props.data.smux
-        if (!this.isRecord(mux) || typeof mux.max_streams !== 'number') return 0
-        return mux.max_streams
+        if (!this.isRecord(mux)) return 0
+        return this.normalizeRoutingMark(mux.max_streams) ?? 0
       },
       set(v: number) {
         const mux = this.ensureSMux()
-        mux.max_streams = Number.isFinite(v) && v >= 0 ? v : undefined
+        const normalized = this.normalizeRoutingMark(v)
+        if (normalized === undefined) delete mux.max_streams
+        else mux.max_streams = normalized
       },
     },
     muxStatisticValue: {
@@ -515,7 +652,8 @@ export default {
       },
       set(v: boolean) {
         const mux = this.ensureSMux()
-        mux.padding = v === true ? true : undefined
+        if (v === true) mux.padding = true
+        else delete mux.padding
       },
     },
     muxBrutalEnabled: {
@@ -530,30 +668,44 @@ export default {
           return
         }
         const mux = this.ensureSMux()
-        mux.brutal = undefined
+        delete mux.brutal
       },
     },
     muxBrutalUpMbps: {
       get(): number {
         const mux = this.$props.data.smux
-        if (!this.isRecord(mux) || !this.isRecord(mux.brutal) || typeof mux.brutal.up_mbps !== 'number') return 100
-        return mux.brutal.up_mbps
+        if (!this.isRecord(mux) || !this.isRecord(mux.brutal)) return 100
+        return this.normalizeRoutingMark(mux.brutal.up_mbps) ?? 100
       },
       set(v: number) {
         const brutal = this.ensureSMuxBrutal()
-        brutal.up_mbps = Number.isFinite(v) ? v : 100
+        brutal.up_mbps = this.normalizeRoutingMark(v) ?? 100
       },
     },
     muxBrutalDownMbps: {
       get(): number {
         const mux = this.$props.data.smux
-        if (!this.isRecord(mux) || !this.isRecord(mux.brutal) || typeof mux.brutal.down_mbps !== 'number') return 100
-        return mux.brutal.down_mbps
+        if (!this.isRecord(mux) || !this.isRecord(mux.brutal)) return 100
+        return this.normalizeRoutingMark(mux.brutal.down_mbps) ?? 100
       },
       set(v: number) {
         const brutal = this.ensureSMuxBrutal()
-        brutal.down_mbps = Number.isFinite(v) ? v : 100
+        brutal.down_mbps = this.normalizeRoutingMark(v) ?? 100
       },
+    },
+  },
+  watch: {
+    data() {
+      this.sanitizeCurrentData()
+      if (this.hasActiveSMux()) {
+        this.ensureSMux()
+      }
+    },
+    protocol() {
+      this.sanitizeCurrentData()
+      if (this.hasActiveSMux()) {
+        this.ensureSMux()
+      }
     },
   },
 }

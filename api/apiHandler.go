@@ -64,10 +64,25 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.SessionActivity(c)
 	case "changePass":
 		a.ApiService.ChangePass(c)
+		if a.apiv2 != nil {
+			a.apiv2.ReloadTokens()
+		}
 	case "save":
 		a.ApiService.Save(c, loginUser)
+	case "singbox-runtime-retry":
+		a.ApiService.RetrySingboxRuntime(c, loginUser)
 	case "settings-patch":
 		a.ApiService.SaveSettingsPatch(c, loginUser)
+	case "mihomo-dns-save":
+		a.ApiService.SaveMihomoDNSPatch(c, loginUser)
+	case "mihomo-route-save":
+		a.ApiService.SaveMihomoRoutePatch(c, loginUser)
+	case "singbox-route-save":
+		a.ApiService.SaveSingboxRoute(c, loginUser)
+	case "singbox-dns-save":
+		a.ApiService.SaveSingboxDNS(c, loginUser)
+	case "singbox-basics-save":
+		a.ApiService.SaveSingboxBasics(c, loginUser)
 	case "subscription-initial-reset":
 		a.ApiService.ResetSubscriptionToInitialState(c, loginUser)
 	case "subscription-ruleset-probe":
@@ -80,6 +95,10 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.SyncToSubManager(c)
 	case "mihomoSyncToSubManager":
 		a.ApiService.SyncMihomoToSubManager(c)
+	case "client-auto-sync":
+		a.ApiService.SetClientSubManagerAutoSync(c)
+	case "mihomo-client-auto-sync":
+		a.ApiService.SetMihomoClientSubManagerAutoSync(c)
 	case "fetchSubscription":
 		a.ApiService.FetchSubscription(c)
 	case "refreshSubscription":
@@ -114,6 +133,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.AckCoreAutoUpdateError(c)
 	case "core-download-preference":
 		a.ApiService.SaveCoreDownloadPreference(c)
+	case "core-log-level":
+		a.ApiService.SaveSingboxCoreLogLevel(c, loginUser)
 	case "core-download-stop":
 		a.ApiService.StopCoreDownload(c)
 	case "mihomo-coreDownload":
@@ -134,6 +155,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.AckMihomoCoreAutoUpdateError(c)
 	case "mihomo-core-download-preference":
 		a.ApiService.SaveMihomoCoreDownloadPreference(c)
+	case "mihomo-core-log-level":
+		a.ApiService.SaveMihomoCoreLogLevel(c, loginUser)
 	case "mihomo-core-download-stop":
 		a.ApiService.StopMihomoCoreDownload(c)
 	case "panel-update-install":
@@ -158,6 +181,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.GenerateTLSFingerprint(c)
 	case "tlsCertAlgorithm":
 		a.ApiService.GenerateTLSCertAlgorithm(c)
+	case "tlsCertificateInfo":
+		a.ApiService.GetTLSCertificateInfo(c)
 	case "tlsSelfSignedTemplate":
 		a.ApiService.DetectTLSSelfSignedTemplate(c)
 	case "portOccupancy":
@@ -210,6 +235,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.ResetPortForwardRuleTraffic(c)
 	case "port-forward-overview-traffic-reset":
 		a.ApiService.ResetPortForwardOverviewTraffic(c)
+	case "port-forward-sync":
+		a.ApiService.SyncPortForward(c)
 	case "reverse-proxy-rule":
 		a.ApiService.SaveReverseProxyRule(c)
 	case "reverse-proxy-rule-status":
@@ -327,6 +354,15 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.Session(c)
 	case "load":
 		a.ApiService.LoadData(c)
+	case "singbox-route-editor-context":
+		a.ApiService.GetSingboxRouteEditorContext(c)
+		return
+	case "singbox-dns-editor-context":
+		a.ApiService.GetSingboxDNSEditorContext(c)
+		return
+	case "singbox-basics-editor-context":
+		a.ApiService.GetSingboxBasicsEditorContext(c)
+		return
 	case "mihomo-load":
 		a.ApiService.LoadMihomoData(c)
 	case "inbounds", "outbounds", "outboundgroups", "subgroups", "endpoints", "services", "tls", "clients", "config":
@@ -371,6 +407,12 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 			jsonMsg(c, action, err)
 		}
 		return
+	case "mihomo-route-targets":
+		a.ApiService.GetMihomoRouteTargets(c)
+		return
+	case "mihomo-route-editor-context":
+		a.ApiService.GetMihomoRouteEditorContext(c)
+		return
 	case "users":
 		a.ApiService.GetUsers(c)
 	case "settings":
@@ -389,6 +431,8 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetStats(c)
 	case "status":
 		a.ApiService.GetStatus(c)
+	case "dashboard-runtime":
+		a.ApiService.GetDashboardRuntime(c)
 	case "traffic-overview":
 		a.ApiService.GetTrafficOverview(c)
 	case "traffic-overview-vnstat-versions":
@@ -397,12 +441,18 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetTrafficOverviewVnstatUpdateInfo(c)
 	case "traffic-overview-vnstat-install-status":
 		a.ApiService.GetTrafficOverviewVnstatInstallStatus(c)
+	case "traffic-overview-vnstat-removal-status":
+		a.ApiService.GetTrafficOverviewVnstatRemovalStatus(c)
 	case "firewall-overview":
 		a.ApiService.GetFirewallOverview(c)
+	case "firewall-runtime":
+		a.ApiService.GetFirewallRuntime(c)
 	case "firewall-nftables-install-status":
 		a.ApiService.GetFirewallNftablesInstallStatus(c)
 	case "port-forward-overview":
 		a.ApiService.GetPortForwardOverview(c)
+	case "port-forward-runtime":
+		a.ApiService.GetPortForwardRuntime(c)
 	case "reverse-proxy-overview":
 		a.ApiService.GetReverseProxyOverview(c)
 	case "reverse-proxy-runtime":
@@ -417,6 +467,8 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetKernelPackages(c)
 	case "kernel-cleanup-scan":
 		a.ApiService.GetKernelCleanupScan(c)
+	case "kernel-cleanup-status":
+		a.ApiService.GetKernelCleanupStatus(c)
 	case "kernel-download-progress":
 		a.ApiService.GetKernelDownloadProgress(c)
 	case "kernel-install-status":
@@ -441,6 +493,10 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetAcmeIPPortStatus(c)
 	case "certificate-list":
 		a.ApiService.ListCertificates(c)
+	case "certificate-options":
+		a.ApiService.ListTLSCertificateOptions(c)
+	case "acme-certificate-log":
+		a.ApiService.GetAcmeCertificateLog(c)
 	case "tlsSelfSignedTemplates":
 		a.ApiService.GetTLSSelfSignedTemplates(c)
 	case "self-signed-authorities":

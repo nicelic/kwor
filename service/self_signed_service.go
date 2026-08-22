@@ -2,7 +2,9 @@ package service
 
 import (
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"strings"
@@ -277,23 +279,28 @@ func (s *SelfSignedService) Issue(payload SelfSignedIssuePayload) (*AcmeActionRe
 		durationUnit = defaultSelfSignedDurationUnit
 	}
 
-	serverName := ""
-	if len(domains) > 0 {
-		serverName = domains[0]
+	notBefore := time.Now()
+	notAfter := selfSignedCertificateNotAfter(notBefore, durationValue, durationUnit)
+	select {
+	case tlsKeyPairGenerationGate <- struct{}{}:
+		defer func() {
+			<-tlsKeyPairGenerationGate
+		}()
+	default:
+		return nil, common.NewError("generate keypair failed: generation already in progress")
 	}
 
-	options := fmt.Sprintf("%s,%d,%s,%s,%s", serverName, durationValue, durationUnit, keyAlgorithm, signatureAlgorithm)
-	keypair := s.ServerService.GenKeypair("tls", options)
-	if len(keypair) == 0 {
-		return nil, common.NewError("generate keypair failed: empty output")
-	}
-	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(keypair[0])), "failed to generate") {
-		return nil, common.NewError(strings.TrimSpace(keypair[0]))
-	}
-
-	keyPEM, fullchainPEM, err := parseTLSPEMFromKeypairLines(keypair)
+	keyPEM, fullchainPEM, err := s.generateCertWithTemplateForNames(
+		domains,
+		keyAlgorithm,
+		signatureAlgorithm,
+		tlsCertificateUsageServer,
+		notBefore,
+		notAfter,
+		buildSelfSignedAuthorityTemplate(authority),
+	)
 	if err != nil {
-		return nil, err
+		return nil, common.NewError("generate keypair failed: ", err)
 	}
 	certPEM, chainPEM := splitLeafAndChainPEM(fullchainPEM)
 	if len(certPEM) == 0 {
@@ -416,6 +423,193 @@ func (s *SelfSignedService) Issue(payload SelfSignedIssuePayload) (*AcmeActionRe
 	}, nil
 }
 
+func selfSignedCertificateNotAfter(notBefore time.Time, durationValue int, durationUnit string) time.Time {
+	switch durationUnit {
+	case "m":
+		return notBefore.AddDate(0, durationValue, 0)
+	case "d":
+		return notBefore.AddDate(0, 0, durationValue)
+	default:
+		return notBefore.AddDate(durationValue, 0, 0)
+	}
+}
+
+func buildSelfSignedAuthorityTemplate(authority *model.SelfSignedAuthority) *tlsSelfSignedTemplateProfile {
+	if authority == nil {
+		return nil
+	}
+	if authority.Builtin {
+		if template := resolveTLSSelfSignedTemplate(authority.PlatformCode); template != nil {
+			return template
+		}
+	}
+
+	intermediate := selfSignedAuthoritySubject(
+		authority.SubjectCN,
+		authority.Organization,
+		authority.Department,
+		authority.Country,
+		authority.Province,
+		authority.City,
+	)
+	rootCommonName := strings.TrimSpace(authority.IssuerName)
+	if rootCommonName == "" {
+		rootCommonName = intermediate.CommonName
+	}
+	rootOrganization := strings.TrimSpace(authority.IssuerOrg)
+	if rootOrganization == "" {
+		rootOrganization = strings.TrimSpace(authority.Organization)
+	}
+	root := selfSignedAuthoritySubject(
+		rootCommonName,
+		rootOrganization,
+		"",
+		authority.Country,
+		authority.Province,
+		authority.City,
+	)
+
+	return &tlsSelfSignedTemplateProfile{
+		Code:            strings.TrimSpace(authority.PlatformCode),
+		Name:            strings.TrimSpace(authority.PlatformName),
+		Root:            root,
+		Intermediate:    intermediate,
+		CAURL:           strings.TrimSpace(authority.CAURL),
+		OCSPURL:         strings.TrimSpace(authority.OCSPURL),
+		CRLURL:          strings.TrimSpace(authority.CRLURL),
+		LeafKeyUsage:    selfSignedAuthorityKeyUsage(authority.KeyUsage),
+		LeafExtKeyUsage: selfSignedAuthorityExtKeyUsage(authority.ExtKeyUsage),
+	}
+}
+
+func selfSignedAuthoritySubject(commonName string, organization string, department string, country string, province string, city string) tlsTemplateSubjectProfile {
+	profile := tlsTemplateSubjectProfile{
+		CommonName: strings.TrimSpace(commonName),
+	}
+	if value := strings.TrimSpace(organization); value != "" {
+		profile.Organization = []string{value}
+	}
+	if value := strings.TrimSpace(department); value != "" {
+		profile.OrganizationalUnit = []string{value}
+	}
+	if value := strings.TrimSpace(country); value != "" {
+		profile.Country = []string{value}
+	}
+	if value := strings.TrimSpace(province); value != "" {
+		profile.Province = []string{value}
+	}
+	if value := strings.TrimSpace(city); value != "" {
+		profile.Locality = []string{value}
+	}
+	return profile
+}
+
+func selfSignedAuthorityKeyUsage(raw string) x509.KeyUsage {
+	usage := x509.KeyUsage(0)
+	for _, value := range selfSignedAuthorityUsageTokens(raw) {
+		usage |= selfSignedAuthorityKeyUsageValue(value)
+	}
+	return usage
+}
+
+func selfSignedAuthorityExtKeyUsage(raw string) []x509.ExtKeyUsage {
+	result := make([]x509.ExtKeyUsage, 0)
+	seen := map[x509.ExtKeyUsage]struct{}{}
+	for _, value := range selfSignedAuthorityUsageTokens(raw) {
+		usage, ok := selfSignedAuthorityExtKeyUsageValue(value)
+		if !ok {
+			continue
+		}
+		if _, exists := seen[usage]; exists {
+			continue
+		}
+		seen[usage] = struct{}{}
+		result = append(result, usage)
+	}
+	return result
+}
+
+func validateSelfSignedAuthorityKeyUsage(raw string) error {
+	for _, value := range selfSignedAuthorityUsageTokens(raw) {
+		if selfSignedAuthorityKeyUsageValue(value) == 0 {
+			return common.NewError("unsupported self-signed key usage: ", value)
+		}
+	}
+	return nil
+}
+
+func validateSelfSignedAuthorityExtKeyUsage(raw string) error {
+	for _, value := range selfSignedAuthorityUsageTokens(raw) {
+		if _, ok := selfSignedAuthorityExtKeyUsageValue(value); !ok {
+			return common.NewError("unsupported self-signed extended key usage: ", value)
+		}
+	}
+	return nil
+}
+
+func selfSignedAuthorityKeyUsageValue(value string) x509.KeyUsage {
+	switch value {
+	case "digitalsignature":
+		return x509.KeyUsageDigitalSignature
+	case "contentcommitment", "nonrepudiation":
+		return x509.KeyUsageContentCommitment
+	case "keyencipherment":
+		return x509.KeyUsageKeyEncipherment
+	case "dataencipherment":
+		return x509.KeyUsageDataEncipherment
+	case "keyagreement":
+		return x509.KeyUsageKeyAgreement
+	case "certificatesign", "certsign":
+		return x509.KeyUsageCertSign
+	case "crlsign":
+		return x509.KeyUsageCRLSign
+	case "encipheronly":
+		return x509.KeyUsageEncipherOnly
+	case "decipheronly":
+		return x509.KeyUsageDecipherOnly
+	default:
+		return 0
+	}
+}
+
+func selfSignedAuthorityExtKeyUsageValue(value string) (x509.ExtKeyUsage, bool) {
+	switch value {
+	case "serverauth":
+		return x509.ExtKeyUsageServerAuth, true
+	case "clientauth":
+		return x509.ExtKeyUsageClientAuth, true
+	case "codesigning":
+		return x509.ExtKeyUsageCodeSigning, true
+	case "emailprotection":
+		return x509.ExtKeyUsageEmailProtection, true
+	case "timestamping":
+		return x509.ExtKeyUsageTimeStamping, true
+	case "ocspsigning":
+		return x509.ExtKeyUsageOCSPSigning, true
+	default:
+		return 0, false
+	}
+}
+
+func selfSignedAuthorityUsageTokens(raw string) []string {
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r'
+	})
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		var normalized strings.Builder
+		for _, r := range strings.ToLower(strings.TrimSpace(part)) {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+				normalized.WriteRune(r)
+			}
+		}
+		if value := normalized.String(); value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
 func (s *SelfSignedService) DeleteAuthority(id uint) (*AcmeActionResult, error) {
 	if id == 0 {
 		return nil, common.NewError("authority id is required")
@@ -426,6 +620,13 @@ func (s *SelfSignedService) DeleteAuthority(id uint) (*AcmeActionResult, error) 
 	}
 	if row.Builtin {
 		return nil, common.NewError("builtin authority cannot be deleted")
+	}
+	used, err := selfSignedAuthorityUsedByCertificate(row.Id)
+	if err != nil {
+		return nil, err
+	}
+	if used {
+		return nil, common.NewError("该自签平台仍被证书库存引用，不能删除；请先删除或重新签发相关自签证书")
 	}
 	if err := database.GetDB().Delete(row).Error; err != nil {
 		return nil, err
@@ -441,6 +642,32 @@ func (s *SelfSignedService) DeleteAuthority(id uint) (*AcmeActionResult, error) 
 		Overview: overview,
 		Msg:      "authority deleted",
 	}, nil
+}
+
+func selfSignedAuthorityUsedByCertificate(authorityID uint) (bool, error) {
+	if authorityID == 0 {
+		return false, nil
+	}
+	rows := make([]struct {
+		RenewConfig string `gorm:"column:renew_config"`
+	}, 0)
+	if err := database.GetDB().
+		Model(&model.CertificateRecord{}).
+		Select("renew_config").
+		Where("source_type = ? AND renew_config <> ''", CertificateSourceSelfSigned).
+		Find(&rows).Error; err != nil {
+		return false, err
+	}
+	for _, row := range rows {
+		config := SelfSignedRenewConfig{}
+		if err := json.Unmarshal([]byte(row.RenewConfig), &config); err != nil {
+			continue
+		}
+		if config.AuthorityID == authorityID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *SelfSignedService) SaveAuthority(entry *model.SelfSignedAuthority) (*AcmeActionResult, error) {
@@ -487,6 +714,12 @@ func (s *SelfSignedService) SaveAuthority(entry *model.SelfSignedAuthority) (*Ac
 	}
 	if len(normalized.Country) != 2 {
 		return nil, common.NewError("country must be a 2-letter code")
+	}
+	if err := validateSelfSignedAuthorityKeyUsage(normalized.KeyUsage); err != nil {
+		return nil, err
+	}
+	if err := validateSelfSignedAuthorityExtKeyUsage(normalized.ExtKeyUsage); err != nil {
+		return nil, err
 	}
 	if normalized.PlatformCode == "" {
 		normalized.PlatformCode = "custom"

@@ -154,7 +154,7 @@ export interface ShadowTLS extends InboundBasics {
   ss_config?: ShadowsocksConfig
 }
 export interface ShadowQUICJLSUpstream {
-  addr: string
+  addr?: string
   sni?: string
   proxy?: string
   rate_limit?: number
@@ -378,12 +378,27 @@ const defaultValues: Record<InType, Inbound> = {
     type: InTypes.Hysteria,
     server_up_mbps: 500,
     server_down_mbps: 500,
-    stream_receive_window: 25000000,
-    connection_receive_window: 99000000,
+    stream_receive_window: 38000000,
+    connection_receive_window: 150000000,
     tls_id: 0,
   },
   shadowtls: <ShadowTLS>{ type: InTypes.ShadowTLS, version: 3, handshake: { server: 'addons.mozilla.org', server_port: 443 }, handshake_for_server_name: {}, strict_mode: true, ss_config: { method: '2022-blake3-aes-128-gcm', network: 'tcp', udp_over_tcp: { enabled: true, version: 2 }, multiplex: { enabled: true, protocol: 'smux', max_connections: 250, max_streams: 8, padding: true } } },
-  shadowquic: <ShadowQUIC>{ type: InTypes.ShadowQUIC, tls_id: 0 },
+  shadowquic: <ShadowQUIC>{
+    type: InTypes.ShadowQUIC,
+    tls_id: 0,
+    alpn: ['h3'],
+    quic_versions: ['v2'],
+    zero_rtt: true,
+    congestion_controller: 'bbr',
+    up: '500',
+    down: '500',
+    cwnd: 32,
+    max_idle_time: 120000,
+    max_datagram_frame_size: 1400,
+    recv_window_conn: 37000000,
+    recv_window: 160000000,
+    jls_upstream: { rate_limit: 204800 },
+  },
   tuic: <TUIC>{ type: InTypes.TUIC, congestion_control: "cubic", tls_id: 0 },
   hysteria2: <Hysteria2>{ type: InTypes.Hysteria2, tls_id: 0, server_up_mbps: 500, server_down_mbps: 500 },
   trusttunnel: <TrustTunnel>{ type: InTypes.TrustTunnel, tls_id: 0, network: ['tcp'], congestion_controller: "bbr" },

@@ -28,7 +28,8 @@ const (
 	subGroupAutoUpdateSourceClash = "clash"
 
 	subGroupAutoUpdateSourceTimeout = 10 * time.Second
-	subGroupAutoUpdateRetryCount    = 3
+	subGroupAutoUpdateRetryCount    = 1
+	subGroupAutoUpdateMaxGroups     = 32
 )
 
 type SubGroupAutoUpdateInfo struct {
@@ -144,7 +145,7 @@ func (s *SubGroupService) markSubGroupAutoUpdateResult(
 	if err := db.Model(&model.SubGroup{}).Where("id = ?", groupID).Updates(updates).Error; err != nil {
 		return err
 	}
-	markLastUpdate(time.Now().Unix())
+	markBothLastUpdates(time.Now().Unix())
 	return nil
 }
 
@@ -192,15 +193,24 @@ func (s *SubGroupService) RunAutoUpdate() error {
 	if lastRunAt > 0 && now < lastRunAt+int64(intervalMinutes)*60 {
 		return nil
 	}
-	if err := settingSvc.SetSubGroupAutoUpdateLastAt(now); err != nil {
-		return err
-	}
 
 	subGroupSubscriptionUpdateMu.Lock()
 	defer subGroupSubscriptionUpdateMu.Unlock()
 
 	groups, err := s.GetAllForAutoUpdate()
 	if err != nil {
+		return err
+	}
+	activeGroups := 0
+	for _, group := range groups {
+		if subGroupSupportsAutoUpdate(group) {
+			activeGroups++
+		}
+	}
+	if activeGroups > subGroupAutoUpdateMaxGroups {
+		return fmt.Errorf("subscription auto-update has %d active groups, which exceeds the %d group limit", activeGroups, subGroupAutoUpdateMaxGroups)
+	}
+	if err := settingSvc.SetSubGroupAutoUpdateLastAt(now); err != nil {
 		return err
 	}
 

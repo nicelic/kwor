@@ -308,6 +308,8 @@
 </template>
 
 <script lang="ts">
+import { parseSingboxInteger } from '@/plugins/singboxInteger'
+
 type SudokuDirection = 'in' | 'out' | 'out_json'
 
 export default {
@@ -418,9 +420,7 @@ export default {
     },
     normalizePositiveInteger(value: unknown, fallback: number): number {
       const raw = Number(value)
-      if (!Number.isFinite(raw)) return fallback
-      const normalized = Math.floor(raw)
-      return normalized > 0 ? normalized : fallback
+      return Number.isSafeInteger(raw) && raw > 0 ? raw : fallback
     },
     ensureHttpmask(): Record<string, any> {
       if (!this.data.httpmask || typeof this.data.httpmask !== 'object') {
@@ -494,9 +494,20 @@ export default {
         this.data.aead_method = 'aes-128-gcm'
       }
     },
+    sanitizeDirectionSpecificFields() {
+      if (this.direction === ('in' as SudokuDirection)) {
+        if (this.data.httpmask?.tls !== undefined) delete this.data.httpmask.tls
+        if (this.data.httpmask?.host !== undefined) delete this.data.httpmask.host
+        if (this.data.httpmask?.multiplex !== undefined) delete this.data.httpmask.multiplex
+      } else if (this.data.disable_http_mask !== undefined) {
+        delete this.data.disable_http_mask
+      }
+      this.cleanupHttpmask()
+    },
   },
   mounted() {
     this.enforceAEADMethodCompatibility()
+    this.sanitizeDirectionSpecificFields()
     this.ensureCustomTableDefaults()
   },
   computed: {
@@ -547,10 +558,12 @@ export default {
     },
     handshakeTimeout: {
       get(): number {
-        return this.normalizePositiveInteger(this.data.handshake_timeout, 5)
+        return parseSingboxInteger(this.data.handshake_timeout, { min: 1 }) ?? 5
       },
-      set(v: number) {
-        this.data.handshake_timeout = this.normalizePositiveInteger(v, 5)
+      set(v: unknown) {
+        const normalized = parseSingboxInteger(v, { min: 1 })
+        if (normalized === undefined) delete this.data.handshake_timeout
+        else this.data.handshake_timeout = normalized
       }
     },
     enablePureDownlink: {
@@ -657,6 +670,11 @@ export default {
     },
   },
   watch: {
+    data() {
+      this.enforceAEADMethodCompatibility()
+      this.sanitizeDirectionSpecificFields()
+      this.ensureCustomTableDefaults()
+    },
     'data.aead_method'() {
       this.enforceAEADMethodCompatibility()
     },
@@ -664,14 +682,7 @@ export default {
       this.enforceAEADMethodCompatibility()
     },
     direction() {
-      if (this.direction === ('in' as SudokuDirection)) {
-        if (this.data.httpmask?.tls !== undefined) delete this.data.httpmask.tls
-        if (this.data.httpmask?.host !== undefined) delete this.data.httpmask.host
-        if (this.data.httpmask?.multiplex !== undefined) delete this.data.httpmask.multiplex
-      } else if (this.data.disable_http_mask !== undefined && this.direction !== ('in' as SudokuDirection)) {
-        delete this.data.disable_http_mask
-      }
-      this.cleanupHttpmask()
+      this.sanitizeDirectionSpecificFields()
       this.ensureCustomTableDefaults()
     }
   }

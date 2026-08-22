@@ -109,6 +109,14 @@ export default {
   },
   mounted() {
     this.sanitizeForNamespace()
+  },
+  watch: {
+    data() {
+      this.sanitizeForNamespace()
+    },
+    namespace() {
+      this.sanitizeForNamespace()
+    },
   }
 }
 </script>

@@ -2,7 +2,7 @@
   <section class="acme-page">
     <v-row class="mt-1">
       <v-col cols="12">
-        <v-card class="acme-hero" rounded="xl" :loading="loadingOverview && !overview.supported">
+        <v-card class="acme-hero" rounded="xl" :loading="loadingOverview && !overviewReady">
           <div class="acme-hero__bg"></div>
           <v-card-text class="acme-hero__content">
             <div class="acme-hero__top">
@@ -23,7 +23,7 @@
                   class="acme-hero-action"
                   variant="outlined"
                   prepend-icon="mdi-file-certificate-outline"
-                  :disabled="!overview.supported || !overview.installed"
+                  :disabled="!overviewReady || !overview.supported || !overview.installed"
                   @click="openIssueDialog">
                   申请证书
                 </v-btn>
@@ -31,6 +31,7 @@
                   class="acme-hero-action"
                   variant="outlined"
                   prepend-icon="mdi-shield-lock-outline"
+                  :disabled="!overviewReady"
                   @click="openSelfSignedDialog">
                   自签证书
                 </v-btn>
@@ -38,6 +39,7 @@
                   class="acme-hero-action"
                   variant="outlined"
                   prepend-icon="mdi-account-circle-outline"
+                  :disabled="!overviewReady"
                   @click="acmeAccountDialogVisible = true">
                   ACME 账号
                 </v-btn>
@@ -45,6 +47,7 @@
                   class="acme-hero-action"
                   variant="outlined"
                   prepend-icon="mdi-cloud-key-outline"
+                  :disabled="!overviewReady"
                   @click="dnsAccountDialogVisible = true">
                   DNS 账号
                 </v-btn>
@@ -60,44 +63,44 @@
             </div>
 
             <div class="acme-hero__chips">
-              <v-chip size="small" :color="overview.supported ? 'info' : 'warning'" variant="flat">
-                {{ overview.supported ? '当前系统支持 ACME' : '仅 Linux 支持 ACME' }}
-              </v-chip>
-              <v-chip size="small" :color="overview.installed ? 'success' : 'warning'" variant="flat">
-                {{ overview.installed ? 'acme.sh 已安装' : 'acme.sh 未安装' }}
-              </v-chip>
-              <v-chip size="small" color="primary" variant="flat" class="acme-hero-chip acme-hero-chip--version">
-                版本：{{ overview.version || '-' }}
-              </v-chip>
-              <v-chip size="small" color="secondary" variant="flat" class="acme-hero-chip acme-hero-chip--ca">
-                默认 CA：{{ caLabel(overview.preferredCA) }}
-              </v-chip>
+               <v-chip size="small" :color="!overviewReady ? 'info' : overview.supported ? 'info' : 'warning'" variant="flat">
+                 {{ !overviewReady ? '加载中' : overview.supported ? '当前系统支持 ACME' : '仅 Linux 支持 ACME' }}
+               </v-chip>
+               <v-chip size="small" :color="!overviewReady ? 'info' : overview.installed ? 'success' : 'warning'" variant="flat">
+                 {{ !overviewReady ? '加载中' : overview.installed ? 'acme.sh 已安装' : 'acme.sh 未安装' }}
+               </v-chip>
+               <v-chip size="small" color="primary" variant="flat" class="acme-hero-chip acme-hero-chip--version">
+                 版本：{{ overviewReady ? (overview.version || '-') : '加载中' }}
+               </v-chip>
+               <v-chip size="small" color="secondary" variant="flat" class="acme-hero-chip acme-hero-chip--ca">
+                 默认 CA：{{ overviewReady ? caLabel(overview.preferredCA) : '加载中' }}
+               </v-chip>
             </div>
 
             <v-row class="mt-2">
               <v-col cols="12" sm="6" md="3">
                 <div class="acme-metric">
                   <div class="text-caption acme-muted">证书数</div>
-                  <div class="text-h5 mt-1">{{ overview.certificates.length }}</div>
+                  <div class="text-h5 mt-1">{{ certificateListReady ? certificateTotal : '-' }}</div>
                 </div>
               </v-col>
               <v-col cols="12" sm="6" md="3">
                 <div class="acme-metric">
                   <div class="text-caption acme-muted">ACME 账号</div>
-                  <div class="text-h5 mt-1">{{ overview.acmeAccounts.length }}</div>
+                  <div class="text-h5 mt-1">{{ overviewReady ? overview.acmeAccounts.length : '-' }}</div>
                 </div>
               </v-col>
               <v-col cols="12" sm="6" md="3">
                 <div class="acme-metric">
                   <div class="text-caption acme-muted">DNS 账号</div>
-                  <div class="text-h5 mt-1">{{ overview.dnsAccounts.length }}</div>
+                  <div class="text-h5 mt-1">{{ overviewReady ? overview.dnsAccounts.length : '-' }}</div>
                 </div>
               </v-col>
               <v-col cols="12" sm="6" md="3">
                 <div class="acme-metric">
                   <div class="text-caption acme-muted">自动续签窗口</div>
-                  <div class="text-h5 mt-1">{{ autoRenewWindowText }}</div>
-                  <div class="text-caption text-medium-emphasis mt-1">{{ autoRenewWindowHint }}</div>
+                  <div class="text-h5 mt-1">{{ overviewReady ? autoRenewWindowText : '-' }}</div>
+                  <div v-if="overviewReady" class="text-caption text-medium-emphasis mt-1">{{ autoRenewWindowHint }}</div>
                 </div>
               </v-col>
             </v-row>
@@ -213,6 +216,30 @@
     </v-row>
 
     <v-alert
+      v-if="overviewLoadError"
+      type="error"
+      variant="tonal"
+      density="comfortable"
+      class="mt-4 mb-4">
+      <div class="d-flex align-center justify-space-between flex-wrap ga-3">
+        <span>{{ overviewLoadError }}</span>
+        <v-btn variant="text" prepend-icon="mdi-refresh" :loading="loadingOverview" @click="refreshOverview(false, true)">
+          重新加载
+        </v-btn>
+      </div>
+    </v-alert>
+    <v-alert
+      v-else-if="!overviewReady"
+      type="info"
+      variant="tonal"
+      density="comfortable"
+      class="mt-4 mb-4">
+      <div class="d-flex align-center ga-2">
+        <v-progress-circular indeterminate size="18" width="2" />
+        <span>正在读取证书管理概览</span>
+      </div>
+    </v-alert>
+    <v-alert
       v-if="overview.error"
       type="warning"
       variant="tonal"
@@ -221,7 +248,7 @@
       {{ overview.error }}
     </v-alert>
 
-    <v-card rounded="xl" variant="outlined" class="acme-table-card">
+    <v-card rounded="xl" variant="outlined" class="acme-table-card" :loading="loadingCertificateList && !certificateListReady">
       <v-card-title class="acme-table-card__toolbar">
         <div>
           <div class="text-subtitle-1 font-weight-medium">证书列表</div>
@@ -238,13 +265,37 @@
             density="comfortable"
             hide-details
             class="acme-search" />
-          <div class="acme-count-text">（证书数量{{ overview.certificates.length }}）</div>
+          <div class="acme-count-text">（证书数量{{ certificateListReady ? certificateTotal : '-' }}）</div>
         </div>
       </v-card-title>
       <v-divider />
 
-      <v-card-text>
-        <v-table density="comfortable" class="acme-table">
+       <v-card-text>
+        <v-alert
+          v-if="certificateListError"
+          type="error"
+          variant="tonal"
+          density="comfortable"
+          class="mb-4">
+          <div class="d-flex align-center justify-space-between flex-wrap ga-3">
+            <span>{{ certificateListError }}</span>
+            <v-btn variant="text" prepend-icon="mdi-refresh" :loading="loadingCertificateList" @click="refreshCertificateList(true)">
+              重新加载
+            </v-btn>
+          </div>
+        </v-alert>
+        <v-alert
+          v-else-if="!certificateListReady"
+          type="info"
+          variant="tonal"
+          density="comfortable"
+          class="mb-4">
+          <div class="d-flex align-center ga-2">
+            <v-progress-circular indeterminate size="18" width="2" />
+            <span>正在读取证书列表</span>
+          </div>
+        </v-alert>
+         <v-table v-if="mdAndUp" density="comfortable" class="acme-table">
           <thead>
             <tr>
               <th>ID</th>
@@ -261,7 +312,7 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="cert in filteredCertificates" :key="cert.id">
+            <tr v-for="cert in certificateItems" :key="cert.id">
               <td class="acme-id-cell">{{ cert.resourceId || `cert_${cert.displayId || cert.id}` }}</td>
               <td>
                 <div class="font-weight-medium">{{ cert.mainDomain }}</div>
@@ -358,11 +409,63 @@
                 </v-menu>
               </td>
             </tr>
-            <tr v-if="filteredCertificates.length === 0">
+            <tr v-if="certificateListReady && certificateItems.length === 0">
               <td colspan="11" class="text-center text-medium-emphasis py-8">暂无证书记录</td>
             </tr>
           </tbody>
         </v-table>
+        <div v-else class="acme-certificate-cards">
+          <article v-for="cert in certificateItems" :key="cert.id" class="acme-certificate-card">
+            <div class="acme-certificate-card__header">
+              <div class="min-width-0">
+                <div class="font-weight-medium acme-wrap-text">{{ cert.mainDomain }}</div>
+                <div class="text-caption text-medium-emphasis mt-1 acme-wrap-text">
+                  {{ cert.resourceId || `cert_${cert.displayId || cert.id}` }}
+                </div>
+              </div>
+              <div class="d-flex align-center ga-1">
+                <v-chip size="small" :color="statusColor(cert)" variant="flat">{{ statusText(cert) }}</v-chip>
+                <v-menu location="bottom end">
+                  <template #activator="{ props: menuProps }">
+                    <v-btn
+                      v-bind="menuProps"
+                      variant="text"
+                      size="small"
+                      icon="mdi-dots-vertical"
+                      :loading="rowBusyId === cert.id"
+                      :aria-label="`${cert.mainDomain} 操作`" />
+                  </template>
+                  <v-list density="compact" nav>
+                    <v-list-item prepend-icon="mdi-eye-outline" title="查看证书" @click="openViewDialog(cert)" />
+                    <v-list-item v-if="isAcmeCertificate(cert)" prepend-icon="mdi-pencil-refresh-outline" title="编辑并重新签发" @click="openReissueDialog(cert)" />
+                    <v-list-item prepend-icon="mdi-refresh" title="续签证书" :disabled="!supportsRenew(cert)" @click="renewCertificate(cert, false)" />
+                    <v-list-item prepend-icon="mdi-alert" title="强制续签" :disabled="!isAcmeCertificate(cert)" @click="renewCertificate(cert, true)" />
+                    <v-list-item :prepend-icon="cert.autoRenew ? 'mdi-toggle-switch' : 'mdi-toggle-switch-off-outline'" :title="cert.autoRenew ? '关闭自动续签' : '开启自动续签'" :disabled="!supportsAutoRenew(cert)" @click="toggleCertificateAutoRenew(cert)" />
+                    <v-list-item prepend-icon="mdi-folder-arrow-up-outline" title="推送到目录" @click="openPushDialog(cert)" />
+                    <v-list-item :prepend-icon="cert.inUseByPanel ? 'mdi-monitor-off' : 'mdi-monitor-lock'" :title="cert.inUseByPanel ? '取消应用到面板' : '应用到面板'" :disabled="cert.inUseByPanel && isUnapplyDisabled(cert, 'panel')" @click="toggleCertificateApply(cert, 'panel')" />
+                    <v-list-item :prepend-icon="cert.inUseBySub ? 'mdi-link-variant-off' : 'mdi-link-variant'" :title="cert.inUseBySub ? '取消应用到订阅' : '应用到订阅'" :disabled="cert.inUseBySub && isUnapplyDisabled(cert, 'sub')" @click="toggleCertificateApply(cert, 'sub')" />
+                    <v-list-item prepend-icon="mdi-text-box-search-outline" title="查看日志" @click="openLogDialog(cert)" />
+                    <v-list-item prepend-icon="mdi-delete-outline" title="删除证书" @click="deleteCertificate(cert)" />
+                  </v-list>
+                </v-menu>
+              </div>
+            </div>
+            <div class="acme-certificate-card__meta">
+              <div><span>方式</span><strong>{{ challengeLabel(cert.challenge) }}</strong></div>
+              <div><span>到期</span><strong>{{ formatTimestamp(cert.notAfter) }}</strong></div>
+              <div><span>自动续签</span><strong>{{ cert.autoRenew ? '开启' : '关闭' }}</strong></div>
+              <div><span>应用</span><strong class="acme-wrap-text">{{ cert.usageLabel || '-' }}</strong></div>
+            </div>
+            <div v-if="cert.lastError" class="text-caption text-error acme-wrap-text mt-3">{{ cert.lastError }}</div>
+            <div v-if="cert.postActionError" class="text-caption text-warning acme-wrap-text mt-2">后置动作警告：{{ cert.postActionError }}</div>
+          </article>
+          <div v-if="certificateListReady && certificateItems.length === 0" class="text-center text-medium-emphasis py-8">暂无证书记录</div>
+        </div>
+        <div v-if="certificateTotal > certificatePerPage" class="acme-pagination mt-4">
+          <v-btn variant="text" icon="mdi-chevron-left" :disabled="certificatePage <= 1 || loadingCertificateList" aria-label="上一页" @click="goToCertificatePage(certificatePage - 1)" />
+          <span>{{ certificatePage }} / {{ certificatePageCount }}</span>
+          <v-btn variant="text" icon="mdi-chevron-right" :disabled="certificatePage >= certificatePageCount || loadingCertificateList" aria-label="下一页" @click="goToCertificatePage(certificatePage + 1)" />
+        </div>
       </v-card-text>
     </v-card>
 
@@ -409,11 +512,15 @@
                 hide-details
                 @update:model-value="normalizeIssueIPSelection">
                 <template #append>
-                  <v-icon
+                  <v-btn
                     icon="mdi-refresh"
-                    :class="{ rotating: loadingIPOptions }"
+                    size="small"
+                    variant="text"
+                    :loading="loadingIPOptions"
+                    :disabled="loadingIPOptions"
+                    aria-label="刷新 IP"
                     v-tooltip:top="'刷新 IP'"
-                    @click="refreshIPCertificateOptions" />
+                    @click.stop="refreshIPCertificateOptions" />
                 </template>
               </v-combobox>
             </v-col>
@@ -600,7 +707,7 @@
           <v-btn
             color="primary"
             :loading="issuing"
-            :disabled="!canSubmitIssue"
+            :disabled="issuing || !canSubmitIssue"
             @click="issueCertificate">
             {{ isReissueMode ? '重新签发' : '开始签发' }}
           </v-btn>
@@ -619,6 +726,30 @@
         </v-card-title>
         <v-divider />
         <v-card-text class="pt-5">
+          <v-alert
+            v-if="selfSignedAuthoritiesError"
+            type="error"
+            variant="tonal"
+            density="comfortable"
+            class="mb-4">
+            <div class="d-flex align-center justify-space-between flex-wrap ga-3">
+              <span>{{ selfSignedAuthoritiesError }}</span>
+              <v-btn variant="text" prepend-icon="mdi-refresh" :loading="loadingSelfSignedAuthorities" @click="refreshSelfSignedAuthorities(true)">
+                重新加载
+              </v-btn>
+            </div>
+          </v-alert>
+          <v-alert
+            v-else-if="!selfSignedAuthoritiesReady"
+            type="info"
+            variant="tonal"
+            density="comfortable"
+            class="mb-4">
+            <div class="d-flex align-center ga-2">
+              <v-progress-circular indeterminate size="18" width="2" />
+              <span>正在读取自签平台</span>
+            </div>
+          </v-alert>
           <v-row>
             <v-col cols="12" md="6">
               <v-select
@@ -626,7 +757,7 @@
                 :items="selfSignedAuthorityItems"
                 label="签发平台模板"
                 :loading="loadingSelfSignedAuthorities"
-                :disabled="loadingSelfSignedAuthorities"
+                :disabled="loadingSelfSignedAuthorities || !selfSignedAuthoritiesReady"
                 hide-details />
             </v-col>
             <v-col cols="12" md="6">
@@ -636,7 +767,7 @@
                 color="secondary"
                 prepend-icon="mdi-pencil-box-outline"
                 class="mt-md-1"
-                :disabled="loadingSelfSignedAuthorities"
+                :disabled="loadingSelfSignedAuthorities || !selfSignedAuthoritiesReady"
                 @click="openSelfSignedAuthorityManager">
                 编辑平台
               </v-btn>
@@ -724,7 +855,7 @@
           <v-btn
             color="primary"
             :loading="issuingSelfSigned"
-            :disabled="loadingSelfSignedAuthorities || !canSubmitSelfSignedIssue"
+            :disabled="issuingSelfSigned || loadingSelfSignedAuthorities || !canSubmitSelfSignedIssue"
             @click="issueSelfSignedCertificate">
             开始签发
           </v-btn>
@@ -752,6 +883,30 @@
         </v-card-title>
         <v-divider />
         <v-card-text class="pt-5">
+          <v-alert
+            v-if="selfSignedAuthoritiesError"
+            type="error"
+            variant="tonal"
+            density="comfortable"
+            class="mb-4">
+            <div class="d-flex align-center justify-space-between flex-wrap ga-3">
+              <span>{{ selfSignedAuthoritiesError }}</span>
+              <v-btn variant="text" prepend-icon="mdi-refresh" :loading="loadingSelfSignedAuthorities" @click="refreshSelfSignedAuthorities(true)">
+                重新加载
+              </v-btn>
+            </div>
+          </v-alert>
+          <v-alert
+            v-else-if="!selfSignedAuthoritiesReady"
+            type="info"
+            variant="tonal"
+            density="comfortable"
+            class="mb-4">
+            <div class="d-flex align-center ga-2">
+              <v-progress-circular indeterminate size="18" width="2" />
+              <span>正在读取自签平台</span>
+            </div>
+          </v-alert>
           <div class="d-flex justify-space-between align-center flex-wrap ga-3 mb-4">
             <v-btn color="primary" prepend-icon="mdi-plus" @click="openSelfSignedAuthorityForm()">
               创建平台
@@ -766,13 +921,14 @@
               <tr>
                 <th>ID</th>
                 <th>名称</th>
-                <th>账号密钥算法</th>
+                <th>默认签发密钥算法</th>
                 <th>时间</th>
                 <th class="text-right">操作</th>
               </tr>
             </thead>
             <tbody>
               <tr v-for="item in selfSignedAuthorities" :key="item.id">
+                <td class="acme-id-cell">{{ item.id }}</td>
                 <td>{{ item.name }}</td>
                 <td>{{ selfSignedAlgorithmLabel(item.keyAlgorithm) }}</td>
                 <td>{{ formatTimestamp(item.updatedAt || item.createdAt) }}</td>
@@ -784,6 +940,14 @@
                       color="primary"
                       @click="selectSelfSignedAuthority(item)">
                       签发证书
+                    </v-btn>
+                    <v-btn
+                      v-if="!item.builtin"
+                      size="small"
+                      variant="text"
+                      color="primary"
+                      @click="openSelfSignedAuthorityForm(item)">
+                      编辑
                     </v-btn>
                     <v-btn
                       size="small"
@@ -810,8 +974,8 @@
                   </div>
                 </td>
               </tr>
-              <tr v-if="selfSignedAuthorities.length === 0">
-                <td colspan="4" class="text-center text-medium-emphasis py-6">还没有自签平台</td>
+              <tr v-if="selfSignedAuthoritiesReady && selfSignedAuthorities.length === 0">
+                <td colspan="5" class="text-center text-medium-emphasis py-6">还没有自签平台</td>
               </tr>
             </tbody>
           </v-table>
@@ -840,6 +1004,13 @@
             </v-col>
             <v-col cols="12">
               <v-text-field v-model="selfSignedAuthorityForm.organization" label="公司/组织 *" hide-details />
+            </v-col>
+            <v-col cols="12" md="6">
+              <v-select
+                v-model="selfSignedAuthorityForm.keyAlgorithm"
+                :items="selfSignedAlgorithmItems"
+                label="默认签发密钥算法"
+                hide-details />
             </v-col>
             <v-col cols="12">
               <v-text-field v-model="selfSignedAuthorityForm.department" label="部门" hide-details />
@@ -895,8 +1066,8 @@
         <v-divider />
         <v-card-actions>
           <v-spacer />
-          <v-btn variant="text" @click="selfSignedAuthorityFormVisible = false">取消</v-btn>
-          <v-btn color="primary" :disabled="!canSaveSelfSignedAuthority" @click="saveSelfSignedAuthority">确认</v-btn>
+          <v-btn variant="text" :disabled="savingSelfSignedAuthority" @click="selfSignedAuthorityFormVisible = false">取消</v-btn>
+          <v-btn color="primary" :loading="savingSelfSignedAuthority" :disabled="savingSelfSignedAuthority || !canSaveSelfSignedAuthority" @click="saveSelfSignedAuthority">确认</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -1140,8 +1311,8 @@
         <v-divider />
         <v-card-actions>
           <v-spacer />
-          <v-btn variant="text" @click="acmeAccountFormVisible = false">取消</v-btn>
-          <v-btn color="primary" :disabled="!canSaveAcmeAccount" @click="saveAcmeAccount">保存</v-btn>
+          <v-btn variant="text" :disabled="savingAcmeAccount" @click="acmeAccountFormVisible = false">取消</v-btn>
+          <v-btn color="primary" :loading="savingAcmeAccount" :disabled="savingAcmeAccount || !canSaveAcmeAccount" @click="saveAcmeAccount">保存</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -1167,8 +1338,8 @@
         <v-divider />
         <v-card-actions>
           <v-spacer />
-          <v-btn variant="text" @click="acmeAccountRotateVisible = false">取消</v-btn>
-          <v-btn color="primary" :loading="savingAcmeAccount" @click="rotateAcmeAccountKey">确认轮换</v-btn>
+          <v-btn variant="text" :disabled="savingAcmeAccount" @click="acmeAccountRotateVisible = false">取消</v-btn>
+          <v-btn color="primary" :loading="savingAcmeAccount" :disabled="savingAcmeAccount" @click="rotateAcmeAccountKey">确认轮换</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -1285,8 +1456,8 @@
         <v-divider />
         <v-card-actions>
           <v-spacer />
-          <v-btn variant="text" @click="dnsAccountFormVisible = false">取消</v-btn>
-          <v-btn color="primary" :disabled="!canSaveDNSAccount" @click="saveDNSAccount">保存</v-btn>
+          <v-btn variant="text" :disabled="savingDNSAccount" @click="dnsAccountFormVisible = false">取消</v-btn>
+          <v-btn color="primary" :loading="savingDNSAccount" :disabled="savingDNSAccount || !canSaveDNSAccount" @click="saveDNSAccount">保存</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -1333,7 +1504,7 @@
           <v-btn
             color="primary"
             :loading="pushingId === pushDialogCertId"
-            :disabled="pushDialogActionDisabled"
+            :disabled="pushingId === pushDialogCertId || pushDialogActionDisabled"
             @click="confirmPushDialog">
             {{ pushDialogActionLabel }}
           </v-btn>
@@ -1342,14 +1513,14 @@
     </v-dialog>
 
     <v-dialog v-model="logDialogVisible" max-width="960">
-      <v-card rounded="xl">
+      <v-card rounded="xl" :loading="loadingCertificateLog">
         <v-card-title class="text-subtitle-1 font-weight-medium">签发 / 续签日志</v-card-title>
         <v-divider />
         <v-card-text>
           <div class="text-body-2 text-medium-emphasis mb-2" v-if="selectedLogCertificate">
             域名：{{ selectedLogCertificate.mainDomain }}
           </div>
-          <pre class="acme-log">{{ selectedLogContent }}</pre>
+          <pre class="acme-log">{{ certificateLogContent }}</pre>
         </v-card-text>
         <v-divider />
         <v-card-actions>
@@ -1391,7 +1562,6 @@
                 :model-value="viewContent.certPem"
                 label="证书（cert.pem）"
                 rows="10"
-                auto-grow
                 readonly
                 variant="outlined"
                 class="acme-view-text" />
@@ -1401,7 +1571,6 @@
                 :model-value="viewContent.fullchainPem"
                 label="公钥（fullchain.pem）"
                 rows="10"
-                auto-grow
                 readonly
                 variant="outlined"
                 class="acme-view-text" />
@@ -1411,7 +1580,6 @@
                 :model-value="viewContent.keyPem"
                 label="私钥（key.pem）"
                 rows="10"
-                auto-grow
                 readonly
                 variant="outlined"
                 class="acme-view-text" />
@@ -1421,7 +1589,6 @@
                 :model-value="viewContent.chainPem"
                 label="链文件（chain.pem）"
                 rows="10"
-                auto-grow
                 readonly
                 variant="outlined"
                 class="acme-view-text" />
@@ -1451,6 +1618,7 @@
       </div>
       <v-divider />
       <div ref="issueLogBodyRef" class="acme-floating-log__body">
+        <div v-if="issueLogLines.length === 0" class="acme-floating-log__line">等待后端开始写入日志...</div>
         <div v-for="(line, index) in issueLogLines" :key="index" class="acme-floating-log__line">
           {{ line }}
         </div>
@@ -1465,6 +1633,7 @@ import { confirm } from '@/plugins/confirm'
 import { i18n } from '@/locales'
 import { formatPanelDateTime, panelNow } from '@/plugins/panelTime'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useDisplay } from 'vuetify'
 import { push } from 'notivue'
 
 const acmeInstallRequestTimeout = 35 * 1000
@@ -1513,8 +1682,7 @@ type AcmeCertificate = {
   createdAt: number
   lastError: string
   postActionError: string
-  lastOutput: string
-  status: string
+	status: string
   inUseByPanel: boolean
   inUseBySub: boolean
   usageLabel: string
@@ -1621,6 +1789,7 @@ type SelfSignedAuthorityForm = {
   country: string
   province: string
   city: string
+  keyAlgorithm: string
   issuerName: string
   issuerOrg: string
   caUrl: string
@@ -1656,8 +1825,17 @@ type AcmeOverview = {
   dnsProviders: AcmeDNSProviderMeta[]
   acmeAccounts: AcmeAccount[]
   dnsAccounts: AcmeDNSAccount[]
-  certificates: AcmeCertificate[]
   error?: string
+}
+
+type CertificateListResult = {
+  items: AcmeCertificate[]
+  page: number
+  perPage: number
+  total: number
+  hasMore: boolean
+  panelAssignedCount: number
+  subAssignedCount: number
 }
 
 type AcmeActionResult = {
@@ -1722,8 +1900,10 @@ type AcmeVersionCheckResult = {
 type AcmeLogSession = {
   id: string
   title: string
-  status: string
-  lines: string[]
+	status: string
+	lines: string[]
+	lineStart: number
+	lineNext: number
   error?: string
   taskId?: string
   taskStatus?: string
@@ -1753,10 +1933,13 @@ type AcmeIPPortStatus = {
 }
 
 const props = withDefaults(defineProps<{ active?: boolean }>(), {
-  active: false,
+	active: false,
 })
+const { mdAndUp } = useDisplay()
 
 const loadingOverview = ref(false)
+const overviewReady = ref(false)
+const overviewLoadError = ref('')
 const installStartPending = ref(false)
 const acmeInstallTask = ref<AcmeInstallTaskStatus | null>(null)
 const acmeInstallPollTimer = ref<number | null>(null)
@@ -1770,6 +1953,8 @@ const loadingAcmeVersions = ref(false)
 const issuing = ref(false)
 const issuingSelfSigned = ref(false)
 const loadingSelfSignedAuthorities = ref(false)
+const selfSignedAuthoritiesReady = ref(false)
+const selfSignedAuthoritiesError = ref('')
 const savingAcmeAccount = ref(false)
 const savingDNSAccount = ref(false)
 const savingSelfSignedAuthority = ref(false)
@@ -1862,6 +2047,8 @@ const dnsAccountDialogVisible = ref(false)
 const dnsAccountFormVisible = ref(false)
 const pushDialogVisible = ref(false)
 const logDialogVisible = ref(false)
+const loadingCertificateLog = ref(false)
+const certificateLogContent = ref('暂无日志')
 const viewDialogVisible = ref(false)
 const viewingCertId = ref(0)
 const viewLoading = ref(false)
@@ -1903,19 +2090,27 @@ const pushDialogActionDisabled = computed(() => {
 })
 
 const pollTimer = ref<number | null>(null)
+let overviewPollingEnabled = false
 const issueLogTimer = ref<number | null>(null)
 const issueLogVisible = ref(false)
 const issueTaskId = ref('')
 const issueLogSessionId = ref('')
 const issueLogStatus = ref('idle')
 const issueLogLines = ref<string[]>([])
+const issueLogNextLine = ref(0)
+const issueLogLoaded = ref(false)
 const issueLogBodyRef = ref<HTMLElement | null>(null)
 const issueLogZIndex = ref(2600)
 let overviewRequestPromise: Promise<void> | null = null
 let selfSignedAuthoritiesRequestPromise: Promise<void> | null = null
 let issueLogRequestPromise: Promise<void> | null = null
+let certificateListRequestPromise: Promise<void> | null = null
+let certificateListRequestToken = 0
+let certificateSearchTimer: number | null = null
+let certificateListAbortController: AbortController | null = null
 let completedIssueTaskId = ''
 let overviewLoaded = false
+let certificateListLoaded = false
 let selfSignedAuthoritiesLoaded = false
 let selfSignedAuthoritiesDirty = true
 const ipCertificateOptions = ref<string[]>([])
@@ -1953,11 +2148,19 @@ const createEmptyOverview = (): AcmeOverview => ({
   dnsProviders: [],
   acmeAccounts: [],
   dnsAccounts: [],
-  certificates: [],
   error: '',
 })
 
 const overview = ref<AcmeOverview>(createEmptyOverview())
+const certificateItems = ref<AcmeCertificate[]>([])
+const certificatePage = ref(1)
+const certificatePerPage = 20
+const certificateTotal = ref(0)
+const certificatePanelAssignedCount = ref(0)
+const certificateSubAssignedCount = ref(0)
+const loadingCertificateList = ref(false)
+const certificateListReady = ref(false)
+const certificateListError = ref('')
 const selfSignedAuthorities = ref<SelfSignedAuthority[]>([])
 const createEmptySelfSignedAuthorityForm = (): SelfSignedAuthorityForm => ({
   id: 0,
@@ -1970,6 +2173,7 @@ const createEmptySelfSignedAuthorityForm = (): SelfSignedAuthorityForm => ({
   country: 'US',
   province: '',
   city: '',
+  keyAlgorithm: 'ecc256',
   issuerName: '',
   issuerOrg: '',
   caUrl: '',
@@ -2340,7 +2544,6 @@ const normalizeCertificates = (value: unknown): AcmeCertificate[] => {
       createdAt: asNumber(item.createdAt),
       lastError: asString(item.lastError),
       postActionError: asString((item as any).postActionError),
-      lastOutput: asString(item.lastOutput),
       status: asString(item.status),
       inUseByPanel: asBoolean((item as any).inUseByPanel),
       inUseBySub: asBoolean((item as any).inUseBySub),
@@ -2463,11 +2666,12 @@ const applyOverview = (raw: unknown) => {
     dnsProviders: normalizeDNSProviders(data.dnsProviders),
     acmeAccounts: normalizeAcmeAccounts(data.acmeAccounts),
     dnsAccounts: normalizeDNSAccounts(data.dnsAccounts),
-    certificates: normalizeCertificates(data.certificates),
     error: asString(data.error),
   }
 
   overview.value = nextValue
+  overviewReady.value = true
+  overviewLoadError.value = ''
   overviewLoaded = true
   if (
     acmeUpdateInfo.value.currentVersion.trim() !== nextValue.version.trim()
@@ -2489,6 +2693,7 @@ const applyActionResult = (raw: unknown) => {
   if (!data.overview) {
     void refreshOverview(true)
   }
+  void refreshCertificateList(true)
   const output = asString(data.output).trim()
   if (output !== '') {
     push.success({
@@ -3007,38 +3212,23 @@ const shouldPauseOverviewPolling = computed(() => {
     || selfSignedAuthorityManagerVisible.value
     || selfSignedAuthorityFormVisible.value
     || selfSignedAuthorityDetailVisible.value
+    || acmeAccountDialogVisible.value
+    || acmeAccountFormVisible.value
     || acmeAccountRotateVisible.value
+    || dnsAccountDialogVisible.value
+    || dnsAccountFormVisible.value
+    || pushDialogVisible.value
     || logDialogVisible.value
     || viewDialogVisible.value
     || issueLogVisible.value
 })
 
-const filteredCertificates = computed(() => {
-  const keyword = searchText.value.trim().toLowerCase()
-  if (keyword === '') return overview.value.certificates
-
-  return overview.value.certificates.filter((item) => {
-    const bucket = [
-      String(item.displayId || ''),
-      item.resourceId,
-      item.mainDomain,
-      item.domains.join(' '),
-      item.acmeAccountName,
-      item.dnsAccountName,
-      item.remark,
-      item.caServer,
-      item.challenge,
-    ].join(' ').toLowerCase()
-    return bucket.includes(keyword)
-  })
-})
-
 const panelAssignedCertificateCount = computed(() => {
-  return overview.value.certificates.filter(item => item.inUseByPanel).length
+  return certificatePanelAssignedCount.value
 })
 
 const subAssignedCertificateCount = computed(() => {
-  return overview.value.certificates.filter(item => item.inUseBySub).length
+  return certificateSubAssignedCount.value
 })
 
 const unapplyDisabledMessage = (target: 'panel' | 'sub'): string => {
@@ -3057,29 +3247,11 @@ const isUnapplyDisabled = (cert: AcmeCertificate, target: 'panel' | 'sub'): bool
 }
 
 const selectedLogCertificate = computed(() => {
-  return overview.value.certificates.find(item => item.id === logCertId.value) ?? null
+  return certificateItems.value.find(item => item.id === logCertId.value) ?? null
 })
 
 const selectedViewCertificate = computed(() => {
-  return overview.value.certificates.find(item => item.id === viewingCertId.value) ?? null
-})
-
-const selectedLogContent = computed(() => {
-  const cert = selectedLogCertificate.value
-  if (cert == null) return '暂无日志'
-
-  const parts: string[] = []
-  if (cert.lastError.trim() !== '') {
-    parts.push(`最近错误:\n${cert.lastError.trim()}`)
-  }
-  if (cert.postActionError.trim() !== '') {
-    parts.push(`后置动作警告:\n${cert.postActionError.trim()}`)
-  }
-  if (cert.lastOutput.trim() !== '') {
-    parts.push(`最近输出:\n${cert.lastOutput.trim()}`)
-  }
-  if (parts.length === 0) return '暂无输出日志'
-  return parts.join('\n\n')
+  return certificateItems.value.find(item => item.id === viewingCertId.value) ?? null
 })
 
 const issueLogStatusText = computed(() => {
@@ -3151,6 +3323,39 @@ const canSaveDNSAccount = computed(() => {
     const accessKeyId = dnsEnvFieldValue('AWS_ACCESS_KEY_ID').trim()
     const secretAccessKey = dnsEnvFieldValue('AWS_SECRET_ACCESS_KEY').trim()
     if ((accessKeyId === '' && secretAccessKey !== '') || (accessKeyId !== '' && secretAccessKey === '')) {
+      return false
+    }
+  }
+  if (provider.providerCode === 'dns_azure') {
+    const managedIdentity = dnsEnvFieldValue('AZUREDNS_MANAGEDIDENTITY').trim().toLowerCase() === 'true'
+    const bearerToken = dnsEnvFieldValue('AZUREDNS_BEARERTOKEN').trim()
+    const tenantId = dnsEnvFieldValue('AZUREDNS_TENANTID').trim()
+    const appId = dnsEnvFieldValue('AZUREDNS_APPID').trim()
+    const clientSecret = dnsEnvFieldValue('AZUREDNS_CLIENTSECRET').trim()
+    if (!managedIdentity && bearerToken === '' && (tenantId === '' || appId === '' || clientSecret === '')) {
+      return false
+    }
+  }
+  if (provider.providerCode === 'dns_gandi_livedns') {
+    if (dnsEnvFieldValue('GANDI_LIVEDNS_TOKEN').trim() === '' && dnsEnvFieldValue('GANDI_LIVEDNS_KEY').trim() === '') {
+      return false
+    }
+  }
+  if (provider.providerCode === 'dns_cloudns') {
+    const authID = dnsEnvFieldValue('CLOUDNS_AUTH_ID').trim()
+    const subAuthID = dnsEnvFieldValue('CLOUDNS_SUB_AUTH_ID').trim()
+    if ((authID === '' && subAuthID === '') || dnsEnvFieldValue('CLOUDNS_AUTH_PASSWORD').trim() === '') {
+      return false
+    }
+  }
+  if (provider.providerCode === 'dns_yc') {
+    const zoneID = dnsEnvFieldValue('YC_Zone_ID').trim()
+    const folderID = dnsEnvFieldValue('YC_Folder_ID').trim()
+    const serviceAccountID = dnsEnvFieldValue('YC_SA_ID').trim()
+    const keyID = dnsEnvFieldValue('YC_SA_Key_ID').trim()
+    const privateKeyPath = dnsEnvFieldValue('YC_SA_Key_File_Path').trim()
+    const privateKeyBase64 = dnsEnvFieldValue('YC_SA_Key_File_PEM_b64').trim()
+    if ((zoneID === '' && folderID === '') || serviceAccountID === '' || keyID === '' || (privateKeyPath === '' && privateKeyBase64 === '')) {
       return false
     }
   }
@@ -3427,18 +3632,21 @@ const refreshOverview = async (silent = false, force = false) => {
   if (overviewRequestPromise != null) {
     return overviewRequestPromise
   }
-  if (!force && overviewLoaded && !props.active) {
+  if (!props.active) {
     return
   }
   if (!silent && (force || overviewRequestPromise == null)) {
     loadingOverview.value = true
+    overviewLoadError.value = ''
   }
   let request: Promise<void> | null = null
   request = (async () => {
     try {
       const msg = await HttpUtils.get('api/acme-overview')
-      if (msg.success) {
+      if (msg.success && msg.obj) {
         applyOverview(msg.obj)
+      } else if (msg.failureKind !== 'cancelled') {
+        overviewLoadError.value = msg.msg || '证书管理概览加载失败'
       }
     } finally {
       if (overviewRequestPromise === request) {
@@ -3447,10 +3655,80 @@ const refreshOverview = async (silent = false, force = false) => {
       if (!silent) {
         loadingOverview.value = false
       }
+      if (overviewPollingEnabled) {
+        scheduleOverviewPolling()
+      }
     }
   })()
   overviewRequestPromise = request
   return request
+}
+
+const certificatePageCount = computed(() => Math.max(1, Math.ceil(certificateTotal.value / certificatePerPage)))
+
+const refreshCertificateList = async (force = false) => {
+  if (!props.active || (typeof document !== 'undefined' && document.visibilityState !== 'visible')) return
+  if (!force && certificateListLoaded && !props.active) return
+  certificateListAbortController?.abort()
+  const controller = new AbortController()
+  certificateListAbortController = controller
+  const token = ++certificateListRequestToken
+  loadingCertificateList.value = true
+  if (!certificateListReady.value) {
+    certificateListError.value = ''
+  }
+  const request = (async () => {
+    try {
+      const msg = await HttpUtils.get('api/certificate-list', {
+        page: certificatePage.value,
+        per_page: certificatePerPage,
+        search: searchText.value.trim(),
+      }, { silentErrorToast: true, signal: controller.signal })
+      if (
+        token !== certificateListRequestToken
+        || !props.active
+        || (typeof document !== 'undefined' && document.visibilityState !== 'visible')
+      ) return
+      if (!msg.success || !msg.obj) {
+        if (msg.failureKind !== 'cancelled') {
+          certificateListError.value = msg.msg || '证书列表加载失败'
+        }
+        return
+      }
+
+      const raw = (msg.obj ?? {}) as Partial<CertificateListResult>
+      certificateItems.value = normalizeCertificates(raw.items)
+      certificatePage.value = Math.max(1, asNumber(raw.page, certificatePage.value))
+      certificateTotal.value = Math.max(0, asNumber(raw.total))
+      certificatePanelAssignedCount.value = Math.max(0, asNumber(raw.panelAssignedCount))
+      certificateSubAssignedCount.value = Math.max(0, asNumber(raw.subAssignedCount))
+      certificateListLoaded = true
+      certificateListReady.value = true
+      certificateListError.value = ''
+    } finally {
+      if (token === certificateListRequestToken) {
+        loadingCertificateList.value = false
+      }
+    }
+  })()
+  certificateListRequestPromise = request
+  try {
+    await request
+  } finally {
+    if (certificateListRequestPromise === request) {
+      certificateListRequestPromise = null
+    }
+    if (certificateListAbortController === controller) {
+      certificateListAbortController = null
+    }
+  }
+}
+
+const goToCertificatePage = (page: number) => {
+  const target = Math.min(Math.max(1, Math.trunc(page)), certificatePageCount.value)
+  if (target === certificatePage.value || loadingCertificateList.value) return
+  certificatePage.value = target
+  void refreshCertificateList(true)
 }
 
 const refreshSelfSignedAuthorities = async (force = false) => {
@@ -3461,13 +3739,21 @@ const refreshSelfSignedAuthorities = async (force = false) => {
     return
   }
   loadingSelfSignedAuthorities.value = true
+  selfSignedAuthoritiesError.value = ''
   let request: Promise<void> | null = null
   request = (async () => {
     try {
       const msg = await HttpUtils.get('api/self-signed-authorities')
-      if (!msg.success) return
+      if (!msg.success || !msg.obj) {
+        if (msg.failureKind !== 'cancelled') {
+          selfSignedAuthoritiesError.value = msg.msg || '自签平台加载失败'
+        }
+        return
+      }
       selfSignedAuthorities.value = normalizeSelfSignedAuthorities(msg.obj)
       selfSignedAuthoritiesLoaded = true
+      selfSignedAuthoritiesReady.value = true
+      selfSignedAuthoritiesError.value = ''
       selfSignedAuthoritiesDirty = false
       if (selfSignedForm.value.authorityId <= 0) {
         selfSignedForm.value.authorityId = selfSignedAuthorities.value[0]?.id ?? 0
@@ -3547,7 +3833,7 @@ const refreshIPPortStatus = async () => {
 const normalizeIssueIPSelection = (value: unknown) => {
   const raw = Array.isArray(value) ? value : [value]
   const normalized = normalizeIPList(raw)
-  if (raw.length > 100 || normalized.length >= 100) {
+  if (raw.length > 100 || normalized.length > 100) {
     push.warning({
       duration: 3600,
       message: 'IP 证书最多选择或输入 100 个 IP',
@@ -3558,18 +3844,29 @@ const normalizeIssueIPSelection = (value: unknown) => {
 
 const stopIssueLogPolling = () => {
   if (issueLogTimer.value != null) {
-    window.clearInterval(issueLogTimer.value)
+    window.clearTimeout(issueLogTimer.value)
     issueLogTimer.value = null
   }
 }
 
-const startIssueLogPolling = () => {
+const isIssueLogPollingAllowed = () => (
+  props.active
+  && issueLogVisible.value
+  && issueLogSessionId.value !== ''
+  && (typeof document === 'undefined' || document.visibilityState === 'visible')
+)
+
+const scheduleIssueLogPolling = () => {
   stopIssueLogPolling()
-  if (!issueLogVisible.value || issueLogSessionId.value === '') return
-  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
-  issueLogTimer.value = window.setInterval(() => {
+  if (!isIssueLogPollingAllowed()) return
+  issueLogTimer.value = window.setTimeout(() => {
     void pollIssueLog()
   }, 1000)
+}
+
+const startIssueLogPolling = () => {
+  stopIssueLogPolling()
+  if (!isIssueLogPollingAllowed()) return
   void pollIssueLog()
 }
 
@@ -3614,6 +3911,8 @@ const normalizeAcmeLogSession = (raw: unknown): AcmeLogSession => {
     title: asString(data.title),
     status: asString(data.status, 'missing'),
     lines,
+    lineStart: asNumber(data.lineStart),
+    lineNext: asNumber(data.lineNext, lines.length),
     error: asString(data.error),
     taskId: asString(data.taskId),
     taskStatus: asString(data.taskStatus),
@@ -3673,9 +3972,9 @@ const openIssueTaskLog = (task: AcmeTask) => {
   stopIssueLogPolling()
   rememberActiveAcmeTask(task)
   issueLogStatus.value = task.status
-  issueLogLines.value = task.status === 'queued'
-    ? ['后台任务已排队，等待开始执行...']
-    : ['后台任务已创建，正在读取日志...']
+  issueLogNextLine.value = 0
+  issueLogLoaded.value = false
+  issueLogLines.value = []
   issueLogVisible.value = true
   syncIssueLogZIndex()
   scrollIssueLogToBottom()
@@ -3721,18 +4020,32 @@ const restoreActiveAcmeTask = async () => {
 
 const pollIssueLog = async (): Promise<void> => {
   if (issueLogRequestPromise) return issueLogRequestPromise
+  if (!isIssueLogPollingAllowed()) return
   const sessionID = issueLogSessionId.value
   if (sessionID === '') return
+  const requestedAfter = issueLogNextLine.value
+  let shouldContinue = false
   const request = (async () => {
-    const msg = await HttpUtils.get('api/acme-log', { id: sessionID })
-    if (!msg.success || sessionID !== issueLogSessionId.value) return
+    const msg = await HttpUtils.get('api/acme-log', { id: sessionID, after: requestedAfter }, { silentErrorToast: true })
+    if (!msg.success || sessionID !== issueLogSessionId.value) {
+      shouldContinue = true
+      return
+    }
 
     const session = normalizeAcmeLogSession(msg.obj)
     const effectiveStatus = session.taskStatus || session.status
     issueLogStatus.value = effectiveStatus
-    issueLogLines.value = session.lines.length > 0 ? session.lines : ['等待后端开始写入日志...']
+    if (!issueLogLoaded.value || session.lineStart !== requestedAfter) {
+      issueLogLines.value = session.lines
+    } else if (session.lines.length > 0) {
+      issueLogLines.value = [...issueLogLines.value, ...session.lines]
+    }
+    issueLogNextLine.value = session.lineNext
+    issueLogLoaded.value = true
     if (session.taskId) issueTaskId.value = session.taskId
-    scrollIssueLogToBottom()
+    if (session.lines.length > 0) {
+      scrollIssueLogToBottom()
+    }
 
     if (isTerminalAcmeTaskStatus(effectiveStatus)) {
       stopIssueLogPolling()
@@ -3751,7 +4064,9 @@ const pollIssueLog = async (): Promise<void> => {
           push.error({ duration: 5200, message: session.error })
         }
       }
+      return
     }
+    shouldContinue = true
   })()
   issueLogRequestPromise = request
   try {
@@ -3759,6 +4074,9 @@ const pollIssueLog = async (): Promise<void> => {
   } finally {
     if (issueLogRequestPromise === request) {
       issueLogRequestPromise = null
+    }
+    if (shouldContinue && sessionID === issueLogSessionId.value) {
+      scheduleIssueLogPolling()
     }
   }
 }
@@ -4117,6 +4435,7 @@ const openSelfSignedAuthorityForm = (item?: SelfSignedAuthority) => {
       country: item.country || 'US',
       province: item.province,
       city: item.city,
+      keyAlgorithm: item.keyAlgorithm || 'ecc256',
       issuerName: item.issuerName,
       issuerOrg: item.issuerOrg,
       caUrl: item.caUrl,
@@ -4164,6 +4483,7 @@ const saveSelfSignedAuthority = async () => {
       country: selfSignedAuthorityForm.value.country.trim().toUpperCase(),
       province: selfSignedAuthorityForm.value.province.trim(),
       city: selfSignedAuthorityForm.value.city.trim(),
+      keyAlgorithm: selfSignedAuthorityForm.value.keyAlgorithm,
       issuerName: selfSignedAuthorityForm.value.issuerName.trim(),
       issuerOrg: selfSignedAuthorityForm.value.issuerOrg.trim(),
       caUrl: selfSignedAuthorityForm.value.caUrl.trim(),
@@ -4626,9 +4946,32 @@ const confirmPushDialog = async () => {
   }
 }
 
-const openLogDialog = (cert: AcmeCertificate) => {
+const openLogDialog = async (cert: AcmeCertificate) => {
   logCertId.value = cert.id
+  certificateLogContent.value = ''
+  loadingCertificateLog.value = true
   logDialogVisible.value = true
+  try {
+    const msg = await HttpUtils.get('api/acme-certificate-log', { id: cert.id }, { silentErrorToast: true })
+    if (logCertId.value !== cert.id) return
+    if (!msg.success) {
+      certificateLogContent.value = msg.msg || '证书日志加载失败'
+      return
+    }
+    const row = (msg.obj ?? {}) as Record<string, unknown>
+    const parts: string[] = []
+    const lastError = asString(row.lastError).trim()
+    const postActionError = asString(row.postActionError).trim()
+    const lastOutput = asString(row.lastOutput).trim()
+    if (lastError !== '') parts.push(`最近错误:\n${lastError}`)
+    if (postActionError !== '') parts.push(`后置动作警告:\n${postActionError}`)
+    if (lastOutput !== '') parts.push(`最近输出:\n${lastOutput}`)
+    certificateLogContent.value = parts.length > 0 ? parts.join('\n\n') : '暂无输出日志'
+  } finally {
+    if (logCertId.value === cert.id) {
+      loadingCertificateLog.value = false
+    }
+  }
 }
 
 const openAcmeAccountForm = (item?: AcmeAccount) => {
@@ -4809,7 +5152,7 @@ const setDnsEnvField = (key: string, value: string) => {
 
 const isSecretLikeField = (key: string): boolean => {
   const normalized = key.toLowerCase()
-  return normalized.includes('token') || normalized.includes('secret') || normalized.includes('password') || normalized.includes('private_key') || normalized.includes('access_key') || normalized.includes('api_key') || normalized.endsWith('_key') || normalized.endsWith('_key_id') || normalized.endsWith('_secret')
+  return normalized.includes('token') || normalized.includes('secret') || normalized.includes('password') || normalized.includes('private_key') || normalized.includes('key_file') || normalized.includes('access_key') || normalized.includes('api_key') || normalized.endsWith('_key') || normalized.endsWith('_key_id') || normalized.endsWith('_secret')
 }
 
 const parseExtraEnvLines = (raw: string): { env: Record<string, string>; invalidLine: string } => {
@@ -4898,10 +5241,27 @@ const deleteDNSAccount = async (item: AcmeDNSAccount) => {
 }
 
 const stopPolling = () => {
+  overviewPollingEnabled = false
   if (pollTimer.value != null) {
-    window.clearInterval(pollTimer.value)
+    window.clearTimeout(pollTimer.value)
     pollTimer.value = null
   }
+}
+
+const scheduleOverviewPolling = (delay = 12000) => {
+  if (!overviewPollingEnabled || !props.active || shouldPauseOverviewPolling.value) return
+  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+  if (pollTimer.value != null) window.clearTimeout(pollTimer.value)
+  pollTimer.value = window.setTimeout(async () => {
+    pollTimer.value = null
+    try {
+      await refreshOverview(true)
+    } catch {
+      // Keep the overview timer alive across an unexpected transport reject.
+    } finally {
+      if (overviewPollingEnabled) scheduleOverviewPolling()
+    }
+  }, delay)
 }
 
 const startPolling = () => {
@@ -4909,16 +5269,29 @@ const startPolling = () => {
   if (!props.active) return
   if (shouldPauseOverviewPolling.value) return
   if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
-  pollTimer.value = window.setInterval(() => {
-    if (shouldPauseOverviewPolling.value) return
-    void refreshOverview(true)
-  }, 12000)
+  overviewPollingEnabled = true
+  if (overviewRequestPromise != null) {
+    void overviewRequestPromise.finally(() => scheduleOverviewPolling())
+    return
+  }
+  scheduleOverviewPolling()
 }
 
 const handleVisibilityChange = () => {
+  if (!props.active) {
+    stopPolling()
+    closeIssueLog()
+    clearAcmeInstallTaskPolling()
+    certificateListAbortController?.abort()
+    certificateListAbortController = null
+    return
+  }
   if (document.visibilityState === 'visible') {
     if (overviewRequestPromise == null) {
       void refreshOverview(true)
+    }
+    if (certificateListRequestPromise == null) {
+      void refreshCertificateList(true)
     }
     startPolling()
     if (issueLogVisible.value) {
@@ -4941,6 +5314,7 @@ watch(() => props.active, (value) => {
     } else if (overviewRequestPromise == null) {
       void refreshOverview(true)
     }
+    void refreshCertificateList()
     void refreshSelfSignedAuthorities()
     startPolling()
     void restoreActiveAcmeTask()
@@ -4948,7 +5322,10 @@ watch(() => props.active, (value) => {
     return
   }
   stopPolling()
+  closeIssueLog()
   clearAcmeInstallTaskPolling()
+  certificateListAbortController?.abort()
+  certificateListAbortController = null
 })
 
 watch(shouldPauseOverviewPolling, (paused) => {
@@ -4957,6 +5334,18 @@ watch(shouldPauseOverviewPolling, (paused) => {
     return
   }
   startPolling()
+})
+
+watch(searchText, () => {
+  if (certificateSearchTimer != null) {
+    window.clearTimeout(certificateSearchTimer)
+  }
+  certificateSearchTimer = window.setTimeout(() => {
+    certificateSearchTimer = null
+    if (!props.active) return
+    certificatePage.value = 1
+    void refreshCertificateList(true)
+  }, 300)
 })
 
 watch(installEmail, (value) => {
@@ -5113,6 +5502,7 @@ watch(() => dnsAccountForm.value.providerCode, (value) => {
 onMounted(() => {
   if (props.active) {
     void refreshOverview()
+    void refreshCertificateList()
     void refreshSelfSignedAuthorities()
     startPolling()
     void restoreActiveAcmeTask()
@@ -5127,6 +5517,12 @@ onBeforeUnmount(() => {
   stopPolling()
   closeIssueLog()
   clearAcmeInstallTaskPolling()
+  certificateListAbortController?.abort()
+  certificateListAbortController = null
+  if (certificateSearchTimer != null) {
+    window.clearTimeout(certificateSearchTimer)
+    certificateSearchTimer = null
+  }
   if (typeof document !== 'undefined') {
     document.removeEventListener('visibilitychange', handleVisibilityChange)
   }
@@ -5495,6 +5891,59 @@ onBeforeUnmount(() => {
   border: 1px solid rgba(148, 163, 184, 0.14);
 }
 
+.acme-certificate-cards {
+  display: grid;
+  gap: 10px;
+}
+
+.acme-certificate-card {
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 8px;
+  background: rgba(var(--v-theme-surface-variant), 0.1);
+}
+
+.acme-certificate-card__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.acme-certificate-card__meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.acme-certificate-card__meta > div {
+  min-width: 0;
+}
+
+.acme-certificate-card__meta span,
+.acme-certificate-card__meta strong {
+  display: block;
+}
+
+.acme-certificate-card__meta span {
+  color: rgba(148, 163, 184, 0.95);
+  font-size: 12px;
+}
+
+.acme-certificate-card__meta strong {
+  margin-top: 2px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.acme-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
 .acme-id-cell {
   font-family: Consolas, 'Courier New', monospace;
   white-space: nowrap;
@@ -5556,6 +6005,10 @@ onBeforeUnmount(() => {
 
 .acme-sub-table {
   border: 1px solid rgba(148, 163, 184, 0.14);
+}
+
+.acme-sub-table :deep(.v-table__wrapper) {
+  overflow-x: auto;
 }
 
 .acme-log {
@@ -5673,6 +6126,23 @@ onBeforeUnmount(() => {
   .acme-wrap-text,
   .acme-auto-renew-state {
     max-width: 190px;
+  }
+
+  .acme-certificate-card__meta {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .acme-sub-table :deep(table) {
+    min-width: 640px;
+  }
+
+  .self-authority-manager {
+    min-height: 0;
+  }
+
+  .self-authority-detail__label {
+    width: 144px;
+    white-space: normal;
   }
 }
 </style>

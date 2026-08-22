@@ -1,18 +1,22 @@
 <template>
-  <v-dialog transition="dialog-bottom-transition" width="800">
+  <v-dialog transition="dialog-bottom-transition" width="800" max-width="95vw">
     <v-card class="rounded-lg">
       <v-card-title>
         {{ $t('actions.' + title) + " " + $t('objects.rule') }}
       </v-card-title>
       <v-divider></v-divider>
-      <v-card-text style="padding: 0 16px;">
+      <v-card-text style="padding: 0 16px; max-height: 75vh; overflow-y: auto;">
         <v-row>
           <v-col cols="12" sm="6" md="4" v-if="!isMihomoNamespace">
             <v-switch color="primary" v-model="logical" :label="$t('rule.logical')" hide-details></v-switch>
           </v-col>
           <v-spacer></v-spacer>
           <v-col cols="auto" v-if="logical && !isMihomoNamespace" justify="center" align="center">
-            <v-btn color="primary" @click="ruleData.rules.push(<rule>{})" hide-details>{{ $t('actions.add') + " " + $t('objects.rule') }}</v-btn>
+          <v-btn
+            color="primary"
+            :disabled="logicalChildLimitReached"
+            @click="addLogicalRule"
+            hide-details>{{ $t('actions.add') + " " + $t('objects.rule') }}</v-btn>
           </v-col>
         </v-row>
         <v-card style="background-color: inherit; margin-bottom: 5px;" v-for="(r, index) in ruleData.rules" v-if="ruleData.type == 'logical'">
@@ -68,7 +72,7 @@
             </v-col>
           </v-row>
         </v-card>
-        <v-card subtitle="Route Option" v-if="ruleData.action == 'route-options'">
+        <v-card subtitle="Route Option" v-if="hasRouteOptions">
           <v-row>
             <v-col cols="12" sm="6" md="4">
               <v-text-field v-model="ruleData.override_address" :label="$t('types.direct.overrideAddr')" hide-details></v-text-field>
@@ -77,9 +81,28 @@
               <v-text-field
                 v-model.number="ruleData.override_port"
                 type="number"
-                min="0"
-                max="65534"
+                min="1"
+                max="65535"
                 :label="$t('types.direct.overridePort')"
+                hide-details>
+              </v-text-field>
+            </v-col>
+            <v-col cols="12" sm="6" md="4">
+              <v-select
+                v-model="ruleData.network_strategy"
+                :items="networkStrategies"
+                label="Network Strategy"
+                clearable
+                @click:clear="delete ruleData.network_strategy"
+                hide-details>
+              </v-select>
+            </v-col>
+            <v-col cols="12" sm="6" md="4">
+              <v-text-field
+                v-model="ruleData.fallback_delay"
+                label="Fallback Delay"
+                clearable
+                @click:clear="delete ruleData.fallback_delay"
                 hide-details>
               </v-text-field>
             </v-col>
@@ -107,7 +130,7 @@
             </v-select>
             </v-col>
             <v-col v-if="!isMihomoNamespace" cols="12" sm="6" md="4">
-              <v-switch v-model="ruleData.no_drop" :label="$t('rule.noDrop')" hide-details></v-switch>
+              <v-switch v-model="ruleData.no_drop" :disabled="ruleData.method === 'drop'" :label="$t('rule.noDrop')" hide-details></v-switch>
             </v-col>
           </v-row>
         </v-card>
@@ -143,6 +166,21 @@
             <v-col cols="12" sm="6" md="4">
               <v-text-field v-model="ruleData.server" :label="$t('basic.dns.server')" hide-details></v-text-field>
             </v-col>
+            <v-col cols="12" sm="6" md="4">
+              <v-switch v-model="ruleData.disable_cache" label="Disable Cache" hide-details></v-switch>
+            </v-col>
+            <v-col cols="12" sm="6" md="4">
+              <v-switch v-model="ruleData.disable_optimistic_cache" label="Disable Optimistic Cache" hide-details></v-switch>
+            </v-col>
+            <v-col cols="12" sm="6" md="4">
+              <v-text-field v-model="ruleData.rewrite_ttl" label="Rewrite TTL" clearable hide-details></v-text-field>
+            </v-col>
+            <v-col cols="12" sm="6" md="4">
+              <v-text-field v-model="ruleData.timeout" label="Resolve Timeout" clearable hide-details></v-text-field>
+            </v-col>
+            <v-col cols="12" sm="6" md="4">
+              <v-text-field v-model="ruleData.client_subnet" label="Client Subnet" clearable hide-details></v-text-field>
+            </v-col>
           </v-row>
         </v-card>
       </v-card-text>
@@ -169,7 +207,7 @@
 </template>
 
 <script lang="ts">
-import { logicalRule, rule, actionKeys, sanitizeRuleForNamespace } from '@/types/rules'
+import { logicalRule, rule, actionKeys, sanitizeRuleForNamespace, singboxRouteResourceLimits } from '@/types/rules'
 import RuleOptions from '@/components/Rule.vue'
 export default {
   props: ['visible', 'data', 'index', 'namespace', 'clients', 'inTags', 'outTags', 'rsTags'],
@@ -211,12 +249,26 @@ export default {
         { title: 'Prefer IPv6', value: 'prefer_ipv6' },
         { title: 'IPv4 Only', value: 'ipv4_only' },
         { title: 'IPv6 Only', value: 'ipv6_only' },
-      ]
+      ],
+      networkStrategies: [
+        { title: 'Default', value: 'default' },
+        { title: 'Hybrid', value: 'hybrid' },
+        { title: 'Fallback', value: 'fallback' },
+      ],
     }
   },
   methods: {
     normalizeRule(data: any) {
       return sanitizeRuleForNamespace(data, this.$props.namespace)
+    },
+    applyRouteOptions(target: any) {
+      target.override_address = this.ruleData.override_address?.length > 0 ? this.ruleData.override_address : undefined
+      target.override_port = this.ruleData?.override_port > 0 ? this.ruleData.override_port : undefined
+      target.network_strategy = this.ruleData.network_strategy?.length > 0 ? this.ruleData.network_strategy : undefined
+      target.fallback_delay = this.ruleData.fallback_delay?.length > 0 ? this.ruleData.fallback_delay : undefined
+      target.udp_disable_domain_unmapping = this.ruleData.udp_disable_domain_unmapping ? true : undefined
+      target.udp_connect = this.ruleData.udp_connect ? true : undefined
+      target.udp_timeout = this.ruleData.udp_timeout?.length > 0 ? this.ruleData.udp_timeout : undefined
     },
     updateData() {
       if (this.$props.index != -1) {
@@ -273,23 +325,18 @@ export default {
       }
 
       // Filter action data
-      switch (newRule.action){
+        switch (newRule.action){
         case 'route':
           newRule.outbound = this.ruleData.outbound
+          this.applyRouteOptions(newRule)
           break
         case 'route-options':
-          newRule.override_address = this.ruleData.override_address?.length > 0 ? this.ruleData.override_address : undefined
-          newRule.override_port = this.ruleData?.override_port > 0 ? this.ruleData.override_port : undefined
-          newRule.network_strategy = this.ruleData.network_strategy?.length > 0 ? this.ruleData.network_strategy : undefined
-          newRule.fallback_delay = this.ruleData.fallback_delay?.length > 0 ? this.ruleData.fallback_delay : undefined
-          newRule.udp_disable_domain_unmapping = this.ruleData.udp_disable_domain_unmapping? true : undefined
-          newRule.udp_connect = this.ruleData.udp_connect? true : undefined
-          newRule.udp_timeout = this.ruleData.udp_timeout?.length > 0 ? this.ruleData.udp_timeout : undefined
+          this.applyRouteOptions(newRule)
           break
         case 'reject':
           newRule.method = this.ruleData.method?.length > 0 ? this.ruleData.method : undefined
           if (!this.isMihomoNamespace) {
-            newRule.no_drop = this.ruleData.no_drop? true : undefined
+            newRule.no_drop = this.ruleData.method === 'drop' ? undefined : (this.ruleData.no_drop ? true : undefined)
           }
           break
         case 'sniff':
@@ -299,6 +346,11 @@ export default {
         case 'resolve':
           newRule.strategy = this.ruleData.strategy?.length > 0 ? this.ruleData.strategy : undefined
           newRule.server = this.ruleData.server?.length > 0 ? this.ruleData.server : undefined
+          newRule.disable_cache = this.ruleData.disable_cache ? true : undefined
+          newRule.disable_optimistic_cache = this.ruleData.disable_optimistic_cache ? true : undefined
+          newRule.rewrite_ttl = this.ruleData.rewrite_ttl !== undefined && this.ruleData.rewrite_ttl !== null && this.ruleData.rewrite_ttl !== '' ? this.ruleData.rewrite_ttl : undefined
+          newRule.timeout = this.ruleData.timeout?.length > 0 ? this.ruleData.timeout : undefined
+          newRule.client_subnet = this.ruleData.client_subnet?.length > 0 ? this.ruleData.client_subnet : undefined
           break
       }
 
@@ -318,6 +370,12 @@ export default {
     },
     deleteRule(index:number) {
       this.ruleData.rules.splice(index,1)
+    },
+    addLogicalRule() {
+      if (this.isMihomoNamespace || this.ruleData.type !== 'logical' || this.logicalChildLimitReached) {
+        return
+      }
+      this.ruleData.rules.push(<rule>{})
     }
   },
   computed: {
@@ -334,6 +392,12 @@ export default {
       set(v:boolean) {
         this.ruleData.type = !this.isMihomoNamespace && v ? 'logical' : 'simple'
       }
+    },
+    logicalChildLimitReached(): boolean {
+      return this.ruleData.type === 'logical' && this.ruleData.rules.length >= singboxRouteResourceLimits.logicalChildren
+    },
+    hasRouteOptions(): boolean {
+      return !this.isMihomoNamespace && (this.ruleData.action === 'route' || this.ruleData.action === 'route-options')
     }
   },
   watch: {

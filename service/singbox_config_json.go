@@ -23,20 +23,26 @@ func normalizeSingboxConfigJSON(config json.RawMessage, validateRules bool) (jso
 		return nil, err
 	}
 
-	dnsMap, ok := root["dns"].(map[string]interface{})
-	if !ok || dnsMap == nil {
-		return config, nil
+	changed := false
+	if _, exists := root["log"]; exists {
+		delete(root, "log")
+		changed = true
 	}
 
-	changed, err := sanitizeSingboxDNSMap(dnsMap, validateRules)
-	if err != nil {
-		return nil, err
+	dnsMap, ok := root["dns"].(map[string]interface{})
+	if ok && dnsMap != nil {
+		dnsChanged, err := sanitizeSingboxDNSMap(dnsMap, validateRules)
+		if err != nil {
+			return nil, err
+		}
+		changed = changed || dnsChanged
+		if dnsChanged {
+			root["dns"] = dnsMap
+		}
 	}
 	if !changed {
 		return config, nil
 	}
-
-	root["dns"] = dnsMap
 	return json.Marshal(root)
 }
 

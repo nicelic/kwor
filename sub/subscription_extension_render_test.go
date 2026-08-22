@@ -3,6 +3,7 @@ package sub
 import (
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/alireza0/s-ui/database"
@@ -78,6 +79,93 @@ func TestCanonicalSubscriptionExtensionDefaults(t *testing.T) {
 	}
 	if len(expectedRejectQuicRules) != 0 {
 		t.Fatalf("canonical Clash missing QUIC UDP reject rules: %#v", expectedRejectQuicRules)
+	}
+}
+
+func TestJSONSubscriptionRenderCanonicalizesDoHPath(t *testing.T) {
+	if err := database.InitDB(filepath.Join(t.TempDir(), "json-doh-path.db")); err != nil {
+		t.Fatalf("init database: %v", err)
+	}
+	sqlDB, err := database.GetDB().DB()
+	if err != nil {
+		t.Fatalf("access database handle: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	settingService := &service.SettingService{}
+	if _, err := settingService.GetAllSetting(); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	if err := database.GetDB().Model(&model.Setting{}).Where("key = ?", "subJsonExt").Update("value", `{
+  "dns": {
+    "servers": [
+      {"tag":"direct-dns","type":"h3","server":"dns.example","server_port":443,"path":"dns-query"}
+    ]
+  }
+}`).Error; err != nil {
+		t.Fatalf("store JSON subscription extension: %v", err)
+	}
+
+	outbounds := []map[string]interface{}{}
+	tags := []string{}
+	rendered, err := (&JsonService{}).renderJSONSubscription(&outbounds, &tags, "")
+	if err != nil {
+		t.Fatalf("render JSON subscription: %v", err)
+	}
+	root := map[string]interface{}{}
+	if err := json.Unmarshal([]byte(rendered), &root); err != nil {
+		t.Fatalf("decode rendered JSON subscription: %v", err)
+	}
+	dns := root["dns"].(map[string]interface{})
+	servers := dns["servers"].([]interface{})
+	if len(servers) != 1 {
+		t.Fatalf("rendered DNS servers = %#v", servers)
+	}
+	server := servers[0].(map[string]interface{})
+	if path, _ := server["path"].(string); path != "/dns-query" {
+		t.Fatalf("rendered DoH3 path = %q, want /dns-query", path)
+	}
+}
+
+func TestClashSubscriptionExtensionIntervalBounds(t *testing.T) {
+	valid, err := service.ParseSubClashExtension(`_uiConfig:
+  latencyTestInterval: 30s
+  updateInterval: 1h
+rule-providers:
+  domain:
+    type: http
+    behavior: domain
+    format: yaml
+    url: https://example.com/domain.yaml
+    interval: 3600
+`)
+	if err != nil {
+		t.Fatalf("parse valid Clash interval extension: %v", err)
+	}
+	if err := service.ValidateSubClashExtension(valid); err != nil {
+		t.Fatalf("validate minimum Clash intervals: %v", err)
+	}
+
+	tooShort, err := service.ParseSubClashExtension(`_uiConfig:
+  latencyTestInterval: 1s
+  updateInterval: 30m
+`)
+	if err != nil {
+		t.Fatalf("parse low Clash interval extension: %v", err)
+	}
+	if err := service.ValidateSubClashExtension(tooShort); err == nil {
+		t.Fatal("low Clash intervals unexpectedly passed validation")
+	}
+
+	if got := parseMihomoLatencyIntervalSeconds("30s"); got != 30 {
+		t.Fatalf("minimum runtime latency interval = %d, want 30", got)
+	}
+	if got := parseMihomoLatencyIntervalSeconds("1s"); got != 0 {
+		t.Fatalf("low runtime latency interval = %d, want 0", got)
+	}
+	oversized := "x: \"" + strings.Repeat("a", service.SubscriptionClashExtensionMaxBytes) + "\"\n"
+	if _, err := service.ParseSubClashExtension(oversized); err == nil {
+		t.Fatal("oversized historical Clash source unexpectedly entered the parser")
 	}
 }
 

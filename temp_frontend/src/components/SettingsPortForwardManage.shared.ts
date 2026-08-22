@@ -92,6 +92,16 @@ type PortForwardOverview = {
   error?: string
 }
 
+type PortForwardRuntimeOverview = Pick<PortForwardOverview,
+  'lastSyncAt' | 'kernelIPv4Forward' | 'kernelIPv6Forward' | 'totalUp' | 'totalDown' | 'totalTraffic' |
+  'runtimeConflicts' | 'warnings' | 'error'
+> & {
+  rules?: Array<Partial<Pick<PortForwardRule,
+    'id' | 'currentUp' | 'currentDown' | 'currentTotal' | 'trafficNextResetAt' | 'trafficLastResetAt' |
+    'trafficLimitReached' | 'trafficExpired' | 'trafficBlocked' | 'trafficBlockReason'
+  >> & { ruleId?: number }>
+}
+
 type PortForwardRuleForm = {
   id: number
   name: string
@@ -113,6 +123,7 @@ type PortForwardRuleForm = {
 }
 
 const tr = (key: string, params?: Record<string, unknown>) => String(i18n.global.t(`portForward.${key}`, params ?? {}))
+const fullOverviewRefreshInterval = 60_000
 
 const errorMessage = (error: unknown, fallback: string) => {
   if (error instanceof Error && error.message.trim()) return error.message.trim()
@@ -193,6 +204,46 @@ const normalizeProtocolValue = (raw: unknown): string => {
   return 'tcp'
 }
 
+// Keep the editor aligned with the persisted normalized port expression. A
+// legacy row can contain a stale mode beside a valid LocalPortSpec; showing
+// the mode from the expression prevents the hidden fields from truncating it
+// when the user opens and saves the rule again.
+const normalizePersistedLocalPortMode = (
+  raw: unknown,
+  localPortSpec: unknown = '',
+  localPortStart: unknown = 0,
+  localPortEnd: unknown = 0,
+): 'single' | 'multi' | 'range' => {
+  const spec = String(localPortSpec ?? '').trim().replace(/，/g, ',')
+  if (spec.includes(',')) return 'multi'
+  if (/^\d+\s*[-:]\s*\d+$/.test(spec)) {
+    const parts = spec.split(/[-:]/).map(value => Number(value.trim()))
+    if (parts.length === 2 && Number.isFinite(parts[0]) && Number.isFinite(parts[1]) && parts[0] !== parts[1]) {
+      return 'range'
+    }
+  }
+
+  const value = String(raw ?? '').trim().toLowerCase()
+  if (value === 'multi') return 'multi'
+  if (value === 'range') return 'range'
+  if (value === 'count') {
+    return toNumber(localPortEnd) > toNumber(localPortStart) ? 'range' : 'single'
+  }
+  return 'single'
+}
+
+const normalizeSelectedLocalPortMode = (raw: unknown): 'single' | 'multi' | 'range' => {
+  switch (String(raw ?? '').trim().toLowerCase()) {
+    case 'multi':
+      return 'multi'
+    case 'range':
+    case 'count':
+      return 'range'
+    default:
+      return 'single'
+  }
+}
+
 const normalizeRule = (raw: Partial<PortForwardRule> = {}): PortForwardRule => ({
   id: toNumber(raw.id),
   name: String(raw.name ?? ''),
@@ -200,7 +251,7 @@ const normalizeRule = (raw: Partial<PortForwardRule> = {}): PortForwardRule => (
   enabled: Boolean(raw.enabled),
   family: normalizeFamilyValue(raw.family),
   protocol: normalizeProtocolValue(raw.protocol),
-  localPortMode: String(raw.localPortMode ?? 'single'),
+  localPortMode: normalizePersistedLocalPortMode(raw.localPortMode, raw.localPortSpec, raw.localPortStart, raw.localPortEnd),
   localPortSpec: String(raw.localPortSpec ?? ''),
   localPortStart: toNumber(raw.localPortStart),
   localPortCount: toNumber(raw.localPortCount, 1),
@@ -261,9 +312,7 @@ const mapRuleToForm = (rule?: PortForwardRule): PortForwardRuleForm => ({
   enabled: rule?.enabled ?? true,
   family: normalizeFamilyValue(rule?.family),
   protocol: normalizeProtocolValue(rule?.protocol),
-  // Legacy count records represent an inclusive range. Keep the current
-  // semantic visible instead of silently treating it as a single port.
-  localPortMode: rule?.localPortMode === 'count' ? 'range' : (rule?.localPortMode ?? 'single'),
+  localPortMode: normalizePersistedLocalPortMode(rule?.localPortMode, rule?.localPortSpec, rule?.localPortStart, rule?.localPortEnd),
   localPortSpec: rule?.localPortSpec ?? '',
   localPortStart: rule?.localPortStart ?? 0,
   localPortCount: rule?.localPortCount ?? 1,
@@ -276,29 +325,32 @@ const mapRuleToForm = (rule?: PortForwardRule): PortForwardRuleForm => ({
   trafficExpiryDate: rule?.trafficExpiryDate ?? '',
 })
 
-const buildPayload = (form: PortForwardRuleForm) => ({
-  id: form.id,
-  name: form.name.trim(),
-  description: form.description.trim(),
-  enabled: form.enabled,
-  family: normalizeFamilyValue(form.family),
-  protocol: normalizeProtocolValue(form.protocol),
-  localPortMode: form.localPortMode,
-  localPortSpec: form.localPortMode === 'multi'
-    ? form.localPortSpec.trim()
-    : form.localPortMode === 'single'
-      ? String(toNumber(form.localPortStart) || '')
-      : '',
-  localPortStart: toNumber(form.localPortStart),
-  localPortCount: toNumber(form.localPortCount, 1),
-  localPortEnd: toNumber(form.localPortEnd),
-  targetIP: form.targetIP.trim(),
-  targetPort: toNumber(form.targetPort),
-  rateLimitMbps: Math.max(0, toNumber(form.rateLimitMbps)),
-  trafficLimitGiB: Math.max(0, toNumber(form.trafficLimitGiB)),
-  trafficResetDay: Math.max(0, Math.floor(toNumber(form.trafficResetDay))),
-  trafficExpiryDate: form.trafficExpiryDate.trim(),
-})
+const buildPayload = (form: PortForwardRuleForm) => {
+  const localPortMode = normalizeSelectedLocalPortMode(form.localPortMode)
+  return {
+    id: form.id,
+    name: form.name.trim(),
+    description: form.description.trim(),
+    enabled: form.enabled,
+    family: normalizeFamilyValue(form.family),
+    protocol: normalizeProtocolValue(form.protocol),
+    localPortMode,
+    localPortSpec: localPortMode === 'multi'
+      ? form.localPortSpec.trim()
+      : localPortMode === 'single'
+        ? String(toNumber(form.localPortStart) || '')
+        : '',
+    localPortStart: toNumber(form.localPortStart),
+    localPortCount: toNumber(form.localPortCount, 1),
+    localPortEnd: toNumber(form.localPortEnd),
+    targetIP: form.targetIP.trim(),
+    targetPort: toNumber(form.targetPort),
+    rateLimitMbps: Math.max(0, toNumber(form.rateLimitMbps)),
+    trafficLimitGiB: Math.max(0, toNumber(form.trafficLimitGiB)),
+    trafficResetDay: Math.max(0, Math.floor(toNumber(form.trafficResetDay))),
+    trafficExpiryDate: form.trafficExpiryDate.trim(),
+  }
+}
 
 export const familyLabel = (value: string) => {
   if (value === 'ipv6') return 'IPv6'
@@ -466,13 +518,14 @@ const validatePortExpression = (raw: string) => {
 }
 
 const buildRuleValidationError = (form: PortForwardRuleForm): string => {
+  const localPortMode = normalizeSelectedLocalPortMode(form.localPortMode)
   if ([...form.name.trim()].length > 120) return tr('validationNameLength')
   if ([...form.description.trim()].length > 1000) return tr('validationDescriptionLength')
-  if (form.localPortMode === 'single' && !validPort(form.localPortStart)) return tr('validationPort')
-  if (form.localPortMode === 'range' && (!validPort(form.localPortStart) || !validPort(form.localPortEnd) || toNumber(form.localPortEnd) < toNumber(form.localPortStart))) {
+  if (localPortMode === 'single' && !validPort(form.localPortStart)) return tr('validationPort')
+  if (localPortMode === 'range' && (!validPort(form.localPortStart) || !validPort(form.localPortEnd) || toNumber(form.localPortEnd) < toNumber(form.localPortStart))) {
     return tr('validationRange')
   }
-  if (form.localPortMode === 'multi' && !validatePortExpression(form.localPortSpec)) return tr('validationMulti')
+  if (localPortMode === 'multi' && !validatePortExpression(form.localPortSpec)) return tr('validationMulti')
   if (!validPort(form.targetPort)) return tr('validationTargetPort')
   const rate = Number(form.rateLimitMbps)
   if (!Number.isFinite(rate) || !Number.isInteger(rate) || rate < 0 || rate > 1000000) return tr('validationRate')
@@ -498,10 +551,15 @@ export function usePortForwardManage(props: { active?: boolean }) {
   const savingRule = computed(() => mutationBusy.value && dialogVisible.value)
   const pollTimer = ref<number | null>(null)
   const overviewRequest = ref<Promise<Msg> | null>(null)
+  const runtimeRequest = ref<Promise<Msg> | null>(null)
+  const nextFullOverviewAt = ref(0)
   const rowBusyId = ref(0)
   const lastWarningSignature = ref('')
   const hasLoaded = ref(false)
   const loadError = ref('')
+  const runtimeError = ref('')
+  let readResponseGeneration = 0
+  const actionsDisabled = computed(() => mutationBusy.value || !hasLoaded.value || Boolean(loadError.value))
   const searchText = ref('')
   const familyFilter = ref('all')
   const protocolFilter = ref('all')
@@ -582,6 +640,7 @@ export function usePortForwardManage(props: { active?: boolean }) {
     }
     hasLoaded.value = true
     loadError.value = ''
+    runtimeError.value = ''
   }
 
   const lastSyncLabel = computed(() => (
@@ -617,9 +676,10 @@ export function usePortForwardManage(props: { active?: boolean }) {
   ))
   const localPreviewText = computed(() => {
     const form = editingRule.value
+    const mode = normalizeSelectedLocalPortMode(form.localPortMode)
     let localSpec = '-'
-    if (form.localPortMode === 'single') localSpec = String(form.localPortStart || 0)
-    else if (form.localPortMode === 'multi') localSpec = form.localPortSpec.trim() || '-'
+    if (mode === 'single') localSpec = String(form.localPortStart || 0)
+    else if (mode === 'multi') localSpec = form.localPortSpec.trim() || '-'
     else localSpec = `${form.localPortStart || 0}-${form.localPortEnd || 0}`
     return `${tr('localLabel')}: ${localSpec} → ${targetDisplayLabel(form.targetIP, form.targetPort)}`
   })
@@ -657,7 +717,16 @@ export function usePortForwardManage(props: { active?: boolean }) {
     })
   })
 
-  const conflictsForRule = (ruleID: number) => overview.value.runtimeConflicts.filter(item => item.ruleId === ruleID)
+  const conflictsByRule = computed(() => {
+    const result = new Map<number, PortForwardRuntimeConflict[]>()
+    for (const conflict of overview.value.runtimeConflicts) {
+      const current = result.get(conflict.ruleId) ?? []
+      current.push(conflict)
+      result.set(conflict.ruleId, current)
+    }
+    return result
+  })
+  const conflictsForRule = (ruleID: number) => conflictsByRule.value.get(ruleID) ?? []
   const formatConflictOwners = (conflict: PortForwardRuntimeConflict) => {
     if (!conflict.owners.length) return tr('unknownProcess')
     return conflict.owners.map(owner => owner.name ? `${owner.name} (${tr('pid')} ${owner.pid})` : `${tr('pid')} ${owner.pid}`).join(', ')
@@ -675,17 +744,21 @@ export function usePortForwardManage(props: { active?: boolean }) {
   }
 
   const fetchOverview = async (silent = false, showWarnings = !silent) => {
+    if (mutationBusy.value || refreshing.value) return { success: true, msg: '', obj: null } as Msg
     if (silent && (!props.active || (typeof document !== 'undefined' && document.visibilityState !== 'visible'))) {
       return { success: false, msg: '', obj: null } as Msg
     }
     if (overviewRequest.value) return overviewRequest.value
     if (!silent) loading.value = true
+    const requestGeneration = ++readResponseGeneration
     const request = (async () => {
       try {
         const msg = await HttpUtils.get('api/port-forward-overview', {}, { silentAuthCheck: true })
+        if (requestGeneration !== readResponseGeneration) return msg
         if (msg.success && msg.obj) {
           const nextOverview = msg.obj as Partial<PortForwardOverview>
           applyOverview(nextOverview)
+          nextFullOverviewAt.value = Date.now() + fullOverviewRefreshInterval
           handleWarnings(normalizeWarnings(nextOverview.warnings), showWarnings)
         } else {
           loadError.value = msg.msg || tr('loadFailed')
@@ -693,6 +766,7 @@ export function usePortForwardManage(props: { active?: boolean }) {
         return msg
       } catch (error) {
         const message = errorMessage(error, tr('loadFailed'))
+        if (requestGeneration !== readResponseGeneration) return { success: false, msg: message, obj: null } as Msg
         loadError.value = message
         return { success: false, msg: message, obj: null } as Msg
       }
@@ -706,11 +780,105 @@ export function usePortForwardManage(props: { active?: boolean }) {
     }
   }
 
+  const applyRuntimeOverview = (raw: Partial<PortForwardRuntimeOverview> | null | undefined) => {
+    if (!raw) return
+    const runtimeRulesByID = new Map<number, NonNullable<PortForwardRuntimeOverview['rules']>[number]>()
+    if (Array.isArray(raw.rules)) {
+      for (const runtimeRule of raw.rules) {
+        runtimeRulesByID.set(toNumber(runtimeRule.ruleId ?? runtimeRule.id), runtimeRule)
+      }
+    }
+    overview.value = {
+      ...overview.value,
+      lastSyncAt: toNumber(raw.lastSyncAt, overview.value.lastSyncAt),
+      kernelIPv4Forward: typeof raw.kernelIPv4Forward === 'boolean' ? raw.kernelIPv4Forward : overview.value.kernelIPv4Forward,
+      kernelIPv6Forward: typeof raw.kernelIPv6Forward === 'boolean' ? raw.kernelIPv6Forward : overview.value.kernelIPv6Forward,
+      totalUp: toNumber(raw.totalUp, overview.value.totalUp),
+      totalDown: toNumber(raw.totalDown, overview.value.totalDown),
+      totalTraffic: toNumber(raw.totalTraffic, overview.value.totalTraffic),
+      runtimeConflicts: Array.isArray(raw.runtimeConflicts) ? raw.runtimeConflicts.map(conflict => normalizeConflict(conflict)) : overview.value.runtimeConflicts,
+      warnings: raw.warnings == null ? overview.value.warnings : normalizeWarnings(raw.warnings),
+    }
+    runtimeError.value = raw.error == null ? '' : String(raw.error)
+    const conflictCounts = new Map<number, number>()
+    for (const conflict of overview.value.runtimeConflicts) {
+      conflictCounts.set(conflict.ruleId, (conflictCounts.get(conflict.ruleId) ?? 0) + 1)
+    }
+    overview.value.rules = overview.value.rules.map(rule => ({
+      ...rule,
+      ...(() => {
+        const runtimeRule = runtimeRulesByID.get(rule.id)
+        if (!runtimeRule) return {}
+        return {
+          currentUp: toNumber(runtimeRule.currentUp, rule.currentUp),
+          currentDown: toNumber(runtimeRule.currentDown, rule.currentDown),
+          currentTotal: toNumber(runtimeRule.currentTotal, rule.currentTotal),
+          trafficNextResetAt: toNumber(runtimeRule.trafficNextResetAt, rule.trafficNextResetAt),
+          trafficLastResetAt: toNumber(runtimeRule.trafficLastResetAt, rule.trafficLastResetAt),
+          trafficLimitReached: typeof runtimeRule.trafficLimitReached === 'boolean' ? runtimeRule.trafficLimitReached : rule.trafficLimitReached,
+          trafficExpired: typeof runtimeRule.trafficExpired === 'boolean' ? runtimeRule.trafficExpired : rule.trafficExpired,
+          trafficBlocked: typeof runtimeRule.trafficBlocked === 'boolean' ? runtimeRule.trafficBlocked : rule.trafficBlocked,
+          trafficBlockReason: runtimeRule.trafficBlockReason == null ? rule.trafficBlockReason : String(runtimeRule.trafficBlockReason),
+        }
+      })(),
+      runtimeConflictCount: conflictCounts.get(rule.id) ?? 0,
+    }))
+  }
+
+  const fetchRuntimeOverview = async (showWarnings = false) => {
+    if (mutationBusy.value || refreshing.value) return { success: true, msg: '', obj: null } as Msg
+    if (!props.active || (typeof document !== 'undefined' && document.visibilityState !== 'visible')) {
+      return { success: false, msg: '', obj: null } as Msg
+    }
+    if (runtimeRequest.value) return runtimeRequest.value
+    const requestGeneration = readResponseGeneration
+    const request = (async () => {
+      try {
+        const msg = await HttpUtils.get('api/port-forward-runtime', {}, { silentAuthCheck: true })
+        if (requestGeneration !== readResponseGeneration) return msg
+        if (msg.success && msg.obj) {
+          const runtime = msg.obj as Partial<PortForwardRuntimeOverview>
+          applyRuntimeOverview(runtime)
+          handleWarnings(normalizeWarnings(runtime.warnings), showWarnings)
+        } else {
+          runtimeError.value = msg.msg || tr('loadFailed')
+        }
+        return msg
+      } catch (error) {
+        const message = errorMessage(error, tr('loadFailed'))
+        if (requestGeneration !== readResponseGeneration) return { success: false, msg: message, obj: null } as Msg
+        runtimeError.value = message
+        return { success: false, msg: message, obj: null } as Msg
+      }
+    })()
+    runtimeRequest.value = request
+    try {
+      return await request
+    } finally {
+      if (runtimeRequest.value === request) runtimeRequest.value = null
+    }
+  }
+
   const refreshOverview = async () => {
-    if (mutationBusy.value) return
+    if (mutationBusy.value || refreshing.value) return
+    const requestGeneration = ++readResponseGeneration
     refreshing.value = true
     try {
-      await fetchOverview(true, true)
+      const msg = await HttpUtils.post('api/port-forward-sync', {}, {
+        headers: { 'Content-Type': 'application/json' },
+        silentAuthCheck: true,
+      })
+      if (requestGeneration !== readResponseGeneration) return
+      if (msg.success && msg.obj) {
+        const nextOverview = msg.obj as Partial<PortForwardOverview>
+        applyOverview(nextOverview)
+        nextFullOverviewAt.value = Date.now() + fullOverviewRefreshInterval
+        handleWarnings(normalizeWarnings(nextOverview.warnings), true)
+      } else {
+        loadError.value = msg.msg || tr('loadFailed')
+      }
+    } catch (error) {
+      loadError.value = errorMessage(error, tr('loadFailed'))
     } finally {
       refreshing.value = false
     }
@@ -727,6 +895,7 @@ export function usePortForwardManage(props: { active?: boolean }) {
 
   const beginMutation = (ruleID = 0) => {
     if (mutationBusy.value) return false
+    readResponseGeneration += 1
     mutationBusy.value = true
     rowBusyId.value = ruleID
     return true
@@ -734,6 +903,7 @@ export function usePortForwardManage(props: { active?: boolean }) {
   const endMutation = () => {
     rowBusyId.value = 0
     mutationBusy.value = false
+    if (!props.active) dialogVisible.value = false
   }
 
   const saveRule = async () => {
@@ -883,27 +1053,32 @@ export function usePortForwardManage(props: { active?: boolean }) {
     if (!props.active || (typeof document !== 'undefined' && document.visibilityState !== 'visible')) return
     pollTimer.value = window.setTimeout(async () => {
       pollTimer.value = null
-      const msg = await fetchOverview(true)
+      const msg = Date.now() >= nextFullOverviewAt.value
+        ? await fetchOverview(true)
+        : await fetchRuntimeOverview()
       schedulePolling(msg.success ? 10000 : 30000)
     }, delay)
   }
   const startPolling = () => schedulePolling()
   const handleVisibilityChange = () => {
     if (document.visibilityState === 'visible' && props.active) {
-      void fetchOverview(true, true)
+      void fetchOverview(hasLoaded.value, true)
       startPolling()
       return
     }
+    readResponseGeneration += 1
     stopPolling()
   }
 
   watch(() => props.active, (active) => {
     if (active) {
-      void fetchOverview(true, true)
+      void fetchOverview(hasLoaded.value, true)
       startPolling()
       return
     }
+    readResponseGeneration += 1
     stopPolling()
+    if (!mutationBusy.value) dialogVisible.value = false
   })
   onMounted(() => {
     if (props.active) void fetchOverview()
@@ -924,6 +1099,7 @@ export function usePortForwardManage(props: { active?: boolean }) {
     rowBusyId,
     hasLoaded,
     loadError,
+    runtimeError,
     searchText,
     familyFilter,
     protocolFilter,
@@ -939,6 +1115,7 @@ export function usePortForwardManage(props: { active?: boolean }) {
     capabilityLabel,
     capabilityChipColor,
     compatibilityModeLabel,
+    actionsDisabled,
     dialogTitle,
     localStartLabel,
     localPreviewText,

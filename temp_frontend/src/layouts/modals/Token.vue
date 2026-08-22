@@ -1,11 +1,23 @@
 <template>
-  <v-dialog transition="dialog-bottom-transition" width="800">
+  <v-dialog
+    :model-value="visible"
+    transition="dialog-bottom-transition"
+    width="800"
+    max-width="calc(100vw - 24px)"
+    max-height="calc(100vh - 24px)"
+    scrollable
+    @update:model-value="updateDialog"
+  >
     <v-card class="rounded-lg" :loading="loading">
       <v-card-title>
         <v-row>
           <v-col>{{ $t('admin.api.title') }}</v-col>
           <v-spacer></v-spacer>
-          <v-col cols="auto"><v-icon icon="mdi-close-box" @click="$emit('close')" /></v-col>
+          <v-col cols="auto">
+            <v-btn icon="mdi-close" variant="text" :aria-label="$t('actions.close')" @click="$emit('close')">
+              <v-tooltip activator="parent" location="top" :text="$t('actions.close')" />
+            </v-btn>
+          </v-col>
         </v-row>
       </v-card-title>
       <v-divider></v-divider>
@@ -26,7 +38,8 @@
             v-model="newToken.token"
           ></v-text-field>
         </v-alert>
-        <v-table density="compact">
+        <div class="token-table-wrap">
+        <v-table density="compact" class="token-table">
           <thead>
             <tr>
               <th>#</th>
@@ -49,13 +62,16 @@
                   location="top center"
                 >
                   <template v-slot:activator="{ props }">
-                    <v-icon
-                      class="me-2"
+                    <v-btn
+                      icon="mdi-delete"
+                      size="small"
                       color="error"
+                      variant="text"
                       v-bind="props"
+                      :aria-label="$t('actions.del')"
                     >
-                      mdi-delete
-                    </v-icon>
+                      <v-tooltip activator="parent" location="top" :text="$t('actions.del')" />
+                    </v-btn>
                   </template>
                   <v-card :title="$t('actions.del')" rounded="lg">
                     <v-divider></v-divider>
@@ -70,16 +86,21 @@
             </tr>
           </tbody>
         </v-table>
+        </div>
         <v-btn color="primary" @click="showAddToken()">
           {{ $t('actions.add') }}
         </v-btn>
-        <v-dialog v-model="showNewToken" width="300">
+        <v-dialog v-model="showNewToken" width="300" max-width="calc(100vw - 24px)">
           <v-card class="rounded-lg">
             <v-card-title>
               <v-row>
                 <v-col>{{ $t('admin.api.token') }}</v-col>
                 <v-spacer></v-spacer>
-                <v-col cols="auto"><v-icon icon="mdi-close-box" @click="showNewToken = false" /></v-col>
+                <v-col cols="auto">
+                  <v-btn icon="mdi-close" variant="text" :aria-label="$t('actions.close')" @click="showNewToken = false">
+                    <v-tooltip activator="parent" location="top" :text="$t('actions.close')" />
+                  </v-btn>
+                </v-col>
               </v-row>
             </v-card-title>
             <v-divider></v-divider>
@@ -91,7 +112,14 @@
               </v-row>
               <v-row>
                 <v-col>
-                  <v-text-field :label="$t('date.expiry')" v-model.number="newToken.expiry" min="0" type="number" :suffix="$t('date.d')"></v-text-field>
+                  <v-text-field
+                    :label="$t('date.expiry')"
+                    v-model.number="newToken.expiry"
+                    min="0"
+                    step="1"
+                    type="number"
+                    :suffix="$t('date.d')"
+                  ></v-text-field>
                 </v-col>
               </v-row>
             </v-card-text>
@@ -137,7 +165,7 @@ import Clipboard from 'clipboard'
 import { push } from 'notivue';
 
 export default {
-  props: ['visible', 'user'],
+  props: ['visible', 'user', 'modelValue'],
   data() {
     return {
       loading: false,
@@ -165,6 +193,10 @@ export default {
     },
   },
   methods: {
+    updateDialog(value: boolean) {
+      this.$emit('update:modelValue', value)
+      if (!value) this.$emit('close')
+    },
     async loadData() {
       this.loading = true
       try {
@@ -265,3 +297,14 @@ export default {
   },
 }
 </script>
+
+<style scoped>
+.token-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.token-table {
+  min-width: 620px;
+}
+</style>

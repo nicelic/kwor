@@ -105,7 +105,7 @@ func TestReverseProxyDNSStoppedInstanceRollsBackWithFreshInstanceAfterRebuildFai
 		running: map[string]*reverseProxyDNSInstance{key: instance},
 		retry:   make(map[string]reverseProxyDNSRetryState),
 	}
-	if err := manager.sync(service, []model.ReverseProxyRule{desired}); err != nil {
+	if err := manager.sync(service, []model.ReverseProxyRule{desired}, 1); err != nil {
 		t.Fatalf("sync dns runtime failed: %v", err)
 	}
 	republished, exists := manager.running[key]

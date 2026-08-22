@@ -106,6 +106,7 @@
 <script lang="ts">
 import { XHTTP } from '../../types/transport'
 import Headers from '../Headers.vue'
+import { parseSingboxInteger } from '@/plugins/singboxInteger'
 
 type ReuseSettings = {
   max_connections?: string
@@ -128,14 +129,12 @@ export default {
     },
     scMaxEachPostBytes: {
       get() {
-        return this.xhttp.sc_max_each_post_bytes ?? ''
+        return parseSingboxInteger(this.xhttp.sc_max_each_post_bytes, { min: 1 }) ?? ''
       },
-      set(newValue: number) {
-        if (newValue && newValue > 0) {
-          this.$props.transport.sc_max_each_post_bytes = newValue
-        } else {
-          delete this.$props.transport.sc_max_each_post_bytes
-        }
+      set(newValue: unknown) {
+        const normalized = parseSingboxInteger(newValue, { min: 1 })
+        if (normalized === undefined) delete this.$props.transport.sc_max_each_post_bytes
+        else this.$props.transport.sc_max_each_post_bytes = normalized
       },
     },
     reuseEnabled: {

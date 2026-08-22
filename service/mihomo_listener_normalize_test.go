@@ -370,129 +370,6 @@ func TestNormalizeMihomoListenerPayloadCompatAcrossInboundTypes(t *testing.T) {
 		}
 	})
 
-	t.Run("shadowtls is converted to shadowsocks listener with nested shadow-tls", func(t *testing.T) {
-		listener := map[string]interface{}{
-			"type":         "shadowtls",
-			"version":      3,
-			"strict_mode":  true,
-			"wildcard_sni": "authed",
-			"users": []interface{}{
-				map[string]interface{}{
-					"name":     "alice",
-					"password": "shadow-pass",
-				},
-			},
-			"handshake": map[string]interface{}{
-				"server":      "addons.mozilla.org",
-				"server_port": 443,
-				"detour":      "handshake-proxy",
-			},
-			"handshake_for_server_name": map[string]interface{}{
-				"edge.example.com": map[string]interface{}{
-					"server":      "edge.example.com",
-					"server_port": 8443,
-					"detour":      "edge-proxy",
-				},
-			},
-			"ss_config": map[string]interface{}{
-				"method":   "2022-blake3-aes-128-gcm",
-				"password": "ss-pass",
-				"network":  "tcp",
-				"multiplex": map[string]interface{}{
-					"enabled": true,
-					"padding": true,
-				},
-			},
-		}
-
-		normalizeMihomoListenerPayload(listener)
-
-		if got := listener["type"]; got != "shadowsocks" {
-			t.Fatalf("type = %#v", got)
-		}
-		if got := listener["cipher"]; got != "2022-blake3-aes-128-gcm" {
-			t.Fatalf("cipher = %#v", got)
-		}
-		if got := listener["password"]; got != "ss-pass" {
-			t.Fatalf("password = %#v", got)
-		}
-		if _, exists := listener["udp"]; exists {
-			t.Fatalf("udp should be omitted for shadowtls inbound ss_config.network: %#v", listener["udp"])
-		}
-		if _, ok := listener["mux-option"].(map[string]interface{}); !ok {
-			t.Fatalf("mux-option missing: %#v", listener["mux-option"])
-		}
-
-		shadowTLS, ok := listener["shadow-tls"].(map[string]interface{})
-		if !ok {
-			t.Fatalf("shadow-tls = %#v", listener["shadow-tls"])
-		}
-		if got := shadowTLS["enable"]; got != true {
-			t.Fatalf("shadow-tls.enable = %#v", got)
-		}
-		if got := shadowTLS["version"]; got != 3 {
-			t.Fatalf("shadow-tls.version = %#v", got)
-		}
-		if _, exists := shadowTLS["strict-mode"]; exists {
-			t.Fatalf("shadow-tls.strict-mode should be omitted: %#v", shadowTLS["strict-mode"])
-		}
-		if _, exists := shadowTLS["wildcard-sni"]; exists {
-			t.Fatalf("shadow-tls.wildcard-sni should be omitted: %#v", shadowTLS["wildcard-sni"])
-		}
-		shadowUsers, ok := shadowTLS["users"].([]interface{})
-		if !ok || len(shadowUsers) != 1 {
-			t.Fatalf("shadow-tls.users = %#v", shadowTLS["users"])
-		}
-		handshake, ok := shadowTLS["handshake"].(map[string]interface{})
-		if !ok {
-			t.Fatalf("shadow-tls.handshake = %#v", shadowTLS["handshake"])
-		}
-		if got := handshake["dest"]; got != "addons.mozilla.org:443" {
-			t.Fatalf("shadow-tls.handshake.dest = %#v", got)
-		}
-		if _, exists := handshake["proxy"]; exists {
-			t.Fatalf("shadow-tls.handshake.proxy should be omitted: %#v", handshake["proxy"])
-		}
-		if _, exists := shadowTLS["handshake-for-server-name"]; exists {
-			t.Fatalf("shadow-tls.handshake-for-server-name should be omitted: %#v", shadowTLS["handshake-for-server-name"])
-		}
-
-		for _, key := range []string{"version", "users", "handshake", "handshake_for_server_name", "strict_mode", "wildcard_sni", "ss_config"} {
-			if _, exists := listener[key]; exists {
-				t.Fatalf("%s should be removed: %#v", key, listener[key])
-			}
-		}
-	})
-
-	t.Run("shadowtls v2 keeps outer password separate from ss password", func(t *testing.T) {
-		listener := map[string]interface{}{
-			"type":     "shadowtls",
-			"version":  2,
-			"password": "shadow-pass",
-			"handshake": map[string]interface{}{
-				"server":      "addons.mozilla.org",
-				"server_port": 443,
-			},
-			"ss_config": map[string]interface{}{
-				"method":   "2022-blake3-aes-128-gcm",
-				"password": "ss-pass",
-			},
-		}
-
-		normalizeMihomoListenerPayload(listener)
-
-		if got := listener["password"]; got != "ss-pass" {
-			t.Fatalf("listener password = %#v", got)
-		}
-		shadowTLS, ok := listener["shadow-tls"].(map[string]interface{})
-		if !ok {
-			t.Fatalf("shadow-tls = %#v", listener["shadow-tls"])
-		}
-		if got := shadowTLS["password"]; got != "shadow-pass" {
-			t.Fatalf("shadow-tls password = %#v", got)
-		}
-	})
-
 	t.Run("vmess converts transport and synthesizes users", func(t *testing.T) {
 		listener := map[string]interface{}{
 			"type":     "vmess",
@@ -892,6 +769,9 @@ func TestNormalizeMihomoListenerPayloadCompatAcrossInboundTypes(t *testing.T) {
 			"interface_name": "tun0",
 			"address":        []interface{}{"172.18.0.1/30", "fd00::1/126"},
 			"udp_timeout":    "5m",
+			"listen":         "::",
+			"listen_port":    1080,
+			"port":           1080,
 			"tcp_fast_open":  true,
 			"udp_fragment":   true,
 			"tcp_multi_path": true,
@@ -918,6 +798,11 @@ func TestNormalizeMihomoListenerPayloadCompatAcrossInboundTypes(t *testing.T) {
 		if _, exists := listener["address"]; exists {
 			t.Fatalf("address should be removed: %#v", listener)
 		}
+		for _, key := range []string{"listen", "listen_port", "port"} {
+			if _, exists := listener[key]; exists {
+				t.Fatalf("%s should be removed from tun listener: %#v", key, listener)
+			}
+		}
 		if _, exists := listener["tcp_fast_open"]; exists {
 			t.Fatalf("tcp_fast_open should be removed: %#v", listener)
 		}
@@ -938,6 +823,37 @@ func TestNormalizeMihomoListenerPayloadCompatAcrossInboundTypes(t *testing.T) {
 			t.Fatalf("network should be removed: %#v", listener)
 		}
 	})
+}
+
+func TestNormalizeMihomoShadowsocksListenerWithTLSWrapper(t *testing.T) {
+	listener := map[string]interface{}{
+		"type":     "shadowsocks",
+		"method":   "2022-blake3-aes-128-gcm",
+		"password": "ss-password",
+		"tls": map[string]interface{}{
+			"shadow_tls": map[string]interface{}{
+				"enable":    true,
+				"version":   3,
+				"users":     []interface{}{map[string]interface{}{"name": "u", "password": "p"}},
+				"handshake": map[string]interface{}{"dest": "cloud.tencent.com:443"},
+			},
+		},
+	}
+	normalizeMihomoListenerPayload(listener)
+	if listener["type"] != "shadowsocks" || listener["cipher"] != "2022-blake3-aes-128-gcm" {
+		t.Fatalf("unexpected shadowsocks listener: %#v", listener)
+	}
+	if _, exists := listener["tls"]; exists {
+		t.Fatalf("internal tls block must be removed: %#v", listener)
+	}
+	shadow, ok := listener["shadow-tls"].(map[string]interface{})
+	if !ok || shadow["version"] != 3 {
+		t.Fatalf("missing shadow-tls wrapper: %#v", listener["shadow-tls"])
+	}
+	handshake, ok := shadow["handshake"].(map[string]interface{})
+	if !ok || handshake["dest"] != "cloud.tencent.com:443" {
+		t.Fatalf("unexpected shadow-tls handshake: %#v", shadow["handshake"])
+	}
 }
 
 func TestBuildMihomoListenerNormalizesPayload(t *testing.T) {
@@ -1074,6 +990,70 @@ func TestBuildMihomoListenerRealityConfigSupportsDurationString(t *testing.T) {
 	}
 	if got := realityConfig["max-time-difference"]; got != 60000000 {
 		t.Fatalf("max-time-difference = %#v", got)
+	}
+}
+
+func TestBuildMihomoListenerRealityConfigRejectsOutOfRangeHandshakePort(t *testing.T) {
+	inbound := model.MihomoInbound{Type: "vless", Tag: "reality-port-in"}
+	payload := map[string]interface{}{
+		"tls": map[string]interface{}{
+			"reality": map[string]interface{}{
+				"enabled": true,
+				"handshake": map[string]interface{}{
+					"server":      "addons.mozilla.org",
+					"server_port": 70000,
+				},
+			},
+		},
+	}
+
+	listener := buildMihomoListener(inbound, payload, mihomoInboundRouteRef{})
+	realityConfig, ok := listener["reality-config"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("reality-config = %#v", listener["reality-config"])
+	}
+	if _, exists := realityConfig["dest"]; exists {
+		t.Fatalf("out-of-range Reality destination survived: %#v", realityConfig)
+	}
+}
+
+func TestBuildMihomoListenerRealityConfigForAnyTLS(t *testing.T) {
+	inbound := model.MihomoInbound{
+		Type: "anytls",
+		Tag:  "anytls-reality-in",
+	}
+	payload := map[string]interface{}{
+		"type":        "anytls",
+		"listen":      "::",
+		"listen_port": 443,
+		"password":    "anytls-password",
+		"tls": map[string]interface{}{
+			"server_name": "anytls.example.com",
+			"reality": map[string]interface{}{
+				"enabled":     true,
+				"private_key": "priv-key",
+				"short_id":    []interface{}{"abcd"},
+				"handshake": map[string]interface{}{
+					"server":      "addons.mozilla.org",
+					"server_port": 443,
+				},
+			},
+		},
+	}
+
+	listener := buildMihomoListener(inbound, payload, mihomoInboundRouteRef{})
+	if listener["type"] != "anytls" {
+		t.Fatalf("listener type = %#v", listener["type"])
+	}
+	realityConfig, ok := listener["reality-config"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("reality-config = %#v", listener["reality-config"])
+	}
+	if realityConfig["dest"] != "addons.mozilla.org:443" || realityConfig["private-key"] != "priv-key" {
+		t.Fatalf("unexpected AnyTLS Reality config: %#v", realityConfig)
+	}
+	if !reflect.DeepEqual(realityConfig["server-names"], []string{"anytls.example.com"}) {
+		t.Fatalf("server-names = %#v", realityConfig["server-names"])
 	}
 }
 
@@ -1358,6 +1338,43 @@ func TestBuildMihomoRuleProviders_SupportsInlinePayload(t *testing.T) {
 	}
 	if _, exists := provider["format"]; exists {
 		t.Fatalf("inline provider should not emit format: %#v", provider["format"])
+	}
+}
+
+func TestNormalizeMihomoHysteria2ReceiveWindowsRejectsFractionalValues(t *testing.T) {
+	listener := map[string]interface{}{
+		"initial-stream-receive-window":     float64(1024.5),
+		"initial_stream_receive_window":     float64(2048),
+		"max_stream_receive_window":         float64(4096.5),
+		"max-connection-receive-window":     float64(8192),
+		"max_connection_receive_window":     float64(16384.5),
+		"initial-connection-receive-window": float64(-1),
+		"initial_connection_receive_window": float64(32768),
+	}
+
+	normalizeMihomoHysteria2ReceiveWindows(listener, listener)
+
+	if got := listener["initial-stream-receive-window"]; got != 2048 {
+		t.Fatalf("initial stream receive window = %#v", got)
+	}
+	if _, exists := listener["max-stream-receive-window"]; exists {
+		t.Fatalf("fractional max stream receive window survived: %#v", listener)
+	}
+	if got := listener["max-connection-receive-window"]; got != 8192 {
+		t.Fatalf("valid hyphenated max connection receive window = %#v", got)
+	}
+	if got := listener["initial-connection-receive-window"]; got != 32768 {
+		t.Fatalf("initial connection receive window fallback = %#v", got)
+	}
+	for _, key := range []string{
+		"initial_stream_receive_window",
+		"max_stream_receive_window",
+		"max_connection_receive_window",
+		"initial_connection_receive_window",
+	} {
+		if _, exists := listener[key]; exists {
+			t.Fatalf("legacy receive window key %q survived: %#v", key, listener)
+		}
 	}
 }
 

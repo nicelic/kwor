@@ -7,6 +7,24 @@ import (
 	"github.com/alireza0/s-ui/database/model"
 )
 
+func TestSubOutboundServiceGetAllReturnsEmptyJSONArray(t *testing.T) {
+	initSubOutboundOrderTestDB(t, "suboutbounds-empty.db")
+
+	items, err := (&SubOutboundService{}).GetAll()
+	if err != nil {
+		t.Fatalf("GetAll failed: %v", err)
+	}
+	if items == nil {
+		t.Fatal("GetAll returned a nil slice pointer")
+	}
+	if *items == nil {
+		t.Fatal("GetAll returned a nil slice; API would serialize suboutbounds as null")
+	}
+	if len(*items) != 0 {
+		t.Fatalf("expected no subscription outbounds, got %#v", *items)
+	}
+}
+
 func TestExpandSubOutboundsForSubscription_PassThroughTypes(t *testing.T) {
 	passThroughTypes := []string{
 		"direct",
@@ -43,6 +61,44 @@ func TestExpandSubOutboundsForSubscription_PassThroughTypes(t *testing.T) {
 		if gotType, _ := outbounds[0]["type"].(string); gotType != typ {
 			t.Fatalf("type=%s expected outbound type %s, got %s", typ, typ, gotType)
 		}
+	}
+}
+
+func TestExpandSubOutboundsForSubscriptionClonesNestedPassThroughFields(t *testing.T) {
+	raw := []map[string]interface{}{
+		{
+			"type": "trojan",
+			"tag":  "trojan-node",
+			"tls": map[string]interface{}{
+				"server_name": "source.example.com",
+				"utls":        map[string]interface{}{"fingerprint": "chrome"},
+			},
+			"transport": map[string]interface{}{
+				"type":    "ws",
+				"headers": map[string]interface{}{"Host": "source.example.com"},
+			},
+		},
+	}
+
+	outbounds, _ := expandSubOutboundsForSubscription(raw)
+	if len(outbounds) != 1 {
+		t.Fatalf("expected one pass-through outbound, got %#v", outbounds)
+	}
+
+	outbounds[0]["tls"].(map[string]interface{})["server_name"] = "mutated.example.com"
+	outbounds[0]["tls"].(map[string]interface{})["utls"].(map[string]interface{})["fingerprint"] = "firefox"
+	outbounds[0]["transport"].(map[string]interface{})["headers"].(map[string]interface{})["Host"] = "mutated.example.com"
+
+	sourceTLS := raw[0]["tls"].(map[string]interface{})
+	if got, _ := sourceTLS["server_name"].(string); got != "source.example.com" {
+		t.Fatalf("subscription expansion mutated source TLS: %#v", sourceTLS)
+	}
+	if got, _ := sourceTLS["utls"].(map[string]interface{})["fingerprint"].(string); got != "chrome" {
+		t.Fatalf("subscription expansion mutated source nested TLS: %#v", sourceTLS)
+	}
+	sourceTransport := raw[0]["transport"].(map[string]interface{})
+	if got, _ := sourceTransport["headers"].(map[string]interface{})["Host"].(string); got != "source.example.com" {
+		t.Fatalf("subscription expansion mutated source transport: %#v", sourceTransport)
 	}
 }
 

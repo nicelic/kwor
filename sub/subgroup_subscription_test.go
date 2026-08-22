@@ -2,12 +2,14 @@ package sub
 
 import (
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
+	"github.com/alireza0/s-ui/service"
 	"gopkg.in/yaml.v3"
 	"gorm.io/gorm"
 )
@@ -58,6 +60,21 @@ func TestGetSubGroupClashReturnsEmptyConfigForEmptyGroup(t *testing.T) {
 	}
 	if !strings.Contains(*result, "proxy-groups:") {
 		t.Fatalf("expected proxy-groups section in Clash payload, got:\n%s", *result)
+	}
+}
+
+func TestParseSubscriptionGroupOutboundTagsRejectsOversizedGroup(t *testing.T) {
+	tags := make([]string, service.SubscriptionGroupMaxOutbounds+1)
+	for index := range tags {
+		tags[index] = fmt.Sprintf("node-%d", index)
+	}
+	raw, err := json.Marshal(tags)
+	if err != nil {
+		t.Fatalf("marshal tags failed: %v", err)
+	}
+
+	if _, err := parseSubscriptionGroupOutboundTags(string(raw)); err == nil {
+		t.Fatalf("expected group larger than %d nodes to be rejected", service.SubscriptionGroupMaxOutbounds)
 	}
 }
 

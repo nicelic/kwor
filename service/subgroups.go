@@ -23,6 +23,9 @@ type SubGroupService struct{}
 
 const subOutboundSourceSubGroup = "subgroup"
 
+const SubscriptionGroupMaxOutbounds = 512
+const subscriptionImportMaxNodes = 512
+
 type subGroupReorderRequest struct {
 	IDs []uint `json:"ids"`
 }
@@ -35,7 +38,7 @@ func (s *SubGroupService) GetAll() ([]*model.SubGroup, error) {
 	if _, err := s.pruneMissingOutboundTags(db); err != nil {
 		return nil, err
 	}
-	var groups []*model.SubGroup
+	groups := make([]*model.SubGroup, 0)
 	if err := db.Model(model.SubGroup{}).Order("sort_order ASC").Order("id ASC").Find(&groups).Error; err != nil {
 		return nil, err
 	}
@@ -44,7 +47,7 @@ func (s *SubGroupService) GetAll() ([]*model.SubGroup, error) {
 
 func (s *SubGroupService) GetAllForAutoUpdate() ([]*model.SubGroup, error) {
 	db := database.GetDB()
-	var groups []*model.SubGroup
+	groups := make([]*model.SubGroup, 0)
 	if err := db.Model(model.SubGroup{}).Order("id ASC").Find(&groups).Error; err != nil {
 		return nil, err
 	}
@@ -178,16 +181,27 @@ func (s *SubGroupService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 		if err := json.Unmarshal(data, &group); err != nil {
 			return err
 		}
+		if act == "new" {
+			// A create request must never reuse a copied primary key. Otherwise a
+			// stale modal payload can overwrite an existing group through GORM Save.
+			group.Id = 0
+		} else if group.Id == 0 {
+			return fmt.Errorf("subscription group id is required for edit")
+		}
 		group.Name = strings.TrimSpace(group.Name)
 		group.SubscriptionUrl = strings.TrimSpace(group.SubscriptionUrl)
 		group.SubscriptionUrlClash = strings.TrimSpace(group.SubscriptionUrlClash)
-		if strings.TrimSpace(group.Outbounds) == "" {
-			group.Outbounds = "[]"
+		normalizedOutbounds, normalizeErr := normalizeSubscriptionGroupOutboundTags(group.Outbounds)
+		if normalizeErr != nil {
+			return normalizeErr
 		}
+		group.Outbounds = normalizedOutbounds
 		oldName := ""
-		if group.Id > 0 {
+		if act == "edit" {
 			var existing model.SubGroup
-			if err := tx.Where("id = ?", group.Id).First(&existing).Error; err == nil {
+			if err := tx.Where("id = ?", group.Id).First(&existing).Error; err != nil {
+				return err
+			} else {
 				group.AutoUpdateLastAt = existing.AutoUpdateLastAt
 				group.AutoUpdateFailedSources = existing.AutoUpdateFailedSources
 				group.AutoUpdateError = existing.AutoUpdateError
@@ -195,8 +209,6 @@ func (s *SubGroupService) Save(tx *gorm.DB, act string, data json.RawMessage) er
 					group.SortOrder = existing.SortOrder
 				}
 				oldName = strings.TrimSpace(existing.Name)
-			} else if !database.IsNotFound(err) {
-				return err
 			}
 		} else if group.SortOrder <= 0 {
 			nextSortOrder, err := nextSubGroupSortOrder(tx)
@@ -788,9 +800,9 @@ func (s *SubGroupService) replaceSubscriptionGroupNodesTx(
 		return nil, err
 	}
 
-	markLastUpdate(time.Now().Unix())
+	markBothLastUpdates(time.Now().Unix())
 	if err := RunManagedRuntimeHookScope(tx); err != nil {
-		return nil, err
+		return nil, &CommittedSaveError{Err: err}
 	}
 
 	return result, nil
@@ -1073,6 +1085,9 @@ func buildSubscriptionImportNodes(jsonOutbounds []map[string]interface{}, clashP
 		}
 		node.JSONOutbound["tag"] = tag
 		filtered = append(filtered, node)
+		if len(filtered) > subscriptionImportMaxNodes {
+			return nil, fmt.Errorf("subscription contains more than %d valid nodes", subscriptionImportMaxNodes)
+		}
 	}
 
 	if len(filtered) == 0 {
@@ -1313,6 +1328,37 @@ func parseSubGroupOutboundTags(raw string) []string {
 	return result
 }
 
+func normalizeSubscriptionGroupOutboundTags(raw string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return "[]", nil
+	}
+	var tags []string
+	if err := json.Unmarshal([]byte(raw), &tags); err != nil {
+		return "", fmt.Errorf("subscription group outbounds must be a JSON string array: %w", err)
+	}
+	result := make([]string, 0, len(tags))
+	seen := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			continue
+		}
+		if _, exists := seen[tag]; exists {
+			continue
+		}
+		seen[tag] = struct{}{}
+		result = append(result, tag)
+		if len(result) > SubscriptionGroupMaxOutbounds {
+			return "", fmt.Errorf("subscription group cannot contain more than %d nodes", SubscriptionGroupMaxOutbounds)
+		}
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
 func normalizeUniqueTags(tags []string) []string {
 	result := make([]string, 0, len(tags))
 	seen := make(map[string]struct{}, len(tags))
@@ -1517,7 +1563,7 @@ func (s *SubGroupService) pruneMissingOutboundTags(db *gorm.DB) (int, error) {
 	}
 
 	if prunedCount > 0 {
-		markLastUpdate(time.Now().Unix())
+		markBothLastUpdates(time.Now().Unix())
 	}
 
 	return prunedCount, nil
@@ -1622,6 +1668,11 @@ func (s *SubGroupService) ClearSubManagerData() (*SubManagerClearResult, error) 
 			tx.Rollback()
 			return nil, err
 		}
+		if err := disableAutoSyncBySubOutbound(tx, record); err != nil {
+			DiscardManagedRuntimeHookScope(tx)
+			tx.Rollback()
+			return nil, err
+		}
 	}
 
 	if err := tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&model.SubOutbound{}).Error; err != nil {
@@ -1660,10 +1711,10 @@ func (s *SubGroupService) ClearSubManagerData() (*SubManagerClearResult, error) 
 	}
 
 	if err := RunManagedRuntimeHookScope(tx); err != nil {
-		return nil, err
+		return nil, &CommittedSaveError{Err: err}
 	}
 
-	markLastUpdate(time.Now().Unix())
+	markBothLastUpdates(time.Now().Unix())
 	return &SubManagerClearResult{
 		ClearedNodes:  len(cleanedTags),
 		ClearedGroups: len(groups),

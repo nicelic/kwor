@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,18 @@ const (
 )
 
 const defaultSystemSysctlContent = `net.core.default_qdisc=cake
+net.ipv4.tcp_congestion_control=bbr
+
+net.ipv4.tcp_window_scaling=1
+
+# 4KiB, 128KiB, 16MiB
+net.ipv4.tcp_rmem=4096 131072 16777216
+net.ipv4.tcp_wmem=4096 16384 16777216
+
+vm.swappiness=100
+`
+
+const legacyDefaultSystemSysctlContent = `net.core.default_qdisc=cake
 net.ipv4.tcp_congestion_control=bbr
 
 net.ipv4.tcp_window_scaling=1
@@ -54,6 +67,13 @@ type SystemSysctlOptimizationOverview struct {
 }
 
 func (s *SystemSysctlOptimizationService) GetOverview() (*SystemSysctlOptimizationOverview, error) {
+	return s.GetOverviewContext(context.Background())
+}
+
+// GetOverviewContext only reads state and performs bounded host inspection.
+// It must stay independent from the write mutex so a refresh never waits for
+// a sysctl apply or service restart.
+func (s *SystemSysctlOptimizationService) GetOverviewContext(ctx context.Context) (*SystemSysctlOptimizationOverview, error) {
 	content, err := s.getString(systemSysctlContentKey)
 	if err != nil {
 		return nil, err
@@ -67,6 +87,9 @@ func (s *SystemSysctlOptimizationService) GetOverview() (*SystemSysctlOptimizati
 		Supported: IsSystemPlatformLinux(),
 		Enabled:   enabled,
 		Content:   content,
+	}
+	if err := validateSystemOptimizationContent(content); err != nil {
+		return nil, err
 	}
 
 	if !overview.Supported {
@@ -85,7 +108,7 @@ func (s *SystemSysctlOptimizationService) GetOverview() (*SystemSysctlOptimizati
 			missingPaths = append(missingPaths, path)
 			continue
 		}
-		immutable, immutableErr := detectFileImmutable(path)
+		immutable, immutableErr := detectFileImmutableContext(ctx, path)
 		if immutableErr != nil || !immutable {
 			lockedAll = false
 		}
@@ -100,6 +123,10 @@ func (s *SystemSysctlOptimizationService) GetOverview() (*SystemSysctlOptimizati
 }
 
 func (s *SystemSysctlOptimizationService) SetEnabled(enabled bool) error {
+	return s.SetEnabledContext(context.Background(), enabled)
+}
+
+func (s *SystemSysctlOptimizationService) SetEnabledContext(ctx context.Context, enabled bool) error {
 	systemSysctlOptimizationMu.Lock()
 	defer systemSysctlOptimizationMu.Unlock()
 
@@ -112,12 +139,15 @@ func (s *SystemSysctlOptimizationService) SetEnabled(enabled bool) error {
 		if err != nil {
 			return err
 		}
+		if err := validateSystemOptimizationContent(content); err != nil {
+			return err
+		}
 		content = normalizeManagedSysctlContent(content)
-		paths, err := s.applyManagedSysctlContentLocked(content)
+		paths, err := s.applyManagedSysctlContentLocked(ctx, content)
 		if err != nil {
 			return err
 		}
-		if err := applySysctlFromManagedFiles(paths); err != nil {
+		if err := applySysctlFromManagedFilesContext(ctx, paths); err != nil {
 			return err
 		}
 		if err := s.setString(systemSysctlEnabledKey, "true"); err != nil {
@@ -137,6 +167,10 @@ func (s *SystemSysctlOptimizationService) SetEnabled(enabled bool) error {
 }
 
 func (s *SystemSysctlOptimizationService) SaveContent(content string) error {
+	return s.SaveContentContext(context.Background(), content)
+}
+
+func (s *SystemSysctlOptimizationService) SaveContentContext(ctx context.Context, content string) error {
 	systemSysctlOptimizationMu.Lock()
 	defer systemSysctlOptimizationMu.Unlock()
 
@@ -144,16 +178,19 @@ func (s *SystemSysctlOptimizationService) SaveContent(content string) error {
 		return common.NewError("sysctl 优化仅支持 Linux")
 	}
 
+	if err := validateSystemOptimizationContent(content); err != nil {
+		return err
+	}
 	normalized := normalizeManagedSysctlContent(content)
 	if strings.TrimSpace(normalized) == "" {
 		return common.NewError("sysctl 配置内容不能为空")
 	}
 
-	paths, err := s.applyManagedSysctlContentLocked(normalized)
+	paths, err := s.applyManagedSysctlContentLocked(ctx, normalized)
 	if err != nil {
 		return err
 	}
-	if err := applySysctlFromManagedFiles(paths); err != nil {
+	if err := applySysctlFromManagedFilesContext(ctx, paths); err != nil {
 		return err
 	}
 	if err := s.setString(systemSysctlContentKey, normalized); err != nil {
@@ -176,6 +213,10 @@ func (s *SystemSysctlOptimizationService) ReconcileOnStartup() error {
 	if !IsSystemPlatformLinux() {
 		return nil
 	}
+	migrated, err := s.migrateLegacyDefaultContentOnStartup()
+	if err != nil {
+		return err
+	}
 
 	enabled, err := s.getBool(systemSysctlEnabledKey)
 	if err != nil {
@@ -190,7 +231,7 @@ func (s *SystemSysctlOptimizationService) ReconcileOnStartup() error {
 		return s.setString(systemSysctlEnabledKey, "false")
 	}
 
-	if allManagedSysctlPathsLocked(paths) {
+	if allManagedSysctlPathsLocked(paths) && !migrated {
 		return nil
 	}
 
@@ -200,11 +241,14 @@ func (s *SystemSysctlOptimizationService) ReconcileOnStartup() error {
 	}
 	content = normalizeManagedSysctlContent(content)
 
-	appliedPaths, err := s.applyManagedSysctlContentLocked(content)
+	if err := validateSystemOptimizationContent(content); err != nil {
+		return err
+	}
+	appliedPaths, err := s.applyManagedSysctlContentLocked(context.Background(), content)
 	if err != nil {
 		return err
 	}
-	if err := applySysctlFromManagedFiles(appliedPaths); err != nil {
+	if err := applySysctlFromManagedFilesContext(context.Background(), appliedPaths); err != nil {
 		return err
 	}
 	if err := s.setString(systemSysctlPathKey, formatManagedSysctlPathList(appliedPaths)); err != nil {
@@ -213,8 +257,27 @@ func (s *SystemSysctlOptimizationService) ReconcileOnStartup() error {
 	return s.setString(systemSysctlEnabledKey, "true")
 }
 
-func (s *SystemSysctlOptimizationService) applyManagedSysctlContentLocked(content string) ([]string, error) {
+// Only the exact old built-in profile is migrated. Any user-edited content,
+// including a profile that intentionally uses larger buffers, remains intact.
+func (s *SystemSysctlOptimizationService) migrateLegacyDefaultContentOnStartup() (bool, error) {
+	content, err := s.getString(systemSysctlContentKey)
+	if err != nil {
+		return false, err
+	}
+	if normalizeManagedSysctlContent(content) != normalizeManagedSysctlContent(legacyDefaultSystemSysctlContent) {
+		return false, nil
+	}
+	if err := s.setString(systemSysctlContentKey, defaultSystemSysctlContent); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *SystemSysctlOptimizationService) applyManagedSysctlContentLocked(ctx context.Context, content string) ([]string, error) {
 	content = normalizeManagedSysctlContent(content)
+	if err := validateSystemOptimizationContent(content); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(content) == "" {
 		return nil, common.NewError("sysctl 配置内容不能为空")
 	}
@@ -243,6 +306,7 @@ func (s *SystemSysctlOptimizationService) applyManagedSysctlContentLocked(conten
 		}
 		if err := rewriteManagedFileWithImmutable(path, pathContent, managedFileRewriteOptions{
 			DisplayName: "sysctl 配置",
+			Context:     ctx,
 		}); err != nil {
 			return nil, err
 		}
@@ -331,6 +395,10 @@ func normalizeManagedSysctlContent(content string) string {
 }
 
 func applySysctlFromManagedFiles(paths []string) error {
+	return applySysctlFromManagedFilesContext(context.Background(), paths)
+}
+
+func applySysctlFromManagedFilesContext(ctx context.Context, paths []string) error {
 	sysctlPath, err := exec.LookPath("sysctl")
 	if err != nil {
 		return common.NewError("未找到 sysctl 命令")
@@ -372,7 +440,7 @@ func applySysctlFromManagedFiles(paths []string) error {
 
 	allDirectSucceeded := true
 	for _, path := range pathsByPriority {
-		if attemptErr := runCommandWithTimeout(12*time.Second, sysctlPath, "-p", path); attemptErr != nil {
+		if attemptErr := runOptimizationCommandWithTimeout(ctx, 12*time.Second, sysctlPath, "-p", path); attemptErr != nil {
 			allDirectSucceeded = false
 			appendAttempt("sysctl -p "+path, attemptErr)
 		}
@@ -381,13 +449,13 @@ func applySysctlFromManagedFiles(paths []string) error {
 		return nil
 	}
 
-	if attemptErr := runCommandWithTimeout(18*time.Second, sysctlPath, "--system"); attemptErr == nil {
+	if attemptErr := runOptimizationCommandWithTimeout(ctx, 18*time.Second, sysctlPath, "--system"); attemptErr == nil {
 		return nil
 	} else {
 		appendAttempt("sysctl --system", attemptErr)
 	}
 
-	if attemptErr := restartSysctlService(); attemptErr == nil {
+	if attemptErr := restartSysctlServiceContext(ctx); attemptErr == nil {
 		return nil
 	} else {
 		appendAttempt("restart sysctl service", attemptErr)
@@ -414,6 +482,10 @@ func resolveSysctlServiceCandidates() []string {
 }
 
 func restartSysctlService() error {
+	return restartSysctlServiceContext(context.Background())
+}
+
+func restartSysctlServiceContext(ctx context.Context) error {
 	attempts := make([]string, 0)
 	appendAttempt := func(prefix string, attemptErr error) {
 		if attemptErr == nil {
@@ -429,7 +501,7 @@ func restartSysctlService() error {
 
 	if systemctlPath, err := exec.LookPath("systemctl"); err == nil {
 		for _, serviceName := range serviceNames {
-			commandErr := runCommandWithTimeout(12*time.Second, systemctlPath, "restart", serviceName)
+			commandErr := runOptimizationCommandWithTimeout(ctx, 12*time.Second, systemctlPath, "restart", serviceName)
 			if commandErr == nil {
 				return nil
 			}
@@ -439,7 +511,7 @@ func restartSysctlService() error {
 
 	if servicePath, err := exec.LookPath("service"); err == nil {
 		for _, serviceName := range serviceNames {
-			commandErr := runCommandWithTimeout(12*time.Second, servicePath, serviceName, "restart")
+			commandErr := runOptimizationCommandWithTimeout(ctx, 12*time.Second, servicePath, serviceName, "restart")
 			if commandErr == nil {
 				return nil
 			}
@@ -449,7 +521,7 @@ func restartSysctlService() error {
 
 	if openrcPath, err := exec.LookPath("rc-service"); err == nil {
 		for _, serviceName := range serviceNames {
-			commandErr := runCommandWithTimeout(12*time.Second, openrcPath, serviceName, "restart")
+			commandErr := runOptimizationCommandWithTimeout(ctx, 12*time.Second, openrcPath, serviceName, "restart")
 			if commandErr == nil {
 				return nil
 			}
@@ -459,7 +531,7 @@ func restartSysctlService() error {
 
 	if runitPath, err := exec.LookPath("sv"); err == nil {
 		for _, serviceName := range serviceNames {
-			commandErr := runCommandWithTimeout(12*time.Second, runitPath, "restart", serviceName)
+			commandErr := runOptimizationCommandWithTimeout(ctx, 12*time.Second, runitPath, "restart", serviceName)
 			if commandErr == nil {
 				return nil
 			}
@@ -472,7 +544,7 @@ func restartSysctlService() error {
 		if !pathExists(initScript) {
 			continue
 		}
-		commandErr := runCommandWithTimeout(12*time.Second, initScript, "restart")
+		commandErr := runOptimizationCommandWithTimeout(ctx, 12*time.Second, initScript, "restart")
 		if commandErr == nil {
 			return nil
 		}

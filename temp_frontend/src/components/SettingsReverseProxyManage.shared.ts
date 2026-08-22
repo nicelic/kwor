@@ -99,9 +99,9 @@ export const reverseProxyCopy = {
   responseRewriteInputBytes: '正文改写输入上限（字节）',
   responseRewriteOutputBytes: '正文改写输出上限（字节）',
   responseRewriteMaxConcurrent: '正文改写最大并发',
-  resourceMemoryHint: '内存池与正文改写参数会同时约束 DNS 缓存和普通反代正文改写。默认值为 8 GiB 共享池、单规则 384 MiB、输入 4 MiB、输出 8 MiB、并发 32。',
+  resourceMemoryHint: '内存池与正文改写参数会同时约束 DNS 缓存和普通反代正文改写。默认值为 8 GiB 共享池、单规则 384 MiB、输入 4 MiB、输出 8 MiB、并发 32；8 GiB 是按需准入上限，不会在启动时直接分配。',
   ruleResourceHint: '填写 0 表示不额外限制：本地连接仍受监听组安全阀保护，请求仍受全局 HTTP 并发保护，上游空闲连接使用全局默认值，内存使用全局默认规则上限。',
-  resourceInvalid: '资源控制数值无效：连接/并发必须为非负整数；H2、QUIC 与正文改写并发必须为正整数；正文改写的输入加双输出缓冲不得超过默认规则内存上限。',
+  resourceInvalid: '资源控制数值无效：连接/并发必须在允许范围内；H2、QUIC 与正文改写并发必须为正整数；内存和正文改写缓冲必须在 500 KiB 到 64 GiB 范围内，且输入加双输出缓冲不得超过默认规则内存上限。',
   resourceSaved: '资源控制已保存',
   runtimeHttp: '活动 HTTP',
   runtimeDns: '活动 DNS',
@@ -112,10 +112,12 @@ export const reverseProxyCopy = {
   ipCertificateRoutingHint: 'IP 访问只使用证书真实 IP SAN。单个公网 IP 经 NAT 时，普通单 IP 证书即可；同一地址族的多个公网 IP 汇入同一内网地址时，才需要一张覆盖该地址族全部允许 IP 的证书。',
   dnsAccessInvalid: 'DNS 每客户端 QPS 必须为 1 到 10000 的整数，DNS 最大并发必须为 0 到 4096 的整数（0 表示不额外限制）',
   requestLimitInvalid: '规则最大并发请求必须为 0 到 10000 的整数（0 表示不额外限制）',
-  ruleResourceInvalid: '规则连接、请求、上游连接与空闲连接必须为指定范围内的非负整数；规则内存上限填 0 使用全局默认值。',
+  ruleResourceInvalid: '规则连接、请求、上游连接与空闲连接必须为指定范围内的非负整数；规则内存上限填 0 使用全局默认值，否则必须在 500 KiB 到当前共享内存池上限之间。',
   dnsCIDRRequired: 'DNS 监听全部网卡时必须填写至少一个非全网 CIDR 白名单',
   dnsCacheInvalid: 'DNS 缓存大小必须是大于 0 的安全整数；TTL 必须是 0 到 4294967295 的安全整数，且最大 TTL 非 0 时不能小于最小 TTL',
   dnsUpstreamTimeoutInvalid: '上游超时必须在 1 到 120 秒之间',
+  listenPortInvalid: '监听端口必须是 1 到 65535 的整数',
+  targetPortInvalid: '目标端口必须是 1 到 65535 的整数',
   ednsTitle: 'EDNS 客户端子网',
   ednsEnabled: '启用 EDNS 客户端子网',
   ednsMode: 'EDNS 模式',
@@ -137,7 +139,7 @@ export const reverseProxyCopy = {
   upstreamTlsVerify: '是否校验证书',
   apiPassthrough: '流式/API 透传',
   advertiseHttp3: '向浏览器广播 HTTP/3',
-  advertiseHttp3Hint: '仅用于 HTTPS（H2+H3）。同一端口、同一域名的任一规则开启后，该域名统一广播 5 分钟；全部关闭时清理浏览器保存的 HTTP/3 路由。',
+  advertiseHttp3Hint: '仅用于 HTTPS（H2+H3）。只有同端口 UDP/H3 listener 实际启动且公网 UDP 可达时才会广播；同一域名存在 WSS 规则时不会广播。广播端口按请求 Host 的外部端口推断，未带端口时使用 443；全部关闭或 H3 不可用时会清理浏览器保存的 HTTP/3 路由。',
   remark: '备注',
   cancel: '取消',
   save: '保存',
@@ -176,9 +178,9 @@ export const reverseProxyCopy = {
   dnsHostUnused: '传统 UDP/TCP DNS 没有 SNI 或 Host，按端口进入固定规则',
   dnsHttpFieldUnused: 'DNS 反代不使用 HTTP 路径改写与 API 透传',
   listenModeHTTP: 'HTTP：仅监听明文 HTTP 请求。',
-  listenModeHTTPS: 'HTTPS：同时监听 TCP(H2) 与 UDP(H3)。默认不广播 HTTP/3，开启下方开关后浏览器才会自动优先尝试 H3。',
-  listenModeH2: 'H2：仅监听 TCP，仅提供 HTTPS/HTTP2。',
-  listenModeH3: 'H3：仅监听 UDP，仅提供 HTTPS/HTTP3。',
+  listenModeHTTPS: 'HTTPS（H2+H3）：TCP 仅提供 HTTP/2，UDP 仅提供 HTTP/3，不提供 HTTP/1.1。默认不广播 HTTP/3，开启下方开关后浏览器才会自动优先尝试 H3。',
+  listenModeH2: 'H2：仅监听 TCP，仅提供 HTTPS/HTTP2，不提供 HTTP/1.1。',
+  listenModeH3: 'H3：仅监听 UDP，仅提供 HTTPS/HTTP3，不提供 TCP/H2 或 HTTP/1.1。',
   listenModeDNSDoH: 'DoH（DNS）：仅监听 TCP/TLS 上的 DNS over HTTPS（H2；不会打开 H3 UDP 监听），可自定义端口和 URL 路径。',
   listenModeDNSDoHH3: 'DoH3（DNS）：仅监听 H3 的 DNS over HTTPS，可自定义端口和 URL 路径。',
   listenModeDNSDoQ: 'DoQ（DNS）：通过 QUIC 提供 DNS over QUIC，可自定义端口。',
@@ -218,6 +220,10 @@ export const reverseProxyHeaders = [
 ]
 
 const reverseProxyDNSMaxTTL = 4294967295
+const reverseProxyMaximumConfiguredLimit = 1000000
+const reverseProxyMaximumConfiguredStreams = 65535
+const reverseProxyMinimumMemoryBytes = 500 * 1024
+const reverseProxyMaximumMemoryBytes = 64 * 1024 * 1024 * 1024
 
 export const protocolItems = [
   { title: 'HTTP', value: 'http' },
@@ -282,6 +288,8 @@ export const defaultResourceSettings = (): ReverseProxyResourceSettings => ({
   http2MaxConcurrentStreams: 250,
   quicMaxIncomingStreams: 256,
   defaultUpstreamMaxIdleConnections: 32,
+  // This deliberately mirrors the backend admission ceiling. It is not an
+  // eager 8 GiB browser or server allocation.
   memoryPoolBytes: 8 * 1024 * 1024 * 1024,
   defaultRuleMemoryLimitBytes: 384 * 1024 * 1024,
   responseRewriteInputBytes: 4 * 1024 * 1024,
@@ -454,16 +462,19 @@ const sortCertificateIDsByOptionOrder = (ids: number[], options: ReverseProxyCer
 
 const normalizeCertificates = (value: unknown): ReverseProxyCertificateOption[] => {
   if (!Array.isArray(value)) return []
-  return value.map((raw) => {
+  return value.flatMap((raw) => {
+    if (raw == null || typeof raw !== 'object') return []
     const item = raw as Partial<ReverseProxyCertificateOption>
-    return {
-      id: asNumber(item.id),
+    const id = asNumber(item.id)
+    if (!Number.isSafeInteger(id) || id <= 0) return []
+    return [{
+      id,
       displayId: asNumber(item.displayId),
       mainDomain: asString(item.mainDomain),
       domains: normalizeStringList(item.domains),
       notAfter: asNumber(item.notAfter),
       status: asString(item.status),
-    }
+    }]
   })
 }
 
@@ -562,7 +573,7 @@ const normalizeOverview = (value: unknown): ReverseProxyOverview => {
   return {
     revision: asNumber(item.revision),
     resourceSettings: normalizeResourceSettings(item.resourceSettings),
-    available: asBoolean(item.available, true),
+    available: asBoolean(item.available, false),
     started: asBoolean(item.started),
     listenerCount: asNumber(item.listenerCount),
     enabledCount: asNumber(item.enabledCount),
@@ -582,7 +593,7 @@ const normalizeRuntimeOverview = (value: unknown): ReverseProxyRuntimeOverview =
   const rawRules = Array.isArray(item.rules) ? item.rules : []
   return {
     revision: asNumber(item.revision),
-    available: asBoolean(item.available, true),
+    available: asBoolean(item.available, false),
     started: asBoolean(item.started),
     listenerCount: asNumber(item.listenerCount),
     lastSyncAt: asNumber(item.lastSyncAt),
@@ -1074,8 +1085,10 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   const configurationConflict = ref(false)
   const actionsDisabled = computed(() => mutationBusy.value || !hasLoaded.value || Boolean(loadError.value))
   let latestOverviewRequestId = 0
+  const isRecord = (value: unknown): value is Record<string, unknown> => value != null && typeof value === 'object' && !Array.isArray(value)
 
   const applyOverview = (raw: unknown, clearConflict = true) => {
+    if (!isRecord(raw) || !Array.isArray(raw.rules) || !isRecord(raw.resourceSettings)) return false
     const nextOverview = normalizeOverview(raw)
     // A GET started before a successful write can finish afterwards.  Revisions
     // are monotonic, so never let that stale response roll the UI back and make
@@ -1122,7 +1135,10 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     const request = (async () => {
       const msg = await HttpUtils.get('api/reverse-proxy-overview', {}, { silentErrorToast: silent })
       if (msg.success && requestId === latestOverviewRequestId) {
-        applyOverview(msg.obj, !preserveConflict)
+        if (!applyOverview(msg.obj, !preserveConflict)) {
+          loadError.value = reverseProxyCopy.loadFailed
+          overview.value.available = false
+        }
       } else if (!msg.success && requestId === latestOverviewRequestId) {
         loadError.value = msg.msg || reverseProxyCopy.loadFailed
         overview.value.available = false
@@ -1194,7 +1210,7 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     if (runtimeRequest.value) return runtimeRequest.value
     const request = (async () => {
       const msg = await HttpUtils.get('api/reverse-proxy-runtime', {}, { silentErrorToast: true })
-      if (msg.success) mergeRuntime(msg.obj)
+      if (msg.success && isRecord(msg.obj) && Array.isArray(msg.obj.rules) && isRecord(msg.obj.resources)) mergeRuntime(msg.obj)
       return msg
     })()
     runtimeRequest.value = request
@@ -1214,29 +1230,33 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   }
 
   const resourcesAreValid = (value: ReverseProxyResourceSettings) => {
-    const nonNegative = [
+    const boundedNonNegative = [
       value.listenerConnectionLimit,
       value.globalHttpMaxConcurrent,
       value.globalDnsMaxConcurrent,
       value.defaultUpstreamMaxIdleConnections,
     ]
-    const positive = [
-      value.http2MaxConcurrentStreams,
-      value.quicMaxIncomingStreams,
+    if (boundedNonNegative.some(item => !Number.isSafeInteger(Number(item)) || Number(item) < 0 || Number(item) > reverseProxyMaximumConfiguredLimit)) return false
+    if (!Number.isSafeInteger(Number(value.http2MaxConcurrentStreams))
+      || Number(value.http2MaxConcurrentStreams) < 1
+      || Number(value.http2MaxConcurrentStreams) > reverseProxyMaximumConfiguredStreams) return false
+    if (!Number.isSafeInteger(Number(value.quicMaxIncomingStreams))
+      || Number(value.quicMaxIncomingStreams) < 1
+      || Number(value.quicMaxIncomingStreams) > reverseProxyMaximumConfiguredStreams) return false
+    const memoryValues = [
       value.memoryPoolBytes,
       value.defaultRuleMemoryLimitBytes,
       value.responseRewriteInputBytes,
       value.responseRewriteOutputBytes,
-      value.responseRewriteMaxConcurrent,
     ]
-    if (nonNegative.some(item => !Number.isSafeInteger(Number(item)) || Number(item) < 0)) return false
-    if (positive.some(item => !Number.isSafeInteger(Number(item)) || Number(item) <= 0)) return false
+    if (memoryValues.some(item => !Number.isSafeInteger(Number(item))
+      || Number(item) < reverseProxyMinimumMemoryBytes
+      || Number(item) > reverseProxyMaximumMemoryBytes)) return false
+    if (!Number.isSafeInteger(Number(value.responseRewriteMaxConcurrent))
+      || Number(value.responseRewriteMaxConcurrent) < 1
+      || Number(value.responseRewriteMaxConcurrent) > reverseProxyMaximumConfiguredLimit) return false
     return Number(value.defaultRuleMemoryLimitBytes) <= Number(value.memoryPoolBytes)
       && Number(value.responseRewriteInputBytes) + Number(value.responseRewriteOutputBytes) * 2 <= Number(value.defaultRuleMemoryLimitBytes)
-      && Number(value.memoryPoolBytes) >= 500 * 1024
-      && Number(value.defaultRuleMemoryLimitBytes) >= 500 * 1024
-      && Number(value.responseRewriteInputBytes) >= 500 * 1024
-      && Number(value.responseRewriteOutputBytes) >= 500 * 1024
   }
 
   const saveResources = async () => {
@@ -1303,6 +1323,16 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   const saveRule = async () => {
     if (saving.value || actionsDisabled.value) return
     normalizeRuleTextInputs()
+    const listenPort = Number(editingRule.value.listenPort)
+    if (!Number.isSafeInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
+      push.warning({ duration: 4000, message: reverseProxyCopy.listenPortInvalid })
+      return
+    }
+    const targetPort = Number(editingRule.value.targetPort)
+    if (!Number.isSafeInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
+      push.warning({ duration: 4000, message: reverseProxyCopy.targetPortInvalid })
+      return
+    }
     if (protocolIsDNS(editingRule.value.listenProtocol) !== protocolIsDNS(editingRule.value.targetProtocol)) {
       push.warning({ duration: 4000, message: reverseProxyCopy.dnsProtocolPairRequired })
       return
@@ -1321,6 +1351,17 @@ export function useReverseProxyManage(props: { active?: boolean }) {
       const minTtl = Number(editingRule.value.dnsCacheMinTtl)
       const maxTtl = Number(editingRule.value.dnsCacheMaxTtl)
       if (!Number.isSafeInteger(cacheSize) || cacheSize <= 0 || !Number.isSafeInteger(minTtl) || !Number.isSafeInteger(maxTtl) || minTtl < 0 || maxTtl < 0 || minTtl > reverseProxyDNSMaxTTL || maxTtl > reverseProxyDNSMaxTTL || (maxTtl > 0 && minTtl > maxTtl)) {
+        push.warning({ duration: 4000, message: reverseProxyCopy.dnsCacheInvalid })
+        return
+      }
+      const configuredMemoryLimit = Number(editingRule.value.memoryLimitBytes)
+      const effectiveRuleMemory = configuredMemoryLimit > 0
+        ? configuredMemoryLimit
+        : Number(overview.value.resourceSettings.defaultRuleMemoryLimitBytes)
+      if (editingRule.value.dnsCacheEnabled && (!Number.isSafeInteger(effectiveRuleMemory)
+        || effectiveRuleMemory < reverseProxyMinimumMemoryBytes
+        || effectiveRuleMemory > Number(overview.value.resourceSettings.memoryPoolBytes)
+        || cacheSize > effectiveRuleMemory)) {
         push.warning({ duration: 4000, message: reverseProxyCopy.dnsCacheInvalid })
         return
       }
@@ -1344,10 +1385,13 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     const upstreamMaxConnections = Number(editingRule.value.upstreamMaxConnections)
     const upstreamMaxIdleConnections = Number(editingRule.value.upstreamMaxIdleConnections)
     const memoryLimitBytes = Number(editingRule.value.memoryLimitBytes)
-    if (!Number.isSafeInteger(maxConcurrentConnections) || maxConcurrentConnections < 0 || maxConcurrentConnections > 1_000_000
+    if (!Number.isSafeInteger(maxConcurrentConnections) || maxConcurrentConnections < 0 || maxConcurrentConnections > reverseProxyMaximumConfiguredLimit
       || !Number.isSafeInteger(upstreamMaxConnections) || upstreamMaxConnections < 0 || upstreamMaxConnections > 1_000_000
       || !Number.isSafeInteger(upstreamMaxIdleConnections) || upstreamMaxIdleConnections < 0 || upstreamMaxIdleConnections > 1_000_000
-      || !Number.isSafeInteger(memoryLimitBytes) || memoryLimitBytes < 0) {
+      || !Number.isSafeInteger(memoryLimitBytes) || memoryLimitBytes < 0
+      || (memoryLimitBytes > 0 && (memoryLimitBytes < reverseProxyMinimumMemoryBytes
+        || memoryLimitBytes > reverseProxyMaximumMemoryBytes
+        || memoryLimitBytes > Number(overview.value.resourceSettings.memoryPoolBytes)))) {
       push.warning({ duration: 4000, message: reverseProxyCopy.ruleResourceInvalid })
       return
     }
@@ -1590,12 +1634,11 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     return reverseProxyCopy.ipCertificateRoutingHint
   })
   const targetVersionConfigurable = computed(() => {
-    if (protocolIsDNS(editingRule.value.targetProtocol)) return false
-    return editingRule.value.targetProtocol !== 'wss' && normalizeVirtualProtocol(editingRule.value.targetProtocol) === 'https'
+    return editingRule.value.targetProtocol.trim().toLowerCase() === 'https'
   })
   const listenCanAdvertiseHTTP3 = computed(() => {
     const value = editingRule.value.listenProtocol.trim().toLowerCase()
-    return value === 'https'
+    return value === 'https' && editingRule.value.listenHttpVersionStrategy === 'h2_h3'
   })
   const listenIsDNS = computed(() => protocolIsDNS(editingRule.value.listenProtocol))
   const listenIsPlainDNS = computed(() => editingRule.value.listenProtocol === 'dns_udp' || editingRule.value.listenProtocol === 'dns_tcp')
@@ -1612,7 +1655,7 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     if (value === 'dns_udp') return reverseProxyCopy.listenModeDNSUDP
     if (value === 'dns_tcp') return reverseProxyCopy.listenModeDNSTCP
     if (value === 'ws') return 'WS：仅监听明文 WebSocket（ws://）。'
-    if (value === 'wss') return 'WSS：通过 TLS 监听 WebSocket（wss://），需绑定证书。'
+    if (value === 'wss') return 'WSS：通过 TLS 监听传统 HTTP/1.1 WebSocket（wss://），需绑定证书；不属于严格 H2/H3 入口。'
     if (value === 'h2') return reverseProxyCopy.listenModeH2
     if (value === 'h3') return reverseProxyCopy.listenModeH3
     if (value === 'https') return reverseProxyCopy.listenModeHTTPS

@@ -124,6 +124,18 @@ export default {
       usePath: 0,
     }
   },
+  methods: {
+    syncMihomoEditorState() {
+      if (this.isMihomoNamespace) {
+        delete this.data.private_key_path
+        delete this.data.client_version
+        delete this.data.cipher
+        delete this.data.mac
+        delete this.data.kex_algorithm
+      }
+      this.usePath = this.data.private_key != undefined && this.data.private_key_path == undefined ? 1 : 0
+    },
+  },
   computed: {
     isMihomoNamespace(): boolean {
       return this.namespace === 'mihomo'
@@ -241,22 +253,15 @@ export default {
     },
   },
   watch: {
-    isMihomoNamespace: {
+    data: {
       immediate: true,
-      handler(v: boolean) {
-        if (!v) return
-        delete this.data.private_key_path
-        delete this.data.client_version
-        delete this.data.cipher
-        delete this.data.mac
-        delete this.data.kex_algorithm
+      handler() {
+        this.syncMihomoEditorState()
       },
     },
-  },
-  mounted() {
-    if (this.data.private_key != undefined && this.data.private_key_path == undefined) {
-      this.usePath = 1
-    }
+    namespace() {
+      this.syncMihomoEditorState()
+    },
   },
 }
 </script>

@@ -25,14 +25,36 @@ const (
 	firewallGeoUpdateIntervalMinutesKey = "firewallGeoUpdateIntervalMinutes"
 	firewallGeoLastRefreshAtKey         = "firewallGeoLastRefreshAt"
 
-	firewallGeoHTTPTimeout          = 45 * time.Second
-	firewallGeoMaxSourceBytes int64 = 32 * 1024 * 1024
+	firewallGeoHTTPTimeout                    = 45 * time.Second
+	firewallGeoMaxSourceBytes           int64 = 32 * 1024 * 1024
+	firewallGeoMaxSourcesPerRule              = 4
+	firewallGeoMaxRules                       = 16
+	firewallGeoMaxPrefixCount                 = 100000
+	firewallGeoMaxRuntimePrefixCount          = 100000
+	firewallGeoMaxRefreshBytes          int64 = 64 * 1024 * 1024
+	firewallGeoMaxURLBytes                    = 2048
+	firewallGeoMaxCustomSourceURLsBytes       = 16 * 1024
+	firewallGeoMaxStoredListBytes             = 16 * 1024
+	firewallGeoMaxRuleNameBytes               = 256
+	firewallGeoMaxRuleDescriptionBytes        = 4096
 )
 
 var firewallGeoState = struct {
 	loaded map[uint]firewallGeoResolvedPrefixes
 }{
 	loaded: make(map[uint]firewallGeoResolvedPrefixes),
+}
+
+var firewallGeoHTTPClient = &http.Client{
+	Timeout: firewallGeoHTTPTimeout,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          8,
+		MaxIdleConnsPerHost:   4,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
 }
 
 type FirewallGeoRulePayload struct {
@@ -85,8 +107,11 @@ type firewallGeoRuleRefreshResult struct {
 func loadFirewallGeoRulesLocked() ([]model.FirewallGeoRule, error) {
 	db := database.GetDB()
 	rows := make([]model.FirewallGeoRule, 0)
-	if err := db.Order("id asc").Find(&rows).Error; err != nil {
+	if err := db.Order("id asc").Limit(firewallGeoMaxRules + 1).Find(&rows).Error; err != nil {
 		return nil, err
+	}
+	if len(rows) > firewallGeoMaxRules {
+		return nil, fmt.Errorf("GeoIP rule limit exceeded: %d", firewallGeoMaxRules)
 	}
 	return rows, nil
 }
@@ -137,6 +162,9 @@ func normalizeFirewallGeoProtocol(raw string) (string, error) {
 
 func parseFirewallGeoCustomSourceURLs(raw string) ([]string, error) {
 	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	if len(raw) > firewallGeoMaxCustomSourceURLsBytes {
+		return nil, fmt.Errorf("custom geo sources exceed %d bytes", firewallGeoMaxCustomSourceURLsBytes)
+	}
 	segments := make([]string, 0)
 	for _, line := range strings.Split(raw, "\n") {
 		for _, part := range strings.Split(line, ",") {
@@ -160,11 +188,17 @@ func parseFirewallGeoCustomSourceURLs(raw string) ([]string, error) {
 		if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
 			return nil, fmt.Errorf("custom geo source must start with http:// or https://: %s", value)
 		}
+		if len(value) > firewallGeoMaxURLBytes {
+			return nil, fmt.Errorf("custom geo source exceeds %d bytes", firewallGeoMaxURLBytes)
+		}
 		if _, exists := seen[value]; exists {
 			continue
 		}
 		seen[value] = struct{}{}
 		result = append(result, value)
+		if len(result) > firewallGeoMaxSourcesPerRule {
+			return nil, fmt.Errorf("a GeoIP rule supports at most %d custom sources", firewallGeoMaxSourcesPerRule)
+		}
 	}
 	return result, nil
 }
@@ -194,7 +228,7 @@ func encodeFirewallGeoStringList(items []string) string {
 
 func decodeFirewallGeoStringList(raw string) []string {
 	raw = strings.TrimSpace(raw)
-	if raw == "" {
+	if raw == "" || len(raw) > firewallGeoMaxStoredListBytes {
 		return []string{}
 	}
 	var result []string
@@ -257,7 +291,12 @@ func hasFirewallGeoCache(row model.FirewallGeoRule) bool {
 func mergeFirewallGeoResolvedSets(items []firewallGeoResolvedPrefixes) (firewallGeoResolvedPrefixes, error) {
 	var builder netipx.IPSetBuilder
 	for _, item := range items {
-		for _, prefix := range item.All {
+		for _, prefix := range item.IPv4 {
+			if err := addFirewallGeoPrefixString(&builder, prefix); err != nil {
+				return firewallGeoResolvedPrefixes{}, err
+			}
+		}
+		for _, prefix := range item.IPv6 {
 			if err := addFirewallGeoPrefixString(&builder, prefix); err != nil {
 				return firewallGeoResolvedPrefixes{}, err
 			}
@@ -270,14 +309,13 @@ func downloadFirewallGeoSource(sourceURL string, cache map[string]firewallGeoDow
 	if cached, exists := cache[sourceURL]; exists {
 		return cached, nil
 	}
-	client := &http.Client{Timeout: firewallGeoHTTPTimeout}
 	req, err := http.NewRequest(http.MethodGet, sourceURL, nil)
 	if err != nil {
 		return firewallGeoDownloadedSource{}, err
 	}
 	req.Header.Set("User-Agent", "kwor-firewall-geoip/1.0")
 
-	resp, err := client.Do(req)
+	resp, err := firewallGeoHTTPClient.Do(req)
 	if err != nil {
 		return firewallGeoDownloadedSource{}, err
 	}
@@ -293,6 +331,9 @@ func downloadFirewallGeoSource(sourceURL string, cache map[string]firewallGeoDow
 	if int64(len(body)) > firewallGeoMaxSourceBytes {
 		return firewallGeoDownloadedSource{}, fmt.Errorf("geo source exceeds %d MiB", firewallGeoMaxSourceBytes/(1024*1024))
 	}
+	if firewallGeoRefreshCacheBytes(cache)+int64(len(body)) > firewallGeoMaxRefreshBytes {
+		return firewallGeoDownloadedSource{}, fmt.Errorf("GeoIP refresh data exceeds %d MiB", firewallGeoMaxRefreshBytes/(1024*1024))
+	}
 	parsed, err := parseFirewallGeoRuleBytes(sourceURL, body)
 	if err != nil {
 		return firewallGeoDownloadedSource{}, err
@@ -307,15 +348,31 @@ func downloadFirewallGeoSource(sourceURL string, cache map[string]firewallGeoDow
 	return result, nil
 }
 
+func firewallGeoRefreshCacheBytes(cache map[string]firewallGeoDownloadedSource) int64 {
+	var total int64
+	for _, entry := range cache {
+		total += int64(len(entry.Body))
+	}
+	return total
+}
+
 func resolveFirewallGeoRuleSources(row model.FirewallGeoRule, cache map[string]firewallGeoDownloadedSource) (firewallGeoRuleRefreshResult, error) {
 	customURLs := decodeFirewallGeoStringList(row.CustomSourceURLs)
 	if len(customURLs) > 0 {
+		if len(customURLs) > firewallGeoMaxSourcesPerRule {
+			return firewallGeoRuleRefreshResult{}, fmt.Errorf("geo rule has too many custom sources: %d", len(customURLs))
+		}
 		sources := make([]firewallGeoDownloadedSource, 0, len(customURLs))
 		parsed := make([]firewallGeoResolvedPrefixes, 0, len(customURLs))
+		totalPrefixes := 0
 		for _, sourceURL := range customURLs {
 			source, err := downloadFirewallGeoSource(sourceURL, cache)
 			if err != nil {
 				return firewallGeoRuleRefreshResult{}, fmt.Errorf("custom source %s: %w", sourceURL, err)
+			}
+			totalPrefixes += source.Parsed.PrefixCount
+			if totalPrefixes > firewallGeoMaxPrefixCount {
+				return firewallGeoRuleRefreshResult{}, fmt.Errorf("combined geo rule prefix count exceeds %d", firewallGeoMaxPrefixCount)
 			}
 			sources = append(sources, source)
 			parsed = append(parsed, source.Parsed)
@@ -337,6 +394,9 @@ func resolveFirewallGeoRuleSources(row model.FirewallGeoRule, cache map[string]f
 	providers := decodeFirewallGeoStringList(row.SourceProviders)
 	if len(providers) == 0 {
 		providers = firewallGeoDefaultSourceKeys()
+	}
+	if len(providers) > firewallGeoMaxSourcesPerRule {
+		return firewallGeoRuleRefreshResult{}, fmt.Errorf("geo rule has too many source providers: %d", len(providers))
 	}
 
 	attemptErrors := make([]string, 0, len(providers))
@@ -424,7 +484,6 @@ func applyFirewallGeoRuleRefreshResultLocked(row *model.FirewallGeoRule, result 
 	if err := database.GetDB().Save(row).Error; err != nil {
 		return err
 	}
-	firewallGeoState.loaded[row.Id] = result.Merged
 	return nil
 }
 
@@ -452,9 +511,28 @@ func loadFirewallGeoRuleCachedPrefixes(row model.FirewallGeoRule) (firewallGeoRe
 		return firewallGeoResolvedPrefixes{}, fmt.Errorf("geo rule has no cached files")
 	}
 
+	if len(files) > firewallGeoMaxSourcesPerRule {
+		return firewallGeoResolvedPrefixes{}, fmt.Errorf("geo rule cache has too many files: %d", len(files))
+	}
+	var totalBytes int64
 	parsed := make([]firewallGeoResolvedPrefixes, 0, len(files))
 	for _, fileName := range files {
-		body, err := os.ReadFile(firewallGeoFilePath(fileName))
+		if !isSafeFirewallGeoCachedFileName(fileName) {
+			return firewallGeoResolvedPrefixes{}, fmt.Errorf("invalid geo cache file name")
+		}
+		filePath := firewallGeoFilePath(fileName)
+		info, statErr := os.Stat(filePath)
+		if statErr != nil {
+			return firewallGeoResolvedPrefixes{}, statErr
+		}
+		if info.Size() > firewallGeoMaxSourceBytes {
+			return firewallGeoResolvedPrefixes{}, fmt.Errorf("geo cache file exceeds %d MiB", firewallGeoMaxSourceBytes/(1024*1024))
+		}
+		totalBytes += info.Size()
+		if totalBytes > firewallGeoMaxRefreshBytes {
+			return firewallGeoResolvedPrefixes{}, fmt.Errorf("geo rule cache exceeds %d MiB", firewallGeoMaxRefreshBytes/(1024*1024))
+		}
+		body, err := os.ReadFile(filePath)
 		if err != nil {
 			return firewallGeoResolvedPrefixes{}, err
 		}
@@ -475,21 +553,46 @@ func loadFirewallGeoRuleCachedPrefixes(row model.FirewallGeoRule) (firewallGeoRe
 	return merged, nil
 }
 
+func isSafeFirewallGeoCachedFileName(raw string) bool {
+	name := strings.TrimSpace(raw)
+	return name != "" && name == filepath.Base(name) && !strings.ContainsAny(name, "/\\") && !strings.Contains(name, "..")
+}
+
 func ensureFirewallGeoRuntimeLoadedLocked(rows []model.FirewallGeoRule) error {
 	if len(rows) == 0 {
 		firewallGeoState.loaded = make(map[uint]firewallGeoResolvedPrefixes)
 		return nil
 	}
 
+	declaredPrefixes := 0
+	for _, row := range rows {
+		if row.PrefixCount < 0 || row.PrefixCount > firewallGeoMaxPrefixCount {
+			return fmt.Errorf("geo rule %d prefix count exceeds %d", row.Id, firewallGeoMaxPrefixCount)
+		}
+		declaredPrefixes += row.PrefixCount
+		if declaredPrefixes > firewallGeoMaxRuntimePrefixCount {
+			return fmt.Errorf("total GeoIP runtime prefixes exceed %d", firewallGeoMaxRuntimePrefixCount)
+		}
+	}
+
 	loaded := make(map[uint]firewallGeoResolvedPrefixes, len(rows))
+	totalPrefixes := 0
 	for _, row := range rows {
 		if cached, exists := firewallGeoState.loaded[row.Id]; exists && cached.ContentHash == row.ContentHash {
+			totalPrefixes += cached.PrefixCount
+			if totalPrefixes > firewallGeoMaxRuntimePrefixCount {
+				return fmt.Errorf("total GeoIP runtime prefixes exceed %d", firewallGeoMaxRuntimePrefixCount)
+			}
 			loaded[row.Id] = cached
 			continue
 		}
 		result, err := loadFirewallGeoRuleCachedPrefixes(row)
 		if err != nil {
 			return fmt.Errorf("load geo cache for rule %d failed: %w", row.Id, err)
+		}
+		totalPrefixes += result.PrefixCount
+		if totalPrefixes > firewallGeoMaxRuntimePrefixCount {
+			return fmt.Errorf("total GeoIP runtime prefixes exceed %d", firewallGeoMaxRuntimePrefixCount)
 		}
 		loaded[row.Id] = result
 	}
@@ -586,6 +689,10 @@ func (s *FirewallService) refreshFirewallGeoRulesLocked(rows []model.FirewallGeo
 		if err := applyFirewallGeoRuleRefreshResultLocked(row, result, now); err != nil {
 			return err
 		}
+		// The freshly parsed result is already validated and normalized. Keep it
+		// in the runtime cache so the subsequent render does not read and parse
+		// the same cache files a second time.
+		firewallGeoState.loaded[row.Id] = result.Merged
 	}
 	return s.setFirewallGeoLastRefreshAtLocked(now)
 }
@@ -623,7 +730,7 @@ func (s *FirewallService) prepareFirewallGeoRulesLocked(forceRefresh bool) ([]mo
 		return nil, err
 	}
 
-	if forceRefresh || s.shouldAutoRefreshFirewallGeoLocked() {
+	if forceRefresh {
 		if err := s.refreshFirewallGeoRulesLocked(rows, false); err != nil {
 			return nil, err
 		}
@@ -655,6 +762,13 @@ func (s *FirewallService) UpsertGeoRule(payload FirewallGeoRulePayload) error {
 		copyRow := row
 		previous = &copyRow
 	} else {
+		var ruleCount int64
+		if err := db.Model(&model.FirewallGeoRule{}).Count(&ruleCount).Error; err != nil {
+			return err
+		}
+		if ruleCount >= firewallGeoMaxRules {
+			return common.NewError("GeoIP rule limit reached: ", firewallGeoMaxRules)
+		}
 		row = model.FirewallGeoRule{
 			Enabled: true,
 		}
@@ -662,6 +776,12 @@ func (s *FirewallService) UpsertGeoRule(payload FirewallGeoRulePayload) error {
 
 	name := strings.TrimSpace(payload.Name)
 	description := strings.TrimSpace(payload.Description)
+	if len(name) > firewallGeoMaxRuleNameBytes {
+		return common.NewError("GeoIP rule name exceeds ", firewallGeoMaxRuleNameBytes, " bytes")
+	}
+	if len(description) > firewallGeoMaxRuleDescriptionBytes {
+		return common.NewError("GeoIP rule description exceeds ", firewallGeoMaxRuleDescriptionBytes, " bytes")
+	}
 	family := normalizeFirewallFamily(payload.Family)
 	protocol, err := normalizeFirewallGeoProtocol(payload.Protocol)
 	if err != nil {
@@ -673,7 +793,13 @@ func (s *FirewallService) UpsertGeoRule(payload FirewallGeoRulePayload) error {
 	}
 	action := normalizeFirewallGeoAction(payload.Action)
 	countryCode := normalizeFirewallGeoCountryCode(payload.CountryCode)
+	if len(payload.SourceProviders) > firewallGeoMaxSourcesPerRule {
+		return common.NewError("GeoIP rule supports at most ", firewallGeoMaxSourcesPerRule, " source providers")
+	}
 	sourceProviders := normalizeFirewallGeoProviderKeys(payload.SourceProviders)
+	if len(sourceProviders) > firewallGeoMaxSourcesPerRule {
+		return common.NewError("GeoIP rule supports at most ", firewallGeoMaxSourcesPerRule, " source providers")
+	}
 	customURLs, err := parseFirewallGeoCustomSourceURLs(payload.CustomSourceURLs)
 	if err != nil {
 		return err

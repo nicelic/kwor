@@ -32,6 +32,7 @@ const (
 	panelUpdateVersionCacheMax   = 64
 	panelUpdateVersionCacheTTL   = 10 * time.Minute
 	panelUpdateSupportFileMaxLen = 512 * 1024
+	panelUpdateLastLogMaxBytes   = 128 * 1024
 	panelUpdateServiceName       = "kwor"
 	panelUpdateDefaultInstallDir = "/opt/kwor"
 )
@@ -163,7 +164,7 @@ var panelUpdateVersionCache = struct {
 var panelUpdateMu sync.Mutex
 var panelUpdateTaskManager = NewManagedDownloadTaskManager("panel update")
 
-const panelUpdateLogMaxBytes = 128 * 1024
+const panelUpdateLogMaxBytes = panelUpdateLastLogMaxBytes
 const panelUpdateLogMaxLines = 300
 
 func (s *PanelUpdateService) GetStatus() (*PanelUpdateStatus, error) {
@@ -753,7 +754,7 @@ func readPanelUpdateLastError(logPath string) string {
 	if logPath == "" {
 		return ""
 	}
-	content, err := os.ReadFile(logPath)
+	content, _, err := readPanelUpdateLogTailBytes(logPath, panelUpdateLastLogMaxBytes)
 	if err != nil {
 		return ""
 	}
@@ -804,7 +805,7 @@ func loadPanelUpdateLogView(logPath string) (*PanelUpdateLogView, error) {
 	view.Exists = true
 	view.Modified = info.ModTime().Unix()
 
-	content, tooLong, err := readPanelUpdateLogBytes(logPath, panelUpdateLogMaxBytes)
+	content, tooLong, err := readPanelUpdateLogTailBytes(logPath, panelUpdateLogMaxBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -813,22 +814,38 @@ func loadPanelUpdateLogView(logPath string) (*PanelUpdateLogView, error) {
 	return view, nil
 }
 
-func readPanelUpdateLogBytes(logPath string, maxBytes int64) ([]byte, bool, error) {
+func readPanelUpdateLogTailBytes(logPath string, maxBytes int64) ([]byte, bool, error) {
+	if maxBytes <= 0 {
+		return []byte{}, false, nil
+	}
 	f, err := os.Open(logPath)
 	if err != nil {
 		return nil, false, err
 	}
 	defer f.Close()
 
-	reader := io.LimitReader(f, maxBytes+1)
-	content, err := io.ReadAll(reader)
+	info, err := f.Stat()
 	if err != nil {
 		return nil, false, err
 	}
-	if int64(len(content)) > maxBytes {
-		return content[:maxBytes], true, nil
+	tooLong := info.Size() > maxBytes
+	if tooLong {
+		if _, err := f.Seek(-maxBytes, io.SeekEnd); err != nil {
+			return nil, false, err
+		}
 	}
-	return content, false, nil
+	content, err := io.ReadAll(io.LimitReader(f, maxBytes))
+	if err != nil {
+		return nil, false, err
+	}
+	if tooLong {
+		if newline := bytes.IndexByte(content, '\n'); newline >= 0 {
+			content = content[newline+1:]
+		} else {
+			content = []byte{}
+		}
+	}
+	return content, tooLong, nil
 }
 
 func normalizePanelUpdateLogLines(content []byte, maxLines int) []string {
@@ -1235,7 +1252,7 @@ cleanup() {
 	fi
 	CLEANUP_DONE=1
   if [[ "$UPDATE_SUCCESS" -eq 0 && -f "$LOG_PATH" ]]; then
-    cp -f "$LOG_PATH" "$LAST_LOG_PATH" 2>/dev/null || true
+    tail -c %d "$LOG_PATH" > "$LAST_LOG_PATH" 2>/dev/null || : > "$LAST_LOG_PATH"
     chmod 600 "$LAST_LOG_PATH" 2>/dev/null || true
   else
     rm -f "$LAST_LOG_PATH"
@@ -1521,6 +1538,7 @@ exit 1
 		shellQuote(panelUpdateServiceName),
 		shellQuote(binaryName),
 		shellQuote(operationID),
+		panelUpdateLastLogMaxBytes,
 		InternalSystemdCommandEnv,
 		shellQuote(filepath.Dir(installSupportPath)),
 		shellQuote(installSupportPath),

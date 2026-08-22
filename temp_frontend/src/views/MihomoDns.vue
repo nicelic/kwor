@@ -1,7 +1,27 @@
 <template>
+  <template v-if="initializing">
+    <v-row align="center" justify="center" style="min-height: 240px;">
+      <v-col cols="12" class="text-center">
+        <v-progress-circular indeterminate color="primary" />
+        <div class="mt-3">{{ $t('loading') }}</div>
+      </v-col>
+    </v-row>
+  </template>
+  <template v-else-if="loadFailed">
+    <v-row align="center" justify="center" style="min-height: 240px;">
+      <v-col cols="12" sm="8" md="6">
+        <v-alert type="error" variant="tonal" :title="$t('failed')" class="text-center">
+          <v-btn color="primary" class="mt-2" prepend-icon="mdi-refresh" @click="initialize">
+            {{ $t('actions.update') }}
+          </v-btn>
+        </v-alert>
+      </v-col>
+    </v-row>
+  </template>
+  <template v-else>
   <v-row>
     <v-col cols="12" justify="center" align="center">
-      <v-btn variant="outlined" color="warning" @click="saveConfig" :loading="loading" :disabled="isPristine">
+      <v-btn variant="outlined" color="warning" @click="saveConfig" :loading="loading" :disabled="loading || !initialized || (isPristine && !runtimeRefreshFailed) || hasDnsInputError">
         {{ $t('actions.save') }}
       </v-btn>
     </v-col>
@@ -20,8 +40,17 @@
         multiple
         chips
         closable-chips
-        hide-details
+        :disabled="loading"
+        :error-messages="dnsListError(form.directNameserver)"
+        :hide-details="dnsListError(form.directNameserver).length === 0"
       ></v-combobox>
+    </v-col>
+  </v-row>
+  <v-row v-if="dnsTotalError(form)">
+    <v-col cols="12" md="8">
+      <v-alert type="error" density="compact" variant="tonal">
+        {{ dnsTotalError(form) }}
+      </v-alert>
     </v-col>
   </v-row>
   <v-row>
@@ -33,7 +62,9 @@
         multiple
         chips
         closable-chips
-        hide-details
+        :disabled="loading"
+        :error-messages="dnsListError(form.proxyServerNameserver)"
+        :hide-details="dnsListError(form.proxyServerNameserver).length === 0"
       ></v-combobox>
     </v-col>
   </v-row>
@@ -46,7 +77,9 @@
         multiple
         chips
         closable-chips
-        hide-details
+        :disabled="loading"
+        :error-messages="dnsListError(form.nameserver)"
+        :hide-details="dnsListError(form.nameserver).length === 0"
       ></v-combobox>
     </v-col>
   </v-row>
@@ -59,7 +92,9 @@
         multiple
         chips
         closable-chips
-        hide-details
+        :disabled="loading"
+        :error-messages="dnsListError(form.defaultNameserver)"
+        :hide-details="dnsListError(form.defaultNameserver).length === 0"
       ></v-combobox>
     </v-col>
   </v-row>
@@ -72,7 +107,9 @@
         multiple
         chips
         closable-chips
-        hide-details
+        :disabled="loading"
+        :error-messages="dnsListError(form.fallback)"
+        :hide-details="dnsListError(form.fallback).length === 0"
       ></v-combobox>
     </v-col>
   </v-row>
@@ -82,53 +119,63 @@
         v-model="form.globalIpv6"
         :items="optionalBoolOptions"
         label="IPv6 总开关"
+        :disabled="loading"
         hide-details
       ></v-select>
     </v-col>
   </v-row>
   <v-row>
-    <v-col cols="12" sm="3" md="2">
-      <v-switch
+    <v-col cols="12" sm="4" md="3">
+      <v-select
         v-model="form.dnsIpv6"
-        color="primary"
         label="DNS_IPv6"
+        :items="optionalBoolOptions"
+        :disabled="loading || !hasDnsServers"
         hide-details
-      ></v-switch>
+      ></v-select>
     </v-col>
-    <v-col cols="12" sm="5" md="3" v-if="form.dnsIpv6">
+    <v-col cols="12" sm="5" md="3" v-if="form.dnsIpv6 === true && hasDnsServers">
       <v-text-field
         v-model="form.ipv6Timeout"
         label="ipv6-timeout"
         placeholder="ipv6-timeout"
-        hide-details
+        :disabled="loading"
+        :error-messages="ipv6TimeoutError ? [ipv6TimeoutError] : []"
+        :hide-details="ipv6TimeoutError === ''"
         @blur="normalizeIpv6TimeoutField"
       ></v-text-field>
     </v-col>
-    <v-col cols="12" sm="3" md="2">
-      <v-switch
+  </v-row>
+  <v-row>
+    <v-col cols="12" sm="4" md="3">
+      <v-select
         v-model="form.preferH3"
-        color="primary"
         label="prefer-h3"
+        :items="optionalBoolOptions"
+        :disabled="loading || !hasDnsServers"
         hide-details
-      ></v-switch>
+      ></v-select>
     </v-col>
   </v-row>
   <v-row>
-    <v-col cols="12" sm="3" md="2">
-      <v-switch
+    <v-col cols="12" sm="4" md="3">
+      <v-select
         v-model="form.tcpConcurrent"
-        color="primary"
-        label="TCP并发"
+        label="TCP 并发（全局）"
+        :items="optionalBoolOptions"
+        :disabled="loading"
         hide-details
-      ></v-switch>
+      ></v-select>
     </v-col>
   </v-row>
+  </template>
 </template>
 
 <script lang="ts" setup>
-import { computed, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import MihomoData from '@/store/modules/mihomoData'
 import { FindDiff } from '@/plugins/utils'
+import { push } from 'notivue'
 
 const mihomoDnsOptions = [
   'udp://127.0.0.1',
@@ -162,10 +209,11 @@ const mihomoDnsOptions = [
   'tls://[2606:4700:4700::1001]#disable-ipv4=true',
 ]
 
-const defaultMihomoNameserver = [
-  'tls://1.1.1.1#disable-ipv6=true',
-  'tls://1.0.0.1#disable-ipv6=true',
-]
+const maxMihomoDNSAddressesPerList = 8
+const maxMihomoDNSAddressesTotal = 32
+const maxMihomoDNSAddressBytes = 1024
+const maxMihomoDNSAddressesBytes = 16 * 1024
+const textEncoder = new TextEncoder()
 
 interface MihomoDnsForm {
   globalIpv6: boolean | null
@@ -174,17 +222,23 @@ interface MihomoDnsForm {
   nameserver: string[]
   defaultNameserver: string[]
   fallback: string[]
-  dnsIpv6: boolean
-  preferH3: boolean
-  tcpConcurrent: boolean
+  dnsIpv6: boolean | null
+  preferH3: boolean | null
+  tcpConcurrent: boolean | null
   ipv6Timeout: string
 }
 
 const store = MihomoData()
 const loading = ref(false)
+const initializing = ref(true)
+const loadFailed = ref(false)
 const initialized = ref(false)
 const form = ref<MihomoDnsForm>(createEmptyForm())
 const oldForm = ref<MihomoDnsForm>(createEmptyForm())
+const runtimeRefreshFailed = ref(false)
+const revision = ref(0)
+let componentActive = true
+let refreshTimer: number | undefined
 const optionalBoolOptions = [
   { title: '', value: null },
   { title: 'true', value: true },
@@ -199,9 +253,9 @@ function createEmptyForm(): MihomoDnsForm {
     nameserver: [],
     defaultNameserver: [],
     fallback: [],
-    dnsIpv6: false,
-    preferH3: false,
-    tcpConcurrent: false,
+    dnsIpv6: null,
+    preferH3: null,
+    tcpConcurrent: null,
     ipv6Timeout: '',
   }
 }
@@ -229,9 +283,58 @@ function normalizeStringList(value: unknown): string[] {
   return result
 }
 
+function dnsAddressError(value: string): string {
+  if (textEncoder.encode(value).byteLength > maxMihomoDNSAddressBytes) {
+    return `单个 DNS 地址不能超过 ${maxMihomoDNSAddressBytes} 字节`
+  }
+  if (/[\u0000-\u001F\u007F\s]/.test(value)) {
+    return 'DNS 地址不能包含空白或控制字符'
+  }
+  if (value.includes('://')) {
+    try {
+      const parsed = new URL(value)
+      if (!parsed.protocol || !parsed.host) return 'DNS URI 格式无效'
+    } catch {
+      return 'DNS URI 格式无效'
+    }
+  }
+  return ''
+}
+
+function dnsListError(value: unknown): string[] {
+  const normalized = normalizeStringList(value)
+  if (normalized.length > maxMihomoDNSAddressesPerList) {
+    return [`每个 DNS 列表最多允许 ${maxMihomoDNSAddressesPerList} 个地址`]
+  }
+  for (const item of normalized) {
+    const error = dnsAddressError(item)
+    if (error) return [error]
+  }
+  return []
+}
+
+function dnsTotalError(value: MihomoDnsForm): string {
+  const lists = [
+    value.directNameserver,
+    value.proxyServerNameserver,
+    value.nameserver,
+    value.defaultNameserver,
+    value.fallback,
+  ].map(normalizeStringList)
+  const count = lists.reduce((total, list) => total + list.length, 0)
+  if (count > maxMihomoDNSAddressesTotal) {
+    return `DNS 地址总数不能超过 ${maxMihomoDNSAddressesTotal}`
+  }
+  const bytes = lists.flat().reduce((total, item) => total + textEncoder.encode(item).byteLength, 0)
+  if (bytes > maxMihomoDNSAddressesBytes) {
+    return `DNS 地址总大小不能超过 ${maxMihomoDNSAddressesBytes} 字节`
+  }
+  return ''
+}
+
 function normalizeIpv6TimeoutInput(value: unknown): string {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    const normalized = Math.trunc(value)
+  if (typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value)) {
+    const normalized = value
     return normalized > 0 ? String(normalized) : ''
   }
 
@@ -285,9 +388,9 @@ function normalizeForm(value: MihomoDnsForm): MihomoDnsForm {
     nameserver: normalizeStringList(value.nameserver),
     defaultNameserver: normalizeStringList(value.defaultNameserver),
     fallback: normalizeStringList(value.fallback),
-    dnsIpv6: value.dnsIpv6 === true,
-    preferH3: value.preferH3 === true,
-    tcpConcurrent: value.tcpConcurrent === true,
+    dnsIpv6: normalizeOptionalBoolean(value.dnsIpv6),
+    preferH3: normalizeOptionalBoolean(value.preferH3),
+    tcpConcurrent: normalizeOptionalBoolean(value.tcpConcurrent),
     ipv6Timeout: normalizeIpv6TimeoutInput(value.ipv6Timeout),
   }
 }
@@ -296,21 +399,21 @@ function parseForm(config: any): MihomoDnsForm {
   const dns = config?.dns
   const emptyForm = createEmptyForm()
   emptyForm.globalIpv6 = normalizeOptionalBoolean(config?.['ipv6'])
-  emptyForm.tcpConcurrent = normalizeOptionalBoolean(config?.['tcp-concurrent']) === true
+  emptyForm.tcpConcurrent = normalizeOptionalBoolean(config?.['tcp-concurrent'])
   if (!dns || typeof dns !== 'object' || Array.isArray(dns)) {
     return emptyForm
   }
 
   return {
     globalIpv6: normalizeOptionalBoolean(config?.['ipv6']),
-    tcpConcurrent: normalizeOptionalBoolean(config?.['tcp-concurrent']) === true,
+    tcpConcurrent: normalizeOptionalBoolean(config?.['tcp-concurrent']),
     directNameserver: normalizeStringList(dns['direct-nameserver']),
     proxyServerNameserver: normalizeStringList(dns['proxy-server-nameserver']),
     nameserver: normalizeStringList(dns['nameserver']),
     defaultNameserver: normalizeStringList(dns['default-nameserver']),
     fallback: normalizeStringList(dns['fallback']),
-    dnsIpv6: dns['ipv6'] === true,
-    preferH3: dns['prefer-h3'] === true,
+    dnsIpv6: normalizeOptionalBoolean(dns['ipv6']),
+    preferH3: normalizeOptionalBoolean(dns['prefer-h3']),
     ipv6Timeout: normalizeIpv6TimeoutInput(dns['ipv6-timeout']),
   }
 }
@@ -339,61 +442,180 @@ function buildDnsConfig(value: MihomoDnsForm): Record<string, unknown> | null {
     return null
   }
 
-  dns['ipv6'] = normalized.dnsIpv6 === true
-  dns['prefer-h3'] = normalized.preferH3 === true
-  if (normalized.dnsIpv6 && normalized.ipv6Timeout.length > 0) {
+  if (normalized.dnsIpv6 !== null) {
+    dns['ipv6'] = normalized.dnsIpv6
+  }
+  if (normalized.preferH3 !== null) {
+    dns['prefer-h3'] = normalized.preferH3
+  }
+  if (normalized.dnsIpv6 === true && normalized.ipv6Timeout.length > 0) {
     dns['ipv6-timeout'] = Number.parseInt(normalized.ipv6Timeout, 10)
   }
   return dns
 }
 
 function normalizeIpv6TimeoutField() {
-  form.value.ipv6Timeout = normalizeIpv6TimeoutInput(form.value.ipv6Timeout)
+  const raw = form.value.ipv6Timeout
+  if (typeof raw !== 'string' || raw.trim() === '') {
+    form.value.ipv6Timeout = ''
+    return
+  }
+  const normalized = normalizeIpv6TimeoutInput(raw)
+  if (normalized !== '') {
+    form.value.ipv6Timeout = normalized
+  }
 }
+
+const hasDnsServers = computed(() => [
+  form.value.directNameserver,
+  form.value.proxyServerNameserver,
+  form.value.nameserver,
+  form.value.defaultNameserver,
+  form.value.fallback,
+].some(list => normalizeStringList(list).length > 0))
+
+const ipv6TimeoutError = computed(() => {
+  if (!hasDnsServers.value || form.value.dnsIpv6 !== true) return ''
+  const raw = form.value.ipv6Timeout
+  if (typeof raw === 'string' && raw.trim() === '') return ''
+  return normalizeIpv6TimeoutInput(raw) === ''
+    ? 'ipv6-timeout 必须是大于 0 的整数毫秒'
+    : ''
+})
+
+watch(hasDnsServers, enabled => {
+  if (enabled) return
+  form.value.dnsIpv6 = null
+  form.value.preferH3 = null
+  form.value.ipv6Timeout = ''
+}, { immediate: true })
 
 const isPristine = computed(() => {
   return FindDiff.deepCompare(normalizeForm(form.value), oldForm.value)
 })
 
-watch(
-  () => store.config,
-  (config) => {
-    if (!initialized.value || isPristine.value) {
-      const nextForm = parseForm(config)
-      form.value = cloneForm(nextForm)
-      oldForm.value = cloneForm(nextForm)
-      initialized.value = true
+const hasDnsInputError = computed(() => {
+  const lists = [
+    form.value.directNameserver,
+    form.value.proxyServerNameserver,
+    form.value.nameserver,
+    form.value.defaultNameserver,
+    form.value.fallback,
+  ]
+  return lists.some(list => dnsListError(list).length > 0)
+    || dnsTotalError(form.value) !== ''
+    || ipv6TimeoutError.value !== ''
+})
+
+const initialize = async () => {
+  initializing.value = true
+  loadFailed.value = false
+  initialized.value = false
+  loading.value = true
+  try {
+    const config = await store.loadConfig()
+    if (!componentActive) return
+    if (config === null) {
+      loadFailed.value = true
+      return
     }
-  },
-  { deep: true, immediate: true },
-)
+    const nextForm = parseForm(config)
+    form.value = cloneForm(nextForm)
+    oldForm.value = cloneForm(nextForm)
+    revision.value = store.lastLoad
+    runtimeRefreshFailed.value = false
+    initialized.value = true
+  } catch {
+    if (componentActive) loadFailed.value = true
+  } finally {
+    if (componentActive) {
+      initializing.value = false
+      loading.value = false
+    }
+  }
+}
+
+const refreshWhenClean = async () => {
+  if (!componentActive || (typeof document !== 'undefined' && document.visibilityState !== 'visible') || !initialized.value || loading.value || !isPristine.value) return
+  const config = await store.loadConfig()
+  if (!componentActive || config === null || !isPristine.value) return
+  const nextForm = parseForm(config)
+  form.value = cloneForm(nextForm)
+  oldForm.value = cloneForm(nextForm)
+  revision.value = store.lastLoad
+  runtimeRefreshFailed.value = false
+}
+
+const handleVisibilityChange = () => {
+  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+    stopRefreshTimer()
+    return
+  }
+  startRefreshTimer()
+  void refreshWhenClean()
+}
+
+const stopRefreshTimer = () => {
+  if (refreshTimer === undefined) return
+  window.clearTimeout(refreshTimer)
+  refreshTimer = undefined
+}
+
+const scheduleRefresh = (delay = 30_000) => {
+  if ((typeof document !== 'undefined' && document.visibilityState !== 'visible') || !componentActive) return
+  if (refreshTimer !== undefined) window.clearTimeout(refreshTimer)
+  refreshTimer = window.setTimeout(async () => {
+    refreshTimer = undefined
+    try {
+      await refreshWhenClean()
+    } catch {
+      // Keep the next refresh alive after a transient load failure.
+    }
+    scheduleRefresh()
+  }, delay)
+}
+
+const startRefreshTimer = () => {
+  if ((typeof document !== 'undefined' && document.visibilityState !== 'visible') || refreshTimer !== undefined) return
+  scheduleRefresh()
+}
+
+onMounted(() => {
+  void initialize()
+  startRefreshTimer()
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', handleVisibilityChange)
+})
+onUnmounted(() => {
+  componentActive = false
+  stopRefreshTimer()
+  if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', handleVisibilityChange)
+})
 
 const saveConfig = async () => {
-  const payload = JSON.parse(JSON.stringify(store.config ?? {}))
+  if (!initialized.value || loading.value) return
   const normalizedForm = normalizeForm(form.value)
-  const dnsConfig = buildDnsConfig(form.value)
-
-  if (normalizedForm.globalIpv6 === null) {
-    delete payload.ipv6
-  } else {
-    payload.ipv6 = normalizedForm.globalIpv6
-  }
-
-  payload['tcp-concurrent'] = normalizedForm.tcpConcurrent === true
-
-  if (dnsConfig) {
-    payload.dns = dnsConfig
-  } else {
-    delete payload.dns
-  }
+  if (hasDnsInputError.value) return
 
   loading.value = true
   try {
-    const success = await store.save('config', 'set', payload)
-    if (success) {
+    const result = await store.saveDnsConfig({
+      expectedRevision: revision.value,
+      ipv6: normalizedForm.globalIpv6,
+      tcpConcurrent: normalizedForm.tcpConcurrent,
+      dns: buildDnsConfig(normalizedForm),
+      retryRuntime: runtimeRefreshFailed.value,
+    })
+    if (result.saved) {
       const nextForm = parseForm(store.config)
       form.value = cloneForm(nextForm)
       oldForm.value = cloneForm(nextForm)
+      revision.value = result.revision ?? store.lastLoad
+      runtimeRefreshFailed.value = result.runtimeRefreshFailed
+    } else if (result.conflict) {
+      push.warning({
+        title: 'DNS 配置已变更',
+        message: '其他页面或窗口已更新 Mihomo 配置，请重新加载 DNS 页面后再保存。',
+      })
     }
   } finally {
     loading.value = false

@@ -7,7 +7,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
+
+const firewallConnectionStatsSnapshotMinGap = 5 * time.Second
 
 type firewallConnectionStats struct {
 	TCPActiveCount      int
@@ -40,6 +44,13 @@ type firewallConnectionStatSources struct {
 	udpStatPath string
 }
 
+var firewallConnectionStatsState = struct {
+	mu         sync.Mutex
+	lastReadAt time.Time
+	snapshot   firewallConnectionStats
+	err        error
+}{}
+
 var defaultFirewallConnectionStatSources = firewallConnectionStatSources{
 	tcp4Path:    procTCP,
 	tcp6Path:    procTCP6,
@@ -53,7 +64,16 @@ func readFirewallConnectionStats() (firewallConnectionStats, error) {
 	if !IsSystemPlatformLinux() {
 		return firewallConnectionStats{}, nil
 	}
-	return readFirewallConnectionStatsFromSources(defaultFirewallConnectionStatSources)
+	firewallConnectionStatsState.mu.Lock()
+	defer firewallConnectionStatsState.mu.Unlock()
+	if !firewallConnectionStatsState.lastReadAt.IsZero() && time.Since(firewallConnectionStatsState.lastReadAt) < firewallConnectionStatsSnapshotMinGap {
+		return firewallConnectionStatsState.snapshot, firewallConnectionStatsState.err
+	}
+	stats, err := readFirewallConnectionStatsFromSources(defaultFirewallConnectionStatSources)
+	firewallConnectionStatsState.lastReadAt = time.Now()
+	firewallConnectionStatsState.snapshot = stats
+	firewallConnectionStatsState.err = err
+	return stats, err
 }
 
 func readFirewallConnectionStatsFromSources(sources firewallConnectionStatSources) (firewallConnectionStats, error) {

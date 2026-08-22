@@ -1,6 +1,14 @@
 ﻿<template>
-  <v-dialog transition="dialog-bottom-transition" width="800" @after-enter="updateData(id ?? 0)">
-    <v-card class="rounded-lg" :loading="loading">
+  <v-dialog
+    v-model="dialogVisible"
+    transition="dialog-bottom-transition"
+    width="800"
+    max-width="95vw"
+    max-height="90vh"
+    :persistent="loading"
+    @after-enter="updateData(id ?? 0)"
+  >
+    <v-card class="rounded-lg inbound-modal-card" :loading="loading">
       <v-card-title>
         {{ $t('actions.' + title) + " " + $t('objects.inbound') }}
       </v-card-title>
@@ -11,8 +19,11 @@
           type="card, text, divider, list-item-two-line"
           v-if="loading"
         ></v-skeleton-loader>
-      <v-card-text style="padding: 0 16px; overflow-y: scroll;">
-        <v-container style="padding: 0;" :hidden="loading">
+      <v-card-text class="inbound-modal-body">
+          <v-alert v-if="loadError" type="error" variant="tonal" class="mb-4">
+            入站详情加载失败，请稍后重试或关闭后重新打开。
+          </v-alert>
+          <v-container style="padding: 0;" :hidden="loading || loadError">
           <v-row>
             <v-col cols="12" sm="6" md="4">
                 <v-select
@@ -43,8 +54,8 @@
                 :data="inbound"
                 :inTags="inTags"
                 :disable-detour-option="isMihomoShadowProtocol"
-                :disable-tcp-options="isMihomoShadowProtocol"
-                :disable-udp-options="isMihomoShadowProtocol"
+                :disable-tcp-options="disableMihomoListenTcpOptions"
+                :disable-udp-options="disableMihomoListenUdpOptions"
                 v-if="inbound.type == inTypes.TrustTunnel"
                 @listen-port-blur="handleListenPortBlur"
               />
@@ -52,8 +63,8 @@
                 :data="inbound"
                 :inTags="inTags"
                 :disable-detour-option="isMihomoShadowProtocol"
-                :disable-tcp-options="isMihomoShadowProtocol"
-                :disable-udp-options="isMihomoShadowProtocol"
+                :disable-tcp-options="disableMihomoListenTcpOptions"
+                :disable-udp-options="disableMihomoListenUdpOptions"
                 v-if="inbound.type != inTypes.Tun && inbound.type != inTypes.Mieru && inbound.type != inTypes.TrustTunnel"
                 @listen-port-blur="handleListenPortBlur"
               />
@@ -76,10 +87,10 @@
                 :data="inbound"
                 :namespace="namespace"
               />
-              <TrustTunnel v-if="inbound.type == inTypes.TrustTunnel" direction="in" :data="inbound" />
+              <TrustTunnel v-if="inbound.type == inTypes.TrustTunnel" direction="in" :data="inbound" :namespace="namespace" />
               <Naive v-if="inbound.type == inTypes.Naive" :inbound="inbound" :tls-configs="tlsConfigs" />
               <ShadowTls v-if="inbound.type == inTypes.ShadowTLS" direction="in" :data="inbound" :namespace="namespace" />
-              <ShadowQuic v-if="inbound.type == inTypes.ShadowQUIC" direction="in" :data="inbound" />
+              <ShadowQuic v-if="inbound.type == inTypes.ShadowQUIC" direction="in" :data="inbound" :namespace="namespace" />
               <Tuic v-if="inbound.type == inTypes.TUIC" direction="in" :data="inbound" :namespace="namespace" />
               <Tun v-if="inbound.type == inTypes.Tun" :data="inbound" />
               <AnyTls v-if="inbound.type == inTypes.AnyTls" :data="inbound" direction="in" />
@@ -88,9 +99,10 @@
               <Sudoku v-if="inbound.type == inTypes.Sudoku" :data="inbound" direction="in" />
               <TProxy v-if="inbound.type == inTypes.TProxy" :inbound="inbound" />
               <Transport
-                v-if="Object.hasOwn(inbound,'transport') && inbound.type != inTypes.Mieru"
+                v-if="showInboundTransportEditor"
                 :data="inbound"
                 :namespace="namespace"
+                scope="inbound"
               />
               <v-card v-if="namespace === 'mihomo' && inbound.type === inTypes.VLESS" subtitle="VLESS Encryption" style="margin-top: 1rem;">
                 <v-row>
@@ -166,13 +178,18 @@
                   </v-row>
                 </template>
               </v-card>
-              <Users v-if="hasUser" :clients="clients" :data="initUsers" />
-              <InTls v-if="HasTls.includes(inbound.type)"  :inbound="inbound" :tlsConfigs="tlsConfigs" :tls_id="inbound.tls_id" />
-              <Multiplex v-if="Object.hasOwn(inbound,'multiplex')" direction="in" :data="inbound" />
+              <Users
+                v-if="hasUser"
+                :clients="clients"
+                :data="initUsers"
+                :single="singleInitialUserSelection"
+              />
+              <InTls v-if="hasTlsForCurrentInbound" :inbound="inbound" :tlsConfigs="tlsConfigs" :namespace="namespace" :tls_id="inbound.tls_id" />
+              <Multiplex v-if="showInboundMultiplexEditor" direction="in" :data="inbound" />
             </v-window-item>
             <v-window-item value="c">
               <OutJsonVue v-if="inbound.type != inTypes.Mieru && inbound.type != inTypes.Sudoku && inbound.type != inTypes.ShadowQUIC" :inData="inbound" :type="inbound.type" :namespace="namespace" @port-hop-range-blur="handlePortHopRangeBlur" />
-              <ShadowQuic v-else-if="inbound.type == inTypes.ShadowQUIC" direction="out_json" :data="inbound.out_json" />
+              <ShadowQuic v-else-if="inbound.type == inTypes.ShadowQUIC" direction="out_json" :data="inbound.out_json" :namespace="namespace" :initialize-client-defaults="title === 'add'" />
               <Mieru v-else-if="inbound.type == inTypes.Mieru" :data="inbound.out_json" direction="out_json" :namespace="namespace" />
               <Sudoku v-else :data="inbound.out_json" direction="out_json" />
               <Snell
@@ -181,7 +198,7 @@
                 :data="inbound.out_json"
               />
               <Multiplex v-if="namespace !== 'mihomo' && inbound.type == inTypes.ShadowTLS" direction="out" :data="stlsClientSsConfig" />
-              <Multiplex v-else-if="namespace !== 'mihomo' && Object.hasOwn(inbound,'multiplex')" direction="out" :data="inbound.out_json" />
+              <Multiplex v-else-if="namespace !== 'mihomo' && showClientMultiplexEditor" direction="out" :data="inbound.out_json" />
               <MihomoClientCommonFields
                 v-if="namespace === 'mihomo' && HasInData.includes(inbound.type)"
                 :data="clientCommonFieldTarget"
@@ -222,10 +239,10 @@
                 <v-card-subtitle>{{ $t('in.multiDomain') }}
                   <v-chip color="primary" density="compact" variant="elevated" @click="add_addr"><v-icon icon="mdi-plus" /></v-chip>
                 </v-card-subtitle>
-                <template v-for="addr,index in inbound.addrs">
+                <template v-for="(addr, index) in inbound.addrs" :key="getAddressRenderKey(addr)">
                   {{ $t('in.addr') }} #{{ (index+1) }} <v-icon icon="mdi-delete" color="error" @click="inbound.addrs?.splice(index,1)" />
                   <v-divider></v-divider>
-                  <AddrVue :addr="addr" :hasTls="HasTls.includes(inbound.type)" />
+                  <AddrVue :addr="addr" :hasTls="hasTlsForAddress" :namespace="namespace" :protocol="inbound.type" />
                 </template>
               </v-card>
             </v-window-item>
@@ -237,6 +254,7 @@
         <v-btn
           color="primary"
           variant="outlined"
+          :disabled="loading"
           @click="closeModal"
         >
           {{ $t('actions.close') }}
@@ -245,6 +263,7 @@
           color="primary"
           variant="tonal"
           :loading="loading"
+          :disabled="loading || loadError"
           @click="saveChanges"
         >
           {{ $t('actions.save') }}
@@ -257,6 +276,7 @@
 <script lang="ts">
 import { InTypes, createInbound, Addr, ShadowTLS } from '@/types/inbounds'
 import RandomUtil from '@/plugins/randomUtil'
+import { normalizeShadowQuicJlsUpstreamAddr, shadowQuicJlsSniFromAddr } from '@/plugins/shadowQuic'
 
 import Listen from '@/components/Listen.vue'
 import Direct from '@/components/protocols/Direct.vue'
@@ -284,10 +304,19 @@ import OutJsonVue from '@/components/OutJson.vue'
 import MihomoClientCommonFields from '@/components/MihomoClientCommonFields.vue'
 import { push } from 'notivue'
 import { PORT_RANGE_TEMPLATE, checkPortOccupancy } from '@/plugins/portCheck'
+import { normalizeManagedPortHopRangeInput } from '@/plugins/portRange'
+import { parseHopIntervalSeconds } from '@/plugins/hopInterval'
 import { getNamespaceStore } from '@/store/uiNamespace'
 import HttpUtils from '@/plugins/httputil'
+
+let nextAddressRenderKey = 0
+const addressRenderKeys = new WeakMap<object, string>()
 export default {
   props: {
+    modelValue: {
+      type: Boolean,
+      default: undefined,
+    },
     visible: Boolean,
     id: Number,
     inTags: Array,
@@ -297,7 +326,7 @@ export default {
       default: 'default',
     },
   },
-  emits: ['close'],
+  emits: ['close', 'update:modelValue'],
   data() {
     return {
       inbound: createInbound("direct",{ id:0, "tag": "" }),
@@ -305,8 +334,8 @@ export default {
       loading: false,
       side: "s",
       inTypes: InTypes,
-      mihomoUnsupportedTypes: ['direct', 'naive', 'hysteria'],
-      defaultUnsupportedTypes: [InTypes.Snell, InTypes.Mieru, InTypes.Sudoku, InTypes.TrustTunnel, InTypes.ShadowQUIC],
+		mihomoUnsupportedTypes: ['direct', 'naive', 'hysteria', InTypes.ShadowTLS, InTypes.SSH],
+      defaultUnsupportedTypes: [InTypes.Snell, InTypes.Mieru, InTypes.Sudoku, InTypes.TrustTunnel, InTypes.ShadowQUIC, InTypes.SSH],
       stlsFingerprints: [
         { title: "Chrome", value: "chrome" },
         { title: "Firefox", value: "firefox" },
@@ -359,6 +388,12 @@ export default {
       OnlyTLS: [InTypes.Hysteria, InTypes.Hysteria2, InTypes.TrustTunnel, InTypes.TUIC, InTypes.Naive, InTypes.AnyTls ],
       singlePortCheckSeq: 0,
       portRangeCheckSeq: 0,
+      inboundLoadSeq: 0,
+      saveRequestSeq: 0,
+      singlePortCheckController: null as AbortController | null,
+      portRangeCheckController: null as AbortController | null,
+      inboundLoadController: null as AbortController | null,
+      loadError: false,
       portCheckUnsupportedHinted: false,
       vlessEncryptionPrefix: 'mlkem768x25519plus',
       vlessEncryptionDefaultMode: 'random',
@@ -385,28 +420,39 @@ export default {
         { title: '0rtt', value: '0rtt' },
       ],
       vlessEncryptionRefreshLoading: false,
+      vlessEncryptionRefreshQueued: false,
     }
   },
   methods: {
-    initShadowTlsClientDefaults() {
+    getAddressRenderKey(addr: unknown): string {
+      if (!addr || typeof addr !== 'object') {
+        return `inbound-address-${++nextAddressRenderKey}`
+      }
+      const existing = addressRenderKeys.get(addr)
+      if (existing) return existing
+      const key = `inbound-address-${++nextAddressRenderKey}`
+      addressRenderKeys.set(addr, key)
+      return key
+    },
+    initShadowTlsClientDefaults(forceDefaults: boolean = false) {
       if (this.inbound.type != this.inTypes.ShadowTLS) return
       if (!this.inbound.out_json) this.inbound.out_json = {}
-      if (!this.inbound.out_json.tls) this.inbound.out_json.tls = { enabled: true }
-      if (!this.inbound.out_json.tls.utls) {
+      if (forceDefaults && !this.inbound.out_json.tls) this.inbound.out_json.tls = { enabled: true }
+      if (forceDefaults && this.inbound.out_json.tls && !this.inbound.out_json.tls.utls) {
         this.inbound.out_json.tls.utls = { enabled: true, fingerprint: 'safari' }
       }
     },
-    initAnyTlsClientDefaults() {
+    initAnyTlsClientDefaults(forceDefaults: boolean = false) {
       if (this.inbound.type != this.inTypes.AnyTls) return
       if (!this.inbound.out_json) this.inbound.out_json = {}
-      if (!this.inbound.out_json.idle_session_check_interval) {
+      if (forceDefaults && this.inbound.out_json.idle_session_check_interval === undefined) {
         this.inbound.out_json.idle_session_check_interval = "30s"
       }
-      if (!this.inbound.out_json.idle_session_timeout) {
+      if (forceDefaults && this.inbound.out_json.idle_session_timeout === undefined) {
         this.inbound.out_json.idle_session_timeout = "30s"
       }
     },
-    initTrustTunnelClientDefaults() {
+    initTrustTunnelClientDefaults(forceDefaults: boolean = false) {
       if (this.inbound.type != this.inTypes.TrustTunnel) return
       if (!this.inbound.out_json) this.inbound.out_json = {}
       const trustTunnelNetwork = Array.isArray((this.inbound as any).network) ? (this.inbound as any).network : []
@@ -417,24 +463,34 @@ export default {
       if (this.inbound.out_json.health_check === undefined) {
         this.inbound.out_json.health_check = false
       }
-      if (!this.inbound.out_json.congestion_controller) {
+      // The clearable selector uses an absent field to mean "Default". Only
+      // seed BBR for a freshly created/type-switched template; reopening an
+      // existing inbound must not silently restore a value the user removed.
+      if (forceDefaults && this.inbound.out_json.congestion_controller === undefined) {
         this.inbound.out_json.congestion_controller = "bbr"
       }
     },
-    initNaiveClientDefaults() {
+    initNaiveClientDefaults(forceDefaults: boolean = false) {
       if (this.inbound.type != this.inTypes.Naive) return
       if (!this.inbound.out_json) this.inbound.out_json = {}
-      if (this.inbound.out_json.quic === undefined) {
+      if (forceDefaults && this.inbound.out_json.quic === undefined) {
         this.inbound.out_json.quic = false
       }
-      if (typeof this.inbound.out_json.insecure_concurrency !== 'number') {
+      if (forceDefaults && typeof this.inbound.out_json.insecure_concurrency !== 'number') {
         this.inbound.out_json.insecure_concurrency = 0
       }
-      if (this.inbound.out_json.quic_congestion_control === undefined) {
+      if (forceDefaults && this.inbound.out_json.quic_congestion_control === undefined) {
         this.inbound.out_json.quic_congestion_control = 'bbr2'
       }
-      if (this.inbound.out_json.udp_over_tcp === undefined) {
+      if (forceDefaults && this.inbound.out_json.udp_over_tcp === undefined) {
         this.inbound.out_json.udp_over_tcp = false
+      }
+    },
+    initMihomoShadowsocksClientDefaults() {
+      if (this.namespace !== 'mihomo' || this.inbound.type !== this.inTypes.Shadowsocks) return
+      if (!this.inbound.out_json) this.inbound.out_json = {}
+      if (this.inbound.out_json.udp_over_tcp === undefined) {
+        this.inbound.out_json.udp_over_tcp = { enabled: true, version: 2 }
       }
     },
     initHysteriaClientBandwidthDefaults(forceDefaults: boolean = false) {
@@ -855,73 +911,93 @@ export default {
       return ''
     },
     async refreshVLESSEncryptionKeys(showSuccess: boolean = true) {
-      if (this.vlessEncryptionRefreshLoading) return
+      if (this.vlessEncryptionRefreshLoading) {
+        this.vlessEncryptionRefreshQueued = true
+        return
+      }
       this.vlessEncryptionRefreshLoading = true
 
       const inbound = this.inbound as any
       const method = this.normalizeVLESSMihomoEncryptionAuthMethod(inbound.vless_encryption_auth_method)
       const command = method === 'mlkem768' ? 'vless-mlkem768' : 'vless-x25519'
-      const msg = await HttpUtils.get('api/keypairs', { k: command })
-      this.vlessEncryptionRefreshLoading = false
+      try {
+        const msg = await HttpUtils.get('api/keypairs', { k: command })
+        const currentInbound = this.inbound as any
+        const currentMethod = this.normalizeVLESSMihomoEncryptionAuthMethod(currentInbound.vless_encryption_auth_method)
+        if (this.inbound !== inbound || !this.vlessEncryptionEnabled || currentMethod !== method) return
 
-      const lines = Array.isArray(msg.obj) ? msg.obj : []
-      if (method === 'mlkem768') {
-        const seed = this.parseKeypairValue(lines, 'Seed')
-        const client = this.parseKeypairValue(lines, 'Client')
-        if (!seed || !client) {
-          push.warning({
-            title: 'VLESS Encryption',
-            duration: 7000,
-            message: 'Failed to generate ML-KEM-768 key pair.',
-          })
-          return
+        const lines = Array.isArray(msg.obj) ? msg.obj : []
+        if (method === 'mlkem768') {
+          const seed = this.parseKeypairValue(lines, 'Seed')
+          const client = this.parseKeypairValue(lines, 'Client')
+          if (!seed || !client) {
+            push.warning({
+              title: 'VLESS Encryption',
+              duration: 7000,
+              message: 'Failed to generate ML-KEM-768 key pair.',
+            })
+            return
+          }
+          inbound.vless_encryption_mlkem_seed = seed
+          inbound.vless_encryption_mlkem_client = client
+          inbound.vless_encryption_x25519_private_key = ''
+          inbound.vless_encryption_x25519_password = ''
+        } else {
+          const privateKey = this.parseKeypairValue(lines, 'PrivateKey')
+          const password = this.parseKeypairValue(lines, 'Password')
+          if (!privateKey || !password) {
+            push.warning({
+              title: 'VLESS Encryption',
+              duration: 7000,
+              message: 'Failed to generate X25519 key pair.',
+            })
+            return
+          }
+          inbound.vless_encryption_x25519_private_key = privateKey
+          inbound.vless_encryption_x25519_password = password
+          inbound.vless_encryption_mlkem_seed = ''
+          inbound.vless_encryption_mlkem_client = ''
         }
-        inbound.vless_encryption_mlkem_seed = seed
-        inbound.vless_encryption_mlkem_client = client
-        inbound.vless_encryption_x25519_private_key = ''
-        inbound.vless_encryption_x25519_password = ''
-      } else {
-        const privateKey = this.parseKeypairValue(lines, 'PrivateKey')
-        const password = this.parseKeypairValue(lines, 'Password')
-        if (!privateKey || !password) {
-          push.warning({
-            title: 'VLESS Encryption',
-            duration: 7000,
-            message: 'Failed to generate X25519 key pair.',
-          })
-          return
-        }
-        inbound.vless_encryption_x25519_private_key = privateKey
-        inbound.vless_encryption_x25519_password = password
-        inbound.vless_encryption_mlkem_seed = ''
-        inbound.vless_encryption_mlkem_client = ''
-      }
 
-      if (showSuccess) {
-        const methodText = method === 'mlkem768' ? 'ML-KEM-768' : 'X25519'
-        push.success({
-          title: 'VLESS Encryption',
-          duration: 3000,
-          message: `Generated a new ${methodText} key pair.`,
-        })
+        if (showSuccess) {
+          const methodText = method === 'mlkem768' ? 'ML-KEM-768' : 'X25519'
+          push.success({
+            title: 'VLESS Encryption',
+            duration: 3000,
+            message: `Generated a new ${methodText} key pair.`,
+          })
+        }
+      } finally {
+        this.vlessEncryptionRefreshLoading = false
+        if (this.vlessEncryptionRefreshQueued) {
+          this.vlessEncryptionRefreshQueued = false
+          if (this.namespace === 'mihomo' && this.inbound.type === this.inTypes.VLESS && this.vlessEncryptionEnabled) {
+            void this.refreshVLESSEncryptionKeys(false)
+          }
+        }
       }
     },
     initMihomoFastOpenDefaults() {
       if (!this.inbound.out_json) this.inbound.out_json = {}
 
       if (this.inbound.type === this.inTypes.Hysteria2) {
+        const legacyFastOpen = this.inbound.out_json.mihomo_fast_open
+          ?? this.inbound.out_json.fast_open
+          ?? this.inbound.out_json['fast-open']
         if (this.inbound.out_json.mihomo_fast_open === undefined) {
-          this.inbound.out_json.mihomo_fast_open = false
+          this.inbound.out_json.mihomo_fast_open = typeof legacyFastOpen === 'boolean' ? legacyFastOpen : false
         }
+        delete this.inbound.out_json.fast_open
+        delete this.inbound.out_json['fast-open']
         return
       }
 
       if (this.namespace !== 'mihomo') return
 
       if (this.inbound.type === this.inTypes.TUIC) {
-        if (this.inbound.out_json.mihomo_fast_open === undefined) {
-          this.inbound.out_json.mihomo_fast_open = false
-        }
+        delete this.inbound.out_json.mihomo_fast_open
+        delete this.inbound.out_json.fast_open
+        delete this.inbound.out_json['fast-open']
         return
       }
 
@@ -946,14 +1022,59 @@ export default {
         }
       }
       this.initMihomoFastOpenDefaults()
-      this.initShadowTlsClientDefaults()
+      this.initShadowTlsClientDefaults(forceHyBandwidthDefaults)
       this.sanitizeMihomoShadowTLSUnsupportedFields()
       this.sanitizeMihomoShadowQUICUnsupportedFields()
-      this.initAnyTlsClientDefaults()
-      this.initTrustTunnelClientDefaults()
-      this.initNaiveClientDefaults()
+      this.initAnyTlsClientDefaults(forceHyBandwidthDefaults)
+      this.initTrustTunnelClientDefaults(forceHyBandwidthDefaults)
+      this.initNaiveClientDefaults(forceHyBandwidthDefaults)
+      this.initMihomoShadowsocksClientDefaults()
       this.initHysteriaClientBandwidthDefaults(forceHyBandwidthDefaults)
       this.initVLESSMihomoEncryptionDefaults()
+      this.migrateMihomoClientCommonFields(forceHyBandwidthDefaults)
+    },
+    parseValidPort(value: unknown): number | undefined {
+      if (value === '' || value === null || value === undefined) return undefined
+      if (typeof value === 'string' && !/^\d+$/.test(value.trim())) return undefined
+      const port = Number(value)
+      return Number.isSafeInteger(port) && port >= 1 && port <= 65535 ? port : undefined
+    },
+    validateAddresses(): boolean {
+      if (!this.HasInData.includes(this.inbound.type)) return true
+      const rawAddresses = (this.inbound as any).addrs
+      if (rawAddresses === undefined || rawAddresses === null) {
+        ;(this.inbound as any).addrs = []
+        return true
+      }
+      if (!Array.isArray(rawAddresses)) {
+        push.warning({
+          title: this.$t('objects.inbound'),
+          duration: 5000,
+          message: '多域名地址数据无效。',
+        })
+        return false
+      }
+
+      for (let index = 0; index < rawAddresses.length; index++) {
+        const address = rawAddresses[index]
+        const server = address && typeof address === 'object' && !Array.isArray(address) && typeof address.server === 'string'
+          ? address.server.trim()
+          : ''
+        const port = address && typeof address === 'object' && !Array.isArray(address)
+          ? this.parseValidPort(address.server_port)
+          : undefined
+        if (!server || port === undefined) {
+          push.warning({
+            title: this.$t('objects.inbound'),
+            duration: 5000,
+            message: `地址 #${index + 1} 的服务器地址或端口无效。`,
+          })
+          return false
+        }
+        address.server = server
+        address.server_port = port
+      }
+      return true
     },
     sanitizeMihomoShadowTLSUnsupportedFields() {
       if (this.namespace !== 'mihomo' || this.inbound.type !== this.inTypes.ShadowTLS) return
@@ -986,8 +1107,8 @@ export default {
             server = dest.slice(1, endBracket)
             const suffix = dest.slice(endBracket + 1)
             if (suffix.startsWith(':')) {
-              const parsed = Number.parseInt(suffix.slice(1), 10)
-              if (Number.isInteger(parsed) && parsed > 0) {
+              const parsed = this.parseValidPort(suffix.slice(1))
+              if (parsed !== undefined) {
                 port = parsed
               }
             }
@@ -997,8 +1118,8 @@ export default {
           const lastColon = dest.lastIndexOf(':')
           if (firstColon > 0 && firstColon === lastColon) {
             server = dest.slice(0, lastColon)
-            const parsed = Number.parseInt(dest.slice(lastColon + 1), 10)
-            if (Number.isInteger(parsed) && parsed > 0) {
+            const parsed = this.parseValidPort(dest.slice(lastColon + 1))
+            if (parsed !== undefined) {
               port = parsed
             }
           }
@@ -1014,8 +1135,7 @@ export default {
       if (typeof handshake.server !== 'string') {
         handshake.server = ''
       }
-      const rawPort = Number.parseInt(String(handshake.server_port ?? ''), 10)
-      handshake.server_port = Number.isInteger(rawPort) && rawPort > 0 ? rawPort : 443
+      handshake.server_port = this.parseValidPort(handshake.server_port) ?? 443
     },
     showPortCheckUnsupportedHint() {
       if (this.portCheckUnsupportedHinted) return
@@ -1025,6 +1145,28 @@ export default {
         duration: 5000,
         message: "Port occupancy check is supported only on Linux"
       })
+    },
+    cancelSinglePortCheck() {
+      this.singlePortCheckSeq++
+      this.singlePortCheckController?.abort()
+      this.singlePortCheckController = null
+    },
+    cancelPortRangeCheck() {
+      this.portRangeCheckSeq++
+      this.portRangeCheckController?.abort()
+      this.portRangeCheckController = null
+    },
+    cancelPortOccupancyChecks() {
+      this.cancelSinglePortCheck()
+      this.cancelPortRangeCheck()
+    },
+    cancelInboundLoad() {
+      this.inboundLoadSeq++
+      this.inboundLoadController?.abort()
+      this.inboundLoadController = null
+    },
+    invalidatePendingSaveResult() {
+      this.saveRequestSeq++
     },
     buildSinglePortStatusText(port: number, tcpUsed: boolean, udpUsed: boolean): string {
       if (tcpUsed && udpUsed) {
@@ -1050,9 +1192,10 @@ export default {
       const normalized = value.replace(/\s+/g, '').replace(/-/g, ':')
       const parts = normalized.split(':')
       if (parts.length !== 2) return undefined
-      const start = Number.parseInt(parts[0], 10)
-      const end = Number.parseInt(parts[1], 10)
-      if (!Number.isInteger(start) || !Number.isInteger(end)) return undefined
+      if (!/^\d+$/.test(parts[0]) || !/^\d+$/.test(parts[1])) return undefined
+      const start = Number(parts[0])
+      const end = Number(parts[1])
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) return undefined
       if (start < 1 || end > 65535 || start >= end) return undefined
       return `${start}-${end}`
     },
@@ -1085,36 +1228,68 @@ export default {
       ;(<any>this.inbound).port_range = normalized
       return true
     },
+    validateSingboxPortHop(): boolean {
+      if (this.namespace === 'mihomo') return true
+      if (this.inbound.type !== this.inTypes.Hysteria && this.inbound.type !== this.inTypes.Hysteria2) return true
+
+      const inbound = this.inbound as any
+      const range = typeof inbound.port_hop_range === 'string' ? inbound.port_hop_range.trim() : ''
+      const normalized = normalizeManagedPortHopRangeInput(range)
+      if (normalized.error) {
+        push.warning({ title: 'Port Check', duration: 7000, message: normalized.error })
+        return false
+      }
+      inbound.port_hop_range = normalized.normalized || undefined
+
+      for (const key of ['port_hop_interval', 'port_hop_interval_max']) {
+        const raw = inbound[key]
+        if (raw === undefined || raw === null || String(raw).trim() === '') continue
+        if (parseHopIntervalSeconds(raw) < 10) {
+          push.warning({ title: 'Port Check', duration: 7000, message: 'Port hop interval must be an integer of at least 10 seconds.' })
+          return false
+        }
+      }
+      return true
+    },
     async handleListenPortBlur(portValue: number | string) {
+      this.cancelSinglePortCheck()
       const parsed = Number(portValue)
       if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) return
 
+      const controller = new AbortController()
+      this.singlePortCheckController = controller
       const seq = ++this.singlePortCheckSeq
-      const resp = await checkPortOccupancy({
-        single_ports: [parsed]
-      })
-      if (seq !== this.singlePortCheckSeq || !resp) return
-      if (!resp.supported) {
-        this.showPortCheckUnsupportedHint()
-        return
-      }
+      try {
+        const resp = await checkPortOccupancy({
+          single_ports: [parsed]
+        }, { signal: controller.signal })
+        if (controller.signal.aborted || this.singlePortCheckController !== controller || seq !== this.singlePortCheckSeq || !resp) return
+        if (!resp.supported) {
+          this.showPortCheckUnsupportedHint()
+          return
+        }
 
-      const status = resp.single.find((item) => item.port === parsed)
-      if (!status) return
+        const status = resp.single.find((item) => item.port === parsed)
+        if (!status) return
 
-      const text = this.buildSinglePortStatusText(parsed, status.tcp, status.udp)
-      if (status.tcp || status.udp) {
-        push.warning({
-          title: "Port Check",
-          duration: 5000,
-          message: text
-        })
-      } else {
-        push.success({
-          title: "Port Check",
-          duration: 5000,
-          message: text
-        })
+        const text = this.buildSinglePortStatusText(parsed, status.tcp, status.udp)
+        if (status.tcp || status.udp) {
+          push.warning({
+            title: "Port Check",
+            duration: 5000,
+            message: text
+          })
+        } else {
+          push.success({
+            title: "Port Check",
+            duration: 5000,
+            message: text
+          })
+        }
+      } finally {
+        if (this.singlePortCheckController === controller) {
+          this.singlePortCheckController = null
+        }
       }
     },
     sanitizeMihomoShadowQUICUnsupportedFields() {
@@ -1134,6 +1309,12 @@ export default {
       delete inbound['jls-upstream']
       if (inbound.jls_upstream && typeof inbound.jls_upstream === 'object' && !Array.isArray(inbound.jls_upstream)) {
         const upstream = inbound.jls_upstream as Record<string, any>
+        if (typeof upstream.addr === 'string' && upstream.addr.trim() !== '') {
+          upstream.addr = normalizeShadowQuicJlsUpstreamAddr(upstream.addr)
+          if (typeof upstream.sni !== 'string' || upstream.sni.trim() === '') {
+            upstream.sni = shadowQuicJlsSniFromAddr(upstream.addr)
+          }
+        }
         for (const key of ['addr', 'sni', 'proxy']) {
           if (typeof upstream[key] !== 'string') continue
           const value = upstream[key].trim()
@@ -1148,8 +1329,15 @@ export default {
     },
     validateMihomoShadowQUICJLSUpstream(): boolean {
       if (this.namespace !== 'mihomo' || this.inbound.type !== this.inTypes.ShadowQUIC) return true
-      const addr = typeof (this.inbound as any).jls_upstream?.addr === 'string'
-        ? (this.inbound as any).jls_upstream.addr.trim()
+      const upstream = (this.inbound as any).jls_upstream
+      if (upstream && typeof upstream === 'object' && typeof upstream.addr === 'string' && upstream.addr.trim() !== '') {
+        upstream.addr = normalizeShadowQuicJlsUpstreamAddr(upstream.addr)
+        if (typeof upstream.sni !== 'string' || upstream.sni.trim() === '') {
+          upstream.sni = shadowQuicJlsSniFromAddr(upstream.addr)
+        }
+      }
+      const addr = typeof upstream?.addr === 'string'
+        ? upstream.addr.trim()
         : ''
       let host = ''
       let portText = ''
@@ -1158,6 +1346,12 @@ export default {
       if (ipv6Match) {
         host = ipv6Match[1]
         portText = ipv6Match[2]
+		try {
+			const parsed = new URL(`http://${addr}`)
+			if (parsed.hostname === '') host = ''
+		} catch {
+			host = ''
+		}
       } else if (hostMatch) {
         host = hostMatch[1]
         portText = hostMatch[2]
@@ -1174,61 +1368,128 @@ export default {
       return true
     },
     async handlePortHopRangeBlur(rangeValue: string) {
-      if (this.inbound.type !== this.inTypes.Hysteria && this.inbound.type !== this.inTypes.Hysteria2) return
-      const range = (rangeValue ?? "").trim()
-      if (range === "") return
+	  this.cancelPortRangeCheck()
+	  if (this.inbound.type !== this.inTypes.Hysteria && this.inbound.type !== this.inTypes.Hysteria2) return
+	  if (this.namespace === 'mihomo' && this.inbound.type !== this.inTypes.Hysteria2) return
+	  const range = (rangeValue ?? "").trim()
+	  if (range === "") return
+	  const normalized = normalizeManagedPortHopRangeInput(range)
+	  if (normalized.error) {
+		push.warning({ title: 'Port Check', duration: 7000, message: normalized.error })
+		return
+	  }
+	  const normalizedRange = normalized.normalized
+	  ;(this.inbound as any).port_hop_range = normalizedRange || undefined
 
-      const seq = ++this.portRangeCheckSeq
-      const resp = await checkPortOccupancy({
-        udp_ranges: [{
-          id: `${this.inbound.id || 0}`,
-          tag: this.inbound.tag ?? "",
-          range: range
-        }]
-      })
-      if (seq !== this.portRangeCheckSeq || !resp) return
-      if (!resp.supported) {
-        this.showPortCheckUnsupportedHint()
-        return
-      }
+	  const controller = new AbortController()
+	  this.portRangeCheckController = controller
+	  const seq = ++this.portRangeCheckSeq
+	  try {
+		const resp = await checkPortOccupancy({
+		  udp_ranges: [{
+			id: `${this.inbound.id || 0}`,
+			tag: this.inbound.tag ?? "",
+			range: normalizedRange
+		  }]
+		}, { signal: controller.signal })
+		if (controller.signal.aborted || this.portRangeCheckController !== controller || seq !== this.portRangeCheckSeq || !resp) return
+		if (!resp.supported) {
+		  this.showPortCheckUnsupportedHint()
+		  return
+		}
 
-      const status = resp.udp_ranges?.[0]
-      if (!status) return
+		const status = resp.udp_ranges?.[0]
+		if (!status) return
 
-      if (!status.valid) {
-        push.warning({
-          title: "Port Check",
-          duration: 7000,
-          message: `Invalid range format. Example: ${PORT_RANGE_TEMPLATE}`
-        })
-        return
-      }
+		if (!status.valid) {
+		  push.warning({
+			title: "Port Check",
+			duration: 7000,
+			message: `Invalid range format. Example: ${PORT_RANGE_TEMPLATE}`
+		  })
+		  return
+		}
 
-      if (status.occupied_count > 0) {
-        push.warning({
-          title: "Port Check",
-          duration: 7000,
-          message: `UDP range occupied: ${this.buildRangePortText(status.occupied_ports)}`
-        })
-      } else {
-        push.success({
-          title: "Port Check",
-          duration: 5000,
-          message: `UDP range is free: ${status.normalized || status.input}`
-        })
-      }
+		if (status.occupied_count > 0) {
+		  push.warning({
+			title: "Port Check",
+			duration: 7000,
+			message: `UDP range occupied: ${this.buildRangePortText(status.occupied_ports)}`
+		  })
+		} else {
+		  push.success({
+			title: "Port Check",
+			duration: 5000,
+			message: `UDP range is free: ${status.normalized || status.input}`
+		  })
+		}
+	  } finally {
+		if (this.portRangeCheckController === controller) {
+		  this.portRangeCheckController = null
+		}
+	  }
     },
     async loadData(id: number) {
+      this.cancelPortOccupancyChecks()
+      this.cancelInboundLoad()
+      const controller = new AbortController()
+      this.inboundLoadController = controller
+      const seq = ++this.inboundLoadSeq
       this.loading = true
+      this.loadError = false
       try {
-        const inboundArray = await getNamespaceStore(this.namespace).loadInbounds([id])
+        const inboundArray = await getNamespaceStore(this.namespace).loadInbounds([id], { signal: controller.signal, silentErrorToast: true })
+        if (controller.signal.aborted || this.inboundLoadController !== controller || seq !== this.inboundLoadSeq || !this.$props.visible || (this.$props.id ?? 0) !== id) return
+        if (inboundArray === null) {
+          this.loadError = true
+          push.warning({
+            title: this.namespace === 'mihomo' ? 'Mihomo' : this.$t('objects.inbound'),
+            duration: 7000,
+            message: '入站详情加载失败，请稍后重试。',
+          })
+          return
+        }
+        if (!inboundArray[0]) {
+          push.warning({
+            title: this.namespace === 'mihomo' ? 'Mihomo' : this.$t('objects.inbound'),
+            duration: 7000,
+            message: '入站不存在或已被删除，请刷新列表后重试。',
+          })
+          this.closeModal()
+          return
+        }
         this.inbound = inboundArray[0]
-        this.initProtocolClientDefaults(false)
+        this.loadError = false
+         if (this.namespace === 'mihomo' && this.inbound?.type === this.inTypes.Hysteria) {
+          push.warning({
+            title: 'Mihomo',
+            duration: 7000,
+            message: 'Mihomo does not support Hysteria v1. Please delete this legacy inbound.',
+          })
+           this.closeModal()
+           return
+         }
+         if (this.namespace === 'mihomo' && this.inbound?.type === this.inTypes.ShadowTLS) {
+           push.warning({
+             title: 'Mihomo',
+             duration: 7000,
+             message: 'Mihomo 独立 ShadowTLS 入站已移除，请在 Shadowsocks 入站中选择 TLS 模式。',
+           })
+           this.closeModal()
+           return
+         }
+         this.initProtocolClientDefaults(false)
       } finally {
-        this.loading = false
+        if (this.inboundLoadController === controller) {
+          this.inboundLoadController = null
+          this.loading = false
+        }
       }
     },
     updateData(id: number) {
+      this.cancelPortOccupancyChecks()
+      this.cancelInboundLoad()
+      this.loadError = false
       if (id > 0) {
         this.loadData(id)
         this.title = "edit"
@@ -1307,14 +1568,34 @@ export default {
 
       return common
     },
+    migrateMihomoClientCommonFields(forceDefaults: boolean = false) {
+      if (this.namespace !== 'mihomo' || !this.HasInData.includes(this.inbound.type)) return
+      if (!this.inbound.out_json || typeof this.inbound.out_json !== 'object' || Array.isArray(this.inbound.out_json)) {
+        this.inbound.out_json = {}
+      }
+      const target = this.inbound.type === this.inTypes.ShadowTLS
+        ? this.stlsClientSsConfig
+        : this.inbound.out_json
+      const common = this.ensureMihomoCommonStore(target, this.inbound.type)
+      if (forceDefaults) {
+        common.udp = true
+      }
+    },
     changeType() {
+      this.cancelPortOccupancyChecks()
       if (!this.inbound.listen_port) this.inbound.listen_port = RandomUtil.randomIntRange(10000, 60000)
       // Tag change only in add inbound
       const currentId = this.$props.id ?? 0
-      const tag = currentId > 0 ? this.inbound.tag : this.inbound.type + "-" + this.inbound.listen_port
+      const inboundId = Number(this.inbound.id ?? currentId)
+      const preservedId = Number.isSafeInteger(inboundId) && inboundId > 0 ? inboundId : 0
+      const editingExisting = currentId > 0 || preservedId > 0
+      const tag = editingExisting ? this.inbound.tag : this.inbound.type + "-" + this.inbound.listen_port
       // Use previous data
-      const prevConfig = { id: this.inbound.id, tag: tag, listen: this.inbound.listen?? "::", listen_port: this.inbound.listen_port }
-      this.inbound = createInbound(this.inbound.type, this.inbound.type != this.inTypes.Tun ? prevConfig : { tag: tag })
+      const prevConfig = { id: preservedId, tag: tag, listen: this.inbound.listen?? "::", listen_port: this.inbound.listen_port }
+      const typeConfig = this.inbound.type === this.inTypes.Tun
+        ? { id: preservedId, tag }
+        : prevConfig
+      this.inbound = createInbound(this.inbound.type, typeConfig)
       if (this.HasInData.includes(this.inbound.type)){
         this.inbound.addrs = []
         this.inbound.out_json = {}
@@ -1329,52 +1610,117 @@ export default {
       this.inbound.addrs?.push(<Addr>{ server: location.hostname, server_port: this.inbound.listen_port })
     },
     closeModal() {
-      this.updateData(0) // reset
-      this.$emit('close')
+      this.dialogVisible = false
     },
     async saveChanges() {
-      if (!this.$props.visible) return
+      if (!this.$props.visible || this.loading) return
+      if (this.namespace === 'mihomo' && this.inbound.type === this.inTypes.Hysteria) {
+        push.warning({
+          title: 'Mihomo',
+          duration: 7000,
+          message: 'Mihomo does not support Hysteria v1.',
+        })
+        return
+      }
       // check duplicate tag
       const store = getNamespaceStore(this.namespace)
       const isDuplicatedTag = store.checkTag('inbound', this.inbound.id, this.inbound.tag)
       if (isDuplicatedTag) return
+      if (!this.validate) {
+        push.warning({
+          title: this.namespace === 'mihomo' ? 'Mihomo' : this.$t('objects.inbound'),
+          duration: 5000,
+          message: this.namespace === 'mihomo'
+            ? '请填写非空标签、合法监听端口，并为要求 TLS 的协议选择 TLS 配置。'
+            : '入站标签和监听端口无效。',
+        })
+        return
+      }
+      if (!this.validateSingboxPortHop()) return
+      if (!this.validateAddresses()) return
       if (!this.validateMihomoMieruClientPortRange()) return
       this.sanitizeMihomoShadowTLSUnsupportedFields()
       this.sanitizeMihomoShadowQUICUnsupportedFields()
+      this.migrateMihomoClientCommonFields()
       if (!this.validateMihomoShadowQUICJLSUpstream()) return
       this.sanitizeVLESSMihomoEncryptionFields()
       if (!this.validateVLESSMihomoEncryption()) return
 
-      // save data
+      // Keep an older request from closing a newly opened dialog after a
+      // programmatic route/modal change. Writes are intentionally not aborted.
+      const saveRequestSeq = ++this.saveRequestSeq
       this.loading = true
       try {
-        let clientIds = []
+        let clientIds: number[] = []
         if (this.hasUser) {
           switch (this.initUsers.model) {
             case 'all':
               clientIds = this.clients.map((c:any) => c.id)
               break
             case 'group':
-              clientIds = this.clients.filter((c:any) => this.initUsers.values.includes(c.group)).map((c:any) => c.id)
+              clientIds = this.clients
+                .filter((c:any) => Array.isArray(this.initUsers.values) && this.initUsers.values.includes(c.group))
+                .map((c:any) => c.id)
               break
             case 'client':
-              clientIds = this.initUsers.values
+              clientIds = Array.isArray(this.initUsers.values) ? this.initUsers.values : []
           }
+        }
+        clientIds = Array.from(new Set(clientIds
+          .map((id: any) => Number(id))
+          .filter((id: number) => Number.isSafeInteger(id) && id > 0)))
+        if (this.singleInitialUserSelection && clientIds.length > 1) {
+          push.warning({
+            title: 'Snell',
+            duration: 7000,
+            message: 'Snell 入站只能初始化绑定一个用户。',
+          })
+          return
         }
         const currentId = this.$props.id ?? 0
         const success = await store.save('inbounds', currentId == 0 ? 'new' : 'edit', this.inbound, clientIds)
-        if (success) this.closeModal()
+        if (success && saveRequestSeq === this.saveRequestSeq && this.$props.visible && (this.$props.id ?? 0) === currentId) {
+          this.closeModal()
+        }
       } finally {
-        this.loading = false
+        if (saveRequestSeq === this.saveRequestSeq) {
+          this.loading = false
+        }
       }
     },
   },
   computed: {
+    dialogVisible: {
+      get(): boolean {
+        return this.$props.modelValue ?? this.$props.visible ?? false
+      },
+      set(value: boolean) {
+        this.$emit('update:modelValue', value)
+      },
+    },
+    showInboundTransportEditor(): boolean {
+      return [this.inTypes.VMess, this.inTypes.Trojan, this.inTypes.VLESS].includes(this.inbound.type) ||
+        Object.hasOwn(this.inbound, 'transport')
+    },
+    showInboundMultiplexEditor(): boolean {
+      return [this.inTypes.Shadowsocks, this.inTypes.VMess, this.inTypes.Trojan, this.inTypes.VLESS].includes(this.inbound.type) ||
+        Object.hasOwn(this.inbound, 'multiplex')
+    },
+    showClientMultiplexEditor(): boolean {
+      return [this.inTypes.Shadowsocks, this.inTypes.VMess, this.inTypes.Trojan, this.inTypes.VLESS].includes(this.inbound.type) ||
+        Object.hasOwn(this.inbound.out_json ?? {}, 'multiplex')
+    },
     isMihomoShadowTLS(): boolean {
       return this.namespace === 'mihomo' && this.inbound.type === this.inTypes.ShadowTLS
     },
     isMihomoShadowProtocol(): boolean {
       return this.namespace === 'mihomo' && [this.inTypes.ShadowTLS, this.inTypes.ShadowQUIC].includes(this.inbound.type)
+    },
+    disableMihomoListenTcpOptions(): boolean {
+      return this.namespace === 'mihomo'
+    },
+    disableMihomoListenUdpOptions(): boolean {
+      return this.namespace === 'mihomo'
     },
     vlessEncryptionEnabled: {
       get(): boolean {
@@ -1497,22 +1843,45 @@ export default {
       moveEntry(this.inTypes.ShadowTLS, this.inTypes.Shadowsocks, 'after')
       moveEntry(this.inTypes.Sudoku, this.inTypes.Mieru, 'after')
 
+      const currentInboundType = this.inbound.type
+      const editingExistingInbound = (this.$props.id ?? 0) > 0
       return entries
-        .filter(([, value]) => !unsupportedTypes.has(value) || value === this.inbound.type)
+        // Keep the current legacy protocol selectable while editing it. The
+        // protocol must remain unavailable for newly created inbounds.
+        .filter(([, value]) => !unsupportedTypes.has(value) || (editingExistingInbound && value === currentInboundType))
         .map(([key, value]) => ({
           title: value === this.inTypes.SSH ? 'SSH(\u4ec5\u8ba2\u9605\u3001\u51fa\u7ad9)' : key,
           value,
         }))
     },
+    hasTlsForCurrentInbound(): boolean {
+      if (this.namespace === 'mihomo' && this.inbound.type === this.inTypes.Shadowsocks) return true
+      return this.HasTls.includes(this.inbound.type)
+    },
+    hasTlsForAddress(): boolean {
+      if (this.namespace === 'mihomo' && this.inbound.type === this.inTypes.Shadowsocks) {
+        return Number(this.inbound.tls_id ?? 0) > 0
+      }
+      return this.HasTls.includes(this.inbound.type)
+    },
     validate() {
       if (this.inbound == undefined) return false
-      if (this.inbound.tag == "") return false
-      if (this.inbound.listen_port > 65535 || this.inbound.listen_port < 1) return false
-      if (this.OnlyTLS.includes(this.inbound.type) && this.inbound.tls_id == 0) return false
+      if (String(this.inbound.tag ?? '').trim() === '') return false
+      if (this.inbound.type === this.inTypes.Tun) {
+        return !this.OnlyTLS.includes(this.inbound.type) || Number(this.inbound.tls_id ?? 0) > 0
+      }
+      const rawPort = (<any>this.inbound).listen_port
+      if (typeof rawPort === 'string' && !/^\d+$/.test(rawPort.trim())) return false
+      const port = Number(rawPort)
+      if (!Number.isInteger(port) || port > 65535 || port < 1) return false
+      if (this.OnlyTLS.includes(this.inbound.type) && Number(this.inbound.tls_id ?? 0) === 0) return false
       return true
     },
     clients() {
       return getNamespaceStore(this.namespace).clients ?? []
+    },
+    singleInitialUserSelection(): boolean {
+      return this.namespace === 'mihomo' && this.inbound.type === this.inTypes.Snell
     },
     stlsUtlsEnabled: {
       get(): boolean {
@@ -1570,10 +1939,9 @@ export default {
         case InTypes.HTTP:
         case InTypes.Snell:
         case InTypes.Shadowsocks:
-        case InTypes.VMess:
-        case InTypes.Trojan:
-        case InTypes.ShadowTLS:
-        case InTypes.ShadowQUIC:
+         case InTypes.VMess:
+         case InTypes.Trojan:
+         case InTypes.ShadowQUIC:
         case InTypes.TUIC:
         case InTypes.Hysteria2:
         case InTypes.VLESS:
@@ -1591,11 +1959,22 @@ export default {
     }
   },
   watch: {
-    visible(newValue) {
+    dialogVisible(newValue) {
       if (newValue) {
         this.loading = true
+      } else {
+        this.invalidatePendingSaveResult()
+        this.cancelPortOccupancyChecks()
+        this.cancelInboundLoad()
+        this.updateData(0)
+        this.$emit('close')
       }
     },
+  },
+  beforeUnmount() {
+    this.invalidatePendingSaveResult()
+    this.cancelPortOccupancyChecks()
+    this.cancelInboundLoad()
   },
   components: {
     Listen, InTls, Hysteria2, TrustTunnel, Naive, Direct, Shadowsocks,
@@ -1604,3 +1983,18 @@ export default {
   }
 }
 </script>
+
+<style scoped>
+.inbound-modal-card {
+  display: flex;
+  flex-direction: column;
+  max-height: 90vh;
+}
+
+.inbound-modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 0 16px;
+  overflow-y: auto;
+}
+</style>

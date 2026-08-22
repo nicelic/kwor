@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -207,8 +208,12 @@ func TestShadowQUICOutboundGroupRenameUpdatesJLSReference(t *testing.T) {
 		"outbounds":  "[]",
 		"sort_order": group.SortOrder,
 	})
-	if err := (&MihomoOutboundGroupService{}).Save(db, "edit", payload); err != nil {
+	runtimeChanged, err := (&MihomoOutboundGroupService{}).SaveWithRuntimeImpact(db, "edit", payload)
+	if err != nil {
 		t.Fatalf("rename Mihomo outbound group failed: %v", err)
+	}
+	if runtimeChanged {
+		t.Fatal("renaming a panel group must not report a Mihomo runtime change")
 	}
 
 	assertShadowQUICJLSReference(t, db, inbound.Id, "sq-group-new")
@@ -229,6 +234,81 @@ func TestShadowQUICManualOutboundSavesRequireCredentials(t *testing.T) {
 	}
 	if err := (&SubOutboundService{}).Save(db, "new", payload); err == nil || !strings.Contains(err.Error(), "password") {
 		t.Fatalf("expected subscription ShadowQUIC save to reject missing password, got %v", err)
+	}
+}
+
+func TestShadowQUICManualAndSubscriptionOutboundSavesNormalizeOptionalControls(t *testing.T) {
+	db := setupMihomoSyncTestDB(t, "shadowquic-outbound-control-normalization.db")
+	payload := func(tag string) json.RawMessage {
+		return mustJSONRaw(t, map[string]interface{}{
+			"type":                    "shadowquic",
+			"tag":                     tag,
+			"server":                  "edge.example.com",
+			"server_port":             10443,
+			"username":                "alice",
+			"password":                "secret",
+			"quic_versions":           []string{"v2", "unsupported", "v1", "v2"},
+			"udp_over_stream":         false,
+			"zero_rtt":                false,
+			"keep_alive_interval":     0,
+			"congestion_controller":   "BBR",
+			"cwnd":                    0,
+			"bbr_profile":             "standard",
+			"max_datagram_frame_size": 0,
+			"max_open_streams":        0,
+			"recv_window_conn":        0,
+			"recv_window":             0,
+			"disable_mtu_discovery":   false,
+		})
+	}
+
+	if err := (&MihomoOutboundService{}).Save(db, "new", payload("sq-manual-controls")); err != nil {
+		t.Fatalf("save manual ShadowQUIC outbound failed: %v", err)
+	}
+	if err := (&SubOutboundService{}).Save(db, "new", payload("sq-sub-controls")); err != nil {
+		t.Fatalf("save subscription ShadowQUIC outbound failed: %v", err)
+	}
+
+	assertNormalized := func(raw json.RawMessage) {
+		t.Helper()
+		outbound := map[string]interface{}{}
+		if err := json.Unmarshal(raw, &outbound); err != nil {
+			t.Fatalf("decode normalized outbound failed: %v", err)
+		}
+		if got := fmt.Sprint(outbound["quic_versions"]); got != "[v2 v1]" {
+			t.Fatalf("quic_versions = %#v; outbound=%#v", outbound["quic_versions"], outbound)
+		}
+		if outbound["congestion_controller"] != "bbr" {
+			t.Fatalf("congestion_controller = %#v; outbound=%#v", outbound["congestion_controller"], outbound)
+		}
+		for _, key := range []string{
+			"udp_over_stream", "zero_rtt", "keep_alive_interval", "cwnd",
+			"max_datagram_frame_size", "max_open_streams", "recv_window_conn",
+			"recv_window", "disable_mtu_discovery",
+		} {
+			if _, exists := outbound[key]; !exists {
+				t.Fatalf("explicit false/zero control %s was lost: %#v", key, outbound)
+			}
+		}
+	}
+
+	var manual model.MihomoOutbound
+	if err := db.Where("tag = ?", "sq-manual-controls").First(&manual).Error; err != nil {
+		t.Fatalf("load manual ShadowQUIC outbound failed: %v", err)
+	}
+	assertNormalized(manual.RawOutbound)
+
+	var subscription model.SubOutbound
+	if err := db.Where("tag = ?", "sq-sub-controls").First(&subscription).Error; err != nil {
+		t.Fatalf("load subscription ShadowQUIC outbound failed: %v", err)
+	}
+	assertNormalized(subscription.RawOutbound)
+	clash := map[string]interface{}{}
+	if err := json.Unmarshal(subscription.ClashOptions, &clash); err != nil {
+		t.Fatalf("decode subscription ShadowQUIC Clash options failed: %v", err)
+	}
+	if got := fmt.Sprint(clash["quic-versions"]); got != "[v2 v1]" || clash["congestion-controller"] != "bbr" {
+		t.Fatalf("subscription Clash options were not normalized: %#v", clash)
 	}
 }
 

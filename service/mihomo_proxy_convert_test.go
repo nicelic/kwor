@@ -1,6 +1,9 @@
 package service
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func asIntValue(t *testing.T, raw interface{}) int {
 	t.Helper()
@@ -19,6 +22,60 @@ func asIntValue(t *testing.T, raw interface{}) int {
 	default:
 		t.Fatalf("expected numeric value, got %#v", raw)
 		return 0
+	}
+}
+
+func TestMihomoIntegerConversionRejectsLossyValues(t *testing.T) {
+	accepted := []struct {
+		raw  interface{}
+		want int
+	}{
+		{raw: 443, want: 443},
+		{raw: float64(443), want: 443},
+		{raw: "443", want: 443},
+		{raw: " -7 ", want: -7},
+	}
+	for _, test := range accepted {
+		if got, ok := toInt(test.raw); !ok || got != test.want {
+			t.Fatalf("toInt(%#v) = (%d, %t), want (%d, true)", test.raw, got, ok, test.want)
+		}
+		if got, ok := toIntValue(test.raw); !ok || got != test.want {
+			t.Fatalf("toIntValue(%#v) = (%d, %t), want (%d, true)", test.raw, got, ok, test.want)
+		}
+	}
+
+	for _, raw := range []interface{}{"443x", "443.5", float64(443.5)} {
+		if got, ok := toInt(raw); ok {
+			t.Fatalf("toInt(%#v) = (%d, true), want rejection", raw, got)
+		}
+		if got, ok := toIntValue(raw); ok {
+			t.Fatalf("toIntValue(%#v) = (%d, true), want rejection", raw, got)
+		}
+	}
+}
+
+func TestMihomoDurationConversionRejectsFractionalNumbers(t *testing.T) {
+	for _, convert := range []struct {
+		name string
+		fn   func(interface{}) (int, bool)
+	}{
+		{name: "seconds", fn: durationToSeconds},
+		{name: "milliseconds", fn: durationToMilliseconds},
+		{name: "microseconds", fn: durationToMicroseconds},
+	} {
+		if got, ok := convert.fn(float64(1.5)); ok {
+			t.Fatalf("%s conversion accepted fractional value as %d", convert.name, got)
+		}
+		if got, ok := convert.fn(150); !ok || got != 150 {
+			t.Fatalf("%s conversion of integer = (%d, %t), want (150, true)", convert.name, got, ok)
+		}
+	}
+
+	if got, ok := durationToMilliseconds("150ms"); !ok || got != 150 {
+		t.Fatalf("millisecond duration = (%d, %t), want (150, true)", got, ok)
+	}
+	if got, ok := durationToMicroseconds("150us"); !ok || got != 150 {
+		t.Fatalf("microsecond duration = (%d, %t), want (150, true)", got, ok)
 	}
 }
 
@@ -120,6 +177,11 @@ func TestConvertMihomoOutboundsToClash_URLTestKeepsProxyMembers(t *testing.T) {
 
 func TestConvertMihomoOutboundsToClash_MapsSupportedProxyFields(t *testing.T) {
 	rawOutbounds := []map[string]interface{}{
+		{
+			"type":      "selector",
+			"tag":       "group-a",
+			"outbounds": []interface{}{"node-a"},
+		},
 		{
 			"type":           "vless",
 			"tag":            "node-a",
@@ -264,6 +326,55 @@ func TestConvertMihomoOutboundsToClash_MapsSupportedProxyFields(t *testing.T) {
 	}
 	if got, _ := brutalOpts["down"].(int); got != 200 {
 		t.Fatalf("unexpected brutal down: %#v", brutalOpts["down"])
+	}
+	if len(result.ValidationErrs) != 0 {
+		t.Fatalf("unexpected proxy conversion validation errors: %#v", result.ValidationErrs)
+	}
+}
+
+func TestConvertMihomoOutboundsToClash_NormalizesDialerProxyTargets(t *testing.T) {
+	rawOutbounds := []map[string]interface{}{
+		{
+			"type": "direct",
+			"tag":  "direct",
+		},
+		{
+			"type":        "socks",
+			"tag":         "direct-dial",
+			"server":      "1.1.1.1",
+			"server_port": 1080,
+			"detour":      "direct",
+		},
+		{
+			"type":        "socks",
+			"tag":         "invalid-dial",
+			"server":      "2.2.2.2",
+			"server_port": 1080,
+			"detour":      "panel-only-group",
+		},
+	}
+
+	result := convertMihomoOutboundsToClash(rawOutbounds)
+	if len(result.Proxies) != 2 {
+		t.Fatalf("expected 2 proxies, got %d", len(result.Proxies))
+	}
+
+	var directDial map[string]interface{}
+	for _, proxy := range result.Proxies {
+		if proxy["name"] == "direct-dial" {
+			directDial = proxy
+			break
+		}
+	}
+	if directDial == nil {
+		t.Fatalf("direct-dial proxy was not generated: %#v", result.Proxies)
+	}
+	if got, _ := directDial["dialer-proxy"].(string); got != "DIRECT" {
+		t.Fatalf("direct outbound tag must normalize to DIRECT, got %#v", directDial["dialer-proxy"])
+	}
+
+	if len(result.ValidationErrs) != 1 || !strings.Contains(result.ValidationErrs[0], "panel-only-group") {
+		t.Fatalf("expected panel-only dialer-proxy rejection, got %#v", result.ValidationErrs)
 	}
 }
 
@@ -416,7 +527,7 @@ func TestConvertMihomoOutboundsToClash_HTTPTransportLegacyH2Compatibility(t *tes
 	}
 }
 
-func TestConvertMihomoOutboundsToClash_AnyTLSOmitsRealityOpts(t *testing.T) {
+func TestConvertMihomoOutboundsToClash_AnyTLSIncludesRealityOpts(t *testing.T) {
 	rawOutbounds := []map[string]interface{}{
 		{
 			"type":             "anytls",
@@ -449,8 +560,9 @@ func TestConvertMihomoOutboundsToClash_AnyTLSOmitsRealityOpts(t *testing.T) {
 	if got, _ := proxy["client-fingerprint"].(string); got != "safari" {
 		t.Fatalf("unexpected client-fingerprint: %#v", proxy["client-fingerprint"])
 	}
-	if _, exists := proxy["reality-opts"]; exists {
-		t.Fatalf("anytls should not emit reality-opts: %#v", proxy["reality-opts"])
+	realityOpts, exists := proxy["reality-opts"].(map[string]interface{})
+	if !exists || realityOpts["public-key"] != "pub-key" || realityOpts["short-id"] != "short-id" {
+		t.Fatalf("expected anytls reality-opts: %#v", proxy["reality-opts"])
 	}
 }
 
@@ -466,6 +578,7 @@ func TestConvertMihomoOutboundsToClash_HysteriaMapsNewQUICFields(t *testing.T) {
 			"down_mbps":                  200,
 			"stream_receive_window":      25000000,
 			"connection_receive_window":  67108864,
+			"max_concurrent_streams":     1024,
 			"disable_path_mtu_discovery": true,
 			"mihomo_fast_open":           true,
 			"server_ports":               []interface{}{"443:8443", "9000"},
@@ -483,6 +596,9 @@ func TestConvertMihomoOutboundsToClash_HysteriaMapsNewQUICFields(t *testing.T) {
 	}
 	if got, _ := proxy["recv-window"].(int); got != 67108864 {
 		t.Fatalf("unexpected recv-window: %#v", proxy["recv-window"])
+	}
+	if got, _ := proxy["max-concurrent-streams"].(int); got != 1024 {
+		t.Fatalf("unexpected max-concurrent-streams: %#v", proxy["max-concurrent-streams"])
 	}
 	if got, _ := proxy["disable-mtu-discovery"].(bool); !got {
 		t.Fatalf("expected disable-mtu-discovery=true, got %#v", proxy["disable-mtu-discovery"])
@@ -519,6 +635,25 @@ func TestConvertMihomoOutboundsToClash_HysteriaOmitsZeroBandwidth(t *testing.T) 
 	}
 	if _, exists := proxy["down"]; exists {
 		t.Fatalf("expected hysteria down to be omitted when zero, got %#v", proxy["down"])
+	}
+}
+
+func TestConvertMihomoOutboundsToClash_SnellMapsUDP(t *testing.T) {
+	result := convertMihomoOutboundsToClash([]map[string]interface{}{
+		{
+			"type":        "snell",
+			"tag":         "snell-udp",
+			"server":      "example.com",
+			"server_port": 443,
+			"psk":         "secret",
+			"udp":         true,
+		},
+	})
+	if len(result.Proxies) != 1 {
+		t.Fatalf("expected 1 proxy, got %d", len(result.Proxies))
+	}
+	if got, _ := result.Proxies[0]["udp"].(bool); !got {
+		t.Fatalf("expected Snell udp=true, got %#v", result.Proxies[0]["udp"])
 	}
 }
 
@@ -1080,7 +1215,7 @@ func TestConvertMihomoOutboundsToClash_ProtocolFastOpenSeparatedFromTFO(t *testi
 		{tag: "hy1-fast-open-off-tfo-on", wantFastOpen: false, wantTFO: true},
 		{tag: "hy1-fast-open-on-tfo-off", wantFastOpen: true, wantTFO: false},
 		{tag: "hy2-fast-open-off-tfo-on", wantFastOpen: false, wantTFO: true},
-		{tag: "hy2-fast-open-on-tfo-off", wantFastOpen: false, wantTFO: false},
+		{tag: "hy2-fast-open-on-tfo-off", wantFastOpen: true, wantTFO: false},
 		{tag: "tuic-fast-open-off-tfo-on", wantFastOpen: false, wantTFO: true},
 		{tag: "tuic-fast-open-on-tfo-off", wantFastOpen: false, wantTFO: false},
 	}
@@ -1102,7 +1237,7 @@ func TestConvertMihomoOutboundsToClash_ProtocolFastOpenSeparatedFromTFO(t *testi
 	}
 }
 
-func TestConvertMihomoOutboundsToClash_Hysteria2OmitsUnsupportedFastOpenAndUnsetBandwidth(t *testing.T) {
+func TestConvertMihomoOutboundsToClash_Hysteria2FastOpenAndUnsetBandwidth(t *testing.T) {
 	rawOutbounds := []map[string]interface{}{
 		{
 			"type":             "hysteria2",
@@ -1120,8 +1255,8 @@ func TestConvertMihomoOutboundsToClash_Hysteria2OmitsUnsupportedFastOpenAndUnset
 	}
 
 	proxy := result.Proxies[0]
-	if _, exists := proxy["fast-open"]; exists {
-		t.Fatalf("expected hysteria2 fast-open to be omitted, got %#v", proxy["fast-open"])
+	if got, _ := proxy["fast-open"].(bool); !got {
+		t.Fatalf("expected hysteria2 fast-open=true, got %#v", proxy["fast-open"])
 	}
 	if _, exists := proxy["up"]; exists {
 		t.Fatalf("expected hysteria2 up to be omitted when unset, got %#v", proxy["up"])

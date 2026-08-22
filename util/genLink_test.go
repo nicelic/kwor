@@ -135,6 +135,114 @@ func TestLinkGenerator_VLESSIncludesMihomoEncryptionQuery(t *testing.T) {
 	}
 }
 
+func TestLinkGenerator_HTTPUsesTLSPerAddress(t *testing.T) {
+	clientConfig := json.RawMessage(`{
+  "http": {
+    "username": "alice",
+    "password": "secret"
+  }
+}`)
+	inbound := &model.Inbound{
+		Type: "http",
+		Tag:  "http-in",
+		Addrs: json.RawMessage(`[
+  {"server": "plain.example.com", "server_port": 80, "remark": " plain"},
+  {"server": "secure.example.com", "server_port": 443, "remark": " secure", "tls": {"enabled": true}}
+]`),
+	}
+
+	links := LinkGenerator(clientConfig, inbound, "ignored.example.com")
+	if len(links) != 2 {
+		t.Fatalf("expected 2 HTTP links, got %d", len(links))
+	}
+	if !strings.HasPrefix(links[0], "http://") {
+		t.Fatalf("expected first address to remain HTTP, got %q", links[0])
+	}
+	if !strings.HasPrefix(links[1], "https://") {
+		t.Fatalf("expected second address to use HTTPS, got %q", links[1])
+	}
+}
+
+func TestPopulateVmessTlsParamsHandlesIncompleteTLS(t *testing.T) {
+	result := map[string]interface{}{}
+	populateVmessTlsParams(result, map[string]interface{}{
+		"server_name": "legacy.example.com",
+		"reality": map[string]interface{}{
+			"public_key": "legacy-key",
+		},
+	})
+
+	if got := result["tls"]; got != "none" {
+		t.Fatalf("expected incomplete TLS config to be treated as disabled, got %#v", got)
+	}
+}
+
+func TestPopulateVmessTlsParamsKeepsEnabledTLS(t *testing.T) {
+	tests := []struct {
+		name string
+		tls  map[string]interface{}
+	}{
+		{
+			name: "ordinary TLS",
+			tls:  map[string]interface{}{"enabled": true, "server_name": "tls.example.com"},
+		},
+		{
+			name: "Reality",
+			tls: map[string]interface{}{
+				"enabled": true,
+				"reality": map[string]interface{}{"enabled": true, "public_key": "public-key", "short_id": "abcd"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := map[string]interface{}{}
+			populateVmessTlsParams(result, tt.tls)
+			if got := result["tls"]; got != "tls" {
+				t.Fatalf("enabled TLS was overwritten by disabled marker: %#v", result)
+			}
+		})
+	}
+}
+
+func TestGetTlsParamsFallsBackToTLSWhenRealityDisabled(t *testing.T) {
+	params := []LinkParam{}
+	getTlsParams(&params, map[string]interface{}{
+		"insecure": true,
+		"reality": map[string]interface{}{
+			"enabled":    false,
+			"public_key": "unused",
+		},
+	}, "allowInsecure")
+
+	values := map[string]string{}
+	for _, param := range params {
+		values[param.Key] = param.Value
+	}
+	if got := values["security"]; got != "tls" {
+		t.Fatalf("expected disabled Reality to fall back to TLS, got %q", got)
+	}
+	if got := values["allowInsecure"]; got != "1" {
+		t.Fatalf("expected TLS insecure flag to be preserved, got %q", got)
+	}
+}
+
+func TestGetTlsParamsSkipsMalformedALPNEntries(t *testing.T) {
+	params := []LinkParam{}
+	getTlsParams(&params, map[string]interface{}{
+		"alpn": []interface{}{" h2 ", 12, nil, ""},
+	}, "allowInsecure")
+
+	values := map[string]string{}
+	for _, param := range params {
+		values[param.Key] = param.Value
+	}
+	if got := values["alpn"]; got != "h2" {
+		t.Fatalf("expected only valid ALPN values, got %q", got)
+	}
+}
+
 func TestLinkGenerator_MieruSupportsSinglePortRangeOption(t *testing.T) {
 	clientConfig := json.RawMessage(`{
   "mieru": {

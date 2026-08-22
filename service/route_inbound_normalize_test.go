@@ -46,6 +46,24 @@ func TestDeriveEffectiveInboundRouteTag(t *testing.T) {
 			want: "stls_hk1-in",
 		},
 		{
+			name:       "shadowtls with empty ss_config still maps to internal shadowsocks inbound",
+			tag:        "stls_empty",
+			inboundTyp: "shadowtls",
+			options: map[string]interface{}{
+				"ss_config": map[string]interface{}{},
+			},
+			want: "stls_empty-in",
+		},
+		{
+			name:       "shadowtls with non-object ss_config keeps original tag",
+			tag:        "stls_invalid",
+			inboundTyp: "shadowtls",
+			options: map[string]interface{}{
+				"ss_config": "invalid",
+			},
+			want: "stls_invalid",
+		},
+		{
 			name:       "detour has higher priority than shadowtls internal mapping",
 			tag:        "stls_hk1",
 			inboundTyp: "shadowtls",

@@ -1,6 +1,8 @@
 package service
 
 import (
+	"fmt"
+	"io"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -13,7 +15,17 @@ import (
 	"github.com/alireza0/s-ui/database/model"
 )
 
-const firewallListenerSnapshotMinGap = 2 * time.Second
+const firewallListenerSnapshotMinGap = 5 * time.Second
+
+const (
+	firewallListenerOwnerCommandMaxBytes = 2 * 1024
+	firewallListenerOwnerNameMaxBytes    = 512
+	firewallListenerOwnerMaxFDLinks      = 50000
+	firewallListenerProcNetMaxBytes      = 4 * 1024 * 1024
+	firewallListenerMaxMatchesPerRule    = 8
+	firewallListenerMaxOwnersPerSocket   = 4
+	firewallListenerMaxSockets           = 256
+)
 
 type FirewallRuleListenerState struct {
 	Supported     bool                       `json:"supported"`
@@ -100,6 +112,9 @@ func buildFirewallRuleListenerStates(rows []model.FirewallRule) map[uint]Firewal
 
 func firewallRuleSupportsListenerTracking(row model.FirewallRule) bool {
 	if !row.Enabled {
+		return false
+	}
+	if row.Origin == firewallOriginExternal || row.Origin == firewallOriginTemporary {
 		return false
 	}
 	if !firewallProtocolNeedsPort(row.Protocol) {
@@ -261,7 +276,7 @@ func readProcListenerSockets(filter firewallListenerFilter) ([]procListenerSocke
 
 	sockets := make([]procListenerSocket, 0, 16)
 	for _, spec := range specs {
-		data, err := readFileFresh(spec.path)
+		data, err := readFirewallProcFile(spec.path, firewallListenerProcNetMaxBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -301,9 +316,28 @@ func readProcListenerSockets(filter firewallListenerFilter) ([]procListenerSocke
 				wildcard:    wildcard,
 				inode:       strings.TrimSpace(fields[9]),
 			})
+			if len(sockets) >= firewallListenerMaxSockets {
+				return sockets, nil
+			}
 		}
 	}
 	return sockets, nil
+}
+
+func readFirewallProcFile(path string, limit int) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, int64(limit)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > limit {
+		return nil, fmt.Errorf("proc listener snapshot exceeds %d bytes", limit)
+	}
+	return data, nil
 }
 
 func procSocketRemoteIsWildcard(raw string) bool {
@@ -443,6 +477,7 @@ func resolveProcListenerOwners(targetInodes map[string]struct{}) map[string][]Fi
 		return result
 	}
 
+	scannedFDLinks := 0
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -459,6 +494,10 @@ func resolveProcListenerOwners(targetInodes map[string]struct{}) map[string][]Fi
 
 		matched := make(map[string]struct{})
 		for _, fdEntry := range fdEntries {
+			scannedFDLinks++
+			if scannedFDLinks > firewallListenerOwnerMaxFDLinks {
+				return result
+			}
 			linkTarget, linkErr := os.Readlink(filepath.Join("/proc", entry.Name(), "fd", fdEntry.Name()))
 			if linkErr != nil {
 				continue
@@ -514,11 +553,11 @@ func readProcOwnerInfo(pid int) FirewallListenerOwnerView {
 	}
 	pidText := strconv.Itoa(pid)
 
-	if data, err := readFileFresh(filepath.Join("/proc", pidText, "comm")); err == nil {
-		owner.Name = strings.TrimSpace(string(data))
+	if value, err := readFirewallProcText(filepath.Join("/proc", pidText, "comm"), firewallListenerOwnerNameMaxBytes); err == nil {
+		owner.Name = strings.TrimSpace(value)
 	}
-	if data, err := readFileFresh(filepath.Join("/proc", pidText, "cmdline")); err == nil {
-		command := strings.ReplaceAll(string(data), "\x00", " ")
+	if value, err := readFirewallProcText(filepath.Join("/proc", pidText, "cmdline"), firewallListenerOwnerCommandMaxBytes); err == nil {
+		command := strings.ReplaceAll(value, "\x00", " ")
 		owner.Command = strings.TrimSpace(command)
 	}
 	if target, err := os.Readlink(filepath.Join("/proc", pidText, "exe")); err == nil {
@@ -540,11 +579,33 @@ func readProcOwnerInfo(pid int) FirewallListenerOwnerView {
 	return owner
 }
 
+func readFirewallProcText(path string, limit int) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	if limit <= 0 {
+		return "", nil
+	}
+	data, err := io.ReadAll(io.LimitReader(file, int64(limit)+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > limit {
+		return string(data[:limit]) + "...", nil
+	}
+	return string(data), nil
+}
+
 func appendFirewallListenerOwner(owners []FirewallListenerOwnerView, next FirewallListenerOwnerView) []FirewallListenerOwnerView {
 	for _, owner := range owners {
 		if owner.PID == next.PID {
 			return owners
 		}
+	}
+	if len(owners) >= firewallListenerMaxOwnersPerSocket {
+		return owners
 	}
 	return append(owners, next)
 }
@@ -564,6 +625,9 @@ func matchFirewallListenersForRule(row model.FirewallRule, listeners []FirewallP
 			continue
 		}
 		matched = append(matched, listener)
+		if len(matched) >= firewallListenerMaxMatchesPerRule {
+			break
+		}
 	}
 	return matched
 }

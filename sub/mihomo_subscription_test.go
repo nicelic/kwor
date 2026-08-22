@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -154,6 +155,157 @@ func TestMihomoClientSubscriptions(t *testing.T) {
 	}
 	if got, _ := clashProxy["password"].(string); got != "secret-pass" {
 		t.Fatalf("expected mihomo clash password secret-pass, got %v", clashProxy["password"])
+	}
+}
+
+func TestLoadMihomoSubscriptionDataAcceptsLegacyStringInboundIDs(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "mihomo-subscription-legacy-inbound-ids.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("InitDB failed: %v", err)
+	}
+
+	db := database.GetDB()
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("db.DB failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
+
+	inbound := model.MihomoInbound{
+		Type:    "trojan",
+		Tag:     "trojan-legacy-id",
+		Addrs:   mustRawJSON(t, []interface{}{}),
+		OutJson: mustRawJSON(t, map[string]interface{}{}),
+		Options: mustRawJSON(t, map[string]interface{}{"listen_port": 443}),
+	}
+	if err := db.Create(&inbound).Error; err != nil {
+		t.Fatalf("create Mihomo inbound failed: %v", err)
+	}
+
+	legacyInboundIDs, err := json.Marshal([]string{strconv.FormatUint(uint64(inbound.Id), 10)})
+	if err != nil {
+		t.Fatalf("marshal legacy inbound ids failed: %v", err)
+	}
+	client := model.MihomoClient{
+		Enable:   true,
+		Name:     "legacy-id-user",
+		Config:   mustRawJSON(t, map[string]interface{}{"trojan": map[string]interface{}{"password": "secret"}}),
+		Inbounds: legacyInboundIDs,
+		Links: mustRawJSON(t, []map[string]string{
+			{
+				"type":   "local",
+				"remark": inbound.Tag,
+				"uri":    "trojan://secret@legacy.example.com:443#legacy",
+			},
+		}),
+	}
+	if err := db.Create(&client).Error; err != nil {
+		t.Fatalf("create Mihomo client failed: %v", err)
+	}
+
+	_, inbounds, err := loadMihomoSubscriptionData(client.Name)
+	if err != nil {
+		t.Fatalf("load Mihomo subscription data failed: %v", err)
+	}
+	if len(inbounds) != 1 || inbounds[0].Tag != inbound.Tag {
+		t.Fatalf("loaded inbounds = %#v, want %q", inbounds, inbound.Tag)
+	}
+
+	plainSub, _, err := (&SubService{}).GetMihomoSubs(client.Name)
+	if err != nil {
+		t.Fatalf("load plain Mihomo subscription failed: %v", err)
+	}
+	decodedPlain, err := base64.StdEncoding.DecodeString(*plainSub)
+	if err != nil {
+		t.Fatalf("decode plain Mihomo subscription failed: %v", err)
+	}
+	if !strings.Contains(string(decodedPlain), "trojan://secret@legacy.example.com:443#legacy") {
+		t.Fatalf("plain Mihomo subscription lost legacy inbound link: %s", decodedPlain)
+	}
+}
+
+func TestMihomoSubscriptionsExcludeLegacyUnsupportedInbounds(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "mihomo-subscription-unsupported-inbounds.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("InitDB failed: %v", err)
+	}
+
+	db := database.GetDB()
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("db.DB failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
+
+	allInbounds := make([]model.MihomoInbound, 0, 6)
+	for _, inboundType := range []string{"direct", "naive", "ssh", "hysteria", "shadowtls", "trojan"} {
+		inbound := model.MihomoInbound{
+			Type:    inboundType,
+			Tag:     inboundType + "-legacy",
+			Addrs:   mustRawJSON(t, []interface{}{}),
+			OutJson: mustRawJSON(t, map[string]interface{}{}),
+			Options: mustRawJSON(t, map[string]interface{}{"listen_port": 443}),
+		}
+		if err := db.Create(&inbound).Error; err != nil {
+			t.Fatalf("create %s Mihomo inbound failed: %v", inboundType, err)
+		}
+		allInbounds = append(allInbounds, inbound)
+	}
+
+	inboundIDs := make([]uint, 0, len(allInbounds))
+	links := make([]map[string]string, 0, len(allInbounds))
+	for _, inbound := range allInbounds {
+		inboundIDs = append(inboundIDs, inbound.Id)
+		links = append(links, map[string]string{
+			"type":   "local",
+			"remark": inbound.Tag,
+			"uri":    inbound.Type + "://legacy.example.com",
+		})
+	}
+	client := model.MihomoClient{
+		Enable:   true,
+		Name:     "legacy-unsupported-user",
+		Inbounds: mustRawJSON(t, inboundIDs),
+		Links:    mustRawJSON(t, links),
+	}
+	if err := db.Create(&client).Error; err != nil {
+		t.Fatalf("create Mihomo client failed: %v", err)
+	}
+
+	_, inbounds, err := loadMihomoSubscriptionData(client.Name)
+	if err != nil {
+		t.Fatalf("load Mihomo subscription data failed: %v", err)
+	}
+	if len(inbounds) != 1 || inbounds[0].Type != "trojan" {
+		t.Fatalf("subscription inbounds = %#v, want only the supported trojan inbound", inbounds)
+	}
+
+	baseClient := mihomoClientToBase(&client)
+	filteredLinks, err := (&SubService{}).filterServerOnlyLocalLinks(baseClient, true)
+	if err != nil {
+		t.Fatalf("filter Mihomo local links failed: %v", err)
+	}
+	var decodedLinks []Link
+	if err := json.Unmarshal(filteredLinks, &decodedLinks); err != nil {
+		t.Fatalf("decode filtered links failed: %v", err)
+	}
+	if len(decodedLinks) != 1 || decodedLinks[0].Remark != "trojan-legacy" {
+		t.Fatalf("filtered links = %#v, want only the supported trojan local link", decodedLinks)
+	}
+
+	legacyOnlyClient := *baseClient
+	legacyOnlyClient.Inbounds = mustRawJSON(t, inboundIDs[:5])
+	legacyOnlyClient.ServerIp = "panel.example.com"
+	regeneratedLinks, err := (&SubService{}).buildCurrentLocalLinks(&legacyOnlyClient, true, "")
+	if err != nil {
+		t.Fatalf("regenerate Mihomo local links failed: %v", err)
+	}
+	if len(regeneratedLinks) != 0 {
+		t.Fatalf("legacy unsupported inbounds regenerated local links: %#v", regeneratedLinks)
 	}
 }
 
@@ -414,8 +566,8 @@ func TestNormalizeMihomoSubscriptionOutJSON_TUICStripsListenerOnlyFields(t *test
 			t.Fatalf("expected %s to be removed, got %#v", key, outbound[key])
 		}
 	}
-	if got, ok := outbound["mihomo_fast_open"].(bool); !ok || !got {
-		t.Fatalf("expected mihomo_fast_open=true to be preserved for clash subscription, got %#v", outbound["mihomo_fast_open"])
+	if _, exists := outbound["mihomo_fast_open"]; exists {
+		t.Fatalf("expected mihomo_fast_open to be removed, got %#v", outbound["mihomo_fast_open"])
 	}
 	if got, _ := outbound["max_udp_relay_packet_size"].(float64); got != 1400 {
 		t.Fatalf("expected max_udp_relay_packet_size 1400, got %#v", outbound["max_udp_relay_packet_size"])
@@ -468,6 +620,149 @@ func TestNormalizeMihomoSubscriptionOutJSON_MigratesLegacyCommonFields(t *testin
 	}
 }
 
+func TestNormalizeMihomoSubscriptionOutJSONSanitizesUnsafeClientFields(t *testing.T) {
+	inbound := model.Inbound{
+		Type: "vless",
+		OutJson: mustRawJSON(t, map[string]interface{}{
+			"tls": map[string]interface{}{
+				"enabled":                 true,
+				"fragment":                true,
+				"fragment_fallback_delay": "500ms",
+				"record_fragment":         true,
+			},
+			"transport": map[string]interface{}{
+				"type":            "grpc",
+				"ping_interval":   10.5,
+				"max_connections": 8,
+				"min_streams":     -1,
+				"max_streams":     "16",
+			},
+			"mihomo_common": map[string]interface{}{
+				"routing_mark": "12",
+				"smux": map[string]interface{}{
+					"enabled":         true,
+					"max_connections": 8.5,
+					"min_streams":     0,
+					"max_streams":     16,
+					"brutal": map[string]interface{}{
+						"enabled":   true,
+						"up_mbps":   100.5,
+						"down_mbps": 200,
+					},
+				},
+			},
+		}),
+	}
+
+	if err := normalizeMihomoSubscriptionOutJSON(&inbound); err != nil {
+		t.Fatalf("normalizeMihomoSubscriptionOutJSON failed: %v", err)
+	}
+
+	var outbound map[string]interface{}
+	if err := json.Unmarshal(inbound.OutJson, &outbound); err != nil {
+		t.Fatalf("unmarshal normalized out_json failed: %v", err)
+	}
+	tls := asMap(t, outbound["tls"])
+	for _, key := range []string{"fragment", "fragment_fallback_delay", "record_fragment"} {
+		if _, exists := tls[key]; exists {
+			t.Fatalf("unsupported TLS field %q survived: %#v", key, tls)
+		}
+	}
+	transport := asMap(t, outbound["transport"])
+	if got := transport["max_connections"]; got != float64(8) {
+		t.Fatalf("max_connections = %#v", got)
+	}
+	for _, key := range []string{"ping_interval", "min_streams", "max_streams"} {
+		if _, exists := transport[key]; exists {
+			t.Fatalf("invalid gRPC field %q survived: %#v", key, transport)
+		}
+	}
+	common := asMap(t, outbound["mihomo_common"])
+	if _, exists := common["routing_mark"]; exists {
+		t.Fatalf("text routing_mark survived: %#v", common)
+	}
+	smux := asMap(t, common["smux"])
+	if _, exists := smux["max_connections"]; exists {
+		t.Fatalf("fractional SMUX max_connections survived: %#v", smux)
+	}
+	if got := smux["min_streams"]; got != float64(0) {
+		t.Fatalf("min_streams = %#v", got)
+	}
+	if got := smux["max_streams"]; got != float64(16) {
+		t.Fatalf("max_streams = %#v", got)
+	}
+	brutal := asMap(t, smux["brutal"])
+	if _, exists := brutal["up_mbps"]; exists {
+		t.Fatalf("fractional Brutal up_mbps survived: %#v", brutal)
+	}
+	if got := brutal["down_mbps"]; got != float64(200) {
+		t.Fatalf("down_mbps = %#v", got)
+	}
+}
+
+func TestNormalizeMihomoSubscriptionOutJSONSanitizesHysteria2ReceiveWindows(t *testing.T) {
+	inbound := model.Inbound{
+		Type: "hysteria2",
+		OutJson: mustRawJSON(t, map[string]interface{}{
+			"mihomo_hy2": map[string]interface{}{
+				"initial_stream_receive_window":     1024,
+				"max_stream_receive_window":         2048.5,
+				"initial_connection_receive_window": "4096",
+				"max_connection_receive_window":     0,
+				"unexpected":                        true,
+			},
+		}),
+	}
+
+	if err := normalizeMihomoSubscriptionOutJSON(&inbound); err != nil {
+		t.Fatalf("normalizeMihomoSubscriptionOutJSON failed: %v", err)
+	}
+
+	var outbound map[string]interface{}
+	if err := json.Unmarshal(inbound.OutJson, &outbound); err != nil {
+		t.Fatalf("unmarshal normalized out_json failed: %v", err)
+	}
+	windows := asMap(t, outbound["mihomo_hy2"])
+	if got := windows["initial_stream_receive_window"]; got != float64(1024) {
+		t.Fatalf("initial_stream_receive_window = %#v", got)
+	}
+	for _, key := range []string{
+		"max_stream_receive_window",
+		"initial_connection_receive_window",
+		"max_connection_receive_window",
+		"unexpected",
+	} {
+		if _, exists := windows[key]; exists {
+			t.Fatalf("invalid receive window %q survived: %#v", key, windows)
+		}
+	}
+}
+
+func TestNormalizeMihomoSubscriptionOutJSONPreservesHysteria2FastOpen(t *testing.T) {
+	inbound := model.Inbound{
+		Type: "hysteria2",
+		OutJson: mustRawJSON(t, map[string]interface{}{
+			"mihomo_fast_open": true,
+			"fast_open":        true,
+		}),
+	}
+
+	if err := normalizeMihomoSubscriptionOutJSON(&inbound); err != nil {
+		t.Fatalf("normalizeMihomoSubscriptionOutJSON failed: %v", err)
+	}
+
+	var outbound map[string]interface{}
+	if err := json.Unmarshal(inbound.OutJson, &outbound); err != nil {
+		t.Fatalf("unmarshal normalized out_json failed: %v", err)
+	}
+	if got, ok := outbound["mihomo_fast_open"].(bool); !ok || !got {
+		t.Fatalf("expected mihomo_fast_open=true, got %#v", outbound["mihomo_fast_open"])
+	}
+	if _, exists := outbound["fast_open"]; exists {
+		t.Fatalf("legacy fast_open survived: %#v", outbound)
+	}
+}
+
 func TestNormalizeMihomoSubscriptionOutJSON_MigratesLegacyBBRProfileToCommonFields(t *testing.T) {
 	inbound := model.Inbound{
 		Type: "hysteria2",
@@ -494,6 +789,7 @@ func TestNormalizeMihomoSubscriptionOutJSON_MigratesLegacyBBRProfileToCommonFiel
 }
 
 func TestNormalizeMihomoSubscriptionOutJSON_ShadowTLSDropsLegacySSNetwork(t *testing.T) {
+	t.Skip("standalone Mihomo ShadowTLS compatibility was removed; Shadowsocks wrapper coverage is tested separately")
 	inbound := model.Inbound{
 		Type: "shadowtls",
 		OutJson: mustRawJSON(t, map[string]interface{}{
@@ -745,7 +1041,10 @@ func TestMihomoTUICClashSubscriptionOmitsFastOpen(t *testing.T) {
 		Tag:   "tuic-443",
 		Addrs: mustRawJSON(t, []interface{}{}),
 		OutJson: mustRawJSON(t, map[string]interface{}{
-			"request_timeout": "8s",
+			"request_timeout":  "8s",
+			"mihomo_fast_open": true,
+			"fast_open":        true,
+			"fast-open":        true,
 		}),
 		Options: mustRawJSON(t, map[string]interface{}{
 			"listen_port":               443,
@@ -800,7 +1099,7 @@ func TestMihomoTUICClashSubscriptionOmitsFastOpen(t *testing.T) {
 	}
 }
 
-func TestMihomoShadowTLSSubscriptions(t *testing.T) {
+func TestMihomoShadowsocksShadowTLSSubscriptions(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "mihomo-shadowtls.db")
 	if err := database.InitDB(dbPath); err != nil {
 		t.Fatalf("InitDB failed: %v", err)
@@ -815,42 +1114,39 @@ func TestMihomoShadowTLSSubscriptions(t *testing.T) {
 		_ = sqlDB.Close()
 	})
 
+	tlsConfig := model.MihomoTls{
+		Name: "ss-shadowtls-tls",
+		Mode: model.MihomoTlsModeShadowTLS,
+		Server: mustRawJSON(t, map[string]interface{}{
+			"shadow_tls": map[string]interface{}{
+				"enable":    true,
+				"version":   3,
+				"users":     []interface{}{map[string]interface{}{"name": "alice", "password": "shadow-pass"}},
+				"handshake": map[string]interface{}{"dest": "addons.mozilla.org:443"},
+			},
+		}),
+		Client: mustRawJSON(t, map[string]interface{}{
+			"shadow_tls_opts": map[string]interface{}{"version": 3, "password": "shadow-pass"},
+			"utls":            map[string]interface{}{"enabled": true, "fingerprint": "safari"},
+		}),
+	}
+	if err := db.Create(&tlsConfig).Error; err != nil {
+		t.Fatalf("create mihomo ShadowTLS config failed: %v", err)
+	}
+
 	inbound := model.MihomoInbound{
-		Type:  "shadowtls",
-		Tag:   "stls-443",
+		Type:  "shadowsocks",
+		Tag:   "ss-shadowtls-443",
+		TlsId: tlsConfig.Id,
+		Tls:   &tlsConfig,
 		Addrs: mustRawJSON(t, []interface{}{}),
 		OutJson: mustRawJSON(t, map[string]interface{}{
-			"tls": map[string]interface{}{
-				"enabled":  true,
-				"insecure": true,
-				"alpn":     []interface{}{"h2", "http/1.1"},
-				"utls": map[string]interface{}{
-					"enabled":     true,
-					"fingerprint": "safari",
-				},
-			},
+			"udp_over_tcp": map[string]interface{}{"enabled": true, "version": 2},
 		}),
 		Options: mustRawJSON(t, map[string]interface{}{
 			"listen_port": 443,
-			"version":     3,
-			"strict_mode": true,
-			"handshake": map[string]interface{}{
-				"server":      "addons.mozilla.org",
-				"server_port": 443,
-			},
-			"ss_config": map[string]interface{}{
-				"method":   "2022-blake3-aes-128-gcm",
-				"password": "ss-pass",
-				"network":  "udp",
-				"udp_over_tcp": map[string]interface{}{
-					"enabled": true,
-					"version": 2,
-				},
-				"multiplex": map[string]interface{}{
-					"enabled": true,
-					"padding": true,
-				},
-			},
+			"method":      "2022-blake3-aes-128-gcm",
+			"password":    "ss-pass",
 		}),
 	}
 
@@ -1820,4 +2116,16 @@ func hasTaggedOutbound(raw interface{}, tag string) bool {
 	}
 
 	return false
+}
+
+func TestNormalizeMihomoSubscriptionPositiveIntegerRejectsFractionalValues(t *testing.T) {
+	for _, value := range []interface{}{float64(1200.5), float32(8.5)} {
+		if _, ok := normalizePositiveIntValue(value); ok {
+			t.Fatalf("fractional value %#v must not be truncated into a subscription option", value)
+		}
+	}
+
+	if value, ok := normalizePositiveIntValue(float64(1200)); !ok || value != 1200 {
+		t.Fatalf("integral value should remain usable, got (%d, %v)", value, ok)
+	}
 }

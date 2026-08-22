@@ -85,7 +85,9 @@ func scanExternalFirewallRules() ([]firewallObservedRule, error) {
 		if !ok {
 			continue
 		}
-		rules = append(rules, rule)
+		if len(rules) < firewallMaxExternalRules {
+			rules = append(rules, rule)
+		}
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -148,6 +150,9 @@ func parseObservedFirewallRuleLine(line string, tableFamily string, tableName st
 	comment, _ := extractRuleComment(line)
 	if strings.HasPrefix(comment, "kwor_") {
 		return firewallObservedRule{}, false
+	}
+	if len(comment) > firewallMaxRuleDescriptionBytes {
+		comment = ""
 	}
 
 	handleMatch := firewallRuleHandleTextRe.FindStringSubmatch(line)

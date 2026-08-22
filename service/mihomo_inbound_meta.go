@@ -123,23 +123,6 @@ func buildMihomoInboundUserManagement(inboundType string, shadowTLSVersion int) 
 			IdentityType:   "username",
 			Reason:         "shadowquic_username_password_users",
 		}
-	case "shadowtls":
-		if shadowTLSVersion >= 3 {
-			return MihomoInboundUserManagement{
-				Selectable:     true,
-				UsesUsersField: true,
-				Mode:           "users_list",
-				IdentityType:   "name",
-				Reason:         "shadowtls_v3_users",
-			}
-		}
-		return MihomoInboundUserManagement{
-			Selectable:     true,
-			UsesUsersField: false,
-			Mode:           "shared_password",
-			IdentityType:   "shared_password",
-			Reason:         "shadowtls_legacy_password",
-		}
 	case "shadowsocks":
 		return MihomoInboundUserManagement{
 			Selectable:     true,
@@ -158,11 +141,11 @@ func buildMihomoInboundUserManagement(inboundType string, shadowTLSVersion int) 
 		}
 	case "ssh":
 		return MihomoInboundUserManagement{
-			Selectable:     true,
+			Selectable:     false,
 			UsesUsersField: false,
-			Mode:           "shared_credentials",
-			IdentityType:   "type_tag",
-			Reason:         "ssh_subscription_outbound_only",
+			Mode:           "not_applicable",
+			IdentityType:   "none",
+			Reason:         "ssh_is_not_a_mihomo_listener",
 		}
 	case "direct", "redirect", "tproxy", "tun":
 		return MihomoInboundUserManagement{
@@ -189,12 +172,7 @@ func buildMihomoInboundUserManagementFromOptions(inboundType string, options jso
 		_ = json.Unmarshal(options, &fields)
 	}
 
-	var shadowTLSVersion int
-	if inboundType == "shadowtls" && fields != nil {
-		_ = json.Unmarshal(fields["version"], &shadowTLSVersion)
-	}
-
-	return buildMihomoInboundUserManagement(inboundType, shadowTLSVersion)
+	return buildMihomoInboundUserManagement(inboundType, 0)
 }
 
 func attachMihomoInboundUserManagementView(view map[string]interface{}, inbound model.MihomoInbound) MihomoInboundUserManagement {
@@ -227,8 +205,15 @@ func writeMihomoInboundMetaFile(coreDir string) error {
 	if err := db.Model(model.MihomoInbound{}).Find(&inbounds).Error; err != nil {
 		return fmt.Errorf("load mihomo inbounds for metadata failed: %w", err)
 	}
+	filtered := make([]model.MihomoInbound, 0, len(inbounds))
+	for _, inbound := range inbounds {
+		if isRemovedMihomoInboundType(inbound.Type) || !isSupportedMihomoInboundType(inbound.Type) {
+			continue
+		}
+		filtered = append(filtered, inbound)
+	}
 
-	document := buildMihomoInboundMetaDocument(inbounds)
+	document := buildMihomoInboundMetaDocument(filtered)
 	data, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal mihomo inbound metadata failed: %w", err)

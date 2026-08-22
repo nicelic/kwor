@@ -68,7 +68,7 @@ func (j *JsonService) GetJson(subId string, format string) (*string, []string, e
 		return nil, nil, err
 	}
 
-	return j.buildJSONSubscription(client, inDatas)
+	return j.buildJSONSubscriptionForNamespace(client, inDatas, "default")
 }
 
 func (j *JsonService) GetMihomoJson(subId string, format string) (*string, []string, error) {
@@ -77,11 +77,15 @@ func (j *JsonService) GetMihomoJson(subId string, format string) (*string, []str
 		return nil, nil, err
 	}
 
-	return j.buildJSONSubscription(client, inDatas)
+	return j.buildJSONSubscriptionForNamespace(client, inDatas, "mihomo")
 }
 
 func (j *JsonService) buildJSONSubscription(client *model.Client, inDatas []*model.Inbound) (*string, []string, error) {
-	outbounds, outTags, err := j.getOutbounds(client.Name, client.Config, inDatas)
+	return j.buildJSONSubscriptionForNamespace(client, inDatas, "default")
+}
+
+func (j *JsonService) buildJSONSubscriptionForNamespace(client *model.Client, inDatas []*model.Inbound, namespace string) (*string, []string, error) {
+	outbounds, outTags, err := j.getOutboundsForNamespace(client.Name, client.Config, inDatas, namespace)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -97,6 +101,9 @@ func (j *JsonService) buildJSONSubscription(client *model.Client, inDatas []*mod
 			*outbounds = append(*outbounds, *json)
 			*outTags = append(*outTags, tag)
 		}
+	}
+	if namespace == "mihomo" {
+		filterMihomoJSONUnsupportedOutbounds(outbounds, outTags)
 	}
 	*outbounds, *outTags = util.FilterTaggedSubscriptionOutbounds(
 		*outbounds,
@@ -127,6 +134,66 @@ func (j *JsonService) buildJSONSubscription(client *model.Client, inDatas []*mod
 	headers := util.GetHeaders(client, updateInterval)
 
 	return &resultStr, headers, nil
+}
+
+// Mihomo's Shadowsocks shadow-tls plugin has a direct sing-box equivalent:
+// a Shadowsocks outbound detoured through a ShadowTLS outbound. Other Mihomo
+// wrapper modes still have no canonical sing-box JSON representation.
+func filterMihomoJSONUnsupportedOutbounds(outbounds *[]map[string]interface{}, outTags *[]string) {
+	if outbounds == nil || outTags == nil {
+		return
+	}
+	filteredOutbounds := make([]map[string]interface{}, 0, len(*outbounds))
+	filteredTags := make([]string, 0, len(*outTags))
+	for index, outbound := range *outbounds {
+		if ssOutbound, shadowTLSOutbound, ok := util.BuildMihomoShadowsocksShadowTLSClientPair(outbound); ok {
+			filteredOutbounds = append(filteredOutbounds, ssOutbound, shadowTLSOutbound)
+			tag := ""
+			if index < len(*outTags) {
+				tag = strings.TrimSpace((*outTags)[index])
+			}
+			if tag == "" {
+				tag = strings.TrimSpace(firstString(ssOutbound["tag"]))
+			}
+			if tag != "" {
+				filteredTags = append(filteredTags, tag)
+			}
+			continue
+		}
+		if mihomoJSONOutboundUsesWrapperTLS(outbound) {
+			continue
+		}
+		filteredOutbounds = append(filteredOutbounds, outbound)
+		if index < len(*outTags) {
+			filteredTags = append(filteredTags, (*outTags)[index])
+		}
+	}
+	*outbounds = filteredOutbounds
+	*outTags = filteredTags
+}
+
+func mihomoJSONOutboundUsesWrapperTLS(outbound map[string]interface{}) bool {
+	if outbound == nil {
+		return false
+	}
+	outboundType := strings.ToLower(strings.TrimSpace(firstString(outbound["type"])))
+	if outboundType == "shadowtls" {
+		return true
+	}
+	if outboundType == "shadowsocks" {
+		plugin := strings.ToLower(strings.TrimSpace(firstString(outbound["plugin"])))
+		if plugin == "shadow-tls" || plugin == "shadowtls" || plugin == "restls" || plugin == "res-tls" || plugin == "jls" {
+			return true
+		}
+	}
+	if tlsMap, ok := outbound["tls"].(map[string]interface{}); ok && tlsMap != nil {
+		for _, key := range []string{"shadow_tls_opts", "restls_opts", "jls_opts"} {
+			if _, exists := tlsMap[key]; exists {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (j *JsonService) loadSubJSONExtension() (map[string]interface{}, error) {
@@ -356,6 +423,11 @@ func (j *JsonService) getOutboundsForNamespace(clientName string, clientConfig j
 			util.SanitizeOptionalNetworkField(outbound)
 		}
 
+		// Standalone ShadowTLS remains supported by the default chain only. The
+		// Mihomo design now uses Shadowsocks plus a mihomo_TLS wrapper instead.
+		if namespace == "mihomo" && protocol == "shadowtls" {
+			continue
+		}
 		// ShadowTLS: 生成 shadowsocks + shadowtls 两个出站
 		if protocol == "shadowtls" {
 			ssOutbound, stlsOutbound := j.buildShadowTLSOutbounds(outbound, configs, inData)
@@ -370,32 +442,17 @@ func (j *JsonService) getOutboundsForNamespace(clientName string, clientConfig j
 					outbounds = append(outbounds, stlsOutbound)
 				} else {
 					for index, addr := range addrs {
-						// Clone shadowsocks outbound
-						newSsOut := make(map[string]interface{}, len(ssOutbound))
-						for k, v := range ssOutbound {
-							newSsOut[k] = v
-						}
-						// Clone shadowtls outbound
-						newStlsOut := make(map[string]interface{}, len(stlsOutbound))
-						for k, v := range stlsOutbound {
-							newStlsOut[k] = v
-						}
+						// Each address is an independent subscription variant.
+						// A shallow copy would make their nested TLS maps share
+						// state and let a later address overwrite an earlier one.
+						newSsOut := util.CloneJSONMap(ssOutbound)
+						newStlsOut := util.CloneJSONMap(stlsOutbound)
 						// 更新 server/port
 						newStlsOut["server"], _ = addr["server"].(string)
 						port, _ := addr["server_port"].(float64)
 						newStlsOut["server_port"] = int(port)
 
-						// Override TLS
-						if addrTls, ok := addr["tls"].(map[string]interface{}); ok {
-							outTls, _ := newStlsOut["tls"].(map[string]interface{})
-							if outTls == nil {
-								outTls = make(map[string]interface{})
-							}
-							for key, value := range addrTls {
-								outTls[key] = value
-							}
-							newStlsOut["tls"] = outTls
-						}
+						applySubscriptionAddressTLS(newStlsOut, addr)
 
 						remark, _ := addr["remark"].(string)
 						newTag := fmt.Sprintf("%d.%s%s", index+1, tag, remark)
@@ -469,26 +526,14 @@ func (j *JsonService) getOutboundsForNamespace(clientName string, clientConfig j
 		} else {
 			for index, addr := range addrs {
 				for _, variant := range outboundVariants {
-					newOut := make(map[string]interface{}, len(variant))
-					for key, value := range variant {
-						newOut[key] = value
-					}
+					newOut := util.CloneJSONMap(variant)
 					newOut["server"], _ = addr["server"].(string)
 					port, _ := addr["server_port"].(float64)
 					if protocol != "mieru" || strings.TrimSpace(firstString(newOut["port_range"])) == "" {
 						newOut["server_port"] = int(port)
 					}
 
-					if addrTls, ok := addr["tls"].(map[string]interface{}); ok {
-						outTls, _ := newOut["tls"].(map[string]interface{})
-						if outTls == nil {
-							outTls = make(map[string]interface{})
-						}
-						for key, value := range addrTls {
-							outTls[key] = value
-						}
-						newOut["tls"] = outTls
-					}
+					applySubscriptionAddressTLS(newOut, addr)
 
 					remark, _ := addr["remark"].(string)
 					variantTag, _ := variant["tag"].(string)
@@ -504,6 +549,27 @@ func (j *JsonService) getOutboundsForNamespace(clientName string, clientConfig j
 		}
 	}
 	return &outbounds, &outTags, nil
+}
+
+func applySubscriptionAddressTLS(outbound map[string]interface{}, address map[string]interface{}) {
+	if outbound == nil || address == nil {
+		return
+	}
+
+	addressTLS, ok := address["tls"].(map[string]interface{})
+	if !ok || addressTLS == nil {
+		return
+	}
+
+	outboundTLS, _ := outbound["tls"].(map[string]interface{})
+	outboundTLS = util.CloneJSONMap(outboundTLS)
+	if outboundTLS == nil {
+		outboundTLS = map[string]interface{}{}
+	}
+	for key, value := range util.CloneJSONMap(addressTLS) {
+		outboundTLS[key] = value
+	}
+	outbound["tls"] = outboundTLS
 }
 
 func shouldSkipSubscriptionClientConfigKey(namespace string, protocol string, key string, hasTLS bool) bool {
@@ -945,10 +1011,12 @@ func stripMihomoFields(outbounds *[]map[string]interface{}) {
 		// Keep a defensive sanitize step here so callers that only invoke
 		// stripMihomoFields still produce sing-box-safe transport blocks.
 		util.SanitizeSingboxSubscriptionOutbound((*outbounds)[i])
+		util.PromoteHysteria2ReceiveWindowsToSingbox((*outbounds)[i])
 		delete((*outbounds)[i], "mihomo_common")
 		delete((*outbounds)[i], "mihomo_hy2")
 		delete((*outbounds)[i], "mihomo_fast_open")
 		delete((*outbounds)[i], "fast_open")
+		delete((*outbounds)[i], "fast-open")
 		if tlsMap, ok := (*outbounds)[i]["tls"].(map[string]interface{}); ok {
 			delete(tlsMap, "mihomo_use_fingerprint")
 			delete(tlsMap, "fingerprint")

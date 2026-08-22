@@ -74,8 +74,12 @@ func BuildShadowTLSClientPair(outJSON map[string]interface{}, clientConfigs map[
 	if password, ok := ResolveShadowTLSClientPassword(version, clientConfigs, inboundOptions); ok {
 		stlsOutbound["password"] = password
 	}
-	if tls, ok := outJSON["tls"]; ok {
-		stlsOutbound["tls"] = tls
+	if tls, exists := outJSON["tls"]; exists {
+		if tlsMap, ok := tls.(map[string]interface{}); ok {
+			stlsOutbound["tls"] = CloneJSONMap(tlsMap)
+		} else {
+			stlsOutbound["tls"] = tls
+		}
 	}
 
 	if !hasSSConfig || ssConfig == nil {
@@ -90,6 +94,96 @@ func BuildShadowTLSClientPair(outJSON map[string]interface{}, clientConfigs map[
 	copyShadowTLSSSConfig(ssOutbound, ssConfig, true)
 
 	return ssOutbound, stlsOutbound
+}
+
+// BuildMihomoShadowsocksShadowTLSClientPair converts Mihomo's Shadowsocks
+// shadow-tls plugin projection into the equivalent sing-box detour pair.
+func BuildMihomoShadowsocksShadowTLSClientPair(outbound map[string]interface{}) (map[string]interface{}, map[string]interface{}, bool) {
+	if outbound == nil || !strings.EqualFold(strings.TrimSpace(shadowTLSString(outbound["type"])), "shadowsocks") {
+		return nil, nil, false
+	}
+
+	plugin := strings.ToLower(strings.TrimSpace(shadowTLSString(outbound["plugin"])))
+	if plugin != "shadow-tls" && plugin != "shadowtls" {
+		return nil, nil, false
+	}
+
+	pluginOpts, ok := outbound["plugin_opts"].(map[string]interface{})
+	if !ok || pluginOpts == nil {
+		pluginOpts, ok = outbound["plugin-opts"].(map[string]interface{})
+	}
+	if !ok || pluginOpts == nil {
+		return nil, nil, false
+	}
+
+	version := ShadowTLSVersion(pluginOpts["version"])
+	if version < 1 || version > 3 {
+		return nil, nil, false
+	}
+
+	tag := strings.TrimSpace(shadowTLSString(outbound["tag"]))
+	server := strings.TrimSpace(shadowTLSString(outbound["server"]))
+	serverPort, hasServerPort := outbound["server_port"]
+	if tag == "" || server == "" || !hasServerPort || serverPort == nil {
+		return nil, nil, false
+	}
+
+	ssOutbound := cloneShadowTLSMap(outbound)
+	for _, key := range []string{
+		"server", "server_port", "tls", "plugin", "plugin_opts", "plugin-opts",
+		"client_fingerprint", "client-fingerprint",
+	} {
+		delete(ssOutbound, key)
+	}
+	ssOutbound["type"] = "shadowsocks"
+	ssOutbound["tag"] = tag
+	ssOutbound["detour"] = tag + "-out"
+
+	stlsOutbound := map[string]interface{}{
+		"type":        "shadowtls",
+		"tag":         tag + "-out",
+		"server":      server,
+		"server_port": serverPort,
+		"version":     version,
+	}
+	if version >= 2 {
+		password, ok := pluginOpts["password"].(string)
+		if !ok || strings.TrimSpace(password) == "" {
+			return nil, nil, false
+		}
+		stlsOutbound["password"] = password
+	}
+
+	tls := map[string]interface{}{}
+	if currentTLS, ok := outbound["tls"].(map[string]interface{}); ok && currentTLS != nil {
+		tls = cloneShadowTLSMap(currentTLS)
+	}
+	for _, key := range []string{"shadow_tls_opts", "restls_opts", "jls_opts"} {
+		delete(tls, key)
+	}
+	tls["enabled"] = true
+
+	host := strings.TrimSpace(shadowTLSString(pluginOpts["host"]))
+	if host == "" {
+		host = strings.TrimSpace(shadowTLSString(tls["server_name"]))
+	}
+	if host == "" {
+		host = server
+	}
+	tls["server_name"] = host
+
+	if fingerprint := firstShadowTLSClientFingerprint(outbound); fingerprint != "" {
+		utls := map[string]interface{}{}
+		if currentUTLS, ok := tls["utls"].(map[string]interface{}); ok && currentUTLS != nil {
+			utls = cloneShadowTLSMap(currentUTLS)
+		}
+		utls["enabled"] = true
+		utls["fingerprint"] = fingerprint
+		tls["utls"] = utls
+	}
+	stlsOutbound["tls"] = tls
+
+	return ssOutbound, stlsOutbound, true
 }
 
 // BuildShadowTLSRuntimeOutboundPairMap converts one stored ShadowTLS outbound into runtime outbounds.
@@ -261,7 +355,7 @@ func copyShadowTLSSSConfig(dst map[string]interface{}, ssConfig map[string]inter
 	}
 	if multiplex, ok := ssConfig["multiplex"].(map[string]interface{}); ok && multiplex != nil {
 		if preserveDisabledMultiplex || shadowTLSMultiplexEnabled(multiplex) {
-			dst["multiplex"] = multiplex
+			dst["multiplex"] = CloneJSONMap(multiplex)
 		}
 	}
 }
@@ -272,11 +366,21 @@ func shadowTLSMultiplexEnabled(multiplex map[string]interface{}) bool {
 }
 
 func cloneShadowTLSMap(src map[string]interface{}) map[string]interface{} {
-	dst := make(map[string]interface{}, len(src))
-	for key, value := range src {
-		dst[key] = value
+	return CloneJSONMap(src)
+}
+
+func shadowTLSString(raw interface{}) string {
+	value, _ := raw.(string)
+	return value
+}
+
+func firstShadowTLSClientFingerprint(outbound map[string]interface{}) string {
+	for _, key := range []string{"client_fingerprint", "client-fingerprint"} {
+		if value := strings.TrimSpace(shadowTLSString(outbound[key])); value != "" {
+			return value
+		}
 	}
-	return dst
+	return ""
 }
 
 func splitHostFromAddress(address string) (string, bool) {

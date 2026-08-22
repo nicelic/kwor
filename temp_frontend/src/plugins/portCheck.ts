@@ -38,9 +38,13 @@ export interface PortCheckResponse {
 
 export const PORT_RANGE_TEMPLATE = '2080-3000, 5000:6000, 55100'
 
-export async function checkPortOccupancy(req: PortCheckRequest): Promise<PortCheckResponse | null> {
+export async function checkPortOccupancy(
+  req: PortCheckRequest,
+  options: { signal?: AbortSignal } = {},
+): Promise<PortCheckResponse | null> {
   // This endpoint binds JSON body on backend; force JSON to avoid form-encoding parse errors.
   const msg = await HttpUtils.post('api/portOccupancy', req, {
+		...options,
     headers: {
       'Content-Type': 'application/json'
     }

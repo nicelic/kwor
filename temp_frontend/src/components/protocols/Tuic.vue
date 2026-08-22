@@ -74,12 +74,12 @@
           :label="$t('types.tuic.hb')"
           hide-details
           type="number"
-          :suffix="$t('date.s')"
+          suffix="ms"
           min="1"
-          v-model.number="heartbeat_seconds"
+          v-model.number="heartbeat_ms"
         ></v-text-field>
       </v-col>
-      <v-col v-if="showMihomoInboundFields" cols="12" sm="6" md="4">
+      <v-col v-if="showInboundMaxIdleTime" cols="12" sm="6" md="4">
         <v-text-field
           v-model.number="max_idle_time_ms"
           label="Max Idle Time"
@@ -146,14 +146,6 @@
           hide-details
         ></v-switch>
       </v-col>
-      <v-col cols="12" sm="6" md="4">
-        <v-switch
-          color="primary"
-          label="fast-open"
-          v-model="optionMihomoFastOpen"
-          hide-details
-        ></v-switch>
-      </v-col>
     </v-row>
 
   </v-card>
@@ -162,42 +154,34 @@
 <script lang="ts">
 import Network from '@/components/Network.vue'
 
+function parsePositiveInteger(value: unknown): number | undefined {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value > 0 ? value : undefined
+  }
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim()
+  if (!/^\d+$/.test(normalized)) return undefined
+  const parsed = Number(normalized)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined
+}
+
 function readMilliseconds(value: unknown): number | '' {
-  if (typeof value !== 'string' || value.trim() === '') return ''
+  if (typeof value === 'number') {
+    return parsePositiveInteger(value) ?? ''
+  }
+  if (typeof value !== 'string') return ''
   const normalized = value.trim().toLowerCase()
-  if (normalized.endsWith('ms')) {
-    const parsed = parseInt(normalized.slice(0, -2), 10)
-    return Number.isFinite(parsed) ? parsed : ''
-  }
-  if (normalized.endsWith('s')) {
-    const parsed = parseInt(normalized.slice(0, -1), 10)
-    return Number.isFinite(parsed) ? parsed * 1000 : ''
-  }
-  const parsed = parseInt(normalized, 10)
-  return Number.isFinite(parsed) ? parsed : ''
+  const matched = normalized.match(/^(\d+)(ms|s)?$/)
+  if (!matched) return ''
+  const numeric = parsePositiveInteger(matched[1])
+  if (numeric === undefined) return ''
+  const milliseconds = matched[2] === 's' ? numeric * 1000 : numeric
+  return Number.isSafeInteger(milliseconds) ? milliseconds : ''
 }
 
-function writeMilliseconds(value: number): string {
-  return value ? `${value}ms` : ''
-}
-
-function readSeconds(value: unknown): number | '' {
-  if (typeof value !== 'string' || value.trim() === '') return ''
-  const normalized = value.trim().toLowerCase()
-  if (normalized.endsWith('ms')) {
-    const parsed = parseInt(normalized.slice(0, -2), 10)
-    return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : ''
-  }
-  if (normalized.endsWith('s')) {
-    const parsed = parseInt(normalized.slice(0, -1), 10)
-    return Number.isFinite(parsed) ? parsed : ''
-  }
-  const parsed = parseInt(normalized, 10)
-  return Number.isFinite(parsed) ? parsed : ''
-}
-
-function writeSeconds(value: number): string {
-  return value ? `${value}s` : ''
+function writeMilliseconds(value: unknown): string | undefined {
+  const normalized = parsePositiveInteger(value)
+  return normalized === undefined ? undefined : `${normalized}ms`
 }
 
 export default {
@@ -208,6 +192,28 @@ export default {
         'cubic', 'new_reno', 'bbr'
       ]
     }
+  },
+  methods: {
+    sanitizeMihomoUnsupportedFields() {
+      if (this.$props.namespace !== 'mihomo') return
+      if (this.$props.direction === 'out') {
+        delete this.$props.data.network
+        return
+      }
+      if (this.$props.direction === 'in') {
+        for (const key of [
+          'fast_open', 'mihomo_fast_open', 'fast-open',
+          'zero_rtt_handshake', 'heartbeat', 'network', 'udp_relay_mode',
+          'udp_over_stream', 'udp_over_stream_version', 'ip', 'request_timeout',
+          'max_open_streams', 'max_datagram_frame_size', 'disable_mtu_discovery',
+        ]) {
+          delete this.$props.data[key]
+        }
+      }
+    },
+  },
+  mounted() {
+    this.sanitizeMihomoUnsupportedFields()
   },
   computed: {
     isMihomoNamespace(): boolean {
@@ -222,39 +228,23 @@ export default {
     showMihomoInboundFields(): boolean {
       return this.$props.direction === 'in' && this.isMihomoNamespace
     },
+    showInboundMaxIdleTime(): boolean {
+      return this.$props.direction === 'in'
+    },
     showNetwork(): boolean {
       return this.$props.direction === 'out' && !this.showMihomoOutboundFields
     },
-    fastOpenStore(): any {
-      if (this.$props.direction === 'in') {
-        if (!this.$props.data.out_json || typeof this.$props.data.out_json !== 'object') {
-          this.$props.data.out_json = {}
-        }
-        return this.$props.data.out_json
-      }
-      return this.$props.data
-    },
-    optionMihomoFastOpen: {
-      get(): boolean {
-        if (!this.isMihomoNamespace) return false
-        return this.fastOpenStore.mihomo_fast_open === true
-      },
-      set(newValue: boolean) {
-        if (!this.isMihomoNamespace) return
-        this.fastOpenStore.mihomo_fast_open = newValue
-      }
-    },
     auth_timeout_ms: {
       get() { return readMilliseconds(this.$props.data.auth_timeout) },
-      set(newValue: number) { this.$props.data.auth_timeout = writeMilliseconds(newValue) }
+      set(newValue: unknown) { this.$props.data.auth_timeout = writeMilliseconds(newValue) }
     },
     max_idle_time_ms: {
       get() { return readMilliseconds(this.$props.data.max_idle_time) },
-      set(newValue: number) { this.$props.data.max_idle_time = writeMilliseconds(newValue) }
+      set(newValue: unknown) { this.$props.data.max_idle_time = writeMilliseconds(newValue) }
     },
     request_timeout_ms: {
       get() { return readMilliseconds(this.$props.data.request_timeout) },
-      set(newValue: number) { this.$props.data.request_timeout = writeMilliseconds(newValue) }
+      set(newValue: unknown) { this.$props.data.request_timeout = writeMilliseconds(newValue) }
     },
     showZeroRtt(): boolean {
       return !(this.$props.direction === 'in' && this.isMihomoNamespace)
@@ -262,34 +252,45 @@ export default {
     showHeartbeat(): boolean {
       return !(this.$props.direction === 'in' && this.isMihomoNamespace)
     },
-    heartbeat_seconds: {
-      get() { return readSeconds(this.$props.data.heartbeat) },
-      set(newValue: number) { this.$props.data.heartbeat = writeSeconds(newValue) }
+    heartbeat_ms: {
+      get() { return readMilliseconds(this.$props.data.heartbeat) },
+      set(newValue: unknown) { this.$props.data.heartbeat = writeMilliseconds(newValue) }
     },
     max_open_streams: {
-      get(): number | '' { return this.$props.data.max_open_streams ?? '' },
-      set(newValue: number) { this.$props.data.max_open_streams = newValue || undefined }
+      get(): number | '' { return parsePositiveInteger(this.$props.data.max_open_streams) ?? '' },
+      set(newValue: unknown) { this.$props.data.max_open_streams = parsePositiveInteger(newValue) }
     },
     max_udp_relay_packet_size: {
-      get(): number | '' { return this.$props.data.max_udp_relay_packet_size ?? '' },
-      set(newValue: number) { this.$props.data.max_udp_relay_packet_size = newValue || undefined }
+      get(): number | '' { return parsePositiveInteger(this.$props.data.max_udp_relay_packet_size) ?? '' },
+      set(newValue: unknown) { this.$props.data.max_udp_relay_packet_size = parsePositiveInteger(newValue) }
     },
     cwnd: {
-      get(): number | '' { return this.$props.data.cwnd ?? '' },
-      set(newValue: number) { this.$props.data.cwnd = newValue || undefined }
+      get(): number | '' { return parsePositiveInteger(this.$props.data.cwnd) ?? '' },
+      set(newValue: unknown) { this.$props.data.cwnd = parsePositiveInteger(newValue) }
     },
     max_datagram_frame_size: {
-      get(): number | '' { return this.$props.data.max_datagram_frame_size ?? '' },
-      set(newValue: number) { this.$props.data.max_datagram_frame_size = newValue || undefined }
+      get(): number | '' { return parsePositiveInteger(this.$props.data.max_datagram_frame_size) ?? '' },
+      set(newValue: unknown) { this.$props.data.max_datagram_frame_size = parsePositiveInteger(newValue) }
     },
     udp_over_stream_version: {
-      get(): number | '' { return this.$props.data.udp_over_stream_version ?? '' },
-      set(newValue: number) { this.$props.data.udp_over_stream_version = newValue || undefined }
+      get(): number | '' { return parsePositiveInteger(this.$props.data.udp_over_stream_version) ?? '' },
+      set(newValue: unknown) { this.$props.data.udp_over_stream_version = parsePositiveInteger(newValue) }
     },
     ip: {
       get(): string { return this.$props.data.ip ?? '' },
       set(newValue: string) { this.$props.data.ip = newValue?.trim() ? newValue.trim() : undefined }
     }
+  },
+  watch: {
+    data() {
+      this.sanitizeMihomoUnsupportedFields()
+    },
+    direction() {
+      this.sanitizeMihomoUnsupportedFields()
+    },
+    namespace() {
+      this.sanitizeMihomoUnsupportedFields()
+    },
   },
   components: { Network }
 }

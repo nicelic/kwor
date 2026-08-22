@@ -19,6 +19,7 @@ import (
 	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/util/common"
+	"golang.org/x/sync/singleflight"
 	"gorm.io/gorm"
 )
 
@@ -40,6 +41,9 @@ const (
 	firewallProtocolICMPv4 = "icmp_v4"
 	firewallProtocolICMPv6 = "icmp_v6"
 
+	firewallSourceModeBlock = "block"
+	firewallSourceModeAllow = "allow"
+
 	firewallOriginSystem    = "system"
 	firewallOriginManual    = "manual"
 	firewallOriginTemporary = "temporary"
@@ -50,6 +54,18 @@ const (
 	firewallSystemSub   = "sub"
 
 	firewallInputChain = "panel_input"
+
+	firewallMaxManualRules      = 256
+	firewallMaxExternalRules    = 256
+	firewallMaxOverviewRules    = 512
+	firewallExternalScanGap     = 15 * time.Minute
+	firewallManagedIntegrityGap = 5 * time.Minute
+
+	firewallMaxRuleNameBytes        = 256
+	firewallMaxRuleDescriptionBytes = 4096
+	firewallMaxPortSpecBytes        = 2048
+	firewallMaxSourceSpecBytes      = 16 * 1024
+	firewallMaxSourceEntries        = 1024
 )
 
 var (
@@ -61,15 +77,19 @@ var (
 
 	firewallStateMu sync.Mutex
 	firewallState   = struct {
-		lastRenderHash  string
-		lastRuntimeHash string
-		lastReconcile   time.Time
-		lastError       string
+		lastRenderHash     string
+		lastRuntimeHash    string
+		lastReconcile      time.Time
+		lastExternalScan   time.Time
+		lastIntegrityCheck time.Time
+		lastError          string
 	}{}
 	firewallOverviewRuntimeMu sync.RWMutex
 	firewallOverviewRuntime   struct {
-		lastError string
+		lastError  string
+		lastSyncAt int64
 	}
+	firewallOverviewFlight singleflight.Group
 )
 
 type FirewallService struct {
@@ -77,13 +97,14 @@ type FirewallService struct {
 }
 
 type FirewallRulePayload struct {
-	ID          uint   `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Family      string `json:"family"`
-	Protocol    string `json:"protocol"`
-	PortSpec    string `json:"portSpec"`
-	SourceSpec  string `json:"sourceSpec"`
+	ID          uint    `json:"id"`
+	Name        string  `json:"name"`
+	Description string  `json:"description"`
+	Family      string  `json:"family"`
+	Protocol    string  `json:"protocol"`
+	PortSpec    string  `json:"portSpec"`
+	SourceSpec  string  `json:"sourceSpec"`
+	SourceMode  *string `json:"sourceMode"`
 }
 
 type FirewallRuleView struct {
@@ -131,6 +152,13 @@ type FirewallOverview struct {
 	Error                    string                  `json:"error,omitempty"`
 }
 
+// FirewallRuntimeOverview is the lightweight active-page polling payload.
+// It intentionally avoids SQLite, nft, SSH config, and /proc scans.
+type FirewallRuntimeOverview struct {
+	LastSyncAt int64  `json:"lastSyncAt"`
+	Error      string `json:"error"`
+}
+
 type firewallObservedRule struct {
 	Family      string
 	TableFamily string
@@ -165,6 +193,28 @@ func firewallProtocolNeedsPort(protocol string) bool {
 
 func firewallProtocolNeedsSource(protocol string) bool {
 	return !firewallProtocolIsICMP(protocol)
+}
+
+func normalizeFirewallSourceMode(raw string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(raw))
+	switch mode {
+	case "":
+		return "", nil
+	case firewallSourceModeBlock, firewallSourceModeAllow:
+		return mode, nil
+	default:
+		return "", common.NewError("unsupported firewall source mode: ", raw)
+	}
+}
+
+func effectiveFirewallSourceMode(row model.FirewallRule) string {
+	mode := strings.ToLower(strings.TrimSpace(row.SourceMode))
+	if mode == "" && row.Origin != firewallOriginExternal && strings.TrimSpace(row.SourceSpec) != "" {
+		// SourceMode was added after SourceSpec. Existing managed rows with a
+		// source filter must retain their historical allowlist behavior.
+		return firewallSourceModeAllow
+	}
+	return mode
 }
 
 func normalizeFirewallRuleFamily(raw string, protocol string) string {
@@ -220,6 +270,20 @@ func firewallStaticComment(name string) string {
 }
 
 func (s *FirewallService) GetOverview() (*FirewallOverview, error) {
+	value, err, _ := firewallOverviewFlight.Do("firewall-overview", func() (interface{}, error) {
+		return s.getOverview()
+	})
+	if err != nil {
+		return nil, err
+	}
+	overview, ok := value.(*FirewallOverview)
+	if !ok || overview == nil {
+		return nil, errors.New("invalid firewall overview result")
+	}
+	return overview, nil
+}
+
+func (s *FirewallService) getOverview() (*FirewallOverview, error) {
 	enabled, err := s.getFirewallEnabledLocked()
 	if err != nil {
 		return nil, err
@@ -230,31 +294,22 @@ func (s *FirewallService) GetOverview() (*FirewallOverview, error) {
 
 	defaults := resolveFirewallDefaultPorts()
 	lastSyncAt, _ := s.getFirewallLastSyncAtLocked()
-	rows, err := loadFirewallRulesLocked()
+	rows, overviewTruncated, err := loadFirewallOverviewRulesLocked()
 	if err != nil {
 		return nil, err
 	}
 	defaults = applyFirewallDefaultReservationStatus(defaults, rows)
 	listenerStates := buildFirewallRuleListenerStates(rows)
 	views := make([]FirewallRuleView, 0, len(rows))
-	manualCount := 0
-	temporaryCount := 0
-	externalCount := 0
-	systemCount := 0
+	manualCount, temporaryCount, externalCount, systemCount, totalCount, err := loadFirewallRuleOverviewCountsLocked()
+	if err != nil {
+		return nil, err
+	}
 	for _, row := range rows {
 		if row.Origin == firewallOriginSystem && !row.Enabled {
 			continue
 		}
-		switch row.Origin {
-		case firewallOriginSystem:
-			systemCount++
-		case firewallOriginTemporary:
-			temporaryCount++
-		case firewallOriginExternal:
-			externalCount++
-		default:
-			manualCount++
-		}
+		row.SourceMode = effectiveFirewallSourceMode(row)
 		views = append(views, FirewallRuleView{
 			FirewallRule:  row,
 			CanEdit:       firewallRuleCanEdit(row),
@@ -296,18 +351,38 @@ func (s *FirewallService) GetOverview() (*FirewallOverview, error) {
 		TemporaryCount:           temporaryCount,
 		ExternalCount:            externalCount,
 		SystemCount:              systemCount,
-		TotalCount:               len(views),
+		TotalCount:               totalCount,
 		Rules:                    views,
 		GeoRuleCount:             len(geoViews),
 		GeoUpdateIntervalMinutes: geoUpdateIntervalMinutes,
 		GeoLastRefreshAt:         geoLastRefreshAt,
 		GeoRules:                 geoViews,
 	}
+	runtimeError, runtimeLastSyncAt := firewallRuntimeSnapshot()
+	if runtimeLastSyncAt > lastSyncAt {
+		overview.LastSyncAt = runtimeLastSyncAt
+	}
 	overview.Error = joinFirewallOverviewErrors(
 		buildFirewallNftablesOverviewError(nftStatus),
-		firewallReconcileErrorSnapshot(),
+		runtimeError,
+		firewallOverviewTruncationError(overviewTruncated),
 	)
 	return overview, nil
+}
+
+func firewallOverviewTruncationError(truncated bool) string {
+	if !truncated {
+		return ""
+	}
+	return fmt.Sprintf("firewall overview is limited to the first %d rules", firewallMaxOverviewRules)
+}
+
+func (s *FirewallService) GetRuntimeOverview() *FirewallRuntimeOverview {
+	errText, lastSyncAt := firewallRuntimeSnapshot()
+	return &FirewallRuntimeOverview{
+		LastSyncAt: lastSyncAt,
+		Error:      errText,
+	}
 }
 
 func joinFirewallOverviewErrors(parts ...string) string {
@@ -320,19 +395,37 @@ func joinFirewallOverviewErrors(parts ...string) string {
 	return strings.Join(filtered, " | ")
 }
 
-func firewallReconcileErrorSnapshot() string {
+func firewallRuntimeSnapshot() (string, int64) {
 	if firewallStateMu.TryLock() {
-		value := strings.TrimSpace(firewallState.lastError)
+		errorText := strings.TrimSpace(firewallState.lastError)
+		lastSyncAt := int64(0)
+		if !firewallState.lastReconcile.IsZero() {
+			lastSyncAt = firewallState.lastReconcile.Unix()
+		}
 		firewallStateMu.Unlock()
 		firewallOverviewRuntimeMu.Lock()
-		firewallOverviewRuntime.lastError = value
+		firewallOverviewRuntime.lastError = errorText
+		firewallOverviewRuntime.lastSyncAt = lastSyncAt
 		firewallOverviewRuntimeMu.Unlock()
-		return value
+		return errorText, lastSyncAt
 	}
 	firewallOverviewRuntimeMu.RLock()
-	value := firewallOverviewRuntime.lastError
+	errorText := firewallOverviewRuntime.lastError
+	lastSyncAt := firewallOverviewRuntime.lastSyncAt
 	firewallOverviewRuntimeMu.RUnlock()
+	return errorText, lastSyncAt
+}
+
+func firewallReconcileErrorSnapshot() string {
+	value, _ := firewallRuntimeSnapshot()
 	return value
+}
+
+func firewallLastReconcileUnixLocked() int64 {
+	if firewallState.lastReconcile.IsZero() {
+		return 0
+	}
+	return firewallState.lastReconcile.Unix()
 }
 
 func (s *FirewallService) SetEnabled(enabled bool) error {
@@ -378,6 +471,13 @@ func (s *FirewallService) UpsertRule(payload FirewallRulePayload) error {
 			}
 		}
 	} else {
+		var manualCount int64
+		if err := db.Model(&model.FirewallRule{}).Where("origin = ?", firewallOriginManual).Count(&manualCount).Error; err != nil {
+			return err
+		}
+		if manualCount >= firewallMaxManualRules {
+			return common.NewError("manual firewall rule limit reached: ", firewallMaxManualRules)
+		}
 		row = model.FirewallRule{
 			Enabled:   true,
 			Origin:    firewallOriginManual,
@@ -389,6 +489,12 @@ func (s *FirewallService) UpsertRule(payload FirewallRulePayload) error {
 	if name == "" {
 		name = "自定义规则"
 	}
+	if len(name) > firewallMaxRuleNameBytes {
+		return common.NewError("firewall rule name exceeds ", firewallMaxRuleNameBytes, " bytes")
+	}
+	if len(payload.Description) > firewallMaxRuleDescriptionBytes {
+		return common.NewError("firewall rule description exceeds ", firewallMaxRuleDescriptionBytes, " bytes")
+	}
 	protocol := normalizeFirewallProtocol(payload.Protocol)
 	if protocol == firewallProtocolAny {
 		return common.NewError("ANY protocol is no longer supported; choose TCP/UDP/TCP+UDP/ICMP")
@@ -398,12 +504,37 @@ func (s *FirewallService) UpsertRule(payload FirewallRulePayload) error {
 	if err != nil {
 		return err
 	}
+	if len(portSpec) > firewallMaxPortSpecBytes {
+		return common.NewError("firewall port specification exceeds ", firewallMaxPortSpecBytes, " bytes")
+	}
+	sourceModeRaw := ""
+	if payload.SourceMode != nil {
+		sourceModeRaw = *payload.SourceMode
+	} else if strings.TrimSpace(payload.SourceSpec) != "" {
+		// Keep older API clients working: before sourceMode existed, a
+		// non-empty SourceSpec always meant an allowlist.
+		sourceModeRaw = firewallSourceModeAllow
+	}
+	sourceMode, err := normalizeFirewallSourceMode(sourceModeRaw)
+	if err != nil {
+		return err
+	}
 	sourceSpec := ""
 	if firewallProtocolNeedsSource(protocol) {
-		sourceSpec, err = normalizeFirewallSourceSpec(payload.SourceSpec, family)
-		if err != nil {
-			return err
+		if sourceMode != "" {
+			sourceSpec, err = normalizeFirewallSourceSpec(payload.SourceSpec, family)
+			if err != nil {
+				return err
+			}
+			if sourceSpec == "" {
+				return common.NewError("firewall source mode requires at least one source IP/CIDR")
+			}
+			if len(sourceSpec) > firewallMaxSourceSpecBytes {
+				return common.NewError("firewall source specification exceeds ", firewallMaxSourceSpecBytes, " bytes")
+			}
 		}
+	} else if sourceMode != "" {
+		return common.NewError("ICMP rules do not support source address modes")
 	}
 
 	row.Name = name
@@ -416,6 +547,7 @@ func (s *FirewallService) UpsertRule(payload FirewallRulePayload) error {
 	row.Protocol = protocol
 	row.PortSpec = portSpec
 	row.SourceSpec = sourceSpec
+	row.SourceMode = sourceMode
 	row.ObservedFamily = ""
 	row.ObservedTable = ""
 	row.ObservedChain = ""
@@ -544,12 +676,16 @@ func (s *FirewallService) SetSystemRuleReserved(systemKey string, enabled bool) 
 func (s *FirewallService) SyncIfNeeded(minGap time.Duration) error {
 	firewallStateMu.Lock()
 	defer firewallStateMu.Unlock()
-	err := s.reconcileLocked(minGap)
+	err := s.reconcilePeriodicLocked(minGap)
 	if err != nil {
 		firewallState.lastError = strings.TrimSpace(err.Error())
 	} else {
 		firewallState.lastError = ""
 	}
+	firewallOverviewRuntimeMu.Lock()
+	firewallOverviewRuntime.lastError = firewallState.lastError
+	firewallOverviewRuntime.lastSyncAt = firewallLastReconcileUnixLocked()
+	firewallOverviewRuntimeMu.Unlock()
 	return err
 }
 
@@ -572,35 +708,44 @@ func (s *FirewallService) CleanupOnShutdown() {
 	firewallState.lastRenderHash = ""
 	firewallState.lastRuntimeHash = ""
 	firewallState.lastReconcile = time.Time{}
+	firewallState.lastExternalScan = time.Time{}
+	firewallState.lastIntegrityCheck = time.Time{}
 	firewallState.lastError = ""
 	firewallGeoState.loaded = make(map[uint]firewallGeoResolvedPrefixes)
 }
 
 func (s *FirewallService) enableLocked() error {
 	db := database.GetDB()
+	now := time.Now()
 
 	defaults := resolveFirewallDefaultPorts()
 	if err := upsertFirewallSystemRulesLocked(db, defaults); err != nil {
 		return err
 	}
-	observed, err := scanExternalFirewallRules()
-	if err != nil {
+	if err := s.syncFirewallGeoCacheLocked(false); err != nil {
 		return err
 	}
-	if err := syncExternalFirewallRulesLocked(db, observed); err != nil {
-		return err
+	if firewallState.lastExternalScan.IsZero() || now.Sub(firewallState.lastExternalScan) >= firewallExternalScanGap {
+		observed, err := scanExternalFirewallRules()
+		if err != nil {
+			return err
+		}
+		if err := syncExternalFirewallRulesLocked(db, observed); err != nil {
+			return err
+		}
+		firewallState.lastExternalScan = now
 	}
 	if err := s.renderLocked(true); err != nil {
 		return err
 	}
-	now := time.Now()
+	now = time.Now()
 	if err := s.setFirewallEnabledLocked(true); err != nil {
 		return err
 	}
 	if err := s.setFirewallLastSyncAtLocked(now.Unix()); err != nil {
 		return err
 	}
-	firewallState.lastReconcile = now
+	firewallState.lastReconcile = time.Now()
 	return nil
 }
 
@@ -617,37 +762,60 @@ func (s *FirewallService) disableLocked() error {
 	firewallState.lastRenderHash = ""
 	firewallState.lastRuntimeHash = ""
 	firewallState.lastReconcile = time.Time{}
+	firewallState.lastExternalScan = time.Time{}
+	firewallState.lastIntegrityCheck = time.Time{}
 	firewallGeoState.loaded = make(map[uint]firewallGeoResolvedPrefixes)
 	return nil
 }
 
 func (s *FirewallService) reconcileLocked(minGap time.Duration) error {
+	return s.reconcileLockedWithExtraSSHPortsAndGeoRefresh(minGap, nil, false)
+}
+
+func (s *FirewallService) reconcileLockedWithExtraSSHPorts(minGap time.Duration, extraSSHPorts []int) error {
+	return s.reconcileLockedWithExtraSSHPortsAndGeoRefresh(minGap, extraSSHPorts, false)
+}
+
+func (s *FirewallService) reconcilePeriodicLocked(minGap time.Duration) error {
+	return s.reconcileLockedWithExtraSSHPortsAndGeoRefresh(minGap, nil, true)
+}
+
+func (s *FirewallService) reconcileLockedWithExtraSSHPortsAndGeoRefresh(minGap time.Duration, extraSSHPorts []int, allowGeoAutoRefresh bool) error {
 	enabled, err := s.getFirewallEnabledLocked()
 	if err != nil {
 		return err
 	}
-
 	db := database.GetDB()
 	if err := cleanupExpiredTemporaryFirewallRulesLocked(time.Now().Unix(), false); err != nil {
 		return err
 	}
 	defaults := resolveFirewallDefaultPorts()
+	if len(extraSSHPorts) > 0 {
+		sshPorts := append([]int{}, defaults.SSH...)
+		sshPorts = append(sshPorts, extraSSHPorts...)
+		defaults.SSH = normalizePortList(sshPorts)
+	}
 	if err := upsertFirewallSystemRulesLocked(db, defaults); err != nil {
 		return err
 	}
 
 	if !enabled {
-		if err := s.syncFirewallGeoCacheLocked(false); err != nil {
-			return err
-		}
-		if firewallTableExists() {
-			if err := cleanupManagedFirewallTable(); err != nil {
-				return err
-			}
-		}
+		// A disabled firewall must not keep launching nft probes or remote GeoIP
+		// refreshes from the periodic job. Explicit disable and lifecycle cleanup
+		// already remove the managed table; GeoIP refresh resumes when enabled.
 		firewallState.lastRenderHash = ""
 		firewallState.lastRuntimeHash = ""
+		firewallState.lastIntegrityCheck = time.Time{}
 		firewallGeoState.loaded = make(map[uint]firewallGeoResolvedPrefixes)
+		firewallState.lastReconcile = time.Now()
+		return nil
+	}
+
+	// Check the caller's minimum interval before probing nftables capabilities.
+	// The cron job still maintains the database mirror above, but repeated
+	// background ticks do not need to spawn nft subprocesses until a sync is due.
+	now := time.Now()
+	if minGap > 0 && !firewallState.lastReconcile.IsZero() && now.Sub(firewallState.lastReconcile) < minGap {
 		return nil
 	}
 	if !firewallSupportedFn() {
@@ -656,22 +824,26 @@ func (s *FirewallService) reconcileLocked(minGap time.Duration) error {
 	if err := ensureNftRendererSupported(); err != nil {
 		return err
 	}
-
-	now := time.Now()
-	if minGap > 0 && !firewallState.lastReconcile.IsZero() && now.Sub(firewallState.lastReconcile) < minGap {
-		return nil
+	if allowGeoAutoRefresh {
+		if err := s.syncFirewallGeoCacheLocked(false); err != nil {
+			return err
+		}
 	}
 
-	observed, err := scanExternalFirewallRules()
-	if err != nil {
-		return err
-	}
-	if err := syncExternalFirewallRulesLocked(db, observed); err != nil {
-		return err
+	if firewallState.lastExternalScan.IsZero() || now.Sub(firewallState.lastExternalScan) >= firewallExternalScanGap {
+		observed, err := scanExternalFirewallRules()
+		if err != nil {
+			return err
+		}
+		if err := syncExternalFirewallRulesLocked(db, observed); err != nil {
+			return err
+		}
+		firewallState.lastExternalScan = now
 	}
 	if err := s.renderLocked(false); err != nil {
 		return err
 	}
+	now = time.Now()
 	if err := s.setFirewallLastSyncAtLocked(now.Unix()); err != nil {
 		return err
 	}
@@ -683,7 +855,7 @@ func (s *FirewallService) renderLocked(force bool) error {
 	if err := ensureNftRendererSupported(); err != nil {
 		return err
 	}
-	rows, err := loadFirewallRulesLocked()
+	rows, err := loadManagedFirewallRulesLocked()
 	if err != nil {
 		return err
 	}
@@ -693,6 +865,10 @@ func (s *FirewallService) renderLocked(force bool) error {
 	}
 	managedRows := filterFirewallRulesForRender(rows)
 	hash := computeFirewallRenderHash(managedRows, geoRows)
+	integrityDue := firewallState.lastIntegrityCheck.IsZero() || time.Since(firewallState.lastIntegrityCheck) >= firewallManagedIntegrityGap
+	if !force && hash == firewallState.lastRenderHash && !integrityDue {
+		return nil
+	}
 	tableExists, ownershipErr := inspectOwnedNftTableForMutation(nftFamily, firewallNftTable)
 	if ownershipErr != nil {
 		return ownershipErr
@@ -707,6 +883,7 @@ func (s *FirewallService) renderLocked(force bool) error {
 		}
 	}
 	if !force && hash == firewallState.lastRenderHash && tableExists && runtimeHashBeforeApply != "" && runtimeHashBeforeApply == firewallState.lastRuntimeHash {
+		firewallState.lastIntegrityCheck = time.Now()
 		return nil
 	}
 
@@ -752,8 +929,10 @@ func (s *FirewallService) renderLocked(force bool) error {
 	if hashErr != nil {
 		logger.Warning("failed to refresh managed firewall runtime hash: ", hashErr)
 		firewallState.lastRuntimeHash = ""
+		firewallState.lastIntegrityCheck = time.Time{}
 	} else {
 		firewallState.lastRuntimeHash = runtimeHashAfterApply
+		firewallState.lastIntegrityCheck = time.Now()
 	}
 
 	return nil
@@ -774,6 +953,77 @@ func loadFirewallRulesLocked() ([]model.FirewallRule, error) {
 		return rows[i].Id < rows[j].Id
 	})
 	return rows, nil
+}
+
+func loadManagedFirewallRulesLocked() ([]model.FirewallRule, error) {
+	db := database.GetDB()
+	rows := make([]model.FirewallRule, 0)
+	if err := db.Where("origin IN ?", []string{firewallOriginSystem, firewallOriginManual, firewallOriginTemporary}).Order("id asc").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		left := firewallRuleSortKey(rows[i])
+		right := firewallRuleSortKey(rows[j])
+		if left != right {
+			return left < right
+		}
+		return rows[i].Id < rows[j].Id
+	})
+	return rows, nil
+}
+
+func loadFirewallOverviewRulesLocked() ([]model.FirewallRule, bool, error) {
+	db := database.GetDB()
+	rows := make([]model.FirewallRule, 0, firewallMaxOverviewRules+1)
+	if err := db.Order("CASE origin WHEN 'system' THEN 0 WHEN 'manual' THEN 1 WHEN 'temporary' THEN 2 WHEN 'external' THEN 3 ELSE 4 END, id asc").Limit(firewallMaxOverviewRules + 1).Find(&rows).Error; err != nil {
+		return nil, false, err
+	}
+	truncated := len(rows) > firewallMaxOverviewRules
+	if truncated {
+		rows = rows[:firewallMaxOverviewRules]
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		left := firewallRuleSortKey(rows[i])
+		right := firewallRuleSortKey(rows[j])
+		if left != right {
+			return left < right
+		}
+		return rows[i].Id < rows[j].Id
+	})
+	return rows, truncated, nil
+}
+
+func loadFirewallRuleOverviewCountsLocked() (int, int, int, int, int, error) {
+	db := database.GetDB()
+	rows := make([]struct {
+		Origin  string
+		Enabled bool
+		Count   int
+	}, 0, 4)
+	if err := db.Model(&model.FirewallRule{}).
+		Select("origin, enabled, COUNT(*) AS count").
+		Group("origin, enabled").
+		Scan(&rows).Error; err != nil {
+		return 0, 0, 0, 0, 0, err
+	}
+	manualCount, temporaryCount, externalCount, systemCount, totalCount := 0, 0, 0, 0, 0
+	for _, row := range rows {
+		if row.Origin == firewallOriginSystem && !row.Enabled {
+			continue
+		}
+		totalCount += row.Count
+		switch row.Origin {
+		case firewallOriginSystem:
+			systemCount += row.Count
+		case firewallOriginTemporary:
+			temporaryCount += row.Count
+		case firewallOriginExternal:
+			externalCount += row.Count
+		default:
+			manualCount += row.Count
+		}
+	}
+	return manualCount, temporaryCount, externalCount, systemCount, totalCount, nil
 }
 
 func firewallRuleSortKey(row model.FirewallRule) int {
@@ -859,11 +1109,25 @@ func buildManagedFirewallScript(rows []model.FirewallRule, geoRows []model.Firew
 	for _, args := range managedFirewallStaticRuleSpecs() {
 		appendFirewallScriptArgs(script, args)
 	}
+	sourcePlan, err := appendManagedFirewallSourceRulesScript(script, rows)
+	if err != nil {
+		return "", err
+	}
 	if err := appendManagedFirewallGeoRulesScript(script, geoRows); err != nil {
+		return "", err
+	}
+	if err := appendManagedFirewallSourceBlockFallbacksScript(script, sourcePlan, geoRows); err != nil {
 		return "", err
 	}
 	for _, row := range rows {
 		if !row.Enabled {
+			continue
+		}
+		sourceMode, err := firewallRuleSourceModeForRender(row)
+		if err != nil {
+			return "", err
+		}
+		if sourceMode != "" {
 			continue
 		}
 		targets, err := buildFirewallRenderTargets(row)
@@ -880,6 +1144,262 @@ func buildManagedFirewallScript(rows []model.FirewallRule, geoRows []model.Firew
 	}
 	appendFirewallScriptArgs(script, buildManagedFirewallFinalDropRuleArgs())
 	return script.String(), nil
+}
+
+type firewallSourceRenderRule struct {
+	row    model.FirewallRule
+	target firewallRenderTarget
+	mode   string
+}
+
+type firewallSourceFallbackRule struct {
+	row    model.FirewallRule
+	target firewallRenderTarget
+}
+
+type firewallSourceRenderPlan struct {
+	allowFallbacks []firewallSourceFallbackRule
+	blockFallbacks []firewallSourceFallbackRule
+}
+
+func firewallRuleSourceModeForRender(row model.FirewallRule) (string, error) {
+	return normalizeFirewallSourceMode(effectiveFirewallSourceMode(row))
+}
+
+func firewallSourceRenderKey(row model.FirewallRule, target firewallRenderTarget) string {
+	return strings.Join([]string{
+		target.family,
+		normalizeFirewallProtocol(row.Protocol),
+		row.PortSpec,
+	}, "|")
+}
+
+func firewallSourceFallbackComment(row model.FirewallRule, target firewallRenderTarget, suffix string) string {
+	return firewallRuleComment(row.Id, target.family) + "_source_" + suffix
+}
+
+func appendManagedFirewallSourceRulesScript(script *strings.Builder, rows []model.FirewallRule) (firewallSourceRenderPlan, error) {
+	renderRules := make([]firewallSourceRenderRule, 0)
+	allowFallbacks := make([]firewallSourceFallbackRule, 0)
+	blockFallbacks := make([]firewallSourceFallbackRule, 0)
+	seenAllowFallbacks := make(map[string]struct{})
+	seenBlockFallbacks := make(map[string]struct{})
+
+	for _, row := range rows {
+		if !row.Enabled {
+			continue
+		}
+		mode, err := firewallRuleSourceModeForRender(row)
+		if err != nil {
+			return firewallSourceRenderPlan{}, err
+		}
+		if mode == "" {
+			continue
+		}
+		targets, err := buildFirewallRenderTargets(row)
+		if err != nil {
+			return firewallSourceRenderPlan{}, err
+		}
+		fallbackTargets := append([]firewallRenderTarget(nil), targets...)
+		if row.Family == firewallFamilyDual {
+			hasIPv4 := false
+			hasIPv6 := false
+			for _, target := range targets {
+				hasIPv4 = hasIPv4 || target.family == firewallFamilyIPv4
+				hasIPv6 = hasIPv6 || target.family == firewallFamilyIPv6
+			}
+			if !hasIPv4 {
+				fallbackTargets = append(fallbackTargets, firewallRenderTarget{family: firewallFamilyIPv4})
+			}
+			if !hasIPv6 {
+				fallbackTargets = append(fallbackTargets, firewallRenderTarget{family: firewallFamilyIPv6})
+			}
+		}
+		for _, target := range targets {
+			if len(target.sources) == 0 {
+				continue
+			}
+			renderRules = append(renderRules, firewallSourceRenderRule{
+				row:    row,
+				target: target,
+				mode:   mode,
+			})
+		}
+		for _, target := range fallbackTargets {
+			key := firewallSourceRenderKey(row, target)
+			fallback := firewallSourceFallbackRule{row: row, target: target}
+			if mode == firewallSourceModeAllow {
+				if _, seen := seenAllowFallbacks[key]; !seen {
+					seenAllowFallbacks[key] = struct{}{}
+					allowFallbacks = append(allowFallbacks, fallback)
+				}
+			} else if mode == firewallSourceModeBlock {
+				if _, seen := seenBlockFallbacks[key]; !seen {
+					seenBlockFallbacks[key] = struct{}{}
+					blockFallbacks = append(blockFallbacks, fallback)
+				}
+			}
+		}
+	}
+
+	// Source blocks must precede every source allow or generic allow rule.
+	for _, rule := range renderRules {
+		if rule.mode != firewallSourceModeBlock {
+			continue
+		}
+		args, err := buildManagedFirewallRuleActionArgs(
+			rule.row,
+			rule.target,
+			rule.target.sources,
+			"drop",
+			firewallSourceFallbackComment(rule.row, rule.target, "block"),
+		)
+		if err != nil {
+			return firewallSourceRenderPlan{}, err
+		}
+		appendFirewallScriptArgs(script, args)
+	}
+
+	// All source allow matches must be emitted before their shared fallback
+	// drop, otherwise the first allow row would hide later allow rows.
+	for _, rule := range renderRules {
+		if rule.mode != firewallSourceModeAllow {
+			continue
+		}
+		args, err := buildManagedFirewallRuleActionArgs(
+			rule.row,
+			rule.target,
+			rule.target.sources,
+			"accept",
+			firewallRuleComment(rule.row.Id, rule.target.family),
+		)
+		if err != nil {
+			return firewallSourceRenderPlan{}, err
+		}
+		appendFirewallScriptArgs(script, args)
+	}
+
+	for _, fallback := range allowFallbacks {
+		args, err := buildManagedFirewallRuleActionArgs(
+			fallback.row,
+			fallback.target,
+			nil,
+			"drop",
+			firewallSourceFallbackComment(fallback.row, fallback.target, "allow_fallback"),
+		)
+		if err != nil {
+			return firewallSourceRenderPlan{}, err
+		}
+		appendFirewallScriptArgs(script, args)
+	}
+
+	return firewallSourceRenderPlan{
+		allowFallbacks: allowFallbacks,
+		blockFallbacks: blockFallbacks,
+	}, nil
+}
+
+func appendManagedFirewallSourceBlockFallbacksScript(
+	script *strings.Builder,
+	plan firewallSourceRenderPlan,
+	geoRows []model.FirewallGeoRule,
+) error {
+	for _, fallback := range plan.blockFallbacks {
+		remaining := parsePortRangeInput(fallback.row.PortSpec)
+		for _, allow := range plan.allowFallbacks {
+			if !firewallSourceFallbacksOverlap(fallback, allow) {
+				continue
+			}
+			remaining = subtractFirewallPortRanges(remaining, parsePortRangeInput(allow.row.PortSpec))
+			if len(remaining) == 0 {
+				break
+			}
+		}
+		if len(remaining) > 0 {
+			for _, geoRow := range geoRows {
+				if !firewallGeoAllowMatchesSourceFallback(geoRow, fallback) {
+					continue
+				}
+				remaining = subtractFirewallPortRanges(remaining, parsePortRangeInput(geoRow.PortSpec))
+				if len(remaining) == 0 {
+					break
+				}
+			}
+		}
+		if len(remaining) == 0 {
+			continue
+		}
+
+		row := fallback.row
+		row.PortSpec = portRangesToNft(remaining)
+		args, err := buildManagedFirewallRuleActionArgs(
+			row,
+			fallback.target,
+			nil,
+			"accept",
+			firewallSourceFallbackComment(fallback.row, fallback.target, "block_fallback"),
+		)
+		if err != nil {
+			return err
+		}
+		appendFirewallScriptArgs(script, args)
+	}
+	return nil
+}
+
+func firewallSourceFallbacksOverlap(left firewallSourceFallbackRule, right firewallSourceFallbackRule) bool {
+	if left.target.family != right.target.family {
+		return false
+	}
+	return firewallSourceProtocolsOverlap(left.row.Protocol, right.row.Protocol)
+}
+
+func firewallSourceProtocolsOverlap(left string, right string) bool {
+	left = normalizeFirewallProtocol(left)
+	right = normalizeFirewallProtocol(right)
+	if left == firewallProtocolTCPUDP || right == firewallProtocolTCPUDP {
+		return (left == firewallProtocolTCP || left == firewallProtocolUDP || left == firewallProtocolTCPUDP) &&
+			(right == firewallProtocolTCP || right == firewallProtocolUDP || right == firewallProtocolTCPUDP)
+	}
+	return left == right
+}
+
+func firewallGeoAllowMatchesSourceFallback(row model.FirewallGeoRule, fallback firewallSourceFallbackRule) bool {
+	if !row.Enabled || normalizeFirewallGeoAction(row.Action) != firewallGeoRuleActionAllow {
+		return false
+	}
+	geoFamily := normalizeFirewallFamily(row.Family)
+	if geoFamily != firewallFamilyDual && geoFamily != fallback.target.family {
+		return false
+	}
+	if !firewallSourceProtocolsOverlap(row.Protocol, fallback.row.Protocol) {
+		return false
+	}
+	return len(parsePortRangeInput(row.PortSpec)) > 0
+}
+
+func subtractFirewallPortRanges(ranges []portRange, excluded []portRange) []portRange {
+	remaining := mergePortRanges(append([]portRange(nil), ranges...))
+	for _, blocked := range mergePortRanges(append([]portRange(nil), excluded...)) {
+		next := make([]portRange, 0, len(remaining))
+		for _, current := range remaining {
+			if blocked.end < current.start || blocked.start > current.end {
+				next = append(next, current)
+				continue
+			}
+			if current.start < blocked.start {
+				next = append(next, portRange{start: current.start, end: blocked.start - 1})
+			}
+			if current.end > blocked.end {
+				next = append(next, portRange{start: blocked.end + 1, end: current.end})
+			}
+		}
+		remaining = next
+		if len(remaining) == 0 {
+			return nil
+		}
+	}
+	return mergePortRanges(remaining)
 }
 
 func appendFirewallScriptArgs(script *strings.Builder, args []string) {
@@ -980,23 +1500,87 @@ func buildManagedFirewallFinalDropRuleArgs() []string {
 }
 
 func addManagedFirewallRule(row model.FirewallRule) error {
+	mode, err := firewallRuleSourceModeForRender(row)
+	if err != nil {
+		return err
+	}
 	targets, err := buildFirewallRenderTargets(row)
 	if err != nil {
 		return err
 	}
 	for _, target := range targets {
-		args, err := buildManagedFirewallRuleArgs(row, target)
-		if err != nil {
-			return err
-		}
-		if _, err := runNft(args...); err != nil {
-			return err
+		switch mode {
+		case firewallSourceModeBlock:
+			args, buildErr := buildManagedFirewallRuleActionArgs(row, target, target.sources, "drop", firewallSourceFallbackComment(row, target, "block"))
+			if buildErr != nil {
+				return buildErr
+			}
+			if _, runErr := runNft(args...); runErr != nil {
+				return runErr
+			}
+			args, buildErr = buildManagedFirewallRuleActionArgs(row, target, nil, "accept", firewallSourceFallbackComment(row, target, "block_fallback"))
+			if buildErr != nil {
+				return buildErr
+			}
+			if _, runErr := runNft(args...); runErr != nil {
+				return runErr
+			}
+		case firewallSourceModeAllow:
+			args, buildErr := buildManagedFirewallRuleActionArgs(row, target, target.sources, "accept", firewallRuleComment(row.Id, target.family))
+			if buildErr != nil {
+				return buildErr
+			}
+			if _, runErr := runNft(args...); runErr != nil {
+				return runErr
+			}
+			args, buildErr = buildManagedFirewallRuleActionArgs(row, target, nil, "drop", firewallSourceFallbackComment(row, target, "allow_fallback"))
+			if buildErr != nil {
+				return buildErr
+			}
+			if _, runErr := runNft(args...); runErr != nil {
+				return runErr
+			}
+		default:
+			args, buildErr := buildManagedFirewallRuleArgs(row, target)
+			if buildErr != nil {
+				return buildErr
+			}
+			if _, runErr := runNft(args...); runErr != nil {
+				return runErr
+			}
 		}
 	}
 	return nil
 }
 
 func buildManagedFirewallRuleArgs(row model.FirewallRule, target firewallRenderTarget) ([]string, error) {
+	return buildManagedFirewallRuleActionArgs(row, target, target.sources, "accept", firewallRuleComment(row.Id, target.family))
+}
+
+func buildManagedFirewallRuleActionArgs(row model.FirewallRule, target firewallRenderTarget, sources []string, action string, comment string) ([]string, error) {
+	args, err := buildManagedFirewallRuleMatchArgs(row, target)
+	if err != nil {
+		return nil, err
+	}
+	if len(sources) > 0 {
+		switch target.family {
+		case firewallFamilyIPv4:
+			args = append(args, "ip", "saddr")
+		case firewallFamilyIPv6:
+			args = append(args, "ip6", "saddr")
+		default:
+			return nil, common.NewError("unsupported firewall target family: ", target.family)
+		}
+		args = append(args, buildNftCIDRSetArgs(sources)...)
+	}
+	if action != "accept" && action != "drop" {
+		return nil, common.NewError("unsupported firewall verdict: ", action)
+	}
+	args = append(args, "counter", action, "comment", comment)
+	return args, nil
+}
+
+func buildManagedFirewallRuleMatchArgs(row model.FirewallRule, target firewallRenderTarget) ([]string, error) {
 	args := []string{
 		"add", "rule", nftFamily, firewallNftTable, firewallInputChain,
 		"meta", "nfproto", mapFirewallTargetFamily(target.family),
@@ -1028,31 +1612,42 @@ func buildManagedFirewallRuleArgs(row model.FirewallRule, target firewallRenderT
 	default:
 		return nil, common.NewError("unsupported firewall protocol: ", row.Protocol)
 	}
-	if len(target.sources) > 0 {
-		switch target.family {
-		case firewallFamilyIPv4:
-			args = append(args, "ip", "saddr")
-		case firewallFamilyIPv6:
-			args = append(args, "ip6", "saddr")
-		default:
-			return nil, common.NewError("unsupported firewall target family: ", target.family)
-		}
-		args = append(args, buildNftCIDRSetArgs(target.sources)...)
-	}
-	args = append(args, "counter", "accept", "comment", firewallRuleComment(row.Id, target.family))
 	return args, nil
 }
 
 func buildFirewallRenderTargets(row model.FirewallRule) ([]firewallRenderTarget, error) {
-	v4Sources, v6Sources, err := splitFirewallSourcesByFamily(row.SourceSpec)
+	sourceMode, err := firewallRuleSourceModeForRender(row)
 	if err != nil {
 		return nil, err
+	}
+	sourceSpec := ""
+	if sourceMode != "" {
+		sourceSpec = row.SourceSpec
+	}
+	v4Sources, v6Sources, err := splitFirewallSourcesByFamily(sourceSpec)
+	if err != nil {
+		return nil, err
+	}
+	if sourceMode != "" && len(v4Sources) == 0 && len(v6Sources) == 0 {
+		return nil, common.NewError("firewall source mode requires at least one source IP/CIDR")
 	}
 	targets := make([]firewallRenderTarget, 0, 2)
 	switch row.Family {
 	case firewallFamilyIPv4:
+		if len(v6Sources) > 0 {
+			return nil, common.NewError("ipv4 rule cannot contain ipv6 source")
+		}
+		if sourceMode != "" && len(v4Sources) == 0 {
+			return nil, common.NewError("firewall source mode has no IPv4 source")
+		}
 		targets = append(targets, firewallRenderTarget{family: firewallFamilyIPv4, sources: v4Sources})
 	case firewallFamilyIPv6:
+		if len(v4Sources) > 0 {
+			return nil, common.NewError("ipv6 rule cannot contain ipv4 source")
+		}
+		if sourceMode != "" && len(v6Sources) == 0 {
+			return nil, common.NewError("firewall source mode has no IPv6 source")
+		}
 		targets = append(targets, firewallRenderTarget{family: firewallFamilyIPv6, sources: v6Sources})
 	case firewallFamilyDual:
 		if len(v4Sources) == 0 && len(v6Sources) == 0 {
@@ -1311,6 +1906,10 @@ func upsertFirewallSystemRulesLocked(db *gorm.DB, defaults FirewallDefaultPorts)
 				row.SourceSpec = ""
 				changed = true
 			}
+			if row.SourceMode != "" {
+				row.SourceMode = ""
+				changed = true
+			}
 			if changed {
 				row.LastSeenAt = now
 				if saveErr := db.Save(&row).Error; saveErr != nil {
@@ -1334,6 +1933,7 @@ func upsertFirewallSystemRulesLocked(db *gorm.DB, defaults FirewallDefaultPorts)
 			Protocol:    firewallProtocolTCP,
 			PortSpec:    portSpec,
 			SourceSpec:  "",
+			SourceMode:  "",
 			LastSeenAt:  now,
 		}
 		if createErr := db.Create(&row).Error; createErr != nil {
@@ -1344,12 +1944,16 @@ func upsertFirewallSystemRulesLocked(db *gorm.DB, defaults FirewallDefaultPorts)
 }
 
 func syncExternalFirewallRulesLocked(db *gorm.DB, observed []firewallObservedRule) error {
-	existingRows := make([]model.FirewallRule, 0)
-	if err := db.Where("origin = ?", firewallOriginExternal).Find(&existingRows).Error; err != nil {
+	existingRows := make([]model.FirewallRule, 0, firewallMaxExternalRules+1)
+	if err := db.Where("origin = ?", firewallOriginExternal).Order("id asc").Limit(firewallMaxExternalRules + 1).Find(&existingRows).Error; err != nil {
 		return err
+	}
+	if len(existingRows) > firewallMaxExternalRules {
+		existingRows = existingRows[:firewallMaxExternalRules]
 	}
 
 	existingByKey := make(map[string]*model.FirewallRule, len(existingRows))
+	storedExternalCount := len(existingRows)
 	for index := range existingRows {
 		row := &existingRows[index]
 		existingByKey[observedRuleKey(row.ObservedFamily, row.ObservedTable, row.ObservedChain, row.ObservedHandle)] = row
@@ -1360,6 +1964,9 @@ func syncExternalFirewallRulesLocked(db *gorm.DB, observed []firewallObservedRul
 		key := observedRuleKey(entry.TableFamily, entry.Table, entry.Chain, entry.Handle)
 		seen[key] = struct{}{}
 		if existing, ok := existingByKey[key]; ok {
+			if firewallObservedRuleMatchesRow(*existing, entry) {
+				continue
+			}
 			existing.Name = entry.Description
 			existing.Description = entry.Description
 			existing.Enabled = true
@@ -1373,6 +1980,9 @@ func syncExternalFirewallRulesLocked(db *gorm.DB, observed []firewallObservedRul
 			if err := db.Save(existing).Error; err != nil {
 				return err
 			}
+			continue
+		}
+		if storedExternalCount >= firewallMaxExternalRules {
 			continue
 		}
 
@@ -1396,6 +2006,7 @@ func syncExternalFirewallRulesLocked(db *gorm.DB, observed []firewallObservedRul
 		if err := db.Create(&row).Error; err != nil {
 			return err
 		}
+		storedExternalCount++
 	}
 
 	for _, row := range existingRows {
@@ -1408,6 +2019,18 @@ func syncExternalFirewallRulesLocked(db *gorm.DB, observed []firewallObservedRul
 		}
 	}
 	return nil
+}
+
+func firewallObservedRuleMatchesRow(row model.FirewallRule, entry firewallObservedRule) bool {
+	return row.Name == entry.Description &&
+		row.Description == entry.Description &&
+		row.Enabled &&
+		row.Direction == firewallDirectionIngress &&
+		row.Family == entry.Family &&
+		row.Protocol == entry.Protocol &&
+		row.PortSpec == entry.PortSpec &&
+		row.SourceSpec == entry.SourceSpec &&
+		row.ObservedComment == entry.Comment
 }
 
 func observedRuleKey(family string, table string, chain string, handle int) string {
@@ -1477,6 +2100,9 @@ func normalizeFirewallProtocol(raw string) string {
 
 func normalizeFirewallPortSpec(raw string, protocol string) (string, error) {
 	trimmed := strings.TrimSpace(raw)
+	if len(trimmed) > firewallMaxPortSpecBytes {
+		return "", common.NewError("firewall port specification exceeds ", firewallMaxPortSpecBytes, " bytes")
+	}
 	if !firewallProtocolNeedsPort(protocol) {
 		return "", nil
 	}
@@ -1530,7 +2156,13 @@ func parseFirewallSourceEntries(raw string) ([]string, error) {
 	}
 	trimmed = strings.TrimPrefix(trimmed, "{")
 	trimmed = strings.TrimSuffix(trimmed, "}")
+	if len(trimmed) > firewallMaxSourceSpecBytes {
+		return nil, common.NewError("firewall source specification exceeds ", firewallMaxSourceSpecBytes, " bytes")
+	}
 	parts := strings.Split(trimmed, ",")
+	if len(parts) > firewallMaxSourceEntries {
+		return nil, common.NewError("firewall source entry count exceeds ", firewallMaxSourceEntries)
+	}
 	normalized := make([]string, 0, len(parts))
 	seen := make(map[string]struct{}, len(parts))
 	for _, part := range parts {

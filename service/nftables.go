@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alireza0/s-ui/logger"
@@ -33,6 +35,10 @@ import (
 // - output: meta l4proto {tcp,udp} th sport <port> counter comment "..."
 
 const (
+	nftCommandOutputLimit          = 4 << 20
+	nftReadSnapshotCacheMaxBytes   = 8 << 20
+	nftReadSnapshotCacheMaxEntries = 256
+
 	nftTableOwnershipMarker = "kwor-owner:v1"
 	nftOwnershipChain       = "kwor_owner"
 
@@ -50,6 +56,85 @@ const (
 	nftNatPreroutingPriority  = "-100"
 	nftNatPostroutingPriority = "100"
 )
+
+var errNftCommandOutputLimit = errors.New("nft command output exceeds the configured limit")
+
+type nftReadSnapshotCacheEntry struct {
+	data []byte
+}
+
+// nftReadSnapshotCache is enabled only around one sampler round.  It makes
+// the default chain and Mihomo integrity/traffic passes reuse the same read
+// result, while every mutating nft command invalidates it immediately.
+var nftReadSnapshotCache = struct {
+	sync.Mutex
+	depth          int
+	generation     uint64
+	supportedKnown bool
+	supported      bool
+	entries        map[string]nftReadSnapshotCacheEntry
+	bytes          int
+}{
+	entries: make(map[string]nftReadSnapshotCacheEntry),
+}
+
+type nftLimitedOutputBuffer struct {
+	buffer   bytes.Buffer
+	limit    int
+	exceeded bool
+}
+
+func newNftLimitedOutputBuffer(limit int) *nftLimitedOutputBuffer {
+	return &nftLimitedOutputBuffer{limit: limit}
+}
+
+func (b *nftLimitedOutputBuffer) Write(value []byte) (int, error) {
+	if b == nil || b.limit <= 0 {
+		return 0, errNftCommandOutputLimit
+	}
+	remaining := b.limit - b.buffer.Len()
+	if remaining <= 0 {
+		b.exceeded = true
+		return 0, errNftCommandOutputLimit
+	}
+	if len(value) > remaining {
+		_, _ = b.buffer.Write(value[:remaining])
+		b.exceeded = true
+		return remaining, errNftCommandOutputLimit
+	}
+	return b.buffer.Write(value)
+}
+
+func (b *nftLimitedOutputBuffer) Bytes() []byte {
+	if b == nil {
+		return nil
+	}
+	return b.buffer.Bytes()
+}
+
+func (b *nftLimitedOutputBuffer) String() string {
+	if b == nil {
+		return ""
+	}
+	return b.buffer.String()
+}
+
+func nftCommandOutputError(action string, stdout *nftLimitedOutputBuffer, stderr *nftLimitedOutputBuffer, runErr error) error {
+	if (stdout != nil && stdout.exceeded) || (stderr != nil && stderr.exceeded) || errors.Is(runErr, errNftCommandOutputLimit) {
+		return fmt.Errorf("%s output exceeds %d bytes", action, nftCommandOutputLimit)
+	}
+	if runErr == nil {
+		return nil
+	}
+	message := ""
+	if stderr != nil {
+		message = strings.TrimSpace(stderr.String())
+	}
+	if message == "" {
+		return fmt.Errorf("%s failed: %w", action, runErr)
+	}
+	return fmt.Errorf("%s failed: %w: %s", action, runErr, message)
+}
 
 var (
 	nftTable          = loadNftTableName()
@@ -86,7 +171,22 @@ func resolveNftBinaryPath() (string, error) {
 }
 
 func nftSupported() bool {
-	return nftSupportedFn()
+	nftReadSnapshotCache.Lock()
+	if nftReadSnapshotCache.depth > 0 && nftReadSnapshotCache.supportedKnown {
+		supported := nftReadSnapshotCache.supported
+		nftReadSnapshotCache.Unlock()
+		return supported
+	}
+	nftReadSnapshotCache.Unlock()
+
+	supported := nftSupportedFn()
+	nftReadSnapshotCache.Lock()
+	if nftReadSnapshotCache.depth > 0 {
+		nftReadSnapshotCache.supportedKnown = true
+		nftReadSnapshotCache.supported = supported
+	}
+	nftReadSnapshotCache.Unlock()
+	return supported
 }
 
 var nftSupportedFn = func() bool {
@@ -131,7 +231,92 @@ func ruleLineHasExactComment(line string, comment string) bool {
 }
 
 func runNft(args ...string) ([]byte, error) {
-	return runNftFn(args...)
+	readOnly := nftReadOnlyCommand(args)
+	key := strings.Join(args, "\x00")
+	cacheGeneration := uint64(0)
+	if readOnly {
+		nftReadSnapshotCache.Lock()
+		if nftReadSnapshotCache.depth > 0 {
+			if cached, ok := nftReadSnapshotCache.entries[key]; ok {
+				data := append([]byte(nil), cached.data...)
+				nftReadSnapshotCache.Unlock()
+				return data, nil
+			}
+			cacheGeneration = nftReadSnapshotCache.generation
+		}
+		nftReadSnapshotCache.Unlock()
+	} else {
+		invalidateNftReadSnapshotCache()
+	}
+
+	data, err := runNftFn(args...)
+	if readOnly && err == nil {
+		nftReadSnapshotCache.Lock()
+		if nftReadSnapshotCache.depth > 0 && nftReadSnapshotCache.generation == cacheGeneration &&
+			len(nftReadSnapshotCache.entries) < nftReadSnapshotCacheMaxEntries &&
+			len(data) <= nftReadSnapshotCacheMaxBytes &&
+			nftReadSnapshotCache.bytes <= nftReadSnapshotCacheMaxBytes-len(data) {
+			cachedData := append([]byte(nil), data...)
+			nftReadSnapshotCache.entries[key] = nftReadSnapshotCacheEntry{data: cachedData}
+			nftReadSnapshotCache.bytes += len(cachedData)
+		}
+		nftReadSnapshotCache.Unlock()
+	} else if !readOnly {
+		// A read can finish while this mutation is in flight. Invalidate again
+		// after the command returns so that old output can never be reinserted
+		// into the active sampler snapshot.
+		invalidateNftReadSnapshotCache()
+	}
+	return data, err
+}
+
+func nftReadOnlyCommand(args []string) bool {
+	for index, arg := range args {
+		if strings.EqualFold(strings.TrimSpace(arg), "list") {
+			return index+1 < len(args)
+		}
+	}
+	return false
+}
+
+// WithNftReadSnapshot coalesces read-only nft commands performed by one
+// serialized sampler round.  It is deliberately scoped and never caches
+// mutations or failed reads.
+func WithNftReadSnapshot(fn func()) {
+	if fn == nil {
+		return
+	}
+	nftReadSnapshotCache.Lock()
+	if nftReadSnapshotCache.depth == 0 {
+		nftReadSnapshotCache.entries = make(map[string]nftReadSnapshotCacheEntry)
+		nftReadSnapshotCache.supportedKnown = false
+		nftReadSnapshotCache.supported = false
+		nftReadSnapshotCache.bytes = 0
+	}
+	nftReadSnapshotCache.depth++
+	nftReadSnapshotCache.Unlock()
+	defer func() {
+		nftReadSnapshotCache.Lock()
+		if nftReadSnapshotCache.depth > 0 {
+			nftReadSnapshotCache.depth--
+		}
+		if nftReadSnapshotCache.depth == 0 {
+			nftReadSnapshotCache.entries = make(map[string]nftReadSnapshotCacheEntry)
+			nftReadSnapshotCache.supportedKnown = false
+			nftReadSnapshotCache.supported = false
+			nftReadSnapshotCache.bytes = 0
+		}
+		nftReadSnapshotCache.Unlock()
+	}()
+	fn()
+}
+
+func invalidateNftReadSnapshotCache() {
+	nftReadSnapshotCache.Lock()
+	nftReadSnapshotCache.generation++
+	nftReadSnapshotCache.entries = make(map[string]nftReadSnapshotCacheEntry)
+	nftReadSnapshotCache.bytes = 0
+	nftReadSnapshotCache.Unlock()
 }
 
 var runNftFn = func(args ...string) ([]byte, error) {
@@ -144,18 +329,25 @@ var runNftFn = func(args ...string) ([]byte, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, binaryPath, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout := newNftLimitedOutputBuffer(nftCommandOutputLimit)
+	stderr := newNftLimitedOutputBuffer(nftCommandOutputLimit)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	err = cmd.Run()
-	if err != nil {
-		return nil, fmt.Errorf("nft %s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	if commandErr := nftCommandOutputError("nft "+strings.Join(args, " "), stdout, stderr, err); commandErr != nil {
+		return nil, commandErr
 	}
-	return stdout.Bytes(), nil
+	return append([]byte(nil), stdout.Bytes()...), nil
 }
 
 func runNftScript(script string) ([]byte, error) {
-	return runNftScriptFn(script)
+	invalidateNftReadSnapshotCache()
+	data, err := runNftScriptFn(script)
+	// A read may begin after the pre-script invalidation but finish before the
+	// nft batch commits. Invalidate again so that pre-commit output cannot be
+	// inserted into the active sampler snapshot after this mutation returns.
+	invalidateNftReadSnapshotCache()
+	return data, err
 }
 
 var runNftScriptFn = func(script string) ([]byte, error) {
@@ -169,14 +361,15 @@ var runNftScriptFn = func(script string) ([]byte, error) {
 
 	cmd := exec.CommandContext(ctx, binaryPath, "-f", "-")
 	cmd.Stdin = strings.NewReader(script)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout := newNftLimitedOutputBuffer(nftCommandOutputLimit)
+	stderr := newNftLimitedOutputBuffer(nftCommandOutputLimit)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	err = cmd.Run()
-	if err != nil {
-		return nil, fmt.Errorf("nft script failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+	if commandErr := nftCommandOutputError("nft script", stdout, stderr, err); commandErr != nil {
+		return nil, commandErr
 	}
-	return stdout.Bytes(), nil
+	return append([]byte(nil), stdout.Bytes()...), nil
 }
 
 func nftTableHasOwnershipMarker(output []byte) bool {
@@ -1814,19 +2007,39 @@ func getChainRuleBytesByHandle(chain string, handle int) (int64, error) {
 	if !nftSupported() {
 		return 0, nil
 	}
-	if handle <= 0 {
-		return 0, fmt.Errorf("invalid handle")
-	}
-	if err := ensureNftBase(); err != nil {
+	values, err := getChainRuleBytesByHandles(chain, []int{handle})
+	if err != nil {
 		return 0, err
 	}
+	bytes, ok := values[handle]
+	if !ok {
+		return 0, fmt.Errorf("nft rule handle %d not found in %s", handle, chain)
+	}
+	return bytes, nil
+}
 
+// getChainRuleBytesByHandles reads every requested counter from a chain with a
+// single nft invocation. Traffic collection calls it once per direction so the
+// cost does not grow with the number of configured inbounds.
+func getChainRuleBytesByHandles(chain string, handles []int) (map[int]int64, error) {
+	if !nftSupported() {
+		return map[int]int64{}, nil
+	}
+	wanted := make(map[int]struct{}, len(handles))
+	for _, handle := range handles {
+		if handle > 0 {
+			wanted[handle] = struct{}{}
+		}
+	}
+	if len(wanted) == 0 {
+		return map[int]int64{}, nil
+	}
 	if GetNftablesCapabilities().SupportsJSON {
 		out, err := runNft("-j", "list", "chain", nftFamily, nftTable, chain)
 		if err == nil {
-			bytes, parseErr := getChainRuleBytesByHandleFromJSON(out, chain, handle)
+			values, parseErr := getChainRuleBytesByHandlesFromJSON(out, chain, wanted)
 			if parseErr == nil {
-				return bytes, nil
+				return values, nil
 			}
 			err = parseErr
 		}
@@ -1834,24 +2047,36 @@ func getChainRuleBytesByHandle(chain string, handle int) (int64, error) {
 		// A runtime can report a newer version while a restricted nft binary
 		// rejects JSON. Fall back to the text parser before treating the
 		// counter as unavailable.
-		textBytes, textErr := getChainRuleBytesByHandleFromTextNft(chain, handle)
+		textBytes, textErr := getChainRuleBytesByHandlesFromTextNft(chain, wanted)
 		if textErr == nil {
 			return textBytes, nil
 		}
 		if err != nil {
-			return 0, fmt.Errorf("read nft counter by json failed: %w; text fallback failed: %v", err, textErr)
+			return nil, fmt.Errorf("read nft counters by json failed: %w; text fallback failed: %v", err, textErr)
 		}
-		return 0, textErr
+		return nil, textErr
 	}
-	return getChainRuleBytesByHandleFromTextNft(chain, handle)
+	return getChainRuleBytesByHandlesFromTextNft(chain, wanted)
 }
 
 func getChainRuleBytesByHandleFromJSON(out []byte, chain string, handle int) (int64, error) {
+	if handle <= 0 {
+		return 0, fmt.Errorf("invalid handle")
+	}
+	values, err := getChainRuleBytesByHandlesFromJSON(out, chain, map[int]struct{}{handle: {}})
+	if err != nil {
+		return 0, err
+	}
+	return values[handle], nil
+}
+
+func getChainRuleBytesByHandlesFromJSON(out []byte, chain string, wanted map[int]struct{}) (map[int]int64, error) {
 	var parsed nftList
 	if err := json.Unmarshal(out, &parsed); err != nil {
-		return 0, fmt.Errorf("parse nft json failed: %w", err)
+		return nil, fmt.Errorf("parse nft json failed: %w", err)
 	}
 
+	values := make(map[int]int64, len(wanted))
 	for _, item := range parsed.Nftables {
 		raw, ok := item["rule"]
 		if !ok {
@@ -1861,51 +2086,104 @@ func getChainRuleBytesByHandleFromJSON(out []byte, chain string, handle int) (in
 		if err := json.Unmarshal(raw, &r); err != nil {
 			continue
 		}
-		if r.Handle != handle {
+		if _, ok := wanted[r.Handle]; !ok {
 			continue
 		}
 		for _, expr := range r.Expr {
 			if cRaw, ok := expr["counter"]; ok {
 				var c nftCounter
 				if err := json.Unmarshal(cRaw, &c); err == nil {
-					return c.Bytes, nil
+					values[r.Handle] = c.Bytes
+					break
 				}
 			}
 		}
-		// rule found but no counter expr
-		return 0, nil
+		// A rule without a counter still represents zero bytes.
+		if _, found := values[r.Handle]; !found {
+			values[r.Handle] = 0
+		}
 	}
 
-	return 0, fmt.Errorf("nft rule handle %d not found in %s", handle, chain)
+	if len(values) == len(wanted) {
+		return values, nil
+	}
+	missing := missingNftHandles(wanted, values)
+	return nil, fmt.Errorf("nft rule handles %s not found in %s", missing, chain)
 }
 
 func getChainRuleBytesByHandleFromTextNft(chain string, handle int) (int64, error) {
-	out, err := runNft("--handle", "--numeric", "list", "chain", nftFamily, nftTable, chain)
+	if handle <= 0 {
+		return 0, fmt.Errorf("invalid handle")
+	}
+	values, err := getChainRuleBytesByHandlesFromTextNft(chain, map[int]struct{}{handle: {}})
 	if err != nil {
 		return 0, err
 	}
-	return getChainRuleBytesByHandleFromText(out, chain, handle)
+	return values[handle], nil
 }
 
 func getChainRuleBytesByHandleFromText(out []byte, chain string, handle int) (int64, error) {
+	if handle <= 0 {
+		return 0, fmt.Errorf("invalid handle")
+	}
+	values, err := getChainRuleBytesByHandlesFromText(out, chain, map[int]struct{}{handle: {}})
+	if err != nil {
+		return 0, err
+	}
+	return values[handle], nil
+}
+
+func getChainRuleBytesByHandlesFromTextNft(chain string, wanted map[int]struct{}) (map[int]int64, error) {
+	out, err := runNft("--handle", "--numeric", "list", "chain", nftFamily, nftTable, chain)
+	if err != nil {
+		return nil, err
+	}
+	return getChainRuleBytesByHandlesFromText(out, chain, wanted)
+}
+
+func getChainRuleBytesByHandlesFromText(out []byte, chain string, wanted map[int]struct{}) (map[int]int64, error) {
+	values := make(map[int]int64, len(wanted))
 	for _, line := range strings.Split(string(out), "\n") {
 		match := nftHandleRe.FindStringSubmatch(line)
 		if len(match) != 2 {
 			continue
 		}
 		currentHandle, convErr := strconv.Atoi(match[1])
-		if convErr != nil || currentHandle != handle {
+		if convErr != nil {
+			continue
+		}
+		if _, ok := wanted[currentHandle]; !ok {
 			continue
 		}
 		counterMatch := nftCounterBytesRe.FindStringSubmatch(line)
 		if len(counterMatch) != 2 {
-			return 0, nil
+			values[currentHandle] = 0
+			continue
 		}
 		bytes, bytesErr := strconv.ParseInt(counterMatch[1], 10, 64)
 		if bytesErr != nil {
-			return 0, fmt.Errorf("parse nft counter bytes for handle %d: %w", handle, bytesErr)
+			return nil, fmt.Errorf("parse nft counter bytes for handle %d: %w", currentHandle, bytesErr)
 		}
-		return bytes, nil
+		values[currentHandle] = bytes
 	}
-	return 0, fmt.Errorf("nft rule handle %d not found in %s", handle, chain)
+	if len(values) == len(wanted) {
+		return values, nil
+	}
+	missing := missingNftHandles(wanted, values)
+	return nil, fmt.Errorf("nft rule handles %s not found in %s", missing, chain)
+}
+
+func missingNftHandles(wanted map[int]struct{}, values map[int]int64) string {
+	missing := make([]int, 0, len(wanted)-len(values))
+	for handle := range wanted {
+		if _, ok := values[handle]; !ok {
+			missing = append(missing, handle)
+		}
+	}
+	sort.Ints(missing)
+	parts := make([]string, 0, len(missing))
+	for _, handle := range missing {
+		parts = append(parts, strconv.Itoa(handle))
+	}
+	return strings.Join(parts, ",")
 }

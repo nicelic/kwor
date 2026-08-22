@@ -341,6 +341,11 @@ const singboxLoading = ref(false)
 const mihomoRunning = ref(false)
 const mihomoLoading = ref(false)
 const reloading = ref(false)
+let reloadRequest: Promise<void> | null = null
+let reloadRequestKey = ''
+let reloadRequestGeneration = -1
+let reloadRetryPending = false
+let dashboardMounted = false
 const menu = ref(false)
 const tileSections = [
   {
@@ -621,79 +626,72 @@ const reloadItems = computed({
     Data().reloadItems = next
     persistReloadItems(next)
 
-    if (previous.length === 0 && next.length > 0) {
-      void reloadData()
-      startTimer()
-      return
-    }
-
     if (previous.length > 0 && next.length === 0) {
       stopTimer()
       tilesData.value = {}
-      return
     }
 
-    if (next.length > 0) {
-      void reloadData()
-    }
+    // With no selected host tiles the endpoint only returns the lightweight
+    // core state. Keep that refresh alive so the Core controls do not become
+    // stale while avoiding CPU, disk, network and process scans.
+    void reloadData()
+    startTimer()
   }
 })
 
-const reloadData = async () => {
-  if (reloading.value) return
+const dashboardRefreshAllowed = () => dashboardMounted
+  && (typeof document === 'undefined' || document.visibilityState === 'visible')
+
+const dashboardMetricRequest = () => [...new Set(
+  reloadItems.value
+    .map(r => r.split('-')[1] ?? '')
+    .filter((item): item is string => item.length > 0),
+)].sort()
+
+const reloadData = (): Promise<void> => {
+  if (!dashboardRefreshAllowed()) return Promise.resolve()
+
+  const requestedMetrics = dashboardMetricRequest()
+  const requestKey = requestedMetrics.join(',')
+  if (reloadRequest) {
+    // A tile selection can change while an older request is in flight. Keep
+    // the no-overlap rule, then immediately issue one fresh request after the
+    // current response instead of waiting for the next five-second timer.
+    if (reloadRequestKey !== requestKey || reloadRequestGeneration !== refreshGeneration) reloadRetryPending = true
+    return reloadRequest
+  }
   reloading.value = true
-  try {
-    const request = [...new Set(
-      reloadItems.value
-        .map(r => r.split('-')[1] ?? '')
-        .filter((item): item is string => item.length > 0),
-    )]
-    if (request.length === 0) {
-      tilesData.value = {}
-      return
+  const requestGeneration = refreshGeneration
+  const request = (async () => {
+    try {
+      const data = await HttpUtils.get('api/dashboard-runtime', { r: requestedMetrics.join(',') }, { silentAuthCheck: true })
+      const requestIsCurrent = requestGeneration === refreshGeneration
+        && dashboardRefreshAllowed()
+        && requestKey === dashboardMetricRequest().join(',')
+      if (data.success && data.obj && requestIsCurrent) {
+        tilesData.value = requestedMetrics.length > 0 ? (data.obj.status ?? {}) : {}
+        const cores = data.obj.cores ?? {}
+        singboxRunning.value = cores.singbox?.running === true
+        mihomoRunning.value = cores.mihomo?.running === true
+      }
+    } catch {
+      // A transient dashboard request failure must not break the chained
+      // refresh loop or discard the last valid snapshot.
+    } finally {
+      reloading.value = false
     }
-    const data = await HttpUtils.get('api/status', { r: request.join(',') }, { silentAuthCheck: true })
-    if (data.success && data.obj) {
-      tilesData.value = data.obj
-    }
-  } finally {
-    await loadCoreStatuses()
-    reloading.value = false
-  }
-}
-
-const loadSingboxCoreStatus = async () => {
-  try {
-    const data = await HttpUtils.get('api/core-status', {}, { silentAuthCheck: true })
-    singboxRunning.value = data.success && data.obj ? data.obj.running === true : false
-  } catch {
-    singboxRunning.value = false
-  }
-}
-
-const loadMihomoCoreStatus = async () => {
-  try {
-    const data = await HttpUtils.get('api/mihomo-core-status', {}, { silentAuthCheck: true })
-    mihomoRunning.value = data.success && data.obj ? data.obj.running === true : false
-  } catch {
-    mihomoRunning.value = false
-  }
-}
-
-let coreStatusesRequest: Promise<void> | null = null
-
-const loadCoreStatuses = (): Promise<void> => {
-  if (coreStatusesRequest) return coreStatusesRequest
-
-  const request = Promise.allSettled([
-    loadSingboxCoreStatus(),
-    loadMihomoCoreStatus(),
-  ]).then(() => undefined)
-  coreStatusesRequest = request
+  })()
+  reloadRequest = request
+  reloadRequestKey = requestKey
+  reloadRequestGeneration = requestGeneration
   void request.finally(() => {
-    if (coreStatusesRequest === request) {
-      coreStatusesRequest = null
-    }
+    if (reloadRequest !== request) return
+    reloadRequest = null
+    reloadRequestKey = ''
+    reloadRequestGeneration = -1
+    const retry = reloadRetryPending
+    reloadRetryPending = false
+    if (retry && dashboardRefreshAllowed()) void reloadData()
   })
   return request
 }
@@ -703,9 +701,12 @@ const runCoreAction = async (endpoint: string, loadingState: Ref<boolean>, reloa
   try {
     await HttpUtils.post(endpoint, {})
   } finally {
-    setTimeout(() => {
-      void loadCoreStatuses()
-      loadingState.value = false
+    window.setTimeout(async () => {
+      try {
+        if (dashboardRefreshAllowed()) await reloadData()
+      } finally {
+        loadingState.value = false
+      }
     }, reloadDelayMs)
   }
 }
@@ -722,20 +723,30 @@ const stopMihomoCore = async () => runCoreAction('api/mihomo-coreStop', mihomoLo
 
 const restartMihomoCore = async () => runCoreAction('api/mihomo-coreRestart', mihomoLoading, 2500)
 
-let intervalId: ReturnType<typeof setInterval> | null = null
+let refreshTimerId: number | null = null
+let refreshGeneration = 0
+
+const scheduleRefresh = (delayMs: number) => {
+  if (refreshTimerId != null) return
+  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+  const generation = refreshGeneration
+  refreshTimerId = window.setTimeout(async () => {
+    refreshTimerId = null
+    if (generation !== refreshGeneration || (typeof document !== 'undefined' && document.visibilityState !== 'visible')) return
+    await reloadData()
+    if (generation === refreshGeneration) scheduleRefresh(5000)
+  }, delayMs)
+}
 
 const startTimer = () => {
-  if (intervalId) return
-  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
-  intervalId = setInterval(() => {
-    void reloadData()
-  }, 2000)
+  scheduleRefresh(0)
 }
 
 const stopTimer = () => {
-  if (intervalId) {
-    clearInterval(intervalId)
-    intervalId = null
+  refreshGeneration += 1
+  if (refreshTimerId != null) {
+    window.clearTimeout(refreshTimerId)
+    refreshTimerId = null
   }
 }
 
@@ -744,16 +755,12 @@ const handleVisibilityChange = () => {
     stopTimer()
     return
   }
-  if (reloadItems.value.length !== 0) {
-    void reloadData()
-    startTimer()
-    return
-  }
-  void loadCoreStatuses()
+  startTimer()
 }
 
 onMounted(() => {
-	if (typeof document !== 'undefined') {
+  dashboardMounted = true
+  if (typeof document !== 'undefined') {
 		document.addEventListener('visibilitychange', handleVisibilityChange)
 	}
   const rawReloadItems = [...Data().reloadItems]
@@ -763,15 +770,12 @@ onMounted(() => {
     persistReloadItems(normalizedReloadItems)
   }
 
-  if (normalizedReloadItems.length !== 0) {
-    void reloadData()
-    startTimer()
-    return
-  }
-  void loadCoreStatuses()
+  startTimer()
 })
 
 onBeforeUnmount(() => {
+  dashboardMounted = false
+  reloadRetryPending = false
   stopTimer()
 	if (typeof document !== 'undefined') {
 		document.removeEventListener('visibilitychange', handleVisibilityChange)

@@ -3,6 +3,9 @@ package cronjob
 import (
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/robfig/cron/v3"
 )
 
 type blockingCronTestJob struct {
@@ -101,5 +104,74 @@ func TestCronJobScheduleReloadSharesRunGuard(t *testing.T) {
 	second.Run()
 	if got := secondJob.calls.Load(); got != 1 {
 		t.Fatalf("replacement scheduler did not run after active job completed: calls=%d", got)
+	}
+}
+
+func TestStopCronSchedulerWaitsForRunningJob(t *testing.T) {
+	scheduler := cron.New(cron.WithSeconds())
+	job := &blockingCronTestJob{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	if _, err := scheduler.AddJob("@every 1s", job); err != nil {
+		t.Fatalf("add blocking cron job failed: %v", err)
+	}
+	scheduler.Start()
+
+	select {
+	case <-job.started:
+	case <-time.After(3 * time.Second):
+		scheduler.Stop()
+		t.Fatal("scheduled test job did not start")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		stopCronSchedulerAndWait(scheduler)
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("cron scheduler stopped before its running job completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(job.release)
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("cron scheduler did not finish after its running job completed")
+	}
+}
+
+func TestCronJobStopWaitsForImmediateJob(t *testing.T) {
+	c := NewCronJob()
+	job := &blockingCronTestJob{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	c.runImmediateJob(job)
+	select {
+	case <-job.started:
+	case <-time.After(time.Second):
+		t.Fatal("immediate test job did not start")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		c.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("CronJob.Stop returned before immediate job completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(job.release)
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("CronJob.Stop did not finish after immediate job completed")
 	}
 }

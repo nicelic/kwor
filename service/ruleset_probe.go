@@ -2,7 +2,6 @@ package service
 
 import (
 	"bytes"
-	"compress/gzip"
 	"compress/zlib"
 	"container/list"
 	"context"
@@ -24,19 +23,22 @@ import (
 	"time"
 	"unicode/utf8"
 
+	compressionalgorithm "github.com/alireza0/s-ui/compression/Compression-algorithm"
 	"github.com/klauspost/compress/zstd"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	RuleSetProbeMaxBatch          = 32
-	ruleSetProbeTimeout           = 6 * time.Second
-	ruleSetProbeMaxRedirects      = 3
-	ruleSetProbeMaxWireBytes      = 8 * 1024 * 1024
-	ruleSetProbeMaxDecodedBytes   = 32 * 1024 * 1024
-	ruleSetProbeCacheEntries      = 256
-	ruleSetProbeCacheTTL          = 5 * time.Minute
-	ruleSetProbeGlobalConcurrency = 4
+	RuleSetProbeMaxBatch           = 32
+	ruleSetProbeMaxInFlightBatches = 8
+	ruleSetProbeTimeout            = 6 * time.Second
+	ruleSetProbeMaxRedirects       = 3
+	ruleSetProbeMaxWireBytes       = 8 * 1024 * 1024
+	ruleSetProbeMaxDecodedBytes    = 32 * 1024 * 1024
+	ruleSetProbeAcceptEncoding     = "gzip, deflate, zstd"
+	ruleSetProbeCacheEntries       = 256
+	ruleSetProbeCacheTTL           = 5 * time.Minute
+	ruleSetProbeGlobalConcurrency  = 4
 )
 
 type SubscriptionRuleSetProbeRequest struct {
@@ -69,13 +71,14 @@ type SubscriptionRuleSetProbeResolver interface {
 }
 
 type SubscriptionRuleSetProbeEngineOptions struct {
-	Resolver     SubscriptionRuleSetProbeResolver
-	AllowAddress func(netip.Addr) bool
-	RootCAs      *x509.CertPool
-	Timeout      time.Duration
-	Concurrency  int
-	CacheEntries int
-	CacheTTL     time.Duration
+	Resolver           SubscriptionRuleSetProbeResolver
+	AllowAddress       func(netip.Addr) bool
+	RootCAs            *x509.CertPool
+	Timeout            time.Duration
+	Concurrency        int
+	CacheEntries       int
+	CacheTTL           time.Duration
+	MaxInFlightBatches int
 }
 
 type SubscriptionRuleSetProbeEngine struct {
@@ -83,12 +86,13 @@ type SubscriptionRuleSetProbeEngine struct {
 }
 
 type ruleSetProbeEngine struct {
-	resolver     SubscriptionRuleSetProbeResolver
-	semaphore    chan struct{}
-	cache        *ruleSetProbeMetadataCache
-	allowAddress func(netip.Addr) bool
-	rootCAs      *x509.CertPool
-	timeout      time.Duration
+	resolver       SubscriptionRuleSetProbeResolver
+	semaphore      chan struct{}
+	batchSemaphore chan struct{}
+	cache          *ruleSetProbeMetadataCache
+	allowAddress   func(netip.Addr) bool
+	rootCAs        *x509.CertPool
+	timeout        time.Duration
 }
 
 type ruleSetProbeCacheEntry struct {
@@ -136,13 +140,18 @@ func NewSubscriptionRuleSetProbeEngine(options SubscriptionRuleSetProbeEngineOpt
 	if cacheTTL <= 0 {
 		cacheTTL = ruleSetProbeCacheTTL
 	}
+	maxInFlightBatches := options.MaxInFlightBatches
+	if maxInFlightBatches <= 0 {
+		maxInFlightBatches = ruleSetProbeMaxInFlightBatches
+	}
 	return &SubscriptionRuleSetProbeEngine{engine: &ruleSetProbeEngine{
-		resolver:     resolver,
-		semaphore:    make(chan struct{}, concurrency),
-		cache:        newRuleSetProbeMetadataCache(cacheEntries, cacheTTL),
-		allowAddress: allowAddress,
-		rootCAs:      options.RootCAs,
-		timeout:      timeout,
+		resolver:       resolver,
+		semaphore:      make(chan struct{}, concurrency),
+		batchSemaphore: make(chan struct{}, maxInFlightBatches),
+		cache:          newRuleSetProbeMetadataCache(cacheEntries, cacheTTL),
+		allowAddress:   allowAddress,
+		rootCAs:        options.RootCAs,
+		timeout:        timeout,
 	}}
 }
 
@@ -175,6 +184,12 @@ func (engine *ruleSetProbeEngine) probe(ctx context.Context, request Subscriptio
 	}
 	if engine == nil {
 		return nil, errors.New("规则集探测服务未初始化")
+	}
+	select {
+	case engine.batchSemaphore <- struct{}{}:
+		defer func() { <-engine.batchSemaphore }()
+	default:
+		return nil, errors.New("规则集探测请求过多，请稍后重试")
 	}
 
 	timeout := engine.timeout
@@ -519,7 +534,7 @@ func (engine *ruleSetProbeEngine) fetchOnce(ctx context.Context, target *url.URL
 		return nil, "", "", err
 	}
 	request.Header.Set("Accept", "application/octet-stream, application/json, application/yaml, text/yaml, text/plain;q=0.9")
-	request.Header.Set("Accept-Encoding", "gzip, deflate, zstd")
+	request.Header.Set("Accept-Encoding", ruleSetProbeAcceptEncoding)
 	request.Header.Set("User-Agent", "kwor-ruleset-probe/1")
 	response, err := client.Do(request)
 	if err != nil {
@@ -544,7 +559,7 @@ func (engine *ruleSetProbeEngine) fetchOnce(ctx context.Context, target *url.URL
 	if err != nil {
 		return nil, "", "", err
 	}
-	decoded, err := decodeRuleSetProbeBody(wire, response.Header.Get("Content-Encoding"))
+	decoded, err := decodeRuleSetProbeBody(wire, strings.Join(response.Header.Values("Content-Encoding"), ","))
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -658,30 +673,18 @@ func readRuleSetProbeLimited(reader io.Reader, maximum int64, message string) ([
 }
 
 func decodeRuleSetProbeBody(wire []byte, contentEncoding string) ([]byte, error) {
-	encoding := strings.ToLower(strings.TrimSpace(strings.Split(contentEncoding, ",")[0]))
-	if encoding == "" || encoding == "identity" {
-		if len(wire) > ruleSetProbeMaxDecodedBytes {
-			return nil, errors.New("规则集解压内容超过 32 MiB")
-		}
-		return wire, nil
+	if strings.TrimSpace(contentEncoding) != "" && !compressionalgorithm.ContentEncodingAcceptableValues(contentEncoding, []string{ruleSetProbeAcceptEncoding}) {
+		return nil, fmt.Errorf("规则集响应使用未请求的压缩格式: %s", strings.TrimSpace(contentEncoding))
 	}
-	var reader io.ReadCloser
-	var err error
-	switch encoding {
-	case "gzip", "x-gzip":
-		reader, err = gzip.NewReader(bytes.NewReader(wire))
-	case "deflate":
-		reader, err = zlib.NewReader(bytes.NewReader(wire))
-	case "zstd":
-		var decoder *zstd.Decoder
-		decoder, err = zstd.NewReader(bytes.NewReader(wire), zstd.WithDecoderMaxMemory(ruleSetProbeMaxDecodedBytes))
-		if err == nil {
-			reader = decoder.IOReadCloser()
-		}
-	default:
-		return nil, fmt.Errorf("规则集响应使用不支持的压缩格式: %s", encoding)
-	}
+	reader, err := compressionalgorithm.NewDecoder(
+		io.NopCloser(bytes.NewReader(wire)),
+		contentEncoding,
+		ruleSetProbeMaxDecodedBytes,
+	)
 	if err != nil {
+		if errors.Is(err, compressionalgorithm.ErrUnsupportedEncoding) {
+			return nil, fmt.Errorf("规则集响应使用不支持的压缩格式: %s", strings.TrimSpace(contentEncoding))
+		}
 		return nil, fmt.Errorf("规则集响应解压失败: %w", err)
 	}
 	defer reader.Close()

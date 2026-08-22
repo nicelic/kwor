@@ -83,7 +83,11 @@
                 :label="$t('out.port')"
                 hide-details
                 type="number"
-                v-model.number="mesh.server_port">
+                min="1"
+                max="65535"
+                step="1"
+                :model-value="meshServerPort(mesh)"
+                @update:model-value="setMeshServerPort(mesh, $event)">
                 </v-text-field>
               </v-col>
               <v-col cols="12" sm="6" md="4">
@@ -174,6 +178,7 @@
 import Dial from '@/components/Dial.vue'
 import OutTLS from '../tls/OutTLS.vue'
 import Listen from '../Listen.vue'
+import { parseSingboxInteger } from '@/plugins/singboxInteger'
 export default {
   props: ['data', 'tsTags', 'inTags'],
   data() {
@@ -181,6 +186,15 @@ export default {
       menu: false,
       usePskText: this.$props.data.mesh_psk == undefined ? 1 : 0,
     }
+  },
+  methods: {
+    meshServerPort(mesh: any) {
+      return parseSingboxInteger(mesh?.server_port, { min: 1, max: 65535 }) ?? ''
+    },
+    setMeshServerPort(mesh: any, value: unknown) {
+      if (!mesh || typeof mesh !== 'object') return
+      mesh.server_port = parseSingboxInteger(value, { min: 1, max: 65535 })
+    },
   },
   computed: {
     optionVerifyCE: {

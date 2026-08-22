@@ -382,6 +382,9 @@ func (a *ApiService) getData(c *gin.Context) (interface{}, error) {
 	if err != nil {
 		return "", err
 	}
+	// Capture the revision before reading the snapshot. A later write stays newer
+	// than this response and will therefore be picked up by the next poll.
+	snapshotVersion := service.CurrentConfigRevisionForPolling()
 	onlines, err := a.StatsService.GetOnlines()
 
 	if err != nil {
@@ -392,6 +395,7 @@ func (a *ApiService) getData(c *gin.Context) (interface{}, error) {
 		return "", err
 	}
 	data["enableTraffic"] = trafficAge > 0
+	data["lastUpdate"] = snapshotVersion
 
 	if isUpdated {
 		config, err := a.SettingService.GetConfig()
@@ -473,10 +477,11 @@ func (a *ApiService) getMihomoData(c *gin.Context) (interface{}, error) {
 	data := make(map[string]interface{}, 0)
 	lu := c.Query("lu")
 	light := strings.EqualFold(strings.TrimSpace(c.Query("light")), "true")
-	isUpdated, err := a.ConfigService.CheckChanges(lu)
+	isUpdated, err := a.ConfigService.CheckMihomoChanges(lu)
 	if err != nil {
 		return "", err
 	}
+	snapshotVersion := service.CurrentMihomoConfigRevisionForPolling()
 
 	onlines, err := a.StatsService.GetMihomoOnlines()
 	if err != nil {
@@ -488,6 +493,7 @@ func (a *ApiService) getMihomoData(c *gin.Context) (interface{}, error) {
 	}
 	data["onlines"] = onlines
 	data["enableTraffic"] = trafficAge > 0
+	data["lastUpdate"] = snapshotVersion
 
 	if !isUpdated {
 		if light {
@@ -542,7 +548,6 @@ func (a *ApiService) getMihomoData(c *gin.Context) (interface{}, error) {
 	if err != nil {
 		return "", err
 	}
-
 	data["config"] = json.RawMessage(config)
 	data["clients"] = clients
 	data["tls"] = tlsConfigs
@@ -560,6 +565,7 @@ func (a *ApiService) getMihomoData(c *gin.Context) (interface{}, error) {
 
 func (a *ApiService) LoadPartialData(c *gin.Context, objs []string) error {
 	data := make(map[string]interface{}, 0)
+	data["lastUpdate"] = service.CurrentConfigRevisionForPolling()
 	id := c.Query("id")
 
 	for _, obj := range objs {
@@ -632,13 +638,46 @@ func (a *ApiService) LoadPartialData(c *gin.Context, objs []string) error {
 			data[obj] = settings
 		}
 	}
-
 	jsonObj(c, data, nil)
 	return nil
 }
 
+func (a *ApiService) GetMihomoRouteTargets(c *gin.Context) {
+	targets, err := service.GetMihomoRouteTargets(database.GetDB())
+	jsonObj(c, map[string]interface{}{"routeTargets": targets}, err)
+}
+
+// GetMihomoRouteEditorContext returns the compact data model used exclusively
+// by the Mihomo route editor. It avoids loading unrelated clients, TLS records
+// and subscription collections when the user only opens /mihomo_rules.
+func (a *ApiService) GetMihomoRouteEditorContext(c *gin.Context) {
+	// Capture the revision before assembling the editor snapshot. If a later
+	// write wins while config or targets are being read, this response remains
+	// intentionally stale and its expectedRevision will be rejected on save.
+	snapshotRevision := service.CurrentMihomoConfigRevisionForPolling()
+	config, err := a.MihomoConfigService.GetConfig()
+	if err != nil {
+		jsonObj(c, nil, err)
+		return
+	}
+
+	context, err := service.GetMihomoRouteEditorContext(database.GetDB())
+	if err != nil {
+		jsonObj(c, nil, err)
+		return
+	}
+
+	jsonObj(c, map[string]interface{}{
+		"config":       json.RawMessage(config),
+		"inboundTags":  context.InboundTags,
+		"routeTargets": context.RouteTargets,
+		"revision":     snapshotRevision,
+	}, nil)
+}
+
 func (a *ApiService) LoadMihomoPartialData(c *gin.Context, objs []string) error {
 	data := make(map[string]interface{}, 0)
+	data["lastUpdate"] = service.CurrentMihomoConfigRevisionForPolling()
 	id := c.Query("id")
 
 	for _, obj := range objs {
@@ -693,7 +732,6 @@ func (a *ApiService) LoadMihomoPartialData(c *gin.Context, objs []string) error 
 			data["subgroups"] = subGroups
 		}
 	}
-
 	jsonObj(c, data, nil)
 	return nil
 }
@@ -741,8 +779,10 @@ func (a *ApiService) GetStats(c *gin.Context) {
 	namespace := strings.TrimSpace(c.Query("namespace"))
 	tag := c.Query("tag")
 	limit, err := strconv.Atoi(c.Query("limit"))
-	if err != nil {
+	if err != nil || limit <= 0 {
 		limit = 100
+	} else if limit > 2160 {
+		limit = 2160
 	}
 	if namespace == "mihomo" {
 		switch resource {
@@ -750,6 +790,8 @@ func (a *ApiService) GetStats(c *gin.Context) {
 			resource = "mihomo_inbound"
 		case "client":
 			resource = "mihomo_client"
+		case "outbound":
+			resource = "mihomo_outbound"
 		}
 	}
 	data, err := a.StatsService.GetStats(resource, tag, limit)
@@ -763,6 +805,12 @@ func (a *ApiService) GetStats(c *gin.Context) {
 func (a *ApiService) GetStatus(c *gin.Context) {
 	request := c.Query("r")
 	result := a.ServerService.GetStatus(request)
+	jsonObj(c, result, nil)
+}
+
+func (a *ApiService) GetDashboardRuntime(c *gin.Context) {
+	request := c.Query("r")
+	result := a.ServerService.GetDashboardRuntime(request)
 	jsonObj(c, result, nil)
 }
 
@@ -841,6 +889,10 @@ func (a *ApiService) GetTrafficOverviewVnstatInstallStatus(c *gin.Context) {
 	jsonObj(c, a.TrafficOverviewService.GetManagedVnstatInstallJob(c.Query("jobId")), nil)
 }
 
+func (a *ApiService) GetTrafficOverviewVnstatRemovalStatus(c *gin.Context) {
+	jsonObj(c, a.TrafficOverviewService.GetManagedVnstatRemovalJob(c.Query("jobId")), nil)
+}
+
 func (a *ApiService) InstallTrafficOverviewVnstat(c *gin.Context) {
 	req := trafficOverviewVnstatInstallRequest{}
 	if err := c.ShouldBind(&req); err != nil {
@@ -872,12 +924,12 @@ func (a *ApiService) StopTrafficOverviewVnstatInstall(c *gin.Context) {
 }
 
 func (a *ApiService) RemoveTrafficOverviewVnstat(c *gin.Context) {
-	overview, err := a.TrafficOverviewService.RemoveManagedVnstat()
+	job, err := a.TrafficOverviewService.StartManagedVnstatRemoval()
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
 	}
-	jsonObj(c, overview, nil)
+	jsonObj(c, job, nil)
 }
 
 func pickTrafficOverviewLimitGiB(req trafficOverviewSettingsRequest) (float64, bool) {
@@ -941,6 +993,10 @@ func (a *ApiService) GetFirewallOverview(c *gin.Context) {
 		return
 	}
 	jsonObj(c, overview, nil)
+}
+
+func (a *ApiService) GetFirewallRuntime(c *gin.Context) {
+	jsonObj(c, a.FirewallService.GetRuntimeOverview(), nil)
 }
 
 func (a *ApiService) SaveFirewallSwitch(c *gin.Context) {
@@ -1130,7 +1186,7 @@ func (a *ApiService) SaveFirewallGeoSettings(c *gin.Context) {
 }
 
 func (a *ApiService) GetSystemLogOptimizationOverview(c *gin.Context) {
-	overview, err := a.SystemLogOptimizationService.GetOverview()
+	overview, err := a.SystemLogOptimizationService.GetOverviewContext(c.Request.Context())
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
@@ -1181,7 +1237,7 @@ func (a *ApiService) ResetSystemLogOptimizationContent(c *gin.Context) {
 }
 
 func (a *ApiService) GetSystemSysctlOptimizationOverview(c *gin.Context) {
-	overview, err := a.SystemSysctlOptimizationService.GetOverview()
+	overview, err := a.SystemSysctlOptimizationService.GetOverviewContext(c.Request.Context())
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
@@ -1232,7 +1288,7 @@ func (a *ApiService) ResetSystemSysctlOptimizationContent(c *gin.Context) {
 }
 
 func (a *ApiService) GetSystemLinuxDNSOptimizationOverview(c *gin.Context) {
-	overview, err := a.SystemLinuxDNSOptimizationService.GetOverview()
+	overview, err := a.SystemLinuxDNSOptimizationService.GetOverviewContext(c.Request.Context())
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
@@ -1275,7 +1331,7 @@ func (a *ApiService) SaveSystemLinuxDNSOptimizationNameServers(c *gin.Context) {
 }
 
 func (a *ApiService) GetSystemMTUOptimizationOverview(c *gin.Context) {
-	overview, err := a.SystemMTUOptimizationService.GetOverview()
+	overview, err := a.SystemMTUOptimizationService.GetOverviewContext(c.Request.Context())
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
@@ -1364,7 +1420,16 @@ func (a *ApiService) GetAcmeLog(c *gin.Context) {
 		jsonMsg(c, "", fmt.Errorf("id is required"))
 		return
 	}
-	session, err := a.AcmeService.GetLogSession(id)
+	after := -1
+	if rawAfter := strings.TrimSpace(c.Query("after")); rawAfter != "" {
+		parsed, parseErr := strconv.Atoi(rawAfter)
+		if parseErr != nil || parsed < 0 {
+			jsonMsg(c, "", fmt.Errorf("after must be a non-negative integer"))
+			return
+		}
+		after = parsed
+	}
+	session, err := a.AcmeService.GetLogSessionAfter(id, after)
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
@@ -1830,12 +1895,42 @@ func (a *ApiService) DeleteAcmeCertificate(c *gin.Context) {
 }
 
 func (a *ApiService) ListCertificates(c *gin.Context) {
+	if c.Query("page") != "" || c.Query("per_page") != "" || c.Query("search") != "" {
+		page := 1
+		if rawPage := strings.TrimSpace(c.Query("page")); rawPage != "" {
+			if parsed, err := strconv.Atoi(rawPage); err == nil && parsed > 0 {
+				page = parsed
+			}
+		}
+		perPage := 20
+		if rawPerPage := strings.TrimSpace(c.Query("per_page")); rawPerPage != "" {
+			if parsed, err := strconv.Atoi(rawPerPage); err == nil && parsed > 0 {
+				perPage = parsed
+			}
+		}
+		result, err := a.CertificateInventoryService.ListPage(page, perPage, c.Query("search"))
+		if err != nil {
+			jsonMsg(c, "", err)
+			return
+		}
+		jsonObj(c, result, nil)
+		return
+	}
 	certificates, err := a.CertificateInventoryService.List()
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
 	}
 	jsonObj(c, certificates, nil)
+}
+
+func (a *ApiService) ListTLSCertificateOptions(c *gin.Context) {
+	options, err := a.CertificateInventoryService.ListTLSOptions()
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, options, nil)
 }
 
 func (a *ApiService) GetCertificateMaterial(c *gin.Context) {
@@ -1874,6 +1969,20 @@ func (a *ApiService) ViewAcmeCertificate(c *gin.Context) {
 		return
 	}
 	jsonObj(c, material, nil)
+}
+
+func (a *ApiService) GetAcmeCertificateLog(c *gin.Context) {
+	id, err := strconv.ParseUint(strings.TrimSpace(c.Query("id")), 10, 64)
+	if err != nil || id == 0 {
+		jsonMsg(c, "", fmt.Errorf("valid certificate id is required"))
+		return
+	}
+	logView, err := a.CertificateInventoryService.GetLog(uint(id))
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, logView, nil)
 }
 
 func (a *ApiService) SaveAcmeAccount(c *gin.Context) {
@@ -2218,6 +2327,27 @@ func (a *ApiService) GetPortForwardOverview(c *gin.Context) {
 	jsonObj(c, overview, nil)
 }
 
+// GetPortForwardRuntime serves the active-page poller without repeating the
+// complete SQLite overview or a /proc ownership scan on every interval.
+func (a *ApiService) GetPortForwardRuntime(c *gin.Context) {
+	runtime, err := a.PortForwardService.GetRuntimeOverview()
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, runtime, nil)
+}
+
+// SyncPortForward immediately reconciles the managed nftables state before
+// returning the complete overview requested by the manual refresh action.
+func (a *ApiService) SyncPortForward(c *gin.Context) {
+	if err := a.PortForwardService.SyncIfNeeded(0); err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	a.GetPortForwardOverview(c)
+}
+
 func (a *ApiService) SavePortForwardRule(c *gin.Context) {
 	req := service.PortForwardRulePayload{}
 	if err := c.ShouldBind(&req); err != nil {
@@ -2535,13 +2665,18 @@ func (a *ApiService) PurgeKernelCleanupPackages(c *gin.Context) {
 		jsonMsg(c, "", fmt.Errorf("packages are required"))
 		return
 	}
-	result, err := a.KernelManagerService.PurgePackages(req.Packages)
+	result, err := a.KernelManagerService.StartManagedCleanupPurge(req.Packages)
 	jsonObj(c, result, err)
 }
 
 func (a *ApiService) AutoCleanupKernelPackages(c *gin.Context) {
-	result, err := a.KernelManagerService.AutoCleanupPackages()
+	result, err := a.KernelManagerService.StartManagedAutoCleanup()
 	jsonObj(c, result, err)
+}
+
+func (a *ApiService) GetKernelCleanupStatus(c *gin.Context) {
+	status := a.KernelManagerService.GetManagedCleanupTaskStatus(c.Query("id"))
+	jsonObj(c, status, nil)
 }
 
 func (a *ApiService) SaveKernelCleanupMarker(c *gin.Context) {
@@ -2743,6 +2878,21 @@ func (a *ApiService) GenerateTLSCertAlgorithm(c *gin.Context) {
 	jsonObj(c, algorithmInfo, nil)
 }
 
+func (a *ApiService) GetTLSCertificateInfo(c *gin.Context) {
+	req := tlsSha256Request{}
+	if err := c.ShouldBind(&req); err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+
+	inspection, err := a.ServerService.InspectTLSCertificate(req.SourceType, req.CertificatePath, req.CertificatePEM)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, inspection, nil)
+}
+
 func (a *ApiService) DetectTLSSelfSignedTemplate(c *gin.Context) {
 	req := tlsSha256Request{}
 	if err := c.ShouldBind(&req); err != nil {
@@ -2848,6 +2998,14 @@ func (a *ApiService) writeSessionStatus(c *gin.Context, userActivity bool) {
 	} else {
 		logger.Infof("login session rejected: reason=%s remote=%s", reason, getRemoteIp(c))
 	}
+	if loginSessionReasonIsTransient(reason) {
+		c.JSON(http.StatusServiceUnavailable, Msg{
+			Success: false,
+			Msg:     "Session temporarily unavailable",
+			Obj:     map[string]string{"reason": reason},
+		})
+		return
+	}
 	c.JSON(http.StatusOK, Msg{
 		Success: false,
 		Msg:     "Invalid login",
@@ -2860,8 +3018,11 @@ func (a *ApiService) ChangePass(c *gin.Context) {
 	oldPass := c.Request.FormValue("oldPass")
 	newUsername := c.Request.FormValue("newUsername")
 	newPass := c.Request.FormValue("newPass")
-	err := a.UserService.ChangePass(id, oldPass, newUsername, newPass)
+	oldUsername, err := a.UserService.ChangePass(id, oldPass, newUsername, newPass)
 	if err == nil {
+		if err := RenameLoginSessionUser(oldUsername, newUsername); err != nil {
+			logger.Warning("update renamed user sessions failed: ", err)
+		}
 		logger.Info("change user credentials success")
 		jsonMsg(c, "save", nil)
 	} else {
@@ -2884,6 +3045,11 @@ func (a *ApiService) Save(c *gin.Context, loginUser string) {
 
 	objs, err := a.ConfigService.Save(obj, act, preparedData, initUsers, loginUser, hostname)
 	if err != nil {
+		var committedErr *service.CommittedSaveError
+		if errors.As(err, &committedErr) {
+			writeCommittedSaveFailure(c, committedErr)
+			return
+		}
 		jsonMsg(c, "save", err)
 		return
 	}
@@ -2893,8 +3059,35 @@ func (a *ApiService) Save(c *gin.Context, loginUser string) {
 		err = a.LoadPartialData(c, objs)
 	}
 	if err != nil {
-		jsonMsg(c, obj, err)
+		writeCommittedPartialLoadFailure(c, obj, err)
 	}
+}
+
+func writeCommittedSaveFailure(c *gin.Context, committedErr *service.CommittedSaveError) {
+	retryRuntime := committedErr != nil && committedErr.RetrySingboxRuntime
+	jsonMsgObj(c, "save", map[string]interface{}{
+		"committed":    true,
+		"retryRuntime": retryRuntime,
+	}, fmt.Errorf("data was saved, but a post-commit operation failed: %w", committedErr))
+}
+
+// writeCommittedPartialLoadFailure distinguishes a successful database save
+// from the later best-effort data reload used to build the API response.
+func writeCommittedPartialLoadFailure(c *gin.Context, object string, err error) {
+	jsonMsgObj(c, object, map[string]interface{}{
+		"committed":     true,
+		"retryRuntime":  false,
+		"refreshFailed": true,
+	}, fmt.Errorf("data was saved, but the response data refresh failed: %w", err))
+}
+
+func (a *ApiService) RetrySingboxRuntime(c *gin.Context, loginUser string) {
+	_ = loginUser
+	if err := validateSingboxRuntimeRetryPayload(c.Request.Body); err != nil {
+		jsonMsg(c, "retryRuntime", err)
+		return
+	}
+	jsonMsg(c, "retryRuntime", a.ConfigService.RetrySingboxRuntime())
 }
 
 func (a *ApiService) RestartApp(c *gin.Context) {
@@ -2987,8 +3180,9 @@ func (a *ApiService) AddToken(c *gin.Context) {
 }
 
 func (a *ApiService) DeleteToken(c *gin.Context) {
+	loginUser := GetLoginUser(c)
 	tokenId := c.Request.FormValue("id")
-	err := a.UserService.DeleteToken(tokenId)
+	err := a.UserService.DeleteToken(loginUser, tokenId)
 	jsonMsg(c, "", err)
 }
 
@@ -3000,19 +3194,65 @@ func (a *ApiService) SyncToSubManager(c *gin.Context) {
 	}
 	hostname := getHostname(c)
 	result, err := a.SyncService.SyncClientToSubManager(clientName, hostname)
+	autoSyncEnabled := false
+	if result != nil {
+		client := &model.Client{}
+		if loadErr := database.GetDB().Model(model.Client{}).Where("name = ?", clientName).First(client).Error; loadErr == nil {
+			if markErr := a.SettingService.SetSubManagerAutoSyncClient(client.Id, true); markErr != nil {
+				logger.Warning("set default auto sync client failed: ", markErr)
+				if err == nil {
+					err = fmt.Errorf("set default auto sync client failed: %w", markErr)
+				}
+			} else {
+				autoSyncEnabled = true
+			}
+		} else if database.IsNotFound(loadErr) {
+			if err == nil {
+				err = fmt.Errorf("default client disappeared before auto sync marker could be saved")
+			}
+		} else {
+			logger.Warning("load default client for auto sync marker failed: ", loadErr)
+			if err == nil {
+				err = fmt.Errorf("load default client for auto sync marker failed: %w", loadErr)
+			}
+		}
+	}
 	if err != nil {
+		if result != nil {
+			jsonMsgObj(c, "", gin.H{
+				"result":          result,
+				"committed":       true,
+				"autoSyncEnabled": autoSyncEnabled,
+			}, err)
+			return
+		}
 		jsonMsg(c, "", err)
 		return
 	}
-	client := &model.Client{}
-	if err := database.GetDB().Model(model.Client{}).Where("name = ?", clientName).First(client).Error; err == nil {
-		if markErr := a.SettingService.SetSubManagerAutoSyncClient(client.Id, true); markErr != nil {
-			logger.Warning("set default auto sync client failed: ", markErr)
-		}
-	} else if !database.IsNotFound(err) {
-		logger.Warning("load default client for auto sync marker failed: ", err)
-	}
 	jsonObj(c, result, nil)
+}
+
+func (a *ApiService) SetClientSubManagerAutoSync(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Request.FormValue("id"), 10, 64)
+	if err != nil || id == 0 {
+		jsonMsg(c, "", fmt.Errorf("client id is required"))
+		return
+	}
+	enabled, err := strconv.ParseBool(c.Request.FormValue("enabled"))
+	if err != nil {
+		jsonMsg(c, "", fmt.Errorf("auto sync enabled must be true or false"))
+		return
+	}
+	client := &model.Client{}
+	if err := database.GetDB().Select("id").Where("id = ?", id).First(client).Error; err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	if err := a.SettingService.SetSubManagerAutoSyncClient(client.Id, enabled); err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, gin.H{"id": client.Id, "enabled": enabled}, nil)
 }
 
 func (a *ApiService) SyncMihomoToSubManager(c *gin.Context) {
@@ -3023,19 +3263,65 @@ func (a *ApiService) SyncMihomoToSubManager(c *gin.Context) {
 	}
 	hostname := getHostname(c)
 	result, err := a.MihomoSyncService.SyncClientToSubManager(clientName, hostname)
+	autoSyncEnabled := false
+	if result != nil {
+		client := &model.MihomoClient{}
+		if loadErr := database.GetDB().Model(model.MihomoClient{}).Where("name = ?", clientName).First(client).Error; loadErr == nil {
+			if markErr := a.SettingService.SetSubManagerAutoSyncMihomoClient(client.Id, true); markErr != nil {
+				logger.Warning("set mihomo auto sync client failed: ", markErr)
+				if err == nil {
+					err = fmt.Errorf("set mihomo auto sync client failed: %w", markErr)
+				}
+			} else {
+				autoSyncEnabled = true
+			}
+		} else if database.IsNotFound(loadErr) {
+			if err == nil {
+				err = fmt.Errorf("mihomo client disappeared before auto sync marker could be saved")
+			}
+		} else {
+			logger.Warning("load mihomo client for auto sync marker failed: ", loadErr)
+			if err == nil {
+				err = fmt.Errorf("load mihomo client for auto sync marker failed: %w", loadErr)
+			}
+		}
+	}
 	if err != nil {
+		if result != nil {
+			jsonMsgObj(c, "", gin.H{
+				"result":          result,
+				"committed":       true,
+				"autoSyncEnabled": autoSyncEnabled,
+			}, err)
+			return
+		}
 		jsonMsg(c, "", err)
 		return
 	}
-	client := &model.MihomoClient{}
-	if err := database.GetDB().Model(model.MihomoClient{}).Where("name = ?", clientName).First(client).Error; err == nil {
-		if markErr := a.SettingService.SetSubManagerAutoSyncMihomoClient(client.Id, true); markErr != nil {
-			logger.Warning("set mihomo auto sync client failed: ", markErr)
-		}
-	} else if !database.IsNotFound(err) {
-		logger.Warning("load mihomo client for auto sync marker failed: ", err)
-	}
 	jsonObj(c, result, nil)
+}
+
+func (a *ApiService) SetMihomoClientSubManagerAutoSync(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Request.FormValue("id"), 10, 64)
+	if err != nil || id == 0 {
+		jsonMsg(c, "", fmt.Errorf("mihomo client id is required"))
+		return
+	}
+	enabled, err := strconv.ParseBool(c.Request.FormValue("enabled"))
+	if err != nil {
+		jsonMsg(c, "", fmt.Errorf("auto sync enabled must be true or false"))
+		return
+	}
+	client := &model.MihomoClient{}
+	if err := database.GetDB().Select("id").Where("id = ?", id).First(client).Error; err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	if err := a.SettingService.SetSubManagerAutoSyncMihomoClient(client.Id, enabled); err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, gin.H{"id": client.Id, "enabled": enabled}, nil)
 }
 
 func (a *ApiService) GetSingboxConfig(c *gin.Context) {
@@ -3061,21 +3347,22 @@ func (a *ApiService) GetSingboxConfig(c *gin.Context) {
 // (recommended, NAT-friendly). Otherwise only local interface public IPs are returned.
 func (a *ApiService) GetServerIPs(c *gin.Context) {
 	verify := c.Query("verify")
+	forceRefresh := c.Query("refresh") == "true"
 
 	var ips []string
 	if verify == "true" {
 		// Fetch real outbound IPs from external APIs (supports NAT scenarios).
-		ips = a.IPDetectService.GetOutboundIPs()
+		ips = a.IPDetectService.GetOutboundIPs(forceRefresh)
 	} else {
 		// Use local interface public IPs only (not NAT-aware).
 		ips = a.IPDetectService.GetAllAvailableIPs()
-	}
-
-	// Fallback to the default outbound IP when no result is found.
-	if len(ips) == 0 {
-		defaultIP, ok := a.IPDetectService.GetDefaultOutboundIP()
-		if ok {
-			ips = []string{defaultIP}
+		// Fallback to the default outbound IP when no local address is available.
+		// Verified requests already perform this fallback inside their shared timeout.
+		if len(ips) == 0 {
+			defaultIP, ok := a.IPDetectService.GetDefaultOutboundIP()
+			if ok {
+				ips = []string{defaultIP}
+			}
 		}
 	}
 
@@ -3136,6 +3423,17 @@ func (a *ApiService) FetchSubscription(c *gin.Context) {
 
 	err := a.SubGroupService.FetchAndSaveSubscriptionSources(groupName, jsonURL, clashURL, allowInsecure)
 	if err != nil {
+		var committedErr *service.CommittedSaveError
+		if errors.As(err, &committedErr) {
+			data, dataErr := a.getSubGroupData()
+			if dataErr != nil {
+				jsonMsg(c, "", dataErr)
+				return
+			}
+			data["committed"] = true
+			jsonMsgObj(c, "", data, fmt.Errorf("subscription data was saved, but post-commit validation failed: %w", committedErr))
+			return
+		}
 		jsonMsg(c, "", err)
 		return
 	}
@@ -3165,6 +3463,18 @@ func (a *ApiService) RefreshSubscription(c *gin.Context) {
 
 	result, err := a.SubGroupService.RefreshSubscriptionSources(groupName, jsonURL, clashURL, allowInsecure)
 	if err != nil {
+		var committedErr *service.CommittedSaveError
+		if errors.As(err, &committedErr) {
+			data, dataErr := a.getSubGroupData()
+			if dataErr != nil {
+				jsonMsg(c, "", dataErr)
+				return
+			}
+			data["committed"] = true
+			data["result"] = result
+			jsonMsgObj(c, "", data, fmt.Errorf("subscription data was saved, but post-commit validation failed: %w", committedErr))
+			return
+		}
 		jsonMsg(c, "", err)
 		return
 	}
@@ -3181,6 +3491,18 @@ func (a *ApiService) RefreshSubscription(c *gin.Context) {
 func (a *ApiService) ClearSubManager(c *gin.Context) {
 	result, err := a.SubGroupService.ClearSubManagerData()
 	if err != nil {
+		var committedErr *service.CommittedSaveError
+		if errors.As(err, &committedErr) {
+			data, dataErr := a.getSubGroupData()
+			if dataErr != nil {
+				jsonMsg(c, "", dataErr)
+				return
+			}
+			data["committed"] = true
+			data["result"] = result
+			jsonMsgObj(c, "", data, fmt.Errorf("subscription manager data was cleared, but post-commit validation failed: %w", committedErr))
+			return
+		}
 		jsonMsg(c, "", err)
 		return
 	}
@@ -3251,6 +3573,17 @@ func (a *ApiService) FetchOutboundSubscription(c *gin.Context) {
 	}
 
 	if err := a.OutboundGroupService.FetchAndSaveSubscription(groupName, url, allowInsecure); err != nil {
+		var committedErr *service.CommittedSingboxOutboundSubscriptionImportError
+		if errors.As(err, &committedErr) {
+			data, loadErr := a.getOutboundGroupData()
+			if loadErr != nil {
+				jsonMsg(c, "", errors.Join(err, loadErr))
+				return
+			}
+			data["committed"] = true
+			jsonMsgObj(c, "", data, fmt.Errorf("订阅数据已保存，但运行配置更新失败: %w", committedErr))
+			return
+		}
 		jsonMsg(c, "", err)
 		return
 	}
@@ -3276,6 +3609,18 @@ func (a *ApiService) RefreshOutboundSubscription(c *gin.Context) {
 
 	result, err := a.OutboundGroupService.RefreshSubscription(groupName, url, allowInsecure)
 	if err != nil {
+		var committedErr *service.CommittedSingboxOutboundSubscriptionImportError
+		if errors.As(err, &committedErr) {
+			data, loadErr := a.getOutboundGroupData()
+			if loadErr != nil {
+				jsonMsg(c, "", errors.Join(err, loadErr))
+				return
+			}
+			data["result"] = result
+			data["committed"] = true
+			jsonMsgObj(c, "", data, fmt.Errorf("订阅数据已保存，但运行配置更新失败: %w", committedErr))
+			return
+		}
 		jsonMsg(c, "", err)
 		return
 	}
@@ -3300,6 +3645,17 @@ func (a *ApiService) FetchMihomoOutboundSubscription(c *gin.Context) {
 	}
 
 	if err := a.MihomoOutboundGroupService.FetchAndSaveSubscription(groupName, url, allowInsecure); err != nil {
+		var committedErr *service.CommittedMihomoSubscriptionImportError
+		if errors.As(err, &committedErr) {
+			data, loadErr := a.getMihomoOutboundGroupData()
+			if loadErr != nil {
+				jsonMsg(c, "", errors.Join(err, loadErr))
+				return
+			}
+			data["committed"] = true
+			jsonMsgObj(c, "", data, fmt.Errorf("订阅数据已保存，但运行配置更新失败: %w", committedErr))
+			return
+		}
 		jsonMsg(c, "", err)
 		return
 	}
@@ -3324,6 +3680,18 @@ func (a *ApiService) RefreshMihomoOutboundSubscription(c *gin.Context) {
 
 	result, err := a.MihomoOutboundGroupService.RefreshSubscription(groupName, url, allowInsecure)
 	if err != nil {
+		var committedErr *service.CommittedMihomoSubscriptionImportError
+		if errors.As(err, &committedErr) {
+			data, loadErr := a.getMihomoOutboundGroupData()
+			if loadErr != nil {
+				jsonMsg(c, "", errors.Join(err, loadErr))
+				return
+			}
+			data["result"] = result
+			data["committed"] = true
+			jsonMsgObj(c, "", data, fmt.Errorf("订阅数据已保存，但运行配置更新失败: %w", committedErr))
+			return
+		}
 		jsonMsg(c, "", err)
 		return
 	}

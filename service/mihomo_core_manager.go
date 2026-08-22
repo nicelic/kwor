@@ -35,6 +35,7 @@ type MihomoCoreInfo struct {
 	RuntimeMode        string                       `json:"runtimeMode,omitempty"`
 	InstalledTarget    MihomoCoreDownloadTarget     `json:"installedTarget,omitempty"`
 	InstalledChannel   string                       `json:"installedChannel,omitempty"`
+	LogLevel           string                       `json:"logLevel"`
 	DownloadPreference MihomoCoreDownloadPreference `json:"downloadPreference"`
 }
 
@@ -152,6 +153,8 @@ const (
 	mihomoCoreAutoCheckEnabledKey        = "mihomoCoreAutoCheckEnabled"
 	mihomoCoreAutoCheckIntervalHoursKey  = "mihomoCoreAutoCheckIntervalHours"
 	mihomoCoreAutoCheckLastAtKey         = "mihomoCoreAutoCheckLastAt"
+	mihomoCoreAutoCheckFirstAtKey        = "mihomoCoreAutoCheckFirstAt"
+	mihomoCoreAutoCheckFirstTimeZoneKey  = "mihomoCoreAutoCheckFirstTimeZone"
 	mihomoCoreAutoCheckLatestStableKey   = "mihomoCoreAutoCheckLatestStable"
 	mihomoCoreAutoCheckLatestAlphaKey    = "mihomoCoreAutoCheckLatestAlpha"
 	mihomoCoreAutoCheckPendingStableKey  = "mihomoCoreAutoCheckPendingStable"
@@ -511,6 +514,12 @@ func (s *MihomoCoreManagerService) GetCoreStatus() (*MihomoCoreInfo, error) {
 
 	info := &MihomoCoreInfo{
 		Platform: s.getPlatformInfo(),
+		LogLevel: defaultMihomoCoreLogLevel,
+	}
+	if level, err := GetMihomoCoreLogLevel(); err != nil {
+		logger.Warning("failed to load mihomo core log level: ", err)
+	} else {
+		info.LogLevel = level
 	}
 	info.RuntimeMode = string(getManagedCoreRuntimeMode())
 	if preference, err := s.GetDownloadPreference(); err == nil {
@@ -1545,15 +1554,22 @@ func (s *MihomoCoreManagerService) StartCore() (err error) {
 		return lockErr
 	}
 	defer func() { _ = lifecycleLock.Release() }()
+	finishTrafficMutation := BeginRuntimeTrafficMutation()
+	defer finishTrafficMutation()
 
 	s.mu.Lock()
+	invalidateManagedCoreProcessRuntimeCache()
 	defer func() {
 		if err == nil {
 			SyncPortForwardNftablesAfterCoreRuntimeReady()
 			notifyCertificateCoreLoadedLatestConfig(certificateCoreKindMihomo)
+			InvalidateDashboardRuntimeCache()
 		}
 	}()
 	defer s.mu.Unlock()
+	if flushErr := FlushTrafficRuntimeJournal(); flushErr != nil {
+		return fmt.Errorf("启动 Mihomo 前刷新流量账本失败: %w", flushErr)
+	}
 
 	if err := EnsureManagedCoreLayout(); err != nil {
 		return err
@@ -1668,18 +1684,31 @@ func (s *MihomoCoreManagerService) StopCore() error {
 		return err
 	}
 	defer func() { _ = lifecycleLock.Release() }()
+	finishTrafficMutation := BeginRuntimeTrafficMutation()
+	defer finishTrafficMutation()
 
 	s.mu.Lock()
+	invalidateManagedCoreProcessRuntimeCache()
 	defer s.mu.Unlock()
+	defer func() {
+		InvalidateDashboardRuntimeCache()
+	}()
+	if flushErr := FlushTrafficRuntimeJournal(); flushErr != nil {
+		return fmt.Errorf("停止 Mihomo 前刷新流量账本失败: %w", flushErr)
+	}
 
 	if IsSystemPlatformLinux() {
 		err := s.stopCoreLinuxFull()
-		if err == nil {
-			clearManagedCoreShouldRun("mihomo")
+		if err != nil {
+			return err
 		}
+		clearManagedCoreShouldRun("mihomo")
+	} else if err := s.stopCoreInternal(); err != nil {
 		return err
 	}
-	return s.stopCoreInternal()
+
+	DiscardMaterializedManagedRuntimeCoreFile(s.getConfigPath())
+	return nil
 }
 
 func (s *MihomoCoreManagerService) DeleteCore() error {
@@ -1688,9 +1717,18 @@ func (s *MihomoCoreManagerService) DeleteCore() error {
 		return err
 	}
 	defer func() { _ = lifecycleLock.Release() }()
+	finishTrafficMutation := BeginRuntimeTrafficMutation()
+	defer finishTrafficMutation()
 
 	s.mu.Lock()
+	invalidateManagedCoreProcessRuntimeCache()
 	defer s.mu.Unlock()
+	defer func() {
+		InvalidateDashboardRuntimeCache()
+	}()
+	if flushErr := FlushTrafficRuntimeJournal(); flushErr != nil {
+		return fmt.Errorf("删除 Mihomo 前刷新流量账本失败: %w", flushErr)
+	}
 
 	if err := EnsureManagedCoreLayout(); err != nil {
 		return err
@@ -1708,6 +1746,7 @@ func (s *MihomoCoreManagerService) DeleteCore() error {
 			return err
 		}
 	}
+	DiscardMaterializedManagedRuntimeCoreFile(s.getConfigPath())
 
 	binPath := s.getCoreBinPath()
 	if err := os.Remove(binPath); err != nil && !os.IsNotExist(err) {
@@ -1733,15 +1772,22 @@ func (s *MihomoCoreManagerService) RestartCore() (err error) {
 		return lockErr
 	}
 	defer func() { _ = lifecycleLock.Release() }()
+	finishTrafficMutation := BeginRuntimeTrafficMutation()
+	defer finishTrafficMutation()
 
 	s.mu.Lock()
+	invalidateManagedCoreProcessRuntimeCache()
 	defer func() {
 		if err == nil {
 			SyncPortForwardNftablesAfterCoreRuntimeReady()
 			notifyCertificateCoreLoadedLatestConfig(certificateCoreKindMihomo)
+			InvalidateDashboardRuntimeCache()
 		}
 	}()
 	defer s.mu.Unlock()
+	if flushErr := FlushTrafficRuntimeJournal(); flushErr != nil {
+		return fmt.Errorf("重启 Mihomo 前刷新流量账本失败: %w", flushErr)
+	}
 
 	if err := EnsureManagedCoreLayout(); err != nil {
 		return err
@@ -1854,6 +1900,7 @@ func (s *MihomoCoreManagerService) startCoreWindows(coreDir string) error {
 		if s.coreCmd == startedCmd {
 			s.isStarted = false
 			s.coreCmd = nil
+			DiscardMaterializedManagedRuntimeCoreFile(s.getConfigPath())
 			closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
 			s.stdout = nil
 			s.stderr = nil
@@ -1890,6 +1937,7 @@ func (s *MihomoCoreManagerService) startCoreDirectLinux(coreDir string) error {
 		if s.coreCmd == startedCmd {
 			s.isStarted = false
 			s.coreCmd = nil
+			DiscardMaterializedManagedRuntimeCoreFile(s.getConfigPath())
 			closeManagedCoreDirectStdStreams(s.stdout, s.stderr)
 			s.stdout = nil
 			s.stderr = nil
@@ -1965,7 +2013,9 @@ func (s *MihomoCoreManagerService) stopCoreLinuxFull() error {
 		clearManagedCoreShouldRun("mihomo")
 		return nil
 	}
-	_ = s.stopCoreInternal()
+	if err := s.stopCoreInternal(); err != nil {
+		return err
+	}
 	s.removeMihomoSystemdService()
 	clearManagedCoreShouldRun("mihomo")
 	return nil
@@ -2171,33 +2221,16 @@ func (s *MihomoCoreManagerService) removeMihomoSystemdService() {
 }
 
 func (s *MihomoCoreManagerService) getCoreAutoCheckSettings() (enabled bool, intervalHours int, lastCheckedAt int64, err error) {
-	settingSvc := &SettingService{}
+	schedule, err := loadCoreAutoCheckSchedule(&SettingService{}, mihomoCoreAutoCheckSettingKeys)
+	return schedule.Enabled, schedule.IntervalHours, schedule.LastCheckedAt, err
+}
 
-	enabled, err = settingSvc.getBool(mihomoCoreAutoCheckEnabledKey)
-	if err != nil {
-		return false, 12, 0, err
-	}
-
-	intervalRaw, err := settingSvc.getString(mihomoCoreAutoCheckIntervalHoursKey)
-	if err != nil {
-		return false, 12, 0, err
-	}
-	intervalHours = normalizeCoreAutoCheckIntervalHours(intervalRaw)
-
-	lastRaw, err := settingSvc.getString(mihomoCoreAutoCheckLastAtKey)
-	if err != nil {
-		return false, 12, 0, err
-	}
-	lastRaw = strings.TrimSpace(lastRaw)
-	if lastRaw == "" {
-		return enabled, intervalHours, 0, nil
-	}
-
-	lastCheckedAt, parseErr := strconv.ParseInt(lastRaw, 10, 64)
-	if parseErr != nil || lastCheckedAt < 0 {
-		lastCheckedAt = 0
-	}
-	return enabled, intervalHours, lastCheckedAt, nil
+var mihomoCoreAutoCheckSettingKeys = coreAutoCheckSettingKeys{
+	enabled:            mihomoCoreAutoCheckEnabledKey,
+	intervalHours:      mihomoCoreAutoCheckIntervalHoursKey,
+	lastCheckedAt:      mihomoCoreAutoCheckLastAtKey,
+	firstCheckAt:       mihomoCoreAutoCheckFirstAtKey,
+	firstCheckTimeZone: mihomoCoreAutoCheckFirstTimeZoneKey,
 }
 
 func (s *MihomoCoreManagerService) buildMihomoCoreUpdateInfo() (*MihomoCoreUpdateInfo, error) {
@@ -2270,50 +2303,99 @@ func (s *MihomoCoreManagerService) buildMihomoCoreUpdateInfo() (*MihomoCoreUpdat
 }
 
 func (s *MihomoCoreManagerService) SetCoreAutoCheckSettings(enabled bool, intervalHours int, hasAutoUpdate bool, autoUpdateEnabled bool) error {
-	if intervalHours <= 0 {
-		intervalHours = 12
+	if err := s.SetCoreAutoCheckEnabled(enabled); err != nil {
+		return err
 	}
+	if err := s.SetCoreAutoCheckInterval(intervalHours); err != nil {
+		return err
+	}
+	if hasAutoUpdate && enabled {
+		return s.SetCoreAutoUpdateEnabled(autoUpdateEnabled)
+	}
+	return nil
+}
 
+func (s *MihomoCoreManagerService) SetCoreAutoCheckEnabled(enabled bool) error {
 	mihomoCoreAutoCheckMu.Lock()
 	defer mihomoCoreAutoCheckMu.Unlock()
 
 	settingSvc := &SettingService{}
-	prevAutoUpdateEnabled, err := settingSvc.getBool(mihomoCoreAutoUpdateEnabledKey)
+	current, err := settingSvc.getBool(mihomoCoreAutoCheckEnabledKey)
 	if err != nil {
 		return err
 	}
 	if err := settingSvc.setString(mihomoCoreAutoCheckEnabledKey, strconv.FormatBool(enabled)); err != nil {
 		return err
 	}
-	if err := settingSvc.setString(mihomoCoreAutoCheckIntervalHoursKey, strconv.Itoa(intervalHours)); err != nil {
+	if enabled && !current {
+		return scheduleCoreAutoCheckFirstRunLocked(settingSvc, mihomoCoreAutoCheckSettingKeys)
+	}
+	if enabled {
+		return nil
+	}
+	if err := s.setCoreAutoUpdateEnabledLocked(settingSvc, false); err != nil {
 		return err
 	}
-	if hasAutoUpdate {
-		if autoUpdateEnabled && !prevAutoUpdateEnabled {
-			status, err := s.GetCoreStatus()
-			if err != nil {
-				return err
-			}
-			if reason := mihomoAutoUpdateReadinessReason(status); reason != "" {
-				return fmt.Errorf("%s", reason)
-			}
-		}
-		if err := s.setCoreAutoUpdateEnabledLocked(settingSvc, autoUpdateEnabled); err != nil {
+	if err := clearCoreAutoCheckFirstRunLocked(settingSvc, mihomoCoreAutoCheckSettingKeys); err != nil {
+		return err
+	}
+	if err := settingSvc.setString(mihomoCoreAutoCheckPendingStableKey, ""); err != nil {
+		return err
+	}
+	return settingSvc.setString(mihomoCoreAutoCheckPendingAlphaKey, "")
+}
+
+func (s *MihomoCoreManagerService) SetCoreAutoCheckInterval(intervalHours int) error {
+	if intervalHours <= 0 {
+		return fmt.Errorf("检查间隔必须是正整数小时")
+	}
+	mihomoCoreAutoCheckMu.Lock()
+	defer mihomoCoreAutoCheckMu.Unlock()
+	return (&SettingService{}).setString(mihomoCoreAutoCheckIntervalHoursKey, strconv.Itoa(intervalHours))
+}
+
+func (s *MihomoCoreManagerService) ReschedulePendingCoreAutoCheckForPanelTimeZone() error {
+	mihomoCoreAutoCheckMu.Lock()
+	defer mihomoCoreAutoCheckMu.Unlock()
+
+	settingSvc := &SettingService{}
+	schedule, err := loadCoreAutoCheckSchedule(settingSvc, mihomoCoreAutoCheckSettingKeys)
+	if err != nil || !schedule.Enabled || schedule.FirstCheckAt == 0 {
+		return err
+	}
+	return scheduleCoreAutoCheckFirstRunLocked(settingSvc, mihomoCoreAutoCheckSettingKeys)
+}
+
+func (s *MihomoCoreManagerService) SetCoreAutoUpdateEnabled(enabled bool) error {
+	mihomoCoreAutoCheckMu.Lock()
+	defer mihomoCoreAutoCheckMu.Unlock()
+
+	settingSvc := &SettingService{}
+	autoCheckEnabled, err := settingSvc.getBool(mihomoCoreAutoCheckEnabledKey)
+	if err != nil {
+		return err
+	}
+	if enabled && !autoCheckEnabled {
+		return fmt.Errorf("请先启用自动更新检查")
+	}
+	previouslyEnabled, err := settingSvc.getBool(mihomoCoreAutoUpdateEnabledKey)
+	if err != nil {
+		return err
+	}
+	if enabled && !previouslyEnabled {
+		status, err := s.GetCoreStatus()
+		if err != nil {
 			return err
 		}
-		if autoUpdateEnabled {
-			if err := s.clearCoreAutoUpdateDisableReasonLocked(settingSvc); err != nil {
-				return err
-			}
+		if reason := mihomoAutoUpdateReadinessReason(status); reason != "" {
+			return fmt.Errorf("%s", reason)
 		}
 	}
-	if !enabled {
-		if err := settingSvc.setString(mihomoCoreAutoCheckPendingStableKey, ""); err != nil {
-			return err
-		}
-		if err := settingSvc.setString(mihomoCoreAutoCheckPendingAlphaKey, ""); err != nil {
-			return err
-		}
+	if err := s.setCoreAutoUpdateEnabledLocked(settingSvc, enabled); err != nil {
+		return err
+	}
+	if enabled {
+		return s.clearCoreAutoUpdateDisableReasonLocked(settingSvc)
 	}
 	return nil
 }
@@ -2399,21 +2481,16 @@ func (s *MihomoCoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
 	mihomoCoreAutoCheckMu.Lock()
 	defer mihomoCoreAutoCheckMu.Unlock()
 
-	enabled, intervalHours, lastCheckedAt, err := s.getCoreAutoCheckSettings()
+	settingSvc := &SettingService{}
+	schedule, err := loadCoreAutoCheckSchedule(settingSvc, mihomoCoreAutoCheckSettingKeys)
 	if err != nil {
 		return err
 	}
-	if !enabled {
-		return nil
+	shouldRun, err := shouldRunCoreAutoCheckLocked(settingSvc, mihomoCoreAutoCheckSettingKeys, schedule, force)
+	if err != nil || !shouldRun {
+		return err
 	}
-
-	now := time.Now().Unix()
-	if !force && lastCheckedAt > 0 {
-		nextDueAt := lastCheckedAt + int64(intervalHours)*3600
-		if now < nextDueAt {
-			return nil
-		}
-	}
+	now := PanelNow().Unix()
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	latestStable, err := s.fetchLatestStableTag(client)
@@ -2421,7 +2498,6 @@ func (s *MihomoCoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
 		return err
 	}
 	_, latestAlpha, alphaErr := s.fetchLatestAlphaRelease(client)
-	settingSvc := &SettingService{}
 	prevStable, err := settingSvc.getString(mihomoCoreAutoCheckLatestStableKey)
 	if err != nil {
 		return err
@@ -2432,6 +2508,9 @@ func (s *MihomoCoreManagerService) CheckAndMarkCoreUpdates(force bool) error {
 	}
 
 	if err = settingSvc.setString(mihomoCoreAutoCheckLastAtKey, strconv.FormatInt(now, 10)); err != nil {
+		return err
+	}
+	if err = clearCoreAutoCheckFirstRunLocked(settingSvc, mihomoCoreAutoCheckSettingKeys); err != nil {
 		return err
 	}
 	if latestStable != prevStable {

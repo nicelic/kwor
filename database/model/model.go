@@ -33,6 +33,9 @@ type Tls struct {
 	CertificateRecordID uint            `json:"certificateRecordId" form:"certificateRecordId" gorm:"column:certificate_record_id;not null;default:0;index"`
 	Server              json.RawMessage `json:"server" form:"server"`
 	Client              json.RawMessage `json:"client" form:"client"`
+	// Mode is carried only while projecting Mihomo TLS into the shared inbound
+	// model. The default-chain TLS table does not persist this field.
+	Mode string `json:"-" gorm:"-"`
 }
 
 type User struct {
@@ -45,6 +48,7 @@ type User struct {
 type Client struct {
 	Id                    uint            `json:"id" form:"id" gorm:"primaryKey;autoIncrement"`
 	Enable                bool            `json:"enable" form:"enable"`
+	Depleted              bool            `json:"-" form:"-" gorm:"not null;default:false"`
 	Name                  string          `json:"name" form:"name"`
 	Config                json.RawMessage `json:"config,omitempty" form:"config"`
 	Inbounds              json.RawMessage `json:"inbounds" form:"inbounds"`
@@ -60,6 +64,7 @@ type Client struct {
 	Extra                 int             `json:"extra" form:"extra"`
 	LastReset             int64           `json:"lastReset" form:"lastReset"`
 	TrafficResetRequested bool            `json:"trafficResetRequested" form:"trafficResetRequested" gorm:"-"`
+	AutoSync              bool            `json:"autoSync" form:"-" gorm:"-"`
 }
 
 type Stats struct {

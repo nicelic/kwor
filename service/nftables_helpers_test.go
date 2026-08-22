@@ -1,10 +1,24 @@
 package service
 
 import (
+	"errors"
 	"os"
 	"testing"
 	"time"
 )
+
+func TestNftLimitedOutputBufferRejectsOversizedOutput(t *testing.T) {
+	buffer := newNftLimitedOutputBuffer(4)
+	if written, err := buffer.Write([]byte("abcdef")); !errors.Is(err, errNftCommandOutputLimit) || written != 4 {
+		t.Fatalf("unexpected limited write result: written=%d err=%v", written, err)
+	}
+	if !buffer.exceeded || buffer.String() != "abcd" {
+		t.Fatalf("unexpected limited buffer state: exceeded=%v output=%q", buffer.exceeded, buffer.String())
+	}
+	if err := nftCommandOutputError("nft test", buffer, newNftLimitedOutputBuffer(4), nil); err == nil {
+		t.Fatal("expected output limit error")
+	}
+}
 
 func TestParsePortRangeInputNormalizeAndMerge(t *testing.T) {
 	ranges := parsePortRangeInput("3000-2000, 2001:2002, 65536, 0, 100, 100")

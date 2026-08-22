@@ -12,6 +12,11 @@ import (
 
 const portForwardRuntimeOwnerCacheTTL = 30 * time.Second
 
+const (
+	portForwardRuntimeConflictCacheTTL = 30 * time.Second
+	portForwardRuntimeConflictMaxCount = 512
+)
+
 // PortForwardRuntimeConflict is an observation only. It deliberately does not
 // change a saved forwarding rule: an external listener can appear after a
 // rule has been accepted, and that situation must remain diagnosable instead
@@ -55,9 +60,91 @@ var (
 	}{
 		ownersByInode: make(map[string]portForwardCachedOwners),
 	}
+	portForwardRuntimeConflictSnapshotState = struct {
+		mu        sync.RWMutex
+		scanMu    sync.Mutex
+		signature string
+		expiresAt time.Time
+		conflicts []PortForwardRuntimeConflict
+	}{
+		conflicts: []PortForwardRuntimeConflict{},
+	}
 )
 
+// loadPortForwardRuntimeConflicts shares the expensive /proc scan across
+// overview readers. Rule changes alter the signature and force a fresh scan;
+// otherwise a short-lived snapshot keeps active-page polling out of /proc.
+func loadPortForwardRuntimeConflicts(rows []model.PortForwardRule) []PortForwardRuntimeConflict {
+	signature := portForwardRuntimeConflictSignature(rows)
+	if conflicts, ok := readPortForwardRuntimeConflictSnapshot(signature, time.Now()); ok {
+		return conflicts
+	}
+
+	portForwardRuntimeConflictSnapshotState.scanMu.Lock()
+	defer portForwardRuntimeConflictSnapshotState.scanMu.Unlock()
+	if conflicts, ok := readPortForwardRuntimeConflictSnapshot(signature, time.Now()); ok {
+		return conflicts
+	}
+
+	conflicts := collectPortForwardRuntimeConflicts(rows)
+	now := time.Now()
+	portForwardRuntimeConflictSnapshotState.mu.Lock()
+	portForwardRuntimeConflictSnapshotState.signature = signature
+	portForwardRuntimeConflictSnapshotState.expiresAt = now.Add(portForwardRuntimeConflictCacheTTL)
+	portForwardRuntimeConflictSnapshotState.conflicts = clonePortForwardRuntimeConflicts(conflicts)
+	portForwardRuntimeConflictSnapshotState.mu.Unlock()
+	return conflicts
+}
+
+func portForwardRuntimeConflictSnapshot() []PortForwardRuntimeConflict {
+	portForwardRuntimeConflictSnapshotState.mu.RLock()
+	conflicts := clonePortForwardRuntimeConflicts(portForwardRuntimeConflictSnapshotState.conflicts)
+	portForwardRuntimeConflictSnapshotState.mu.RUnlock()
+	return conflicts
+}
+
+func readPortForwardRuntimeConflictSnapshot(signature string, now time.Time) ([]PortForwardRuntimeConflict, bool) {
+	portForwardRuntimeConflictSnapshotState.mu.RLock()
+	match := signature == portForwardRuntimeConflictSnapshotState.signature && now.Before(portForwardRuntimeConflictSnapshotState.expiresAt)
+	conflicts := clonePortForwardRuntimeConflicts(portForwardRuntimeConflictSnapshotState.conflicts)
+	portForwardRuntimeConflictSnapshotState.mu.RUnlock()
+	return conflicts, match
+}
+
+func portForwardRuntimeConflictSignature(rows []model.PortForwardRule) string {
+	var builder strings.Builder
+	for _, row := range rows {
+		if !row.Enabled {
+			continue
+		}
+		builder.WriteString(strconv.FormatUint(uint64(row.Id), 10))
+		builder.WriteByte(':')
+		builder.WriteString(strconv.FormatInt(row.UpdatedAt.UnixNano(), 10))
+		builder.WriteByte(':')
+		builder.WriteString(strings.TrimSpace(row.Family))
+		builder.WriteByte(':')
+		builder.WriteString(strings.TrimSpace(row.Protocol))
+		builder.WriteByte(':')
+		builder.WriteString(strings.TrimSpace(row.LocalPortSpec))
+		builder.WriteByte(';')
+	}
+	return builder.String()
+}
+
+func clonePortForwardRuntimeConflicts(items []PortForwardRuntimeConflict) []PortForwardRuntimeConflict {
+	if len(items) == 0 {
+		return []PortForwardRuntimeConflict{}
+	}
+	result := make([]PortForwardRuntimeConflict, 0, len(items))
+	for _, item := range items {
+		item.Owners = append([]PortForwardRuntimeConflictOwner(nil), item.Owners...)
+		result = append(result, item)
+	}
+	return result
+}
+
 func collectPortForwardRuntimeConflicts(rows []model.PortForwardRule) []PortForwardRuntimeConflict {
+	prunePortForwardRuntimeOwnerCache(time.Now())
 	if portForwardRuntimeGOOS() != "linux" {
 		return []PortForwardRuntimeConflict{}
 	}
@@ -137,6 +224,9 @@ func collectPortForwardRuntimeConflicts(rows []model.PortForwardRule) []PortForw
 		}
 		owners := compactPortForwardRuntimeOwners(ownersByInode[item.socket.inode])
 		for _, row := range item.rows {
+			if len(result) >= portForwardRuntimeConflictMaxCount {
+				break
+			}
 			result = append(result, PortForwardRuntimeConflict{
 				RuleID:        row.Id,
 				RuleName:      strings.TrimSpace(row.Name),
@@ -151,6 +241,9 @@ func collectPortForwardRuntimeConflicts(rows []model.PortForwardRule) []PortForw
 				Owners:        owners,
 				CheckedAt:     checkedAt,
 			})
+		}
+		if len(result) >= portForwardRuntimeConflictMaxCount {
+			break
 		}
 	}
 	sort.SliceStable(result, func(i, j int) bool {
@@ -188,10 +281,11 @@ func compactPortForwardRuntimeOwners(owners []FirewallListenerOwnerView) []PortF
 
 func loadPortForwardRuntimeOwners(targetInodes map[string]struct{}) map[string][]FirewallListenerOwnerView {
 	result := make(map[string][]FirewallListenerOwnerView, len(targetInodes))
+	now := time.Now()
+	prunePortForwardRuntimeOwnerCache(now)
 	if len(targetInodes) == 0 {
 		return result
 	}
-	now := time.Now()
 	missing := make(map[string]struct{})
 
 	portForwardRuntimeConflictState.mu.Lock()
@@ -216,14 +310,19 @@ func loadPortForwardRuntimeOwners(targetInodes map[string]struct{}) map[string][
 			}
 			result[inode] = append([]FirewallListenerOwnerView(nil), owners...)
 		}
-		for inode, cached := range portForwardRuntimeConflictState.ownersByInode {
-			if now.After(cached.expiresAt) {
-				delete(portForwardRuntimeConflictState.ownersByInode, inode)
-			}
-		}
 		portForwardRuntimeConflictState.mu.Unlock()
 	}
 	return result
+}
+
+func prunePortForwardRuntimeOwnerCache(now time.Time) {
+	portForwardRuntimeConflictState.mu.Lock()
+	for inode, cached := range portForwardRuntimeConflictState.ownersByInode {
+		if !now.Before(cached.expiresAt) {
+			delete(portForwardRuntimeConflictState.ownersByInode, inode)
+		}
+	}
+	portForwardRuntimeConflictState.mu.Unlock()
 }
 
 func portForwardRuleSpans(row model.PortForwardRule) []portSpan {

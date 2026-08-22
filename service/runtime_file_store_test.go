@@ -50,6 +50,7 @@ func TestManagedRuntimeWriteSingboxConfigDoesNotPersistDiskFile(t *testing.T) {
 	_ = os.Remove(diskPath)
 	t.Cleanup(func() {
 		_ = os.Remove(diskPath)
+		_ = os.Remove(managedRuntimeTempCoreMarkerPath("core/singbox/config.json"))
 	})
 
 	if err := ManagedRuntimeWriteFile(configPath, configData); err != nil {
@@ -58,6 +59,83 @@ func TestManagedRuntimeWriteSingboxConfigDoesNotPersistDiskFile(t *testing.T) {
 
 	if _, err := os.Stat(diskPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected singbox config to remain store-only before materialize, got err=%v", err)
+	}
+}
+
+func TestReadStoredManagedRuntimeCoreFileReadsSQLiteWithoutDiskFallback(t *testing.T) {
+	db := setupManagedRuntimeFileStoreTestDB(t, "managed-runtime-read-only-core.db")
+	canonical := "core/singbox/config.json"
+	content := []byte(`{"log":{"level":"debug"}}`)
+	diskPath := managedRuntimeDiskPath(canonical)
+	if err := ManagedRuntimeWriteFile(canonical, content); err != nil {
+		t.Fatalf("write managed singbox config failed: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+		t.Fatalf("create legacy config directory failed: %v", err)
+	}
+	if err := os.WriteFile(diskPath, []byte(`{"disk":true}`), 0o600); err != nil {
+		t.Fatalf("write legacy disk config failed: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(diskPath) })
+
+	var before struct {
+		Content   []byte
+		UpdatedAt int64
+	}
+	if err := db.Raw("SELECT content, updated_at FROM managed_runtime_files WHERE path = ?", canonical).Scan(&before).Error; err != nil {
+		t.Fatalf("read stored config snapshot failed: %v", err)
+	}
+
+	got, err := ReadStoredManagedRuntimeCoreFile(canonical)
+	if err != nil {
+		t.Fatalf("read stored managed config failed: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("stored config=%q want %q", got, content)
+	}
+	var after struct {
+		Content   []byte
+		UpdatedAt int64
+	}
+	if err := db.Raw("SELECT content, updated_at FROM managed_runtime_files WHERE path = ?", canonical).Scan(&after).Error; err != nil {
+		t.Fatalf("read stored config after snapshot failed: %v", err)
+	}
+	if string(after.Content) != string(before.Content) || after.UpdatedAt != before.UpdatedAt {
+		t.Fatalf("read-only inspection changed SQLite row: before=%#v after=%#v", before, after)
+	}
+	diskAfter, err := os.ReadFile(diskPath)
+	if err != nil {
+		t.Fatalf("read legacy disk config after inspection failed: %v", err)
+	}
+	if string(diskAfter) != `{"disk":true}` {
+		t.Fatalf("read-only inspection changed legacy disk config: %q", diskAfter)
+	}
+}
+
+func TestReadStoredManagedRuntimeCoreFileDoesNotImportDiskFallback(t *testing.T) {
+	db := setupManagedRuntimeFileStoreTestDB(t, "managed-runtime-read-only-missing.db")
+	canonical := "core/mihomo/server.yaml"
+	diskPath := managedRuntimeDiskPath(canonical)
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+		t.Fatalf("create legacy config directory failed: %v", err)
+	}
+	if err := os.WriteFile(diskPath, []byte("mixed-port: 7890\n"), 0o600); err != nil {
+		t.Fatalf("write legacy disk config failed: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(diskPath) })
+
+	if _, err := ReadStoredManagedRuntimeCoreFile(canonical); err == nil {
+		t.Fatal("missing SQLite config unexpectedly succeeded from disk fallback")
+	}
+	var count int64
+	if err := db.Table(managedRuntimeFileTable).Where("path = ?", canonical).Count(&count).Error; err != nil {
+		t.Fatalf("count missing managed config failed: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("read-only inspection imported disk config into SQLite, count=%d", count)
+	}
+	if _, err := os.Stat(diskPath); err != nil {
+		t.Fatalf("read-only inspection removed legacy disk config: %v", err)
 	}
 }
 
@@ -70,6 +148,7 @@ func TestMaterializeManagedSingboxConfigCreatesTempDiskFile(t *testing.T) {
 	_ = os.Remove(diskPath)
 	t.Cleanup(func() {
 		_ = os.Remove(diskPath)
+		_ = os.Remove(managedRuntimeTempCoreMarkerPath("core/singbox/config.json"))
 	})
 
 	if err := ManagedRuntimeWriteFile(configPath, configData); err != nil {
@@ -85,6 +164,13 @@ func TestMaterializeManagedSingboxConfigCreatesTempDiskFile(t *testing.T) {
 	}
 	if string(data) != string(configData) {
 		t.Fatalf("unexpected singbox config content: %s", data)
+	}
+	markerData, err := os.ReadFile(managedRuntimeTempCoreMarkerPath("core/singbox/config.json"))
+	if err != nil {
+		t.Fatalf("expected materialized singbox config marker: %v", err)
+	}
+	if string(markerData) != managedRuntimeTempCoreMarkerContent {
+		t.Fatalf("unexpected materialized singbox config marker: %q", markerData)
 	}
 }
 
@@ -109,6 +195,58 @@ func TestDiscardMaterializedSingboxConfigRemovesTempDiskFile(t *testing.T) {
 
 	if _, err := os.Stat(diskPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected materialized singbox config removed after discard, got err=%v", err)
+	}
+	if _, err := os.Stat(managedRuntimeTempCoreMarkerPath("core/singbox/config.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected materialized singbox config marker removed after discard, got err=%v", err)
+	}
+}
+
+func TestMigrateLegacyFilesDiscardsMarkedMaterializedCoreConfig(t *testing.T) {
+	db := setupManagedRuntimeFileStoreTestDB(t, "managed-runtime-marked-core-config.db")
+	if err := InitManagedRuntimeFileStore(); err != nil {
+		t.Fatalf("InitManagedRuntimeFileStore failed: %v", err)
+	}
+
+	canonical := "core/mihomo/server.yaml"
+	diskPath := managedRuntimeDiskPath(canonical)
+	markerPath := managedRuntimeTempCoreMarkerPath(canonical)
+	_ = os.Remove(diskPath)
+	_ = os.Remove(markerPath)
+	t.Cleanup(func() {
+		_ = os.Remove(diskPath)
+		_ = os.Remove(markerPath)
+	})
+
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+		t.Fatalf("create temporary mihomo config directory failed: %v", err)
+	}
+	if err := os.WriteFile(diskPath, []byte("mixed-port: 7890\n"), 0o600); err != nil {
+		t.Fatalf("write marked temporary mihomo config failed: %v", err)
+	}
+	if err := os.WriteFile(markerPath, []byte(managedRuntimeTempCoreMarkerContent), 0o600); err != nil {
+		t.Fatalf("write temporary mihomo config marker failed: %v", err)
+	}
+
+	store := &managedRuntimeFileStore{
+		cache:  make(map[string]*managedRuntimeFileEntry),
+		timers: make(map[string]*time.Timer),
+	}
+	if err := store.migrateLegacyFiles(); err != nil {
+		t.Fatalf("migrate legacy files failed: %v", err)
+	}
+
+	if _, err := os.Stat(diskPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected marked temporary config removed, got err=%v", err)
+	}
+	if _, err := os.Stat(markerPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected marked temporary config marker removed, got err=%v", err)
+	}
+	var count int64
+	if err := db.Table(managedRuntimeFileTable).Where("path = ?", canonical).Count(&count).Error; err != nil {
+		t.Fatalf("count managed runtime entry failed: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("marked temporary config must not be imported into managed runtime store, count=%d", count)
 	}
 }
 
@@ -147,6 +285,37 @@ func TestManagedRuntimeReadTempSingboxDiskFallbackRemovesDiskFile(t *testing.T) 
 
 	if _, err := os.Stat(diskPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected temp disk fallback config removed after load, got err=%v", err)
+	}
+}
+
+func TestManagedRuntimeFileStoreDoesNotCacheLargeConfig(t *testing.T) {
+	setupManagedRuntimeFileStoreTestDB(t, "managed-runtime-large-config.db")
+	store := &managedRuntimeFileStore{
+		cache:  make(map[string]*managedRuntimeFileEntry),
+		timers: make(map[string]*time.Timer),
+	}
+
+	canonical := "core/mihomo/server.yaml"
+	data := make([]byte, managedRuntimeFileCacheMaxBytes+1)
+	for index := range data {
+		data[index] = 'x'
+	}
+	if err := store.put(canonical, data); err != nil {
+		t.Fatalf("write large managed config failed: %v", err)
+	}
+	if _, cached := store.cache[canonical]; cached {
+		t.Fatal("large managed config must not remain in the process cache")
+	}
+
+	got, err := store.read(canonical)
+	if err != nil {
+		t.Fatalf("read large managed config failed: %v", err)
+	}
+	if len(got) != len(data) {
+		t.Fatalf("large managed config size = %d, want %d", len(got), len(data))
+	}
+	if _, cached := store.cache[canonical]; cached {
+		t.Fatal("reading a large managed config must not populate the process cache")
 	}
 }
 

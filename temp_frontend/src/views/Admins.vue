@@ -184,6 +184,7 @@ const saveEditModal = async (data:any) => {
   try {
     const response = await HttpUtils.post('api/changePass',data)
     if(response.success){
+      await loadData()
       await new Promise(resolve => window.setTimeout(resolve, 500))
       editModal.value.visible = false
     }

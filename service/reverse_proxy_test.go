@@ -32,6 +32,7 @@ import (
 	"time"
 
 	dnsproxy "github.com/AdguardTeam/dnsproxy/proxy"
+	compressionalgorithm "github.com/alireza0/s-ui/compression/Compression-algorithm"
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/network"
@@ -139,6 +140,89 @@ func TestReverseProxyWSSPayloadDisablesHTTP3Advertisement(t *testing.T) {
 	}
 }
 
+func TestReverseProxyHTTPSListenerNextProtosStrictModes(t *testing.T) {
+	tests := []struct {
+		name  string
+		rules []*model.ReverseProxyRule
+		want  []string
+	}{
+		{
+			name: "h2-only",
+			rules: []*model.ReverseProxyRule{{
+				ListenProtocol:            reverseProxyProtocolHTTPS,
+				ListenHTTPVersionStrategy: reverseProxyListenHTTPVersionH2Only,
+			}},
+			want: []string{"h2"},
+		},
+		{
+			name: "h2+h3",
+			rules: []*model.ReverseProxyRule{{
+				ListenProtocol:            reverseProxyProtocolHTTPS,
+				ListenHTTPVersionStrategy: reverseProxyListenHTTPVersionH2H3,
+			}},
+			want: []string{"h2"},
+		},
+		{
+			name: "wss-only",
+			rules: []*model.ReverseProxyRule{{
+				ListenProtocol:      reverseProxyProtocolHTTPS,
+				ListenProtocolAlias: "wss",
+			}},
+			want: []string{"http/1.1"},
+		},
+		{
+			name: "wss-and-h2-routes",
+			rules: []*model.ReverseProxyRule{
+				{ListenProtocol: reverseProxyProtocolHTTPS, ListenProtocolAlias: "wss"},
+				{ListenProtocol: reverseProxyProtocolHTTPS, ListenHTTPVersionStrategy: reverseProxyListenHTTPVersionH2Only},
+			},
+			want: []string{"h2", "http/1.1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := reverseProxyHTTPSListenerNextProtos(tt.rules); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("reverseProxyHTTPSListenerNextProtos() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+
+	if _, err := reverseProxyRequireHTTP2ALPN(&tls.ClientHelloInfo{SupportedProtos: []string{"http/1.1"}}); err == nil {
+		t.Fatal("HTTP/1.1-only ClientHello must be rejected")
+	}
+	if _, err := reverseProxyRequireHTTP2ALPN(&tls.ClientHelloInfo{SupportedProtos: []string{"h2"}}); err != nil {
+		t.Fatalf("H2 ClientHello must be accepted: %v", err)
+	}
+}
+
+func TestReverseProxyStrictHTTPSRejectsWebSocketTarget(t *testing.T) {
+	openReverseProxyTestDB(t)
+
+	svc := &ReverseProxyService{}
+	t.Cleanup(func() {
+		_ = svc.StopRuntime()
+	})
+
+	certificateID := createReverseProxyTestCertificateRecord(t, "example.com")
+	err := svc.UpsertRule(ReverseProxyRulePayload{
+		Name:                "strict-https-websocket-target",
+		Enabled:             false,
+		ListenProtocol:      reverseProxyProtocolHTTPS,
+		ListenPort:          reserveReverseProxyTestPort(t),
+		Hosts:               "example.com",
+		TargetProtocol:      reverseProxyProtocolHTTP,
+		TargetProtocolAlias: "ws",
+		TargetAddresses:     "127.0.0.1",
+		TargetPort:          18080,
+		CertificateRecordID: certificateID,
+		IPStrategy:          reverseProxyIPStrategyPreferIPv4,
+	})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "websocket target") {
+		t.Fatalf("strict HTTPS websocket target must be rejected, got %v", err)
+	}
+}
+
 func TestReverseProxyResponseRewriteBodyRespectsStreamingAndSizeBounds(t *testing.T) {
 	const upstreamOrigin = "https://upstream.example"
 	const externalOrigin = "https://panel.example"
@@ -240,6 +324,116 @@ func TestReverseProxyResponseRewriteBodyRespectsStreamingAndSizeBounds(t *testin
 	}
 	if resp.ContentLength != -1 || resp.Header.Get("Content-Length") != "" {
 		t.Fatal("oversized response should be forwarded without a declared content length")
+	}
+}
+
+func TestReverseProxyResponseRewriteSkipsRepresentationBoundaries(t *testing.T) {
+	plan := reverseProxyResponseRewritePlan{
+		Enabled: true,
+		Replacements: []reverseProxyStringReplacement{{
+			Old: "https://upstream.example",
+			New: "https://panel.example",
+		}},
+	}
+	cases := []struct {
+		name         string
+		status       int
+		method       string
+		rangeHeader  string
+		contentRange string
+	}{
+		{name: "head", method: http.MethodHead},
+		{name: "range request", method: http.MethodGet, rangeHeader: "bytes=0-10"},
+		{name: "content range", method: http.MethodGet, contentRange: "bytes 0-10/100"},
+		{name: "no content", status: http.StatusNoContent, method: http.MethodGet},
+		{name: "reset content", status: http.StatusResetContent, method: http.MethodGet},
+		{name: "not modified", status: http.StatusNotModified, method: http.MethodGet},
+	}
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			status := item.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			request := &http.Request{Method: item.method, Header: make(http.Header)}
+			request.Header.Set("Range", item.rangeHeader)
+			resp := &http.Response{
+				StatusCode:    status,
+				Request:       request,
+				Header:        make(http.Header),
+				Body:          io.NopCloser(strings.NewReader("https://upstream.example")),
+				ContentLength: int64(len("https://upstream.example")),
+			}
+			if item.rangeHeader == "" {
+				request.Header.Del("Range")
+			}
+			if item.contentRange != "" {
+				resp.Header.Set("Content-Range", item.contentRange)
+			}
+			resp.Header.Set("Content-Type", "text/html; charset=utf-8")
+			if err := reverseProxyRewriteResponseBody(resp, plan); err != nil {
+				t.Fatalf("rewrite response body failed: %v", err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read preserved response body failed: %v", err)
+			}
+			_ = resp.Body.Close()
+			if string(body) != "https://upstream.example" {
+				t.Fatalf("boundary response was rewritten: %q", body)
+			}
+		})
+	}
+}
+
+func TestReverseProxyDecodeUpstreamResponsePreservesHeadHeaders(t *testing.T) {
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		Request:       &http.Request{Method: http.MethodHead, Header: make(http.Header)},
+		Header:        make(http.Header),
+		Body:          io.NopCloser(strings.NewReader("not a gzip stream")),
+		ContentLength: int64(len("not a gzip stream")),
+	}
+	resp.Header.Set("Content-Encoding", "gzip")
+	resp.Header.Set("ETag", `"head-representation"`)
+	if err := reverseProxyDecodeUpstreamResponse(resp, 1024); err != nil {
+		t.Fatalf("HEAD response decode failed: %v", err)
+	}
+	if got := resp.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+	if got := resp.Header.Get("ETag"); got != `"head-representation"` {
+		t.Fatalf("ETag = %q, want original HEAD representation tag", got)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read HEAD body failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if string(body) != "not a gzip stream" {
+		t.Fatalf("HEAD body was unexpectedly decoded: %q", body)
+	}
+}
+
+func TestReverseProxyResponseRewriteRejectsTruncatedDeclaredBody(t *testing.T) {
+	plan := reverseProxyResponseRewritePlan{
+		Enabled: true,
+		Replacements: []reverseProxyStringReplacement{{
+			Old: "https://upstream.example",
+			New: "https://panel.example",
+		}},
+	}
+	body := "https://upstream.example"
+	resp := &http.Response{
+		Header:        make(http.Header),
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body) + 1),
+	}
+	resp.Header.Set("Content-Type", "text/html; charset=utf-8")
+
+	err := reverseProxyRewriteResponseBody(resp, plan)
+	if !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		t.Fatalf("truncated declared body error = %v, want EOF/UnexpectedEOF", err)
 	}
 }
 
@@ -2145,6 +2339,7 @@ func TestReverseProxyHTTPSRuleForwardsRequestPathRelativeToTargetBase(t *testing
 				ListenProtocol: reverseProxyProtocolHTTPS,
 
 				ListenPort:          listenPort,
+				Hosts:               "example.com",
 				PathPrefix:          tc.pathPrefix,
 				TargetProtocol:      reverseProxyProtocolHTTPS,
 				TargetAddresses:     upstreamHost,
@@ -4542,8 +4737,7 @@ func TestReverseProxyHTTPSRuleProxiesHTTP11TLSUpstream(t *testing.T) {
 	}
 
 	client := &http.Client{
-		Transport: &http.Transport{
-			Proxy: nil,
+		Transport: &http2.Transport{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: true,
 				ServerName:         "example.com",
@@ -4645,6 +4839,79 @@ func TestReverseProxyHTTPSListenerAcceptsHTTP3Client(t *testing.T) {
 	}
 	if got := string(body); got != "ok:/h3/ping" {
 		t.Fatalf("unexpected h3 body: got %q", got)
+	}
+}
+
+func TestReverseProxyHTTPSListenerH2AndH3RejectHTTP11(t *testing.T) {
+	openReverseProxyTestDB(t)
+
+	svc := &ReverseProxyService{}
+	t.Cleanup(func() {
+		_ = svc.StopRuntime()
+	})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(r.URL.Path))
+	}))
+	defer upstream.Close()
+
+	upstreamHost, upstreamPort := splitReverseProxyTestServerAddress(t, upstream.URL)
+	listenPort := reserveReverseProxyTestPort(t)
+	certRecordID := createReverseProxyTestCertificateRecord(t, "example.com")
+	if err := svc.UpsertRule(ReverseProxyRulePayload{
+		Name:                "https-h2-h3-strict",
+		Enabled:             true,
+		ListenProtocol:      reverseProxyProtocolHTTPS,
+		ListenPort:          listenPort,
+		Hosts:               "example.com",
+		TargetProtocol:      reverseProxyProtocolHTTP,
+		TargetAddresses:     upstreamHost,
+		TargetPort:          upstreamPort,
+		CertificateRecordID: certRecordID,
+		IPStrategy:          reverseProxyIPStrategyPreferIPv4,
+	}); err != nil {
+		t.Fatalf("upsert strict h2+h3 rule failed: %v", err)
+	}
+
+	h2Client := &http.Client{
+		Transport: &http.Transport{
+			Proxy:             nil,
+			ForceAttemptHTTP2: true,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				ServerName:         "example.com",
+			},
+		},
+		Timeout: 15 * time.Second,
+	}
+	h2Req, err := http.NewRequest(http.MethodGet, "https://127.0.0.1:"+strconv.Itoa(listenPort)+"/h2", nil)
+	if err != nil {
+		t.Fatalf("build strict h2 request failed: %v", err)
+	}
+	h2Req.Host = "example.com"
+	h2Resp, err := h2Client.Do(h2Req)
+	if err != nil {
+		t.Fatalf("strict h2 request failed: %v", err)
+	}
+	h2Body, readErr := io.ReadAll(h2Resp.Body)
+	_ = h2Resp.Body.Close()
+	if readErr != nil || h2Resp.StatusCode != http.StatusOK || h2Resp.ProtoMajor != 2 || string(h2Body) != "/h2" {
+		t.Fatalf("unexpected strict h2 response: status=%d proto=%s body=%q err=%v", h2Resp.StatusCode, h2Resp.Proto, string(h2Body), readErr)
+	}
+
+	h1Dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: 2 * time.Second},
+		Config: &tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         "example.com",
+			NextProtos:         []string{"http/1.1"},
+		},
+	}
+	h1Conn, err := h1Dialer.DialContext(context.Background(), "tcp", "127.0.0.1:"+strconv.Itoa(listenPort))
+	if err == nil {
+		_ = h1Conn.Close()
+		t.Fatal("strict h2+h3 listener accepted a TLS client with HTTP/1.1 ALPN")
 	}
 }
 
@@ -4921,7 +5188,8 @@ func TestReverseProxyHTTPSStrictDomainCertificateRejectsIPDirect(t *testing.T) {
 
 	domainClient := &http.Client{
 		Transport: &http.Transport{
-			Proxy: nil,
+			Proxy:             nil,
+			ForceAttemptHTTP2: true,
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: true,
 				ServerName:         "example.com",
@@ -5000,7 +5268,8 @@ func TestReverseProxyHTTPSListenerH2OnlyRejectsHTTP3Client(t *testing.T) {
 
 	tcpClient := &http.Client{
 		Transport: &http.Transport{
-			Proxy: nil,
+			Proxy:             nil,
+			ForceAttemptHTTP2: true,
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: true,
 				ServerName:         "example.com",
@@ -5021,6 +5290,22 @@ func TestReverseProxyHTTPSListenerH2OnlyRejectsHTTP3Client(t *testing.T) {
 	if tcpResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(tcpResp.Body)
 		t.Fatalf("unexpected h2 proxy status: %d body=%q", tcpResp.StatusCode, string(body))
+	}
+	if tcpResp.ProtoMajor != 2 {
+		t.Fatalf("h2-only listener negotiated unexpected protocol: %s", tcpResp.Proto)
+	}
+	h1Dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: 2 * time.Second},
+		Config: &tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         "example.com",
+			NextProtos:         []string{"http/1.1"},
+		},
+	}
+	h1Conn, err := h1Dialer.DialContext(context.Background(), "tcp", "127.0.0.1:"+strconv.Itoa(listenPort))
+	if err == nil {
+		_ = h1Conn.Close()
+		t.Fatal("h2-only listener accepted a TLS client without ALPN h2")
 	}
 
 	transport := &http3.Transport{
@@ -5364,7 +5649,8 @@ func TestReverseProxyRewritesAbsoluteOriginsToListenerHost(t *testing.T) {
 
 	client := &http.Client{
 		Transport: &http.Transport{
-			Proxy: nil,
+			Proxy:             nil,
+			ForceAttemptHTTP2: true,
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: true,
 				ServerName:         "example.com",
@@ -5400,7 +5686,7 @@ func TestReverseProxyRewritesAbsoluteOriginsToListenerHost(t *testing.T) {
 	}
 }
 
-func TestReverseProxyAPIPassthroughPreservesResponseBodyAndAcceptEncoding(t *testing.T) {
+func TestReverseProxyAPIPassthroughPreservesResponseBodyAndUsesProjectAcceptEncoding(t *testing.T) {
 	openReverseProxyTestDB(t)
 
 	svc := &ReverseProxyService{}
@@ -5464,8 +5750,8 @@ func TestReverseProxyAPIPassthroughPreservesResponseBodyAndAcceptEncoding(t *tes
 
 	select {
 	case got := <-acceptEncoding:
-		if got != "gzip" {
-			t.Fatalf("expected upstream accept-encoding to remain gzip, got %q", got)
+		if got != compressionalgorithm.UpstreamAcceptEncoding() {
+			t.Fatalf("expected upstream accept-encoding to use project priority, got %q", got)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for upstream accept-encoding")
@@ -5772,7 +6058,8 @@ func TestReverseProxyRewritesRootRelativeLinksWithLocalPathPrefix(t *testing.T) 
 
 	client := &http.Client{
 		Transport: &http.Transport{
-			Proxy: nil,
+			Proxy:             nil,
+			ForceAttemptHTTP2: true,
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: true,
 				ServerName:         "example.com",
@@ -6074,7 +6361,8 @@ func TestReverseProxyHTTPSRuleRejectsMismatchedSNIOrHost(t *testing.T) {
 	} {
 		client := &http.Client{
 			Transport: &http.Transport{
-				Proxy: nil,
+				Proxy:             nil,
+				ForceAttemptHTTP2: true,
 				TLSClientConfig: &tls.Config{
 					InsecureSkipVerify: true,
 					ServerName:         tc.serverName,
@@ -6429,6 +6717,7 @@ func TestReverseProxyAPIPassthroughStillRewritesLocationAndCookieDomain(t *testi
 		ListenProtocol: reverseProxyProtocolHTTPS,
 
 		ListenPort:          listenPort,
+		Hosts:               "example.com",
 		PathPrefix:          "/panel",
 		TargetProtocol:      reverseProxyProtocolHTTPS,
 		TargetAddresses:     upstreamHost,
@@ -6443,8 +6732,7 @@ func TestReverseProxyAPIPassthroughStillRewritesLocationAndCookieDomain(t *testi
 	}
 
 	client := &http.Client{
-		Transport: &http.Transport{
-			Proxy: nil,
+		Transport: &http2.Transport{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: true,
 				ServerName:         "example.com",
@@ -6554,32 +6842,37 @@ func TestReverseProxyHTTP3AdvertisementHeaderAggregatesByOrigin(t *testing.T) {
 		listenPort:                8443,
 		protocol:                  reverseProxyProtocolHTTPS,
 		listenHTTPVersionStrategy: reverseProxyListenHTTPVersionH2H3,
+		h3AvailabilityKnown:       true,
+		h3ListenerAvailable:       true,
 		rules:                     []*model.ReverseProxyRule{disabledPath, enabledPath, otherOrigin},
 	}
 
-	if got := group.http3AdvertisementHeader("example.com", "example.com", 1); got != `h3=":8443"; ma=300` {
+	if got := group.http3AdvertisementHeader("example.com", "example.com", 1, 443); got != `h3=":443"; ma=300` {
 		t.Fatalf("same-origin enabled rule must advertise for every path, got %q", got)
 	}
-	if got := group.http3AdvertisementHeader("example.com", "example.com", 3); got != "" {
+	if got := group.http3AdvertisementHeader("example.com", "example.com", 1, 8443); got != `h3=":8443"; ma=300` {
+		t.Fatalf("explicit external host port must be preserved, got %q", got)
+	}
+	if got := group.http3AdvertisementHeader("example.com", "example.com", 3, 443); got != "" {
 		t.Fatalf("http3 response should not advertise itself again, got %q", got)
 	}
-	if got := group.http3AdvertisementHeader("other.example", "other.example", 1); got != "clear" {
+	if got := group.http3AdvertisementHeader("other.example", "other.example", 1, 443); got != "clear" {
 		t.Fatalf("another origin must keep its independent clear policy, got %q", got)
 	}
-	if got := group.http3AdvertisementHeader("unknown.example", "unknown.example", 1); got != "" {
+	if got := group.http3AdvertisementHeader("unknown.example", "unknown.example", 1, 443); got != "" {
 		t.Fatalf("unknown origin must not receive an Alt-Svc policy, got %q", got)
 	}
 
 	enabledPath.AdvertiseHTTP3 = false
-	if got := group.http3AdvertisementHeader("example.com", "example.com", 1); got != "clear" {
+	if got := group.http3AdvertisementHeader("example.com", "example.com", 1, 443); got != "clear" {
 		t.Fatalf("origin with every rule disabled must clear cached h3 routes, got %q", got)
 	}
 	group.listenHTTPVersionStrategy = reverseProxyListenHTTPVersionH2Only
-	if got := group.http3AdvertisementHeader("example.com", "example.com", 1); got != "clear" {
+	if got := group.http3AdvertisementHeader("example.com", "example.com", 1, 443); got != "clear" {
 		t.Fatalf("h2-only listener must clear a previously advertised h3 route, got %q", got)
 	}
 	group.listenHTTPVersionStrategy = reverseProxyListenHTTPVersionH3Only
-	if got := group.http3AdvertisementHeader("example.com", "example.com", 3); got != "" {
+	if got := group.http3AdvertisementHeader("example.com", "example.com", 3, 443); got != "" {
 		t.Fatalf("h3-only listener must retain forced-h3 behavior without Alt-Svc, got %q", got)
 	}
 }
@@ -6596,10 +6889,12 @@ func TestReverseProxyHTTP3AdvertisementHeaderIgnoresWSSRules(t *testing.T) {
 		listenPort:                8443,
 		protocol:                  reverseProxyProtocolHTTPS,
 		listenHTTPVersionStrategy: reverseProxyListenHTTPVersionH2H3,
+		h3AvailabilityKnown:       true,
+		h3ListenerAvailable:       true,
 		rules:                     []*model.ReverseProxyRule{legacyWSSRule},
 	}
 
-	if got := group.http3AdvertisementHeader("example.com", "example.com", 1); got != "clear" {
+	if got := group.http3AdvertisementHeader("example.com", "example.com", 1, 443); got != "clear" {
 		t.Fatalf("legacy wss rule must clear cached h3 routes, got %q", got)
 	}
 
@@ -6610,8 +6905,26 @@ func TestReverseProxyHTTP3AdvertisementHeaderIgnoresWSSRules(t *testing.T) {
 		AdvertiseHTTP3:            true,
 	}
 	group.rules = []*model.ReverseProxyRule{legacyWSSRule, pageRule}
-	if got := group.http3AdvertisementHeader("example.com", "example.com", 1); got != `h3=":8443"; ma=300` {
-		t.Fatalf("regular https rule must continue advertising h3, got %q", got)
+	if got := group.http3AdvertisementHeader("example.com", "example.com", 1, 443); got != "clear" {
+		t.Fatalf("same-origin WSS must suppress h3 advertising for the whole origin, got %q", got)
+	}
+}
+
+func TestReverseProxyHTTP3AdvertisementClearsWhenUDPListenerIsUnavailable(t *testing.T) {
+	group := &reverseProxyListenerGroup{
+		protocol:                  reverseProxyProtocolHTTPS,
+		listenHTTPVersionStrategy: reverseProxyListenHTTPVersionH2H3,
+		h3AvailabilityKnown:       true,
+		h3ListenerAvailable:       false,
+		rules: []*model.ReverseProxyRule{{
+			ListenProtocol:            reverseProxyProtocolHTTPS,
+			ListenHTTPVersionStrategy: reverseProxyListenHTTPVersionH2H3,
+			HostList:                  encodeReverseProxyList([]string{"example.com"}),
+			AdvertiseHTTP3:            true,
+		}},
+	}
+	if got := group.http3AdvertisementHeader("example.com", "example.com", 1, 443); got != "clear" {
+		t.Fatalf("unavailable UDP listener must clear cached h3 routes, got %q", got)
 	}
 }
 
@@ -6680,7 +6993,8 @@ func TestReverseProxyHTTP3AdvertisementCoversOriginResponsesOnce(t *testing.T) {
 		t.Helper()
 		client := &http.Client{
 			Transport: &http.Transport{
-				Proxy: nil,
+				Proxy:             nil,
+				ForceAttemptHTTP2: true,
 				TLSClientConfig: &tls.Config{
 					InsecureSkipVerify: true,
 					ServerName:         serverName,
@@ -6718,7 +7032,7 @@ func TestReverseProxyHTTP3AdvertisementCoversOriginResponsesOnce(t *testing.T) {
 		}
 	}
 
-	advertisement := reverseProxyAltSvcValue(listenPort)
+	advertisement := reverseProxyAltSvcValue(443)
 	assertResponse(request("example.com", "example.com", "/off"), http.StatusNoContent, advertisement)
 	assertResponse(request("example.com", "example.com", "/missing"), http.StatusNotFound, advertisement)
 	assertResponse(request("example.com", "example.com", "/error"), http.StatusBadGateway, advertisement)

@@ -84,6 +84,11 @@ const RandomUtil = {
       return segment
     }).join('-')
   },
+  randomExtendedUUID(): string {
+    return [8, 4, 4, 4, 12]
+      .map((length) => this.randomSeq(length))
+      .join('-')
+  },
   randomShadowsocksPassword(n: number): string {
     const array = new Uint8Array(n)
     window.crypto.getRandomValues(array)

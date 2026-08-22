@@ -230,6 +230,84 @@ func TestMihomoOutboundServiceSaveStoresRawPayloadWithoutID(t *testing.T) {
 	}
 }
 
+func TestMihomoOutboundServiceSaveStripsUnsupportedFastOpen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "mihomo-outbound-fast-open.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("InitDB failed: %v", err)
+	}
+	db := database.GetDB()
+	if sqlDB, err := db.DB(); err == nil && sqlDB != nil {
+		t.Cleanup(func() {
+			_ = sqlDB.Close()
+		})
+	}
+
+	service := &MihomoOutboundService{}
+	for _, outboundType := range []string{"hysteria2", "tuic"} {
+		t.Run(outboundType, func(t *testing.T) {
+			tag := outboundType + "-manual-fast-open"
+			payload := json.RawMessage(`{
+				"type": "` + outboundType + `",
+				"tag": "` + tag + `",
+				"server": "1.1.1.1",
+				"server_port": 443,
+				"mihomo_fast_open": true,
+				"fast_open": true,
+				"fast-open": true
+			}`)
+			if err := service.Save(db, "new", payload); err != nil {
+				t.Fatalf("Save failed: %v", err)
+			}
+
+			record := &model.MihomoOutbound{}
+			if err := db.Where("tag = ?", tag).First(record).Error; err != nil {
+				t.Fatalf("load Mihomo outbound failed: %v", err)
+			}
+			for _, raw := range []json.RawMessage{record.Options, record.RawOutbound} {
+				stored := map[string]interface{}{}
+				if err := json.Unmarshal(raw, &stored); err != nil {
+					t.Fatalf("unmarshal stored payload failed: %v", err)
+				}
+				for _, key := range []string{"mihomo_fast_open", "fast_open", "fast-open"} {
+					if _, exists := stored[key]; exists {
+						t.Fatalf("%s survived in stored payload: %#v", key, stored)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestResolveMihomoOutboundJSONStripsHistoricalUnsupportedFastOpen(t *testing.T) {
+	for _, outboundType := range []string{"hysteria2", "tuic"} {
+		t.Run(outboundType, func(t *testing.T) {
+			resolved, err := resolveMihomoOutboundJSON(&model.MihomoOutbound{
+				Type: outboundType,
+				RawOutbound: json.RawMessage(`{
+					"type": "` + outboundType + `",
+					"tag": "legacy-` + outboundType + `",
+					"mihomo_fast_open": true,
+					"fast_open": true,
+					"fast-open": true
+				}`),
+			})
+			if err != nil {
+				t.Fatalf("resolveMihomoOutboundJSON failed: %v", err)
+			}
+
+			resolvedMap := map[string]interface{}{}
+			if err := json.Unmarshal(resolved, &resolvedMap); err != nil {
+				t.Fatalf("unmarshal resolved payload failed: %v", err)
+			}
+			for _, key := range []string{"mihomo_fast_open", "fast_open", "fast-open"} {
+				if _, exists := resolvedMap[key]; exists {
+					t.Fatalf("%s survived historical raw payload: %#v", key, resolvedMap)
+				}
+			}
+		})
+	}
+}
+
 func TestMihomoOutboundServiceEditPreservesImportedRawClashProxyWhenPayloadOmitsHiddenKey(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "mihomo-outbound-edit.db")
 	if err := database.InitDB(dbPath); err != nil {

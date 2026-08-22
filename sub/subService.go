@@ -72,8 +72,8 @@ func (s *SubService) filterServerOnlyLocalLinks(client *model.Client, mihomo boo
 		return nil, nil
 	}
 
-	var inboundIDs []uint
-	if err := json.Unmarshal(client.Inbounds, &inboundIDs); err != nil {
+	inboundIDs, err := util.ParseInboundIDs(client.Inbounds)
+	if err != nil {
 		return nil, err
 	}
 	if len(inboundIDs) == 0 {
@@ -88,7 +88,7 @@ func (s *SubService) filterServerOnlyLocalLinks(client *model.Client, mihomo boo
 			return nil, err
 		}
 		for _, inbound := range inbounds {
-			if util.IsSubscriptionServerOnlyInboundType(inbound.Type) {
+			if util.IsSubscriptionServerOnlyInboundType(inbound.Type) || !util.SupportsMihomoRuntimeListenerType(inbound.Type) {
 				serverOnlyTags[strings.TrimSpace(inbound.Tag)] = struct{}{}
 			}
 		}
@@ -133,8 +133,8 @@ func (s *SubService) buildCurrentLocalLinks(client *model.Client, mihomo bool, c
 		return nil, nil
 	}
 
-	var inboundIDs []uint
-	if err := json.Unmarshal(client.Inbounds, &inboundIDs); err != nil {
+	inboundIDs, err := util.ParseInboundIDs(client.Inbounds)
+	if err != nil {
 		return nil, err
 	}
 	if len(inboundIDs) == 0 {
@@ -149,6 +149,9 @@ func (s *SubService) buildCurrentLocalLinks(client *model.Client, mihomo bool, c
 		}
 		inbounds = util.OrderMihomoInboundValuesByIDs(inboundIDs, inbounds)
 		for _, inbound := range inbounds {
+			if !util.SupportsMihomoRuntimeListenerType(inbound.Type) {
+				continue
+			}
 			base := inbound.ToBase()
 			serverHost := util.ResolveSubscriptionServerHost(client.ServerIp, &base, "")
 			for _, uri := range util.LinkGenerator(client.Config, &base, serverHost) {

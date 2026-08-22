@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/json"
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -50,8 +51,6 @@ func TestBuildMihomoDNSDocument(t *testing.T) {
 	want := map[string]interface{}{
 		"enable":     true,
 		"nameserver": []string{"udp://8.8.8.8#节点选择"},
-		"ipv6":       false,
-		"prefer-h3":  false,
 	}
 
 	if !reflect.DeepEqual(got, want) {
@@ -70,12 +69,23 @@ func TestBuildMihomoDNSDocumentWithIPv6Timeout(t *testing.T) {
 		"enable":       true,
 		"nameserver":   []string{"udp://8.8.8.8#节点选择"},
 		"ipv6":         true,
-		"prefer-h3":    false,
 		"ipv6-timeout": 100,
 	}
 
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildMihomoDNSDocument() = %#v, want %#v", got, want)
+	}
+}
+
+func TestSanitizeMihomoDNSIPv6TimeoutRejectsLossyNumericValues(t *testing.T) {
+	if got, ok := sanitizeMihomoDNSIPv6Timeout(float64(50.5)); ok {
+		t.Fatalf("fractional timeout was accepted as %d", got)
+	}
+	if got, ok := sanitizeMihomoDNSIPv6Timeout("50.5"); ok {
+		t.Fatalf("fractional timeout string was accepted as %d", got)
+	}
+	if got, ok := sanitizeMihomoDNSIPv6Timeout("50ms"); !ok || got != 50 {
+		t.Fatalf("millisecond timeout = (%d, %t), want (50, true)", got, ok)
 	}
 }
 
@@ -136,6 +146,22 @@ func TestSanitizeMihomoConfigJSONKeepsDNSPreferH3(t *testing.T) {
 	}
 	if got, ok := dns["prefer-h3"].(bool); !ok || !got {
 		t.Fatalf("expected dns.prefer-h3=true, got %#v", dns["prefer-h3"])
+	}
+}
+
+func TestValidateMihomoDNSConfigRejectsOversizedAndMalformedValues(t *testing.T) {
+	if err := validateMihomoDNSConfig(map[string]interface{}{
+		"nameserver": []interface{}{"https:///dns-query"},
+	}); err == nil {
+		t.Fatal("malformed DNS URI was accepted")
+	}
+
+	tooMany := make([]interface{}, maxMihomoDNSAddressesPerList+1)
+	for index := range tooMany {
+		tooMany[index] = "udp://192.0.2." + strconv.Itoa(index+1)
+	}
+	if err := validateMihomoDNSConfig(map[string]interface{}{"nameserver": tooMany}); err == nil {
+		t.Fatal("oversized DNS list was accepted")
 	}
 }
 

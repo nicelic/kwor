@@ -10,6 +10,7 @@ import (
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/logger"
+	"github.com/alireza0/s-ui/util"
 	"gorm.io/gorm"
 )
 
@@ -23,7 +24,7 @@ import (
 // - enabled clients only
 // - bound inbound tags only
 // - per inbound port use the MIN speedLimitMbps across all bound clients
-// - port hopping ranges are not used; only listen_port is limited
+// - listener ports and validated Hysteria/Mieru ranges are limited
 type ClientRateLimitService struct{}
 
 func (s *ClientRateLimitService) IsNftTableReady() bool {
@@ -44,6 +45,15 @@ func (s *ClientRateLimitService) EnsureRuleIntegrity() error {
 		return nil
 	}
 	if !(&CoreManagerService{}).IsRunning() {
+		return nil
+	}
+	return s.EnsureRuleIntegrityWhenRunning()
+}
+
+// EnsureRuleIntegrityWhenRunning avoids another core status command when the
+// caller already confirmed the core is running.
+func (s *ClientRateLimitService) EnsureRuleIntegrityWhenRunning() error {
+	if !IsSystemPlatformLinux() || !nftSupported() {
 		return nil
 	}
 	return s.Reconcile(true)
@@ -88,10 +98,6 @@ func (s *ClientRateLimitService) CleanupOnShutdown() {
 }
 
 func (s *ClientRateLimitService) reconcileStateOnly(tx *gorm.DB, desired map[int]int, desiredTags map[int]string) error {
-	if err := deleteRulesByCommentPrefix(singboxLimitNftRuleComments.prefix); err != nil {
-		return err
-	}
-
 	var states []model.ClientPortLimitState
 	if err := tx.Find(&states).Error; err != nil {
 		return err
@@ -115,6 +121,9 @@ func (s *ClientRateLimitService) reconcileStateOnly(tx *gorm.DB, desired map[int
 		limit := desired[port]
 		tag := desiredTags[port]
 		if st, ok := existing[port]; ok {
+			if st.Tag == tag && st.LimitMbps == limit && st.InHandle == 0 && st.OutHandle == 0 {
+				continue
+			}
 			if err := tx.Model(st).Updates(map[string]interface{}{
 				"tag":        tag,
 				"limit_mbps": limit,
@@ -153,6 +162,14 @@ func (s *ClientRateLimitService) reconcileWithRules(tx *gorm.DB, desired map[int
 	for i := range states {
 		existing[states[i].Port] = &states[i]
 	}
+	inHandles, err := snapshotManagedRuleHandles(nftChainIn, singboxLimitNftRuleComments.prefix)
+	if err != nil {
+		return err
+	}
+	outHandles, err := snapshotManagedRuleHandles(nftChainOut, singboxLimitNftRuleComments.prefix)
+	if err != nil {
+		return err
+	}
 
 	// Remove obsolete states/rules.
 	for _, state := range states {
@@ -165,6 +182,9 @@ func (s *ClientRateLimitService) reconcileWithRules(tx *gorm.DB, desired map[int
 		if err := tx.Delete(&state).Error; err != nil {
 			return err
 		}
+		portTag := strconv.Itoa(state.Port)
+		delete(inHandles, singboxLimitNftRuleComments.in(portTag))
+		delete(outHandles, singboxLimitNftRuleComments.out(portTag))
 	}
 
 	validComments := make(map[string]struct{}, len(desired)*2)
@@ -197,12 +217,16 @@ func (s *ClientRateLimitService) reconcileWithRules(tx *gorm.DB, desired map[int
 				continue
 			}
 
-			st.Tag = tag
-			if err := s.tryRecoverHandles(tx, st); err != nil {
-				logger.Warning("recover client limit handles failed for port ", st.Port, ": ", err)
+			originalInHandle := st.InHandle
+			originalOutHandle := st.OutHandle
+			inHandle, inOk := inHandles[singboxLimitNftRuleComments.in(portTag)]
+			outHandle, outOk := outHandles[singboxLimitNftRuleComments.out(portTag)]
+			if inOk {
+				st.InHandle = inHandle
 			}
-			inOk := ruleHandleExists(nftChainIn, st.InHandle)
-			outOk := ruleHandleExists(nftChainOut, st.OutHandle)
+			if outOk {
+				st.OutHandle = outHandle
+			}
 			if !inOk || !outOk {
 				if err := s.removeRulesFromState(st); err != nil {
 					logger.Warning("failed to clear broken client limit rules for port ", st.Port, ": ", err)
@@ -222,11 +246,15 @@ func (s *ClientRateLimitService) reconcileWithRules(tx *gorm.DB, desired map[int
 				continue
 			}
 
-			if err := tx.Model(st).Updates(map[string]interface{}{
-				"tag":        tag,
-				"updated_at": time.Now(),
-			}).Error; err != nil {
-				return err
+			if st.Tag != tag || originalInHandle != st.InHandle || originalOutHandle != st.OutHandle {
+				if err := tx.Model(st).Updates(map[string]interface{}{
+					"tag":        tag,
+					"in_handle":  st.InHandle,
+					"out_handle": st.OutHandle,
+					"updated_at": time.Now(),
+				}).Error; err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -250,7 +278,7 @@ func (s *ClientRateLimitService) reconcileWithRules(tx *gorm.DB, desired map[int
 		}
 	}
 
-	if err := s.cleanupOrphanRules(validComments); err != nil {
+	if err := s.cleanupOrphanRules(validComments, inHandles, outHandles); err != nil {
 		logger.Warning("cleanup orphan client limit nft rules failed: ", err)
 	}
 	return nil
@@ -305,33 +333,23 @@ func (s *ClientRateLimitService) removeRulesFromState(state *model.ClientPortLim
 	return firstErr
 }
 
-func (s *ClientRateLimitService) cleanupOrphanRules(validComments map[string]struct{}) error {
-	if !nftSupported() || !nftTableExists() {
-		return nil
-	}
-
-	chains := []string{nftChainIn, nftChainOut}
+func (s *ClientRateLimitService) cleanupOrphanRules(validComments map[string]struct{}, inHandles map[string]int, outHandles map[string]int) error {
 	var firstErr error
-	for _, chain := range chains {
-		rules, err := listRuleCommentsByPrefix(chain, singboxLimitNftRuleComments.prefix)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		for _, rule := range rules {
-			if _, ok := validComments[rule.comment]; ok {
+	cleanupChain := func(chain string, handles map[string]int) {
+		for comment, handle := range handles {
+			if _, ok := validComments[comment]; ok {
 				continue
 			}
-			if err := deleteRuleByHandle(chain, rule.handle); err != nil {
-				logger.Warning("failed to delete orphan client limit nft rule ", rule.comment, " handle ", rule.handle, ": ", err)
+			if err := deleteRuleByHandle(chain, handle); err != nil && !nftObjectMissing(err) {
+				logger.Warning("failed to delete orphan client limit nft rule ", comment, " handle ", handle, ": ", err)
 				if firstErr == nil {
 					firstErr = err
 				}
 			}
 		}
 	}
+	cleanupChain(nftChainIn, inHandles)
+	cleanupChain(nftChainOut, outHandles)
 	return firstErr
 }
 
@@ -450,71 +468,11 @@ func (s *ClientRateLimitService) collectDesiredPortLimits(tx *gorm.DB) (map[int]
 }
 
 func parseClientInboundIDsForLimit(raw json.RawMessage) []uint {
-	if len(raw) == 0 {
+	ids, err := util.ParseInboundIDs(raw)
+	if err != nil || len(ids) == 0 {
 		return nil
 	}
-
-	var direct []uint
-	if err := json.Unmarshal(raw, &direct); err == nil {
-		return dedupPositiveUintSlice(direct)
-	}
-
-	var generic []interface{}
-	if err := json.Unmarshal(raw, &generic); err != nil {
-		return nil
-	}
-	ids := make([]uint, 0, len(generic))
-	for _, item := range generic {
-		switch value := item.(type) {
-		case float64:
-			if value <= 0 {
-				continue
-			}
-			id := uint(value)
-			if float64(id) != value {
-				continue
-			}
-			ids = append(ids, id)
-		case int:
-			if value > 0 {
-				ids = append(ids, uint(value))
-			}
-		case int64:
-			if value > 0 {
-				ids = append(ids, uint(value))
-			}
-		case string:
-			text := strings.TrimSpace(value)
-			if text == "" {
-				continue
-			}
-			n, err := strconv.ParseUint(text, 10, 64)
-			if err != nil || n == 0 {
-				continue
-			}
-			ids = append(ids, uint(n))
-		}
-	}
-	return dedupPositiveUintSlice(ids)
-}
-
-func dedupPositiveUintSlice(values []uint) []uint {
-	if len(values) == 0 {
-		return nil
-	}
-	seen := make(map[uint]struct{}, len(values))
-	result := make([]uint, 0, len(values))
-	for _, value := range values {
-		if value == 0 {
-			continue
-		}
-		if _, ok := seen[value]; ok {
-			continue
-		}
-		seen[value] = struct{}{}
-		result = append(result, value)
-	}
-	return result
+	return ids
 }
 
 func normalizeLimitMbps(raw int) int {

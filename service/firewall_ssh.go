@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,9 +10,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/util/common"
 )
 
@@ -20,6 +21,7 @@ const (
 	sshDirectiveAllowTcpForwarding = "allowtcpforwarding"
 	sshDirectivePermitOpen         = "permitopen"
 	sshDirectiveGatewayPorts       = "gatewayports"
+	firewallSSHProbeCacheMinGap    = 5 * time.Second
 )
 
 var sshMainConfigCandidates = []string{
@@ -42,6 +44,45 @@ var sshDirectiveStableOrder = []string{
 	sshDirectiveAllowTcpForwarding,
 	sshDirectivePermitOpen,
 	sshDirectiveGatewayPorts,
+}
+
+var firewallSSHProbeCache = struct {
+	mu        sync.Mutex
+	path      string
+	checkedAt time.Time
+	status    FirewallSSHConfigStatus
+	err       error
+}{}
+
+func cloneFirewallSSHConfigStatus(status FirewallSSHConfigStatus) FirewallSSHConfigStatus {
+	status.Ports = append([]int(nil), status.Ports...)
+	return status
+}
+
+func invalidateFirewallSSHProbeCache() {
+	firewallSSHProbeCache.mu.Lock()
+	firewallSSHProbeCache.path = ""
+	firewallSSHProbeCache.checkedAt = time.Time{}
+	firewallSSHProbeCache.status = FirewallSSHConfigStatus{}
+	firewallSSHProbeCache.err = nil
+	firewallSSHProbeCache.mu.Unlock()
+}
+
+func probeFirewallSSHConfigCached(mainPath string) (FirewallSSHConfigStatus, error) {
+	mainPath = filepath.Clean(strings.TrimSpace(mainPath))
+	firewallSSHProbeCache.mu.Lock()
+	defer firewallSSHProbeCache.mu.Unlock()
+	if firewallSSHProbeCache.path == mainPath &&
+		!firewallSSHProbeCache.checkedAt.IsZero() &&
+		time.Since(firewallSSHProbeCache.checkedAt) < firewallSSHProbeCacheMinGap {
+		return cloneFirewallSSHConfigStatus(firewallSSHProbeCache.status), firewallSSHProbeCache.err
+	}
+	status, err := probeSSHConfig(mainPath)
+	firewallSSHProbeCache.path = mainPath
+	firewallSSHProbeCache.checkedAt = time.Now()
+	firewallSSHProbeCache.status = cloneFirewallSSHConfigStatus(status)
+	firewallSSHProbeCache.err = err
+	return cloneFirewallSSHConfigStatus(status), err
 }
 
 type FirewallSSHConfigStatus struct {
@@ -107,7 +148,7 @@ func resolveFirewallSSHConfigStatus() FirewallSSHConfigStatus {
 		return status
 	}
 
-	probe, err := probeSSHConfig(status.ConfigPath)
+	probe, err := probeFirewallSSHConfigCached(status.ConfigPath)
 	if err != nil {
 		status.Error = err.Error()
 		return status
@@ -146,12 +187,75 @@ func (s *FirewallService) UpdateSSHPort(port int) error {
 	if err != nil {
 		return err
 	}
-	if err := applyAndRestartSSHConfig(configPath, map[string]string{
-		sshDirectivePort: strconv.Itoa(port),
-	}); err != nil {
+
+	firewallEnabled, err := s.getFirewallEnabledLocked()
+	if err != nil {
 		return err
 	}
-	return s.syncFirewallAfterSSHConfigChangeLocked()
+	if firewallEnabled {
+		if !firewallSupported() {
+			return common.NewError("firewall is enabled but nftables is unavailable; disable the firewall or restore nftables before changing the ssh port")
+		}
+		if err := ensureNftRendererSupported(); err != nil {
+			return common.NewError("firewall renderer is unavailable; cannot safely change the ssh port: ", err)
+		}
+	}
+
+	previousSSHPorts := detectSSHPorts()
+	previousConfig, changed, err := applySSHDirectiveChanges(configPath, map[string]string{
+		sshDirectivePort: strconv.Itoa(port),
+	})
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	invalidateFirewallSSHProbeCache()
+
+	if err := validateSSHConfig(configPath); err != nil {
+		_ = restoreSSHConfigFile(configPath, previousConfig)
+		invalidateFirewallSSHProbeCache()
+		return common.NewError("updated ssh config is invalid: ", err)
+	}
+
+	// Keep the old port open while the new sshd configuration is being applied.
+	// This prevents a failed restart or a short restart window from locking out
+	// existing remote operators.
+	if err := s.syncFirewallAfterSSHConfigChangeLockedWithExtraPorts(previousSSHPorts); err != nil {
+		rollbackErrors := []error{fmt.Errorf("prepare firewall for new ssh port: %w", err)}
+		if restoreErr := restoreSSHConfigFile(configPath, previousConfig); restoreErr != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("restore ssh config: %w", restoreErr))
+		} else if firewallRollbackErr := s.syncFirewallAfterSSHConfigChangeLocked(); firewallRollbackErr != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("restore firewall ssh rule: %w", firewallRollbackErr))
+		}
+		invalidateFirewallSSHProbeCache()
+		return errors.Join(rollbackErrors...)
+	}
+
+	if err := restartSSHService(); err != nil {
+		rollbackErrors := []error{fmt.Errorf("restart ssh service with new port: %w", err)}
+		if restoreErr := restoreSSHConfigFile(configPath, previousConfig); restoreErr != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("restore ssh config: %w", restoreErr))
+		} else {
+			if restartRollbackErr := restartSSHService(); restartRollbackErr != nil {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("restart ssh service with the previous config: %w", restartRollbackErr))
+			}
+			if firewallRollbackErr := s.syncFirewallAfterSSHConfigChangeLocked(); firewallRollbackErr != nil {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("restore firewall ssh rule: %w", firewallRollbackErr))
+			}
+		}
+		invalidateFirewallSSHProbeCache()
+		return errors.Join(rollbackErrors...)
+	}
+
+	// The new port was already allowed during the restart. Now remove the old
+	// port from the managed system rule and converge the database mirror.
+	if err := s.syncFirewallAfterSSHConfigChangeLocked(); err != nil {
+		return common.NewError("ssh port updated and ssh service restarted, but firewall synchronization failed: ", err)
+	}
+	invalidateFirewallSSHProbeCache()
+	return nil
 }
 
 func (s *FirewallService) SetSSHProxyEnabled(enabled bool) error {
@@ -180,19 +284,29 @@ func (s *FirewallService) SetSSHProxyEnabled(enabled bool) error {
 }
 
 func (s *FirewallService) syncFirewallAfterSSHConfigChangeLocked() error {
-	defaults := resolveFirewallDefaultPorts()
-	if err := upsertFirewallSystemRulesLocked(database.GetDB(), defaults); err != nil {
-		return err
-	}
+	return s.syncFirewallAfterSSHConfigChangeLockedWithExtraPorts(nil)
+}
 
+func (s *FirewallService) syncFirewallAfterSSHConfigChangeLockedWithExtraPorts(extraSSHPorts []int) error {
 	enabled, err := s.getFirewallEnabledLocked()
 	if err != nil {
 		return err
 	}
-	if !enabled || !firewallSupported() {
-		return nil
+	if enabled {
+		if !firewallSupported() {
+			return common.NewError("firewall is enabled but nftables is unavailable")
+		}
+		if err := ensureNftRendererSupported(); err != nil {
+			return err
+		}
 	}
-	return s.reconcileLocked(0)
+	syncErr := s.reconcileLockedWithExtraSSHPorts(0, extraSSHPorts)
+	if syncErr != nil {
+		firewallState.lastError = strings.TrimSpace(syncErr.Error())
+	} else {
+		firewallState.lastError = ""
+	}
+	return syncErr
 }
 
 func probeSSHConfig(mainPath string) (FirewallSSHConfigStatus, error) {
@@ -334,9 +448,11 @@ func applyAndRestartSSHConfig(configPath string, directives map[string]string) e
 	if !changed {
 		return nil
 	}
+	invalidateFirewallSSHProbeCache()
 
 	if err := validateSSHConfig(configPath); err != nil {
 		_ = restoreSSHConfigFile(configPath, previous)
+		invalidateFirewallSSHProbeCache()
 		return common.NewError("updated ssh config is invalid: ", err)
 	}
 
@@ -345,11 +461,13 @@ func applyAndRestartSSHConfig(configPath string, directives map[string]string) e
 		if restoreErr == nil {
 			_ = restartSSHService()
 		}
+		invalidateFirewallSSHProbeCache()
 		if restoreErr != nil {
 			return common.NewError("failed to restart ssh service and rollback failed: ", err, "; rollback: ", restoreErr)
 		}
 		return common.NewError("failed to restart ssh service: ", err)
 	}
+	invalidateFirewallSSHProbeCache()
 	return nil
 }
 
@@ -616,22 +734,17 @@ func restartSSHService() error {
 }
 
 func runCommandWithTimeout(timeout time.Duration, command string, args ...string) error {
+	if timeout <= 0 {
+		timeout = systemCommandTimeout
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, command, args...)
-	output, err := cmd.CombinedOutput()
+	err := exec.CommandContext(ctx, command, args...).Run()
 	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("command timed out (%s %s)", command, strings.Join(args, " "))
+		return fmt.Errorf("%s timed out after %s", command, timeout)
 	}
-	if err != nil {
-		trimmed := strings.TrimSpace(string(output))
-		if trimmed == "" {
-			return err
-		}
-		return fmt.Errorf("%w: %s", err, trimmed)
-	}
-	return nil
+	return err
 }
 
 func pathExists(path string) bool {

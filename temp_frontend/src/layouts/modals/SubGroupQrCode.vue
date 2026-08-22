@@ -1,11 +1,15 @@
 <template>
-  <v-dialog transition="dialog-bottom-transition" width="calc(100vw - 32px)" max-width="400">
+  <v-dialog v-model="dialogVisible" transition="dialog-bottom-transition" width="calc(100vw - 32px)" max-width="400">
     <v-card class="rounded-lg" id="subgroup-qrcode-modal" :loading="loading || subscriptionUriLoading">
       <v-card-title>
         <v-row>
           <v-col class="text-truncate">{{ groupName }} - QrCode</v-col>
           <v-spacer></v-spacer>
-          <v-col cols="auto"><v-icon icon="mdi-close-box" @click="$emit('close')" /></v-col>
+          <v-col cols="auto">
+            <v-btn icon="mdi-close" variant="text" density="compact" @click="closeDialog">
+              <v-tooltip activator="parent" location="top">{{ $t('actions.close') }}</v-tooltip>
+            </v-btn>
+          </v-col>
         </v-row>
       </v-card-title>
       <v-divider></v-divider>
@@ -57,7 +61,8 @@ import { i18n } from '@/locales'
 import { push } from 'notivue'
 
 export default {
-  props: ['groupName', 'visible'],
+  props: ['modelValue', 'groupName', 'visible'],
+  emits: ['close', 'update:modelValue'],
   data() {
     return {
       loading: false,
@@ -68,6 +73,9 @@ export default {
     }
   },
   methods: {
+    closeDialog() {
+      this.dialogVisible = false
+    },
     copyToClipboard(txt: string) {
       if (!txt) return
       const hiddenButton = document.createElement('button')
@@ -120,6 +128,15 @@ export default {
     }
   },
   computed: {
+    dialogVisible: {
+      get(): boolean {
+        return this.$props.modelValue ?? this.$props.visible ?? false
+      },
+      set(value: boolean) {
+        this.$emit('update:modelValue', value)
+        if (!value) this.$emit('close')
+      }
+    },
     subJsonUrl() {
       if (!this.subscriptionUriReady) return ''
       return Data().subURI + "q/group?name=" + encodeURIComponent(this.groupName) + "&format=json"

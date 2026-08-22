@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 type managedFileRewriteOptions struct {
 	DisplayName                      string
 	IgnoreUnsupportedUnlockOnSymlink bool
+	Context                          context.Context
 }
 
 func rewriteManagedFileWithImmutable(path string, content string, opts managedFileRewriteOptions) error {
@@ -43,10 +45,10 @@ func rewriteManagedFileWithImmutable(path string, content string, opts managedFi
 		return common.NewError("校验", displayName, "失败: 写入内容与文件内容不一致")
 	}
 
-	if err := setManagedFileImmutableFlag(path, displayName); err != nil {
+	if err := setManagedFileImmutableFlag(path, displayName, opts.Context); err != nil {
 		return err
 	}
-	immutable, immutableErr := detectFileImmutable(path)
+	immutable, immutableErr := detectFileImmutableContext(opts.Context, path)
 	if immutableErr == nil && !immutable {
 		return common.NewError("校验", displayName, "失败: immutable 标记未生效")
 	}
@@ -73,7 +75,7 @@ func removeManagedFile(path string, opts managedFileRewriteOptions) error {
 	}
 
 	displayName := normalizeManagedFileDisplayName(opts.DisplayName)
-	immutable, immutableErr := detectFileImmutable(path)
+	immutable, immutableErr := detectFileImmutableContext(opts.Context, path)
 	if immutableErr == nil && immutable {
 		logger.Infof("[SystemOptimize] detected immutable lock on %s: %s", displayName, path)
 	}
@@ -103,7 +105,7 @@ func clearManagedFileImmutableFlag(path string, displayName string, opts managed
 		logger.Warningf("[SystemOptimize] chattr not found while unlocking %s: %s", displayName, path)
 		return nil
 	}
-	if err := runCommandWithTimeout(8*time.Second, chattrPath, "-i", path); err != nil {
+	if err := runOptimizationCommandWithTimeout(opts.Context, 8*time.Second, chattrPath, "-i", path); err != nil {
 		if opts.IgnoreUnsupportedUnlockOnSymlink && isPathSymlink(path) && isImmutableUnsupportedError(err) {
 			return nil
 		}
@@ -116,7 +118,7 @@ func clearManagedFileImmutableFlag(path string, displayName string, opts managed
 	return nil
 }
 
-func setManagedFileImmutableFlag(path string, displayName string) error {
+func setManagedFileImmutableFlag(path string, displayName string, parent context.Context) error {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return common.NewError(displayName, "路径为空")
@@ -126,7 +128,7 @@ func setManagedFileImmutableFlag(path string, displayName string) error {
 	if err != nil {
 		return common.NewError("未找到 chattr 命令，无法锁定", displayName)
 	}
-	if err := runCommandWithTimeout(8*time.Second, chattrPath, "+i", path); err != nil {
+	if err := runOptimizationCommandWithTimeout(parent, 8*time.Second, chattrPath, "+i", path); err != nil {
 		if isImmutableUnsupportedError(err) {
 			return common.NewError("设置", displayName, " immutable 失败: 当前文件系统不支持 chattr +i")
 		}

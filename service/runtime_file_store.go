@@ -17,6 +17,9 @@ import (
 )
 
 const managedRuntimeFileTable = "managed_runtime_files"
+const managedRuntimeFileCacheMaxBytes = 256 * 1024
+const managedRuntimeTempCoreMarkerSuffix = ".kwor-runtime-temp"
+const managedRuntimeTempCoreMarkerContent = "kwor-managed-runtime-temp-v1\n"
 
 var obsoleteManagedRuntimeJSONRoots = []string{"Inbound", "outbound", "sub_manager", "sub_json"}
 
@@ -81,6 +84,44 @@ func ManagedRuntimeReadFile(filePath string) ([]byte, error) {
 	}
 
 	return runtimeManagedFiles.read(canonical)
+}
+
+// ReadStoredManagedRuntimeCoreFile reads only the persisted Core configuration
+// row from managed_runtime_files. This intentionally does not initialize the
+// store, regenerate configuration, read legacy disk fallbacks, or write back
+// any migration result; it is reserved for the local VS Code F5 read-only
+// inspection endpoints.
+func ReadStoredManagedRuntimeCoreFile(filePath string) ([]byte, error) {
+	canonical, managed := canonicalManagedRuntimePath(filePath)
+	if !managed || !isManagedRuntimeTempCoreFile(canonical) {
+		return nil, fmt.Errorf("managed Core configuration path is invalid")
+	}
+
+	db := database.GetDB()
+	if db == nil {
+		return nil, fmt.Errorf("database is not initialized")
+	}
+
+	entry := &managedRuntimeFileEntry{}
+	row := db.Raw(
+		fmt.Sprintf(`SELECT path, dir_path, file_name, ext, content, size, updated_at FROM %s WHERE path = ?`, managedRuntimeFileTable),
+		canonical,
+	).Row()
+	if err := row.Scan(
+		&entry.Path,
+		&entry.DirPath,
+		&entry.FileName,
+		&entry.Ext,
+		&entry.Content,
+		&entry.Size,
+		&entry.UpdatedAt,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("managed Core configuration %s not found", canonical)
+		}
+		return nil, err
+	}
+	return append([]byte(nil), entry.Content...), nil
 }
 
 func ManagedRuntimeFileExists(filePath string) (bool, error) {
@@ -173,16 +214,7 @@ func MaterializeManagedRuntimeCoreFile(filePath string, ttl time.Duration) error
 		return err
 	}
 
-	diskPath := managedRuntimeDiskPath(canonical)
-	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
-		return err
-	}
-	if err := os.WriteFile(diskPath, content, 0o600); err != nil {
-		return err
-	}
-
-	runtimeManagedFiles.scheduleCleanup(canonical, ttl)
-	return nil
+	return runtimeManagedFiles.writeMaterializedTempCoreFile(canonical, content, ttl)
 }
 
 func DiscardMaterializedManagedRuntimeCoreFile(filePath string) {
@@ -192,8 +224,7 @@ func DiscardMaterializedManagedRuntimeCoreFile(filePath string) {
 		return
 	}
 
-	runtimeManagedFiles.cancelCleanup(canonical)
-	_ = os.Remove(managedRuntimeDiskPath(canonical))
+	runtimeManagedFiles.discardMaterializedTempCoreFile(canonical)
 }
 
 func (s *managedRuntimeFileStore) ensureReady() error {
@@ -264,16 +295,17 @@ func (s *managedRuntimeFileStore) resetForDatabaseReload() {
 		}
 		if isManagedRuntimeTempCoreFile(canonical) {
 			_ = os.Remove(managedRuntimeDiskPath(canonical))
+			_ = os.Remove(managedRuntimeTempCoreMarkerPath(canonical))
 		}
 	}
 }
 
 func (s *managedRuntimeFileStore) put(canonical string, data []byte) error {
-	entry := newManagedRuntimeFileEntry(canonical, data)
 	db := database.GetDB()
 	if db == nil {
 		return fmt.Errorf("database is not initialized")
 	}
+	entry := newManagedRuntimeFileEntry(canonical, data)
 
 	stmt := fmt.Sprintf(`INSERT INTO %s (path, dir_path, file_name, ext, content, size, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -299,18 +331,27 @@ func (s *managedRuntimeFileStore) put(canonical string, data []byte) error {
 	}
 
 	s.cacheMu.Lock()
-	s.cache[canonical] = cloneManagedRuntimeEntry(entry)
+	if shouldCacheManagedRuntimeEntry(entry) {
+		s.cache[canonical] = cloneManagedRuntimeEntry(entry)
+	} else {
+		delete(s.cache, canonical)
+	}
 	s.cacheMu.Unlock()
 
-	if s.hasActiveCleanup(canonical) && isManagedRuntimeTempCoreFile(canonical) {
-		diskPath := managedRuntimeDiskPath(canonical)
-		if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err == nil {
-			_ = os.WriteFile(diskPath, data, 0o600)
+	if isManagedRuntimeTempCoreFile(canonical) {
+		updated, updateErr := s.updateMaterializedTempCoreFileIfActive(canonical, data)
+		if updateErr != nil {
+			return updateErr
 		}
-		return nil
+		if updated {
+			return nil
+		}
 	}
 
 	_ = os.Remove(managedRuntimeDiskPath(canonical))
+	if isManagedRuntimeTempCoreFile(canonical) {
+		_ = os.Remove(managedRuntimeTempCoreMarkerPath(canonical))
+	}
 	return nil
 }
 
@@ -342,9 +383,11 @@ func (s *managedRuntimeFileStore) read(canonical string) ([]byte, error) {
 		&entry.Size,
 		&entry.UpdatedAt,
 	); err == nil {
-		s.cacheMu.Lock()
-		s.cache[canonical] = cloneManagedRuntimeEntry(entry)
-		s.cacheMu.Unlock()
+		if shouldCacheManagedRuntimeEntry(entry) {
+			s.cacheMu.Lock()
+			s.cache[canonical] = cloneManagedRuntimeEntry(entry)
+			s.cacheMu.Unlock()
+		}
 		return append([]byte(nil), entry.Content...), nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
@@ -500,21 +543,86 @@ func (s *managedRuntimeFileStore) clearDirJSONFiles(canonicalDir string, keepFil
 	return nil
 }
 
-func (s *managedRuntimeFileStore) scheduleCleanup(canonical string, ttl time.Duration) {
+func (s *managedRuntimeFileStore) writeMaterializedTempCoreFile(canonical string, content []byte, ttl time.Duration) error {
+	diskPath := managedRuntimeDiskPath(canonical)
+	markerPath := managedRuntimeTempCoreMarkerPath(canonical)
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+		return err
+	}
+
 	s.timerMu.Lock()
 	defer s.timerMu.Unlock()
 
-	if timer, ok := s.timers[canonical]; ok {
+	if timer, ok := s.timers[canonical]; ok && timer != nil {
+		timer.Stop()
+	}
+	if err := os.WriteFile(markerPath, []byte(managedRuntimeTempCoreMarkerContent), 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(diskPath, content, 0o600); err != nil {
+		_ = os.Remove(markerPath)
+		return err
+	}
+	s.scheduleCleanupLocked(canonical, ttl)
+	return nil
+}
+
+// updateMaterializedTempCoreFileIfActive keeps a freshly generated core
+// config in sync with an already materialized file without extending its
+// configured lifetime. Holding timerMu prevents an expiring old timer from
+// deleting the file while it is being replaced.
+func (s *managedRuntimeFileStore) updateMaterializedTempCoreFileIfActive(canonical string, content []byte) (bool, error) {
+	diskPath := managedRuntimeDiskPath(canonical)
+	markerPath := managedRuntimeTempCoreMarkerPath(canonical)
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+		return false, err
+	}
+
+	s.timerMu.Lock()
+	defer s.timerMu.Unlock()
+	if _, ok := s.timers[canonical]; !ok {
+		return false, nil
+	}
+	if err := os.WriteFile(markerPath, []byte(managedRuntimeTempCoreMarkerContent), 0o600); err != nil {
+		return false, err
+	}
+	if err := os.WriteFile(diskPath, content, 0o600); err != nil {
+		_ = os.Remove(markerPath)
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *managedRuntimeFileStore) scheduleCleanupLocked(canonical string, ttl time.Duration) {
+	if timer, ok := s.timers[canonical]; ok && timer != nil {
 		timer.Stop()
 	}
 
-	diskPath := managedRuntimeDiskPath(canonical)
-	s.timers[canonical] = time.AfterFunc(ttl, func() {
-		_ = os.Remove(diskPath)
+	var timer *time.Timer
+	timer = time.AfterFunc(ttl, func() {
 		s.timerMu.Lock()
+		defer s.timerMu.Unlock()
+		if current, ok := s.timers[canonical]; !ok || current != timer {
+			return
+		}
 		delete(s.timers, canonical)
-		s.timerMu.Unlock()
+		_ = os.Remove(managedRuntimeDiskPath(canonical))
+		_ = os.Remove(managedRuntimeTempCoreMarkerPath(canonical))
 	})
+	s.timers[canonical] = timer
+}
+
+func (s *managedRuntimeFileStore) discardMaterializedTempCoreFile(canonical string) {
+	s.timerMu.Lock()
+	defer s.timerMu.Unlock()
+	if timer, ok := s.timers[canonical]; ok {
+		if timer != nil {
+			timer.Stop()
+		}
+		delete(s.timers, canonical)
+	}
+	_ = os.Remove(managedRuntimeDiskPath(canonical))
+	_ = os.Remove(managedRuntimeTempCoreMarkerPath(canonical))
 }
 
 func (s *managedRuntimeFileStore) cancelCleanup(canonical string) {
@@ -545,6 +653,11 @@ func (s *managedRuntimeFileStore) migrateLegacyFiles() error {
 		"core/" + mihomoInboundMetaFilename,
 	}
 	for _, canonical := range managedCoreFiles {
+		if isManagedRuntimeTempCoreFile(canonical) {
+			if err := discardMarkedMaterializedTempCoreFile(canonical); err != nil {
+				return err
+			}
+		}
 		if err := s.migrateLegacyFile(canonical); err != nil {
 			return err
 		}
@@ -780,7 +893,7 @@ func newManagedRuntimeFileEntry(canonical string, data []byte) *managedRuntimeFi
 		DirPath:   path.Dir(canonical),
 		FileName:  path.Base(canonical),
 		Ext:       path.Ext(canonical),
-		Content:   append([]byte(nil), data...),
+		Content:   data,
 		Size:      int64(len(data)),
 		UpdatedAt: time.Now().Unix(),
 	}
@@ -793,6 +906,10 @@ func cloneManagedRuntimeEntry(entry *managedRuntimeFileEntry) *managedRuntimeFil
 	cloned := *entry
 	cloned.Content = append([]byte(nil), entry.Content...)
 	return &cloned
+}
+
+func shouldCacheManagedRuntimeEntry(entry *managedRuntimeFileEntry) bool {
+	return entry != nil && entry.Size <= managedRuntimeFileCacheMaxBytes
 }
 
 func canonicalManagedRuntimePath(rawPath string) (string, bool) {
@@ -907,6 +1024,47 @@ func managedRuntimeDiskPath(canonical string) string {
 	items = append(items, config.GetDataDir())
 	items = append(items, parts...)
 	return filepath.Join(items...)
+}
+
+func managedRuntimeTempCoreMarkerPath(canonical string) string {
+	diskPath := managedRuntimeDiskPath(canonical)
+	return filepath.Join(
+		filepath.Dir(diskPath),
+		"."+filepath.Base(diskPath)+managedRuntimeTempCoreMarkerSuffix,
+	)
+}
+
+// discardMarkedMaterializedTempCoreFile only removes files carrying the
+// marker written immediately before a temporary core configuration is placed
+// on disk. Marker-less files remain eligible for the one-time legacy import.
+func discardMarkedMaterializedTempCoreFile(canonical string) error {
+	markerPath := managedRuntimeTempCoreMarkerPath(canonical)
+	markerInfo, err := os.Lstat(markerPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if markerInfo.Mode()&os.ModeSymlink != 0 || !markerInfo.Mode().IsRegular() {
+		return nil
+	}
+
+	diskPath := managedRuntimeDiskPath(canonical)
+	if diskInfo, statErr := os.Lstat(diskPath); statErr == nil {
+		if diskInfo.Mode()&os.ModeSymlink == 0 && diskInfo.Mode().IsRegular() {
+			if removeErr := os.Remove(diskPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				return removeErr
+			}
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+
+	if err := os.Remove(markerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func splitManagedPath(raw string) []string {

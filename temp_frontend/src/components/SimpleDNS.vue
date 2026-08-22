@@ -25,12 +25,14 @@
     </v-col>
     <v-col cols="3" v-if="showServerFields">
       <v-text-field
-        v-model.number="data.server_port"
+        v-model="serverPort"
         :label="$t('in.port')"
         density="compact"
         type="number"
         class="noGutters"
         min="1"
+        max="65535"
+        step="1"
         hide-details>
       </v-text-field>
     </v-col>
@@ -38,6 +40,8 @@
 </template>
 
 <script lang="ts">
+import { parseSingboxInteger } from '@/plugins/singboxInteger'
+
 export default {
   props: {
     data: {
@@ -87,6 +91,10 @@ export default {
     // 是否需要 TLS 配置
     needsTls(): boolean {
       return this.tlsTypes.includes(this.data.type)
+    },
+    serverPort: {
+      get() { return parseSingboxInteger(this.data.server_port, { min: 1, max: 65535 }) ?? '' },
+      set(value:unknown) { this.data.server_port = parseSingboxInteger(value, { min: 1, max: 65535 }) }
     }
   },
   methods: {

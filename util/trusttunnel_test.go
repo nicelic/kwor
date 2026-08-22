@@ -72,6 +72,9 @@ func TestResolveTrustTunnelReuseOption_RejectsNegativeOrNonInteger(t *testing.T)
 	if _, ok := ResolveTrustTunnelReuseOption(map[string]interface{}{"max_connections": "1.5"}, "max_connections"); ok {
 		t.Fatalf("expected non-integer string to be rejected")
 	}
+	if _, ok := ResolveTrustTunnelReuseOption(map[string]interface{}{"max_connections": float64(1.5)}, "max_connections"); ok {
+		t.Fatalf("expected non-integer number to be rejected")
+	}
 	if value, ok := ResolveTrustTunnelReuseOption(map[string]interface{}{"max_connections": "3"}, "max_connections"); !ok || value != 3 {
 		t.Fatalf("expected integer string to parse, got (%v, %v)", value, ok)
 	}

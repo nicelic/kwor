@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/alireza0/s-ui/database"
@@ -39,37 +40,12 @@ func TestMihomoInboundServiceGetAllIncludesSelectableClientAssignments(t *testin
 		t.Fatalf("create mihomo shadowsocks inbound failed: %v", err)
 	}
 
-	shadowTLSInbound := model.MihomoInbound{
-		Type: "shadowtls",
-		Tag:  "stls-40443",
-		Options: json.RawMessage(`{
-			"listen": "::",
-			"listen_port": 40443,
-			"version": 2,
-			"password": "shadowtls-pass",
-			"handshake": {
-				"server": "addons.mozilla.org",
-				"server_port": 443
-			}
-		}`),
-	}
-	if err := db.Create(&shadowTLSInbound).Error; err != nil {
-		t.Fatalf("create mihomo shadowtls inbound failed: %v", err)
-	}
-
 	clients := []model.MihomoClient{
 		{
 			Enable:   true,
 			Name:     "ss-user",
 			Config:   json.RawMessage(`{"shadowsocks":{"name":"ss-user","password":"client-pass"}}`),
 			Inbounds: json.RawMessage(fmt.Sprintf("[%d]", shadowsocksInbound.Id)),
-			Links:    json.RawMessage(`[]`),
-		},
-		{
-			Enable:   true,
-			Name:     "stls-user",
-			Config:   json.RawMessage(`{"shadowtls":{"name":"stls-user","password":"client-pass"}}`),
-			Inbounds: json.RawMessage(fmt.Sprintf("[%d]", shadowTLSInbound.Id)),
 			Links:    json.RawMessage(`[]`),
 		},
 	}
@@ -112,7 +88,110 @@ func TestMihomoInboundServiceGetAllIncludesSelectableClientAssignments(t *testin
 	}
 
 	assertSelectableUsers("ss-40010", "ss-user")
-	assertSelectableUsers("stls-40443", "stls-user")
+}
+
+func TestMihomoInboundServiceGetAllReturnsEmptyJSONArray(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "mihomo-empty-inbounds.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("InitDB failed: %v", err)
+	}
+
+	db := database.GetDB()
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("db.DB failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
+
+	data, err := (&MihomoInboundService{}).GetAll()
+	if err != nil {
+		t.Fatalf("GetAll failed: %v", err)
+	}
+	if data == nil || len(*data) != 0 {
+		t.Fatalf("GetAll empty result = %#v, want an empty slice", data)
+	}
+
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		t.Fatalf("marshal empty GetAll result failed: %v", err)
+	}
+	if string(encoded) != "[]" {
+		t.Fatalf("empty GetAll JSON = %s, want []", encoded)
+	}
+}
+
+func TestMihomoUnsupportedInboundTypesAreRejectedAndHidden(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "mihomo-unsupported-inbounds.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("InitDB failed: %v", err)
+	}
+
+	db := database.GetDB()
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("db.DB failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
+
+	inboundService := &MihomoInboundService{}
+	for _, inboundType := range []string{"direct", "naive", "ssh"} {
+		t.Run("reject "+inboundType, func(t *testing.T) {
+			payload := json.RawMessage(fmt.Sprintf(`{
+  "type": %q,
+  "tag": "unsupported-%s",
+  "listen": "::",
+  "listen_port": 18080
+}`, inboundType, inboundType))
+			if _, err := inboundService.Save(db, "new", payload, "", "panel.example.com"); err == nil || !strings.Contains(err.Error(), "does not support") {
+				t.Fatalf("expected unsupported Mihomo inbound rejection, got %v", err)
+			}
+		})
+	}
+
+	legacySSH := model.MihomoInbound{
+		Type:    "ssh",
+		Tag:     "legacy-ssh",
+		Options: json.RawMessage(`{"listen":"::","listen_port":2222}`),
+	}
+	supported := model.MihomoInbound{
+		Type:    "socks",
+		Tag:     "supported-socks",
+		Options: json.RawMessage(`{"listen":"::","listen_port":1080}`),
+	}
+	if err := db.Create(&legacySSH).Error; err != nil {
+		t.Fatalf("create legacy SSH inbound: %v", err)
+	}
+	if err := db.Create(&supported).Error; err != nil {
+		t.Fatalf("create supported inbound: %v", err)
+	}
+
+	data, err := inboundService.GetAll()
+	if err != nil {
+		t.Fatalf("GetAll failed: %v", err)
+	}
+	for _, inbound := range *data {
+		if inbound["tag"] == legacySSH.Tag {
+			t.Fatalf("legacy unsupported inbound leaked into the Mihomo UI: %#v", inbound)
+		}
+	}
+	if len(*data) != 1 || (*data)[0]["tag"] != supported.Tag {
+		t.Fatalf("supported-only inbound list = %#v", *data)
+	}
+
+	clientPayload := json.RawMessage(fmt.Sprintf(`{
+  "enable": true,
+  "name": "legacy-ssh-binding",
+  "config": {},
+  "inbounds": [%d],
+  "links": []
+}`, legacySSH.Id))
+	if _, err := (&MihomoClientService{}).Save(db, "new", clientPayload, "panel.example.com"); err == nil || !strings.Contains(err.Error(), "not supported by Mihomo") {
+		t.Fatalf("expected unsupported client binding rejection, got %v", err)
+	}
 }
 
 func TestMihomoUserManagedProtocolsAreSelectable(t *testing.T) {
@@ -124,8 +203,6 @@ func TestMihomoUserManagedProtocolsAreSelectable(t *testing.T) {
 		{inboundType: "socks"},
 		{inboundType: "http"},
 		{inboundType: "shadowsocks"},
-		{inboundType: "shadowtls", shadowTLSVersion: 1},
-		{inboundType: "shadowtls", shadowTLSVersion: 3},
 		{inboundType: "vmess"},
 		{inboundType: "vless"},
 		{inboundType: "trojan"},
@@ -137,7 +214,6 @@ func TestMihomoUserManagedProtocolsAreSelectable(t *testing.T) {
 		{inboundType: "trusttunnel"},
 		{inboundType: "shadowquic"},
 		{inboundType: "snell"},
-		{inboundType: "ssh"},
 	}
 
 	for _, test := range tests {
@@ -149,7 +225,7 @@ func TestMihomoUserManagedProtocolsAreSelectable(t *testing.T) {
 		})
 	}
 
-	for _, inboundType := range []string{"direct", "redirect", "tproxy", "tun", "unknown"} {
+	for _, inboundType := range []string{"direct", "redirect", "tproxy", "tun", "ssh", "unknown"} {
 		management := buildMihomoInboundUserManagement(inboundType, 0)
 		if management.Selectable {
 			t.Fatalf("%s must not be selectable in Mihomo client management: %#v", inboundType, management)

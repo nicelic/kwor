@@ -197,7 +197,25 @@ func TestSettingServiceSaveConfig_SanitizesDeprecatedDNSFields(t *testing.T) {
 		t.Fatalf("load saved config failed: %v", err)
 	}
 
-	assertDeprecatedDNSFieldsRemoved(t, json.RawMessage(setting.Value))
+	var root map[string]interface{}
+	if err := json.Unmarshal([]byte(setting.Value), &root); err != nil {
+		t.Fatalf("decode saved config failed: %v", err)
+	}
+	dns, _ := root["dns"].(map[string]interface{})
+	if _, exists := dns["independent_cache"]; exists {
+		t.Fatalf("expected independent_cache removed, got %#v", dns)
+	}
+	servers, exists := dns["servers"].([]interface{})
+	if !exists || len(servers) != 1 {
+		t.Fatalf("expected DNS servers to remain in settings, got %#v", dns)
+	}
+	server, ok := servers[0].(map[string]interface{})
+	if !ok || server["tag"] != "dns-main" {
+		t.Fatalf("unexpected saved DNS server: %#v", servers[0])
+	}
+	if _, exists := server["strategy"]; exists {
+		t.Fatalf("expected per-server strategy removed, got %#v", server)
+	}
 }
 
 func TestSettingServiceSaveConfig_RejectsIncompatibleDNSRules(t *testing.T) {

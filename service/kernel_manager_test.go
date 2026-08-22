@@ -45,6 +45,17 @@ func TestExtractNetSFFilesJSONMissingMarker(t *testing.T) {
 	}
 }
 
+func TestKernelCommandOutputWriterCapsMemory(t *testing.T) {
+	writer := &kernelCommandOutputWriter{limit: 4}
+	if _, err := writer.Write([]byte("abcdef")); err != nil {
+		t.Fatalf("write output failed: %v", err)
+	}
+	output, truncated := writer.snapshot()
+	if output != "abcd" || !truncated {
+		t.Fatalf("unexpected capped output: output=%q truncated=%v", output, truncated)
+	}
+}
+
 func TestKernelManagerTraversalAndPackageFilter(t *testing.T) {
 	oldBaseURL := xanmodSourceForgeBaseURL
 	defer func() { xanmodSourceForgeBaseURL = oldBaseURL }()

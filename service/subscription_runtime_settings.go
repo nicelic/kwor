@@ -15,16 +15,15 @@ var subscriptionRuntimeSettingKeys = []string{
 	"subEncode",
 	"subShowInfo",
 	"subUpdates",
-	"subJsonExt",
-	"subClashExt",
 	"clientTlsStoreEnabled",
 	"clientTlsStore",
 }
 
 var subscriptionRuntimeSettingsCache = struct {
 	sync.RWMutex
-	loaded bool
-	values map[string]string
+	loaded     bool
+	values     map[string]string
+	generation uint64
 }{}
 
 func init() {
@@ -35,7 +34,18 @@ func invalidateSubscriptionRuntimeSettings() {
 	subscriptionRuntimeSettingsCache.Lock()
 	subscriptionRuntimeSettingsCache.loaded = false
 	subscriptionRuntimeSettingsCache.values = nil
+	subscriptionRuntimeSettingsCache.generation++
 	subscriptionRuntimeSettingsCache.Unlock()
+}
+
+// SubscriptionRuntimeSettingsGeneration changes whenever a setting that can
+// affect subscription rendering is committed. Callers can include it in
+// request-coalescing keys so a request started after a settings change never
+// joins a render built from the previous snapshot.
+func SubscriptionRuntimeSettingsGeneration() uint64 {
+	subscriptionRuntimeSettingsCache.RLock()
+	defer subscriptionRuntimeSettingsCache.RUnlock()
+	return subscriptionRuntimeSettingsCache.generation
 }
 
 func isSubscriptionRuntimeSettingsKey(key string) bool {
@@ -45,6 +55,18 @@ func isSubscriptionRuntimeSettingsKey(key string) bool {
 		}
 	}
 	return false
+}
+
+func isSubscriptionRenderSettingKey(key string) bool {
+	if isSubscriptionRuntimeSettingsKey(key) {
+		return true
+	}
+	switch key {
+	case "subJsonExt", "subClashExt":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *SettingService) getSubscriptionRuntimeSetting(key string) (string, error) {

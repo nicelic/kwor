@@ -740,6 +740,7 @@
                       v-model.number="editingRule.memoryLimitBytes"
                       type="number"
                       min="0"
+                      max="68719476736"
                       :label="reverseProxyCopy.memoryLimitBytes"
                       hide-details />
                     <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.ruleResourceHint }}</div>
@@ -1005,6 +1006,7 @@
                 v-model.number="editingResources.memoryPoolBytes"
                 type="number"
                 min="512000"
+                max="68719476736"
                 :label="reverseProxyCopy.memoryPoolBytes"
                 hide-details />
             </v-col>
@@ -1013,6 +1015,7 @@
                 v-model.number="editingResources.defaultRuleMemoryLimitBytes"
                 type="number"
                 min="512000"
+                max="68719476736"
                 :label="reverseProxyCopy.defaultRuleMemoryLimitBytes"
                 hide-details />
             </v-col>
@@ -1021,6 +1024,7 @@
                 v-model.number="editingResources.responseRewriteInputBytes"
                 type="number"
                 min="512000"
+                max="68719476736"
                 :label="reverseProxyCopy.responseRewriteInputBytes"
                 hide-details />
             </v-col>
@@ -1029,6 +1033,7 @@
                 v-model.number="editingResources.responseRewriteOutputBytes"
                 type="number"
                 min="512000"
+                max="68719476736"
                 :label="reverseProxyCopy.responseRewriteOutputBytes"
                 hide-details />
             </v-col>

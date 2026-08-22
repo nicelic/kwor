@@ -49,7 +49,10 @@ export interface WgPeer {
   reserved?: number[]
 }
 
-export interface Direct extends OutboundBasics, Dial {}
+export interface Direct extends OutboundBasics, Dial {
+  override_address?: string
+  override_port?: number
+}
 
 export interface SOCKS extends OutboundBasics, Dial {
   server: string
@@ -208,7 +211,6 @@ export interface TUIC extends OutboundBasics, Dial {
   token?: string
   uuid?: string
   password?: string
-  mihomo_fast_open?: boolean
   congestion_control?: "cubic"|"new_reno"|"bbr"
   udp_relay_mode?: "native" | "quic"
   udp_over_stream?: boolean
@@ -232,7 +234,6 @@ export interface Hysteria2 extends OutboundBasics, Dial {
   server_ports?: string[]
   hop_interval?: string
   hop_interval_max?: string
-  mihomo_fast_open?: boolean
   up_mbps?: number
   down_mbps?: number
   bbr_profile?: "" | "conservative" | "standard" | "aggressive"
@@ -241,6 +242,14 @@ export interface Hysteria2 extends OutboundBasics, Dial {
     password: string
   }
   password?: string
+  // Mihomo/Clash-only client-template options.
+  mihomo_fast_open?: boolean
+  mihomo_hy2?: {
+    initial_stream_receive_window?: number
+    max_stream_receive_window?: number
+    initial_connection_receive_window?: number
+    max_connection_receive_window?: number
+  }
   network?: "udp" | "tcp"
   tls: oTls
   brutal_debug?: boolean
@@ -388,8 +397,8 @@ const defaultValues: Record<OutType, Outbound> = {
     type: OutTypes.Hysteria,
     up_mbps: 100,
     down_mbps: 100,
-    stream_receive_window: 25000000,
-    connection_receive_window: 67108864,
+    stream_receive_window: 38000000,
+    connection_receive_window: 150000000,
     tls: { enabled: true },
   },
   shadowtls: { type: OutTypes.ShadowTLS, version: 3, strict_mode: true, wildcard_sni: 'off', handshake: { server: 'addons.mozilla.org', server_port: 443 }, tls: { enabled: true }, ss_config: { method: '2022-blake3-aes-128-gcm', network: 'tcp', udp_over_tcp: false, multiplex: { enabled: true, protocol: 'h2mux', max_connections: 8, min_streams: 16, padding: true } } },

@@ -82,8 +82,8 @@ func buildSubOutboundInboundRank(raw json.RawMessage) map[uint]int {
 		return map[uint]int{}
 	}
 
-	var inboundIDs []uint
-	if err := json.Unmarshal(raw, &inboundIDs); err != nil {
+	inboundIDs, err := util.ParseInboundIDs(raw)
+	if err != nil {
 		return map[uint]int{}
 	}
 
@@ -234,7 +234,10 @@ func (s *SubOutboundService) GetAll() (*[]map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	var data []map[string]interface{}
+	// Keep the empty result as a non-nil slice so the API serializes it as
+	// [] rather than null. The frontend uses this response to clear the last
+	// visible subscription card immediately after deletion.
+	data := make([]map[string]interface{}, 0, len(subOutbounds))
 	for _, subOutbound := range subOutbounds {
 		if isSubscriptionServerOnlySubOutbound(subOutbound) {
 			continue
@@ -469,20 +472,27 @@ func (s *SubOutboundService) Save(tx *gorm.DB, act string, data json.RawMessage)
 		if err != nil {
 			return err
 		}
+		if act == "new" {
+			// Do not let copied/imported primary keys turn a create into an edit.
+			subOutbound.Id = 0
+		} else if subOutbound.Id == 0 {
+			return fmt.Errorf("subscription outbound id is required for edit")
+		}
 		incomingRaw := normalizeSubOutboundRawPayload(data)
 		subOutbound.RawOutbound = incomingRaw
 
 		// Preserve sync source metadata when editing through generic SubOutbound APIs.
 		existing := &model.SubOutbound{}
 		var lookupErr error
+		existingFound := false
 		oldTag := ""
-		switch {
-		case subOutbound.Id > 0:
+		if act == "edit" {
 			lookupErr = tx.Model(model.SubOutbound{}).Where("id = ?", subOutbound.Id).First(existing).Error
-		case subOutbound.Tag != "":
-			lookupErr = tx.Model(model.SubOutbound{}).Where("tag = ?", subOutbound.Tag).First(existing).Error
+			if lookupErr == nil {
+				existingFound = true
+			}
 		}
-		if lookupErr == nil {
+		if existingFound {
 			if subOutbound.SourceType == "" {
 				subOutbound.SourceType = existing.SourceType
 			}
@@ -504,7 +514,7 @@ func (s *SubOutboundService) Save(tx *gorm.DB, act string, data json.RawMessage)
 				subOutbound.RawOutbound = append(json.RawMessage(nil), existing.RawOutbound...)
 			}
 			oldTag = strings.TrimSpace(existing.Tag)
-		} else if lookupErr != nil && !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+		} else if lookupErr != nil {
 			return lookupErr
 		}
 		if len(subOutbound.RawOutbound) == 0 {
@@ -562,6 +572,9 @@ func (s *SubOutboundService) Save(tx *gorm.DB, act string, data json.RawMessage)
 		if lookupErr == nil {
 			if blockErr := blockSubSyncInboundBySubOutbound(tx, existing); blockErr != nil {
 				return blockErr
+			}
+			if disableErr := disableAutoSyncBySubOutbound(tx, existing); disableErr != nil {
+				return disableErr
 			}
 		} else if lookupErr != nil && !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
 			return lookupErr
@@ -776,7 +789,7 @@ func expandSubOutboundsForSubscription(raw []map[string]interface{}) ([]map[stri
 		}
 		if multiplex, ok := ssConfig["multiplex"].(map[string]interface{}); ok && multiplex != nil {
 			if enabled, ok := multiplex["enabled"].(bool); ok && enabled {
-				ssOutbound["multiplex"] = multiplex
+				ssOutbound["multiplex"] = util.CloneJSONMap(multiplex)
 			}
 		}
 
@@ -793,11 +806,7 @@ func expandSubOutboundsForSubscription(raw []map[string]interface{}) ([]map[stri
 }
 
 func cloneSubOutboundMap(src map[string]interface{}) map[string]interface{} {
-	dst := make(map[string]interface{}, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
+	return util.CloneJSONMap(src)
 }
 
 func applyCertificateStoreToSubConfig(jsonConfig map[string]interface{}, tlsStore string) {

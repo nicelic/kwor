@@ -27,19 +27,23 @@
       <v-text-field
       :label="$t('out.port')"
       type="number"
-      min="0"
+      min="1"
+      max="65535"
+      step="1"
       hide-details
-      v-model.number="port">
+      v-model="port">
       </v-text-field>
     </v-col>
     <v-col cols="12" sm="6" md="4">
       <v-text-field
       label="KeepAlive"
       type="number"
-      min="0"
+      min="1"
+      max="65535"
+      step="1"
       :suffix="$t('date.s')"
       hide-details
-      v-model.number="keepAlive">
+      v-model="keepAlive">
       </v-text-field>
     </v-col>
   </v-row>
@@ -54,6 +58,8 @@
 </template>
 
 <script lang="ts">
+import { parseSingboxByteList, parseSingboxInteger } from '@/plugins/singboxInteger'
+
 export default {
   props: ['data', 'ext'],
   emits: ['refreshPeerKey'],
@@ -68,14 +74,20 @@ export default {
   computed: {
     allowed_ips: {
       get() { return this.$props.data.allowed_ips?.join(',') },
-      set(v:string) { this.$props.data.allowed_ips = v.length > 0 ? v.split(',') : undefined }
+      set(v:string) {
+        const values = v.split(',').map((item) => item.trim()).filter((item) => item !== '')
+        this.$props.data.allowed_ips = values.length > 0 ? values : undefined
+      }
     },
     reserved: {
       get() { return this.$props.data.reserved?.join(',') },
       set(v:string) {
-        if(!v.endsWith(',')) {
-          this.$props.data.reserved = v.length > 0 ? v.split(',').map(str => parseInt(str, 10)) : undefined
+        if (v.trim() === '') {
+          this.$props.data.reserved = undefined
+          return
         }
+        const values = parseSingboxByteList(v)
+        if (values) this.$props.data.reserved = values
       }
     },
     address: {
@@ -84,27 +96,31 @@ export default {
     },
     port: {
       get() { return this.$props.data.port },
-      set(v:number) { this.$props.data.port = v > 0 ? v : undefined }
+      set(v:unknown) { this.$props.data.port = parseSingboxInteger(v, { min: 1, max: 65535 }) }
     },
     keepAlive: {
-      get() { return this.$props.data.persistent_keepalive_interval?? 0 },
-      set(v:number) { this.$props.data.persistent_keepalive_interval = v > 0 ? v : undefined }
+      get() { return parseSingboxInteger(this.$props.data.persistent_keepalive_interval, { min: 1, max: 65535 }) ?? 0 },
+      set(v:unknown) { this.$props.data.persistent_keepalive_interval = parseSingboxInteger(v, { min: 1, max: 65535 }) }
     },
     privateKey: {
       get() {
-        const indexKeys = this.$props.ext?.keys.findIndex((key: any) => key.public_key == this.$props.data.public_key)?? -1
+        const indexKeys = this.$props.ext?.keys?.findIndex((key: any) => key.public_key == this.$props.data.public_key) ?? -1
         return indexKeys > -1 ? this.$props.ext.keys[indexKeys].private_key : ''
       },
       set(v:string) {
-        const indexKeys = this.$props.ext?.keys.findIndex((key: any) => key.public_key == this.$props.data.public_key)?? -1
-        this.$props.ext.keys[indexKeys].private_key = v
+        const indexKeys = this.$props.ext?.keys?.findIndex((key: any) => key.public_key == this.$props.data.public_key) ?? -1
+        if (indexKeys >= 0 && Array.isArray(this.$props.ext?.keys)) {
+          this.$props.ext.keys[indexKeys].private_key = v
+        }
       }
     },
     publicKey: {
       get() { return this.$props.data.public_key },
       set(v:string) {
-        const indexKeys = this.$props.ext?.keys.findIndex((key: any) => key.public_key == this.$props.data.public_key)?? -1
-        this.$props.ext.keys[indexKeys].public_key = v
+        const indexKeys = this.$props.ext?.keys?.findIndex((key: any) => key.public_key == this.$props.data.public_key) ?? -1
+        if (indexKeys >= 0 && Array.isArray(this.$props.ext?.keys)) {
+          this.$props.ext.keys[indexKeys].public_key = v
+        }
         this.$props.data.public_key = v
       }
     }

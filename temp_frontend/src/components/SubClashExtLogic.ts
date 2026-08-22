@@ -11,7 +11,17 @@ import {
   CLASH_RULE_SET_NAME_OPTIONS_BY_SOURCE,
 } from './SubClashExtConstants'
 
-const SUBSCRIPTION_EXTENSION_MAX_BYTES = 4 * 1024 * 1024
+const SUBSCRIPTION_EXTENSION_MAX_BYTES = 1 * 1024 * 1024
+const CLASH_LATENCY_TEST_MIN_INTERVAL_SECONDS = 30
+const CLASH_RULE_PROVIDER_MIN_INTERVAL_SECONDS = 60 * 60
+const CLASH_REGENERATION_DEBOUNCE_MS = 80
+const CLASH_RULE_SET_PROBE_DEBOUNCE_MS = 100
+const CLASH_RULE_SET_PROBE_BATCH_SIZE = 32
+const CLASH_MAX_RULE_PROVIDERS = 128
+const CLASH_MAX_RULE_ROWS = 64
+const CLASH_MAX_DNS_POLICY_ROWS = 64
+const CLASH_MAX_DNS_SUFFIX_ROWS = 32
+const CLASH_MAX_VALUES_PER_ROW = 24
 
 const CLASH_ALLOWED_RULE_SET_EXTENSIONS = new Set(['.mrs', '.yaml', '.yml', '.txt', '.list'])
 
@@ -260,6 +270,10 @@ function getMihomoLatencyIntervalError(input: any): string {
 	return String(i18n.global.t('subscriptionEditor.clashIntervalInvalid'))
   }
 
+  if (Number.parseInt(value, 10) < CLASH_LATENCY_TEST_MIN_INTERVAL_SECONDS) {
+    return String(i18n.global.t('subscriptionEditor.clashIntervalTooShort', { seconds: CLASH_LATENCY_TEST_MIN_INTERVAL_SECONDS }))
+  }
+
   return ''
 }
 
@@ -268,6 +282,32 @@ function normalizeMihomoLatencyInterval(input: any): string {
   if (!value) return ''
   if (getMihomoLatencyIntervalError(value)) return ''
   return value.toLowerCase()
+}
+
+function getClashRuleProviderIntervalError(input: any): string {
+  const value = normalizeLatencyInput(input).toLowerCase()
+  const match = /^([1-9]\d*)\s*([smhd]?)$/.exec(value)
+  if (!match) return String(i18n.global.t('subscriptionEditor.clashRuleProviderIntervalInvalid'))
+
+  const amount = Number.parseInt(match[1], 10)
+  const multiplier = match[2] === 's'
+    ? 1
+    : match[2] === 'm'
+      ? 60
+      : match[2] === 'h'
+        ? 3600
+        : 86400
+  const seconds = amount * multiplier
+  if (!Number.isSafeInteger(amount) || !Number.isSafeInteger(seconds)) {
+    return String(i18n.global.t('subscriptionEditor.clashRuleProviderIntervalInvalid'))
+  }
+  if (seconds < CLASH_RULE_PROVIDER_MIN_INTERVAL_SECONDS) {
+    return String(i18n.global.t('subscriptionEditor.clashRuleProviderIntervalTooShort', { seconds: CLASH_RULE_PROVIDER_MIN_INTERVAL_SECONDS }))
+  }
+  if (seconds > 365 * 24 * 60 * 60) {
+    return String(i18n.global.t('subscriptionEditor.clashRuleProviderIntervalTooLong'))
+  }
+  return ''
 }
 
 function getLatencyToleranceMsError(input: any): string {
@@ -290,7 +330,7 @@ function normalizeLatencyToleranceMs(input: any): string {
 
 function parseIntervalToSeconds(interval: string): number {
   if (!interval) return 86400
-  const match = interval.match(/^(\d+)\s*([dhms]?)$/i)
+  const match = interval.match(/^([1-9]\d*)\s*([dhms]?)$/i)
   if (!match) return 86400
   const num = parseInt(match[1], 10)
   const unit = match[2].toLowerCase()
@@ -722,6 +762,54 @@ type ClashDnsSuffixRow = {
 	id: string
   targets: ClashDnsSuffixTarget[]
   selections: ClashDnsSuffixSelection[]
+}
+
+type ClashRuleSetProbeBatchEntry = {
+  rawName: string
+  prefix: 'geosite' | 'geoip'
+  typeLabel: string
+  source: string
+  sourceBinding: ClashRuleSetSourceBinding
+}
+
+function hasClashRowValueBoundsError(values: any): boolean {
+  if (!Array.isArray(values) || values.length > CLASH_MAX_VALUES_PER_ROW) return true
+  return values.some((item: any) => typeof item === 'string' && item.length > 2048)
+}
+
+function hasClashEditorBoundsError(config: any): boolean {
+  const uiConfig = config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  const bounds: Array<[string, number]> = [
+    ['clashRuleRows', CLASH_MAX_RULE_ROWS],
+    ['clashDnsPolicyRows', CLASH_MAX_DNS_POLICY_ROWS],
+    ['clashDnsSuffixRows', CLASH_MAX_DNS_SUFFIX_ROWS],
+  ]
+  for (const [key, maximumRows] of bounds) {
+    const rows = uiConfig[key]
+    if (!Array.isArray(rows)) continue
+    if (rows.length > maximumRows) return true
+    if (rows.some((row: any) =>
+      ['values', 'targets', 'selections'].some((valueKey: string) =>
+        row?.[valueKey] !== undefined && hasClashRowValueBoundsError(row[valueKey])
+      )
+    )) return true
+  }
+  return false
+}
+
+function hasClashFormBoundsError(root: any): boolean {
+  if (!root || typeof root !== 'object' || Array.isArray(root)) return false
+  if (Array.isArray(root.rules) && root.rules.length > 2048) return true
+  if (root['rule-providers'] && typeof root['rule-providers'] === 'object' && !Array.isArray(root['rule-providers'])) {
+    if (Object.keys(root['rule-providers']).length > CLASH_MAX_RULE_PROVIDERS) return true
+  }
+  return hasClashEditorBoundsError(root._uiConfig)
+}
+
+function countClashRuleProviders(rows: any): number {
+  return normalizeClashRuleRows(rows)
+    .filter((row: ClashRuleRow) => row.kind === 'ruleset')
+    .reduce((total: number, row: ClashRuleRow) => total + row.values.length, 0)
 }
 
 type ClashDnsPolicyRow = {
@@ -1814,12 +1902,18 @@ function buildLegacyClashRuleRows(config: any): ClashRuleRow[] {
 export const SubClashExtMixin = {
   created(this: any) {
 	this._probeAbortController = new AbortController()
+	this._probeDebounceTimer = null
+	this._probeBatch = new Map<string, ClashRuleSetProbeBatchEntry>()
+	this._probeBatchRunning = false
+	this._regenerationTimer = null
     this._dirtyTrackingBaseline = null
     this._dirtyTrackingReady = false
     this._dirtyTrackingPending = false
-    this._dirtyTrackingTimer = null
-    this._dirtyTrackingPreserveInitial = this._dirty === true
-    this.captureClashRuleRowsValidationSnapshot(this.clashRuleRows)
+	this._dirtyTrackingTimer = null
+	this._dirtyTrackingPreserveInitial = this._dirty === true
+	this.captureClashRuleRowsValidationSnapshot(this.clashRuleRows)
+	this.captureClashDnsPolicyRowsValidationSnapshot(this.clashDnsPolicyRows)
+	this.captureClashDnsSuffixRowsValidationSnapshot(this.clashDnsSuffixRows)
   },
   mounted(this: any) {
     this.$nextTick(() => {
@@ -1830,6 +1924,13 @@ export const SubClashExtMixin = {
   beforeUnmount(this: any) {
 	this.ruleSetResolutionRunToken = (this.ruleSetResolutionRunToken || 0) + 1
 	this._probeAbortController?.abort()
+	if (this._probeDebounceTimer != null && typeof window !== 'undefined') {
+	  window.clearTimeout(this._probeDebounceTimer)
+	}
+	this._probeBatch?.clear()
+	if (this._regenerationTimer != null && typeof window !== 'undefined') {
+	  window.clearTimeout(this._regenerationTimer)
+	}
     if (this._dirtyTrackingTimer != null && typeof window !== 'undefined') {
       window.clearTimeout(this._dirtyTrackingTimer)
     }
@@ -1845,23 +1946,33 @@ export const SubClashExtMixin = {
       handler(this: any, v: string) {
 		const raw = typeof v === 'string' ? v : ''
 		this._rawSource = raw
-		if (!raw.trim()) {
-          this.metaJson = {}
-		  this._parseError = ''
-          return
-        }
+		if (raw.trim() && new TextEncoder().encode(raw).length > SUBSCRIPTION_EXTENSION_MAX_BYTES) {
+		  this.formRowsTooLarge = true
+		  this._parseError = String(i18n.global.t('subscriptionEditor.clashConfigTooLarge'))
+		  this.metaJson = {}
+		  return
+		}
         try {
-		  const document = yaml.parseDocument(raw, { uniqueKeys: true })
+		  const source = raw.trim() ? raw : String(this.canonicalDefault || '')
+		  const document = yaml.parseDocument(source, { uniqueKeys: true })
 		  if (document.errors.length > 0) throw document.errors[0]
 		  const parsed = document.toJS() ?? {}
 		  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
 			throw new Error(String(i18n.global.t('subscriptionEditor.yamlTopLevel')))
 		  }
+		  if (hasClashFormBoundsError(parsed)) {
+			this.formRowsTooLarge = true
+			this.metaJson = {}
+			this._parseError = ''
+			return
+		  }
+		  this.formRowsTooLarge = false
           if (JSON.stringify(parsed) !== JSON.stringify(this.metaJson)) {
             this.metaJson = parsed
           }
 		  this._parseError = ''
 		} catch (error: any) {
+		  this.formRowsTooLarge = false
 		  this._parseError = String(i18n.global.t('subscriptionEditor.yamlParseFailed', { error: String(error?.message || error) }))
 		  this.metaJson = {}
         }
@@ -1898,12 +2009,14 @@ export const SubClashExtMixin = {
             ? normalizeClashDnsPolicyRows(config.clashDnsPolicyRows)
             : buildLegacyClashDnsPolicyRows(this.metaJson)
           this.clashDnsPolicyRows = restoredDnsPolicyRows
+		  this.captureClashDnsPolicyRowsValidationSnapshot(restoredDnsPolicyRows)
 
           const restoredDnsSuffixRows = Array.isArray(config.clashDnsSuffixRows)
             ? normalizeClashDnsSuffixRows(config.clashDnsSuffixRows)
             : buildLegacyClashDnsSuffixRows(config)
           this.clashDnsSuffixRows = restoredDnsSuffixRows
           this.clashDnsSuffixAppliedRowsSnapshot = filterPersistedClashDnsSuffixRows(restoredDnsSuffixRows)
+		  this.captureClashDnsSuffixRowsValidationSnapshot(restoredDnsSuffixRows)
 
           if (config.updateMethod !== undefined) this.updateMethod = normalizeClashUpdateMethod(config.updateMethod)
           if (config.updateInterval !== undefined) this.updateInterval = config.updateInterval
@@ -2012,7 +2125,7 @@ export const SubClashExtMixin = {
         } finally {
           this._suspendClashRegeneration = false
         }
-        this.regenerateClashConfig()
+        this.scheduleClashConfigRegeneration()
       },
       immediate: true,
     },
@@ -2024,7 +2137,7 @@ export const SubClashExtMixin = {
         return
       }
       this.onClashRuleSetSourceChanged()
-      this.regenerateClashConfig()
+      this.scheduleClashConfigRegeneration()
     },
     clashRuleRows: {
       handler(this: any, rows: any[], oldRows: any[]) {
@@ -2042,6 +2155,19 @@ export const SubClashExtMixin = {
 
         const constrained = this.applyClashRuleNameConstraints(withSplitRows)
         const finalRows = constrained.rows
+		if (
+		  finalRows.length > CLASH_MAX_RULE_ROWS ||
+		  finalRows.some((row: ClashRuleRow) => hasClashRowValueBoundsError(row.values)) ||
+		  countClashRuleProviders(finalRows) > CLASH_MAX_RULE_PROVIDERS
+		) {
+		  this.clashRuleRows = previousRowsForValidation
+		  push.warning({
+			title: String(i18n.global.t('subscriptionEditor.probeTitle')),
+			message: String(i18n.global.t('subscriptionEditor.clashFormBounds')),
+			duration: 5000,
+		  })
+		  return
+		}
 
         if (JSON.stringify(rows) !== JSON.stringify(finalRows)) {
           this.captureClashRuleRowsValidationSnapshot(finalRows)
@@ -2050,7 +2176,7 @@ export const SubClashExtMixin = {
           return
         }
 
-        this.regenerateClashConfig()
+        this.scheduleClashConfigRegeneration()
         this.validateNewClashRuleRows(finalRows, previousRowsForValidation)
         this.captureClashRuleRowsValidationSnapshot(finalRows)
       },
@@ -2059,6 +2185,7 @@ export const SubClashExtMixin = {
     clashDnsPolicyRows: {
       handler(this: any, rows: any[]) {
         if (this._suspendClashRegeneration) return
+		const previousRows = this.getPreviousClashDnsPolicyRowsForValidation()
 
         const normalizedRows = normalizeClashDnsPolicyRows(rows)
         const withSplitRows = normalizedRows.map((row: ClashDnsPolicyRow) => {
@@ -2073,8 +2200,21 @@ export const SubClashExtMixin = {
           this.clashDnsPolicyRows = withSplitRows
           return
         }
+		if (
+		  withSplitRows.length > CLASH_MAX_DNS_POLICY_ROWS ||
+		  withSplitRows.some((row: ClashDnsPolicyRow) => hasClashRowValueBoundsError(row.values))
+		) {
+		  this.clashDnsPolicyRows = previousRows
+		  push.warning({
+			title: String(i18n.global.t('subscriptionEditor.probeTitle')),
+			message: String(i18n.global.t('subscriptionEditor.clashFormBounds')),
+			duration: 5000,
+		  })
+		  return
+		}
 
-        this.regenerateClashConfig()
+        this.scheduleClashConfigRegeneration()
+		this.captureClashDnsPolicyRowsValidationSnapshot(withSplitRows)
       },
       deep: true,
     },
@@ -2082,7 +2222,7 @@ export const SubClashExtMixin = {
       handler(this: any) {
         if (this._suspendClashRegeneration) return
         if (!this.hasActiveClashDnsPolicyRows()) return
-        this.regenerateClashConfig()
+        this.scheduleClashConfigRegeneration()
       },
       deep: true,
     },
@@ -2090,7 +2230,7 @@ export const SubClashExtMixin = {
       handler(this: any) {
         if (this._suspendClashRegeneration) return
         if (!this.hasActiveClashDnsPolicyRows()) return
-        this.regenerateClashConfig()
+        this.scheduleClashConfigRegeneration()
       },
       deep: true,
     },
@@ -2098,24 +2238,40 @@ export const SubClashExtMixin = {
       handler(this: any) {
         if (this._suspendClashRegeneration) return
         if (!this.hasActiveClashDnsPolicyRows()) return
-        this.regenerateClashConfig()
+        this.scheduleClashConfigRegeneration()
       },
       deep: true,
     },
     dnsDirectNameserverFollowPolicy(this: any) {
       if (this._suspendClashRegeneration) return
       if (!this.hasActiveClashDnsPolicyRows()) return
-      this.regenerateClashConfig()
+      this.scheduleClashConfigRegeneration()
     },
     clashDnsSuffixRows: {
       handler(this: any, rows: any[]) {
         if (this._suspendClashRegeneration) return
+		const previousRows = this.getPreviousClashDnsSuffixRowsForValidation()
         const normalized = normalizeClashDnsSuffixRows(rows)
         if (!isSameClashDnsSuffixRows(rows, normalized)) {
           this.clashDnsSuffixRows = normalized
           return
         }
+		if (
+		  normalized.length > CLASH_MAX_DNS_SUFFIX_ROWS ||
+		  normalized.some((row: ClashDnsSuffixRow) =>
+			hasClashRowValueBoundsError(row.targets) || hasClashRowValueBoundsError(row.selections)
+		  )
+		) {
+		  this.clashDnsSuffixRows = previousRows
+		  push.warning({
+			title: String(i18n.global.t('subscriptionEditor.probeTitle')),
+			message: String(i18n.global.t('subscriptionEditor.clashFormBounds')),
+			duration: 5000,
+		  })
+		  return
+		}
         this.syncClashDnsSuffixUiConfig()
+		this.captureClashDnsSuffixRowsValidationSnapshot(normalized)
       },
       deep: true,
     },
@@ -2125,12 +2281,12 @@ export const SubClashExtMixin = {
         this.clashNoResolveGlobal = normalized
         return
       }
-      this.regenerateClashConfig()
+      this.scheduleClashConfigRegeneration()
     },
-    updateMethod(this: any) { this.regenerateClashConfig() },
-    updateInterval(this: any) { this.regenerateClashConfig() },
-    routeFinal(this: any) { this.regenerateClashConfig() },
-    enableSniff(this: any) { this.regenerateClashConfig() },
+    updateMethod(this: any) { this.scheduleClashConfigRegeneration() },
+    updateInterval(this: any) { this.scheduleClashConfigRegeneration() },
+    routeFinal(this: any) { this.scheduleClashConfigRegeneration() },
+    enableSniff(this: any) { this.scheduleClashConfigRegeneration() },
     snifferOverrideDestination(this: any, v: any) {
       const normalized = normalizeOptionalBoolean(v)
       if (v !== normalized) {
@@ -2138,7 +2294,7 @@ export const SubClashExtMixin = {
         return
       }
       if (this.enableSniff) {
-        this.regenerateClashConfig()
+        this.scheduleClashConfigRegeneration()
       }
     },
     snifferForceDnsMapping(this: any, v: any) {
@@ -2148,7 +2304,7 @@ export const SubClashExtMixin = {
         return
       }
       if (this.enableSniff) {
-        this.regenerateClashConfig()
+        this.scheduleClashConfigRegeneration()
       }
     },
     snifferParsePureIp(this: any, v: any) {
@@ -2158,27 +2314,27 @@ export const SubClashExtMixin = {
         return
       }
       if (this.enableSniff) {
-        this.regenerateClashConfig()
+        this.scheduleClashConfigRegeneration()
       }
     },
-    enableRejectQuic(this: any) { this.regenerateClashConfig() },
+    enableRejectQuic(this: any) { this.scheduleClashConfigRegeneration() },
     rejectUdpPortsInput(this: any, v: any) {
       if (typeof v !== 'string') {
         this.rejectUdpPortsInput = normalizeOptionalString(v)
         return
       }
-      this.regenerateClashConfig()
+      this.scheduleClashConfigRegeneration()
     },
-    latencyTestUrl(this: any) { this.regenerateClashConfig() },
-    latencyTestInterval(this: any) { this.regenerateClashConfig() },
-    latencyTolerance(this: any) { this.regenerateClashConfig() },
+    latencyTestUrl(this: any) { this.scheduleClashConfigRegeneration() },
+    latencyTestInterval(this: any) { this.scheduleClashConfigRegeneration() },
+    latencyTolerance(this: any) { this.scheduleClashConfigRegeneration() },
     mihomoKeepAlive(this: any, v: any) {
       const normalized = normalizeBoolean(v, false)
       if (v !== normalized) {
         this.mihomoKeepAlive = normalized
         return
       }
-      this.regenerateClashConfig()
+      this.scheduleClashConfigRegeneration()
     },
     keepAliveIdle(this: any, v: any) {
       const normalized = normalizeNonNegativeInteger(v, defaultKeepAliveIdle)
@@ -2187,7 +2343,7 @@ export const SubClashExtMixin = {
         return
       }
       if (this.mihomoKeepAlive) {
-        this.regenerateClashConfig()
+        this.scheduleClashConfigRegeneration()
       }
     },
     keepAliveInterval(this: any, v: any) {
@@ -2197,7 +2353,7 @@ export const SubClashExtMixin = {
         return
       }
       if (this.mihomoKeepAlive) {
-        this.regenerateClashConfig()
+        this.scheduleClashConfigRegeneration()
       }
     },
     disableKeepAlive(this: any, v: any) {
@@ -2207,12 +2363,34 @@ export const SubClashExtMixin = {
         return
       }
       if (this.mihomoKeepAlive) {
-        this.regenerateClashConfig()
+        this.scheduleClashConfigRegeneration()
       }
     },
   },
 
   methods: {
+	scheduleClashConfigRegeneration(this: any) {
+	  if (this._suspendClashRegeneration || this._editorSourcePending) return
+	  if (this._regenerationTimer != null && typeof window !== 'undefined') {
+		window.clearTimeout(this._regenerationTimer)
+	  }
+	  const run = () => {
+		this._regenerationTimer = null
+		this.regenerateClashConfig()
+	  }
+	  if (typeof window === 'undefined') {
+		run()
+		return
+	  }
+	  this._regenerationTimer = window.setTimeout(run, CLASH_REGENERATION_DEBOUNCE_MS)
+	},
+	flushClashConfigRegeneration(this: any) {
+	  if (this._regenerationTimer != null && typeof window !== 'undefined') {
+		window.clearTimeout(this._regenerationTimer)
+		this._regenerationTimer = null
+	  }
+	  this.regenerateClashConfig()
+	},
 	getDirtyTrackingSnapshot(this: any): string {
 	  try {
 		return JSON.stringify(this.metaJson || {})
@@ -2268,9 +2446,17 @@ export const SubClashExtMixin = {
 	  if (!wasDirty) this.$emit?.('dirty-change', true)
 	},
 	isDirty(this: any): boolean {
+	  if (this.formRowsTooLarge !== true && this._editorSourcePending !== true) {
+		this.flushClashConfigRegeneration?.()
+	  }
+	  this.syncDirtyStateFromUi?.()
 	  return this._dirty === true
 	},
 	validateAndSerialize(this: any) {
+	  if (this.formRowsTooLarge !== true && this._editorSourcePending !== true) {
+		this.flushClashConfigRegeneration?.()
+	  }
+	  this.syncDirtyStateFromUi?.()
 	  const dirty = this._dirty === true
 	  if (!dirty) {
 		return { ok: true, dirty: false, value: this._rawSource || '' }
@@ -2280,6 +2466,13 @@ export const SubClashExtMixin = {
 	  }
 	  if (this._parseError) {
 		return { ok: false, dirty: true, value: this._rawSource || '', error: this._parseError }
+	  }
+	  if (this.formRowsTooLarge === true) {
+		const value = this._rawSource || ''
+		if (new TextEncoder().encode(value).length > SUBSCRIPTION_EXTENSION_MAX_BYTES) {
+		  return { ok: false, dirty: true, value, error: String(i18n.global.t('subscriptionEditor.clashConfigTooLarge')) }
+		}
+		return { ok: false, dirty: true, value, error: String(i18n.global.t('subscriptionEditor.formRowsTooLarge')) }
 	  }
 	  if (!this.metaJson || Object.keys(this.metaJson).length === 0) {
 		const requiresEmptyWrite = String(this._rawSource || '').trim() !== ''
@@ -2301,7 +2494,7 @@ export const SubClashExtMixin = {
 		  return { ok: false, dirty: true, value: '', error: String(i18n.global.t('subscriptionEditor.yamlSerializeFailed', { error: String(error?.message || error) })) }
 		}
 		if (new TextEncoder().encode(value).length > SUBSCRIPTION_EXTENSION_MAX_BYTES) {
-		  return { ok: false, dirty: true, value, error: String(i18n.global.t('subscriptionEditor.configTooLarge')) }
+		  return { ok: false, dirty: true, value, error: String(i18n.global.t('subscriptionEditor.clashConfigTooLarge')) }
 		}
 		this.settings.subClashExt = value
 		this._rawSource = value
@@ -2313,7 +2506,7 @@ export const SubClashExtMixin = {
 	  }
 	  this.commitClashRuleRows?.()
 	  this.commitClashDnsPolicyRows?.()
-	  this.regenerateClashConfig?.()
+	  this.flushClashConfigRegeneration?.()
 	  const validationError = this.validateSubscriptionForm?.()
 	  let value = ''
 	  try {
@@ -2322,7 +2515,7 @@ export const SubClashExtMixin = {
 		return { ok: false, dirty: true, value: '', error: String(i18n.global.t('subscriptionEditor.yamlSerializeFailed', { error: String(error?.message || error) })) }
 	  }
 	  if (new TextEncoder().encode(value).length > SUBSCRIPTION_EXTENSION_MAX_BYTES) {
-		return { ok: false, dirty: true, value, error: String(i18n.global.t('subscriptionEditor.configTooLarge')) }
+		return { ok: false, dirty: true, value, error: String(i18n.global.t('subscriptionEditor.clashConfigTooLarge')) }
 	  }
 	  this.settings.subClashExt = value
 	  this._rawSource = value
@@ -2330,8 +2523,21 @@ export const SubClashExtMixin = {
 	},
 	validateSubscriptionForm(this: any): string {
 	  if (this.latencyTestIntervalError) return this.latencyTestIntervalError
+	  if (this.ruleProviderIntervalError) return this.ruleProviderIntervalError
 	  if (this.latencyToleranceError) return this.latencyToleranceError
 	  if (this.rejectUdpPortsInputError) return this.rejectUdpPortsInputError
+	  if (this.clashRuleRows.length > CLASH_MAX_RULE_ROWS) return String(i18n.global.t('subscriptionEditor.clashRuleRowsTooLarge', { maximum: CLASH_MAX_RULE_ROWS }))
+	  if (this.clashDnsPolicyRows.length > CLASH_MAX_DNS_POLICY_ROWS) return String(i18n.global.t('subscriptionEditor.clashDnsPolicyRowsTooLarge', { maximum: CLASH_MAX_DNS_POLICY_ROWS }))
+	  if (this.clashDnsSuffixRows.length > CLASH_MAX_DNS_SUFFIX_ROWS) return String(i18n.global.t('subscriptionEditor.clashDnsSuffixRowsTooLarge', { maximum: CLASH_MAX_DNS_SUFFIX_ROWS }))
+	  if (this.clashRuleRows.some((row: any) => hasClashRowValueBoundsError(row?.values))) return String(i18n.global.t('subscriptionEditor.clashRowValuesTooLarge', { maximum: CLASH_MAX_VALUES_PER_ROW }))
+	  if (this.clashDnsPolicyRows.some((row: any) => hasClashRowValueBoundsError(row?.values))) return String(i18n.global.t('subscriptionEditor.clashRowValuesTooLarge', { maximum: CLASH_MAX_VALUES_PER_ROW }))
+	  if (this.clashDnsSuffixRows.some((row: any) =>
+		(row?.targets !== undefined && hasClashRowValueBoundsError(row.targets)) ||
+		(row?.selections !== undefined && hasClashRowValueBoundsError(row.selections))
+	  )) return String(i18n.global.t('subscriptionEditor.clashRowValuesTooLarge', { maximum: CLASH_MAX_VALUES_PER_ROW }))
+	  if (countClashRuleProviders(this.clashRuleRows) > CLASH_MAX_RULE_PROVIDERS) {
+		return String(i18n.global.t('subscriptionEditor.clashRuleProvidersTooLarge', { maximum: CLASH_MAX_RULE_PROVIDERS }))
+	  }
 	  const mixedPort = Number(this.mixedPort)
 	  if (!Number.isInteger(mixedPort) || mixedPort < 1 || mixedPort > 65535) {
 		return String(i18n.global.t('subscriptionEditor.mixedPortInvalid'))
@@ -2359,10 +2565,35 @@ export const SubClashExtMixin = {
     captureClashRuleRowsValidationSnapshot(this: any, rows: any) {
       this._clashRuleRowsValidationSnapshot = JSON.parse(JSON.stringify(normalizeClashRuleRows(rows)))
     },
+    getPreviousClashDnsPolicyRowsForValidation(this: any): ClashDnsPolicyRow[] {
+      const snapshot = this._clashDnsPolicyRowsValidationSnapshot
+      if (Array.isArray(snapshot) && snapshot.length > 0) {
+        return normalizeClashDnsPolicyRows(snapshot)
+      }
+      return normalizeClashDnsPolicyRows([])
+    },
+    captureClashDnsPolicyRowsValidationSnapshot(this: any, rows: any) {
+      this._clashDnsPolicyRowsValidationSnapshot = JSON.parse(JSON.stringify(normalizeClashDnsPolicyRows(rows)))
+    },
+    getPreviousClashDnsSuffixRowsForValidation(this: any): ClashDnsSuffixRow[] {
+      const snapshot = this._clashDnsSuffixRowsValidationSnapshot
+      if (Array.isArray(snapshot) && snapshot.length > 0) {
+        return normalizeClashDnsSuffixRows(snapshot)
+      }
+      return normalizeClashDnsSuffixRows([])
+    },
+    captureClashDnsSuffixRowsValidationSnapshot(this: any, rows: any) {
+      this._clashDnsSuffixRowsValidationSnapshot = JSON.parse(JSON.stringify(normalizeClashDnsSuffixRows(rows)))
+    },
     openEditor(this: any) {
 	  this.ruleSetResolutionRunToken = (this.ruleSetResolutionRunToken || 0) + 1
 	  this._probeAbortController?.abort()
 	  this._probeAbortController = new AbortController()
+	  this._probeBatch?.clear()
+	  if (this._probeDebounceTimer != null && typeof window !== 'undefined') {
+		window.clearTimeout(this._probeDebounceTimer)
+		this._probeDebounceTimer = null
+	  }
       this.enableEditor = true
     },
     resetSubClashPage(this: any) {
@@ -2385,6 +2616,8 @@ export const SubClashExtMixin = {
 	  this._editorSourcePending = false
       this._uiConfigLoaded = false
       this.captureClashRuleRowsValidationSnapshot(this.clashRuleRows)
+	  this.captureClashDnsPolicyRowsValidationSnapshot(this.clashDnsPolicyRows)
+	  this.captureClashDnsSuffixRowsValidationSnapshot(this.clashDnsSuffixRows)
 	  this.$emit?.('dirty-change', true)
 
       this.$nextTick(() => {
@@ -2403,6 +2636,27 @@ export const SubClashExtMixin = {
           })
 		  return
 		}
+		if (new TextEncoder().encode(data).length > SUBSCRIPTION_EXTENSION_MAX_BYTES) {
+		  push.warning({
+			title: String(i18n.global.t('error')),
+			message: String(i18n.global.t('subscriptionEditor.clashConfigTooLarge')),
+			duration: 5000,
+		  })
+		  return
+		}
+		if (hasClashFormBoundsError(result)) {
+		  this._parseError = ''
+		  this._resetRequested = false
+		  this._editorSourcePending = true
+		  this.formRowsTooLarge = true
+		  this.metaJson = {}
+		  this._rawSource = data
+		  this.settings.subClashExt = data
+		  this.enableEditor = false
+		  this.markUserDirty()
+		  return
+		}
+		this.formRowsTooLarge = false
 		this._parseError = ''
 		this._resetRequested = false
 		this._editorSourcePending = true
@@ -2621,6 +2875,7 @@ export const SubClashExtMixin = {
 
     insertClashRuleRow(this: any, index: number) {
       const rows = normalizeClashRuleRows(this.clashRuleRows)
+	  if (rows.length >= CLASH_MAX_RULE_ROWS) return
       const safeIndex = Number.isInteger(index)
         ? Math.max(-1, Math.min(index, rows.length - 1))
         : rows.length - 1
@@ -2650,7 +2905,7 @@ export const SubClashExtMixin = {
       const normalizedRows = normalizeClashRuleRows(this.clashRuleRows)
       const persistedRows = filterNonEmptyClashRuleRows(normalizedRows)
       this.clashRuleRows = normalizeClashRuleRows(persistedRows)
-      this.regenerateClashConfig()
+      this.flushClashConfigRegeneration()
     },
 
     canDeleteClashDnsPolicyRow(this: any, index: number): boolean {
@@ -2660,6 +2915,7 @@ export const SubClashExtMixin = {
 
     insertClashDnsPolicyRow(this: any, index: number) {
       const rows = normalizeClashDnsPolicyRows(this.clashDnsPolicyRows)
+	  if (rows.length >= CLASH_MAX_DNS_POLICY_ROWS) return
       const safeIndex = Number.isInteger(index)
         ? Math.max(-1, Math.min(index, rows.length - 1))
         : rows.length - 1
@@ -2689,7 +2945,7 @@ export const SubClashExtMixin = {
       const normalizedRows = normalizeClashDnsPolicyRows(this.clashDnsPolicyRows)
       const persistedRows = filterNonEmptyClashDnsPolicyRows(normalizedRows)
       this.clashDnsPolicyRows = normalizeClashDnsPolicyRows(persistedRows)
-      this.regenerateClashConfig()
+      this.flushClashConfigRegeneration()
     },
 
     canDeleteClashDnsSuffixRow(this: any, index: number): boolean {
@@ -2699,6 +2955,7 @@ export const SubClashExtMixin = {
 
     insertClashDnsSuffixRow(this: any, index: number) {
       const rows = normalizeClashDnsSuffixRows(this.clashDnsSuffixRows)
+	  if (rows.length >= CLASH_MAX_DNS_SUFFIX_ROWS) return
       const safeIndex = Number.isInteger(index)
         ? Math.max(-1, Math.min(index, rows.length - 1))
         : rows.length - 1
@@ -3184,14 +3441,35 @@ export const SubClashExtMixin = {
           }
         }
 
+        if (dnsConfig['fake-ip-ttl'] !== undefined) {
+          const fakeIpTtl = parseFakeIpTtlSeconds(dnsConfig['fake-ip-ttl'])
+          if (fakeIpTtl == null) {
+            delete dnsConfig['fake-ip-ttl']
+          } else {
+            dnsConfig['fake-ip-ttl'] = fakeIpTtl
+          }
+        }
+
+        const dnsIpv6 = normalizeOptionalBoolean(dnsConfig['ipv6'])
+        if (dnsIpv6 == null) {
+          delete dnsConfig['ipv6']
+        } else {
+          dnsConfig['ipv6'] = dnsIpv6
+        }
+
         const ipv6Timeout = normalizeOptionalNonNegativeInteger(dnsConfig['ipv6-timeout'])
-        if (dnsConfig['ipv6'] === true && ipv6Timeout != null) {
+        if (dnsIpv6 === true && ipv6Timeout != null) {
           dnsConfig['ipv6-timeout'] = ipv6Timeout
         } else {
           delete dnsConfig['ipv6-timeout']
         }
 
-        dnsConfig['prefer-h3'] = normalizeBoolean(dnsConfig['prefer-h3'], false)
+        const preferH3 = normalizeOptionalBoolean(dnsConfig['prefer-h3'])
+        if (preferH3 == null) {
+          delete dnsConfig['prefer-h3']
+        } else {
+          dnsConfig['prefer-h3'] = preferH3
+        }
 
         if (dnsConfig['fallback-filter'] && typeof dnsConfig['fallback-filter'] === 'object' && !Array.isArray(dnsConfig['fallback-filter'])) {
           const fallbackFilter: any = { ...dnsConfig['fallback-filter'] }
@@ -3331,6 +3609,13 @@ export const SubClashExtMixin = {
     onClashRuleSetSourceChanged(this: any) {
       if (this._suspendClashRegeneration) return
       this.ruleSetResolutionRunToken = (this.ruleSetResolutionRunToken || 0) + 1
+	  this._probeAbortController?.abort()
+	  this._probeAbortController = new AbortController()
+	  this._probeBatch?.clear()
+	  if (this._probeDebounceTimer != null && typeof window !== 'undefined') {
+		window.clearTimeout(this._probeDebounceTimer)
+		this._probeDebounceTimer = null
+	  }
       this.clearResolvedClashRuleSetUrlsForGlobalRows()
       this.validateAllClashRuleSetEntries(true)
     },
@@ -3431,53 +3716,124 @@ export const SubClashExtMixin = {
       if (!cleanName) return
       const source = normalizeClashRuleSetSource(sourceContext?.source)
       const sourceBinding: ClashRuleSetSourceBinding = sourceContext?.sourceBinding === 'override' ? 'override' : 'global'
-      const allowFallback = sourceBinding === 'global'
-	  const token = this.ruleSetResolutionRunToken || 0
-	  const currentSource = normalizeClashRuleSetSource(source)
-	  const cacheKey = fromUrl ? '' : getClashRuleSetCacheKey(prefix, cleanName, currentSource, sourceBinding)
-	  void probeSubscriptionRuleSets([{
-	    id: `${sourceBinding}:${prefix}:${cleanName}`,
-	    kind: 'clash',
-	    sourceId: currentSource,
-	    scope: prefix === 'geoip' ? 'ip' : 'domain',
-	    name: fromUrl ? undefined : cleanName,
-	    url: fromUrl ? rawName.trim() : undefined,
-	    allowFallback,
-	  }], this._probeAbortController?.signal).then(([probe]) => {
-	    if (token !== (this.ruleSetResolutionRunToken || 0) || this._probeAbortController?.signal?.aborted) return
-	    if (!probe?.valid) {
-	      if (cacheKey && this.resolvedRuleSetUrls?.[cacheKey]) {
-	        const next = { ...(this.resolvedRuleSetUrls || {}) }
-	        delete next[cacheKey]
-	        this.resolvedRuleSetUrls = next
-	        this.regenerateClashConfig()
-	      }
-	      push.warning({
-	        title: String(i18n.global.t('subscriptionEditor.probeTitle')),
-	        message: String(i18n.global.t('subscriptionEditor.probeFailed', { type: typeLabel, name: cleanName, error: probe?.error || i18n.global.t('subscriptionEditor.unavailable') })),
-	        duration: 4000,
-	      })
-	      return
-	    }
+      const key = `${sourceBinding}:${prefix}:${cleanName}:${source}`
+      this._probeBatch.set(key, { rawName, prefix, typeLabel, source, sourceBinding })
+      if (this._probeDebounceTimer != null && typeof window !== 'undefined') {
+        window.clearTimeout(this._probeDebounceTimer)
+      }
+      const flush = () => {
+        this._probeDebounceTimer = null
+        void this.flushClashRuleSetProbeBatch()
+      }
+      if (typeof window === 'undefined') flush()
+      else this._probeDebounceTimer = window.setTimeout(flush, CLASH_RULE_SET_PROBE_DEBOUNCE_MS)
+    },
 
-	    const matchedSource = probe.sourceId || currentSource
-	    const matchedUrl = probe.url || (fromUrl ? rawName.trim() : '')
-	    push.success({
-	      title: String(i18n.global.t('subscriptionEditor.probeTitle')),
-	      message: allowFallback && currentSource && matchedSource !== currentSource
-	        ? String(i18n.global.t('subscriptionEditor.probeFallback', { type: typeLabel, name: cleanName, source: this.getClashRuleSetSourceTitle(matchedSource) }))
-	        : String(i18n.global.t('subscriptionEditor.probeAvailable', { type: typeLabel, name: cleanName })),
-	      duration: 3000,
-	    })
-	    if (!cacheKey || !matchedUrl) return
-	    const current = this.resolvedRuleSetUrls?.[cacheKey]
-	    if (current?.url === matchedUrl && current?.source === matchedSource) return
-	    this.resolvedRuleSetUrls = {
-	      ...(this.resolvedRuleSetUrls || {}),
-	      [cacheKey]: { url: matchedUrl, source: matchedSource },
-	    }
-	    this.regenerateClashConfig()
-	  })
+    async flushClashRuleSetProbeBatch(this: any) {
+      if (this._probeBatchRunning || !this._probeBatch?.size) return
+      this._probeBatchRunning = true
+      const token = this.ruleSetResolutionRunToken || 0
+      const entries = Array.from(this._probeBatch.values()).slice(0, CLASH_MAX_RULE_PROVIDERS) as ClashRuleSetProbeBatchEntry[]
+      this._probeBatch.clear()
+      try {
+        for (let offset = 0; offset < entries.length; offset += CLASH_RULE_SET_PROBE_BATCH_SIZE) {
+          if (token !== (this.ruleSetResolutionRunToken || 0) || this._probeAbortController?.signal?.aborted) return
+          const chunk = entries.slice(offset, offset + CLASH_RULE_SET_PROBE_BATCH_SIZE)
+          let results: any[]
+          try {
+            results = await probeSubscriptionRuleSets(chunk.map((entry: ClashRuleSetProbeBatchEntry) => {
+            const fromUrl = isHttpRuleSetInput(entry.rawName)
+            const cleanName = fromUrl ? extractRuleSetNameFromUrl(entry.rawName) : normalizeName(entry.rawName)
+            return {
+              id: `${entry.sourceBinding}:${entry.prefix}:${cleanName}`,
+              kind: 'clash' as const,
+              sourceId: entry.source,
+              scope: entry.prefix === 'geoip' ? 'ip' as const : 'domain' as const,
+              name: fromUrl ? undefined : cleanName,
+              url: fromUrl ? entry.rawName.trim() : undefined,
+              allowFallback: entry.sourceBinding === 'global',
+            }
+            }), this._probeAbortController?.signal)
+          } catch (error: any) {
+            if (token !== (this.ruleSetResolutionRunToken || 0) || this._probeAbortController?.signal?.aborted) return
+            push.warning({
+              title: String(i18n.global.t('subscriptionEditor.probeTitle')),
+              message: String(error?.message || i18n.global.t('subscriptionEditor.unavailable')),
+              duration: 4000,
+            })
+            return
+          }
+          if (token !== (this.ruleSetResolutionRunToken || 0) || this._probeAbortController?.signal?.aborted) return
+          let validCount = 0
+          let fallbackCount = 0
+          let firstFailure: { type: string; name: string; error: string } | null = null
+          for (let index = 0; index < results.length; index++) {
+            const probe = results[index]
+            const entry = chunk[index]
+            if (!entry) continue
+            const fromUrl = isHttpRuleSetInput(entry.rawName)
+            const cleanName = fromUrl ? extractRuleSetNameFromUrl(entry.rawName) : normalizeName(entry.rawName)
+            const currentSource = entry.source
+            const allowFallback = entry.sourceBinding === 'global'
+            const cacheKey = fromUrl ? '' : getClashRuleSetCacheKey(entry.prefix, cleanName, currentSource, entry.sourceBinding)
+            if (!probe?.valid) {
+              if (cacheKey && this.resolvedRuleSetUrls?.[cacheKey]) {
+                const next = { ...(this.resolvedRuleSetUrls || {}) }
+                delete next[cacheKey]
+                this.resolvedRuleSetUrls = next
+              }
+              if (!firstFailure) {
+                firstFailure = {
+                  type: entry.typeLabel,
+                  name: cleanName,
+                  error: String(probe?.error || i18n.global.t('subscriptionEditor.unavailable')),
+                }
+              }
+              continue
+            }
+            validCount++
+            const matchedSource = probe.sourceId || currentSource
+            const matchedUrl = probe.url || (fromUrl ? entry.rawName.trim() : '')
+            if (cacheKey && matchedUrl) {
+              const current = this.resolvedRuleSetUrls?.[cacheKey]
+              if (current?.url !== matchedUrl || current?.source !== matchedSource) {
+                this.resolvedRuleSetUrls = { ...(this.resolvedRuleSetUrls || {}), [cacheKey]: { url: matchedUrl, source: matchedSource } }
+              }
+            }
+            if (allowFallback && currentSource && matchedSource !== currentSource) fallbackCount++
+          }
+          if (firstFailure) {
+            push.warning({
+              title: String(i18n.global.t('subscriptionEditor.probeTitle')),
+              message: String(i18n.global.t('subscriptionEditor.probeBatchFailed', {
+                count: chunk.length - validCount,
+                type: firstFailure.type,
+                name: firstFailure.name,
+                error: firstFailure.error,
+              })),
+              duration: 4000,
+            })
+          } else if (fallbackCount > 0) {
+            push.success({
+              title: String(i18n.global.t('subscriptionEditor.probeTitle')),
+              message: String(i18n.global.t('subscriptionEditor.probeBatchFallback', { count: fallbackCount })),
+              duration: 3000,
+            })
+          } else if (validCount > 0) {
+            push.success({
+              title: String(i18n.global.t('subscriptionEditor.probeTitle')),
+              message: String(i18n.global.t('subscriptionEditor.probeBatchAvailable', { count: validCount })),
+              duration: 3000,
+            })
+          }
+        }
+        this.scheduleClashConfigRegeneration()
+      } finally {
+        this._probeBatchRunning = false
+		if (this._probeBatch?.size > 0 && !this._probeAbortController?.signal?.aborted) {
+          void this.flushClashRuleSetProbeBatch()
+        }
+      }
     },
 
     validateNewClashRuleRows(this: any, newRows: any[], oldRows: any[]) {
@@ -3540,6 +3896,9 @@ export const SubClashExtMixin = {
     latencyTestIntervalError(this: any): string {
       return getMihomoLatencyIntervalError(this.latencyTestInterval)
     },
+    ruleProviderIntervalError(this: any): string {
+      return getClashRuleProviderIntervalError(this.updateInterval)
+    },
     latencyToleranceError(this: any): string {
       return getLatencyToleranceMsError(this.latencyTolerance)
     },
@@ -3548,6 +3907,7 @@ export const SubClashExtMixin = {
     },
     editorData(this: any): string {
 	  if (this._parseError) return this._rawSource || ''
+      if (this.formRowsTooLarge) return this._rawSource || ''
       if (!this.metaJson || Object.keys(this.metaJson).length === 0) return ''
 	  return yaml.stringify(this.metaJson)
     },
@@ -3575,7 +3935,7 @@ export const SubClashExtMixin = {
       set(this: any, v: string) { this.updateMetaJson(v || null, 'external-controller') },
     },
     logLevel: {
-      get(this: any) { return this.metaJson['log-level'] ?? 'info' },
+      get(this: any) { return this.metaJson['log-level'] ?? 'silent' },
       set(this: any, v: string) { this.updateMetaJson(v, 'log-level') },
     },
 
@@ -3584,11 +3944,12 @@ export const SubClashExtMixin = {
       get(this: any) { return this.metaJson['tun']?.['enable'] ?? false },
       set(this: any, v: boolean) {
         if (v) {
-          if (!this.metaJson['tun']) {
-            this.updateMetaJson(JSON.parse(JSON.stringify(defaultClashConfig['tun'])), 'tun')
-          } else {
-            this.updateMetaJson({ ...this.metaJson['tun'], enable: true }, 'tun')
-          }
+          const tunDefaults = JSON.parse(JSON.stringify(defaultClashConfig['tun']))
+          const existingTun = this.metaJson['tun']
+          const tunConfig = existingTun && typeof existingTun === 'object' && !Array.isArray(existingTun)
+            ? { ...tunDefaults, ...existingTun, enable: true }
+            : { ...tunDefaults, enable: true }
+          this.updateMetaJson(tunConfig, 'tun')
         } else {
           if (this.metaJson['tun']) {
             this.updateMetaJson({ ...this.metaJson['tun'], enable: false }, 'tun')
@@ -3613,7 +3974,7 @@ export const SubClashExtMixin = {
       },
     },
     tunStrictRoute: {
-      get(this: any) { return this.metaJson['tun']?.['strict-route'] ?? false },
+      get(this: any) { return this.metaJson['tun']?.['strict-route'] ?? true },
       set(this: any, v: boolean) {
         if (this.metaJson['tun']) {
           this.updateMetaJson({ ...this.metaJson['tun'], 'strict-route': v }, 'tun')
@@ -3727,11 +4088,12 @@ export const SubClashExtMixin = {
       get(this: any) { return this.metaJson['dns']?.['enable'] ?? false },
       set(this: any, v: boolean) {
         if (v) {
-          if (!this.metaJson['dns']) {
-            this.updateMetaJson(JSON.parse(JSON.stringify(defaultClashConfig['dns'])), 'dns')
-          } else {
-            this.updateMetaJson({ ...this.metaJson['dns'], enable: true }, 'dns')
-          }
+          const dnsDefaults = JSON.parse(JSON.stringify(defaultClashConfig['dns']))
+          const existingDns = this.metaJson['dns']
+          const dnsConfig = existingDns && typeof existingDns === 'object' && !Array.isArray(existingDns)
+            ? { ...dnsDefaults, ...existingDns, enable: true }
+            : { ...dnsDefaults, enable: true }
+          this.updateMetaJson(dnsConfig, 'dns')
         } else {
           if (this.metaJson['dns']) {
             this.updateMetaJson({ ...this.metaJson['dns'], enable: false }, 'dns')
@@ -3740,11 +4102,17 @@ export const SubClashExtMixin = {
       },
     },
     dnsIpv6: {
-      get(this: any) { return this.metaJson['dns']?.['ipv6'] ?? false },
-      set(this: any, v: boolean) {
+      get(this: any) { return normalizeOptionalBoolean(this.metaJson['dns']?.['ipv6']) },
+      set(this: any, v: boolean | null) {
         if (this.metaJson['dns']) {
-          const dnsConfig: any = { ...this.metaJson['dns'], ipv6: v }
-          if (v !== true) {
+          const dnsConfig: any = { ...this.metaJson['dns'] }
+          const value = normalizeOptionalBoolean(v)
+          if (value == null) {
+            delete dnsConfig['ipv6']
+          } else {
+            dnsConfig['ipv6'] = value
+          }
+          if (value !== true) {
             delete dnsConfig['ipv6-timeout']
           }
           this.updateMetaJson(dnsConfig, 'dns')
@@ -4037,10 +4405,19 @@ export const SubClashExtMixin = {
       },
     },
     dnsPreferH3: {
-      get(this: any) { return this.metaJson['dns']?.['prefer-h3'] ?? false },
-      set(this: any, v: boolean) {
+      get(this: any) {
+        return normalizeOptionalBoolean(this.metaJson['dns']?.['prefer-h3'])
+      },
+      set(this: any, v: boolean | null) {
         if (this.metaJson['dns']) {
-          this.updateMetaJson({ ...this.metaJson['dns'], 'prefer-h3': v }, 'dns')
+          const dnsConfig: any = { ...this.metaJson['dns'] }
+          const value = normalizeOptionalBoolean(v)
+          if (value == null) {
+            delete dnsConfig['prefer-h3']
+          } else {
+            dnsConfig['prefer-h3'] = value
+          }
+          this.updateMetaJson(dnsConfig, 'dns')
         }
       },
     },
@@ -4059,7 +4436,7 @@ export const SubClashExtMixin = {
     },
     // ===== Mihomo-Specific Settings =====
     unifiedDelay: {
-      get(this: any) { return this.metaJson['unified-delay'] ?? false },
+      get(this: any) { return this.metaJson['unified-delay'] ?? true },
       set(this: any, v: boolean) { this.updateMetaJson(v, 'unified-delay') },
     },
     tcpConcurrent: {
@@ -4071,14 +4448,14 @@ export const SubClashExtMixin = {
       set(this: any, v: string) { this.updateMetaJson(v, 'find-process-mode') },
     },
     storeSelected: {
-      get(this: any) { return this.metaJson['profile']?.['store-selected'] ?? false },
+      get(this: any) { return this.metaJson['profile']?.['store-selected'] ?? true },
       set(this: any, v: boolean) {
         const profile = this.metaJson['profile'] ?? {}
         this.updateMetaJson({ ...profile, 'store-selected': v }, 'profile')
       },
     },
     storeFakeIp: {
-      get(this: any) { return this.metaJson['profile']?.['store-fake-ip'] ?? false },
+      get(this: any) { return this.metaJson['profile']?.['store-fake-ip'] ?? true },
       set(this: any, v: boolean) {
         const profile = this.metaJson['profile'] ?? {}
         this.updateMetaJson({ ...profile, 'store-fake-ip': v }, 'profile')

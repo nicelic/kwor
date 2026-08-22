@@ -59,9 +59,14 @@ func (s *MihomoSyncService) SyncClientToSubManager(clientName string, hostname s
 		return nil, err
 	}
 
-	markLastUpdate(time.Now().Unix())
+	// Managed Mihomo clients update shared sub-manager rows, so notify both
+	// stores while keeping ordinary Mihomo config saves isolated.
+	markBothLastUpdates(time.Now().Unix())
 	if err := RunManagedRuntimeHookScope(tx); err != nil {
-		return nil, err
+		// The transaction has already committed. Keep the result so the API can
+		// preserve the automatic-sync marker even when post-commit validation
+		// reports an error.
+		return result, err
 	}
 
 	return result, nil
@@ -592,22 +597,21 @@ func (s *MihomoSyncService) canReuseLegacyInboundTag(db *gorm.DB, clientID uint,
 		return false
 	}
 
-	condition := "EXISTS (SELECT 1 FROM json_each(mihomo_clients.inbounds) WHERE json_each.value = ?)"
-	var ownCount int64
-	if err := db.Table("mihomo_clients").Where("id = ? AND "+condition, clientID, inboundID).Count(&ownCount).Error; err != nil {
-		logger.Warningf("[MihomoSync] failed to verify inbound ownership for id=%d: %v", inboundID, err)
+	var clients []model.MihomoClient
+	if err := db.Model(model.MihomoClient{}).Select("id", "inbounds").Find(&clients).Error; err != nil {
+		logger.Warningf("[MihomoSync] failed to load inbound owners for id=%d: %v", inboundID, err)
 		return false
 	}
-	if ownCount == 0 {
+	clients = filterMihomoClientsBoundToInboundIDs(clients, []uint{inboundID})
+	if len(clients) == 0 {
 		return false
 	}
-
-	var count int64
-	if err := db.Table("mihomo_clients").Where(condition, inboundID).Count(&count).Error; err != nil {
-		logger.Warningf("[MihomoSync] failed to count inbound owners for id=%d: %v", inboundID, err)
-		return false
+	for _, client := range clients {
+		if client.Id == clientID {
+			return len(clients) <= 1
+		}
 	}
-	return count <= 1
+	return false
 }
 
 func (s *MihomoSyncService) findClientManagedSubOutbound(db *gorm.DB, clientID uint, inboundID uint) (*model.SubOutbound, error) {
@@ -643,9 +647,9 @@ func (s *MihomoSyncService) buildSyncedOutbound(
 	}
 	isShadowQUIC := strings.EqualFold(strings.TrimSpace(inbound.Type), "shadowquic")
 
-	// ShadowQUIC listener options are the source of its shared client fields.
-	// Refresh on every subscription sync so stale templates cannot reintroduce
-	// server-owned values that were later disabled in the inbound editor.
+	// ShadowQUIC listener options are the source of fields shared with client
+	// configuration. Refresh on every subscription sync so stale templates
+	// cannot reintroduce server-owned values that were later disabled.
 	if isShadowQUIC {
 		previousOutJSON := append(json.RawMessage(nil), inbound.OutJson...)
 		if len(inbound.OutJson) == 0 {

@@ -36,7 +36,7 @@ func (s *InboundService) Get(ids string) (*[]map[string]interface{}, error) {
 
 func (s *InboundService) getById(ids string) (*[]map[string]interface{}, error) {
 	var inbound []model.Inbound
-	var result []map[string]interface{}
+	result := make([]map[string]interface{}, 0, len(inbound))
 	db := database.GetDB()
 	err := db.Model(model.Inbound{}).Where("id in ?", strings.Split(ids, ",")).Scan(&inbound).Error
 	if err != nil {
@@ -72,7 +72,7 @@ func (s *InboundService) GetOutJsonIPs(ids string) ([]map[string]interface{}, er
 		}
 	}
 
-	var result []map[string]interface{}
+	result := make([]map[string]interface{}, 0, len(inbounds))
 	for _, inbound := range inbounds {
 		if len(inbound.OutJson) < 5 {
 			continue
@@ -106,7 +106,8 @@ func (s *InboundService) GetAll() (*[]map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	var data []map[string]interface{}
+	data := make([]map[string]interface{}, 0, len(inbounds))
+	userDataIndexes := make(map[uint]int)
 	for _, inbound := range inbounds {
 		var shadowtlsVersion uint
 		routeTag := deriveEffectiveInboundRouteTagFromRaw(inbound.Tag, inbound.Type, inbound.Options)
@@ -124,6 +125,11 @@ func (s *InboundService) GetAll() (*[]map[string]interface{}, error) {
 			}
 			inbData["listen"] = restFields["listen"]
 			inbData["listen_port"] = restFields["listen_port"]
+			if inbound.Type == "hysteria" || inbound.Type == "hysteria2" {
+				if portHopRange := extractPortHopRange(inbound.Options); portHopRange != "" {
+					inbData["port_hop_range"] = portHopRange
+				}
+			}
 			if inbound.Type == "shadowtls" {
 				var rawVersion interface{}
 				if json.Unmarshal(restFields["version"], &rawVersion) == nil {
@@ -136,15 +142,45 @@ func (s *InboundService) GetAll() (*[]map[string]interface{}, error) {
 		userManagement := buildSingboxInboundUserManagement(inbound.Type, shadowtlsVersion)
 		inbData["user_management"] = userManagement
 		if userManagement.Selectable {
-			users := []string{}
-			err = db.Raw("SELECT clients.name FROM clients, json_each(clients.inbounds) as je WHERE je.value = ?", inbound.Id).Scan(&users).Error
-			if err != nil {
-				return nil, err
-			}
-			inbData["users"] = users
+			// Fill users in one query after the inbound list is assembled. Running a
+			// json_each query for every card is especially costly with SQLite's
+			// single connection and a frequently refreshed inbound page.
+			inbData["users"] = []string{}
+			userDataIndexes[inbound.Id] = len(data)
 		}
 
 		data = append(data, inbData)
+	}
+	if len(userDataIndexes) == 0 {
+		return &data, nil
+	}
+
+	userInboundIDs := make([]uint, 0, len(userDataIndexes))
+	for inboundID := range userDataIndexes {
+		userInboundIDs = append(userInboundIDs, inboundID)
+	}
+	type inboundUserAssignment struct {
+		InboundID uint   `gorm:"column:inbound_id"`
+		Name      string `gorm:"column:name"`
+	}
+	assignments := make([]inboundUserAssignment, 0)
+	err = db.Raw(`
+		SELECT CAST(je.value AS INTEGER) AS inbound_id, clients.name AS name
+		FROM clients
+		JOIN json_each(clients.inbounds) AS je
+		WHERE CAST(je.value AS INTEGER) IN ?
+		ORDER BY CAST(je.value AS INTEGER), clients.name COLLATE NOCASE
+	`, userInboundIDs).Scan(&assignments).Error
+	if err != nil {
+		return nil, err
+	}
+	for _, assignment := range assignments {
+		dataIndex, ok := userDataIndexes[assignment.InboundID]
+		if !ok {
+			continue
+		}
+		users, _ := data[dataIndex]["users"].([]string)
+		data[dataIndex]["users"] = append(users, assignment.Name)
 	}
 	return &data, nil
 }
@@ -170,18 +206,27 @@ func (s *InboundService) Save(tx *gorm.DB, act string, data json.RawMessage, ini
 		if err != nil {
 			return nil, err
 		}
+		if err := validateSingboxInboundPayload(data, &inbound, act); err != nil {
+			return nil, err
+		}
+		if err := sanitizeSingboxHysteriaPortHop(&inbound); err != nil {
+			return nil, err
+		}
 		if inbound.TlsId > 0 {
-			err = tx.Model(model.Tls{}).Where("id = ?", inbound.TlsId).Find(&inbound.Tls).Error
+			err = tx.Model(model.Tls{}).Where("id = ?", inbound.TlsId).Take(&inbound.Tls).Error
 			if err != nil {
 				return nil, err
 			}
 		}
 		var oldTag string
+		var previousRuntimeTags []string
 		if act == "edit" {
-			err = tx.Model(model.Inbound{}).Select("tag").Where("id = ?", inbound.Id).Find(&oldTag).Error
-			if err != nil {
+			var previous model.Inbound
+			if err = tx.Where("id = ?", inbound.Id).First(&previous).Error; err != nil {
 				return nil, err
 			}
+			oldTag = previous.Tag
+			previousRuntimeTags = singboxRouteInboundReferenceTags(&previous)
 		}
 
 		err = util.FillOutJson(&inbound, hostname)
@@ -192,6 +237,15 @@ func (s *InboundService) Save(tx *gorm.DB, act string, data json.RawMessage, ini
 		err = tx.Save(&inbound).Error
 		if err != nil {
 			return nil, err
+		}
+		if err := validateSingboxStoredRuntimeInboundTags(tx); err != nil {
+			return nil, err
+		}
+		removedRuntimeTags := removedSingboxRuntimeTags(previousRuntimeTags, singboxRouteInboundReferenceTags(&inbound))
+		if len(removedRuntimeTags) > 0 {
+			if err := validateSingboxInboundRemovalReferences(tx, removedRuntimeTags); err != nil {
+				return nil, err
+			}
 		}
 
 		switch act {
@@ -216,17 +270,17 @@ func (s *InboundService) Save(tx *gorm.DB, act string, data json.RawMessage, ini
 		if err != nil {
 			return nil, err
 		}
-		var id uint
-		err = tx.Model(model.Inbound{}).Select("id").Where("tag = ?", tag).Scan(&id).Error
-		if err != nil {
+		var existing model.Inbound
+		if err = tx.Where("tag = ?", tag).First(&existing).Error; err != nil {
 			return nil, err
 		}
-		err = s.ClientService.UpdateClientsOnInboundDelete(tx, id, tag)
+		removedRuntimeTags := singboxRouteInboundReferenceTags(&existing)
+		err = s.ClientService.UpdateClientsOnInboundDelete(tx, existing.Id, tag)
 		if err != nil {
 			return nil, err
 		}
 		var syncSvc SyncService
-		if err := syncSvc.CleanupSubOutboundsByInboundID(tx, subOutboundSourceClient, id); err != nil {
+		if err := syncSvc.CleanupSubOutboundsByInboundID(tx, subOutboundSourceClient, existing.Id); err != nil {
 			return nil, err
 		}
 
@@ -234,9 +288,12 @@ func (s *InboundService) Save(tx *gorm.DB, act string, data json.RawMessage, ini
 		if err != nil {
 			return nil, err
 		}
+		if err := validateSingboxInboundRemovalReferences(tx, removedRuntimeTags); err != nil {
+			return nil, err
+		}
 		nftAction = &InboundNftAction{
 			Kind:      "remove",
-			InboundID: id,
+			InboundID: existing.Id,
 			Tag:       tag,
 		}
 	default:

@@ -24,14 +24,77 @@ func normalizeMihomoOutboundRawPayload(data json.RawMessage) json.RawMessage {
 	}
 
 	delete(payload, "id")
-	if outboundType, _ := payload["type"].(string); strings.EqualFold(strings.TrimSpace(outboundType), "shadowquic") {
+	outboundType, _ := payload["type"].(string)
+	outboundType = strings.ToLower(strings.TrimSpace(outboundType))
+	stripUnsupportedMihomoFastOpenFields(payload, outboundType)
+	stripUnsupportedMihomoTLSFields(payload)
+	normalizeMihomoHysteriaOutboundFields(payload, outboundType)
+	stripUnsupportedMihomoManualOutboundFields(payload, outboundType)
+	sanitizeMihomoOutboundRoutingMark(payload)
+	sanitizeMihomoGRPCNumericFields(payload)
+	sanitizeMihomoMultiplexFields(payload, "multiplex")
+	if ssConfig, ok := payload["ss_config"].(map[string]interface{}); ok && ssConfig != nil {
+		sanitizeMihomoMultiplexFields(ssConfig, "multiplex")
+	}
+	if outboundType == "hysteria2" {
+		util.EnsureHysteria2MihomoReceiveWindows(payload)
+		sanitizeMihomoHysteria2ClientReceiveWindows(payload)
+	} else {
+		delete(payload, "mihomo_hy2")
+	}
+	if outboundType == "shadowquic" {
 		util.SanitizeMihomoShadowQUICOutbound(payload)
+	}
+	if outboundType == "trusttunnel" {
+		if tls, ok := payload["tls"].(map[string]interface{}); ok && tls != nil {
+			delete(tls, "reality")
+			delete(tls, "ech")
+		}
 	}
 	normalized, err := json.Marshal(payload)
 	if err != nil {
 		return append(json.RawMessage(nil), data...)
 	}
 	return normalized
+}
+
+func normalizeMihomoHysteriaOutboundFields(payload map[string]interface{}, outboundType string) {
+	if outboundType != "hysteria" && outboundType != "hysteria2" {
+		return
+	}
+
+	for canonicalKey, legacyKey := range map[string]string{
+		"up_mbps":   "server_up_mbps",
+		"down_mbps": "server_down_mbps",
+	} {
+		legacyValue, exists := payload[legacyKey]
+		if !exists {
+			continue
+		}
+		if normalized, ok := toInt(legacyValue); ok && normalized >= 0 {
+			// These server_* keys were mistakenly written by the shared outbound
+			// editor. They have no Mihomo proxy meaning, so preserve the user's
+			// bandwidth choice under the actual outbound keys.
+			payload[canonicalKey] = normalized
+		}
+		delete(payload, legacyKey)
+	}
+
+	if outboundType == "hysteria" {
+		delete(payload, "network")
+	}
+}
+
+func stripUnsupportedMihomoManualOutboundFields(payload map[string]interface{}, outboundType string) {
+	switch outboundType {
+	case "socks", "socks5":
+		delete(payload, "version")
+		delete(payload, "udp_over_tcp")
+	case "http":
+		delete(payload, "path")
+	case "vmess", "vless", "trojan", "hysteria2", "tuic":
+		delete(payload, "network")
+	}
 }
 
 func resolveMihomoOutboundJSON(outbound *model.MihomoOutbound) ([]byte, error) {
@@ -42,7 +105,7 @@ func resolveMihomoOutboundJSON(outbound *model.MihomoOutbound) ([]byte, error) {
 	if len(outbound.RawOutbound) > 0 {
 		var payload map[string]interface{}
 		if err := json.Unmarshal(outbound.RawOutbound, &payload); err == nil && payload != nil {
-			return append(json.RawMessage(nil), outbound.RawOutbound...), nil
+			return normalizeMihomoOutboundRawPayload(outbound.RawOutbound), nil
 		}
 	}
 
@@ -86,7 +149,7 @@ func (s *MihomoOutboundService) GetAll() (*[]map[string]interface{}, error) {
 		return nil, err
 	}
 
-	var data []map[string]interface{}
+	data := make([]map[string]interface{}, 0, len(outbounds))
 	for _, outbound := range outbounds {
 		outboundJSON, err := resolveMihomoOutboundJSON(outbound)
 		if err != nil {
@@ -247,36 +310,37 @@ func (s *MihomoOutboundService) Save(tx *gorm.DB, act string, data json.RawMessa
 		if err := outbound.UnmarshalJSON(data); err != nil {
 			return err
 		}
+		if act == "new" {
+			// Do not allow a cloned editor payload to turn a create into an
+			// overwrite through GORM Save.
+			outbound.Id = 0
+		} else if outbound.Id == 0 {
+			return common.NewError("mihomo outbound id is required for edit")
+		}
 		incomingRaw := normalizeMihomoOutboundRawPayload(data)
 		outbound.RawOutbound = incomingRaw
 		outbound.RawClashYAML = nil
 		oldTag := ""
-		if act == "edit" && len(outbound.RawOutbound) > 0 {
+		if act == "edit" {
 			var existing model.MihomoOutbound
-			query := tx.Model(model.MihomoOutbound{})
-			if outbound.Id != 0 {
-				query = query.Where("id = ?", outbound.Id)
-			} else {
-				query = query.Where("tag = ?", outbound.Tag)
-			}
-			if err := query.Take(&existing).Error; err == nil {
-				oldTag = strings.TrimSpace(existing.Tag)
-				if existing.Type == outbound.Type && !strings.EqualFold(strings.TrimSpace(outbound.Type), "shadowquic") {
-					if baseRaw, resolveErr := resolveMihomoOutboundJSON(&existing); resolveErr == nil {
-						outbound.RawOutbound = mergeEditableOutboundRawPayload(baseRaw, data, "mihomo", outbound.Type)
-					}
-					outbound.RawOutbound = preserveExistingMihomoImportedRawProxy(outbound.RawOutbound, existing.RawOutbound)
-				}
-				if len(outbound.RawOutbound) == 0 {
-					outbound.RawOutbound = incomingRaw
-				}
-			} else if !database.IsNotFound(err) {
+			if err := tx.Model(model.MihomoOutbound{}).Where("id = ?", outbound.Id).Take(&existing).Error; err != nil {
 				return err
+			}
+			oldTag = strings.TrimSpace(existing.Tag)
+			if len(outbound.RawOutbound) > 0 && existing.Type == outbound.Type && !strings.EqualFold(strings.TrimSpace(outbound.Type), "shadowquic") {
+				if baseRaw, resolveErr := resolveMihomoOutboundJSON(&existing); resolveErr == nil {
+					outbound.RawOutbound = mergeEditableOutboundRawPayload(baseRaw, data, "mihomo", outbound.Type)
+				}
+				outbound.RawOutbound = preserveExistingMihomoImportedRawProxy(outbound.RawOutbound, existing.RawOutbound)
+			}
+			if len(outbound.RawOutbound) == 0 {
+				outbound.RawOutbound = incomingRaw
 			}
 		}
 		if len(outbound.RawOutbound) == 0 {
 			outbound.RawOutbound = incomingRaw
 		}
+		outbound.RawOutbound = normalizeMihomoOutboundRawPayload(outbound.RawOutbound)
 		outbound.RawOutbound = sanitizeMihomoShadowQUICOutboundRaw(outbound.RawOutbound, outbound.Type)
 		if strings.EqualFold(strings.TrimSpace(outbound.Type), "shadowquic") {
 			shadowQUICRaw := map[string]interface{}{}
@@ -291,6 +355,12 @@ func (s *MihomoOutboundService) Save(tx *gorm.DB, act string, data json.RawMessa
 			return err
 		}
 		if oldTag != "" && oldTag != strings.TrimSpace(outbound.Tag) {
+			if err := replaceMihomoOutboundTagInPanelGroups(tx, oldTag, outbound.Tag); err != nil {
+				return err
+			}
+			if err := validateMihomoOutboundRemovalReferences(tx, []string{oldTag}, nil, nil); err != nil {
+				return err
+			}
 			return replaceMihomoShadowQUICJLSProxyReferences(tx, oldTag, outbound.Tag)
 		}
 		return nil
@@ -300,12 +370,11 @@ func (s *MihomoOutboundService) Save(tx *gorm.DB, act string, data json.RawMessa
 			return err
 		}
 		tag = strings.TrimSpace(tag)
-		inboundTags, err := findMihomoShadowQUICJLSProxyInboundTags(tx, tag)
-		if err != nil {
+		if err := removeMihomoOutboundTagFromPanelGroups(tx, tag); err != nil {
 			return err
 		}
-		if len(inboundTags) > 0 {
-			return common.NewErrorf("cannot delete mihomo outbound %q: referenced by shadowquic inbound(s): %s", tag, strings.Join(inboundTags, ", "))
+		if err := validateMihomoOutboundRemovalReferences(tx, []string{tag}, nil, []string{tag}); err != nil {
+			return err
 		}
 		return tx.Where("tag = ?", tag).Delete(model.MihomoOutbound{}).Error
 	default:

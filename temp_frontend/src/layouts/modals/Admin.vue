@@ -1,5 +1,11 @@
 <template>
-  <v-dialog transition="dialog-bottom-transition" width="400">
+  <v-dialog
+    :model-value="visible"
+    transition="dialog-bottom-transition"
+    width="400"
+    max-width="calc(100vw - 24px)"
+    @update:model-value="updateDialog"
+  >
     <v-card class="rounded-lg">
       <v-card-title>
         {{ $t('admin.changeCred') + " " + user.username }}
@@ -47,7 +53,7 @@
 import { i18n } from '@/locales'
 
 export default {
-  props: ['visible', 'user'],
+  props: ['visible', 'user', 'modelValue'],
   data() {
     return {
       newData: {
@@ -71,6 +77,10 @@ export default {
     }
   },
   methods: {
+    updateDialog(value: boolean) {
+      this.$emit('update:modelValue', value)
+      if (!value) this.$emit('close')
+    },
     resetData() {
       this.newData.id = this.$props.user.id
       this.newData.oldPass = ""

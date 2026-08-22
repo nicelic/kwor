@@ -1,11 +1,12 @@
 <template>
-  <v-dialog transition="dialog-bottom-transition" width="800">
-    <v-card class="rounded-lg">
+  <v-dialog transition="dialog-bottom-transition" width="800" :persistent="loading">
+    <v-card class="rounded-lg" :loading="loading">
       <v-card-title>
         {{ $t('actions.' + title) + " " + $t('objects.service') }}
       </v-card-title>
       <v-divider></v-divider>
       <v-card-text style="padding: 0 16px; overflow-y: scroll;">
+        <div :style="{ pointerEvents: loading ? 'none' : 'auto' }" :aria-busy="loading">
         <v-row>
           <v-col cols="12" sm="6" md="4">
             <v-select
@@ -13,11 +14,12 @@
             :label="$t('type')"
             :items="Object.keys(srvTypes).map((key,index) => ({title: key, value: Object.values(srvTypes)[index]}))"
             v-model="srv.type"
+            :disabled="loading"
             @update:modelValue="changeType">
             </v-select>
           </v-col>
           <v-col cols="12" sm="6" md="4">
-            <v-text-field v-model="srv.tag" :label="$t('objects.tag')" hide-details></v-text-field>
+            <v-text-field v-model="srv.tag" :label="$t('objects.tag')" hide-details :disabled="loading"></v-text-field>
           </v-col>
         </v-row>
 
@@ -25,12 +27,14 @@
         <Derp v-if="srv.type == srvTypes.DERP" :data="srv" :inTags="inTags" :tsTags="tsTags" />
         <SSMapi v-if="srv.type == srvTypes.SSMAPI" :data="srv" :ssTags="ssTags" />
         <InTLS v-if="HasTls.includes(srv.type)"  :inbound="srv" :tlsConfigs="tlsConfigs" :tls_id="srv.tls_id" />
+        </div>
       </v-card-text>
       <v-card-actions>
         <v-spacer></v-spacer>
         <v-btn
           color="primary"
           variant="outlined"
+          :disabled="loading"
           @click="closeModal"
         >
           {{ $t('actions.close') }}
@@ -39,6 +43,7 @@
           color="primary"
           variant="tonal"
           :loading="loading"
+          :disabled="loading"
           @click="saveChanges"
         >
           {{ $t('actions.save') }}
@@ -88,6 +93,7 @@ export default {
       this.tab = "t1"
     },
     changeType() {
+      if (this.loading) return
       // Tag change only in add service
       const tag = this.$props.id > 0 ? this.srv.tag : this.srv.type + "-" + RandomUtil.randomSeq(3)
       // Use previous data
@@ -95,11 +101,14 @@ export default {
       this.srv = createSrv(this.srv.type, prevConfig)
     },
     closeModal() {
-      this.updateData(0) // reset
+      if (this.loading) return
+      this.srv = createSrv("derp", { tag: "" })
+      this.title = "add"
+      this.tab = "t1"
       this.$emit('close')
     },
     async saveChanges() {
-      if (!this.$props.visible) return
+      if (!this.$props.visible || this.loading) return
 
       // check duplicate tag
       const isDuplicatedTag = Data().checkTag("service",this.srv.id, this.srv.tag)
@@ -109,7 +118,10 @@ export default {
       this.loading = true
       try {
         const success = await Data().save("services", this.$props.id == 0 ? "new" : "edit", this.srv)
-        if (success) this.closeModal()
+        if (success) {
+          this.loading = false
+          this.closeModal()
+        }
       } finally {
         this.loading = false
       }

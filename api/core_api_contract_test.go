@@ -109,8 +109,8 @@ func TestCoreRequestContracts(t *testing.T) {
 
 	t.Run("sing-box update settings parse auto update switch", func(t *testing.T) {
 		form := url.Values{
+			"action":              {"auto_update"},
 			"enabled":             {"true"},
-			"interval":            {"6"},
 			"auto_update_enabled": {"1"},
 		}
 		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -120,16 +120,15 @@ func TestCoreRequestContracts(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse sing-box update settings: %v", err)
 		}
-		if !request.Enabled || request.IntervalHours != 6 || !request.HasAutoUpdate || !request.AutoUpdate {
+		if request.Action != "auto_update" || !request.Enabled || request.IntervalHours != 0 || !request.HasAutoUpdate || !request.AutoUpdate {
 			t.Fatalf("unexpected sing-box update settings request: %+v", request)
 		}
 	})
 
 	t.Run("Mihomo update settings parse auto update switch", func(t *testing.T) {
 		form := url.Values{
-			"enabled":             {"true"},
-			"interval":            {"8"},
-			"auto_update_enabled": {"true"},
+			"action":   {"interval"},
+			"interval": {"8"},
 		}
 		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 		ctx.Request = httptest.NewRequest("POST", "/", strings.NewReader(form.Encode()))
@@ -138,8 +137,26 @@ func TestCoreRequestContracts(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse Mihomo update settings: %v", err)
 		}
-		if !request.Enabled || request.IntervalHours != 8 || !request.HasAutoUpdate || !request.AutoUpdate {
+		if request.Action != "interval" || request.Enabled || request.IntervalHours != 8 || request.HasAutoUpdate || request.AutoUpdate {
 			t.Fatalf("unexpected Mihomo update settings request: %+v", request)
+		}
+	})
+
+	t.Run("legacy combined update settings request remains supported", func(t *testing.T) {
+		form := url.Values{
+			"enabled":             {"true"},
+			"interval":            {"12"},
+			"auto_update_enabled": {"true"},
+		}
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest("POST", "/", strings.NewReader(form.Encode()))
+		ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request, err := parseSingboxCoreUpdateSettingsRequest(ctx)
+		if err != nil {
+			t.Fatalf("parse legacy sing-box update settings: %v", err)
+		}
+		if request.Action != "" || !request.Enabled || request.IntervalHours != 12 || !request.HasAutoUpdate || !request.AutoUpdate {
+			t.Fatalf("unexpected legacy sing-box update settings request: %+v", request)
 		}
 	})
 }

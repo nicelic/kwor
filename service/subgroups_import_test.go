@@ -11,6 +11,76 @@ import (
 	"github.com/alireza0/s-ui/database/model"
 )
 
+func TestConvertClashProxyToSubOutboundPreservesMihomoHiddenFields(t *testing.T) {
+	tuic, ok := convertClashProxyToSubOutbound(map[string]interface{}{
+		"name":                      "tuic-hidden",
+		"type":                      "tuic",
+		"server":                    "example.com",
+		"port":                      443,
+		"token":                     "token-value",
+		"request-timeout":           1500,
+		"max-open-streams":          32,
+		"max-udp-relay-packet-size": 1350,
+		"cwnd":                      128,
+		"udp-over-stream-version":   2,
+		"max-datagram-frame-size":   1400,
+		"ip":                        "192.0.2.10",
+		"udp-over-stream":           true,
+		"disable-mtu-discovery":     true,
+	})
+	if !ok || tuic == nil {
+		t.Fatalf("expected TUIC proxy conversion")
+	}
+	for key, want := range map[string]interface{}{
+		"token":                     "token-value",
+		"request_timeout":           "1500ms",
+		"max_open_streams":          32,
+		"max_udp_relay_packet_size": 1350,
+		"cwnd":                      128,
+		"udp_over_stream_version":   2,
+		"max_datagram_frame_size":   1400,
+		"ip":                        "192.0.2.10",
+		"udp_over_stream":           true,
+		"disable_mtu_discovery":     true,
+	} {
+		if got := tuic[key]; got != want {
+			t.Fatalf("TUIC %s = %#v, want %#v", key, got, want)
+		}
+	}
+
+	hy2, ok := convertClashProxyToSubOutbound(map[string]interface{}{
+		"name":                              "hy2-hidden",
+		"type":                              "hysteria2",
+		"server":                            "example.com",
+		"port":                              443,
+		"initial-stream-receive-window":     38000000,
+		"max-stream-receive-window":         70000000,
+		"initial-connection-receive-window": 120000000,
+		"max-connection-receive-window":     150000000,
+		"fast-open":                         true,
+	})
+	if !ok || hy2 == nil {
+		t.Fatalf("expected Hysteria2 proxy conversion")
+	}
+	windows, ok := hy2["mihomo_hy2"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected Hysteria2 mihomo_hy2 map, got %#v", hy2["mihomo_hy2"])
+	}
+	for key, want := range map[string]interface{}{
+		"initial_stream_receive_window":     38000000,
+		"max_stream_receive_window":         70000000,
+		"initial_connection_receive_window": 120000000,
+		"max_connection_receive_window":     150000000,
+	} {
+		if got := windows[key]; got != want {
+			t.Fatalf("Hysteria2 %s = %#v, want %#v", key, got, want)
+		}
+	}
+	if got, _ := hy2["mihomo_fast_open"].(bool); !got {
+		t.Fatalf("expected Hysteria2 mihomo_fast_open=true, got %#v", hy2["mihomo_fast_open"])
+	}
+}
+
 func TestExtractProxyOutboundsInjectsCertificateStoreToTLS(t *testing.T) {
 	jsonData := []byte(`{
 		"certificate": {"store":"mozilla"},

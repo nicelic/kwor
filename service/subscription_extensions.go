@@ -16,7 +16,22 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const SubscriptionExtensionMaxBytes = 4 * 1024 * 1024
+const (
+	// Subscription extensions are parsed and rendered for every uncached
+	// subscription request. Keep the stored source small enough that a burst of
+	// different subscription requests cannot create an excessive heap peak.
+	SubscriptionExtensionMaxBytes      = 4 * 1024 * 1024
+	SubscriptionClashExtensionMaxBytes = 1 * 1024 * 1024
+
+	SubscriptionClashLatencyTestMinIntervalSeconds  = 30
+	SubscriptionClashRuleProviderMinIntervalSeconds = 60 * 60
+	SubscriptionClashMaxRuleProviders               = 128
+	SubscriptionClashMaxRules                       = 2048
+	SubscriptionClashMaxEditorRuleRows              = 64
+	SubscriptionClashMaxEditorRowValues             = 24
+	SubscriptionClashMaxEditorDNSRows               = 64
+	SubscriptionClashMaxEditorDNSSuffixRows         = 32
+)
 
 const SubscriptionJSONBaseConfig = `{
   "inbounds": [
@@ -42,21 +57,37 @@ const SubscriptionJSONBaseConfig = `{
 const SubscriptionClashBaseConfig = `mixed-port: 7890
 allow-lan: false
 mode: rule
-log-level: info
+ipv6: true
+log-level: silent
 external-controller: 127.0.0.1:9090
+unified-delay: true
+profile:
+  store-selected: true
+  store-fake-ip: true
 tun:
   enable: true
-  stack: system
+  stack: mixed
   auto-route: true
+  strict-route: true
   auto-detect-interface: true
+  recvmsgx: true
+  sendmsgx: true
+  inet4-address:
+    - 198.18.0.1/30
+  inet6-address:
+    - fdfe:dcba:9876::1/126
+  mtu: 1500
   dns-hijack:
     - any:53
 dns:
   enable: true
   ipv6: false
+  prefer-h3: true
   use-system-hosts: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/15
+  fake-ip-range6: fc00::/18
+  fake-ip-ttl: 60
   default-nameserver:
     - udp://223.5.5.5
     - udp://223.6.6.6
@@ -173,11 +204,8 @@ func CanonicalSubClashExtension() string {
 }
 
 func NormalizeSubscriptionExtension(key string, raw string) (string, error) {
-	if !utf8.ValidString(raw) {
-		return "", common.NewError("订阅扩展必须是有效的 UTF-8 文本")
-	}
-	if len([]byte(raw)) > SubscriptionExtensionMaxBytes {
-		return "", common.NewErrorf("%s 超过 %d 字节限制", key, SubscriptionExtensionMaxBytes)
+	if err := ValidateSubscriptionExtensionSource(key, raw); err != nil {
+		return "", err
 	}
 	if strings.TrimSpace(raw) == "" {
 		return "", nil
@@ -193,7 +221,24 @@ func NormalizeSubscriptionExtension(key string, raw string) (string, error) {
 	}
 }
 
+func ValidateSubscriptionExtensionSource(key string, raw string) error {
+	if !utf8.ValidString(raw) {
+		return common.NewError("订阅扩展必须是有效的 UTF-8 文本")
+	}
+	maximumBytes := SubscriptionExtensionMaxBytes
+	if key == "subClashExt" {
+		maximumBytes = SubscriptionClashExtensionMaxBytes
+	}
+	if len([]byte(raw)) > maximumBytes {
+		return common.NewErrorf("%s 超过 %d 字节限制", key, maximumBytes)
+	}
+	return nil
+}
+
 func ParseSubJSONExtension(raw string) (map[string]interface{}, error) {
+	if err := ValidateSubscriptionExtensionSource("subJsonExt", raw); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(raw) == "" {
 		raw = CanonicalSubJSONExtension()
 	}
@@ -214,6 +259,9 @@ func ParseSubJSONExtension(raw string) (map[string]interface{}, error) {
 }
 
 func ParseSubClashExtension(raw string) (map[string]interface{}, error) {
+	if err := ValidateSubscriptionExtensionSource("subClashExt", raw); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(raw) == "" {
 		raw = CanonicalSubClashExtension()
 	}
@@ -241,6 +289,9 @@ func ParseSubClashExtension(raw string) (map[string]interface{}, error) {
 	value := map[string]interface{}{}
 	if err := root.Decode(&value); err != nil {
 		return nil, common.NewErrorf("Clash 订阅扩展解析失败: %v", err)
+	}
+	if err := normalizeClashFakeIPTTL(value); err != nil {
+		return nil, err
 	}
 	return value, nil
 }
@@ -442,7 +493,21 @@ func validateSubJSONDNSServers(dns map[string]interface{}) error {
 
 		switch serverType {
 		case "local", "dhcp", "fakeip":
-		case "udp", "tcp", "tls", "quic", "https", "h3":
+			delete(server, "path")
+		case "https", "h3":
+			if err := normalizeSubJSONDNSHTTPPath(server); err != nil {
+				return common.NewErrorf("JSON dns.servers[%d].path: %v", index, err)
+			}
+			if strings.TrimSpace(stringValue(server["server"])) == "" {
+				return common.NewErrorf("JSON dns.servers[%d].server 不能为空", index)
+			}
+			if value, exists := server["server_port"]; exists {
+				if err := validatePortValue(value, fmt.Sprintf("JSON dns.servers[%d].server_port", index)); err != nil {
+					return err
+				}
+			}
+		case "udp", "tcp", "tls", "quic":
+			delete(server, "path")
 			if strings.TrimSpace(stringValue(server["server"])) == "" {
 				return common.NewErrorf("JSON dns.servers[%d].server 不能为空", index)
 			}
@@ -455,6 +520,26 @@ func validateSubJSONDNSServers(dns map[string]interface{}) error {
 			return common.NewErrorf("JSON dns.servers[%d].type 不受支持: %s", index, serverType)
 		}
 	}
+	return nil
+}
+
+func normalizeSubJSONDNSHTTPPath(server map[string]interface{}) error {
+	rawPath, exists := server["path"]
+	if !exists || rawPath == nil {
+		server["path"] = "/dns-query"
+		return nil
+	}
+	path, ok := rawPath.(string)
+	if !ok {
+		return common.NewError("必须是字符串")
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = "/dns-query"
+	} else if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	server["path"] = path
 	return nil
 }
 
@@ -525,6 +610,11 @@ func validateSubClashExtension(root map[string]interface{}) error {
 		if !ok {
 			return common.NewError("Clash dns 必须是对象")
 		}
+		if value, exists := dnsMap["fake-ip-ttl"]; exists {
+			if _, err := parseClashFakeIPTTL(value); err != nil {
+				return err
+			}
+		}
 		if enabled, present := dnsMap["enable"].(bool); present && enabled {
 			if !nonEmptyStringSequence(dnsMap["nameserver"]) {
 				return common.NewError("Clash DNS 启用时 nameserver 不能为空")
@@ -545,11 +635,24 @@ func validateSubClashExtension(root map[string]interface{}) error {
 			return err
 		}
 	}
+	if rules, exists := root["rules"]; exists {
+		items, ok := rules.([]interface{})
+		if !ok {
+			return common.NewError("Clash rules 必须是数组")
+		}
+		if len(items) > SubscriptionClashMaxRules {
+			return common.NewErrorf("Clash rules 最多允许 %d 条", SubscriptionClashMaxRules)
+		}
+	}
 	if uiConfig, ok := root["_uiConfig"].(map[string]interface{}); ok {
 		if value, exists := uiConfig["latencyTestInterval"]; exists {
-			interval := strings.ToLower(strings.TrimSpace(stringValue(value)))
-			if !regexp.MustCompile(`^[1-9][0-9]*s$`).MatchString(interval) {
-				return common.NewError("Clash 延迟测试间隔必须是正整数秒，例如 180s")
+			if _, err := parseClashLatencyTestInterval(stringValue(value)); err != nil {
+				return err
+			}
+		}
+		if value, exists := uiConfig["updateInterval"]; exists {
+			if _, err := parseClashRuleProviderInterval(stringValue(value)); err != nil {
+				return err
 			}
 		}
 		if value, exists := uiConfig["latencyTolerance"]; exists {
@@ -566,6 +669,9 @@ func validateSubClashExtension(root map[string]interface{}) error {
 			if err := validateUDPPortRanges(stringValue(value)); err != nil {
 				return err
 			}
+		}
+		if err := validateClashEditorResourceBounds(uiConfig); err != nil {
+			return err
 		}
 	}
 	if err := validateUIRuleSetSources(root["_uiConfig"], "clashRuleRows", "clash", "ruleSetSource"); err != nil {
@@ -619,6 +725,9 @@ func validateClashRuleProviders(raw interface{}) error {
 	if !ok {
 		return common.NewError("Clash rule-providers 必须是对象")
 	}
+	if len(providers) > SubscriptionClashMaxRuleProviders {
+		return common.NewErrorf("Clash rule-providers 最多允许 %d 项", SubscriptionClashMaxRuleProviders)
+	}
 	for name, rawProvider := range providers {
 		provider, ok := rawProvider.(map[string]interface{})
 		if !ok {
@@ -646,6 +755,145 @@ func validateClashRuleProviders(raw interface{}) error {
 			}
 			if expectedFormat == "mrs" && behavior != "domain" && behavior != "ipcidr" {
 				return common.NewErrorf("Clash rule-providers.%s 的 MRS behavior 必须是 domain 或 ipcidr", name)
+			}
+		}
+		if value, exists := provider["interval"]; exists {
+			if _, err := validateClashRuleProviderIntervalSeconds(value, fmt.Sprintf("Clash rule-providers.%s.interval", name)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func parseClashLatencyTestInterval(raw string) (int64, error) {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if !regexp.MustCompile(`^[1-9][0-9]*s$`).MatchString(value) {
+		return 0, common.NewError("Clash 延迟测试间隔必须是正整数秒，例如 180s")
+	}
+	seconds, err := strconv.ParseInt(strings.TrimSuffix(value, "s"), 10, 64)
+	if err != nil || seconds < SubscriptionClashLatencyTestMinIntervalSeconds {
+		return 0, common.NewErrorf("Clash 延迟测试间隔不能小于 %d 秒", SubscriptionClashLatencyTestMinIntervalSeconds)
+	}
+	return seconds, nil
+}
+
+func parseClashRuleProviderInterval(raw string) (int64, error) {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	match := regexp.MustCompile(`^([1-9][0-9]*)\s*([smhd]?)$`).FindStringSubmatch(value)
+	if len(match) != 3 {
+		return 0, common.NewError("Clash 规则集更新间隔必须是正整数加 s/m/h/d，例如 1h 或 1d")
+	}
+	amount, err := strconv.ParseInt(match[1], 10, 64)
+	if err != nil {
+		return 0, common.NewError("Clash 规则集更新间隔无效")
+	}
+	multiplier := int64(86400)
+	switch match[2] {
+	case "s":
+		multiplier = 1
+	case "m":
+		multiplier = 60
+	case "h":
+		multiplier = 3600
+	case "d", "":
+		multiplier = 86400
+	}
+	if amount > (1<<63-1)/multiplier {
+		return 0, common.NewError("Clash 规则集更新间隔过大")
+	}
+	seconds := amount * multiplier
+	if seconds > 31_536_000 {
+		return 0, common.NewError("Clash 规则集更新间隔不能超过 365 天")
+	}
+	if seconds < SubscriptionClashRuleProviderMinIntervalSeconds {
+		return 0, common.NewErrorf("Clash 规则集更新间隔不能小于 %d 秒", SubscriptionClashRuleProviderMinIntervalSeconds)
+	}
+	return seconds, nil
+}
+
+func parseClashFakeIPTTL(raw interface{}) (int64, error) {
+	value := strings.ToLower(strings.TrimSpace(stringValue(raw)))
+	match := regexp.MustCompile(`^([0-9]+)\s*s?$`).FindStringSubmatch(value)
+	if len(match) != 2 {
+		return 0, common.NewError("Clash dns.fake-ip-ttl 必须是非负整数秒，可带 s 后缀")
+	}
+	seconds, err := strconv.ParseInt(match[1], 10, 64)
+	if err != nil {
+		return 0, common.NewError("Clash dns.fake-ip-ttl 超出有效范围")
+	}
+	return seconds, nil
+}
+
+func normalizeClashFakeIPTTL(root map[string]interface{}) error {
+	dnsMap, ok := root["dns"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	raw, exists := dnsMap["fake-ip-ttl"]
+	if !exists {
+		return nil
+	}
+	seconds, err := parseClashFakeIPTTL(raw)
+	if err != nil {
+		return err
+	}
+	dnsMap["fake-ip-ttl"] = seconds
+	return nil
+}
+
+func validateClashRuleProviderIntervalSeconds(raw interface{}, label string) (int64, error) {
+	seconds, err := positiveInteger(raw, label, 31_536_000)
+	if err != nil {
+		return 0, err
+	}
+	if seconds < SubscriptionClashRuleProviderMinIntervalSeconds {
+		return 0, common.NewErrorf("%s 不能小于 %d 秒", label, SubscriptionClashRuleProviderMinIntervalSeconds)
+	}
+	return seconds, nil
+}
+
+func validateClashEditorResourceBounds(ui map[string]interface{}) error {
+	if err := validateClashEditorRows(ui, "clashRuleRows", SubscriptionClashMaxEditorRuleRows, SubscriptionClashMaxEditorRowValues); err != nil {
+		return err
+	}
+	if err := validateClashEditorRows(ui, "clashDnsPolicyRows", SubscriptionClashMaxEditorDNSRows, SubscriptionClashMaxEditorRowValues); err != nil {
+		return err
+	}
+	if err := validateClashEditorRows(ui, "clashDnsSuffixRows", SubscriptionClashMaxEditorDNSSuffixRows, SubscriptionClashMaxEditorRowValues); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateClashEditorRows(ui map[string]interface{}, key string, maximumRows int, maximumValues int) error {
+	rawRows, exists := ui[key]
+	if !exists {
+		return nil
+	}
+	rows, ok := rawRows.([]interface{})
+	if !ok {
+		return common.NewErrorf("Clash %s 必须是数组", key)
+	}
+	if len(rows) > maximumRows {
+		return common.NewErrorf("Clash %s 最多允许 %d 行", key, maximumRows)
+	}
+	for index, rawRow := range rows {
+		row, ok := rawRow.(map[string]interface{})
+		if !ok {
+			return common.NewErrorf("Clash %s[%d] 必须是对象", key, index)
+		}
+		for _, valueKey := range []string{"values", "targets", "selections"} {
+			rawValues, exists := row[valueKey]
+			if !exists {
+				continue
+			}
+			values, ok := rawValues.([]interface{})
+			if !ok {
+				return common.NewErrorf("Clash %s[%d].%s 必须是数组", key, index, valueKey)
+			}
+			if len(values) > maximumValues {
+				return common.NewErrorf("Clash %s[%d].%s 最多允许 %d 项", key, index, valueKey, maximumValues)
 			}
 		}
 	}

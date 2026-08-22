@@ -537,6 +537,364 @@ func TestSubManagerJson_PreservesExistingSHA256ModeFromStoredOutbound(t *testing
 	}
 }
 
+func TestRefreshMihomoClashProxyTLSUpdatesWrapperProjection(t *testing.T) {
+	tests := []struct {
+		name   string
+		proxy  map[string]interface{}
+		tls    *model.Tls
+		assert func(*testing.T, map[string]interface{})
+	}{
+		{
+			name: "vless restls",
+			proxy: map[string]interface{}{
+				"name":         "node",
+				"type":         "vless",
+				"tls":          true,
+				"servername":   "old.example.com",
+				"reality-opts": map[string]interface{}{"short-id": "old"},
+			},
+			tls: &model.Tls{
+				Mode:   model.MihomoTlsModeRestls,
+				Server: mustRawJSON(t, map[string]interface{}{"res_tls": map[string]interface{}{"dest": "edge.example.com:443", "password": "restls-pass", "restls_script": "300?100"}}),
+				Client: mustRawJSON(t, map[string]interface{}{"server_name": "cdn.example.com", "restls_opts": map[string]interface{}{"password": "restls-pass", "version_hint": "tls13", "restls_script": "300?100"}}),
+			},
+			assert: func(t *testing.T, proxy map[string]interface{}) {
+				if proxy["tls"] != true || proxy["servername"] != "cdn.example.com" {
+					t.Fatalf("unexpected TLS/SNI projection: %#v", proxy)
+				}
+				if _, exists := proxy["reality-opts"]; exists {
+					t.Fatalf("stale Reality options retained: %#v", proxy)
+				}
+				opts, ok := proxy["restls-opts"].(map[string]interface{})
+				if !ok || opts["version-hint"] != "tls13" || opts["restls-script"] != "300?100" {
+					t.Fatalf("unexpected Restls options: %#v", proxy["restls-opts"])
+				}
+			},
+		},
+		{
+			name: "shadowsocks jls",
+			proxy: map[string]interface{}{
+				"name":               "ss-node",
+				"type":               "shadowsocks",
+				"tls":                true,
+				"plugin":             "restls",
+				"plugin-opts":        map[string]interface{}{"password": "old"},
+				"restls-opts":        map[string]interface{}{"password": "old"},
+				"client-fingerprint": "old-fingerprint",
+			},
+			tls: &model.Tls{
+				Mode:   model.MihomoTlsModeJLS,
+				Server: mustRawJSON(t, map[string]interface{}{"jls_config": map[string]interface{}{"dest": "edge.example.com:443", "sni": "jls.example.com", "alpn": []interface{}{"h2"}}}),
+				Client: mustRawJSON(t, map[string]interface{}{"jls_opts": map[string]interface{}{"username": "alice", "password": "jls-pass"}}),
+			},
+			assert: func(t *testing.T, proxy map[string]interface{}) {
+				if proxy["plugin"] != "jls" {
+					t.Fatalf("plugin = %#v", proxy["plugin"])
+				}
+				if _, exists := proxy["tls"]; exists {
+					t.Fatalf("Shadowsocks plugin proxy must not keep tls: %#v", proxy)
+				}
+				opts, ok := proxy["plugin-opts"].(map[string]interface{})
+				if !ok || opts["host"] != "jls.example.com" || opts["username"] != "alice" || opts["password"] != "jls-pass" {
+					t.Fatalf("unexpected JLS plugin options: %#v", proxy["plugin-opts"])
+				}
+				if _, exists := proxy["restls-opts"]; exists {
+					t.Fatalf("stale Restls options retained: %#v", proxy)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			refreshMihomoClashProxyTLS(tt.proxy, tt.tls)
+			tt.assert(t, tt.proxy)
+		})
+	}
+}
+
+func TestSubManagerRuntimeRefreshesMihomoAnyTLSReality(t *testing.T) {
+	initSubManagerTLSRefreshTestLogger()
+	setupSubscriptionTestDB(t, "submanager-mihomo-anytls-reality-refresh.db")
+
+	db := database.GetDB()
+	tlsConfig := model.MihomoTls{
+		Name: "mihomo-anytls-reality",
+		Mode: model.MihomoTlsModeReality,
+		Server: mustRawJSON(t, map[string]interface{}{
+			"server_name": "anytls.example.com",
+			"reality":     map[string]interface{}{"enabled": true},
+		}),
+		Client: mustRawJSON(t, map[string]interface{}{
+			"server_name": "anytls.example.com",
+			"reality": map[string]interface{}{
+				"enabled":    true,
+				"public_key": "public-key",
+				"short_id":   "abcd",
+			},
+		}),
+	}
+	if err := db.Create(&tlsConfig).Error; err != nil {
+		t.Fatalf("create Mihomo TLS failed: %v", err)
+	}
+	inbound := &model.MihomoInbound{
+		Type:  "anytls",
+		Tag:   "anytls-reality-source",
+		TlsId: tlsConfig.Id,
+		Options: mustRawJSON(t, map[string]interface{}{
+			"listen_port": 443,
+			"password":    "anytls-password",
+		}),
+	}
+	if err := db.Create(inbound).Error; err != nil {
+		t.Fatalf("create Mihomo inbound failed: %v", err)
+	}
+
+	subOutbound := &model.SubOutbound{
+		Type:            "anytls",
+		SourceType:      subManagerSourceMihomoClient,
+		SourceInboundId: inbound.Id,
+	}
+	proxy := map[string]interface{}{
+		"type":         "anytls",
+		"tls":          true,
+		"sni":          "old.example.com",
+		"reality-opts": map[string]interface{}{"short-id": "old"},
+	}
+	(&SubManagerSubService{}).refreshSubOutboundClashProxyTLS(proxy, subOutbound)
+
+	if proxy["tls"] != true || proxy["sni"] != "anytls.example.com" {
+		t.Fatalf("unexpected AnyTLS TLS/SNI projection: %#v", proxy)
+	}
+	realityOpts, ok := proxy["reality-opts"].(map[string]interface{})
+	if !ok || realityOpts["public-key"] != "public-key" || realityOpts["short-id"] != "abcd" {
+		t.Fatalf("unexpected AnyTLS Reality projection: %#v", proxy["reality-opts"])
+	}
+}
+
+func TestSubManagerRuntimeRefreshesMihomoShadowsocksPluginWithoutTLSMap(t *testing.T) {
+	initSubManagerTLSRefreshTestLogger()
+	setupSubscriptionTestDB(t, "submanager-mihomo-ss-wrapper-refresh.db")
+
+	db := database.GetDB()
+	tlsConfig := model.MihomoTls{
+		Name: "mihomo-ss-jls",
+		Mode: model.MihomoTlsModeJLS,
+		Server: mustRawJSON(t, map[string]interface{}{
+			"jls_config": map[string]interface{}{
+				"enable": true,
+				"users":  []interface{}{map[string]interface{}{"username": "alice", "password": "jls-pass"}},
+				"dest":   "edge.example.com:443",
+				"sni":    "jls.example.com",
+			},
+		}),
+		Client: mustRawJSON(t, map[string]interface{}{
+			"jls_opts": map[string]interface{}{"username": "alice", "password": "jls-pass"},
+		}),
+	}
+	if err := db.Create(&tlsConfig).Error; err != nil {
+		t.Fatalf("create Mihomo TLS failed: %v", err)
+	}
+	inbound := &model.MihomoInbound{
+		Type:  "shadowsocks",
+		Tag:   "ss-jls-source",
+		TlsId: tlsConfig.Id,
+		Options: mustRawJSON(t, map[string]interface{}{
+			"listen_port": 443,
+			"method":      "2022-blake3-aes-128-gcm",
+			"password":    "ss-pass",
+		}),
+		Tls: &tlsConfig,
+	}
+	if err := db.Create(inbound).Error; err != nil {
+		t.Fatalf("create Mihomo inbound failed: %v", err)
+	}
+
+	subOutbound := &model.SubOutbound{
+		Type:            "shadowsocks",
+		SourceType:      subManagerSourceMihomoClient,
+		SourceInboundId: inbound.Id,
+	}
+	outbound := map[string]interface{}{
+		"type":        "shadowsocks",
+		"plugin":      "restls",
+		"plugin_opts": map[string]interface{}{"password": "old"},
+	}
+	(&SubManagerSubService{}).refreshSubOutboundTLS(outbound, subOutbound)
+
+	if outbound["plugin"] != "jls" {
+		t.Fatalf("plugin = %#v", outbound["plugin"])
+	}
+	if _, exists := outbound["tls"]; exists {
+		t.Fatalf("Shadowsocks plugin refresh must not add tls: %#v", outbound)
+	}
+	pluginOpts, ok := outbound["plugin_opts"].(map[string]interface{})
+	if !ok || pluginOpts["host"] != "jls.example.com" || pluginOpts["username"] != "alice" || pluginOpts["password"] != "jls-pass" {
+		t.Fatalf("unexpected plugin options: %#v", outbound["plugin_opts"])
+	}
+}
+
+func TestSubManagerSubscriptionsRenderMihomoShadowsocksShadowTLS(t *testing.T) {
+	initSubManagerTLSRefreshTestLogger()
+	setupSubscriptionTestDB(t, "submanager-mihomo-ss-shadowtls-subscriptions.db")
+
+	db := database.GetDB()
+	tlsConfig := model.MihomoTls{
+		Name: "mihomo-ss-shadowtls",
+		Mode: model.MihomoTlsModeShadowTLS,
+		Server: mustRawJSON(t, map[string]interface{}{
+			"shadow_tls": map[string]interface{}{
+				"enable":    true,
+				"version":   3,
+				"users":     []interface{}{map[string]interface{}{"name": "alice", "password": "shadow-pass"}},
+				"handshake": map[string]interface{}{"dest": "addons.mozilla.org:443"},
+			},
+		}),
+		Client: mustRawJSON(t, map[string]interface{}{
+			"shadow_tls_opts": map[string]interface{}{"version": 3, "password": "shadow-pass"},
+			"utls":            map[string]interface{}{"enabled": true, "fingerprint": "chrome"},
+		}),
+	}
+	if err := db.Create(&tlsConfig).Error; err != nil {
+		t.Fatalf("create Mihomo ShadowTLS config failed: %v", err)
+	}
+
+	inbound := model.MihomoInbound{
+		Type:  "shadowsocks",
+		Tag:   "ss-shadowtls-source",
+		TlsId: tlsConfig.Id,
+		Options: mustRawJSON(t, map[string]interface{}{
+			"listen_port": 443,
+			"method":      "2022-blake3-aes-128-gcm",
+			"password":    "ss-pass",
+		}),
+	}
+	if err := db.Create(&inbound).Error; err != nil {
+		t.Fatalf("create Mihomo Shadowsocks inbound failed: %v", err)
+	}
+
+	const subTag = "ss-shadowtls-source_sync_default"
+	createSubOutboundFromMap(
+		t,
+		map[string]interface{}{
+			"type":        "shadowsocks",
+			"tag":         subTag,
+			"server":      "203.0.113.10",
+			"server_port": 443,
+			"method":      "2022-blake3-aes-128-gcm",
+			"password":    "ss-pass",
+			"plugin":      "restls",
+			"plugin_opts": map[string]interface{}{"password": "stale"},
+		},
+		subManagerSourceMihomoClient,
+		9001,
+		inbound.Id,
+		nil,
+	)
+
+	jsonSub, err := (&SubManagerSubService{}).GetSubManagerJson(subTag)
+	if err != nil {
+		t.Fatalf("GetSubManagerJson failed: %v", err)
+	}
+	jsonDoc := map[string]interface{}{}
+	if err := json.Unmarshal([]byte(*jsonSub), &jsonDoc); err != nil {
+		t.Fatalf("decode SubManager JSON subscription failed: %v", err)
+	}
+	ssOutbound := findTaggedOutbound(t, jsonDoc["outbounds"], subTag)
+	if ssOutbound["type"] != "shadowsocks" || ssOutbound["detour"] != subTag+"-out" {
+		t.Fatalf("unexpected SubManager Shadowsocks outbound: %#v", ssOutbound)
+	}
+	if _, exists := ssOutbound["plugin"]; exists {
+		t.Fatalf("SubManager sing-box JSON must not retain the Mihomo plugin: %#v", ssOutbound)
+	}
+	shadowTLSOutbound := findTaggedOutbound(t, jsonDoc["outbounds"], subTag+"-out")
+	if shadowTLSOutbound["type"] != "shadowtls" || shadowTLSOutbound["password"] != "shadow-pass" {
+		t.Fatalf("unexpected SubManager ShadowTLS outbound: %#v", shadowTLSOutbound)
+	}
+	shadowTLSTLS := asMap(t, shadowTLSOutbound["tls"])
+	if shadowTLSTLS["server_name"] != "addons.mozilla.org" {
+		t.Fatalf("unexpected SubManager ShadowTLS SNI: %#v", shadowTLSTLS)
+	}
+
+	clashSub, err := (&SubManagerSubService{}).GetSubManagerClash(subTag)
+	if err != nil {
+		t.Fatalf("GetSubManagerClash failed: %v", err)
+	}
+	clashDoc := map[string]interface{}{}
+	if err := yaml.Unmarshal([]byte(*clashSub), &clashDoc); err != nil {
+		t.Fatalf("decode SubManager Clash subscription failed: %v", err)
+	}
+	clashProxy := findNamedProxy(t, clashDoc["proxies"], subTag)
+	if clashProxy["type"] != "ss" || clashProxy["plugin"] != "shadow-tls" {
+		t.Fatalf("unexpected SubManager Clash proxy: %#v", clashProxy)
+	}
+	pluginOpts := asMap(t, clashProxy["plugin-opts"])
+	if pluginOpts["host"] != "addons.mozilla.org" || pluginOpts["password"] != "shadow-pass" {
+		t.Fatalf("unexpected SubManager Clash plugin options: %#v", pluginOpts)
+	}
+}
+
+func TestSubManagerRuntimeRefreshesMihomoWrapperWithoutTLSMap(t *testing.T) {
+	initSubManagerTLSRefreshTestLogger()
+	setupSubscriptionTestDB(t, "submanager-mihomo-wrapper-refresh.db")
+
+	db := database.GetDB()
+	tlsConfig := model.MihomoTls{
+		Name: "mihomo-trojan-restls",
+		Mode: model.MihomoTlsModeRestls,
+		Server: mustRawJSON(t, map[string]interface{}{
+			"enabled": true,
+			"res_tls": map[string]interface{}{
+				"enable":   true,
+				"dest":     "edge.example.com:443",
+				"password": "restls-pass",
+			},
+		}),
+		Client: mustRawJSON(t, map[string]interface{}{
+			"server_name": "restls.example.com",
+			"restls_opts": map[string]interface{}{
+				"password":     "restls-pass",
+				"version_hint": "tls13",
+			},
+		}),
+	}
+	if err := db.Create(&tlsConfig).Error; err != nil {
+		t.Fatalf("create Mihomo TLS failed: %v", err)
+	}
+	inbound := &model.MihomoInbound{
+		Type:  "trojan",
+		Tag:   "trojan-restls-source",
+		TlsId: tlsConfig.Id,
+		Tls:   &tlsConfig,
+		Options: mustRawJSON(t, map[string]interface{}{
+			"listen_port": 443,
+			"password":    "trojan-pass",
+		}),
+	}
+	if err := db.Create(inbound).Error; err != nil {
+		t.Fatalf("create Mihomo inbound failed: %v", err)
+	}
+
+	subOutbound := &model.SubOutbound{
+		Type:            "trojan",
+		SourceType:      subManagerSourceMihomoClient,
+		SourceInboundId: inbound.Id,
+	}
+	outbound := map[string]interface{}{"type": "trojan"}
+	(&SubManagerSubService{}).refreshSubOutboundTLS(outbound, subOutbound)
+
+	tlsMap, ok := outbound["tls"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected managed wrapper refresh to create tls map: %#v", outbound)
+	}
+	if tlsMap["enabled"] != true || tlsMap["server_name"] != "restls.example.com" {
+		t.Fatalf("unexpected refreshed managed TLS envelope: %#v", tlsMap)
+	}
+	if opts, ok := tlsMap["restls_opts"].(map[string]interface{}); !ok || opts["password"] != "restls-pass" {
+		t.Fatalf("unexpected refreshed Restls options: %#v", tlsMap["restls_opts"])
+	}
+}
+
 func TestSubManagerJson_SubgroupImportedNodePreservesStoredSHA256(t *testing.T) {
 	initSubManagerTLSRefreshTestLogger()
 	setupSubscriptionTestDB(t, "submanager-subgroup-preserve-stored-sha256.db")
