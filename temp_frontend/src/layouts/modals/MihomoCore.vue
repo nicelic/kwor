@@ -1804,7 +1804,10 @@ const submitCoreDownload = async (formData: FormData, versionLabel: string) => {
   resetDownloadProgress()
   feedbackMsg.value = ''
   try {
-    const data = await HttpUtils.post(mihomoCore.downloadEndpoint, formData, { silentAuthCheck: true })
+    const data = await HttpUtils.post(mihomoCore.downloadEndpoint, formData, {
+      silentAuthCheck: true,
+      timeout: 300000,
+    })
     if (data.success && data.obj) {
       const nextProgress = normalizeCoreDownloadProgress(data.obj)
       downloadProgress.value = nextProgress

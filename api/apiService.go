@@ -1448,6 +1448,15 @@ func (a *ApiService) GetAcmeLog(c *gin.Context) {
 		jsonMsg(c, "", err)
 		return
 	}
+	if session != nil {
+		status := strings.TrimSpace(session.TaskStatus)
+		if status == "" {
+			status = strings.TrimSpace(session.Status)
+		}
+		if status == "success" || status == "warning" || status == "error" {
+			a.AcmeService.CleanupTaskAndLog(session.TaskID, session.Id)
+		}
+	}
 	jsonObj(c, session, nil)
 }
 
@@ -1461,6 +1470,9 @@ func (a *ApiService) GetAcmeTask(c *gin.Context) {
 	if err != nil {
 		jsonMsg(c, "", err)
 		return
+	}
+	if task != nil && (task.Status == "success" || task.Status == "warning" || task.Status == "error") {
+		a.AcmeService.CleanupTaskAndLog(task.ID, task.LogSessionID)
 	}
 	jsonObj(c, task, nil)
 }

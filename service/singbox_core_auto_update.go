@@ -235,7 +235,7 @@ func (s *CoreManagerService) resolveAutoUpdateTargetVersion(status *SingboxCoreI
 
 func (s *CoreManagerService) getStrictDownloadAssetContext(ctx context.Context, version string, target SingboxCoreDownloadTarget) (string, error) {
 	apiURL := fmt.Sprintf("https://api.github.com/repos/SagerNet/sing-box/releases/tags/%s", version)
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: coreReleaseAssetRequestTimeout}
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return "", err

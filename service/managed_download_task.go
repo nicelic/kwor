@@ -61,18 +61,20 @@ type ManagedDownloadTaskHandle struct {
 }
 
 type ManagedDownloadTaskManagerOptions struct {
-	Deadline time.Duration
+	Deadline    time.Duration
+	TerminalTTL time.Duration
 }
 
 // ManagedDownloadTaskManager keeps one active task per resource. Completed
 // snapshots remain queryable briefly so a refreshed browser can show a result.
 type ManagedDownloadTaskManager struct {
-	mu       sync.Mutex
-	name     string
-	deadline time.Duration
-	tasks    map[string]*managedDownloadTask
-	activeID string
-	latestID string
+	mu          sync.Mutex
+	name        string
+	deadline    time.Duration
+	terminalTTL time.Duration
+	tasks       map[string]*managedDownloadTask
+	activeID    string
+	latestID    string
 }
 
 func NewManagedDownloadTaskManager(name string) *ManagedDownloadTaskManager {
@@ -84,10 +86,15 @@ func NewManagedDownloadTaskManagerWithOptions(name string, options ManagedDownlo
 	if deadline <= 0 {
 		deadline = managedDownloadTaskDeadline
 	}
+	terminalTTL := options.TerminalTTL
+	if terminalTTL <= 0 {
+		terminalTTL = managedDownloadTaskTTL
+	}
 	return &ManagedDownloadTaskManager{
-		name:     strings.TrimSpace(name),
-		deadline: deadline,
-		tasks:    make(map[string]*managedDownloadTask),
+		name:        strings.TrimSpace(name),
+		deadline:    deadline,
+		terminalTTL: terminalTTL,
+		tasks:       make(map[string]*managedDownloadTask),
 	}
 }
 
@@ -96,6 +103,13 @@ func (m *ManagedDownloadTaskManager) taskDeadline() time.Duration {
 		return managedDownloadTaskDeadline
 	}
 	return m.deadline
+}
+
+func (m *ManagedDownloadTaskManager) taskTerminalTTL() time.Duration {
+	if m == nil || m.terminalTTL <= 0 {
+		return managedDownloadTaskTTL
+	}
+	return m.terminalTTL
 }
 
 // Start either creates a task or returns the equivalent active task. A caller
@@ -346,7 +360,7 @@ func (h *ManagedDownloadTaskHandle) finish(state string, phase string, message s
 	}
 	operation := task.operation
 	task.operation = nil
-	task.expires = time.AfterFunc(managedDownloadTaskTTL, func() {
+	task.expires = time.AfterFunc(h.manager.taskTerminalTTL(), func() {
 		h.manager.expire(h.id)
 	})
 	h.manager.mu.Unlock()
@@ -455,7 +469,7 @@ func (m *ManagedDownloadTaskManager) pruneExpiredLocked(now time.Time) {
 		if task == nil || !isManagedDownloadTaskTerminal(task.status.State) || task.status.FinishedAt == 0 {
 			continue
 		}
-		if now.Sub(time.Unix(task.status.FinishedAt, 0)) <= managedDownloadTaskTTL {
+		if now.Sub(time.Unix(task.status.FinishedAt, 0)) <= m.taskTerminalTTL() {
 			continue
 		}
 		if task.expires != nil {

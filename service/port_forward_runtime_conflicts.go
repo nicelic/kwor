@@ -14,7 +14,7 @@ const portForwardRuntimeOwnerCacheTTL = 30 * time.Second
 
 const (
 	portForwardRuntimeConflictCacheTTL = 30 * time.Second
-	portForwardRuntimeConflictMaxCount = 512
+	portForwardRuntimeConflictMaxCount = 2048
 )
 
 // PortForwardRuntimeConflict is an observation only. It deliberately does not

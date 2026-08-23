@@ -55,17 +55,17 @@ const (
 
 	firewallInputChain = "panel_input"
 
-	firewallMaxManualRules      = 256
-	firewallMaxExternalRules    = 256
-	firewallMaxOverviewRules    = 512
+	firewallMaxManualRules      = 2048
+	firewallMaxExternalRules    = 4096
+	firewallMaxOverviewRules    = 4096
 	firewallExternalScanGap     = 15 * time.Minute
 	firewallManagedIntegrityGap = 5 * time.Minute
 
-	firewallMaxRuleNameBytes        = 256
-	firewallMaxRuleDescriptionBytes = 4096
-	firewallMaxPortSpecBytes        = 2048
-	firewallMaxSourceSpecBytes      = 16 * 1024
-	firewallMaxSourceEntries        = 1024
+	firewallMaxRuleNameBytes        = 1 * 1024 * 1024
+	firewallMaxRuleDescriptionBytes = 2 * 1024 * 1024
+	firewallMaxPortSpecBytes        = 2 * 1024 * 1024
+	firewallMaxSourceSpecBytes      = 2 * 1024 * 1024
+	firewallMaxSourceEntries        = 8092
 )
 
 var (

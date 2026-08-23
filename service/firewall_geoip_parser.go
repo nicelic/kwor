@@ -20,16 +20,20 @@ import (
 )
 
 const (
-	firewallGeoMaxCompressedRuleCount       = 100000
-	firewallGeoMaxLogicalRuleCount          = 100000
-	firewallGeoMaxIPSetRanges               = 100000
-	firewallGeoMaxTotalIPSetRanges          = 100000
-	firewallGeoMaxDecodedBytes        int64 = 64 * 1024 * 1024
+	firewallGeoMaxCompressedRuleCount       = 2 * 1000 * 1000
+	firewallGeoMaxLogicalRuleCount          = 2 * 1000 * 1000
+	firewallGeoMaxIPSetRanges               = 2 * 1000 * 1000
+	firewallGeoMaxTotalIPSetRanges          = 2 * 1000 * 1000
+	firewallGeoMaxDecodedBytes        int64 = 10 * 1024 * 1024 * 1024
 	firewallGeoMaxSRSDepth                  = 64
-	firewallGeoMaxJSONDepth                 = 64
-	firewallGeoMaxJSONCIDRsPerRule          = 4096
-	firewallGeoMaxJSONCIDRsTotal            = 100000
-	firewallGeoMaxJSONBytes                 = 8 * 1024 * 1024
+	firewallGeoMaxJSONDepth                 = 512
+	firewallGeoMaxJSONCIDRsPerRule          = 2 * 1000 * 1000
+	firewallGeoMaxJSONCIDRsTotal            = 2 * 1000 * 1000
+	firewallGeoMaxJSONBytes                 = 1 * 1024 * 1024 * 1024
+	firewallGeoMaxExpandedPrefixCount       = 2 * 1000 * 1000
+	// Keep a separate JSON rule budget; the requested 2 million rule budget
+	// applies to compressed SRS/MRS rule counts, not JSON object count.
+	firewallGeoMaxJSONRuleCount = 100000
 )
 
 const (
@@ -74,8 +78,8 @@ func (b *firewallGeoParserBudget) addIPRange(builder *netipx.IPSetBuilder, from 
 	if len(prefixes) == 0 {
 		return fmt.Errorf("invalid ip range")
 	}
-	if len(prefixes) > firewallGeoMaxPrefixCount || b.candidatePrefixes > firewallGeoMaxPrefixCount-len(prefixes) {
-		return fmt.Errorf("ip range expansion exceeds %d prefixes", firewallGeoMaxPrefixCount)
+	if len(prefixes) > firewallGeoMaxExpandedPrefixCount || b.candidatePrefixes > firewallGeoMaxExpandedPrefixCount-len(prefixes) {
+		return fmt.Errorf("ip range expansion exceeds %d prefixes", firewallGeoMaxExpandedPrefixCount)
 	}
 	b.candidatePrefixes += len(prefixes)
 	for _, prefix := range prefixes {
@@ -88,8 +92,8 @@ func (b *firewallGeoParserBudget) enterJSONRule(depth int) error {
 	if depth > firewallGeoMaxJSONDepth {
 		return fmt.Errorf("json rule nesting exceeds %d", firewallGeoMaxJSONDepth)
 	}
-	if b.jsonRules >= firewallGeoMaxCompressedRuleCount {
-		return fmt.Errorf("json rule count exceeds %d", firewallGeoMaxCompressedRuleCount)
+	if b.jsonRules >= firewallGeoMaxJSONRuleCount {
+		return fmt.Errorf("json rule count exceeds %d", firewallGeoMaxJSONRuleCount)
 	}
 	b.jsonRules++
 	return nil

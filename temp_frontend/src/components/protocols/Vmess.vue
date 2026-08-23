@@ -20,7 +20,7 @@
         <v-select
           hide-details
           :label="$t('types.vmess.security')"
-          :items="securities"
+          :items="availableSecurities"
           v-model="data.security">
         </v-select>
       </v-col>
@@ -51,9 +51,12 @@ import { parseSingboxInteger } from '@/plugins/singboxInteger'
 
 export default {
   props: ['data', 'namespace'],
-  data() {
-    return {
-      securities: [
+  computed: {
+    isMihomoNamespace(): boolean {
+      return this.namespace === 'mihomo'
+    },
+    availableSecurities(): string[] {
+      const securities = [
         "auto",
         "none",
         "zero",
@@ -61,11 +64,9 @@ export default {
         "aes-128-ctr",
         "chacha20-poly1305",
       ]
-    }
-  },
-  computed: {
-    isMihomoNamespace(): boolean {
-      return this.namespace === 'mihomo'
+      return this.isMihomoNamespace
+        ? securities.filter((security) => security !== "aes-128-ctr")
+        : securities
     },
     alterID: {
       get() { return parseSingboxInteger(this.$props.data.alter_id, { min: 0 }) ?? 0 },
@@ -78,7 +79,9 @@ export default {
   },
   methods: {
     sanitizeMihomoUnsupportedFields() {
-      if (this.isMihomoNamespace) delete this.$props.data.network
+      if (!this.isMihomoNamespace) return
+      delete this.$props.data.network
+      if (this.$props.data.security === "aes-128-ctr") this.$props.data.security = "auto"
     },
   },
   mounted() {

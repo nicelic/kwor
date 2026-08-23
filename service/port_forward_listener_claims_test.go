@@ -163,3 +163,52 @@ func TestPortForwardRuntimeConflictsKeepRulesEnabledAndExposeOwners(t *testing.T
 		t.Fatalf("unexpected runtime conflict: %#v", conflicts[0])
 	}
 }
+
+func TestPortForwardRuntimeConflictsReachConfiguredMaximum(t *testing.T) {
+	originalGOOS := portForwardRuntimeGOOS
+	originalSockets := portForwardReadListenerSocketsFn
+	originalBindV6Only := portForwardReadBindV6OnlyFn
+	originalOwners := portForwardResolveOwnersFn
+	t.Cleanup(func() {
+		portForwardRuntimeGOOS = originalGOOS
+		portForwardReadListenerSocketsFn = originalSockets
+		portForwardReadBindV6OnlyFn = originalBindV6Only
+		portForwardResolveOwnersFn = originalOwners
+	})
+
+	portForwardRuntimeGOOS = func() string { return "linux" }
+	portForwardReadListenerSocketsFn = func(filter firewallListenerFilter) ([]procListenerSocket, error) {
+		if !filter.matches(firewallProtocolTCP, 18081) {
+			t.Fatal("runtime conflict scanner did not include the forwarding port")
+		}
+		return []procListenerSocket{{
+			protocol: firewallProtocolTCP,
+			family:   firewallFamilyIPv4,
+			port:     18081,
+			wildcard: true,
+		}}, nil
+	}
+	portForwardReadBindV6OnlyFn = func() (bool, bool) { return true, true }
+	portForwardResolveOwnersFn = func(map[string]struct{}) map[string][]FirewallListenerOwnerView {
+		return map[string][]FirewallListenerOwnerView{}
+	}
+
+	rows := make([]model.PortForwardRule, portForwardRuntimeConflictMaxCount+1)
+	for index := range rows {
+		rows[index] = model.PortForwardRule{
+			Id:             uint(index + 1),
+			Name:           "conflict",
+			Enabled:        true,
+			Family:         portForwardFamilyIPv4,
+			Protocol:       portForwardProtocolTCP,
+			LocalPortSpec:  "18081",
+			LocalPortStart: 18081,
+			LocalPortEnd:   18081,
+		}
+	}
+
+	conflicts := collectPortForwardRuntimeConflicts(rows)
+	if len(conflicts) != portForwardRuntimeConflictMaxCount {
+		t.Fatalf("runtime conflicts = %d, want configured maximum %d", len(conflicts), portForwardRuntimeConflictMaxCount)
+	}
+}

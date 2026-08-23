@@ -72,7 +72,7 @@ func TestFirewallGeoParserBudgetRejectsCumulativeIPSetRanges(t *testing.T) {
 
 func TestFirewallGeoParserBudgetRejectsRangeExpansionBeforeBuildingIPSet(t *testing.T) {
 	var builder netipx.IPSetBuilder
-	budget := &firewallGeoParserBudget{candidatePrefixes: firewallGeoMaxPrefixCount - 1}
+	budget := &firewallGeoParserBudget{candidatePrefixes: firewallGeoMaxExpandedPrefixCount - 1}
 	if err := budget.addIPRange(&builder, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")); err == nil {
 		t.Fatal("expected ip range expansion budget error")
 	}
@@ -96,6 +96,68 @@ func TestEnsureFirewallGeoRuntimeLoadedRejectsDeclaredTotalBeforeReadingFiles(t 
 	}
 	if err := ensureFirewallGeoRuntimeLoadedLocked(rows); err == nil {
 		t.Fatal("expected declared total prefix limit error")
+	}
+}
+
+func TestFirewallGeoActivePrefixLimitSeparatesFromLoadedRuntimeLimit(t *testing.T) {
+	previous := firewallGeoState.loaded
+	defer func() { firewallGeoState.loaded = previous }()
+
+	firewallGeoState.loaded = map[uint]firewallGeoResolvedPrefixes{
+		1: {PrefixCount: firewallGeoMaxActivePrefixCount},
+		2: {PrefixCount: 1},
+	}
+	rows := []model.FirewallGeoRule{
+		{Id: 1, Enabled: true},
+		{Id: 2, Enabled: true},
+	}
+	if err := ensureFirewallGeoActivePrefixLimit(rows); err == nil {
+		t.Fatal("expected active prefix limit error")
+	}
+
+	rows[1].Enabled = false
+	if err := ensureFirewallGeoActivePrefixLimit(rows); err != nil {
+		t.Fatalf("disabled geo rule should not count toward active prefix limit: %v", err)
+	}
+}
+
+func TestFirewallGeoRequestedResourceLimits(t *testing.T) {
+	if firewallGeoMaxRules != 2048 ||
+		firewallGeoMaxSourcesPerRule != 32 ||
+		firewallGeoMaxCachedFilesPerRule != 2048 ||
+		firewallGeoMaxPrefixCount != 1000000 ||
+		firewallGeoMaxActivePrefixCount != 1000000 ||
+		firewallGeoMaxRuntimePrefixCount != 10000000 ||
+		firewallGeoMaxURLBytes != 1*1024*1024 ||
+		firewallGeoMaxCustomSourceURLsBytes != 1*1024*1024 ||
+		firewallGeoMaxSourceBytes != 1*1024*1024*1024 ||
+		firewallGeoMaxRefreshBytes != 10*1024*1024*1024 ||
+		firewallGeoMaxStoredListBytes != 8*1024*1024 ||
+		firewallGeoMaxNftScriptBytes != 1*1024*1024*1024 ||
+		firewallGeoMaxPrefixesPerGroup != 1000000 {
+		t.Fatal("GeoIP resource limits do not match the requested values")
+	}
+	if firewallGeoMaxCompressedRuleCount != 2000000 ||
+		firewallGeoMaxLogicalRuleCount != 2000000 ||
+		firewallGeoMaxIPSetRanges != 2000000 ||
+		firewallGeoMaxTotalIPSetRanges != 2000000 ||
+		firewallGeoMaxExpandedPrefixCount != 2000000 ||
+		firewallGeoMaxJSONCIDRsPerRule != 2000000 ||
+		firewallGeoMaxJSONCIDRsTotal != 2000000 ||
+		firewallGeoMaxJSONBytes != 1*1024*1024*1024 ||
+		firewallGeoMaxDecodedBytes != 10*1024*1024*1024 ||
+		firewallGeoMaxJSONDepth != 512 {
+		t.Fatal("GeoIP parser resource limits do not match the requested values")
+	}
+	if firewallMaxManualRules != 2048 ||
+		firewallMaxExternalRules != 4096 ||
+		firewallMaxOverviewRules != 4096 ||
+		firewallMaxRuleNameBytes != 1*1024*1024 ||
+		firewallMaxRuleDescriptionBytes != 2*1024*1024 ||
+		firewallMaxPortSpecBytes != 2*1024*1024 ||
+		firewallMaxSourceSpecBytes != 2*1024*1024 ||
+		firewallMaxSourceEntries != 8092 {
+		t.Fatal("firewall resource limits do not match the requested values")
 	}
 }
 

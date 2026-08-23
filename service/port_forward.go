@@ -49,7 +49,7 @@ const (
 	portForwardPortSpecMaxRunes        = 512
 	portForwardTargetIPMaxRunes        = 253
 	portForwardRateLimitMaxMbps        = 1000000
-	portForwardRuleMaxCount            = 500
+	portForwardRuleMaxCount            = 2048
 	portForwardIdleVerifyInterval      = 5 * time.Minute
 )
 

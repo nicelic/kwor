@@ -37,6 +37,10 @@ func scanExternalFirewallRules() ([]firewallObservedRule, error) {
 	}
 
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	// External rule comments use the same bounded description field as manual
+	// rules. The scanner default is only 64 KiB and would reject valid comments
+	// long before the firewall description limit is reached.
+	scanner.Buffer(make([]byte, 64*1024), firewallMaxRuleDescriptionBytes+64*1024)
 	stack := make([]nftBlockFrame, 0, 4)
 	rules := make([]firewallObservedRule, 0)
 	now := time.Now().Unix()

@@ -12,6 +12,16 @@ const (
 	// only by the one-time database migration that creates the singleton.
 	ReverseProxyLegacyMaxConcurrentRequests   = 128
 	ReverseProxyLegacyDNSMaxConcurrentQueries = 128
+
+	// These values identify the previous built-in reverse-proxy resource
+	// defaults.  Database initialization uses the complete five-field tuple to
+	// upgrade untouched installations without overwriting a user's custom
+	// resource policy.
+	ReverseProxyLegacyMemoryPoolBytes              int64 = 8 * 1024 * 1024 * 1024
+	ReverseProxyLegacyDefaultRuleMemoryLimitBytes  int64 = 384 * 1024 * 1024
+	ReverseProxyLegacyResponseRewriteInputBytes    int64 = 4 * 1024 * 1024
+	ReverseProxyLegacyResponseRewriteOutputBytes   int64 = 8 * 1024 * 1024
+	ReverseProxyLegacyResponseRewriteMaxConcurrent       = 32
 )
 
 // ReverseProxySettings is the singleton, persisted resource policy for the
@@ -30,13 +40,13 @@ type ReverseProxySettings struct {
 	DefaultUpstreamMaxIdleConnections int    `json:"defaultUpstreamMaxIdleConnections" gorm:"column:default_upstream_max_idle_connections;not null;default:32"`
 
 	// MemoryPoolBytes is an admission ceiling for reverse-proxy cache and body
-	// rewrite buffers. The 8 GiB default is intentional and is not eagerly
+	// rewrite buffers. The 32 GiB default is intentional and is not eagerly
 	// allocated when the panel starts.
-	MemoryPoolBytes              int64 `json:"memoryPoolBytes" gorm:"column:memory_pool_bytes;not null;default:8589934592"`
-	DefaultRuleMemoryLimitBytes  int64 `json:"defaultRuleMemoryLimitBytes" gorm:"column:default_rule_memory_limit_bytes;not null;default:402653184"`
-	ResponseRewriteInputBytes    int64 `json:"responseRewriteInputBytes" gorm:"column:response_rewrite_input_bytes;not null;default:4194304"`
-	ResponseRewriteOutputBytes   int64 `json:"responseRewriteOutputBytes" gorm:"column:response_rewrite_output_bytes;not null;default:8388608"`
-	ResponseRewriteMaxConcurrent int   `json:"responseRewriteMaxConcurrent" gorm:"column:response_rewrite_max_concurrent;not null;default:32"`
+	MemoryPoolBytes              int64 `json:"memoryPoolBytes" gorm:"column:memory_pool_bytes;not null;default:34359738368"`
+	DefaultRuleMemoryLimitBytes  int64 `json:"defaultRuleMemoryLimitBytes" gorm:"column:default_rule_memory_limit_bytes;not null;default:1073741824"`
+	ResponseRewriteInputBytes    int64 `json:"responseRewriteInputBytes" gorm:"column:response_rewrite_input_bytes;not null;default:134217728"`
+	ResponseRewriteOutputBytes   int64 `json:"responseRewriteOutputBytes" gorm:"column:response_rewrite_output_bytes;not null;default:268435456"`
+	ResponseRewriteMaxConcurrent int   `json:"responseRewriteMaxConcurrent" gorm:"column:response_rewrite_max_concurrent;not null;default:512"`
 
 	UpdatedAt time.Time `json:"updatedAt"`
 	CreatedAt time.Time `json:"createdAt"`
@@ -56,11 +66,11 @@ func DefaultReverseProxySettings() ReverseProxySettings {
 		HTTP2MaxConcurrentStreams:         250,
 		QUICMaxIncomingStreams:            256,
 		DefaultUpstreamMaxIdleConnections: 32,
-		// This is a deliberate capacity limit, not an eager 8 GiB allocation.
-		MemoryPoolBytes:              8 * 1024 * 1024 * 1024,
-		DefaultRuleMemoryLimitBytes:  384 * 1024 * 1024,
-		ResponseRewriteInputBytes:    4 * 1024 * 1024,
-		ResponseRewriteOutputBytes:   8 * 1024 * 1024,
-		ResponseRewriteMaxConcurrent: 32,
+		// This is a deliberate capacity limit, not an eager 32 GiB allocation.
+		MemoryPoolBytes:              32 * 1024 * 1024 * 1024,
+		DefaultRuleMemoryLimitBytes:  1024 * 1024 * 1024,
+		ResponseRewriteInputBytes:    128 * 1024 * 1024,
+		ResponseRewriteOutputBytes:   256 * 1024 * 1024,
+		ResponseRewriteMaxConcurrent: 512,
 	}
 }

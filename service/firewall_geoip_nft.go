@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	firewallGeoMaxNftScriptBytes   = 16 * 1024 * 1024
-	firewallGeoMaxPrefixesPerGroup = 50000
+	firewallGeoMaxNftScriptBytes   = 1 * 1024 * 1024 * 1024
+	firewallGeoMaxPrefixesPerGroup = 1 * 1000 * 1000
 )
 
 type firewallGeoRenderGroup struct {
@@ -26,6 +26,9 @@ type firewallGeoRenderGroup struct {
 func addManagedFirewallGeoRules(rows []model.FirewallGeoRule) error {
 	if len(rows) == 0 {
 		return nil
+	}
+	if err := ensureFirewallGeoActivePrefixLimit(rows); err != nil {
+		return err
 	}
 
 	blockGroups := make(map[string]*firewallGeoRenderGroup)
@@ -60,6 +63,9 @@ func addManagedFirewallGeoRules(rows []model.FirewallGeoRule) error {
 func appendManagedFirewallGeoRulesScript(script *strings.Builder, rows []model.FirewallGeoRule) error {
 	if len(rows) == 0 {
 		return nil
+	}
+	if err := ensureFirewallGeoActivePrefixLimit(rows); err != nil {
+		return err
 	}
 
 	blockGroups := make(map[string]*firewallGeoRenderGroup)

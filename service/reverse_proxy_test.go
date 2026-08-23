@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -93,7 +94,8 @@ func TestReverseProxyHTTP3WebSocketRequestDetection(t *testing.T) {
 			name: "http2 websocket extended connect",
 			req: &http.Request{
 				Method:     http.MethodConnect,
-				Proto:      "websocket",
+				Header:     http.Header{":protocol": []string{"websocket"}},
+				Proto:      "HTTP/2.0",
 				ProtoMajor: 2,
 			},
 			want: false,
@@ -152,7 +154,7 @@ func TestReverseProxyHTTPSListenerNextProtosStrictModes(t *testing.T) {
 				ListenProtocol:            reverseProxyProtocolHTTPS,
 				ListenHTTPVersionStrategy: reverseProxyListenHTTPVersionH2Only,
 			}},
-			want: []string{"h2"},
+			want: []string{"h2", "http/1.1"},
 		},
 		{
 			name: "h2+h3",
@@ -160,7 +162,7 @@ func TestReverseProxyHTTPSListenerNextProtosStrictModes(t *testing.T) {
 				ListenProtocol:            reverseProxyProtocolHTTPS,
 				ListenHTTPVersionStrategy: reverseProxyListenHTTPVersionH2H3,
 			}},
-			want: []string{"h2"},
+			want: []string{"h2", "http/1.1"},
 		},
 		{
 			name: "wss-only",
@@ -168,7 +170,7 @@ func TestReverseProxyHTTPSListenerNextProtosStrictModes(t *testing.T) {
 				ListenProtocol:      reverseProxyProtocolHTTPS,
 				ListenProtocolAlias: "wss",
 			}},
-			want: []string{"http/1.1"},
+			want: []string{"h2", "http/1.1"},
 		},
 		{
 			name: "wss-and-h2-routes",
@@ -176,6 +178,14 @@ func TestReverseProxyHTTPSListenerNextProtosStrictModes(t *testing.T) {
 				{ListenProtocol: reverseProxyProtocolHTTPS, ListenProtocolAlias: "wss"},
 				{ListenProtocol: reverseProxyProtocolHTTPS, ListenHTTPVersionStrategy: reverseProxyListenHTTPVersionH2Only},
 			},
+			want: []string{"h2", "http/1.1"},
+		},
+		{
+			name: "doh-default",
+			rules: []*model.ReverseProxyRule{{
+				ListenProtocol:      reverseProxyProtocolDNS,
+				ListenProtocolAlias: reverseProxyDNSProtocolDoH,
+			}},
 			want: []string{"h2", "http/1.1"},
 		},
 	}
@@ -196,7 +206,7 @@ func TestReverseProxyHTTPSListenerNextProtosStrictModes(t *testing.T) {
 	}
 }
 
-func TestReverseProxyStrictHTTPSRejectsWebSocketTarget(t *testing.T) {
+func TestReverseProxyHTTPSAllowsWebSocketTargetForExtendedConnect(t *testing.T) {
 	openReverseProxyTestDB(t)
 
 	svc := &ReverseProxyService{}
@@ -218,8 +228,8 @@ func TestReverseProxyStrictHTTPSRejectsWebSocketTarget(t *testing.T) {
 		CertificateRecordID: certificateID,
 		IPStrategy:          reverseProxyIPStrategyPreferIPv4,
 	})
-	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "websocket target") {
-		t.Fatalf("strict HTTPS websocket target must be rejected, got %v", err)
+	if err != nil {
+		t.Fatalf("HTTPS listener should allow a websocket target for H1/H2/H3 CONNECT, got %v", err)
 	}
 }
 
@@ -2567,11 +2577,11 @@ func TestReverseProxyDNSAndHTTPListenerSocketConflictMatrix(t *testing.T) {
 		conflicts bool
 	}{
 		{name: "dot_with_h2", dnsAlias: reverseProxyDNSProtocolDoT, httpMode: reverseProxyListenHTTPVersionH2Only, conflicts: true},
-		{name: "dot_with_h3", dnsAlias: reverseProxyDNSProtocolDoT, httpMode: reverseProxyListenHTTPVersionH3Only, conflicts: false},
+		{name: "dot_with_h3", dnsAlias: reverseProxyDNSProtocolDoT, httpMode: reverseProxyListenHTTPVersionH3Only, conflicts: true},
 		{name: "doq_with_h2", dnsAlias: reverseProxyDNSProtocolDoQ, httpMode: reverseProxyListenHTTPVersionH2Only, conflicts: false},
 		{name: "doq_with_h3", dnsAlias: reverseProxyDNSProtocolDoQ, httpMode: reverseProxyListenHTTPVersionH3Only, conflicts: true},
 		{name: "doh_with_h2", dnsAlias: reverseProxyDNSProtocolDoH, httpMode: reverseProxyListenHTTPVersionH2Only, conflicts: true},
-		{name: "doh_with_h3", dnsAlias: reverseProxyDNSProtocolDoH, httpMode: reverseProxyListenHTTPVersionH3Only, conflicts: false},
+		{name: "doh_with_h3", dnsAlias: reverseProxyDNSProtocolDoH, httpMode: reverseProxyListenHTTPVersionH3Only, conflicts: true},
 		{name: "doh3_with_h2", dnsAlias: reverseProxyDNSProtocolDoHH3, httpMode: reverseProxyListenHTTPVersionH2Only, conflicts: false},
 		{name: "doh3_with_h3", dnsAlias: reverseProxyDNSProtocolDoHH3, httpMode: reverseProxyListenHTTPVersionH3Only, conflicts: true},
 	}
@@ -3485,8 +3495,8 @@ func TestReverseProxyDoH3AndH3ShareListenerAndRouteByPath(t *testing.T) {
 	reverseProxyDNSRuntime.mu.Lock()
 	standaloneCount := len(reverseProxyDNSRuntime.running)
 	reverseProxyDNSRuntime.mu.Unlock()
-	if groupCount != 1 || standaloneCount != 0 {
-		t.Fatalf("shared DoH3/H3 must own one HTTP group and no standalone DNS listener: http=%d dns=%d", groupCount, standaloneCount)
+	if groupCount != 2 || standaloneCount != 0 {
+		t.Fatalf("shared DoH3/H3 must own TCP compatibility and UDP H3 groups with no standalone DNS listener: http=%d dns=%d", groupCount, standaloneCount)
 	}
 }
 
@@ -4880,7 +4890,7 @@ func TestReverseProxyHTTPSListenerAcceptsHTTP3Client(t *testing.T) {
 	}
 }
 
-func TestReverseProxyHTTPSListenerH2AndH3RejectHTTP11(t *testing.T) {
+func TestReverseProxyHTTPSListenerH2AndH3AcceptsHTTP11(t *testing.T) {
 	openReverseProxyTestDB(t)
 
 	svc := &ReverseProxyService{}
@@ -4947,13 +4957,13 @@ func TestReverseProxyHTTPSListenerH2AndH3RejectHTTP11(t *testing.T) {
 		},
 	}
 	h1Conn, err := h1Dialer.DialContext(context.Background(), "tcp", "127.0.0.1:"+strconv.Itoa(listenPort))
-	if err == nil {
-		_ = h1Conn.Close()
-		t.Fatal("strict h2+h3 listener accepted a TLS client with HTTP/1.1 ALPN")
+	if err != nil {
+		t.Fatalf("default h2+h3 listener must accept HTTP/1.1 ALPN: %v", err)
 	}
+	_ = h1Conn.Close()
 }
 
-func TestReverseProxyHTTPSListenerRejectsHTTP3WebSocket(t *testing.T) {
+func TestReverseProxyHTTPSListenerSupportsHTTP3WebSocketCONNECT(t *testing.T) {
 	openReverseProxyTestDB(t)
 
 	svc := &ReverseProxyService{}
@@ -5038,14 +5048,24 @@ func TestReverseProxyHTTPSListenerRejectsHTTP3WebSocket(t *testing.T) {
 		t.Fatalf("h3 websocket request failed: %v", err)
 	}
 	defer websocketResponse.Body.Close()
-	if websocketResponse.StatusCode != http.StatusNotImplemented {
+	if websocketResponse.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(websocketResponse.Body)
 		t.Fatalf("unexpected h3 websocket status: %d body=%q", websocketResponse.StatusCode, string(body))
 	}
+	websocketBody, err := io.ReadAll(websocketResponse.Body)
+	if err != nil {
+		t.Fatalf("read h3 websocket fallback body failed: %v", err)
+	}
+	if string(websocketBody) != "ok:/socket" {
+		t.Fatalf("unexpected h3 websocket fallback body: %q", string(websocketBody))
+	}
 	select {
 	case got := <-upstreamRequests:
-		t.Fatalf("h3 websocket request must not reach upstream: %q", got)
-	case <-time.After(250 * time.Millisecond):
+		if got != "GET /socket" {
+			t.Fatalf("unexpected h3 websocket upstream request: %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("h3 websocket request did not reach upstream for WS negotiation")
 	}
 }
 
@@ -5122,8 +5142,8 @@ func TestReverseProxyHTTPSListenerMovesBetweenTCPAndUDPGroups(t *testing.T) {
 	}
 	h3TCP, _, h3TCPListeners, h3TCPPackets := groupFor(reverseProxySocketKindTCP)
 	h3Only, strategy, tcpListeners, udpListeners := groupFor(reverseProxySocketKindUDP)
-	if h3TCP != nil || h3TCPListeners != 0 || h3TCPPackets != 0 || h3Only == nil || h3Only != h2h3UDP || strategy != reverseProxyListenHTTPVersionH3Only || tcpListeners != 0 || udpListeners == 0 {
-		t.Fatalf("h3-only strategy must retain only udp group: tcp=%p/%d/%d udp=%p/%q/%d/%d", h3TCP, h3TCPListeners, h3TCPPackets, h3Only, strategy, tcpListeners, udpListeners)
+	if h3TCP == nil || h3TCPListeners == 0 || h3TCPPackets != 0 || h3Only == nil || h3Only != h2h3UDP || strategy != reverseProxyListenHTTPVersionH3Only || tcpListeners != 0 || udpListeners == 0 {
+		t.Fatalf("h3-only strategy must retain tcp compatibility plus udp H3: tcp=%p/%d/%d udp=%p/%q/%d/%d", h3TCP, h3TCPListeners, h3TCPPackets, h3Only, strategy, tcpListeners, udpListeners)
 	}
 }
 
@@ -5341,10 +5361,10 @@ func TestReverseProxyHTTPSListenerH2OnlyRejectsHTTP3Client(t *testing.T) {
 		},
 	}
 	h1Conn, err := h1Dialer.DialContext(context.Background(), "tcp", "127.0.0.1:"+strconv.Itoa(listenPort))
-	if err == nil {
-		_ = h1Conn.Close()
-		t.Fatal("h2-only listener accepted a TLS client without ALPN h2")
+	if err != nil {
+		t.Fatalf("h2-only compatibility listener should accept H1 ALPN for classic WebSocket Upgrade/CONNECT: %v", err)
 	}
+	_ = h1Conn.Close()
 
 	transport := &http3.Transport{
 		TLSClientConfig: &tls.Config{
@@ -5451,11 +5471,11 @@ func TestReverseProxyHTTPSListenerH3OnlyRejectsTCPHTTPSClient(t *testing.T) {
 	}
 	tcpReq.Host = "example.com"
 	tcpResp, err := tcpClient.Do(tcpReq)
-	if err == nil {
-		_, _ = io.ReadAll(tcpResp.Body)
-		_ = tcpResp.Body.Close()
-		t.Fatal("expected tcp https request to fail for h3-only listener")
+	if err != nil {
+		t.Fatalf("h3-only compatibility listener should accept TCP/H1 HTTP for WebSocket Upgrade/CONNECT: %v", err)
 	}
+	_, _ = io.ReadAll(tcpResp.Body)
+	_ = tcpResp.Body.Close()
 }
 
 func TestReverseProxyVirtualH2ListenerProxiesToVirtualH3Upstream(t *testing.T) {
@@ -6028,6 +6048,7 @@ func TestReverseProxyForwardsWebSocketUpgradeAndPath(t *testing.T) {
 		PathPrefix:          "/app",
 		TargetProtocol:      reverseProxyProtocolHTTP,
 		TargetProtocolAlias: "ws",
+		TargetPath:          "/backend",
 		TargetAddresses:     upstreamHost,
 		TargetPort:          upstreamPort,
 		IPStrategy:          reverseProxyIPStrategyPreferIPv4,
@@ -6067,11 +6088,357 @@ func TestReverseProxyForwardsWebSocketUpgradeAndPath(t *testing.T) {
 	}
 	select {
 	case got := <-upstreamRequests:
-		if got != "/socket?token=abc%2Fdef" {
+		if got != "/backend/socket?token=abc%2Fdef" {
 			t.Fatalf("unexpected websocket upstream path: %q", got)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("upstream did not receive websocket upgrade")
+	}
+}
+
+func TestReverseProxyForwardsHTTP11CONNECTTunnel(t *testing.T) {
+	openReverseProxyTestDB(t)
+
+	svc := &ReverseProxyService{}
+	t.Cleanup(func() {
+		_ = svc.StopRuntime()
+	})
+
+	upstreamListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen upstream tunnel failed: %v", err)
+	}
+	defer upstreamListener.Close()
+	upstreamPort := upstreamListener.Addr().(*net.TCPAddr).Port
+	upstreamDone := make(chan error, 1)
+	go func() {
+		conn, acceptErr := upstreamListener.Accept()
+		if acceptErr != nil {
+			upstreamDone <- acceptErr
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 5)
+		if _, readErr := io.ReadFull(conn, buf); readErr != nil {
+			upstreamDone <- readErr
+			return
+		}
+		_, writeErr := conn.Write(append([]byte("echo:"), buf...))
+		upstreamDone <- writeErr
+	}()
+
+	listenPort := reserveReverseProxyTestPort(t)
+	if err := svc.UpsertRule(ReverseProxyRulePayload{
+		Name:            "http11-connect-tunnel",
+		Enabled:         true,
+		ListenProtocol:  reverseProxyProtocolHTTP,
+		ListenPort:      listenPort,
+		Hosts:           "example.com",
+		TargetProtocol:  reverseProxyProtocolHTTP,
+		TargetAddresses: "127.0.0.1",
+		TargetPort:      upstreamPort,
+		IPStrategy:      reverseProxyIPStrategyPreferIPv4,
+	}); err != nil {
+		t.Fatalf("upsert CONNECT tunnel rule failed: %v", err)
+	}
+
+	client, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(listenPort), 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial CONNECT listener failed: %v", err)
+	}
+	defer client.Close()
+	if _, err := io.WriteString(client, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\nhello"); err != nil {
+		t.Fatalf("write CONNECT request failed: %v", err)
+	}
+	reader := bufio.NewReader(client)
+	response, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatalf("read CONNECT response failed: %v", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		response.Body.Close()
+		t.Fatalf("CONNECT returned status %d", response.StatusCode)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatalf("close CONNECT response body failed: %v", err)
+	}
+	echo := make([]byte, len("echo:hello"))
+	if _, err := io.ReadFull(reader, echo); err != nil {
+		t.Fatalf("read CONNECT tunnel payload failed: %v", err)
+	}
+	if string(echo) != "echo:hello" {
+		t.Fatalf("unexpected CONNECT tunnel payload %q", string(echo))
+	}
+	select {
+	case err := <-upstreamDone:
+		if err != nil {
+			t.Fatalf("upstream CONNECT tunnel failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream CONNECT tunnel did not finish")
+	}
+}
+
+func TestReverseProxyForwardsHTTP2ExtendedWebSocketCONNECT(t *testing.T) {
+	openReverseProxyTestDB(t)
+
+	svc := &ReverseProxyService{}
+	t.Cleanup(func() {
+		_ = svc.StopRuntime()
+	})
+
+	upstreamPath := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath <- r.URL.RequestURI()
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = conn.CloseNow()
+		for {
+			typ, data, readErr := conn.Read(context.Background())
+			if readErr != nil {
+				return
+			}
+			if writeErr := conn.Write(context.Background(), typ, data); writeErr != nil {
+				return
+			}
+		}
+	}))
+	defer upstream.Close()
+	upstreamHost, upstreamPort := splitReverseProxyTestServerAddress(t, upstream.URL)
+	listenPort := reserveReverseProxyTestPort(t)
+	certificateID := createReverseProxyTestCertificateRecord(t, "example.com")
+	if err := svc.UpsertRule(ReverseProxyRulePayload{
+		Name:                "h2-extended-websocket-connect",
+		Enabled:             true,
+		ListenProtocol:      reverseProxyProtocolHTTPS,
+		ListenPort:          listenPort,
+		Hosts:               "example.com",
+		TargetProtocol:      reverseProxyProtocolHTTP,
+		TargetProtocolAlias: "ws",
+		TargetAddresses:     upstreamHost,
+		TargetPort:          upstreamPort,
+		CertificateRecordID: certificateID,
+		IPStrategy:          reverseProxyIPStrategyPreferIPv4,
+	}); err != nil {
+		t.Fatalf("upsert HTTP/2 websocket CONNECT rule failed: %v", err)
+	}
+
+	transport := &http2.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: "example.com"},
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+	requestBody, requestWriter := io.Pipe()
+	req, err := http.NewRequest(http.MethodConnect, "https://127.0.0.1:"+strconv.Itoa(listenPort)+"/socket?x=1", requestBody)
+	if err != nil {
+		t.Fatalf("build HTTP/2 extended CONNECT request failed: %v", err)
+	}
+	req.Host = "example.com"
+	req.Header.Set(":protocol", "websocket")
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		_ = requestWriter.Close()
+	}()
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("HTTP/2 extended CONNECT failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("HTTP/2 extended CONNECT returned status=%d body=%q", resp.StatusCode, string(body))
+	}
+	select {
+	case got := <-upstreamPath:
+		if got != "/socket?x=1" {
+			t.Fatalf("unexpected translated websocket path %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("translated websocket handshake did not reach upstream")
+	}
+}
+
+func TestReverseProxyForwardsHTTP2ExtendedWebSocketCONNECTBidirectional(t *testing.T) {
+	openReverseProxyTestDB(t)
+	enableReverseProxyHTTP2ExtendedConnect()
+
+	svc := &ReverseProxyService{}
+	t.Cleanup(func() { _ = svc.StopRuntime() })
+
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			http.Error(w, "expected H1 websocket fallback", http.StatusBadRequest)
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			typ, data, readErr := conn.Read(context.Background())
+			if readErr != nil {
+				return
+			}
+			if writeErr := conn.Write(context.Background(), typ, data); writeErr != nil {
+				return
+			}
+		}
+	}))
+	upstream.EnableHTTP2 = true
+	upstream.StartTLS()
+	defer upstream.Close()
+
+	upstreamHost, upstreamPort := splitReverseProxyTestServerAddress(t, upstream.URL)
+	listenPort := reserveReverseProxyTestPort(t)
+	certificateID := createReverseProxyTestCertificateRecord(t, "example.com")
+	if err := svc.UpsertRule(ReverseProxyRulePayload{
+		Name:                "h2-extended-websocket-bidirectional",
+		Enabled:             true,
+		ListenProtocol:      reverseProxyProtocolHTTPS,
+		ListenPort:          listenPort,
+		Hosts:               "example.com",
+		TargetProtocol:      reverseProxyProtocolHTTPS,
+		TargetAddresses:     upstreamHost,
+		TargetPort:          upstreamPort,
+		HTTPVersionStrategy: reverseProxyHTTPVersionH2Only,
+		CertificateRecordID: certificateID,
+		IPStrategy:          reverseProxyIPStrategyPreferIPv4,
+		UpstreamTLSVerify:   false,
+	}); err != nil {
+		t.Fatalf("upsert bidirectional HTTP/2 websocket rule failed: %v", err)
+	}
+
+	transport := &http2.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: "example.com"}}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+	requestBody, requestWriter := io.Pipe()
+	req, err := http.NewRequest(http.MethodConnect, "https://127.0.0.1:"+strconv.Itoa(listenPort)+"/socket", requestBody)
+	if err != nil {
+		t.Fatalf("build bidirectional HTTP/2 request failed: %v", err)
+	}
+	req.Host = "example.com"
+	req.Header.Set(":protocol", "websocket")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("bidirectional HTTP/2 CONNECT failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("bidirectional HTTP/2 CONNECT returned status=%d body=%q", resp.StatusCode, string(body))
+	}
+	if n, err := requestWriter.Write(reverseProxyTestMaskedWebSocketTextFrame("hello-h2")); err != nil {
+		t.Fatalf("write downstream WebSocket frame failed: %v", err)
+	} else if n == 0 {
+		t.Fatal("WebSocket frame write returned zero bytes")
+	}
+	got, err := reverseProxyTestReadWebSocketTextFrame(resp.Body)
+	if err != nil {
+		t.Fatalf("read upstream WebSocket echo failed: %v", err)
+	}
+	if got != "hello-h2" {
+		t.Fatalf("unexpected upstream WebSocket echo %q", got)
+	}
+	_ = requestWriter.Close()
+	_ = resp.Body.Close()
+}
+
+func reverseProxyTestMaskedWebSocketTextFrame(payload string) []byte {
+	mask := [4]byte{1, 2, 3, 4}
+	frame := make([]byte, 2+4+len(payload))
+	frame[0] = 0x81
+	frame[1] = 0x80 | byte(len(payload))
+	copy(frame[2:6], mask[:])
+	for i := range payload {
+		frame[6+i] = payload[i] ^ mask[i%len(mask)]
+	}
+	return frame
+}
+
+func reverseProxyTestReadWebSocketTextFrame(r io.Reader) (string, error) {
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return "", err
+	}
+	if header[0]&0x0f != 0x1 {
+		return "", fmt.Errorf("unexpected websocket opcode 0x%x", header[0]&0x0f)
+	}
+	if header[1]&0x80 != 0 || header[1]&0x7f >= 126 {
+		return "", errors.New("unsupported websocket test frame")
+	}
+	payload := make([]byte, int(header[1]&0x7f))
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return "", err
+	}
+	return string(payload), nil
+}
+
+func TestReverseProxyForwardsHTTP3ExtendedWebSocketCONNECT(t *testing.T) {
+	openReverseProxyTestDB(t)
+
+	svc := &ReverseProxyService{}
+	t.Cleanup(func() {
+		_ = svc.StopRuntime()
+	})
+
+	upstreamPath := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath <- r.URL.RequestURI()
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = conn.CloseNow()
+	}))
+	defer upstream.Close()
+	upstreamHost, upstreamPort := splitReverseProxyTestServerAddress(t, upstream.URL)
+	listenPort := reserveReverseProxyTestPort(t)
+	certificateID := createReverseProxyTestCertificateRecord(t, "example.com")
+	if err := svc.UpsertRule(ReverseProxyRulePayload{
+		Name:                "h3-extended-websocket-connect",
+		Enabled:             true,
+		ListenProtocol:      reverseProxyProtocolHTTPS,
+		ListenPort:          listenPort,
+		Hosts:               "example.com",
+		TargetProtocol:      reverseProxyProtocolHTTP,
+		TargetProtocolAlias: "ws",
+		TargetAddresses:     upstreamHost,
+		TargetPort:          upstreamPort,
+		CertificateRecordID: certificateID,
+		IPStrategy:          reverseProxyIPStrategyPreferIPv4,
+	}); err != nil {
+		t.Fatalf("upsert HTTP/3 websocket CONNECT rule failed: %v", err)
+	}
+
+	transport := &http3.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: "example.com"}}
+	defer transport.Close()
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+	req, err := http.NewRequest(http.MethodConnect, "https://127.0.0.1:"+strconv.Itoa(listenPort)+"/socket?x=3", nil)
+	if err != nil {
+		t.Fatalf("build HTTP/3 extended CONNECT request failed: %v", err)
+	}
+	req.Host = "example.com"
+	req.Proto = "websocket"
+	req.ProtoMajor = 3
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("HTTP/3 extended CONNECT failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("HTTP/3 extended CONNECT returned status=%d body=%q", resp.StatusCode, string(body))
+	}
+	select {
+	case got := <-upstreamPath:
+		if got != "/socket?x=3" {
+			t.Fatalf("unexpected translated HTTP/3 websocket path %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("translated HTTP/3 websocket handshake did not reach upstream")
 	}
 }
 

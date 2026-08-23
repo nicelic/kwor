@@ -981,7 +981,7 @@ func (s *MihomoCoreManagerService) getDownloadAsset(version string, target Mihom
 func (s *MihomoCoreManagerService) getDownloadAssetContext(ctx context.Context, version string, target MihomoCoreDownloadTarget) (string, error) {
 	apiURL := fmt.Sprintf("https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/%s", version)
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: coreReleaseAssetRequestTimeout}
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return "", err
@@ -1145,7 +1145,7 @@ func (s *MihomoCoreManagerService) downloadCoreWithContext(operationContext cont
 	}
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageDownloading)
 
-	client := &http.Client{Timeout: 600 * time.Second}
+	client := &http.Client{Timeout: coreBinaryDownloadTimeout}
 	req, err := http.NewRequestWithContext(operationContext, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		err = fmt.Errorf("create download request failed: %v", err)
@@ -1367,7 +1367,7 @@ func (s *MihomoCoreManagerService) downloadCoreFromURLWithContext(operationConte
 	}
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageDownloading)
 
-	client := &http.Client{Timeout: 600 * time.Second}
+	client := &http.Client{Timeout: coreBinaryDownloadTimeout}
 	req, err := http.NewRequestWithContext(operationContext, "GET", downloadURL, nil)
 	if err != nil {
 		err = fmt.Errorf("create request failed: %v", err)

@@ -201,12 +201,12 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 setlocal EnableDelayedExpansion
-set "SOURCE_EXCLUDE_DIRS="%RELEASE_DIR%" "%CD%\release" "%CD%\tmp" "%CD%\temp_frontend\node_modules" "%CD%\temp_frontend\dist" "%CD%\web\html" "%CD%\Promanager_data" "%CD%\db" "%CD%\bin" "%CD%\backup" "%CD%\.git" "%CD%\.vscode" "%CD%\.cache" "%CD%\.claude" "%CD%\.codex" "%CD%\tools""
+set "SOURCE_EXCLUDE_DIRS="%RELEASE_DIR%" "%CD%\release" "%CD%\tmp" "%CD%\temp_frontend\node_modules" "%CD%\temp_frontend\dist" "%CD%\web\html" "%CD%\Promanager_data" "%CD%\db" "%CD%\bin" "%CD%\backup" "%CD%\.git" "%CD%\.gocache" "%CD%\.vscode" "%CD%\.cache" "%CD%\.claude" "%CD%\.codex" "%CD%\tools""
 for /d %%D in ("%CD%\.release-work-*") do set "SOURCE_EXCLUDE_DIRS=!SOURCE_EXCLUDE_DIRS! "%%~fD""
 for /d %%D in ("%CD%\.shadowquic-build-*") do set "SOURCE_EXCLUDE_DIRS=!SOURCE_EXCLUDE_DIRS! "%%~fD""
 robocopy "%CD%" "%SOURCE_STAGE%" /E /COPY:DAT /DCOPY:DAT /R:1 /W:1 ^
     /XD !SOURCE_EXCLUDE_DIRS! ^
-    /XF "*.exe" "*.tar.gz" "*.zip" "gcm-diagnose.log" "kwor" "sui" "main" >nul
+    /XF "*.exe" "*.tar.gz" "*.zip" "gcm-diagnose.log" "outbound_scan.txt" "*count-only" "build-final.log" "kwor" "sui" "main" >nul
 set "ROBOCOPY_EXIT=!ERRORLEVEL!"
 endlocal & set "ROBOCOPY_EXIT=%ROBOCOPY_EXIT%"
 if %ROBOCOPY_EXIT% GEQ 8 (
@@ -231,6 +231,12 @@ if %ERRORLEVEL% NEQ 0 (
 if not exist "%SOURCE_STAGE%\README.md" (
     echo.
     echo [FAILED] Source archive staging is missing README.md!
+    goto :failed
+)
+
+if exist "%SOURCE_STAGE%\.gocache\NUL" (
+    echo.
+    echo [FAILED] Source archive staging contains local Go build cache .gocache
     goto :failed
 )
 

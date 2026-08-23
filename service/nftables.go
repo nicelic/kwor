@@ -35,7 +35,7 @@ import (
 // - output: meta l4proto {tcp,udp} th sport <port> counter comment "..."
 
 const (
-	nftCommandOutputLimit          = 4 << 20
+	nftCommandOutputLimit          = 32 << 20
 	nftReadSnapshotCacheMaxBytes   = 8 << 20
 	nftReadSnapshotCacheMaxEntries = 256
 

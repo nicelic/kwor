@@ -1,11 +1,16 @@
 package service
 
 import (
+	"bufio"
 	"bytes"
 	"container/list"
 	"context"
+	"crypto/rand"
+	"crypto/sha1"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -422,14 +427,30 @@ func reverseProxyIsWebSocketAlias(alias string) bool {
 }
 
 func reverseProxyIsHTTP3WebSocketRequest(r *http.Request) bool {
-	return r != nil &&
-		r.ProtoMajor == 3 &&
-		r.Method == http.MethodConnect &&
-		strings.EqualFold(strings.TrimSpace(r.Proto), "websocket")
+	return reverseProxyIsExtendedWebSocketConnectRequest(r) && r.ProtoMajor == 3
+}
+
+// reverseProxyIsExtendedWebSocketConnectRequest recognizes RFC 8441 / RFC
+// 9220 WebSocket Extended CONNECT requests.  HTTP/3 exposes the :protocol
+// pseudo-header as Request.Proto, while x/net/http2 keeps the value in the
+// synthetic ":protocol" header.  Accept both representations so the handler
+// behaves consistently across the two server implementations and in tests.
+func reverseProxyIsExtendedWebSocketConnectRequest(r *http.Request) bool {
+	if r == nil || r.Method != http.MethodConnect || r.ProtoMajor < 2 {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get(":protocol")), "websocket") {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(r.Proto), "websocket")
+}
+
+func reverseProxyIsCONNECTRequest(r *http.Request) bool {
+	return r != nil && r.Method == http.MethodConnect
 }
 
 func reverseProxyIsWebSocketUpgradeRequest(r *http.Request) bool {
-	if r == nil || r.ProtoMajor != 1 || !strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket") {
+	if r == nil || r.ProtoMajor != 1 || r.Method != http.MethodGet || !strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket") {
 		return false
 	}
 	for _, value := range strings.Split(r.Header.Get("Connection"), ",") {
@@ -438,6 +459,65 @@ func reverseProxyIsWebSocketUpgradeRequest(r *http.Request) bool {
 		}
 	}
 	return false
+}
+
+func reverseProxyValidateWebSocketHandshake(response *http.Response, request *http.Request) error {
+	if response == nil || response.StatusCode != http.StatusSwitchingProtocols {
+		return errors.New("upstream did not return 101 Switching Protocols")
+	}
+	if !strings.EqualFold(strings.TrimSpace(response.Header.Get("Upgrade")), "websocket") {
+		return errors.New("upstream WebSocket response is missing Upgrade: websocket")
+	}
+	connectionUpgrade := false
+	for _, value := range strings.Split(response.Header.Get("Connection"), ",") {
+		if strings.EqualFold(strings.TrimSpace(value), "upgrade") {
+			connectionUpgrade = true
+			break
+		}
+	}
+	if !connectionUpgrade {
+		return errors.New("upstream WebSocket response is missing Connection: Upgrade")
+	}
+	key := ""
+	if request != nil {
+		key = strings.TrimSpace(request.Header.Get("Sec-WebSocket-Key"))
+	}
+	if key == "" {
+		return errors.New("WebSocket request is missing Sec-WebSocket-Key")
+	}
+	digest := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	expected := base64.StdEncoding.EncodeToString(digest[:])
+	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(response.Header.Get("Sec-WebSocket-Accept"))), []byte(expected)) != 1 {
+		return errors.New("upstream WebSocket Sec-WebSocket-Accept mismatch")
+	}
+	return nil
+}
+
+// reverseProxyTargetSupportsWebSocket reports whether a configured target has
+// an HTTP-shaped connection on which the proxy can perform a WebSocket
+// handshake. Raw DNS wire transports (UDP/TCP/DoT/DoQ) remain CONNECT-only;
+// DoH/DoH3 are HTTP targets and can also carry a WebSocket upgrade when the
+// peer requests it.
+func reverseProxyTargetSupportsWebSocket(rule *model.ReverseProxyRule) bool {
+	if rule == nil {
+		return false
+	}
+	if reverseProxyIsWebSocketAlias(rule.TargetProtocolAlias) {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(rule.TargetProtocol), reverseProxyProtocolHTTP) ||
+		strings.EqualFold(strings.TrimSpace(rule.TargetProtocol), reverseProxyProtocolHTTPS) {
+		return true
+	}
+	return reverseProxyIsHTTPDNSAlias(rule.TargetProtocolAlias)
+}
+
+func reverseProxyTargetUsesTLS(rule *model.ReverseProxyRule) bool {
+	if rule == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(rule.TargetProtocol), reverseProxyProtocolHTTPS) ||
+		reverseProxyDNSProtocolUsesTLS(rule.TargetProtocolAlias)
 }
 
 type reverseProxyListenBind struct {
@@ -822,6 +902,28 @@ type reverseProxyCountedConn struct {
 	net.Conn
 	onClose func()
 	once    sync.Once
+}
+
+func (c *reverseProxyCountedConn) CloseWrite() error {
+	if c == nil || c.Conn == nil {
+		return nil
+	}
+	if halfCloser, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return halfCloser.CloseWrite()
+	}
+	return nil
+}
+
+// reverseProxyCloseWrite performs only the write half of a tunnel close when
+// the underlying connection supports it.  A full Close here would terminate
+// the peer-to-client direction while the opposite copy is still active.
+func reverseProxyCloseWrite(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	if halfCloser, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = halfCloser.CloseWrite()
+	}
 }
 
 // reverseProxyTrackedClientConn keeps the connection lifecycle visible after
@@ -2550,11 +2652,6 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		return reverseProxyNormalizedRule{}, err
 	}
 	normalized.httpVersionStrategy = httpVersionStrategy
-	if normalized.listenProtocol == reverseProxyProtocolHTTPS &&
-		!reverseProxyIsWebSocketAlias(normalized.listenProtocolAlias) &&
-		reverseProxyIsWebSocketAlias(normalized.targetProtocolAlias) {
-		return reverseProxyNormalizedRule{}, common.NewError("strict HTTPS H2/H3 listener cannot proxy a websocket target; use WSS or HTTP listener")
-	}
 	normalized.upstreamTLSVerify = reverseProxyPayloadTLSVerify(payload.UpstreamTLSVerify, payload.upstreamTLSVerifyDecoded, payload.upstreamTLSVerifySet, normalized.targetProtocol == reverseProxyProtocolHTTPS)
 
 	if normalized.listenProtocol == reverseProxyProtocolHTTPS {
@@ -3407,7 +3504,9 @@ func reverseProxyHTTPListenerUsesSockets(protocol string, listenStrategy string)
 		case reverseProxyListenHTTPVersionH2Only:
 			return true, false
 		case reverseProxyListenHTTPVersionH3Only:
-			return false, true
+			// Keep a TCP compatibility endpoint for HTTP/1.1 Upgrade/CONNECT
+			// and HTTP/2 Extended CONNECT while the UDP endpoint serves H3.
+			return true, true
 		default:
 			return true, true
 		}
@@ -3416,30 +3515,25 @@ func reverseProxyHTTPListenerUsesSockets(protocol string, listenStrategy string)
 }
 
 // reverseProxyHTTPSListenerNextProtos describes the protocols that the TCP
-// side of a TLS listener may negotiate.  HTTP/1.1 is deliberately limited to
-// WSS routes because ordinary HTTPS, H2-only, and H2+H3 routes must not expose
-// an HTTP/1.1 service on the secure listener.
+// side of a TLS listener may negotiate. Every HTTPS-shaped listener exposes
+// both H2 and H1.1: H1.1 is required for classic WebSocket Upgrade/CONNECT,
+// while H2 is required for RFC 8441 Extended CONNECT. The selected strategy
+// remains useful for routing/advertising decisions, but it must not remove
+// either WebSocket-capable wire entry from the shared endpoint.
 func reverseProxyHTTPSListenerNextProtos(rules []*model.ReverseProxyRule) []string {
-	hasWebSocket := false
-	hasHTTP2 := false
+	if len(rules) == 0 {
+		return []string{"h2", "http/1.1"}
+	}
 	for _, rule := range rules {
 		if rule == nil {
 			continue
 		}
-		alias := normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
-		if reverseProxyIsWebSocketAlias(alias) {
-			hasWebSocket = true
-			continue
-		}
-		hasHTTP2 = true
+		// Touch normalization here so malformed legacy rows do not affect
+		// the advertised result, while still keeping both protocols enabled.
+		_, _ = normalizeReverseProxyListenHTTPVersionStrategy(rule.ListenHTTPVersionStrategy, rule.ListenProtocol)
+		_ = normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
 	}
-	if !hasHTTP2 && hasWebSocket {
-		return []string{"http/1.1"}
-	}
-	if hasWebSocket {
-		return []string{"h2", "http/1.1"}
-	}
-	return []string{"h2"}
+	return []string{"h2", "http/1.1"}
 }
 
 // reverseProxyRequireHTTP2ALPN rejects TLS clients that do not offer H2.  A
@@ -4753,6 +4847,13 @@ func reverseProxyGroupListenHTTPVersionStrategy(protocol string, socketKind stri
 		if rule == nil {
 			continue
 		}
+		// DoH is an HTTPS/TCP listener. Its DNS alias does not carry the
+		// ordinary HTTPS version field, so use the normal dual H2/H1.1 mode
+		// instead of silently falling back to the legacy H2-only mode.
+		alias := normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
+		if socketKind == reverseProxySocketKindTCP && reverseProxyIsHTTPDNSAlias(alias) {
+			return reverseProxyListenHTTPVersionH2H3
+		}
 		strategy, err := normalizeReverseProxyListenHTTPVersionStrategy(rule.ListenHTTPVersionStrategy, rule.ListenProtocol)
 		if err == nil && strategy == reverseProxyListenHTTPVersionH2H3 {
 			return reverseProxyListenHTTPVersionH2H3
@@ -5353,6 +5454,7 @@ func (s *ReverseProxyService) newListenerGroup(key string, rules []*model.Revers
 				},
 			}
 			if group.protocol == reverseProxyProtocolHTTPS {
+				enableReverseProxyHTTP2ExtendedConnect()
 				nextProtos := reverseProxyHTTPSListenerNextProtos(rules)
 				tlsConfig := &tls.Config{
 					GetCertificate: group.getCertificate,
@@ -6383,21 +6485,17 @@ func (g *reverseProxyListenerGroup) newHandler() http.Handler {
 			http.Error(w, http.StatusText(status), status)
 			return
 		}
-		if reverseProxyIsHTTP3WebSocketRequest(r) {
-			http.Error(w, http.StatusText(http.StatusNotImplemented), http.StatusNotImplemented)
-			return
-		}
 		listenAlias := normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
 		targetAlias := normalizeReverseProxyProtocolAlias(rule.TargetProtocolAlias, rule.TargetProtocol)
-		g.mu.RLock()
-		strictHTTPS2 := strings.EqualFold(g.protocol, reverseProxyProtocolHTTPS) && g.socketKind == reverseProxySocketKindTCP
-		g.mu.RUnlock()
-		if strictHTTPS2 && !reverseProxyIsWebSocketAlias(listenAlias) && r.ProtoMajor != 2 {
-			http.Error(w, http.StatusText(http.StatusHTTPVersionNotSupported), http.StatusHTTPVersionNotSupported)
-			return
-		}
+		// H1 Upgrade and H2/H3 Extended CONNECT are both accepted on the
+		// same logical HTTPS rule. ALPN/QUIC selects the wire protocol.
+		// A single HTTPS endpoint may expose H1 Upgrade and H2/H3 Extended
+		// CONNECT simultaneously.  ALPN chooses the wire protocol; do not
+		// reject H1 here merely because the rule's preferred strategy is H2.
 		altSvc := g.http3AdvertisementHeader(host, sni, r.ProtoMajor, externalPort)
-		if (reverseProxyIsWebSocketAlias(listenAlias) || reverseProxyIsWebSocketAlias(targetAlias)) && !reverseProxyIsWebSocketUpgradeRequest(r) {
+		websocketRequest := reverseProxyIsWebSocketUpgradeRequest(r) || reverseProxyIsExtendedWebSocketConnectRequest(r)
+		if (reverseProxyIsWebSocketAlias(listenAlias) || reverseProxyIsWebSocketAlias(targetAlias)) &&
+			!websocketRequest && !reverseProxyIsCONNECTRequest(r) {
 			if altSvc != "" {
 				w.Header().Set("Alt-Svc", altSvc)
 			}
@@ -6411,9 +6509,33 @@ func (g *reverseProxyListenerGroup) newHandler() http.Handler {
 				http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
 				return
 			}
-			if reverseProxyIsWebSocketUpgradeRequest(r) {
+			if websocketRequest || reverseProxyIsCONNECTRequest(r) {
 				g.setHijackedConnectionRule(connID, rule.Id)
 			}
+		}
+		if reverseProxyIsCONNECTRequest(r) {
+			if !reverseProxyResources.tryAcquireHTTP() {
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+				return
+			}
+			defer reverseProxyResources.releaseHTTP()
+			reverseProxyRuntime.clearMismatch(extractRemoteIP(r.RemoteAddr))
+			reverseProxyRuntime.reportRuleState(rule.Id, "running", "")
+			g.forwardCONNECT(w, r, rule, altSvc)
+			return
+		}
+		if reverseProxyIsWebSocketUpgradeRequest(r) {
+			if !reverseProxyResources.tryAcquireHTTP() {
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+				return
+			}
+			defer reverseProxyResources.releaseHTTP()
+			reverseProxyRuntime.clearMismatch(extractRemoteIP(r.RemoteAddr))
+			reverseProxyRuntime.reportRuleState(rule.Id, "running", "")
+			g.forwardWebSocketUpgrade(w, r, rule, altSvc)
+			return
 		}
 		if reverseProxyIsHTTPDNSAlias(listenAlias) {
 			g.mu.RLock()
@@ -7800,6 +7922,479 @@ func reverseProxyApplyBoundedBodyReplacements(body []byte, replacements []revers
 		index++
 	}
 	return out, true
+}
+
+// dialReverseProxyCONNECT opens the raw TCP leg for an RFC CONNECT tunnel.
+// CONNECT carries an opaque byte stream, so it intentionally bypasses the
+// HTTP RoundTripper (and any HTTP content-coding layer) after selecting the
+// configured target address. The upstream connection lease is released when
+// the returned connection is closed.
+type reverseProxyCONNECTDialResult struct {
+	conn       net.Conn
+	serverName string
+	hostHeader string
+}
+
+func (g *reverseProxyListenerGroup) dialReverseProxyCONNECT(ctx context.Context, rule *model.ReverseProxyRule) (reverseProxyCONNECTDialResult, error) {
+	if g == nil || rule == nil || g.service == nil {
+		return reverseProxyCONNECTDialResult{}, errors.New("connect tunnel is unavailable")
+	}
+	targets := decodeReverseProxyList(rule.TargetAddresses)
+	if len(targets) == 0 || rule.TargetPort <= 0 || rule.TargetPort > 65535 {
+		return reverseProxyCONNECTDialResult{}, errors.New("connect tunnel target is invalid")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, reverseProxyRequestTimeout)
+	defer cancel()
+	var firstErr error
+	for _, target := range targets {
+		candidates, err := g.service.resolveTargetCandidates(ctx, target, rule.TargetPort, rule.IPStrategy)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		for _, candidate := range reorderCandidatesByIPStrategy(candidates, rule.IPStrategy) {
+			if g.resolvedTargetLoopsToListener(rule, candidate.address) {
+				if firstErr == nil {
+					firstErr = errors.New("connect tunnel target points back to the local listener")
+				}
+				continue
+			}
+			limiter, acquired := g.acquireUpstreamConnection(rule.Id)
+			if !acquired {
+				if firstErr == nil {
+					firstErr = errors.New("connect tunnel upstream connection limit reached")
+				}
+				continue
+			}
+			release := func() { g.releaseUpstreamConnection(rule.Id, limiter) }
+			dialer := &net.Dialer{Timeout: 12 * time.Second, KeepAlive: reverseProxyUpstreamTCPKeepAlive}
+			conn, dialErr := dialer.DialContext(ctx, "tcp", net.JoinHostPort(candidate.address, strconv.Itoa(rule.TargetPort)))
+			if dialErr == nil {
+				return reverseProxyCONNECTDialResult{
+					conn:       &reverseProxyCountedConn{Conn: conn, onClose: release},
+					serverName: candidate.serverName,
+					hostHeader: candidate.hostHeader,
+				}, nil
+			}
+			release()
+			if firstErr == nil {
+				firstErr = dialErr
+			}
+		}
+	}
+	if firstErr == nil {
+		firstErr = errors.New("connect tunnel target could not be reached")
+	}
+	return reverseProxyCONNECTDialResult{}, firstErr
+}
+
+func (g *reverseProxyListenerGroup) forwardCONNECT(w http.ResponseWriter, r *http.Request, rule *model.ReverseProxyRule, altSvc string) {
+	// Keep the client-facing H2/H3 Extended CONNECT stream full duplex. The
+	// target leg uses the raw TCP/H1 Upgrade bridge because standard
+	// RoundTripper APIs may wait for request EOF before exposing response
+	// headers, which is incompatible with an interactive WebSocket stream.
+	dialResult, err := g.dialReverseProxyCONNECT(r.Context(), rule)
+	if err != nil {
+		if altSvc != "" {
+			w.Header().Set("Alt-Svc", altSvc)
+		}
+		reverseProxyRuntime.reportRuleState(rule.Id, "proxy_error", err.Error())
+		reverseProxyWriteGatewayError(w, err)
+		return
+	}
+	if reverseProxyIsExtendedWebSocketConnectRequest(r) && reverseProxyTargetSupportsWebSocket(rule) {
+		g.forwardExtendedWebSocketCONNECT(w, r, rule, altSvc, dialResult)
+		return
+	}
+	upstream := dialResult.conn
+
+	// HTTP/1.1 CONNECT switches the connection into a byte tunnel and must use
+	// Hijacker so the response headers are followed by raw bytes. HTTP/2 and
+	// HTTP/3 keep the tunnel on the request stream and support full duplex body
+	// traffic without hijacking the connection.
+	if r.ProtoMajor == 1 {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			_ = upstream.Close()
+			http.Error(w, http.StatusText(http.StatusHTTPVersionNotSupported), http.StatusHTTPVersionNotSupported)
+			return
+		}
+		clientConn, buffered, hijackErr := hijacker.Hijack()
+		if hijackErr != nil {
+			_ = upstream.Close()
+			reverseProxyWriteGatewayError(w, hijackErr)
+			return
+		}
+		if altSvc != "" {
+			_, _ = buffered.WriteString("Alt-Svc: " + altSvc + "\r\n")
+		}
+		_, _ = buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+		_ = buffered.Flush()
+		go func() {
+			_, _ = io.Copy(upstream, buffered)
+			reverseProxyCloseWrite(upstream)
+		}()
+		_, _ = io.Copy(clientConn, upstream)
+		_ = upstream.Close()
+		_ = clientConn.Close()
+		return
+	}
+
+	if controller := http.NewResponseController(w); controller != nil {
+		_ = controller.EnableFullDuplex()
+	}
+	if altSvc != "" {
+		w.Header().Set("Alt-Svc", altSvc)
+	}
+	w.WriteHeader(http.StatusOK)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	clientDone := make(chan struct{})
+	requestBody := r.Body
+	if requestBody == nil {
+		requestBody = http.NoBody
+	}
+	go func() {
+		_, _ = io.Copy(upstream, requestBody)
+		reverseProxyCloseWrite(upstream)
+		close(clientDone)
+	}()
+	_, _ = io.Copy(w, upstream)
+	// Stop the request-body copy when the peer closes first. Without closing
+	// the body, an H2/H3 CONNECT stream whose client keeps its write side open
+	// can leave this handler blocked forever after the upstream has gone away.
+	_ = requestBody.Close()
+	_ = upstream.Close()
+	<-clientDone
+}
+
+// forwardWebSocketUpgrade handles the classic HTTP/1.1 WebSocket opening
+// handshake. It deliberately bypasses httputil.ReverseProxy and the response
+// compression writer: once the upstream returns 101, both legs carry opaque
+// WebSocket frames and must remain byte-for-byte unchanged.
+func (g *reverseProxyListenerGroup) forwardWebSocketUpgrade(w http.ResponseWriter, r *http.Request, rule *model.ReverseProxyRule, altSvc string) {
+	if !reverseProxyTargetSupportsWebSocket(rule) {
+		http.Error(w, http.StatusText(http.StatusUpgradeRequired), http.StatusUpgradeRequired)
+		return
+	}
+	dialResult, err := g.dialReverseProxyCONNECT(r.Context(), rule)
+	if err != nil {
+		reverseProxyRuntime.reportRuleState(rule.Id, "proxy_error", err.Error())
+		reverseProxyWriteGatewayError(w, err)
+		return
+	}
+	upstream := dialResult.conn
+	if reverseProxyTargetUsesTLS(rule) {
+		tlsConfig := buildReverseProxyUpstreamTLSConfig(dialResult.serverName, rule.UpstreamTLSVerify, []string{"http/1.1"})
+		tlsConn := tls.Client(upstream, tlsConfig)
+		if err := tlsConn.HandshakeContext(r.Context()); err != nil {
+			_ = upstream.Close()
+			reverseProxyWriteGatewayError(w, err)
+			return
+		}
+		upstream = tlsConn
+	}
+
+	path := "/"
+	rawPath := ""
+	if r.URL != nil {
+		incomingPath, incomingRawPath := reverseProxyTrimMatchedPathPrefix(r.URL.Path, r.URL.RawPath, rule.PathPrefix)
+		basePath := normalizeReverseProxyPath(rule.TargetPath, false)
+		if basePath == "/" {
+			basePath = ""
+		}
+		path = strings.TrimSuffix(basePath, "/") + "/" + strings.TrimPrefix(incomingPath, "/")
+		if path == "" {
+			path = "/"
+		}
+		if incomingRawPath != "" && basePath == "" {
+			rawPath = incomingRawPath
+		} else {
+			rawPath = (&url.URL{Path: path}).EscapedPath()
+		}
+	}
+	requestURL := &url.URL{Path: path, RawPath: rawPath, RawQuery: r.URL.RawQuery}
+	requestURI := requestURL.EscapedPath()
+	if requestURI == "" {
+		requestURI = "/"
+	}
+	if requestURL.RawQuery != "" {
+		requestURI += "?" + requestURL.RawQuery
+	}
+	keyBytes := make([]byte, 16)
+	if _, err := rand.Read(keyBytes); err != nil {
+		_ = upstream.Close()
+		reverseProxyWriteGatewayError(w, err)
+		return
+	}
+	upstreamRequest := &http.Request{
+		Method:     http.MethodGet,
+		URL:        requestURL,
+		Host:       dialResult.hostHeader,
+		RequestURI: requestURI,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     make(http.Header),
+	}
+	for key, values := range r.Header {
+		lower := strings.ToLower(key)
+		if lower == "connection" || lower == "upgrade" || lower == "host" || lower == "sec-websocket-key" || lower == "sec-websocket-accept" {
+			continue
+		}
+		upstreamRequest.Header[key] = append([]string(nil), values...)
+	}
+	upstreamRequest.Header.Set("Connection", "Upgrade")
+	upstreamRequest.Header.Set("Upgrade", "websocket")
+	upstreamRequest.Header.Set("Sec-WebSocket-Version", "13")
+	websocketKey := strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key"))
+	if websocketKey == "" {
+		websocketKey = base64.StdEncoding.EncodeToString(keyBytes)
+	}
+	upstreamRequest.Header.Set("Sec-WebSocket-Key", websocketKey)
+	if err := upstreamRequest.Write(upstream); err != nil {
+		_ = upstream.Close()
+		reverseProxyWriteGatewayError(w, err)
+		return
+	}
+	reader := bufio.NewReader(upstream)
+	response, err := http.ReadResponse(reader, upstreamRequest)
+	if err != nil {
+		_ = upstream.Close()
+		reverseProxyWriteGatewayError(w, err)
+		return
+	}
+	if response.StatusCode != http.StatusSwitchingProtocols {
+		for key, values := range response.Header {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+		w.WriteHeader(response.StatusCode)
+		_, _ = io.Copy(w, response.Body)
+		_ = response.Body.Close()
+		_ = upstream.Close()
+		return
+	}
+	if err := reverseProxyValidateWebSocketHandshake(response, upstreamRequest); err != nil {
+		_ = response.Body.Close()
+		_ = upstream.Close()
+		reverseProxyRuntime.reportRuleState(rule.Id, "proxy_error", err.Error())
+		reverseProxyWriteGatewayError(w, err)
+		return
+	}
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		_ = response.Body.Close()
+		_ = upstream.Close()
+		http.Error(w, http.StatusText(http.StatusHTTPVersionNotSupported), http.StatusHTTPVersionNotSupported)
+		return
+	}
+	clientConn, clientBuffered, err := hijacker.Hijack()
+	if err != nil {
+		_ = response.Body.Close()
+		_ = upstream.Close()
+		reverseProxyWriteGatewayError(w, err)
+		return
+	}
+	statusText := response.Status
+	if statusText == "" {
+		statusText = "101 Switching Protocols"
+	}
+	_, _ = clientBuffered.WriteString("HTTP/1.1 " + statusText + "\r\n")
+	for key, values := range response.Header {
+		for _, value := range values {
+			_, _ = clientBuffered.WriteString(key + ": " + value + "\r\n")
+		}
+	}
+	if altSvc != "" {
+		_, _ = clientBuffered.WriteString("Alt-Svc: " + altSvc + "\r\n")
+	}
+	_, _ = clientBuffered.WriteString("\r\n")
+	if err := clientBuffered.Flush(); err != nil {
+		_ = upstream.Close()
+		_ = clientConn.Close()
+		return
+	}
+	go func() {
+		_, _ = io.Copy(upstream, clientBuffered)
+		reverseProxyCloseWrite(upstream)
+	}()
+	_, _ = io.Copy(clientConn, reader)
+	_ = upstream.Close()
+	_ = clientConn.Close()
+}
+
+// forwardExtendedWebSocketCONNECT translates an RFC 8441/9220 WebSocket
+// Extended CONNECT into the traditional HTTP/1.1 Upgrade handshake expected
+// by most configured ws/wss upstreams. WebSocket frames are identical after
+// the handshake, so the established stream is then relayed byte-for-byte.
+func (g *reverseProxyListenerGroup) forwardExtendedWebSocketCONNECT(w http.ResponseWriter, r *http.Request, rule *model.ReverseProxyRule, altSvc string, dialResult reverseProxyCONNECTDialResult) {
+	upstream := dialResult.conn
+	if reverseProxyTargetUsesTLS(rule) {
+		tlsConfig := buildReverseProxyUpstreamTLSConfig(dialResult.serverName, rule.UpstreamTLSVerify, []string{"http/1.1"})
+		tlsConn := tls.Client(upstream, tlsConfig)
+		if err := tlsConn.HandshakeContext(r.Context()); err != nil {
+			_ = upstream.Close()
+			reverseProxyWriteGatewayError(w, err)
+			return
+		}
+		upstream = tlsConn
+	}
+
+	incomingPath, incomingRawPath := "/", ""
+	if r.URL != nil {
+		incomingPath, incomingRawPath = reverseProxyTrimMatchedPathPrefix(r.URL.Path, r.URL.RawPath, rule.PathPrefix)
+		if incomingPath == "" {
+			incomingPath = "/"
+		}
+	}
+	basePath := normalizeReverseProxyPath(rule.TargetPath, false)
+	if basePath == "/" {
+		basePath = ""
+	}
+	requestURL := &url.URL{}
+	requestURL.Path = strings.TrimSuffix(basePath, "/") + "/" + strings.TrimPrefix(incomingPath, "/")
+	if requestURL.Path == "" {
+		requestURL.Path = "/"
+	}
+	if incomingRawPath != "" && basePath == "" {
+		requestURL.RawPath = incomingRawPath
+	}
+	if r.URL != nil {
+		requestURL.RawQuery = r.URL.RawQuery
+	}
+	requestURI := requestURL.EscapedPath()
+	if requestURI == "" {
+		requestURI = "/"
+	}
+	if requestURL.RawQuery != "" {
+		requestURI += "?" + requestURL.RawQuery
+	}
+	keyBytes := make([]byte, 16)
+	if _, err := rand.Read(keyBytes); err != nil {
+		_ = upstream.Close()
+		reverseProxyWriteGatewayError(w, err)
+		return
+	}
+	upstreamRequest := &http.Request{
+		Method:     http.MethodGet,
+		URL:        requestURL,
+		Host:       dialResult.hostHeader,
+		RequestURI: requestURI,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     make(http.Header),
+	}
+	for key, values := range r.Header {
+		lower := strings.ToLower(key)
+		if strings.HasPrefix(lower, ":") || lower == "connection" || lower == "upgrade" || lower == "host" || lower == "sec-websocket-key" {
+			continue
+		}
+		upstreamRequest.Header[key] = append([]string(nil), values...)
+	}
+	upstreamRequest.Header.Set("Connection", "Upgrade")
+	upstreamRequest.Header.Set("Upgrade", "websocket")
+	upstreamRequest.Header.Set("Sec-WebSocket-Version", "13")
+	websocketKey := strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key"))
+	if websocketKey == "" {
+		websocketKey = base64.StdEncoding.EncodeToString(keyBytes)
+	}
+	upstreamRequest.Header.Set("Sec-WebSocket-Key", websocketKey)
+	if err := upstreamRequest.Write(upstream); err != nil {
+		_ = upstream.Close()
+		reverseProxyWriteGatewayError(w, err)
+		return
+	}
+	// Keep the buffered reader alive after parsing the 101 response. The
+	// server may have already placed the first WebSocket frame in that buffer;
+	// reading directly from upstream would otherwise lose those bytes.
+	upstreamReader := bufio.NewReader(upstream)
+	response, err := http.ReadResponse(upstreamReader, upstreamRequest)
+	if err != nil {
+		_ = upstream.Close()
+		reverseProxyWriteGatewayError(w, err)
+		return
+	}
+	if response.StatusCode != http.StatusSwitchingProtocols {
+		for key, values := range response.Header {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+		w.WriteHeader(response.StatusCode)
+		_, _ = io.Copy(w, response.Body)
+		_ = response.Body.Close()
+		_ = upstream.Close()
+		return
+	}
+	if err := reverseProxyValidateWebSocketHandshake(response, upstreamRequest); err != nil {
+		_ = response.Body.Close()
+		_ = upstream.Close()
+		reverseProxyRuntime.reportRuleState(rule.Id, "proxy_error", err.Error())
+		reverseProxyWriteGatewayError(w, err)
+		return
+	}
+	for key, values := range response.Header {
+		lower := strings.ToLower(key)
+		if lower == "connection" || lower == "upgrade" || lower == "sec-websocket-accept" {
+			continue
+		}
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	if altSvc != "" {
+		w.Header().Set("Alt-Svc", altSvc)
+	}
+	if controller := http.NewResponseController(w); controller != nil {
+		_ = controller.EnableFullDuplex()
+	}
+	w.WriteHeader(http.StatusOK)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	clientDone := make(chan struct{})
+	requestBody := r.Body
+	if requestBody == nil {
+		requestBody = http.NoBody
+	}
+	go func() {
+		_, _ = io.Copy(upstream, requestBody)
+		reverseProxyCloseWrite(upstream)
+		close(clientDone)
+	}()
+	// A 101 response has no net/http response body. The upgraded byte stream is
+	// the buffered reader itself, so relay that reader rather than response.Body.
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := upstreamReader.Read(buf)
+		if n > 0 {
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				break
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+	// The downstream may legally keep the request stream open while the
+	// upstream closes. Close it to unblock the opposite copy direction before
+	// releasing the upstream connection and request lease.
+	_ = requestBody.Close()
+	_ = response.Body.Close()
+	_ = upstream.Close()
+	<-clientDone
 }
 
 func (g *reverseProxyListenerGroup) forwardRequest(w http.ResponseWriter, r *http.Request, rule *model.ReverseProxyRule, altSvc string) {

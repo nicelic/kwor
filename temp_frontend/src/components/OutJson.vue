@@ -157,14 +157,6 @@ export default {
   data() {
     return {
       inTypes: InTypes,
-      vmessSecurities: [
-        "auto",
-        "none",
-        "zero",
-        "aes-128-gcm",
-        "aes-128-ctr",
-        "chacha20-poly1305",
-      ],
       haveNetwork: [
         InTypes.SOCKS,
         InTypes.Shadowsocks,
@@ -224,6 +216,12 @@ export default {
         delete this.$props.inData.bbr_profile
       }
     },
+    sanitizeMihomoVmessSecurity() {
+      if (this.$props.namespace !== 'mihomo' || this.$props.type !== this.inTypes.VMess) return
+      if (this.$props.inData.out_json?.security === "aes-128-ctr") {
+        this.$props.inData.out_json.security = "auto"
+      }
+    },
     syncHy2HopIntervalInput() {
       const lower = this.usesInboundPortHopBackend ? this.$props.inData.port_hop_interval : this.$props.inData.out_json.hop_interval
       const upper = this.usesInboundPortHopBackend ? this.$props.inData.port_hop_interval_max : this.$props.inData.out_json.hop_interval_max
@@ -259,6 +257,19 @@ export default {
     },
   },
   computed: {
+    vmessSecurities(): string[] {
+      const securities = [
+        "auto",
+        "none",
+        "zero",
+        "aes-128-gcm",
+        "aes-128-ctr",
+        "chacha20-poly1305",
+      ]
+      return this.$props.namespace === 'mihomo'
+        ? securities.filter((security) => security !== "aes-128-ctr")
+        : securities
+    },
     needNetwork():boolean {
       if (this.isMihomoUnsupportedClientNetworkType) {
         return false
@@ -367,6 +378,7 @@ export default {
     namespace: {
       handler() {
         this.removeUnsupportedMihomoClientNetwork()
+        this.sanitizeMihomoVmessSecurity()
         this.syncHy2HopIntervalInput()
       },
       immediate: true,
@@ -374,6 +386,7 @@ export default {
     type: {
       handler() {
         this.removeUnsupportedMihomoClientNetwork()
+        this.sanitizeMihomoVmessSecurity()
         this.syncHy2HopIntervalInput()
       },
       immediate: true,
@@ -381,6 +394,7 @@ export default {
     inData: {
       handler() {
         this.removeUnsupportedMihomoClientNetwork()
+        this.sanitizeMihomoVmessSecurity()
         this.syncHy2HopIntervalInput()
       },
       immediate: true,

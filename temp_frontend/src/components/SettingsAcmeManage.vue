@@ -534,7 +534,7 @@
             </v-col>
             <v-col cols="12" md="2" v-if="isIPCertificateMode">
               <v-chip class="mt-2" color="info" variant="tonal">
-                {{ issueForm.ipAddresses.length }}/100
+                {{ issueForm.ipAddresses.length }}/{{ acmeIPCertificateMaxIPs }}
               </v-chip>
             </v-col>
             <v-col cols="12" md="4">
@@ -1638,7 +1638,9 @@ import { push } from 'notivue'
 
 const acmeInstallRequestTimeout = 35 * 1000
 const acmeRemoveRequestTimeout = 90 * 1000
-const acmeIssueRequestTimeout = 3 * 60 * 1000 + 30 * 1000
+const acmeAccountOperationRequestTimeout = 3 * 60 * 1000 + 30 * 1000
+const acmeDomainCertificateMaxNames = 2048
+const acmeIPCertificateMaxIPs = 2048
 const confirmAction = (action: string) => i18n.global.t(`confirmDialog.actions.${action}`)
 
 type AcmeCertificate = {
@@ -2837,7 +2839,9 @@ const validateIssueDomainInput = (): { domains: string[]; error: string } => {
     seen.add(normalized.value)
     domains.push(normalized.value)
   }
-  if (domains.length > 100) return { domains, error: '域名证书最多支持 100 个域名' }
+  if (domains.length > acmeDomainCertificateMaxNames) {
+    return { domains, error: `域名证书最多支持 ${acmeDomainCertificateMaxNames} 个域名` }
+  }
   return { domains, error: '' }
 }
 
@@ -2880,7 +2884,7 @@ const normalizeIPList = (raw: unknown[]): string[] => {
         result.push(normalized)
       })
   })
-  return result.slice(0, 100)
+  return result
 }
 
 const buildIssueDomains = (): string[] => {
@@ -3089,7 +3093,7 @@ const canSubmitIssue = computed(() => {
   const domains = buildIssueDomains()
   if (domains.length === 0) return false
   if (isIPCertificateMode.value) {
-    if (domains.length > 100) return false
+    if (domains.length > acmeIPCertificateMaxIPs) return false
     if (!['standalone', 'alpn'].includes(issueForm.value.challenge)) return false
   } else {
     if (issueDomainValidationError.value !== '') return false
@@ -3785,7 +3789,7 @@ const refreshIPCertificateOptions = async () => {
         values.push(String(item?.server ?? ''))
       })
     }
-    ipCertificateOptions.value = normalizeIPList(values)
+    ipCertificateOptions.value = normalizeIPList(values).slice(0, acmeIPCertificateMaxIPs)
     if (issueForm.value.ipAddresses.length === 0 && ipCertificateOptions.value.length > 0) {
       issueForm.value.ipAddresses = [ipCertificateOptions.value[0]]
     }
@@ -3833,13 +3837,13 @@ const refreshIPPortStatus = async () => {
 const normalizeIssueIPSelection = (value: unknown) => {
   const raw = Array.isArray(value) ? value : [value]
   const normalized = normalizeIPList(raw)
-  if (raw.length > 100 || normalized.length > 100) {
+  if (raw.length > acmeIPCertificateMaxIPs || normalized.length > acmeIPCertificateMaxIPs) {
     push.warning({
       duration: 3600,
-      message: 'IP 证书最多选择或输入 100 个 IP',
+      message: `IP 证书最多选择或输入 ${acmeIPCertificateMaxIPs} 个 IP`,
     })
   }
-  issueForm.value.ipAddresses = normalized
+  issueForm.value.ipAddresses = normalized.slice(0, acmeIPCertificateMaxIPs)
 }
 
 const stopIssueLogPolling = () => {
@@ -4003,7 +4007,7 @@ const restoreActiveAcmeTask = async () => {
     const storedMsg = await HttpUtils.get('api/acme-task', { id: storedID })
     if (storedMsg.success) {
       const storedTask = normalizeAcmeTask(storedMsg.obj)
-      if (storedTask != null) {
+      if (storedTask != null && !isTerminalAcmeTaskStatus(storedTask.status)) {
         openIssueTaskLog(storedTask)
         return
       }
@@ -4014,8 +4018,9 @@ const restoreActiveAcmeTask = async () => {
   const msg = await HttpUtils.get('api/acme-active-tasks')
   if (!msg.success || !Array.isArray(msg.obj)) return
   const tasks = msg.obj.map(normalizeAcmeTask).filter((item): item is AcmeTask => item != null)
-  if (tasks.length === 0) return
-  openIssueTaskLog(tasks[0])
+  const activeTask = tasks.find(task => !isTerminalAcmeTaskStatus(task.status))
+  if (activeTask == null) return
+  openIssueTaskLog(activeTask)
 }
 
 const pollIssueLog = async (): Promise<void> => {
@@ -4064,6 +4069,7 @@ const pollIssueLog = async (): Promise<void> => {
           push.error({ duration: 5200, message: session.error })
         }
       }
+      issueLogVisible.value = false
       return
     }
     shouldContinue = true
@@ -4603,10 +4609,10 @@ const issueCertificate = async () => {
     })
     return
   }
-  if (isIPCertificateMode.value && domains.length > 100) {
+  if (isIPCertificateMode.value && domains.length > acmeIPCertificateMaxIPs) {
     push.warning({
       duration: 4000,
-      message: 'IP 证书最多支持 100 个 IP',
+      message: `IP 证书最多支持 ${acmeIPCertificateMaxIPs} 个 IP`,
     })
     return
   }
@@ -5074,7 +5080,7 @@ const rotateAcmeAccountKey = async () => {
     const msg = await HttpUtils.post('api/acme-account-key-rotate', {
       id: form.id,
       accountKeyLength: form.accountKeyLength,
-    }, { timeout: acmeIssueRequestTimeout })
+    }, { timeout: acmeAccountOperationRequestTimeout })
     if (msg.success) {
       applyActionResult(msg.obj)
       acmeAccountRotateVisible.value = false

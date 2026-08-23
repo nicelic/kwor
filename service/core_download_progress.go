@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	coreDownloadProgressTTL = 30 * time.Minute
+	coreDownloadProgressTTL = 40 * time.Minute
 
 	coreDownloadStatusRunning = "running"
 	coreDownloadStatusSuccess = "success"

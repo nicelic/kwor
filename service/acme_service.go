@@ -72,15 +72,17 @@ const (
 	acmeLogMaxLineBytes                            = 4 * 1024
 	acmeLogTTL                                     = 30 * time.Minute
 	acmeTaskTTL                                    = 30 * time.Minute
-	acmeTaskQueueCapacity                          = 32
+	acmeTerminalTaskCleanupDelay                   = 5 * time.Second
+	acmeTaskQueueCapacity                          = 4096
 	acmeTaskResultOutputMaxRunes                   = 4096
-	acmeDomainCertificateMaxNames                  = 100
+	acmeTaskDeadline                               = 30 * time.Minute
+	acmeDomainCertificateMaxNames                  = 2048
 	acmeCertificateTypeDomain                      = "domain"
 	acmeCertificateTypeIP                          = "ip"
 	acmeLEProductionDirectory                      = "https://acme-v02.api.letsencrypt.org/directory"
 	acmeLEStagingDirectory                         = "https://acme-staging-v02.api.letsencrypt.org/directory"
 	acmeZeroSSLDirectory                           = "https://acme.zerossl.com/v2/DV90"
-	acmeIPCertificateMaxIPs                        = 100
+	acmeIPCertificateMaxIPs                        = 2048
 	acmeIPCertificatePortHTTP                      = 80
 	acmeIPCertificatePortALPN                      = 443
 	acmeMaskedEnvValue                             = "********"
@@ -1560,10 +1562,6 @@ func (s *AcmeService) Issue(payload AcmeIssuePayload) (*AcmeActionResult, error)
 		logSession.fail(message)
 		return nil, common.NewError(message)
 	}
-	if certificateType == acmeCertificateTypeIP && len(domains) > acmeIPCertificateMaxIPs {
-		logSession.fail("IP 证书最多支持 100 个 IP")
-		return nil, common.NewError("IP 证书最多支持 100 个 IP")
-	}
 	if certificateType == acmeCertificateTypeIP {
 		logSession.append("准备签发 IP: " + strings.Join(domains, ", "))
 	} else {
@@ -1789,7 +1787,7 @@ func (s *AcmeService) Issue(payload AcmeIssuePayload) (*AcmeActionResult, error)
 	logSession.append("手动签发默认强制重新签发，避免复用旧证书")
 
 	logSession.append("执行 acme.sh --issue")
-	output, err := runCommandOutputWithTimeoutEnvLog(3*time.Minute, scriptPath, append(runtime.commandArgs(homeDir), commandArgs...), dnsEnv, logSession)
+	output, err := runCommandOutputWithTimeoutEnvLog(acmeTaskDeadline, scriptPath, append(runtime.commandArgs(homeDir), commandArgs...), dnsEnv, logSession)
 	skippedBecauseDomainsUnchanged := false
 	if err != nil {
 		if isAcmeDomainsNotChangedError(err) {
@@ -2111,7 +2109,7 @@ func (s *AcmeService) Renew(payload AcmeRenewPayload) (*AcmeActionResult, error)
 	} else {
 		logSession.append("普通续签不附加 --force；域名未变化时只同步现有证书")
 	}
-	output, err := runCommandOutputWithTimeoutEnvLog(3*time.Minute, scriptPath, append(runtime.commandArgs(homeDir), commandArgs...), renewEnv, logSession)
+	output, err := runCommandOutputWithTimeoutEnvLog(acmeTaskDeadline, scriptPath, append(runtime.commandArgs(homeDir), commandArgs...), renewEnv, logSession)
 	skippedBecauseDomainsUnchanged := false
 	if err != nil {
 		if isAcmeDomainsNotChangedError(err) {
@@ -5139,7 +5137,11 @@ func normalizeAcmeIssueIdentifiers(text string, certificateType string) []string
 // names, localhost and IP identifiers remain compatible there.
 func validateAcmeIssueIdentifiers(text string, certificateType string) ([]string, error) {
 	if certificateType == acmeCertificateTypeIP {
-		return normalizeAcmeIPIdentifiers(text), nil
+		result := normalizeAcmeIPIdentifiers(text)
+		if err := validateAcmeIssueIdentifierCount(certificateType, len(result)); err != nil {
+			return nil, err
+		}
+		return result, nil
 	}
 
 	normalized := strings.ReplaceAll(text, "\r\n", "\n")
@@ -5162,10 +5164,23 @@ func validateAcmeIssueIdentifiers(text string, certificateType string) ([]string
 		seen[value] = struct{}{}
 		result = append(result, value)
 	}
-	if len(result) > acmeDomainCertificateMaxNames {
-		return nil, common.NewError(fmt.Sprintf("域名证书最多支持 %d 个域名", acmeDomainCertificateMaxNames))
+	if err := validateAcmeIssueIdentifierCount(certificateType, len(result)); err != nil {
+		return nil, err
 	}
 	return result, nil
+}
+
+func validateAcmeIssueIdentifierCount(certificateType string, count int) error {
+	if certificateType == acmeCertificateTypeIP {
+		if count > acmeIPCertificateMaxIPs {
+			return common.NewError(fmt.Sprintf("IP 证书最多支持 %d 个 IP", acmeIPCertificateMaxIPs))
+		}
+		return nil
+	}
+	if count > acmeDomainCertificateMaxNames {
+		return common.NewError(fmt.Sprintf("域名证书最多支持 %d 个域名", acmeDomainCertificateMaxNames))
+	}
+	return nil
 }
 
 func normalizeStrictAcmeDomain(raw string) (string, error) {
@@ -8264,7 +8279,7 @@ func runCommandOutputWithTimeoutEnvContextLogInDir(parent context.Context, timeo
 				logSession.append(line)
 			}
 		}
-		if scanErr := scanner.Err(); scanErr != nil && logSession != nil {
+		if scanErr := scanner.Err(); scanErr != nil && logSession != nil && ctx.Err() == nil && !errors.Is(scanErr, os.ErrClosed) {
 			logSession.append("读取命令输出失败: " + scanErr.Error())
 		}
 	}
@@ -8376,6 +8391,7 @@ type acmeLogSession struct {
 	updatedAt  int64
 	finishedAt int64
 	ctx        context.Context
+	cancel     context.CancelFunc
 	operation  *KworManagedOperationHandle
 }
 
@@ -8463,20 +8479,26 @@ func (s *acmeLogSession) ensureManagedOperation(kind string) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancel := context.WithTimeout(ctx, acmeTaskDeadline)
 	attached := false
 	acmeLogSessionStore.mu.Lock()
 	if s.operation == nil {
 		s.ctx = ctx
+		s.cancel = cancel
 		s.operation = operation
 		s.updatedAt = time.Now().Unix()
 		attached = true
 	}
 	acmeLogSessionStore.mu.Unlock()
 	if !attached {
+		cancel()
 		operation.Done()
 		return func() {}, nil
 	}
-	return operation.Done, nil
+	return func() {
+		cancel()
+		operation.Done()
+	}, nil
 }
 
 func (s *acmeLogSession) trackCommand(cmd *exec.Cmd) error {
@@ -8551,6 +8573,19 @@ func (s *acmeLogStore) getAfter(id string, after int) *AcmeLogSessionView {
 		}
 	}
 	return session.snapshotAfterLocked(after)
+}
+
+func (s *acmeLogStore) remove(id string) {
+	if s == nil {
+		return
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.sessions, id)
+	s.mu.Unlock()
 }
 
 func (s *acmeLogStore) pruneLocked(now int64) {

@@ -43,8 +43,16 @@ _tmp_mieru_official/
 # Log files
 *.log*
 .cache
+.gocache/
+
+# Local release and diagnostic working files
+.release-work-*/
+outbound_scan.txt
+--count-only
+build-final.log
 
 # Editor directories and files
 .idea
 .vscode
-.claude
+.claude/
+.codex/

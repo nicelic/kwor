@@ -774,7 +774,7 @@ func (s *CoreManagerService) getDownloadAssetContext(ctx context.Context, versio
 	apiURL := fmt.Sprintf("https://api.github.com/repos/SagerNet/sing-box/releases/tags/%s", version)
 	explicitLibc := strings.TrimSpace(target.Libc) != ""
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: coreReleaseAssetRequestTimeout}
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return "", err
@@ -1042,7 +1042,7 @@ func (s *CoreManagerService) downloadCoreWithContext(operationContext context.Co
 	logger.Info("开始下载 sing-box: ", downloadURL)
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageDownloading)
 
-	client := &http.Client{Timeout: 600 * time.Second}
+	client := &http.Client{Timeout: coreBinaryDownloadTimeout}
 	req, err := http.NewRequestWithContext(operationContext, http.MethodGet, downloadURL, nil)
 	if err != nil {
 		err = fmt.Errorf("创建下载请求失败: %v", err)
@@ -2627,7 +2627,7 @@ func (s *CoreManagerService) downloadCoreFromURLWithContext(operationContext con
 	logger.Info("start downloading sing-box from custom url: ", downloadURL)
 	SetCoreDownloadProgressStage(sessionID, coreDownloadStageDownloading)
 
-	client := &http.Client{Timeout: 600 * time.Second}
+	client := &http.Client{Timeout: coreBinaryDownloadTimeout}
 	req, err := http.NewRequestWithContext(operationContext, "GET", downloadURL, nil)
 	if err != nil {
 		err = fmt.Errorf("create request failed: %v", err)

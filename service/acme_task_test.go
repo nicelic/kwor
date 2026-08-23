@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"fmt"
 	"os/exec"
 	"strings"
 	"testing"
@@ -46,6 +47,22 @@ func TestAcmeTaskStoreQueuesCompletesAndFails(t *testing.T) {
 	secondDone := waitForAcmeTask(t, store, second.ID, acmeTaskStatusError)
 	if secondDone.Error != "expected task failure" {
 		t.Fatalf("unexpected failed task: %#v", secondDone)
+	}
+}
+
+func TestAcmeTaskStoreUses4096QueueCapacity(t *testing.T) {
+	if acmeTaskQueueCapacity != 4096 {
+		t.Fatalf("ACME task queue capacity = %d, want 4096", acmeTaskQueueCapacity)
+	}
+
+	store := &acmeTaskStore{queue: make(chan acmeTaskJob, acmeTaskQueueCapacity)}
+	for index := 0; index < acmeTaskQueueCapacity; index++ {
+		if !store.enqueueJob(acmeTaskJob{id: fmt.Sprintf("task-%d", index)}) {
+			t.Fatalf("enqueue failed before queue reached capacity at index %d", index)
+		}
+	}
+	if store.enqueueJob(acmeTaskJob{id: "overflow"}) {
+		t.Fatal("enqueue unexpectedly succeeded after the 4096th queued task")
 	}
 }
 

@@ -26,17 +26,21 @@ const (
 	firewallGeoLastRefreshAtKey         = "firewallGeoLastRefreshAt"
 
 	firewallGeoHTTPTimeout                    = 45 * time.Second
-	firewallGeoMaxSourceBytes           int64 = 32 * 1024 * 1024
-	firewallGeoMaxSourcesPerRule              = 4
-	firewallGeoMaxRules                       = 16
-	firewallGeoMaxPrefixCount                 = 100000
-	firewallGeoMaxRuntimePrefixCount          = 100000
-	firewallGeoMaxRefreshBytes          int64 = 64 * 1024 * 1024
-	firewallGeoMaxURLBytes                    = 2048
-	firewallGeoMaxCustomSourceURLsBytes       = 16 * 1024
-	firewallGeoMaxStoredListBytes             = 16 * 1024
-	firewallGeoMaxRuleNameBytes               = 256
-	firewallGeoMaxRuleDescriptionBytes        = 4096
+	firewallGeoMaxSourceBytes           int64 = 1 * 1024 * 1024 * 1024
+	firewallGeoMaxSourcesPerRule              = 32
+	firewallGeoMaxCachedFilesPerRule          = 2048
+	firewallGeoMaxRules                       = 2048
+	firewallGeoMaxPrefixCount                 = 1 * 1000 * 1000
+	firewallGeoMaxActivePrefixCount           = 1 * 1000 * 1000
+	firewallGeoMaxRuntimePrefixCount          = 10 * 1000 * 1000
+	firewallGeoMaxRefreshBytes          int64 = 10 * 1024 * 1024 * 1024
+	firewallGeoMaxURLBytes                    = 1 * 1024 * 1024
+	firewallGeoMaxCustomSourceURLsBytes       = 1 * 1024 * 1024
+	// Stored JSON lists need room for the 1 MiB custom URL input and JSON
+	// escaping overhead, while remaining bounded during database reads.
+	firewallGeoMaxStoredListBytes      = 8 * 1024 * 1024
+	firewallGeoMaxRuleNameBytes        = 256
+	firewallGeoMaxRuleDescriptionBytes = 4096
 )
 
 var firewallGeoState = struct {
@@ -511,7 +515,7 @@ func loadFirewallGeoRuleCachedPrefixes(row model.FirewallGeoRule) (firewallGeoRe
 		return firewallGeoResolvedPrefixes{}, fmt.Errorf("geo rule has no cached files")
 	}
 
-	if len(files) > firewallGeoMaxSourcesPerRule {
+	if len(files) > firewallGeoMaxCachedFilesPerRule {
 		return firewallGeoResolvedPrefixes{}, fmt.Errorf("geo rule cache has too many files: %d", len(files))
 	}
 	var totalBytes int64
@@ -597,6 +601,27 @@ func ensureFirewallGeoRuntimeLoadedLocked(rows []model.FirewallGeoRule) error {
 		loaded[row.Id] = result
 	}
 	firewallGeoState.loaded = loaded
+	return nil
+}
+
+func ensureFirewallGeoActivePrefixLimit(rows []model.FirewallGeoRule) error {
+	totalPrefixes := 0
+	for _, row := range rows {
+		if !row.Enabled {
+			continue
+		}
+		runtimeEntry, exists := currentFirewallGeoRuntime(row.Id)
+		if !exists {
+			return fmt.Errorf("geo rule runtime missing: %d", row.Id)
+		}
+		if runtimeEntry.PrefixCount > firewallGeoMaxPrefixCount {
+			return fmt.Errorf("geo rule %d prefix count exceeds %d", row.Id, firewallGeoMaxPrefixCount)
+		}
+		if totalPrefixes > firewallGeoMaxActivePrefixCount-runtimeEntry.PrefixCount {
+			return fmt.Errorf("active GeoIP runtime prefixes exceed %d", firewallGeoMaxActivePrefixCount)
+		}
+		totalPrefixes += runtimeEntry.PrefixCount
+	}
 	return nil
 }
 

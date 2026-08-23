@@ -6,12 +6,26 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/alireza0/s-ui/logger"
 )
 
-var singboxCoreDownloadTaskManager = NewManagedDownloadTaskManager("sing-box core download")
-var mihomoCoreDownloadTaskManager = NewManagedDownloadTaskManager("mihomo core download")
+const (
+	coreReleaseAssetRequestTimeout = 300 * time.Second
+	coreBinaryDownloadTimeout      = 30 * time.Minute
+	coreManagedTaskDeadline        = 35 * time.Minute
+	coreManagedTaskTerminalTTL     = 40 * time.Minute
+)
+
+var singboxCoreDownloadTaskManager = NewManagedDownloadTaskManagerWithOptions("sing-box core download", ManagedDownloadTaskManagerOptions{
+	Deadline:    coreManagedTaskDeadline,
+	TerminalTTL: coreManagedTaskTerminalTTL,
+})
+var mihomoCoreDownloadTaskManager = NewManagedDownloadTaskManagerWithOptions("mihomo core download", ManagedDownloadTaskManagerOptions{
+	Deadline:    coreManagedTaskDeadline,
+	TerminalTTL: coreManagedTaskTerminalTTL,
+})
 
 var coreDownloadTaskHandles sync.Map // map[string]*ManagedDownloadTaskHandle
 

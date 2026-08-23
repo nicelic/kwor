@@ -40,6 +40,15 @@ func TestAPIRequestBodyLimit(t *testing.T) {
 	}
 }
 
+func TestDefaultAPIRequestBodyLimitIsInclusive32MiB(t *testing.T) {
+	const want int64 = 32 * 1024 * 1024
+	for _, action := range []string{"port-forward-rule", "unrecognized-action"} {
+		if got := apiRequestBodyLimit(action); got != want {
+			t.Fatalf("apiRequestBodyLimit(%q) = %d, want %d", action, got, want)
+		}
+	}
+}
+
 func TestValidateSingboxRuntimeRetryPayload(t *testing.T) {
 	for _, tt := range []struct {
 		name    string

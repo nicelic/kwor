@@ -22,6 +22,7 @@ const (
 type acmeTask struct {
 	view      AcmeTaskView
 	ctx       context.Context
+	cancel    context.CancelFunc
 	operation *KworManagedOperationHandle
 	managed   *ManagedDownloadTaskHandle
 }
@@ -64,11 +65,12 @@ func (s *acmeTaskStore) enqueue(operation string, title string, run func(logSess
 	if err != nil {
 		return nil, err
 	}
+	operationContext, cancel := context.WithTimeout(operationContext, acmeTaskDeadline)
 
 	now := time.Now().Unix()
 	taskID := newAcmeTaskID()
 	logSessionID := "log-" + taskID
-	entry := &acmeTask{ctx: operationContext, operation: operationHandle, view: AcmeTaskView{
+	entry := &acmeTask{ctx: operationContext, cancel: cancel, operation: operationHandle, view: AcmeTaskView{
 		ID:           taskID,
 		Operation:    operation,
 		Status:       acmeTaskStatusQueued,
@@ -88,6 +90,7 @@ func (s *acmeTaskStore) enqueue(operation string, title string, run func(logSess
 		return cloneAcmeTaskView(&entry.view), nil
 	}
 	s.finish(taskID, nil, fmt.Errorf("ACME 后台任务队列已满，请稍后重试"))
+	cancel()
 	operationHandle.Done()
 	return nil, fmt.Errorf("ACME 后台任务队列已满，请稍后重试")
 }
@@ -243,6 +246,9 @@ func (s *acmeTaskStore) run() {
 			if managed == nil && operation != nil {
 				operation.Done()
 			}
+			if managed == nil {
+				s.cancelTask(job.id)
+			}
 			continue
 		}
 		result, err := runAcmeTaskJob(job.run, logSessionID)
@@ -263,7 +269,23 @@ func (s *acmeTaskStore) run() {
 		if managed == nil && operation != nil {
 			operation.Done()
 		}
+		if managed == nil {
+			s.cancelTask(job.id)
+		}
 	}
+}
+
+func (s *acmeTaskStore) cancelTask(id string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	entry := s.tasks[id]
+	if entry != nil && entry.cancel != nil {
+		entry.cancel()
+		entry.cancel = nil
+	}
+	s.mu.Unlock()
 }
 
 func runAcmeTaskJob(run func(logSessionID string) (*AcmeActionResult, error), logSessionID string) (result *AcmeActionResult, err error) {
@@ -318,6 +340,24 @@ func (s *acmeTaskStore) finish(id string, result *AcmeActionResult, taskErr erro
 	s.mu.Unlock()
 
 	acmeLogSessionStore.setTaskState(view.LogSessionID, view.ID, view.Status, view.Warnings, view.Result, view.Error)
+	s.scheduleTerminalCleanup(view.ID, view.LogSessionID)
+}
+
+func (s *acmeTaskStore) scheduleTerminalCleanup(taskID string, logSessionID string) {
+	if strings.TrimSpace(taskID) == "" {
+		return
+	}
+	time.AfterFunc(acmeTerminalTaskCleanupDelay, func() {
+		s.mu.Lock()
+		entry := s.tasks[taskID]
+		if entry == nil || entry.view.Status == acmeTaskStatusQueued || entry.view.Status == acmeTaskStatusRunning {
+			s.mu.Unlock()
+			return
+		}
+		delete(s.tasks, taskID)
+		s.mu.Unlock()
+		acmeLogSessionStore.remove(logSessionID)
+	})
 }
 
 func (s *acmeTaskStore) get(id string) *AcmeTaskView {
@@ -403,6 +443,7 @@ func (s *acmeTaskStore) finishManaged(id string, result *AcmeActionResult, taskE
 	view := cloneAcmeTaskView(&entry.view)
 	s.mu.Unlock()
 	acmeLogSessionStore.setTaskState(view.LogSessionID, view.ID, view.Status, nil, view.Result, view.Error)
+	s.scheduleTerminalCleanup(view.ID, view.LogSessionID)
 }
 
 func cloneManagedAcmeTaskResult(source *AcmeActionResult) *AcmeActionResult {
@@ -521,4 +562,28 @@ func (s *AcmeService) GetTask(id string) (*AcmeTaskView, error) {
 
 func (s *AcmeService) GetActiveTasks() []AcmeTaskView {
 	return acmeTaskSessionStore.listActive()
+}
+
+// CleanupTaskAndLog drops a terminal task's process-local task and live log
+// state. The caller must take its response snapshot before invoking it.
+func (s *AcmeService) CleanupTaskAndLog(taskID string, logSessionID string) {
+	if s == nil {
+		return
+	}
+	if strings.TrimSpace(taskID) != "" {
+		acmeTaskSessionStore.mu.Lock()
+		entry := acmeTaskSessionStore.tasks[strings.TrimSpace(taskID)]
+		if entry != nil {
+			if entry.cancel != nil {
+				entry.cancel()
+				entry.cancel = nil
+			}
+			delete(acmeTaskSessionStore.tasks, strings.TrimSpace(taskID))
+			if strings.TrimSpace(logSessionID) == "" {
+				logSessionID = entry.view.LogSessionID
+			}
+		}
+		acmeTaskSessionStore.mu.Unlock()
+	}
+	acmeLogSessionStore.remove(logSessionID)
 }

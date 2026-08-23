@@ -20,6 +20,26 @@ func TestNftLimitedOutputBufferRejectsOversizedOutput(t *testing.T) {
 	}
 }
 
+func TestNftLimitedOutputBufferAllowsConfiguredLimit(t *testing.T) {
+	buffer := newNftLimitedOutputBuffer(nftCommandOutputLimit)
+	chunk := make([]byte, 1<<20)
+	for writtenBytes := 0; writtenBytes < nftCommandOutputLimit; writtenBytes += len(chunk) {
+		written, err := buffer.Write(chunk)
+		if err != nil || written != len(chunk) {
+			t.Fatalf("writing configured limit failed at %d bytes: written=%d err=%v", writtenBytes, written, err)
+		}
+	}
+	if buffer.exceeded || buffer.buffer.Len() != nftCommandOutputLimit {
+		t.Fatalf("configured output limit was not fully accepted: exceeded=%v bytes=%d", buffer.exceeded, buffer.buffer.Len())
+	}
+	if err := nftCommandOutputError("nft test", buffer, newNftLimitedOutputBuffer(nftCommandOutputLimit), nil); err != nil {
+		t.Fatalf("configured output limit should be accepted: %v", err)
+	}
+	if written, err := buffer.Write([]byte{0}); !errors.Is(err, errNftCommandOutputLimit) || written != 0 {
+		t.Fatalf("output beyond configured limit was not rejected: written=%d err=%v", written, err)
+	}
+}
+
 func TestParsePortRangeInputNormalizeAndMerge(t *testing.T) {
 	ranges := parsePortRangeInput("3000-2000, 2001:2002, 65536, 0, 100, 100")
 	if len(ranges) != 2 {

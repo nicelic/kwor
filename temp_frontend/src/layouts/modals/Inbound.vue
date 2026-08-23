@@ -1700,7 +1700,7 @@ export default {
     },
     showInboundTransportEditor(): boolean {
       return [this.inTypes.VMess, this.inTypes.Trojan, this.inTypes.VLESS].includes(this.inbound.type) ||
-        Object.hasOwn(this.inbound, 'transport')
+        (this.inbound.type !== this.inTypes.Mieru && Object.hasOwn(this.inbound, 'transport'))
     },
     showInboundMultiplexEditor(): boolean {
       return [this.inTypes.Shadowsocks, this.inTypes.VMess, this.inTypes.Trojan, this.inTypes.VLESS].includes(this.inbound.type) ||

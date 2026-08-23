@@ -56,6 +56,31 @@ func TestManagedDownloadTaskManagerUsesConfiguredDeadline(t *testing.T) {
 	handle.FinishCancelled("cancelled")
 }
 
+func TestManagedDownloadTaskManagerUsesConfiguredTerminalTTL(t *testing.T) {
+	customTTL := 45 * time.Minute
+	manager := NewManagedDownloadTaskManagerWithOptions("test download", ManagedDownloadTaskManagerOptions{
+		TerminalTTL: customTTL,
+	})
+	handle, _, created, err := manager.Start("test-download", "one")
+	if err != nil || !created || handle == nil {
+		t.Fatalf("start task: created=%v handle=%v err=%v", created, handle, err)
+	}
+	handle.FinishSuccess("completed")
+
+	manager.mu.Lock()
+	task := manager.tasks[handle.ID()]
+	if task == nil {
+		manager.mu.Unlock()
+		t.Fatal("expected retained terminal task")
+	}
+	task.status.FinishedAt = time.Now().Add(-customTTL - time.Second).Unix()
+	manager.mu.Unlock()
+
+	if status := manager.Get(""); status.State != managedDownloadTaskIdle {
+		t.Fatalf("expected custom terminal TTL to expire snapshot, got %#v", status)
+	}
+}
+
 func TestManagedDownloadTaskManagerStopAndWorkerCleanup(t *testing.T) {
 	manager := NewManagedDownloadTaskManager("test download")
 	handle, _, created, err := manager.Start("test-download", "one")

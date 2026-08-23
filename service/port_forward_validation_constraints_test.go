@@ -5,6 +5,15 @@ import (
 	"testing"
 )
 
+func TestPortForwardRuleLimitIs2048AndInclusive(t *testing.T) {
+	if portForwardRuleMaxCount != 2048 {
+		t.Fatalf("port-forward rule limit = %d, want 2048", portForwardRuleMaxCount)
+	}
+	if 2048 >= portForwardRuleMaxCount+1 {
+		t.Fatal("the configured rule limit must allow exactly 2048 rules")
+	}
+}
+
 func TestNormalizePortForwardRulePayloadRejectsOversizedAndInvalidText(t *testing.T) {
 	base := PortForwardRulePayload{
 		Name:           "valid",

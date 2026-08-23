@@ -12,11 +12,11 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const apiDefaultRequestMaxBytes int64 = 8 * 1024 * 1024
+const apiDefaultRequestMaxBytes int64 = 32 * 1024 * 1024
 
 // TLS certificate derivation accepts at most 2 MiB of PEM material. Keep a
 // small bounded envelope for JSON/form encoding overhead without exposing the
-// general 8 MiB API limit to certificate parsing endpoints.
+// general 32 MiB API limit to certificate parsing endpoints.
 const apiTLSCertificateRequestMaxBytes int64 = 4 * 1024 * 1024
 
 // Retrying the runtime rebuild takes no mutation payload. Keep this endpoint
@@ -27,7 +27,7 @@ const apiSingboxRuntimeRetryRequestMaxBytes int64 = 4 * 1024
 // Settings may carry both subscription extensions. Each field is capped at
 // 100 MiB after JSON decoding, while quotes, slashes and newlines can expand
 // the encoded request body. Keep a bounded envelope for settings writes;
-// all other API actions retain the 8 MiB default.
+// all other API actions retain the 32 MiB default.
 const apiSettingsRequestMaxBytes int64 = 512 * 1024 * 1024
 
 func applyAPIRequestBodyLimit(c *gin.Context, action string) {

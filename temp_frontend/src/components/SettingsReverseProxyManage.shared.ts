@@ -109,7 +109,7 @@ export const reverseProxyCopy = {
   responseRewriteInputBytes: '正文改写输入上限（字节）',
   responseRewriteOutputBytes: '正文改写输出上限（字节）',
   responseRewriteMaxConcurrent: '正文改写最大并发',
-  resourceMemoryHint: '内存池与正文改写参数会同时约束 DNS 缓存和普通反代正文改写。默认值为 8 GiB 共享池、单规则 384 MiB、输入 4 MiB、输出 8 MiB、并发 32；8 GiB 是按需准入上限，不会在启动时直接分配。',
+  resourceMemoryHint: '内存池与正文改写参数会同时约束 DNS 缓存和普通反代正文改写。默认值为 32 GiB 共享池、单规则 1 GiB、输入 128 MiB、输出 256 MiB、并发 512；32 GiB 是按需准入上限，不会在启动时直接分配。',
   ruleResourceHint: '填写 0 表示不额外限制：本地连接仍受监听组安全阀保护，请求仍受全局 HTTP 并发保护，上游空闲连接使用全局默认值，内存使用全局默认规则上限。',
   resourceInvalid: '资源控制数值无效：连接/并发必须在允许范围内；H2、QUIC 与正文改写并发必须为正整数；内存和正文改写缓冲必须在 500 KiB 到 64 GiB 范围内，且输入加双输出缓冲不得超过默认规则内存上限。',
   resourceSaved: '资源控制已保存',

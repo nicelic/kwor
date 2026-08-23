@@ -21,7 +21,7 @@ const (
 	certificateDisplayIDMax       uint64 = 100000000000
 	certificateListDefaultPerPage        = 20
 	certificateListMaxPerPage            = 100
-	certificateMaterialMaxBytes          = 2 * 1024 * 1024
+	certificateMaterialMaxBytes          = 512 * 1024 * 1024
 )
 
 type CertificateRecordView struct {
@@ -644,7 +644,7 @@ func validateCertificateMaterialTotal(lengths ...int) error {
 			continue
 		}
 		if total > certificateMaterialMaxBytes-length {
-			return common.NewError("证书材料总大小超过 2 MiB 限制")
+			return common.NewError("证书材料总大小超过 512 MiB 限制")
 		}
 		total += length
 	}

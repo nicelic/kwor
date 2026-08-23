@@ -471,7 +471,7 @@ func ensureReverseProxySettingsSingleton(target *gorm.DB) error {
 		var existing model.ReverseProxySettings
 		err := tx.Where("id = ?", settings.Id).First(&existing).Error
 		if err == nil {
-			return nil
+			return migrateReverseProxyResourceDefaults(tx, existing)
 		}
 		if err != nil && !IsNotFound(err) {
 			return err
@@ -488,6 +488,36 @@ func ensureReverseProxySettingsSingleton(target *gorm.DB) error {
 			Where("dns_max_concurrent_queries = ?", 0).
 			Update("dns_max_concurrent_queries", model.ReverseProxyLegacyDNSMaxConcurrentQueries).Error
 	})
+}
+
+// migrateReverseProxyResourceDefaults upgrades only an untouched installation
+// that still has the complete previous built-in resource tuple.  A partial
+// match is treated as a user-customized policy and is preserved as-is.
+func migrateReverseProxyResourceDefaults(tx *gorm.DB, existing model.ReverseProxySettings) error {
+	if existing.MemoryPoolBytes != model.ReverseProxyLegacyMemoryPoolBytes ||
+		existing.DefaultRuleMemoryLimitBytes != model.ReverseProxyLegacyDefaultRuleMemoryLimitBytes ||
+		existing.ResponseRewriteInputBytes != model.ReverseProxyLegacyResponseRewriteInputBytes ||
+		existing.ResponseRewriteOutputBytes != model.ReverseProxyLegacyResponseRewriteOutputBytes ||
+		existing.ResponseRewriteMaxConcurrent != model.ReverseProxyLegacyResponseRewriteMaxConcurrent {
+		return nil
+	}
+
+	defaults := model.DefaultReverseProxySettings()
+	nextRevision := existing.Revision + 1
+	if nextRevision == 0 {
+		nextRevision = defaults.Revision
+	}
+	updates := map[string]interface{}{
+		"revision":                        nextRevision,
+		"memory_pool_bytes":               defaults.MemoryPoolBytes,
+		"default_rule_memory_limit_bytes": defaults.DefaultRuleMemoryLimitBytes,
+		"response_rewrite_input_bytes":    defaults.ResponseRewriteInputBytes,
+		"response_rewrite_output_bytes":   defaults.ResponseRewriteOutputBytes,
+		"response_rewrite_max_concurrent": defaults.ResponseRewriteMaxConcurrent,
+	}
+	return tx.Model(&model.ReverseProxySettings{}).
+		Where("id = ?", existing.Id).
+		Updates(updates).Error
 }
 
 func ensureCertificateRecordIndexes(db *gorm.DB) error {
