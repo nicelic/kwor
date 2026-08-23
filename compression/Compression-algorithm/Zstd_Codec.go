@@ -6,7 +6,9 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-const httpZstdMaximumWindowBytes int64 = 8 << 20
+// zstd encoder windows must be powers of two. The requested 36 MiB policy is
+// therefore rounded down to the largest legal value that does not exceed it.
+const httpZstdMaximumWindowBytes int64 = 32 << 20
 
 func newZstdDecoder(source io.Reader, maxDecodedBytes int64) (io.Reader, io.Closer, error) {
 	maxWindow := httpZstdMaximumWindowBytes
@@ -29,15 +31,18 @@ func newZstdDecoder(source io.Reader, maxDecodedBytes int64) (io.Reader, io.Clos
 	}}, nil
 }
 
-func newZstdEncoder(dst io.Writer, level int) (io.WriteCloser, error) {
+func newZstdEncoder(dst io.Writer, level int, windowBytes int64) (io.WriteCloser, error) {
 	// klauspost/compress exposes stable presets rather than the reference
-	// implementation's numeric 1-22 levels. Level 5 maps to its default,
-	// high-throughput preset.
-	return zstd.NewWriter(dst,
+	// implementation's numeric 1-22 levels. The project's level 8 maps to the
+	// library's better-compression preset (roughly reference levels 7-8).
+	options := []zstd.EOption{
 		zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)),
-		// RFC 9659 requires HTTP zstd content-coding frames to use a window
-		// no larger than 8 MiB for interoperability with browser decoders.
-		zstd.WithWindowSize(int(httpZstdMaximumWindowBytes)),
 		zstd.WithEncoderConcurrency(1),
-	)
+	}
+	if windowBytes > 0 {
+		options = append(options, zstd.WithWindowSize(int(windowBytes)))
+	}
+	// Unknown-length streams keep the codec's own default window. Known large
+	// responses are bounded by encoderWindowBytesForContentLength.
+	return zstd.NewWriter(dst, options...)
 }

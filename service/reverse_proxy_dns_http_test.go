@@ -75,7 +75,7 @@ func TestReverseProxyDNSCompressedHTTP3UpstreamRoundTrip(t *testing.T) {
 		}
 		writer.Header().Set("Content-Type", "application/dns-message")
 		writer.Header().Set("Content-Encoding", string(compressionalgorithm.AlgorithmBrotli))
-		encoder, err := compressionalgorithm.NewEncoder(writer, compressionalgorithm.AlgorithmBrotli, compressionalgorithm.DefaultLevel)
+		encoder, err := compressionalgorithm.NewEncoder(writer, compressionalgorithm.AlgorithmBrotli, compressionalgorithm.DefaultLevelFor(compressionalgorithm.AlgorithmBrotli))
 		if err != nil {
 			t.Errorf("create target response encoder: %v", err)
 			return

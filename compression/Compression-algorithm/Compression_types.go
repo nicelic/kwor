@@ -16,14 +16,28 @@ const (
 )
 
 const (
-	// DefaultLevel is the project-wide compression level.  Individual
-	// libraries map this value to their own level model.
-	DefaultLevel = 5
+	// DefaultLevel is the project's zstd compression level. Other codecs use
+	// DefaultGeneralLevel because their level models and interoperability
+	// limits differ from zstd's.
+	DefaultLevel = 8
+
+	// DefaultGeneralLevel is the default for Brotli, S2, DEFLATE and Gzip.
+	// Snappy ignores numeric levels by design.
+	DefaultGeneralLevel = 6
 
 	// DefaultMinimumResponseSize avoids adding a compression header to very
 	// small responses where the framing overhead is larger than the saving.
 	DefaultMinimumResponseSize int64 = 256
 )
+
+// DefaultLevelFor returns the default numeric input for one codec. A zero
+// level passed to NewEncoder or HTTPResponseWriter selects this value.
+func DefaultLevelFor(algorithm Algorithm) int {
+	if algorithm == AlgorithmZstd {
+		return DefaultLevel
+	}
+	return DefaultGeneralLevel
+}
 
 // fixedPriorityOrder returns a fresh copy of the only order used by the
 // negotiation implementation. Keeping the source order here prevents a

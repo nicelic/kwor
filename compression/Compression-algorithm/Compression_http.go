@@ -13,6 +13,7 @@ import (
 // HTTPResponseOptions controls the streaming response wrapper.
 type HTTPResponseOptions struct {
 	Request *http.Request
+	// Level <= 0 selects the per-algorithm defaults (zstd 8, general codecs 6).
 	Level   int
 	Enabled bool
 	MinSize int64
@@ -43,6 +44,7 @@ type HTTPResponseWriter struct {
 	bodyStarted       bool
 	pending           []byte
 	forceCompression  bool
+	contentLengthHint int64
 }
 
 func NewHTTPResponseWriter(writer http.ResponseWriter, options HTTPResponseOptions) *HTTPResponseWriter {
@@ -168,7 +170,11 @@ func (w *HTTPResponseWriter) Close() error {
 	if w.encoder == nil {
 		return w.encoderError
 	}
-	if err := w.encoder.Close(); err != nil && w.encoderError == nil {
+	encoder := w.encoder
+	// Drop the encoder reference after closing so large codec history buffers
+	// become collectible as soon as the response writer leaves the request.
+	w.encoder = nil
+	if err := encoder.Close(); err != nil && w.encoderError == nil {
 		w.encoderError = err
 	}
 	return w.encoderError
@@ -192,7 +198,7 @@ func (w *HTTPResponseWriter) FlushError() error {
 		return nil
 	}
 	if w.algorithm != AlgorithmIdentity && w.encoder == nil {
-		encoder, err := NewEncoder(w.ResponseWriter, w.algorithm, w.level)
+		encoder, err := w.newEncoder()
 		if err != nil {
 			w.encoderError = err
 			return err
@@ -263,8 +269,15 @@ func (w *HTTPResponseWriter) sendHeader() error {
 		return w.encoderError
 	}
 	if w.algorithm != AlgorithmIdentity {
+		if raw := strings.TrimSpace(w.Header().Get("Content-Length")); raw != "" {
+			if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+				w.contentLengthHint = parsed
+			}
+		}
 		w.Header().Del("Content-Length")
 		w.Header().Del("Content-MD5")
+		w.Header().Del("Digest")
+		w.Header().Del("Content-Digest")
 		// A strong validator identifies the selected representation. The
 		// encoded bytes differ from the upstream identity representation, so
 		// retaining its ETag would make conditional requests ambiguous.
@@ -281,7 +294,7 @@ func (w *HTTPResponseWriter) writeBody(p []byte) (int, error) {
 		return w.ResponseWriter.Write(p)
 	}
 	if w.encoder == nil {
-		encoder, err := NewEncoder(w.ResponseWriter, w.algorithm, w.level)
+		encoder, err := w.newEncoder()
 		if err != nil {
 			w.encoderError = err
 			return 0, err
@@ -289,6 +302,19 @@ func (w *HTTPResponseWriter) writeBody(p []byte) (int, error) {
 		w.encoder = encoder
 	}
 	return w.encoder.Write(p)
+}
+
+func (w *HTTPResponseWriter) newEncoder() (io.WriteCloser, error) {
+	contentLength := w.contentLengthHint
+	if contentLength <= 0 {
+		if raw := strings.TrimSpace(w.Header().Get("Content-Length")); raw != "" {
+			if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+				contentLength = parsed
+			}
+		}
+	}
+	windowBytes := encoderWindowBytesForContentLength(w.algorithm, contentLength)
+	return newEncoder(w.ResponseWriter, w.algorithm, w.level, windowBytes)
 }
 
 func (w *HTTPResponseWriter) shouldBufferForMinimumSize() bool {
@@ -321,6 +347,8 @@ func (w *HTTPResponseWriter) sendNotAcceptable() {
 	w.Header().Del("Content-Length")
 	w.Header().Del("Content-MD5")
 	w.Header().Del("ETag")
+	w.Header().Del("Digest")
+	w.Header().Del("Content-Digest")
 	w.Header().Del("Content-Range")
 	AppendVaryAcceptEncoding(w.Header(), "Accept-Encoding")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")

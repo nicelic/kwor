@@ -24,18 +24,20 @@ zstd > s2 > snappy > br > deflate > gzip
 
 ## 默认等级
 
-统一默认等级为 `5`，定义在 `Compression_types.go`：
+默认等级按算法分开，定义在 `Compression_types.go`：
 
-- Zstandard：映射到 `klauspost/compress/zstd` 的 default 高吞吐预设。
-- Zstandard 的 HTTP 编码器和解码器将窗口限制为不超过 8 MB；这是 HTTP `zstd` 的互操作性要求，不等于解压输出总量上限。
-- S2：等级 `4-6` 映射到 `WriterBetterCompression`。
+- Zstandard：项目默认等级 `8`，映射到 `klauspost/compress/zstd` 的 `SpeedBetterCompression` 档位。
+- Zstandard 的 HTTP 编码器和解码器将窗口限制为不超过 `32 MiB`。用户要求的 `36 MiB` 不能直接用于 zstd 编码器，因为底层窗口必须是 2 的幂；项目取不超过 36 MiB 的最大合法值。这个窗口上限和解压输出总量上限是两个不同的限制。
+- 注意：窗口大于 8 MiB 可能不符合部分浏览器或严格 HTTP zstd 实现的互操作性预期；Codex/目标服务必须以实际客户端和上游能力验证，不能把 32 MiB 视为公网通用兼容值。
+- Brotli、S2、DEFLATE/Gzip：项目默认等级 `6`。S2 的等级 `4-6` 映射到 `WriterBetterCompression`；Brotli 使用 quality `6`；DEFLATE/Gzip 使用 level `6`。
+- Brotli 的标准窗口使用 `lgwin=24`，最大历史窗口约 `16 MiB`；底层 Writer 会按数据增长动态使用缓冲，不在创建时预分配完整窗口。
 - Snappy：使用 framing stream，没有数值等级。
-- Brotli：使用质量等级 `5`。
-- DEFLATE/Gzip：使用等级 `5`。
+- Deflate/Gzip 的格式窗口固定约 `32 KiB`，不能改为 36 MiB。
+- S2 的块大小和 Snappy 的 framing 块大小不是 zstd 窗口，当前不伪造 36 MiB 窗口设置。
 
 ## 接入边界
 
-- 普通 HTTP、HTTPS/H2、H3 监听共享请求体解码和响应编码逻辑。
+- 普通 HTTP、HTTPS/H2、H3 请求体保持不透明，不因压缩功能自动解码、删头或重新封装；只有 DoH/DoH3 的 DNS wire message 入口解码请求体。响应是否解码、改写或重新编码由反代规则和 API passthrough 边界决定。
 - 目标 HTTP/HTTPS/H2/H3 连接显式发送按项目固定顺序排列的六种 `Accept-Encoding`，关闭标准库自动 gzip，收到响应后由本目录解码；目标侧选择与本地监听侧相互独立。
 - 本地 DoH/DoH3 支持压缩的 POST 请求和响应；解压后的 DNS wire message 不得超过 `65535` 字节。DoH 请求使用不支持的 `Content-Encoding` 时返回 `415`，并带上六种可接受编码。
 - 不支持的请求 `Content-Encoding` 返回 `415`，并通过响应 `Accept-Encoding` 告知可接受的六种编码；同名的重复编码头按逗号拼接解析。

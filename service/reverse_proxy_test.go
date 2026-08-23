@@ -415,6 +415,44 @@ func TestReverseProxyDecodeUpstreamResponsePreservesHeadHeaders(t *testing.T) {
 	}
 }
 
+func TestReverseProxyRewriteResponseHeadersOnlyTouchesURLSemanticHeaders(t *testing.T) {
+	header := make(http.Header)
+	header.Set("Location", "https://upstream.example/next")
+	header.Set("X-Signature", "https://upstream.example/signed-value")
+	header.Set("Content-Type", "application/json")
+	plan := reverseProxyResponseRewritePlan{
+		Enabled: true,
+		Replacements: []reverseProxyStringReplacement{{
+			Old: "https://upstream.example",
+			New: "https://local.example/cc",
+		}},
+		ExternalPathPrefix: "/cc",
+	}
+
+	reverseProxyRewriteResponseHeaders(header, plan)
+	if got := header.Get("Location"); got != "https://local.example/cc/next" {
+		t.Fatalf("Location = %q, want URL rewrite", got)
+	}
+	if got := header.Get("X-Signature"); got != "https://upstream.example/signed-value" {
+		t.Fatalf("X-Signature = %q, want unchanged custom header", got)
+	}
+	if got := header.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want unchanged header", got)
+	}
+}
+
+func TestReverseProxyRewriteRelativeHeaderValueRefreshURL(t *testing.T) {
+	if got := reverseProxyRewriteRelativeHeaderValue("Refresh", "5; URL=/login", "/cc"); got != "5; URL=/cc/login" {
+		t.Fatalf("Refresh relative URL = %q, want %q", got, "5; URL=/cc/login")
+	}
+	if got := reverseProxyRewriteRelativeHeaderValue("Refresh", "0;url=https://upstream.example/login", "/cc"); got != "0;url=https://upstream.example/login" {
+		t.Fatalf("Refresh absolute URL = %q, want unchanged absolute URL", got)
+	}
+	if got := reverseProxyRewriteRelativeHeaderValue("Refresh", "5; url=//cdn.example/login", "/cc"); got != "5; url=//cdn.example/login" {
+		t.Fatalf("Refresh network-path URL = %q, want unchanged network-path URL", got)
+	}
+}
+
 func TestReverseProxyResponseRewriteRejectsTruncatedDeclaredBody(t *testing.T) {
 	plan := reverseProxyResponseRewritePlan{
 		Enabled: true,
@@ -2242,12 +2280,12 @@ func TestReverseProxyTrimMatchedPathPrefix_UsesStrictPrefixBoundaries(t *testing
 			wantRawPath: "/88999x/tag/mysql/",
 		},
 		{
-			name:        "normalize encoded slash in upstream remainder",
+			name:        "preserve encoded slash in upstream remainder",
 			path:        "/88999/tag/mysql/",
 			rawPath:     "/88999/tag%2Fmysql/",
 			prefix:      "/88999",
 			wantPath:    "/tag/mysql/",
-			wantRawPath: "/tag/mysql/",
+			wantRawPath: "/tag%2Fmysql/",
 		},
 		{
 			name:        "encoded local prefix falls back to decoded trim",
@@ -2258,12 +2296,12 @@ func TestReverseProxyTrimMatchedPathPrefix_UsesStrictPrefixBoundaries(t *testing
 			wantRawPath: "/tag/mysql/",
 		},
 		{
-			name:        "normalize encoded local prefix and encoded slash",
+			name:        "preserve encoded local prefix and encoded slash",
 			path:        "/app/file/name",
 			rawPath:     "/%61pp/file%2Fname",
 			prefix:      "/app",
 			wantPath:    "/file/name",
-			wantRawPath: "/file/name",
+			wantRawPath: "/file%2Fname",
 		},
 	}
 	for _, tc := range tests {
@@ -7236,13 +7274,13 @@ func TestReverseProxyForwardsStandardXForwardedHeadersOnce(t *testing.T) {
 
 		select {
 		case got := <-headerCh:
-			if got.forValue != "127.0.0.1" {
+			if got.forValue != "198.51.100.10" {
 				t.Fatalf("unexpected X-Forwarded-For value: %q", got.forValue)
 			}
-			if got.forwarded != `for=127.0.0.1;host="`+req.Host+`";proto=http` {
+			if got.forwarded != "for=198.51.100.10;proto=https" {
 				t.Fatalf("unexpected Forwarded value: %q", got.forwarded)
 			}
-			if got.host != req.Host || got.proto != "http" || got.port != strconv.Itoa(listenPort) || got.realIP != "127.0.0.1" {
+			if got.host != "" || got.proto != "" || got.port != "" || got.realIP != "198.51.100.10" {
 				t.Fatalf("unexpected forwarded headers for Host %q: %#v", req.Host, got)
 			}
 		case <-time.After(2 * time.Second):

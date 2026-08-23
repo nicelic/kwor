@@ -10,7 +10,10 @@ import (
 	"github.com/alireza0/s-ui/database/model"
 )
 
-const reverseProxyCompressionLevel = compressionalgorithm.DefaultLevel
+// Zero selects the per-algorithm defaults in NewHTTPResponseWriter: zstd 8,
+// general codecs 6. Keeping this as a sentinel avoids applying zstd's level
+// model to Brotli, S2, DEFLATE or Gzip.
+const reverseProxyCompressionLevel = 0
 
 var reverseProxyCompressionAlgorithmOrder = [...]string{"zstd", "s2", "snappy", "br", "deflate", "gzip"}
 
@@ -204,5 +207,7 @@ func reverseProxyDecodeUpstreamResponse(resp *http.Response, maxDecodedBytes int
 	resp.Header.Del("Content-Length")
 	resp.Header.Del("ETag")
 	resp.Header.Del("Content-MD5")
+	resp.Header.Del("Digest")
+	resp.Header.Del("Content-Digest")
 	return nil
 }

@@ -685,6 +685,26 @@ type reverseProxyTransportBundle struct {
 	Cleanup      func()
 }
 
+type reverseProxyPreserveHeadersRoundTripper struct {
+	base   http.RoundTripper
+	values http.Header
+}
+
+func (t reverseProxyPreserveHeadersRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.base == nil {
+		return nil, errors.New("upstream transport is nil")
+	}
+	if req != nil {
+		for key, values := range t.values {
+			req.Header.Del(key)
+			if values != nil {
+				req.Header[key] = append([]string(nil), values...)
+			}
+		}
+	}
+	return t.base.RoundTrip(req)
+}
+
 type reverseProxyCachedUpstream struct {
 	ResolvedAddress string
 	ServerName      string
@@ -7504,6 +7524,9 @@ func reverseProxyRewriteResponseHeaders(header http.Header, plan reverseProxyRes
 			header[key] = next
 			continue
 		}
+		if !reverseProxyResponseHeaderCarriesURL(key) {
+			continue
+		}
 		next := make([]string, 0, len(values))
 		for _, value := range values {
 			rewritten := reverseProxyApplyStringReplacements(value, plan.Replacements)
@@ -7511,6 +7534,15 @@ func reverseProxyRewriteResponseHeaders(header http.Header, plan reverseProxyRes
 			next = append(next, rewritten)
 		}
 		header[key] = next
+	}
+}
+
+func reverseProxyResponseHeaderCarriesURL(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "location", "content-location", "link", "refresh":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -7690,6 +7722,8 @@ func reverseProxyRewriteResponseBodyWithLimits(resp *http.Response, plan reverse
 	resp.Header.Set("Content-Length", strconv.Itoa(len(rewritten)))
 	resp.Header.Del("ETag")
 	resp.Header.Del("Content-MD5")
+	resp.Header.Del("Digest")
+	resp.Header.Del("Content-Digest")
 	return nil
 }
 
@@ -7783,7 +7817,25 @@ func (g *reverseProxyListenerGroup) forwardRequest(w http.ResponseWriter, r *htt
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	proxy.Transport = transportBundle.RoundTripper
+	forwardedHeaders := make(http.Header)
+	for _, key := range []string{
+		"Forwarded",
+		"X-Forwarded-For",
+		"X-Forwarded-Host",
+		"X-Forwarded-Proto",
+		"X-Forwarded-Port",
+		"X-Real-IP",
+	} {
+		if values, exists := r.Header[http.CanonicalHeaderKey(key)]; exists {
+			forwardedHeaders[http.CanonicalHeaderKey(key)] = append([]string(nil), values...)
+		} else {
+			forwardedHeaders[http.CanonicalHeaderKey(key)] = nil
+		}
+	}
+	proxy.Transport = reverseProxyPreserveHeadersRoundTripper{
+		base:   transportBundle.RoundTripper,
+		values: forwardedHeaders,
+	}
 	rewritePlan := buildReverseProxyResponseRewritePlan(r, rule, targetURL)
 	bodyRewriteEnabled := rewritePlan.Enabled && !rule.ApiPassthrough
 	cleanup := transportBundle.Cleanup
@@ -7814,11 +7866,13 @@ func (g *reverseProxyListenerGroup) forwardRequest(w http.ResponseWriter, r *htt
 		}
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
-		if err := reverseProxyDecodeUpstreamResponse(resp, reverseProxyEffectiveRuleMemoryLimit(rule)); err != nil {
-			return err
+		if !rule.ApiPassthrough {
+			if err := reverseProxyDecodeUpstreamResponse(resp, reverseProxyEffectiveRuleMemoryLimit(rule)); err != nil {
+				return err
+			}
 		}
-		resp.Header.Del("Alt-Svc")
 		if altSvc != "" {
+			resp.Header.Del("Alt-Svc")
 			resp.Header.Set("Alt-Svc", altSvc)
 		}
 		reverseProxyRewriteResponseHeaders(resp.Header, rewritePlan)
@@ -7836,42 +7890,25 @@ func (g *reverseProxyListenerGroup) forwardRequest(w http.ResponseWriter, r *htt
 		originalDirector(req)
 		req.Host = targetURL.Host
 		req.URL.RawQuery = r.URL.RawQuery
-		// Identity forwarding headers are an ingress trust boundary. Never let a
-		// client-provided forwarding chain reach the upstream unchanged.
-		for _, header := range []string{
-			"Forwarded",
-			"X-Forwarded-For",
-			"X-Forwarded-Host",
-			"X-Forwarded-Proto",
-			"X-Forwarded-Port",
-			"X-Real-IP",
-		} {
-			req.Header.Del(header)
-		}
 		targetAcceptEncoding := reverseProxyTargetAcceptEncoding(rule)
 		if rule.ApiPassthrough {
 			// API passthrough preserves the caller's representation contract.
 			// The request body and its Content-Encoding are forwarded unchanged.
 		} else if bodyRewriteEnabled || req.Method == http.MethodHead || req.Header.Get("Range") != "" || reverseProxyIsWebSocketUpgradeRequest(r) {
-			if targetAcceptEncoding == "" {
-				req.Header.Del("Accept-Encoding")
-			} else {
-				req.Header.Set("Accept-Encoding", "identity")
-			}
+			// These representations must be received unencoded so HEAD/Range
+			// metadata and URL/body rewrites describe the actual entity.
+			req.Header.Set("Accept-Encoding", "identity")
 		} else {
 			setReverseProxyAcceptEncoding(req.Header, targetAcceptEncoding)
 		}
-		forwardedScheme := reverseProxyRequestScheme(r, rule.ListenProtocol)
-		clientIP := extractRemoteIP(r.RemoteAddr)
-		req.Header.Set("X-Forwarded-Host", r.Host)
-		req.Header.Set("X-Forwarded-Proto", forwardedScheme)
-		req.Header.Set("X-Forwarded-Port", strconv.Itoa(g.listenPort))
-		req.Header.Set("X-Real-IP", clientIP)
-		req.Header.Set("Forwarded", reverseProxyBuildForwardedHeader(clientIP, r.Host, forwardedScheme))
-		// httputil.ReverseProxy appends the peer address to X-Forwarded-For
-		// after Director returns.  Setting it here would duplicate that address.
 	}
 	reverseProxyRuntime.reportRuleState(rule.Id, "running", "")
+	if rule.ApiPassthrough {
+		// API/SSE passthrough preserves the upstream representation and its
+		// framing. The request header contract was already preserved above.
+		proxy.ServeHTTP(w, r)
+		return
+	}
 	listenCompressionEnabled, _ := reverseProxyListenCompressionOptions(rule)
 	compressedWriter := compressionalgorithm.NewHTTPResponseWriter(w, compressionalgorithm.HTTPResponseOptions{
 		Request: r,
@@ -7913,11 +7950,27 @@ func reverseProxyRewriteRelativeHeaderValue(key string, value string, prefix str
 	if prefix == "" {
 		return value
 	}
-	if strings.EqualFold(key, "Location") {
+	lowerKey := strings.ToLower(strings.TrimSpace(key))
+	if lowerKey == "location" || lowerKey == "content-location" {
 		trimmed := strings.TrimSpace(value)
 		if strings.HasPrefix(trimmed, "/") && !strings.HasPrefix(trimmed, "//") {
 			return reverseProxyJoinExternalPathPrefix(prefix, trimmed)
 		}
+	}
+	if lowerKey == "refresh" {
+		parts := strings.Split(value, ";")
+		for index, part := range parts {
+			trimmed := strings.TrimSpace(part)
+			if len(trimmed) < 4 || !strings.EqualFold(trimmed[:4], "url=") {
+				continue
+			}
+			target := strings.TrimSpace(trimmed[4:])
+			if strings.HasPrefix(target, "/") && !strings.HasPrefix(target, "//") {
+				leading := part[:len(part)-len(strings.TrimLeft(part, " \t"))]
+				parts[index] = leading + trimmed[:4] + reverseProxyJoinExternalPathPrefix(prefix, target)
+			}
+		}
+		return strings.Join(parts, ";")
 	}
 	return value
 }
@@ -8089,12 +8142,15 @@ func reverseProxyTrimMatchedPathPrefix(path string, rawPath string, prefix strin
 	if normalizedPath == "" {
 		normalizedPath = "/"
 	}
+	// Preserve the caller's escaped path whenever there is no configured
+	// prefix. Re-escaping Path here would turn data such as %2F into a real
+	// slash before the request reaches the upstream.
 	normalizedRawPath := strings.TrimSpace(rawPath)
-	if normalizedRawPath == "" {
-		normalizedRawPath = (&url.URL{Path: normalizedPath}).EscapedPath()
-	}
 	if normalizedPrefix == "" {
 		return normalizedPath, normalizedRawPath
+	}
+	if normalizedRawPath == "" {
+		normalizedRawPath = (&url.URL{Path: normalizedPath}).EscapedPath()
 	}
 	if normalizedPath != normalizedPrefix && !strings.HasPrefix(normalizedPath, normalizedPrefix+"/") {
 		return normalizedPath, normalizedRawPath
@@ -8108,7 +8164,69 @@ func reverseProxyTrimMatchedPathPrefix(path string, rawPath string, prefix strin
 	} else if !strings.HasPrefix(trimmedPath, "/") {
 		trimmedPath = "/" + trimmedPath
 	}
+	if normalizedRawPath == "" {
+		return trimmedPath, (&url.URL{Path: trimmedPath}).EscapedPath()
+	}
+	if trimmedRawPath, ok := reverseProxyTrimEscapedPathPrefix(normalizedRawPath, normalizedPrefix); ok {
+		return trimmedPath, trimmedRawPath
+	}
 	return trimmedPath, (&url.URL{Path: trimmedPath}).EscapedPath()
+}
+
+func reverseProxyTrimEscapedPathPrefix(rawPath string, prefix string) (string, bool) {
+	if rawPath == "" || prefix == "" {
+		return rawPath, prefix == ""
+	}
+	decoded := make([]byte, 0, len(rawPath))
+	boundaries := make([]int, 0, len(rawPath))
+	for index := 0; index < len(rawPath); {
+		var value byte
+		if rawPath[index] == '%' {
+			if index+2 >= len(rawPath) {
+				return "", false
+			}
+			hi, okHigh := fromHexDigit(rawPath[index+1])
+			lo, okLow := fromHexDigit(rawPath[index+2])
+			if !okHigh || !okLow {
+				return "", false
+			}
+			value = hi<<4 | lo
+			index += 3
+		} else {
+			value = rawPath[index]
+			index++
+		}
+		decoded = append(decoded, value)
+		boundaries = append(boundaries, index)
+	}
+	if len(decoded) < len(prefix) || string(decoded[:len(prefix)]) != prefix {
+		return "", false
+	}
+	if len(decoded) > len(prefix) && decoded[len(prefix)] != '/' {
+		return "", false
+	}
+	rawEnd := boundaries[len(prefix)-1]
+	trimmed := rawPath[rawEnd:]
+	if trimmed == "" {
+		return "/", true
+	}
+	if !strings.HasPrefix(trimmed, "/") {
+		trimmed = "/" + trimmed
+	}
+	return trimmed, true
+}
+
+func fromHexDigit(value byte) (byte, bool) {
+	switch {
+	case value >= '0' && value <= '9':
+		return value - '0', true
+	case value >= 'a' && value <= 'f':
+		return value - 'a' + 10, true
+	case value >= 'A' && value <= 'F':
+		return value - 'A' + 10, true
+	default:
+		return 0, false
+	}
 }
 
 func (s *ReverseProxyService) pickUpstreamTarget(ctx context.Context, protocol string, targets []string, port int, ipStrategy string, httpVersionStrategy string, strictVerify bool, loopGuard func(reverseProxyTargetCandidate) bool) (string, string, string, string, error) {

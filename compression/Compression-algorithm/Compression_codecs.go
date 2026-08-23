@@ -14,6 +14,9 @@ func (r *decoderReadCloser) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	if r.Reader == nil {
+		return 0, io.ErrClosedPipe
+	}
 	if r.limit > 0 {
 		remaining := r.limit - r.decoded
 		if remaining <= 0 {
@@ -37,14 +40,19 @@ func (r *decoderReadCloser) Read(p []byte) (int, error) {
 }
 
 func (r *decoderReadCloser) Close() error {
+	decoders := r.decoders
+	source := r.source
+	r.decoders = nil
+	r.source = nil
+	r.Reader = nil
 	var firstErr error
-	for index := len(r.decoders) - 1; index >= 0; index-- {
-		if err := r.decoders[index].Close(); err != nil && firstErr == nil {
+	for index := len(decoders) - 1; index >= 0; index-- {
+		if err := decoders[index].Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
-	if r.source != nil {
-		if err := r.source.Close(); err != nil && firstErr == nil {
+	if source != nil {
+		if err := source.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -120,6 +128,10 @@ func newDecoderForAlgorithm(source io.Reader, algorithm Algorithm, maxDecodedByt
 // NewEncoder creates a streaming encoder using the project's default level
 // mapping. The returned writer does not close dst.
 func NewEncoder(dst io.Writer, algorithm Algorithm, level int) (io.WriteCloser, error) {
+	return newEncoder(dst, algorithm, level, 0)
+}
+
+func newEncoder(dst io.Writer, algorithm Algorithm, level int, windowBytes int64) (io.WriteCloser, error) {
 	if dst == nil {
 		return nil, io.ErrClosedPipe
 	}
@@ -127,17 +139,17 @@ func NewEncoder(dst io.Writer, algorithm Algorithm, level int) (io.WriteCloser, 
 		return identityWriteCloser{Writer: dst}, nil
 	}
 	if level <= 0 {
-		level = DefaultLevel
+		level = DefaultLevelFor(algorithm)
 	}
 	switch algorithm {
 	case AlgorithmZstd:
-		return newZstdEncoder(dst, level)
+		return newZstdEncoder(dst, level, windowBytes)
 	case AlgorithmS2:
 		return newS2Encoder(dst, level)
 	case AlgorithmSnappy:
 		return newSnappyEncoder(dst, level)
 	case AlgorithmBrotli:
-		return newBrotliEncoder(dst, level)
+		return newBrotliEncoder(dst, level, windowBytes)
 	case AlgorithmDeflate:
 		return newDeflateEncoder(dst, level)
 	case AlgorithmGzip:
@@ -145,4 +157,33 @@ func NewEncoder(dst io.Writer, algorithm Algorithm, level int) (io.WriteCloser, 
 	default:
 		return nil, ErrUnsupportedEncoding
 	}
+}
+
+// encoderWindowBytesForContentLength chooses a bounded history window for a
+// response whose entity length is known. A zero result keeps the codec's
+// streaming default for unknown-length responses.
+func encoderWindowBytesForContentLength(algorithm Algorithm, contentLength int64) int64 {
+	if contentLength <= 0 {
+		return 0
+	}
+	var maximum int64
+	switch algorithm {
+	case AlgorithmZstd:
+		maximum = httpZstdMaximumWindowBytes
+	case AlgorithmBrotli:
+		maximum = 1 << httpBrotliMaximumWindowBits
+	default:
+		return 0
+	}
+	if contentLength < 1<<10 {
+		return 1 << 10
+	}
+	if contentLength >= maximum {
+		return maximum
+	}
+	window := int64(1 << 10)
+	for window < contentLength {
+		window <<= 1
+	}
+	return window
 }

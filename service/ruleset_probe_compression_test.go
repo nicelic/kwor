@@ -22,7 +22,7 @@ func TestDecodeRuleSetProbeBodyDecodesStackedContentEncoding(t *testing.T) {
 	}
 
 	var gzipEncoded bytes.Buffer
-	gzipWriter, err := compressionalgorithm.NewEncoder(&gzipEncoded, compressionalgorithm.AlgorithmGzip, compressionalgorithm.DefaultLevel)
+	gzipWriter, err := compressionalgorithm.NewEncoder(&gzipEncoded, compressionalgorithm.AlgorithmGzip, compressionalgorithm.DefaultLevelFor(compressionalgorithm.AlgorithmGzip))
 	if err != nil {
 		t.Fatal(err)
 	}

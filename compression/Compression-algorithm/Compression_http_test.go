@@ -15,7 +15,7 @@ func TestRoundTripAllAlgorithms(t *testing.T) {
 	for _, algorithm := range Priority {
 		t.Run(string(algorithm), func(t *testing.T) {
 			var compressed bytes.Buffer
-			writer, err := NewEncoder(&compressed, algorithm, DefaultLevel)
+			writer, err := NewEncoder(&compressed, algorithm, DefaultLevelFor(algorithm))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -41,6 +41,47 @@ func TestRoundTripAllAlgorithms(t *testing.T) {
 				t.Fatalf("decoded payload differs: got %d bytes, want %d", len(decoded), len(input))
 			}
 		})
+	}
+}
+
+func TestDefaultCompressionLevels(t *testing.T) {
+	if DefaultLevel != 8 {
+		t.Fatalf("zstd DefaultLevel = %d, want 8", DefaultLevel)
+	}
+	if DefaultLevelFor(AlgorithmZstd) != 8 {
+		t.Fatalf("zstd default = %d, want 8", DefaultLevelFor(AlgorithmZstd))
+	}
+	for _, algorithm := range []Algorithm{AlgorithmS2, AlgorithmBrotli, AlgorithmDeflate, AlgorithmGzip} {
+		if got := DefaultLevelFor(algorithm); got != 6 {
+			t.Fatalf("%s default = %d, want 6", algorithm, got)
+		}
+	}
+}
+
+func TestHTTPCompressionWindowPolicies(t *testing.T) {
+	if httpZstdMaximumWindowBytes != 32<<20 {
+		t.Fatalf("zstd HTTP window = %d, want 32 MiB rounded down from 36 MiB", httpZstdMaximumWindowBytes)
+	}
+	if httpBrotliMaximumWindowBits != 24 {
+		t.Fatalf("Brotli lgwin = %d, want standard maximum 24", httpBrotliMaximumWindowBits)
+	}
+}
+
+func TestEncoderWindowBytesForContentLengthIsBoundedAndDynamic(t *testing.T) {
+	if got := encoderWindowBytesForContentLength(AlgorithmZstd, 900); got != 1<<10 {
+		t.Fatalf("small zstd window = %d, want 1 KiB", got)
+	}
+	if got := encoderWindowBytesForContentLength(AlgorithmZstd, 9<<20); got != 16<<20 {
+		t.Fatalf("zstd 9 MiB window = %d, want 16 MiB", got)
+	}
+	if got := encoderWindowBytesForContentLength(AlgorithmZstd, 36<<20); got != 32<<20 {
+		t.Fatalf("zstd 36 MiB window = %d, want 32 MiB cap", got)
+	}
+	if got := encoderWindowBytesForContentLength(AlgorithmBrotli, 36<<20); got != 16<<20 {
+		t.Fatalf("Brotli 36 MiB window = %d, want 16 MiB cap", got)
+	}
+	if got := encoderWindowBytesForContentLength(AlgorithmDeflate, 36<<20); got != 0 {
+		t.Fatalf("Deflate window = %d, want codec default/fixed window", got)
 	}
 }
 
