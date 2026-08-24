@@ -662,7 +662,7 @@ func TestDeleteAccountsClearsRecordBindingsAndDisablesAutoRenew(t *testing.T) {
 	}
 }
 
-func TestDeleteCertificateDetachesApplicationsButKeepsAccounts(t *testing.T) {
+func TestDeleteCertificateRejectsBoundApplicationsButKeepsAccounts(t *testing.T) {
 	db := setupAcmeDNSTestDB(t, "acme-certificate-delete-detach.db")
 	acmeAccount := &model.AcmeAccount{Name: "acme-keep-after-cert-delete", Server: "letsencrypt", AccountKeyLength: "ec-256"}
 	if err := db.Create(acmeAccount).Error; err != nil {
@@ -717,12 +717,15 @@ func TestDeleteCertificateDetachesApplicationsButKeepsAccounts(t *testing.T) {
 	if err := db.Create(&model.ReverseProxyCertificateBalanceState{ListenerKey: "reverse-listener", SNIBucket: "delete-detach.example.com", CertificateRecordID: record.Id}).Error; err != nil {
 		t.Fatalf("create reverse proxy balance state failed: %v", err)
 	}
-
-	if _, err := (&AcmeService{}).Delete(AcmeDeletePayload{ID: record.Id}); err != nil {
-		t.Fatalf("delete certificate with bindings failed: %v", err)
+	if err := RefreshAllCertificateBindingUsageFlags(); err != nil {
+		t.Fatalf("refresh certificate binding usage flags failed: %v", err)
 	}
-	if err := db.Where("id = ?", record.Id).First(&model.CertificateRecord{}).Error; !database.IsNotFound(err) {
-		t.Fatalf("certificate record should be deleted, got err=%v", err)
+
+	if _, err := (&AcmeService{}).Delete(AcmeDeletePayload{ID: record.Id}); err == nil || !strings.Contains(err.Error(), "反向代理") {
+		t.Fatalf("expected delete to be rejected by bindings, got %v", err)
+	}
+	if err := db.Where("id = ?", record.Id).First(&model.CertificateRecord{}).Error; err != nil {
+		t.Fatalf("certificate record must remain after rejected deletion: %v", err)
 	}
 	if err := db.Where("id = ?", acmeAccount.Id).First(&model.AcmeAccount{}).Error; err != nil {
 		t.Fatalf("ACME account must remain after certificate deletion: %v", err)
@@ -734,31 +737,31 @@ func TestDeleteCertificateDetachesApplicationsButKeepsAccounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read panel assignments failed: %v", err)
 	}
-	if len(assigned) != 0 {
-		t.Fatalf("panel assignment should be cleared after certificate deletion: %#v", assigned)
+	if len(assigned) != 1 || assigned[0] != record.Id {
+		t.Fatalf("panel assignment must remain after rejected deletion: %#v", assigned)
 	}
-	if err := db.Where("id = ?", tlsRow.Id).First(tlsRow).Error; err != nil || tlsRow.CertificateRecordID != 0 {
-		t.Fatalf("default TLS binding should be cleared: row=%#v err=%v", tlsRow, err)
+	if err := db.Where("id = ?", tlsRow.Id).First(tlsRow).Error; err != nil || tlsRow.CertificateRecordID != record.Id {
+		t.Fatalf("default TLS binding must remain: row=%#v err=%v", tlsRow, err)
 	}
-	if err := db.Where("id = ?", mihomoTLSRow.Id).First(mihomoTLSRow).Error; err != nil || mihomoTLSRow.CertificateRecordID != 0 {
-		t.Fatalf("Mihomo TLS binding should be cleared: row=%#v err=%v", mihomoTLSRow, err)
+	if err := db.Where("id = ?", mihomoTLSRow.Id).First(mihomoTLSRow).Error; err != nil || mihomoTLSRow.CertificateRecordID != record.Id {
+		t.Fatalf("Mihomo TLS binding must remain: row=%#v err=%v", mihomoTLSRow, err)
 	}
 	if err := db.Where("id = ?", reverseProxy.Id).First(reverseProxy).Error; err != nil {
 		t.Fatalf("reload reverse proxy binding failed: %v", err)
 	}
-	if reverseProxy.CertificateRecordID != 0 || reverseProxy.CertificateRecordList != "" {
-		t.Fatalf("reverse proxy certificate binding should be cleared: %#v", reverseProxy)
+	if len(reverseProxyRuleStoredCertificateIDs(reverseProxy)) != 1 || reverseProxyRuleStoredCertificateIDs(reverseProxy)[0] != record.Id {
+		t.Fatalf("reverse proxy certificate binding must remain: %#v", reverseProxy)
 	}
 	var balanceCount int64
-	if err := db.Model(&model.PanelCertificateBalanceState{}).Where("certificate_record_id = ?", record.Id).Count(&balanceCount).Error; err != nil || balanceCount != 0 {
-		t.Fatalf("panel balance state should be cleared: count=%d err=%v", balanceCount, err)
+	if err := db.Model(&model.PanelCertificateBalanceState{}).Where("certificate_record_id = ?", record.Id).Count(&balanceCount).Error; err != nil || balanceCount != 1 {
+		t.Fatalf("panel balance state must remain: count=%d err=%v", balanceCount, err)
 	}
-	if err := db.Model(&model.ReverseProxyCertificateBalanceState{}).Where("certificate_record_id = ?", record.Id).Count(&balanceCount).Error; err != nil || balanceCount != 0 {
-		t.Fatalf("reverse proxy balance state should be cleared: count=%d err=%v", balanceCount, err)
+	if err := db.Model(&model.ReverseProxyCertificateBalanceState{}).Where("certificate_record_id = ?", record.Id).Count(&balanceCount).Error; err != nil || balanceCount != 1 {
+		t.Fatalf("reverse proxy balance state must remain: count=%d err=%v", balanceCount, err)
 	}
 }
 
-func TestRemoveAcmeCertificatesAndInventoryDetachesReverseProxyWithSingleRevisionBump(t *testing.T) {
+func TestRemoveAcmeCertificatesAndInventoryRejectsBoundReverseProxy(t *testing.T) {
 	db := setupAcmeDNSTestDB(t, "acme-remove-all-certificate-bindings.db")
 	proxyService := &ReverseProxyService{}
 	_ = proxyService.StopRuntime()
@@ -800,6 +803,11 @@ func TestRemoveAcmeCertificatesAndInventoryDetachesReverseProxyWithSingleRevisio
 	if err := db.Create(rule).Error; err != nil {
 		t.Fatalf("create reverse proxy binding failed: %v", err)
 	}
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		return RefreshCertificateBindingUsageFlagsTx(tx, []uint{first.Id, second.Id})
+	}); err != nil {
+		t.Fatalf("refresh reverse proxy binding flags failed: %v", err)
+	}
 
 	settings := &model.ReverseProxySettings{}
 	if err := db.Where("id = ?", model.ReverseProxySettingsSingletonID).First(settings).Error; err != nil {
@@ -807,28 +815,38 @@ func TestRemoveAcmeCertificatesAndInventoryDetachesReverseProxyWithSingleRevisio
 	}
 	initialRevision := settings.Revision
 
-	if err := (&AcmeService{}).removeAcmeCertificatesAndInventoryLocked(); err != nil {
-		t.Fatalf("remove all certificate inventory failed: %v", err)
+	err := (&AcmeService{}).removeAcmeCertificatesAndInventoryLocked()
+	if err == nil || !strings.Contains(err.Error(), "反向代理") {
+		t.Fatalf("expected bulk certificate deletion to reject reverse proxy binding, got %v", err)
 	}
 
 	if err := db.Where("id = ?", rule.Id).First(rule).Error; err != nil {
 		t.Fatalf("reload reverse proxy rule failed: %v", err)
 	}
-	if rule.CertificateRecordID != 0 || rule.CertificateRecordList != "" {
-		t.Fatalf("bulk certificate deletion must clear reverse proxy bindings: %#v", rule)
+	if got := reverseProxyRuleStoredCertificateIDs(rule); len(got) != 2 || got[0] != first.Id || got[1] != second.Id {
+		t.Fatalf("bulk certificate rejection must preserve reverse proxy bindings: %#v", rule)
 	}
 	if err := db.Where("id = ?", model.ReverseProxySettingsSingletonID).First(settings).Error; err != nil {
 		t.Fatalf("reload reverse proxy settings failed: %v", err)
 	}
-	if settings.Revision != initialRevision+1 {
-		t.Fatalf("bulk certificate deletion must bump revision once: before=%d after=%d", initialRevision, settings.Revision)
+	if settings.Revision != initialRevision {
+		t.Fatalf("rejected bulk certificate deletion must not bump reverse proxy revision: before=%d after=%d", initialRevision, settings.Revision)
 	}
 	var certificateCount int64
 	if err := db.Model(&model.CertificateRecord{}).Count(&certificateCount).Error; err != nil {
 		t.Fatalf("count certificate inventory failed: %v", err)
 	}
-	if certificateCount != 0 {
-		t.Fatalf("certificate inventory should be empty after bulk deletion, got %d", certificateCount)
+	if certificateCount != 2 {
+		t.Fatalf("rejected bulk certificate deletion must preserve certificate inventory, got %d", certificateCount)
+	}
+	for _, certificateID := range []uint{first.Id, second.Id} {
+		row := &model.CertificateRecord{}
+		if err := db.Where("id = ?", certificateID).First(row).Error; err != nil {
+			t.Fatalf("reload bound certificate %d failed: %v", certificateID, err)
+		}
+		if !row.BoundByReverseProxy {
+			t.Fatalf("bound certificate must retain reverse proxy deletion marker: %#v", row)
+		}
 	}
 }
 

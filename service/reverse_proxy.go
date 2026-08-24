@@ -1500,6 +1500,7 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 				return err
 			}
 		}
+		previousCertificateIDs := reverseProxyRuleStoredCertificateIDs(existing)
 		if err := s.validateNormalizedRule(tx, normalized); err != nil {
 			return err
 		}
@@ -1588,6 +1589,9 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 				return err
 			}
 		}
+		if err := RefreshCertificateBindingUsageFlagsTx(tx, append(previousCertificateIDs, reverseProxyRuleStoredCertificateIDs(row)...)); err != nil {
+			return err
+		}
 		if err := validatePortForwardListenerClaimsAgainstActiveRules(tx); err != nil {
 			return err
 		}
@@ -1661,6 +1665,9 @@ func (s *ReverseProxyService) SetRuleEnabled(payload ReverseProxyRuleStatusPaylo
 		}).Error; err != nil {
 			return err
 		}
+		if err := RefreshCertificateBindingUsageFlagsTx(tx, reverseProxyRuleStoredCertificateIDs(row)); err != nil {
+			return err
+		}
 		if payload.Enabled {
 			if err := validatePortForwardListenerClaimsAgainstActiveRules(tx); err != nil {
 				return err
@@ -1709,7 +1716,11 @@ func (s *ReverseProxyService) deleteRule(id uint, expectedRevision *uint64) erro
 		if err := tx.Where("id = ?", id).First(row).Error; err != nil {
 			return err
 		}
+		certificateIDs := reverseProxyRuleStoredCertificateIDs(row)
 		if err := tx.Delete(row).Error; err != nil {
+			return err
+		}
+		if err := RefreshCertificateBindingUsageFlagsTx(tx, certificateIDs); err != nil {
 			return err
 		}
 		return reverseProxyBumpRevisionTx(tx, settings)
@@ -3976,6 +3987,17 @@ func reverseProxyRuleCertificateIDs(row *model.ReverseProxyRule) []uint {
 		return []uint{row.CertificateRecordID}
 	}
 	return []uint{}
+}
+
+// reverseProxyRuleStoredCertificateIDs is used by inventory reference checks.
+// It intentionally reads both persisted fields so a legacy or partially
+// migrated row cannot leave an undeletable runtime reference unmarked. The
+// reverse-proxy runtime itself continues using reverseProxyRuleCertificateIDs.
+func reverseProxyRuleStoredCertificateIDs(row *model.ReverseProxyRule) []uint {
+	if row == nil {
+		return []uint{}
+	}
+	return normalizeReverseProxyCertificateIDList(decodeReverseProxyUintList(row.CertificateRecordList), row.CertificateRecordID)
 }
 
 func buildReverseProxyCertificateHints(hosts []string, certs []ReverseProxyCertificateOption) []string {

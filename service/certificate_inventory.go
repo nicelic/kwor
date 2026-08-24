@@ -76,23 +76,21 @@ type CertificateRecordView struct {
 	NotBefore   int64  `json:"notBefore"`
 	NotAfter    int64  `json:"notAfter"`
 
-	LastIssuedAt    int64  `json:"lastIssuedAt"`
-	LastRenewedAt   int64  `json:"lastRenewedAt"`
-	ListOrderAt     int64  `json:"listOrderAt"`
-	UpdatedAt       int64  `json:"updatedAt"`
-	CreatedAt       int64  `json:"createdAt"`
-	LastError       string `json:"lastError"`
-	PostActionError string `json:"postActionError"`
-	Status          string `json:"status"`
-	InUseByPanel    bool   `json:"inUseByPanel"`
-	InUseBySub      bool   `json:"inUseBySub"`
-	InUseByTLS      bool   `json:"inUseByTls"`
-	InUseByMihomo   bool   `json:"inUseByMihomo"`
-	UsageLabel      string `json:"usageLabel"`
-	// DeleteBlocked is kept for API compatibility. Certificate deletion now
-	// detaches active consumers atomically, so a usage reference is informative
-	// rather than a hard delete block.
-	DeleteBlocked bool `json:"deleteBlocked"`
+	LastIssuedAt        int64  `json:"lastIssuedAt"`
+	LastRenewedAt       int64  `json:"lastRenewedAt"`
+	ListOrderAt         int64  `json:"listOrderAt"`
+	UpdatedAt           int64  `json:"updatedAt"`
+	CreatedAt           int64  `json:"createdAt"`
+	LastError           string `json:"lastError"`
+	PostActionError     string `json:"postActionError"`
+	Status              string `json:"status"`
+	InUseByPanel        bool   `json:"inUseByPanel"`
+	InUseBySub          bool   `json:"inUseBySub"`
+	InUseByTLS          bool   `json:"inUseByTls"`
+	InUseByMihomo       bool   `json:"inUseByMihomo"`
+	UsageLabel          string `json:"usageLabel"`
+	DeleteBlocked       bool   `json:"deleteBlocked"`
+	DeleteBlockedReason string `json:"deleteBlockedReason"`
 }
 
 type CertificateMaterialView struct {
@@ -336,6 +334,7 @@ func certificateRecordListProjectionColumns() []string {
 		"auto_renew_retry_phase", "auto_renew_retry_count", "auto_renew_next_retry_at", "auto_renew_last_attempt_at",
 		"acme_account_id", "acme_account_name", "dns_account_id", "dns_account_name",
 		"apply_target", "push_enabled", "push_dir", "push_file_paths", "push_files", "remark", "renew_config",
+		"bound_by_reverse_proxy", "bound_by_singbox_tls", "bound_by_mihomo_tls",
 		"webroot", "dns_provider", "custom_args",
 		"fingerprint", "not_before", "not_after",
 		"last_issued_at", "last_renewed_at", "last_error", "post_action_error",
@@ -868,6 +867,7 @@ func convertCertificateRecordWithUsage(entry *model.CertificateRecord, snapshot 
 	inUseByTLS := len(tlsUsage.DefaultTLSNames) > 0
 	inUseByMihomo := len(tlsUsage.MihomoTLSNames) > 0
 	usageLabel := buildCertificateUsageLabel(inUseByPanel, inUseBySub, tlsUsage, reverseProxyUsage)
+	deleteBlockedReason := certificateDeleteBlockReason(entry)
 	applyTarget := strings.TrimSpace(entry.ApplyTarget)
 	switch {
 	case inUseByPanel && inUseBySub:
@@ -943,20 +943,21 @@ func convertCertificateRecordWithUsage(entry *model.CertificateRecord, snapshot 
 		NotBefore:   entry.NotBefore,
 		NotAfter:    entry.NotAfter,
 
-		LastIssuedAt:    entry.LastIssuedAt,
-		LastRenewedAt:   entry.LastRenewedAt,
-		ListOrderAt:     entry.ListOrderAt,
-		UpdatedAt:       entry.UpdatedAt.Unix(),
-		CreatedAt:       entry.CreatedAt.Unix(),
-		LastError:       strings.TrimSpace(entry.LastError),
-		PostActionError: strings.TrimSpace(entry.PostActionError),
-		Status:          certificateStatus(entry),
-		InUseByPanel:    inUseByPanel,
-		InUseBySub:      inUseBySub,
-		InUseByTLS:      inUseByTLS,
-		InUseByMihomo:   inUseByMihomo,
-		UsageLabel:      usageLabel,
-		DeleteBlocked:   false,
+		LastIssuedAt:        entry.LastIssuedAt,
+		LastRenewedAt:       entry.LastRenewedAt,
+		ListOrderAt:         entry.ListOrderAt,
+		UpdatedAt:           entry.UpdatedAt.Unix(),
+		CreatedAt:           entry.CreatedAt.Unix(),
+		LastError:           strings.TrimSpace(entry.LastError),
+		PostActionError:     strings.TrimSpace(entry.PostActionError),
+		Status:              certificateStatus(entry),
+		InUseByPanel:        inUseByPanel,
+		InUseBySub:          inUseBySub,
+		InUseByTLS:          inUseByTLS,
+		InUseByMihomo:       inUseByMihomo,
+		UsageLabel:          usageLabel,
+		DeleteBlocked:       deleteBlockedReason != "",
+		DeleteBlockedReason: deleteBlockedReason,
 	}
 }
 
@@ -1126,7 +1127,7 @@ func collectCertificateUsageSnapshot(rows []model.CertificateRecord) (certificat
 	seenNamesByID := make(map[uint]map[string]struct{})
 	for i := range reverseRows {
 		row := reverseRows[i]
-		certIDs := reverseProxyRuleCertificateIDs(&row)
+		certIDs := reverseProxyRuleStoredCertificateIDs(&row)
 		if len(certIDs) == 0 {
 			continue
 		}
@@ -1240,7 +1241,7 @@ func collectCertificateReverseProxyUsage(recordID uint) certificateReverseProxyU
 	result := certificateReverseProxyUsage{}
 	seen := make(map[string]struct{})
 	for i := range rows {
-		certIDs := reverseProxyRuleCertificateIDs(&rows[i])
+		certIDs := reverseProxyRuleStoredCertificateIDs(&rows[i])
 		matched := false
 		for _, certID := range certIDs {
 			if certID == recordID {

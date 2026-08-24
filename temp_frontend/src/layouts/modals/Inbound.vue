@@ -977,7 +977,7 @@ export default {
         }
       }
     },
-    initMihomoFastOpenDefaults() {
+    initMihomoFastOpenDefaults(forceDefaults: boolean = false) {
       if (!this.inbound.out_json) this.inbound.out_json = {}
 
       if (this.inbound.type === this.inTypes.Hysteria2) {
@@ -985,7 +985,19 @@ export default {
           ?? this.inbound.out_json.fast_open
           ?? this.inbound.out_json['fast-open']
         if (this.inbound.out_json.mihomo_fast_open === undefined) {
-          this.inbound.out_json.mihomo_fast_open = typeof legacyFastOpen === 'boolean' ? legacyFastOpen : false
+          if (typeof legacyFastOpen === 'boolean') {
+            this.inbound.out_json.mihomo_fast_open = legacyFastOpen
+          } else if (forceDefaults) {
+            this.inbound.out_json.mihomo_fast_open = true
+          }
+        }
+        if (forceDefaults && this.inbound.out_json.mihomo_hy2 === undefined) {
+          this.inbound.out_json.mihomo_hy2 = {
+            initial_stream_receive_window: 38000000,
+            max_stream_receive_window: 70000000,
+            initial_connection_receive_window: 120000000,
+            max_connection_receive_window: 150000000,
+          }
         }
         delete this.inbound.out_json.fast_open
         delete this.inbound.out_json['fast-open']
@@ -1021,7 +1033,7 @@ export default {
           this.inbound.out_json.reuse = false
         }
       }
-      this.initMihomoFastOpenDefaults()
+      this.initMihomoFastOpenDefaults(forceHyBandwidthDefaults)
       this.initShadowTlsClientDefaults(forceHyBandwidthDefaults)
       this.sanitizeMihomoShadowTLSUnsupportedFields()
       this.sanitizeMihomoShadowQUICUnsupportedFields()

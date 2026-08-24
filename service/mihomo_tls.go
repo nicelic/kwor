@@ -44,6 +44,7 @@ func (s *MihomoTlsService) Save(tx *gorm.DB, action string, data json.RawMessage
 		if err := json.Unmarshal(data, &tls); err != nil {
 			return err
 		}
+		previous := model.MihomoTls{}
 		if action == "new" {
 			// A copied TLS template must receive a fresh database identity.
 			tls.Id = 0
@@ -51,8 +52,7 @@ func (s *MihomoTlsService) Save(tx *gorm.DB, action string, data json.RawMessage
 			if tls.Id == 0 {
 				return common.NewError("mihomo TLS id is required for edit")
 			}
-			var existing model.MihomoTls
-			if err := tx.Model(model.MihomoTls{}).Select("id").Where("id = ?", tls.Id).First(&existing).Error; err != nil {
+			if err := tx.Model(model.MihomoTls{}).Select("id", "certificate_record_id").Where("id = ?", tls.Id).First(&previous).Error; err != nil {
 				return err
 			}
 		}
@@ -85,6 +85,13 @@ func (s *MihomoTlsService) Save(tx *gorm.DB, action string, data json.RawMessage
 		if err := tx.Save(&tls).Error; err != nil {
 			return err
 		}
+		affectedCertificateIDs := []uint{tls.CertificateRecordID}
+		if action == "edit" {
+			affectedCertificateIDs = append(affectedCertificateIDs, previous.CertificateRecordID)
+		}
+		if err := RefreshCertificateBindingUsageFlagsTx(tx, affectedCertificateIDs); err != nil {
+			return err
+		}
 		if action == "edit" {
 			var inbounds []model.MihomoInbound
 			err := tx.Model(model.MihomoInbound{}).Preload("Tls").Where("tls_id = ?", tls.Id).Find(&inbounds).Error
@@ -111,6 +118,10 @@ func (s *MihomoTlsService) Save(tx *gorm.DB, action string, data json.RawMessage
 		if err := json.Unmarshal(data, &id); err != nil {
 			return err
 		}
+		existing := model.MihomoTls{}
+		if err := tx.Model(model.MihomoTls{}).Select("id", "certificate_record_id").Where("id = ?", id).First(&existing).Error; err != nil {
+			return err
+		}
 		var inboundCount int64
 		if err := tx.Model(model.MihomoInbound{}).Where("tls_id = ?", id).Count(&inboundCount).Error; err != nil {
 			return err
@@ -119,6 +130,9 @@ func (s *MihomoTlsService) Save(tx *gorm.DB, action string, data json.RawMessage
 			return common.NewError("tls in use")
 		}
 		if err := tx.Where("id = ?", id).Delete(model.MihomoTls{}).Error; err != nil {
+			return err
+		}
+		if err := RefreshCertificateBindingUsageFlagsTx(tx, []uint{existing.CertificateRecordID}); err != nil {
 			return err
 		}
 	default:

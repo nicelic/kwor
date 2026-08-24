@@ -1689,6 +1689,7 @@ type AcmeCertificate = {
   inUseBySub: boolean
   usageLabel: string
   deleteBlocked: boolean
+  deleteBlockedReason: string
 }
 
 type AcmeCertificateMaterial = {
@@ -2551,6 +2552,7 @@ const normalizeCertificates = (value: unknown): AcmeCertificate[] => {
       inUseBySub: asBoolean((item as any).inUseBySub),
       usageLabel: asString((item as any).usageLabel),
       deleteBlocked: asBoolean((item as any).deleteBlocked),
+      deleteBlockedReason: asString((item as any).deleteBlockedReason),
     }
   })
 }
@@ -4810,11 +4812,16 @@ const toggleCertificateApply = async (cert: AcmeCertificate, target: 'panel' | '
 }
 
 const deleteCertificate = async (cert: AcmeCertificate) => {
-  const bindingHint = cert.usageLabel.trim() === ''
-    ? ''
-    : `\n同时解除以下引用：${cert.usageLabel}`
+  const deleteBlockedReason = cert.deleteBlockedReason.trim()
+  if (cert.deleteBlocked || deleteBlockedReason !== '') {
+    push.warning({
+      duration: 4800,
+      message: deleteBlockedReason || '该证书仍被配置引用，无法删除。',
+    })
+    return
+  }
   const confirmed = await confirm({
-    message: `确认删除证书 ${cert.mainDomain} 吗？删除后会保留 ACME/DNS 账号。${bindingHint}`,
+    message: `确认删除证书 ${cert.mainDomain} 吗？删除后会保留 ACME/DNS 账号。`,
     severity: 'danger',
     confirmText: confirmAction('delete'),
   })

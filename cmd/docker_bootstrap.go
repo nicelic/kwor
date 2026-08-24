@@ -64,6 +64,9 @@ func runDockerBootstrap() error {
 	if repairErr := (&service.CertificateInventoryService{}).RepairDisplayIDs(); repairErr != nil {
 		fmt.Printf("[kwor] bootstrap certificate display id repair failed: %v\n", repairErr)
 	}
+	if syncErr := service.RefreshAllCertificateBindingUsageFlags(); syncErr != nil {
+		fmt.Printf("[kwor] bootstrap certificate binding usage refresh failed: %v\n", syncErr)
+	}
 	if syncErr := service.SyncPanelTLSAssignments(settingService); syncErr != nil {
 		fmt.Printf("[kwor] bootstrap panel tls assignment sync failed: %v\n", syncErr)
 	}

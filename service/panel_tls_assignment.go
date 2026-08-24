@@ -11,6 +11,7 @@ import (
 
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
+	"gorm.io/gorm"
 )
 
 const (
@@ -20,6 +21,7 @@ const (
 	panelAssignedCertificateRecordIDsSubKey   = "subAssignedCertificateRecordIDs"
 	panelTLSDrainGracePeriod                  = 6 * time.Minute
 	panelTLSUnapplyDrainGracePeriod           = 30 * time.Second
+	panelTLSDeleteDrainGracePeriod            = 60 * time.Second
 )
 
 func PanelTLSDrainGracePeriod() time.Duration {
@@ -28,6 +30,10 @@ func PanelTLSDrainGracePeriod() time.Duration {
 
 func PanelTLSUnapplyDrainGracePeriod() time.Duration {
 	return panelTLSUnapplyDrainGracePeriod
+}
+
+func PanelTLSDeleteDrainGracePeriod() time.Duration {
+	return panelTLSDeleteDrainGracePeriod
 }
 
 func panelAssignedCertificateRecordIDKey(target PanelSelfSignedTarget) string {
@@ -237,6 +243,99 @@ func SetAssignedCertificateRecordIDs(settingService *SettingService, target Pane
 		return err
 	}
 	return persistAssignedCertificateRecordIDs(settingService, target, filtered)
+}
+
+func getAssignedCertificateRecordIDsTx(tx *gorm.DB, settingService *SettingService, target PanelSelfSignedTarget) ([]uint, error) {
+	if tx == nil {
+		return nil, fmt.Errorf("database transaction is not ready")
+	}
+	if settingService == nil {
+		return []uint{}, nil
+	}
+	rawList, err := settingService.getStringTx(tx, panelAssignedCertificateRecordIDsKey(target))
+	if err != nil {
+		return nil, err
+	}
+	parsedFromList, parsedListOK := parseAssignedCertificateRecordIDs(rawList)
+	if !parsedListOK {
+		parsedFromList = []uint{}
+	}
+	filtered, err := filterExistingCertificateRecordIDsTx(tx, parsedFromList)
+	if err != nil {
+		return nil, err
+	}
+	if len(filtered) > 0 {
+		return filtered, nil
+	}
+	legacyRaw, err := settingService.getStringTx(tx, panelAssignedCertificateRecordIDKey(target))
+	if err != nil {
+		return nil, err
+	}
+	legacyID, err := parseLegacyAssignedCertificateRecordID(legacyRaw)
+	if err != nil || legacyID == 0 {
+		return []uint{}, err
+	}
+	return filterExistingCertificateRecordIDsTx(tx, []uint{legacyID})
+}
+
+func setAssignedCertificateRecordIDsTx(tx *gorm.DB, target PanelSelfSignedTarget, ids []uint) error {
+	if tx == nil {
+		return fmt.Errorf("database transaction is not ready")
+	}
+	filtered, err := filterExistingCertificateRecordIDsTx(tx, ids)
+	if err != nil {
+		return err
+	}
+	normalized := normalizeAssignedCertificateRecordIDs(filtered)
+	encoded, err := json.Marshal(normalized)
+	if err != nil {
+		return err
+	}
+	if err := upsertSetting(tx, panelAssignedCertificateRecordIDsKey(target), string(encoded)); err != nil {
+		return err
+	}
+	legacyID := uint(0)
+	if len(normalized) > 0 {
+		legacyID = normalized[0]
+	}
+	return upsertSetting(tx, panelAssignedCertificateRecordIDKey(target), strconv.FormatUint(uint64(legacyID), 10))
+}
+
+func filterExistingCertificateRecordIDsTx(tx *gorm.DB, ids []uint) ([]uint, error) {
+	normalized := normalizeAssignedCertificateRecordIDs(ids)
+	if len(normalized) == 0 {
+		return []uint{}, nil
+	}
+	rows := make([]model.CertificateRecord, 0, len(normalized))
+	if err := tx.Model(&model.CertificateRecord{}).
+		Select("id").
+		Where("id IN ?", normalized).
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	existing := make(map[uint]struct{}, len(rows))
+	for i := range rows {
+		existing[rows[i].Id] = struct{}{}
+	}
+	result := make([]uint, 0, len(normalized))
+	for _, id := range normalized {
+		if _, ok := existing[id]; ok {
+			result = append(result, id)
+		}
+	}
+	return result, nil
+}
+
+func parseLegacyAssignedCertificateRecordID(raw string) (uint, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	parsed, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return 0, nil
+	}
+	return uint(parsed), nil
 }
 
 func GetAssignedCertificateRecordID(settingService *SettingService, target PanelSelfSignedTarget) (uint, error) {

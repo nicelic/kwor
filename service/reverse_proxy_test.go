@@ -2874,7 +2874,7 @@ func TestReverseProxySNIUsesReloadedCertificate(t *testing.T) {
 	}
 }
 
-func TestReverseProxyCertificateDeletionStopsTLSListenerAndRemovesOption(t *testing.T) {
+func TestReverseProxyCertificateDeletionRejectsBoundCertificate(t *testing.T) {
 	openReverseProxyTestDB(t)
 
 	svc := &ReverseProxyService{}
@@ -2908,18 +2908,22 @@ func TestReverseProxyCertificateDeletionStopsTLSListenerAndRemovesOption(t *test
 	if got := reverseProxyDialWithSNIFingerprint(t, listenPort, "delete-runtime.example.com"); got == "" {
 		t.Fatal("TLS listener did not serve its initial certificate")
 	}
-	if _, err := (&AcmeService{}).Delete(AcmeDeletePayload{ID: certRecordID}); err != nil {
-		t.Fatalf("delete referenced certificate failed: %v", err)
+	if _, err := (&AcmeService{}).Delete(AcmeDeletePayload{ID: certRecordID}); err == nil || !strings.Contains(err.Error(), "反向代理") {
+		t.Fatalf("expected referenced certificate deletion rejection, got %v", err)
 	}
 
 	overview, err := svc.GetOverview()
 	if err != nil {
-		t.Fatalf("load overview after certificate deletion failed: %v", err)
+		t.Fatalf("load overview after rejected certificate deletion failed: %v", err)
 	}
+	foundCertificate := false
 	for _, option := range overview.Certificates {
 		if option.ID == certRecordID {
-			t.Fatal("deleted certificate remained in reverse proxy certificate options")
+			foundCertificate = true
 		}
+	}
+	if !foundCertificate {
+		t.Fatal("referenced certificate disappeared from reverse proxy certificate options")
 	}
 	foundRule := false
 	for _, rule := range overview.Rules {
@@ -2927,21 +2931,16 @@ func TestReverseProxyCertificateDeletionStopsTLSListenerAndRemovesOption(t *test
 			continue
 		}
 		foundRule = true
-		if rule.Enabled || len(rule.CertificateRecordIDs) != 0 || rule.CertificateRecordID != 0 {
-			t.Fatalf("rule without a remaining TLS certificate must be disabled and detached: %#v", rule)
+		if !rule.Enabled || len(rule.CertificateRecordIDs) != 1 || rule.CertificateRecordIDs[0] != certRecordID || rule.CertificateRecordID != certRecordID {
+			t.Fatalf("rule certificate binding must remain after rejected deletion: %#v", rule)
 		}
 	}
 	if !foundRule {
-		t.Fatal("reverse proxy rule disappeared after certificate deletion")
+		t.Fatal("reverse proxy rule disappeared after rejected certificate deletion")
 	}
 
-	conn, err := tls.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(listenPort)), &tls.Config{
-		InsecureSkipVerify: true,
-		ServerName:         "delete-runtime.example.com",
-	})
-	if err == nil {
-		_ = conn.Close()
-		t.Fatal("deleted certificate listener remained reachable after runtime reconciliation")
+	if got := reverseProxyDialWithSNIFingerprint(t, listenPort, "delete-runtime.example.com"); got == "" {
+		t.Fatal("TLS listener stopped after rejected certificate deletion")
 	}
 }
 

@@ -216,6 +216,96 @@ func TestAcmeUnapplyIdempotentAndDrainsRemovedFingerprint(t *testing.T) {
 	}
 }
 
+func TestAcmeDeleteLastPanelAndSubCertificateIsRejected(t *testing.T) {
+	settingService := initPanelSQLiteSettingTestDB(t)
+	_ = settingService
+
+	mockRuntime := &mockPanelTLSRuntimeApplier{}
+	RegisterPanelTLSRuntimeApplier(mockRuntime)
+	defer RegisterPanelTLSRuntimeApplier(nil)
+
+	only := upsertAcmeApplyTestCertificateRecord(t, "delete-last-both", "fp-delete-last-both")
+	svc := &AcmeService{}
+	if _, err := svc.Apply(AcmeApplyPayload{ID: only.Id, Target: "panel"}); err != nil {
+		t.Fatalf("apply only certificate to panel failed: %v", err)
+	}
+	if _, err := svc.Apply(AcmeApplyPayload{ID: only.Id, Target: "sub"}); err != nil {
+		t.Fatalf("apply only certificate to subscription failed: %v", err)
+	}
+
+	if _, err := svc.Delete(AcmeDeletePayload{ID: only.Id}); err == nil || !strings.Contains(err.Error(), "界面、订阅") {
+		t.Fatalf("expected panel and subscription minimum-assignment rejection, got %v", err)
+	}
+	for _, target := range []PanelSelfSignedTarget{PanelSelfSignedTargetPanel, PanelSelfSignedTargetSub} {
+		ids, err := GetAssignedCertificateRecordIDs(&SettingService{}, target)
+		if err != nil {
+			t.Fatalf("read %s assignment failed: %v", target, err)
+		}
+		if len(ids) != 1 || ids[0] != only.Id {
+			t.Fatalf("%s assignment must remain unchanged: %v", target, ids)
+		}
+	}
+	_, drains := mockRuntime.snapshot()
+	if len(drains) != 0 {
+		t.Fatalf("rejected delete must not drain TLS connections: %#v", drains)
+	}
+}
+
+func TestAcmeDeleteAppliedCertificateRemovesAssignmentsAndDrainsForSixtySeconds(t *testing.T) {
+	settingService := initPanelSQLiteSettingTestDB(t)
+	_ = settingService
+
+	mockRuntime := &mockPanelTLSRuntimeApplier{}
+	RegisterPanelTLSRuntimeApplier(mockRuntime)
+	defer RegisterPanelTLSRuntimeApplier(nil)
+
+	oldRecord := upsertAcmeApplyTestCertificateRecord(t, "delete-old", "fp-delete-old")
+	remainingRecord := upsertAcmeApplyTestCertificateRecord(t, "delete-remaining", "fp-delete-remaining")
+	svc := &AcmeService{}
+	for _, target := range []string{"panel", "sub"} {
+		if _, err := svc.Apply(AcmeApplyPayload{ID: oldRecord.Id, Target: target}); err != nil {
+			t.Fatalf("apply old certificate to %s failed: %v", target, err)
+		}
+		if _, err := svc.Apply(AcmeApplyPayload{ID: remainingRecord.Id, Target: target}); err != nil {
+			t.Fatalf("apply remaining certificate to %s failed: %v", target, err)
+		}
+	}
+
+	if _, err := svc.Delete(AcmeDeletePayload{ID: oldRecord.Id}); err != nil {
+		t.Fatalf("delete non-final applied certificate failed: %v", err)
+	}
+	for _, target := range []PanelSelfSignedTarget{PanelSelfSignedTargetPanel, PanelSelfSignedTargetSub} {
+		ids, err := GetAssignedCertificateRecordIDs(&SettingService{}, target)
+		if err != nil {
+			t.Fatalf("read %s assignment failed: %v", target, err)
+		}
+		if len(ids) != 1 || ids[0] != remainingRecord.Id {
+			t.Fatalf("%s assignment mismatch after delete: %v", target, ids)
+		}
+	}
+	if _, err := certificateInventory.GetRecordByID(oldRecord.Id); err == nil {
+		t.Fatalf("deleted certificate record must no longer exist")
+	}
+
+	_, drains := mockRuntime.snapshot()
+	if len(drains) != 2 {
+		t.Fatalf("delete should drain both panel and subscription TLS connections, got %#v", drains)
+	}
+	seenTargets := map[PanelSelfSignedTarget]bool{}
+	for _, drain := range drains {
+		if drain.fingerprint != "fp-delete-old" {
+			t.Fatalf("delete drain fingerprint mismatch: %#v", drain)
+		}
+		if drain.gracePeriod != PanelTLSDeleteDrainGracePeriod() || drain.gracePeriod != 60*time.Second {
+			t.Fatalf("delete drain grace period mismatch: %#v", drain)
+		}
+		seenTargets[drain.target] = true
+	}
+	if !seenTargets[PanelSelfSignedTargetPanel] || !seenTargets[PanelSelfSignedTargetSub] {
+		t.Fatalf("delete must drain both targets: %#v", drains)
+	}
+}
+
 func upsertAcmeApplyTestCertificateRecord(t *testing.T, sourceRef string, fingerprint string) *model.CertificateRecord {
 	t.Helper()
 	record, err := certificateInventory.Upsert(CertificateUpsertPayload{

@@ -5,9 +5,10 @@ import (
 	"testing"
 
 	"github.com/alireza0/s-ui/database/model"
+	"gorm.io/gorm"
 )
 
-func TestCertificateDeleteDetachesReverseProxyCertificateList(t *testing.T) {
+func TestCertificateDeleteBlockedByReverseProxyCertificateList(t *testing.T) {
 	db := setupMihomoSyncTestDB(t, "cert-reverse-proxy-list-usage.db")
 	record := upsertTestCertificateRecord(t, "reverse-proxy-list.example.com")
 
@@ -20,14 +21,17 @@ func TestCertificateDeleteDetachesReverseProxyCertificateList(t *testing.T) {
 	if err := db.Create(rule).Error; err != nil {
 		t.Fatalf("create reverse proxy rule failed: %v", err)
 	}
+	if err := RefreshAllCertificateBindingUsageFlags(); err != nil {
+		t.Fatalf("refresh certificate binding flags failed: %v", err)
+	}
 
 	views, err := certificateInventory.List()
 	if err != nil {
 		t.Fatalf("list certificates failed: %v", err)
 	}
 	view := findCertificateRecordView(t, views, record.Id)
-	if view.DeleteBlocked {
-		t.Fatalf("expected reverse proxy usage to be informational only, got %#v", view)
+	if !view.DeleteBlocked || !strings.Contains(view.DeleteBlockedReason, "反向代理") {
+		t.Fatalf("expected reverse proxy usage to block deletion, got %#v", view)
 	}
 	if !strings.Contains(view.UsageLabel, "反向代理使用中") || !strings.Contains(view.UsageLabel, "rp-listener-a") {
 		t.Fatalf("expected usage label to include reverse proxy rule name, got %q", view.UsageLabel)
@@ -36,14 +40,17 @@ func TestCertificateDeleteDetachesReverseProxyCertificateList(t *testing.T) {
 		t.Fatalf("expected remark to include reverse proxy usage marker, got %q", view.Remark)
 	}
 
-	if _, err := (&AcmeService{}).Delete(AcmeDeletePayload{ID: record.Id}); err != nil {
-		t.Fatalf("delete while reverse proxy is bound failed: %v", err)
+	if _, err := (&AcmeService{}).Delete(AcmeDeletePayload{ID: record.Id}); err == nil || !strings.Contains(err.Error(), "反向代理") {
+		t.Fatalf("expected reverse proxy delete rejection, got %v", err)
+	}
+	if err := db.Where("id = ?", record.Id).First(&model.CertificateRecord{}).Error; err != nil {
+		t.Fatalf("certificate must remain after rejected deletion: %v", err)
 	}
 	if err := db.Where("id = ?", rule.Id).First(rule).Error; err != nil {
 		t.Fatalf("reload reverse proxy rule failed: %v", err)
 	}
-	if rule.CertificateRecordID != 0 || rule.CertificateRecordList != "" {
-		t.Fatalf("expected reverse proxy binding cleared: %#v", rule)
+	if len(reverseProxyRuleStoredCertificateIDs(rule)) != 1 || reverseProxyRuleStoredCertificateIDs(rule)[0] != record.Id {
+		t.Fatalf("reverse proxy binding must remain unchanged: %#v", rule)
 	}
 }
 
@@ -60,14 +67,17 @@ func TestCertificateListReportsDisabledReverseProxyLegacyCertificateField(t *tes
 	if err := db.Create(rule).Error; err != nil {
 		t.Fatalf("create reverse proxy legacy rule failed: %v", err)
 	}
+	if err := RefreshAllCertificateBindingUsageFlags(); err != nil {
+		t.Fatalf("refresh certificate binding flags failed: %v", err)
+	}
 
 	views, err := certificateInventory.List()
 	if err != nil {
 		t.Fatalf("list certificates failed: %v", err)
 	}
 	view := findCertificateRecordView(t, views, record.Id)
-	if view.DeleteBlocked {
-		t.Fatalf("expected disabled reverse proxy usage to be informational only, got %#v", view)
+	if !view.DeleteBlocked || !strings.Contains(view.DeleteBlockedReason, "反向代理") {
+		t.Fatalf("disabled reverse proxy must still block deletion, got %#v", view)
 	}
 	if !strings.Contains(view.UsageLabel, "rp-disabled-legacy") {
 		t.Fatalf("expected usage label to include disabled reverse proxy rule, got %q", view.UsageLabel)
@@ -114,10 +124,15 @@ func TestCertificateDeleteAllowedAfterReverseProxyBindingCleared(t *testing.T) {
 	if err := db.Create(rule).Error; err != nil {
 		t.Fatalf("create reverse proxy rule failed: %v", err)
 	}
-	if err := db.Model(&model.ReverseProxyRule{}).Where("id = ?", rule.Id).Updates(map[string]interface{}{
-		"certificate_record_id":   0,
-		"certificate_record_list": "",
-	}).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&model.ReverseProxyRule{}).Where("id = ?", rule.Id).Updates(map[string]interface{}{
+			"certificate_record_id":   0,
+			"certificate_record_list": "",
+		}).Error; err != nil {
+			return err
+		}
+		return RefreshCertificateBindingUsageFlagsTx(tx, []uint{record.Id})
+	}); err != nil {
 		t.Fatalf("clear reverse proxy binding failed: %v", err)
 	}
 

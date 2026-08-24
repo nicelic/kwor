@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/alireza0/s-ui/network"
+	"gorm.io/gorm"
 )
 
 // MigrateLegacySettingsPathCertificatesToInventory migrates legacy
@@ -152,6 +153,30 @@ func clearLegacySettingsPathCertificateSource(settingService *SettingService, so
 	}
 
 	return nil
+}
+
+func clearLegacySettingsPathCertificateSourceTx(tx *gorm.DB, sourceRef string) error {
+	if tx == nil {
+		return fmt.Errorf("database transaction is not ready")
+	}
+	target, ok := parseImportedSourceRefTarget(sourceRef)
+	if !ok {
+		return nil
+	}
+	switch target {
+	case PanelSelfSignedTargetPanel:
+		if err := upsertSetting(tx, "webCertFile", ""); err != nil {
+			return err
+		}
+		return upsertSetting(tx, "webKeyFile", "")
+	case PanelSelfSignedTargetSub:
+		if err := upsertSetting(tx, "subCertFile", ""); err != nil {
+			return err
+		}
+		return upsertSetting(tx, "subKeyFile", "")
+	default:
+		return fmt.Errorf("unsupported imported certificate target: %q", target)
+	}
 }
 
 func parseImportedSourceRefTarget(sourceRef string) (PanelSelfSignedTarget, bool) {

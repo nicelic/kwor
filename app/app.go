@@ -445,6 +445,9 @@ func (a *APP) prepareStartupData() error {
 	if repairErr := (&service.CertificateInventoryService{}).RepairDisplayIDs(); repairErr != nil {
 		logger.Warning("repair certificate display ids failed:", repairErr)
 	}
+	if syncErr := service.RefreshAllCertificateBindingUsageFlags(); syncErr != nil {
+		logger.Warning("refresh certificate binding usage flags failed:", syncErr)
+	}
 	if syncErr := service.SyncPanelTLSAssignments(&a.SettingService); syncErr != nil {
 		logger.Warning("sync panel tls assignments failed:", syncErr)
 	}

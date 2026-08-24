@@ -258,6 +258,28 @@ func discardUnassignedPanelCertificateBalanceRuntime(boundIDs []uint) {
 	panelCertificateBalanceRuntimeMu.Unlock()
 }
 
+// discardPanelCertificateBalanceRuntimeRecordIDs removes the in-memory lease
+// state for deleted inventory records. It is intentionally separate from the
+// periodic maintenance pass because certificate deletion has a fixed TLS
+// connection drain deadline.
+func discardPanelCertificateBalanceRuntimeRecordIDs(recordIDs []uint) {
+	ids := normalizePanelCertificateBalanceRecordIDs(recordIDs)
+	if len(ids) == 0 {
+		return
+	}
+	removed := make(map[uint]struct{}, len(ids))
+	for _, id := range ids {
+		removed[id] = struct{}{}
+	}
+	panelCertificateBalanceRuntimeMu.Lock()
+	for key := range panelCertificateBalanceRuntime {
+		if _, exists := removed[key.certificateRecordID]; exists {
+			delete(panelCertificateBalanceRuntime, key)
+		}
+	}
+	panelCertificateBalanceRuntimeMu.Unlock()
+}
+
 func (s *PanelCertificateBalanceService) Maintain(force bool) error {
 	panelCertificateBalanceMaintenanceMu.Lock()
 	defer panelCertificateBalanceMaintenanceMu.Unlock()

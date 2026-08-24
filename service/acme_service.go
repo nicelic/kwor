@@ -2473,26 +2473,26 @@ func (s *AcmeService) Delete(payload AcmeDeletePayload) (*AcmeActionResult, erro
 	if getErr != nil {
 		return nil, getErr
 	}
-	if row.PushEnabled {
-		if err := removeVerifiedCertificateFiles(row.PushDir, row.PushFilePaths); err != nil {
-			return nil, err
-		}
+	if err := validateCertificateRecordDeletion(row); err != nil {
+		return nil, err
 	}
-	if row.SourceType == CertificateSourceImported {
-		if err := clearLegacySettingsPathCertificateSource(&SettingService{}, row.SourceRef); err != nil {
-			return nil, err
-		}
-	}
-	bindings, err := detachAndDeleteCertificateRecord(row)
+	bindings, err := deleteCertificateRecordWithMinimumAssignments(row)
 	if err != nil {
 		return nil, err
+	}
+	cleanupWarning := ""
+	if row.PushEnabled {
+		if cleanupErr := removeVerifiedCertificateFiles(row.PushDir, row.PushFilePaths); cleanupErr != nil {
+			cleanupWarning = "；已删除证书记录，但清理已推送文件失败：" + cleanupErr.Error()
+			logger.Warning("remove pushed certificate files after deletion failed: ", cleanupErr)
+		}
 	}
 	if row.SourceType == CertificateSourceACME {
 		if err := syncManagedAcmeCertificateOwnership(); err != nil {
 			return nil, fmt.Errorf("clear deleted certificate ownership: %w", err)
 		}
 	}
-	syncDetachedCertificateBindings(bindings)
+	syncDeletedCertificateRuntime(bindings, row)
 	if err := s.EnsureOverviewRuntimeConsistency(true); err != nil {
 		return nil, err
 	}
@@ -2503,188 +2503,114 @@ func (s *AcmeService) Delete(payload AcmeDeletePayload) (*AcmeActionResult, erro
 	}
 	return &AcmeActionResult{
 		Overview: overview,
-		Msg:      "证书已删除，关联应用绑定已解除",
+		Msg:      "证书已删除" + cleanupWarning,
 	}, nil
 }
 
-type detachedCertificateBindings struct {
-	panelTargets   []PanelSelfSignedTarget
-	defaultTLSIDs  []uint
-	mihomoTLSIDs   []uint
-	reverseChanged bool
+type deletedCertificateBindings struct {
+	panelTargets []PanelSelfSignedTarget
 }
 
-// detachAndDeleteCertificateRecord removes every database-level reference to
-// one certificate before deleting its material row. ACME/DNS account rows are
-// intentionally not touched: they are independent reusable credentials.
-func detachAndDeleteCertificateRecord(row *model.CertificateRecord) (detachedCertificateBindings, error) {
+func validateCertificateRecordDeletion(row *model.CertificateRecord) error {
 	if row == nil || row.Id == 0 {
-		return detachedCertificateBindings{}, common.NewError("certificate record is required")
+		return common.NewError("certificate record is required")
 	}
-	return detachAndDeleteCertificateRecords([]model.CertificateRecord{*row}, nil)
-}
-
-func detachAndDeleteCertificateRecords(rows []model.CertificateRecord, finalize func(*gorm.DB) error) (detachedCertificateBindings, error) {
-	result := detachedCertificateBindings{}
-	certificateIDs := make([]uint, 0, len(rows))
-	certificateIDSet := make(map[uint]struct{}, len(rows))
-	for i := range rows {
-		id := rows[i].Id
-		if id == 0 {
-			continue
-		}
-		if _, exists := certificateIDSet[id]; exists {
-			continue
-		}
-		certificateIDSet[id] = struct{}{}
-		certificateIDs = append(certificateIDs, id)
+	if reason := certificateDeleteBlockReason(row); reason != "" {
+		return common.NewError("证书无法删除：", reason)
 	}
-	if len(certificateIDs) == 0 && finalize == nil {
-		return result, nil
-	}
-
 	settingService := &SettingService{}
-	previousAssignments := map[PanelSelfSignedTarget][]uint{}
+	blockedTargets := make([]PanelSelfSignedTarget, 0, 2)
 	for _, target := range []PanelSelfSignedTarget{PanelSelfSignedTargetPanel, PanelSelfSignedTargetSub} {
 		assigned, err := GetAssignedCertificateRecordIDs(settingService, target)
 		if err != nil {
-			return result, err
-		}
-		hasRemovedAssignment := false
-		next := make([]uint, 0, len(assigned))
-		for _, id := range assigned {
-			if _, removed := certificateIDSet[id]; removed {
-				hasRemovedAssignment = true
-				continue
-			}
-			next = append(next, id)
-		}
-		if !hasRemovedAssignment {
-			continue
-		}
-		previousAssignments[target] = append([]uint(nil), assigned...)
-		if err := SetAssignedCertificateRecordIDs(settingService, target, next); err != nil {
-			return result, err
-		}
-		result.panelTargets = append(result.panelTargets, target)
-	}
-
-	db := database.GetDB()
-	err := db.Transaction(func(tx *gorm.DB) error {
-		if len(certificateIDs) > 0 {
-			if err := tx.Model(&model.Tls{}).
-				Where("certificate_record_id IN ?", certificateIDs).
-				Pluck("id", &result.defaultTLSIDs).Error; err != nil {
-				return err
-			}
-			if len(result.defaultTLSIDs) > 0 {
-				if err := tx.Model(&model.Tls{}).Where("certificate_record_id IN ?", certificateIDs).Update("certificate_record_id", 0).Error; err != nil {
-					return err
-				}
-			}
-			if err := tx.Model(&model.MihomoTls{}).
-				Where("certificate_record_id IN ?", certificateIDs).
-				Pluck("id", &result.mihomoTLSIDs).Error; err != nil {
-				return err
-			}
-			if len(result.mihomoTLSIDs) > 0 {
-				if err := tx.Model(&model.MihomoTls{}).Where("certificate_record_id IN ?", certificateIDs).Update("certificate_record_id", 0).Error; err != nil {
-					return err
-				}
-			}
-		}
-
-		reverseRows := make([]model.ReverseProxyRule, 0)
-		if err := tx.Model(&model.ReverseProxyRule{}).
-			Select("id", "enabled", "listen_protocol", "listen_protocol_alias", "certificate_record_id", "certificate_record_list").
-			Find(&reverseRows).Error; err != nil {
 			return err
 		}
-		for i := range reverseRows {
-			current := reverseProxyRuleCertificateIDs(&reverseRows[i])
-			next := make([]uint, 0, len(current))
-			for _, id := range current {
-				if _, removed := certificateIDSet[id]; !removed {
-					next = append(next, id)
-				}
-			}
-			if len(next) == len(current) {
-				continue
-			}
-			primaryID := uint(0)
-			if len(next) > 0 {
-				primaryID = next[0]
-			}
-			updates := map[string]interface{}{
-				"certificate_record_id":   primaryID,
-				"certificate_record_list": encodeReverseProxyUintList(next),
-			}
-			listenAlias := normalizeReverseProxyProtocolAlias(reverseRows[i].ListenProtocolAlias, reverseRows[i].ListenProtocol)
-			if len(next) == 0 && reverseProxyListenerUsesManagedCertificates(reverseRows[i].ListenProtocol, listenAlias) {
-				updates["enabled"] = false
-				updates["runtime_status"] = "disabled"
-				updates["last_error"] = ""
-			}
-			if err := tx.Model(&model.ReverseProxyRule{}).Where("id = ?", reverseRows[i].Id).Updates(updates).Error; err != nil {
-				return err
-			}
-			result.reverseChanged = true
-		}
-		if result.reverseChanged {
-			settings, settingsErr := loadReverseProxySettingsTx(tx)
-			if settingsErr != nil {
-				return settingsErr
-			}
-			if bumpErr := reverseProxyBumpRevisionTx(tx, settings); bumpErr != nil {
-				return bumpErr
-			}
-		}
-
-		if len(certificateIDs) > 0 {
-			if err := tx.Where("certificate_record_id IN ?", certificateIDs).Delete(&model.PanelCertificateBalanceState{}).Error; err != nil {
-				return err
-			}
-			if err := tx.Where("certificate_record_id IN ?", certificateIDs).Delete(&model.ReverseProxyCertificateBalanceState{}).Error; err != nil {
-				return err
-			}
-			if err := tx.Where("id IN ?", certificateIDs).Delete(&model.CertificateRecord{}).Error; err != nil {
-				return err
-			}
-		}
-		if finalize != nil {
-			return finalize(tx)
-		}
-		return nil
-	})
-	if err == nil {
-		return result, nil
-	}
-
-	// Settings were changed before the transaction so their canonical filtering
-	// could still see the record. Restore them if the database deletion failed.
-	for target, ids := range previousAssignments {
-		if restoreErr := SetAssignedCertificateRecordIDs(settingService, target, ids); restoreErr != nil {
-			logger.Warning("restore certificate assignment after delete rollback failed: ", restoreErr)
+		if slices.Contains(assigned, row.Id) && len(assigned) <= 1 {
+			blockedTargets = append(blockedTargets, target)
 		}
 	}
-	return detachedCertificateBindings{}, err
+	return certificateMinimumAssignmentDeleteError(blockedTargets)
 }
 
-// Runtime refreshes happen only after the short DB transaction commits. A
-// failed external refresh is logged: the binding is already safely removed and
-// the normal runtime reconciler will retry from the now-authoritative database.
-func syncDetachedCertificateBindings(bindings detachedCertificateBindings) {
+func deleteCertificateRecordWithMinimumAssignments(row *model.CertificateRecord) (deletedCertificateBindings, error) {
+	if row == nil || row.Id == 0 {
+		return deletedCertificateBindings{}, common.NewError("certificate record is required")
+	}
+	result := deletedCertificateBindings{}
+	db := database.GetDB()
+	err := db.Transaction(func(tx *gorm.DB) error {
+		current := &model.CertificateRecord{}
+		if err := tx.Where("id = ?", row.Id).First(current).Error; err != nil {
+			return err
+		}
+		if reason := certificateDeleteBlockReason(current); reason != "" {
+			return common.NewError("证书无法删除：", reason)
+		}
+
+		settingService := &SettingService{}
+		nextAssignments := make(map[PanelSelfSignedTarget][]uint)
+		blockedTargets := make([]PanelSelfSignedTarget, 0, 2)
+		for _, target := range []PanelSelfSignedTarget{PanelSelfSignedTargetPanel, PanelSelfSignedTargetSub} {
+			assigned, err := getAssignedCertificateRecordIDsTx(tx, settingService, target)
+			if err != nil {
+				return err
+			}
+			index := slices.Index(assigned, current.Id)
+			if index < 0 {
+				continue
+			}
+			next := make([]uint, 0, len(assigned)-1)
+			next = append(next, assigned[:index]...)
+			next = append(next, assigned[index+1:]...)
+			if len(next) == 0 {
+				blockedTargets = append(blockedTargets, target)
+				continue
+			}
+			nextAssignments[target] = next
+		}
+		if err := certificateMinimumAssignmentDeleteError(blockedTargets); err != nil {
+			return err
+		}
+		for target, ids := range nextAssignments {
+			if err := setAssignedCertificateRecordIDsTx(tx, target, ids); err != nil {
+				return err
+			}
+			result.panelTargets = append(result.panelTargets, target)
+		}
+		if current.SourceType == CertificateSourceImported {
+			if err := clearLegacySettingsPathCertificateSourceTx(tx, current.SourceRef); err != nil {
+				return err
+			}
+		}
+		if err := tx.Where("certificate_record_id = ?", current.Id).Delete(&model.PanelCertificateBalanceState{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("certificate_record_id = ?", current.Id).Delete(&model.ReverseProxyCertificateBalanceState{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("id = ?", current.Id).Delete(&model.CertificateRecord{}).Error
+	})
+	if err != nil {
+		return deletedCertificateBindings{}, err
+	}
+	return result, nil
+}
+
+func syncDeletedCertificateRuntime(bindings deletedCertificateBindings, row *model.CertificateRecord) {
+	if row == nil {
+		return
+	}
 	for _, target := range bindings.panelTargets {
 		if err := ApplyPanelTLSRuntimeSettings(target); err != nil {
 			logger.Warning("refresh panel TLS after certificate deletion failed: ", err)
+			continue
 		}
-	}
-	if _, err := ForceSyncTLSPathBindingsForTLSIDs(bindings.defaultTLSIDs, bindings.mihomoTLSIDs, ""); err != nil {
-		logger.Warning("refresh TLS bindings after certificate deletion failed: ", err)
-	}
-	noteReverseProxyCertificateInventoryChanged()
-	if err := (&ReverseProxyService{}).SyncCertificateInventoryNow(); err != nil {
-		logger.Warning("refresh reverse proxy after certificate deletion failed: ", err)
+		if err := DrainPanelTLSRuntimeConnectionsByFingerprint(target, strings.TrimSpace(row.Fingerprint), PanelTLSDeleteDrainGracePeriod()); err != nil {
+			logger.Warning("drain deleted panel TLS certificate connections failed: ", err)
+		}
+		time.AfterFunc(PanelTLSDeleteDrainGracePeriod(), func() {
+			discardPanelCertificateBalanceRuntimeRecordIDs([]uint{row.Id})
+		})
 	}
 }
 
@@ -7124,6 +7050,15 @@ func (s *AcmeService) removeManagedAcmeWithOptionsLocked(opts acmeRemoveOptions)
 	var removedUnits []string
 	var outputParts []string
 
+	// Deleting the certificate inventory is optional for normal ACME removal.
+	// Validate it before touching the managed installation or its host files so
+	// a protected certificate never leaves an otherwise partial removal behind.
+	if opts.removeCertificates {
+		if err := ensureAcmeCertificateInventoryDeletionAllowed(); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := cleanupStaleManagedAcmeInstallWorkspaces(managedAcmeWorkspaceParentDir()); err != nil {
 		return nil, err
 	}
@@ -7240,12 +7175,31 @@ func removeAcmeAccountRowsTx(tx *gorm.DB) error {
 }
 
 func (s *AcmeService) removeAcmeCertificatesAndInventoryLocked() error {
-	db := database.GetDB()
-	rows := make([]model.CertificateRecord, 0)
-	if err := db.Select("id").Find(&rows).Error; err != nil {
+	if err := ensureAcmeCertificateInventoryDeletionAllowed(); err != nil {
 		return err
 	}
-	bindings, err := detachAndDeleteCertificateRecords(rows, func(tx *gorm.DB) error {
+	db := database.GetDB()
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := ensureAcmeCertificateInventoryDeletionAllowedTx(tx); err != nil {
+			return err
+		}
+		if err := tx.Where("1 = 1").Delete(&model.PanelCertificateBalanceState{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("1 = 1").Delete(&model.ReverseProxyCertificateBalanceState{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("1 = 1").Delete(&model.CertificateRecord{}).Error; err != nil {
+			return err
+		}
+		for _, target := range []PanelSelfSignedTarget{PanelSelfSignedTargetPanel, PanelSelfSignedTargetSub} {
+			if err := upsertSetting(tx, panelAssignedCertificateRecordIDsKey(target), "[]"); err != nil {
+				return err
+			}
+			if err := upsertSetting(tx, panelAssignedCertificateRecordIDKey(target), "0"); err != nil {
+				return err
+			}
+		}
 		if err := removeAcmeAccountRowsTx(tx); err != nil {
 			return err
 		}
@@ -7254,11 +7208,38 @@ func (s *AcmeService) removeAcmeCertificatesAndInventoryLocked() error {
 		}
 		return tx.Where("key IN ?", []string{"webCertFile", "webKeyFile", "subCertFile", "subKeyFile"}).Delete(&model.Setting{}).Error
 	})
-	if err != nil {
+}
+
+// ensureAcmeCertificateInventoryDeletionAllowed uses the persistent flags as
+// the inventory-deletion authority. Bootstrap and binding write paths keep
+// those flags current, so deletion never scans the consumer tables itself.
+func ensureAcmeCertificateInventoryDeletionAllowed() error {
+	db := database.GetDB()
+	if db == nil {
+		return common.NewError("database is not ready")
+	}
+	return ensureAcmeCertificateInventoryDeletionAllowedTx(db)
+}
+
+func ensureAcmeCertificateInventoryDeletionAllowedTx(db *gorm.DB) error {
+	if db == nil {
+		return common.NewError("database transaction is not ready")
+	}
+	boundRecords := make([]model.CertificateRecord, 0)
+	if err := db.
+		Select("id", "bound_by_reverse_proxy", "bound_by_singbox_tls", "bound_by_mihomo_tls").
+		Where("bound_by_reverse_proxy = ? OR bound_by_singbox_tls = ? OR bound_by_mihomo_tls = ?", true, true, true).
+		Find(&boundRecords).Error; err != nil {
 		return err
 	}
-	if len(rows) > 0 {
-		syncDetachedCertificateBindings(bindings)
+	if len(boundRecords) > 0 {
+		reasons := make([]string, 0, len(boundRecords))
+		for i := range boundRecords {
+			if reason := certificateDeleteBlockReason(&boundRecords[i]); reason != "" {
+				reasons = append(reasons, reason)
+			}
+		}
+		return common.NewError("存在仍被引用的证书，无法删除证书库存：", strings.Join(uniqueStringList(reasons), "；"))
 	}
 	return nil
 }

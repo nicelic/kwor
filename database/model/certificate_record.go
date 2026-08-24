@@ -52,6 +52,13 @@ type CertificateRecord struct {
 	Remark      string `json:"remark" gorm:"type:text;not null;default:''"`
 	RenewConfig string `json:"renewConfig" gorm:"type:text;not null;default:''"`
 
+	// Persistent binding flags are the deletion authority for managed runtime
+	// consumers. They are maintained by the TLS and reverse-proxy write paths
+	// so certificate deletion never needs to scan every consumer table.
+	BoundByReverseProxy bool `json:"boundByReverseProxy" gorm:"column:bound_by_reverse_proxy;not null;default:false"`
+	BoundBySingboxTLS   bool `json:"boundBySingboxTls" gorm:"column:bound_by_singbox_tls;not null;default:false"`
+	BoundByMihomoTLS    bool `json:"boundByMihomoTls" gorm:"column:bound_by_mihomo_tls;not null;default:false"`
+
 	AcmeHome    string `json:"acmeHome" gorm:"size:1024;not null;default:''"`
 	Webroot     string `json:"webroot" gorm:"size:1024;not null;default:''"`
 	DNSProvider string `json:"dnsProvider" gorm:"size:128;not null;default:''"`

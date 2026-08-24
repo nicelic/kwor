@@ -88,6 +88,13 @@ func (s *TlsService) Save(tx *gorm.DB, action string, data json.RawMessage, host
 		if err != nil {
 			return impact, err
 		}
+		affectedCertificateIDs := []uint{tls.CertificateRecordID}
+		if action == "edit" {
+			affectedCertificateIDs = append(affectedCertificateIDs, previous.CertificateRecordID)
+		}
+		if err := RefreshCertificateBindingUsageFlagsTx(tx, affectedCertificateIDs); err != nil {
+			return impact, err
+		}
 		impact.TLSID = tls.Id
 		if action == "new" {
 			impact.PathBindingsChanged = tlsRawHasPathBindings(tls.Server) || tlsRawHasPathBindings(tls.Client)
@@ -136,6 +143,10 @@ func (s *TlsService) Save(tx *gorm.DB, action string, data json.RawMessage, host
 		if err != nil {
 			return impact, err
 		}
+		existing := model.Tls{}
+		if err = tx.Model(model.Tls{}).Select("id", "certificate_record_id").Where("id = ?", id).First(&existing).Error; err != nil {
+			return impact, err
+		}
 		var inboundCount int64
 		err = tx.Model(model.Inbound{}).Where("tls_id = ?", id).Count(&inboundCount).Error
 		if err != nil {
@@ -151,6 +162,9 @@ func (s *TlsService) Save(tx *gorm.DB, action string, data json.RawMessage, host
 		}
 		err = tx.Where("id = ?", id).Delete(model.Tls{}).Error
 		if err != nil {
+			return impact, err
+		}
+		if err := RefreshCertificateBindingUsageFlagsTx(tx, []uint{existing.CertificateRecordID}); err != nil {
 			return impact, err
 		}
 		impact.PathBindingsChanged = true

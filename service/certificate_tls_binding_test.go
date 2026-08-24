@@ -9,9 +9,10 @@ import (
 	"time"
 
 	"github.com/alireza0/s-ui/database/model"
+	"gorm.io/gorm"
 )
 
-func TestCertificateDeleteDetachesDefaultTLSBinding(t *testing.T) {
+func TestCertificateDeleteBlockedByDefaultTLSBinding(t *testing.T) {
 	db := setupMihomoSyncTestDB(t, "cert-default-tls-usage.db")
 	record := upsertTestCertificateRecord(t, "default-tls.example.com")
 
@@ -24,28 +25,31 @@ func TestCertificateDeleteDetachesDefaultTLSBinding(t *testing.T) {
 	if err := db.Create(tlsRow).Error; err != nil {
 		t.Fatalf("create tls row failed: %v", err)
 	}
+	if err := RefreshAllCertificateBindingUsageFlags(); err != nil {
+		t.Fatalf("refresh certificate binding flags failed: %v", err)
+	}
 
 	views, err := certificateInventory.List()
 	if err != nil {
 		t.Fatalf("list certificates failed: %v", err)
 	}
 	view := findCertificateRecordView(t, views, record.Id)
-	if view.DeleteBlocked || !view.InUseByTLS {
-		t.Fatalf("expected default TLS usage to be informational only, got %#v", view)
+	if !view.DeleteBlocked || !view.InUseByTLS || !strings.Contains(view.DeleteBlockedReason, "sing-box TLS") {
+		t.Fatalf("expected default TLS usage to block deletion, got %#v", view)
 	}
 	if !strings.Contains(view.UsageLabel, "default-listener") {
 		t.Fatalf("expected usage label to include tls name, got %q", view.UsageLabel)
 	}
 
-	if _, err := (&AcmeService{}).Delete(AcmeDeletePayload{ID: record.Id}); err != nil {
-		t.Fatalf("delete while default TLS is bound failed: %v", err)
+	if _, err := (&AcmeService{}).Delete(AcmeDeletePayload{ID: record.Id}); err == nil || !strings.Contains(err.Error(), "sing-box TLS") {
+		t.Fatalf("expected sing-box TLS delete rejection, got %v", err)
 	}
-	if err := db.Where("id = ?", tlsRow.Id).First(tlsRow).Error; err != nil || tlsRow.CertificateRecordID != 0 {
-		t.Fatalf("expected default TLS binding cleared, row=%#v err=%v", tlsRow, err)
+	if err := db.Where("id = ?", tlsRow.Id).First(tlsRow).Error; err != nil || tlsRow.CertificateRecordID != record.Id {
+		t.Fatalf("default TLS binding must remain, row=%#v err=%v", tlsRow, err)
 	}
 }
 
-func TestCertificateDeleteDetachesMihomoTLSBinding(t *testing.T) {
+func TestCertificateDeleteBlockedByMihomoTLSBinding(t *testing.T) {
 	db := setupMihomoSyncTestDB(t, "cert-mihomo-tls-usage.db")
 	record := upsertTestCertificateRecord(t, "mihomo-tls.example.com")
 
@@ -58,24 +62,27 @@ func TestCertificateDeleteDetachesMihomoTLSBinding(t *testing.T) {
 	if err := db.Create(tlsRow).Error; err != nil {
 		t.Fatalf("create mihomo tls row failed: %v", err)
 	}
+	if err := RefreshAllCertificateBindingUsageFlags(); err != nil {
+		t.Fatalf("refresh certificate binding flags failed: %v", err)
+	}
 
 	views, err := certificateInventory.List()
 	if err != nil {
 		t.Fatalf("list certificates failed: %v", err)
 	}
 	view := findCertificateRecordView(t, views, record.Id)
-	if view.DeleteBlocked || !view.InUseByMihomo {
-		t.Fatalf("expected Mihomo TLS usage to be informational only, got %#v", view)
+	if !view.DeleteBlocked || !view.InUseByMihomo || !strings.Contains(view.DeleteBlockedReason, "Mihomo TLS") {
+		t.Fatalf("expected Mihomo TLS usage to block deletion, got %#v", view)
 	}
 	if !strings.Contains(view.UsageLabel, "mihomo-listener") {
 		t.Fatalf("expected usage label to include mihomo tls name, got %q", view.UsageLabel)
 	}
 
-	if _, err := (&AcmeService{}).Delete(AcmeDeletePayload{ID: record.Id}); err != nil {
-		t.Fatalf("delete while Mihomo TLS is bound failed: %v", err)
+	if _, err := (&AcmeService{}).Delete(AcmeDeletePayload{ID: record.Id}); err == nil || !strings.Contains(err.Error(), "Mihomo TLS") {
+		t.Fatalf("expected Mihomo TLS delete rejection, got %v", err)
 	}
-	if err := db.Where("id = ?", tlsRow.Id).First(tlsRow).Error; err != nil || tlsRow.CertificateRecordID != 0 {
-		t.Fatalf("expected Mihomo TLS binding cleared, row=%#v err=%v", tlsRow, err)
+	if err := db.Where("id = ?", tlsRow.Id).First(tlsRow).Error; err != nil || tlsRow.CertificateRecordID != record.Id {
+		t.Fatalf("Mihomo TLS binding must remain, row=%#v err=%v", tlsRow, err)
 	}
 }
 
@@ -92,7 +99,12 @@ func TestCertificateDeleteAllowedAfterTLSBindingCleared(t *testing.T) {
 	if err := db.Create(tlsRow).Error; err != nil {
 		t.Fatalf("create tls row failed: %v", err)
 	}
-	if err := db.Model(&model.Tls{}).Where("id = ?", tlsRow.Id).Update("certificate_record_id", 0).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&model.Tls{}).Where("id = ?", tlsRow.Id).Update("certificate_record_id", 0).Error; err != nil {
+			return err
+		}
+		return RefreshCertificateBindingUsageFlagsTx(tx, []uint{record.Id})
+	}); err != nil {
 		t.Fatalf("clear tls binding failed: %v", err)
 	}
 
