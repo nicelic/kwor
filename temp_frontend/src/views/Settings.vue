@@ -473,10 +473,11 @@
 			:key="`json-${subscriptionDraftGeneration}`"
             ref="subJsonExtRef"
 			:settings="subJsonDraftSettings"
-			:canonical-default="settingsDefaults.jsonExt"
-			:initial-dirty="subJsonDraftDirty"
-			:initial-reset="subJsonResetPending"
-			:rule-set-sources="ruleSetSources.json"
+            :canonical-default="settingsDefaults.jsonExt"
+            :initial-dirty="subJsonDraftDirty"
+            :initial-reset="subJsonResetPending"
+            :initial-dirty-baseline="subJsonDraftBaseline"
+            :rule-set-sources="ruleSetSources.json"
 			@dirty-change="onSubJsonDirtyChange"
           />
           <v-alert v-else-if="tab === 't3'" :type="subJsonDraftLoadState === 'error' ? 'error' : 'info'" variant="tonal" class="my-3">
@@ -499,10 +500,11 @@
 			:key="`clash-${subscriptionDraftGeneration}`"
             ref="subClashExtRef"
 			:settings="subClashDraftSettings"
-			:canonical-default="settingsDefaults.clashExt"
-			:initial-dirty="subClashDraftDirty"
-			:initial-reset="subClashResetPending"
-			:rule-set-sources="ruleSetSources.clash"
+            :canonical-default="settingsDefaults.clashExt"
+            :initial-dirty="subClashDraftDirty"
+            :initial-reset="subClashResetPending"
+            :initial-dirty-baseline="subClashDraftBaseline"
+            :rule-set-sources="ruleSetSources.clash"
 			@dirty-change="onSubClashDirtyChange"
           />
           <v-alert v-else-if="tab === 't4'" :type="subClashDraftLoadState === 'error' ? 'error' : 'info'" variant="tonal" class="my-3">
@@ -732,6 +734,8 @@ const subJsonDraftValue = ref('')
 const subClashDraftValue = ref('')
 const subJsonDraftDirty = ref(false)
 const subClashDraftDirty = ref(false)
+const subJsonDraftBaseline = ref('')
+const subClashDraftBaseline = ref('')
 const subJsonDraftError = ref('')
 const subClashDraftError = ref('')
 type SubscriptionDraftLoadState = 'idle' | 'loading' | 'ready' | 'error'
@@ -1242,6 +1246,8 @@ const setData = (snapshot: SettingsSnapshot) => {
 	subClashDraftSettings.value = {}
 	subJsonDraftDirty.value = false
 	subClashDraftDirty.value = false
+	subJsonDraftBaseline.value = ''
+	subClashDraftBaseline.value = ''
 	subJsonDraftError.value = ''
 	subClashDraftError.value = ''
 	subJsonDraftLoadState.value = 'idle'
@@ -1327,6 +1333,7 @@ const loadSubscriptionDraft = async (target: 'json' | 'clash', retryAfterRevisio
 		subJsonDraftValue.value = snapshot.value
 		subJsonDraftSettings.value = { ...settings.value, subJsonExt: value }
 		subJsonDraftDirty.value = false
+		subJsonDraftBaseline.value = ''
 		subJsonDraftError.value = ''
 		subJsonResetPending.value = false
 	} else {
@@ -1335,6 +1342,7 @@ const loadSubscriptionDraft = async (target: 'json' | 'clash', retryAfterRevisio
 		subClashDraftValue.value = snapshot.value
 		subClashDraftSettings.value = { subClashExt: value }
 		subClashDraftDirty.value = false
+		subClashDraftBaseline.value = ''
 		subClashDraftError.value = ''
 		subClashResetPending.value = false
 	}
@@ -1372,6 +1380,7 @@ const applySubscriptionInitialReset = (target: 'json' | 'clash', result: Subscri
 		subJsonDraftValue.value = value
 		subJsonDraftSettings.value = { ...settings.value, subJsonExt: value }
 		subJsonDraftDirty.value = false
+		subJsonDraftBaseline.value = ''
 		subJsonDraftError.value = ''
 		subJsonResetPending.value = false
 		setSubscriptionDraftLoadState('json', 'ready')
@@ -1380,6 +1389,7 @@ const applySubscriptionInitialReset = (target: 'json' | 'clash', result: Subscri
 		subClashDraftValue.value = value
 		subClashDraftSettings.value = { subClashExt: value }
 		subClashDraftDirty.value = false
+		subClashDraftBaseline.value = ''
 		subClashDraftError.value = ''
 		subClashResetPending.value = false
 		setSubscriptionDraftLoadState('clash', 'ready')
@@ -2122,9 +2132,20 @@ const persistSubscriptionDraft = (target: 'json' | 'clash', requireValid = false
 	const component = target === 'json' ? subJsonExtRef.value : subClashExtRef.value
 	const alreadyDirty = target === 'json' ? subJsonDraftDirty.value : subClashDraftDirty.value
 	if (!component) return !requireValid || !alreadyDirty
-	if (!alreadyDirty && component.isDirty?.() !== true) return true
+	const rememberDraftBaseline = () => {
+		const snapshot = component.getDirtyTrackingBaseline?.()
+		if (typeof snapshot !== 'string' || snapshot === '') return
+		if (target === 'json') subJsonDraftBaseline.value = snapshot
+		else subClashDraftBaseline.value = snapshot
+	}
+	const componentDirty = component.isDirty?.() === true
+	if (!alreadyDirty && !componentDirty) {
+		rememberDraftBaseline()
+		return true
+	}
 
 	const result = component.validateAndSerialize?.() as SubscriptionSerializeResult | undefined
+	rememberDraftBaseline()
 	if (!result) return true
 	if (target === 'json') {
 	  subJsonDraftDirty.value = result.dirty === true

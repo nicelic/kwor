@@ -1917,8 +1917,19 @@ export const SubClashExtMixin = {
   },
   mounted(this: any) {
     this.$nextTick(() => {
+      // Complete the initial draft projection before capturing the clean baseline.
+      // Otherwise the debounced projection can be mistaken for a user edit.
+      this.flushClashConfigRegeneration?.()
       this._dirtyTrackingReady = true
-      this.refreshDirtyTrackingBaseline()
+      const initialBaseline = typeof this.initialDirtyBaseline === 'string'
+        ? this.initialDirtyBaseline
+        : ''
+      if (initialBaseline) {
+        this._dirtyTrackingBaseline = initialBaseline
+        this._dirtyTrackingPreserveInitial = false
+      } else if (!this._dirtyTrackingPreserveInitial) {
+        this._dirtyTrackingBaseline = this.getDirtyTrackingSnapshot()
+      }
     })
   },
   beforeUnmount(this: any) {
@@ -2399,11 +2410,12 @@ export const SubClashExtMixin = {
 	  }
 	},
 	refreshDirtyTrackingBaseline(this: any) {
-	  if (!this._dirtyTrackingReady || this._dirtyTrackingPending || this._dirty === true || this._resetRequested === true || this._dirtyTrackingPreserveInitial) return
+	  if (!this._dirtyTrackingReady || this._dirtyTrackingBaseline != null || this._dirtyTrackingPending || this._dirty === true || this._resetRequested === true || this._dirtyTrackingPreserveInitial) return
 	  this._dirtyTrackingBaseline = this.getDirtyTrackingSnapshot()
 	},
 	syncDirtyStateFromUi(this: any) {
 	  if (!this._dirtyTrackingReady || this._resetRequested === true || this._dirtyTrackingPreserveInitial) return
+	  this.flushClashConfigRegeneration?.()
 	  const snapshot = this.getDirtyTrackingSnapshot()
 	  if (this._dirtyTrackingBaseline == null) {
 		this._dirtyTrackingBaseline = snapshot
@@ -2436,6 +2448,7 @@ export const SubClashExtMixin = {
 	onFormValueChange(this: any) {
 	  this._resetRequested = false
 	  this._editorSourcePending = false
+	  if (this._dirtyTrackingReady) this.markUserDirty()
 	  this.scheduleDirtyStateCheck()
 	},
 	markUserDirty(this: any) {
@@ -2451,6 +2464,9 @@ export const SubClashExtMixin = {
 	  }
 	  this.syncDirtyStateFromUi?.()
 	  return this._dirty === true
+	},
+	getDirtyTrackingBaseline(this: any): string {
+	  return typeof this._dirtyTrackingBaseline === 'string' ? this._dirtyTrackingBaseline : ''
 	},
 	validateAndSerialize(this: any) {
 	  if (this.formRowsTooLarge !== true && this._editorSourcePending !== true) {

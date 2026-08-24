@@ -599,7 +599,7 @@ import {
 } from './SubJsonExtConstants'
 
 export default {
-	props: ['settings', 'canonicalDefault', 'initialDirty', 'initialReset', 'ruleSetSources'],
+	props: ['settings', 'canonicalDefault', 'initialDirty', 'initialReset', 'initialDirtyBaseline', 'ruleSetSources'],
 	emits: ['dirty-change'],
   components: { Editor },
   mixins: [SubJsonExtMixin],

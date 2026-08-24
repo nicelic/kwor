@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,11 +78,22 @@ func (r *acmeOperationRuntime) snapshot() error {
 	if r == nil || r.account == nil {
 		return common.NewError("acme runtime account is nil")
 	}
-	state, registered, err := captureAcmeRuntimeState(r.configHome)
+	state, registered, err := captureAcmeRuntimeState(r.configHome, r.account.Server)
 	if err != nil {
 		return err
 	}
 	if !registered {
+		if !r.account.Registered && len(r.account.RuntimeState) == 0 {
+			return nil
+		}
+		// acme.sh creates account.key before EAB and newAccount complete. Never
+		// persist that partial state as a registered account; clearing it here
+		// lets the next operation start with a clean CA runtime.
+		r.account.RuntimeState = nil
+		r.account.Registered = false
+		if err := database.GetDB().Save(r.account).Error; err != nil {
+			return err
+		}
 		return nil
 	}
 	r.account.RuntimeState = state
@@ -92,27 +104,14 @@ func (r *acmeOperationRuntime) snapshot() error {
 	return nil
 }
 
-// hasAccountKey verifies the restored state rather than trusting only the
-// database flag. A partially written or manually damaged snapshot must fall
-// back to a fresh registration instead of letting --issue run with no account
-// key in the temporary config home.
-func (r *acmeOperationRuntime) hasAccountKey() bool {
+// hasVerifiedAccountState verifies the CA-specific runtime instead of trusting
+// only the database flag. account.key is created before an ACME registration
+// completes, so it is insufficient evidence of a usable account.
+func (r *acmeOperationRuntime) hasVerifiedAccountState(server string) bool {
 	if r == nil {
 		return false
 	}
-	caRoot := filepath.Join(r.configHome, "ca")
-	found := false
-	_ = filepath.WalkDir(caRoot, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil || entry == nil || entry.IsDir() {
-			return nil
-		}
-		if entry.Type().IsRegular() && filepath.Base(path) == "account.key" {
-			found = true
-			return fs.SkipAll
-		}
-		return nil
-	})
-	return found
+	return hasVerifiedAcmeRuntimeState(r.configHome, server)
 }
 
 func (r *acmeOperationRuntime) cleanup() {
@@ -218,8 +217,14 @@ func restoreAcmeRuntimeState(configHome string, raw []byte) error {
 	return nil
 }
 
-func captureAcmeRuntimeState(configHome string) ([]byte, bool, error) {
-	caRoot := filepath.Join(configHome, "ca")
+func captureAcmeRuntimeState(configHome string, server string) ([]byte, bool, error) {
+	caRoot, err := acmeRuntimeCADir(configHome, server)
+	if err != nil {
+		return nil, false, err
+	}
+	if !hasVerifiedAcmeRuntimeState(configHome, server) {
+		return nil, false, nil
+	}
 	if _, err := os.Stat(caRoot); err != nil {
 		if os.IsNotExist(err) {
 			return nil, false, nil
@@ -229,8 +234,7 @@ func captureAcmeRuntimeState(configHome string) ([]byte, bool, error) {
 
 	state := acmeRuntimeState{Files: map[string]string{}}
 	totalSize := 0
-	registered := false
-	err := filepath.WalkDir(caRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(caRoot, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -267,22 +271,101 @@ func captureAcmeRuntimeState(configHome string) ([]byte, bool, error) {
 		}
 		state.Files[relative] = base64.StdEncoding.EncodeToString(content)
 		totalSize += len(content)
-		if filepath.Base(path) == "account.key" {
-			registered = true
-		}
 		return nil
 	})
 	if err != nil {
 		return nil, false, common.NewError("capture temporary acme runtime failed: ", err)
-	}
-	if !registered {
-		return nil, false, nil
 	}
 	raw, err := json.Marshal(state)
 	if err != nil {
 		return nil, false, common.NewError("encode acme account runtime failed: ", err)
 	}
 	return raw, true, nil
+}
+
+func acmeRuntimeCADir(configHome string, server string) (string, error) {
+	server = normalizeSupportedAcmeDomainServer(server)
+	var directory string
+	switch server {
+	case "letsencrypt":
+		directory = acmeLEProductionDirectory
+	case "zerossl":
+		directory = acmeZeroSSLDirectory
+	default:
+		return "", common.NewError("unsupported acme runtime CA")
+	}
+
+	parsed, err := url.Parse(directory)
+	if err != nil || strings.TrimSpace(parsed.Host) == "" {
+		return "", common.NewError("parse acme runtime CA failed")
+	}
+	pathPart := strings.Trim(strings.TrimSpace(parsed.Path), "/")
+	if pathPart == "" {
+		return "", common.NewError("acme runtime CA path is empty")
+	}
+	return filepath.Join(strings.TrimSpace(configHome), "ca", parsed.Host, filepath.FromSlash(pathPart)), nil
+}
+
+func hasVerifiedAcmeRuntimeState(configHome string, server string) bool {
+	caDir, err := acmeRuntimeCADir(configHome, server)
+	if err != nil {
+		return false
+	}
+	keyInfo, err := os.Stat(filepath.Join(caDir, "account.key"))
+	if err != nil || !keyInfo.Mode().IsRegular() || keyInfo.Size() == 0 {
+		return false
+	}
+
+	config, err := readAcmeRuntimeCAConfig(caDir)
+	if err != nil {
+		return false
+	}
+	accountURL := strings.TrimSpace(config["ACCOUNT_URL"])
+	parsedURL, err := url.ParseRequestURI(accountURL)
+	if err != nil || (parsedURL.Scheme != "https" && parsedURL.Scheme != "http") || strings.TrimSpace(parsedURL.Host) == "" {
+		return false
+	}
+	if strings.TrimSpace(config["CA_KEY_HASH"]) == "" {
+		return false
+	}
+	if normalizeSupportedAcmeDomainServer(server) == "zerossl" &&
+		(strings.TrimSpace(config["CA_EAB_KEY_ID"]) == "" || strings.TrimSpace(config["CA_EAB_HMAC_KEY"]) == "") {
+		return false
+	}
+	return true
+}
+
+func readAcmeRuntimeCAConfig(caDir string) (map[string]string, error) {
+	raw, err := os.ReadFile(filepath.Join(caDir, "ca.conf"))
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]string)
+	lines := strings.Split(strings.ReplaceAll(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\r", "\n"), "\n")
+	for _, line := range lines {
+		key := parseAcmeEnvLineKey(line)
+		if key == "" {
+			continue
+		}
+		result[key] = parseAcmeEnvLineValue(line)
+	}
+	return result, nil
+}
+
+func clearAcmeRuntimeCAState(configHome string, server string) error {
+	caDir, err := acmeRuntimeCADir(configHome, server)
+	if err != nil {
+		return err
+	}
+	caRoot := filepath.Join(strings.TrimSpace(configHome), "ca")
+	relative, err := filepath.Rel(caRoot, caDir)
+	if err != nil || relative == "." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || relative == ".." {
+		return common.NewError("invalid acme runtime CA directory")
+	}
+	if err := os.RemoveAll(caDir); err != nil && !os.IsNotExist(err) {
+		return common.NewError("clear temporary acme runtime failed: ", err)
+	}
+	return nil
 }
 
 func validateAcmeRuntimeRelativePath(value string) (string, error) {
@@ -356,15 +439,28 @@ func (s *AcmeService) ensureOperationRuntimeAccountWithRunner(scriptPath string,
 		return runErr
 	}
 
-	hasState := account.Registered && len(account.RuntimeState) > 0 && runtime.hasAccountKey()
+	hasState := account.Registered && len(account.RuntimeState) > 0 && runtime.hasVerifiedAccountState(server)
 	if hasState {
+		cachedEmail, readErr := readAcmeRuntimeAccountEmail(runtime.configHome, server)
+		if readErr != nil {
+			return readErr
+		}
+		if acmeRuntimeAccountEmailsEqual(cachedEmail, email, server) {
+			if logSession != nil {
+				logSession.append("ACME 账号运行态已验证，联系人未变化，跳过账号更新")
+			}
+			return nil
+		}
 		if email == "" {
 			// acme.sh falls back to CA_EMAIL when -m is empty. Remove the
 			// temporary cached contact first so a blank Let's Encrypt contact
 			// is synchronized as an empty contact list instead of being ignored.
-			if err := clearAcmeRuntimeAccountEmail(runtime.configHome); err != nil {
+			if err := clearAcmeRuntimeAccountEmail(runtime.configHome, server); err != nil {
 				return err
 			}
+		}
+		if logSession != nil {
+			logSession.append("ACME 账号联系人已变化，正在同步")
 		}
 		args := []string{"--update-account", "-m", email, "--server", server}
 		if err := run(args); err == nil {
@@ -376,6 +472,9 @@ func (s *AcmeService) ensureOperationRuntimeAccountWithRunner(scriptPath string,
 		}
 		// A damaged or manually removed account state is repaired by creating a
 		// fresh account inside the same temporary config home below.
+	}
+	if err := clearAcmeRuntimeCAState(runtime.configHome, server); err != nil {
+		return err
 	}
 
 	if logSession != nil {
@@ -396,12 +495,36 @@ func (s *AcmeService) ensureOperationRuntimeAccountWithRunner(scriptPath string,
 	}
 }
 
+func readAcmeRuntimeAccountEmail(configHome string, server string) (string, error) {
+	caDir, err := acmeRuntimeCADir(configHome, server)
+	if err != nil {
+		return "", err
+	}
+	config, err := readAcmeRuntimeCAConfig(caDir)
+	if err != nil {
+		return "", common.NewError("read temporary acme account config failed: ", err)
+	}
+	return strings.TrimSpace(config["CA_EMAIL"]), nil
+}
+
+func acmeRuntimeAccountEmailsEqual(left string, right string, server string) bool {
+	leftNormalized, leftErr := validateAcmeAccountEmailForServer(left, server)
+	rightNormalized, rightErr := validateAcmeAccountEmailForServer(right, server)
+	if leftErr != nil || rightErr != nil {
+		return strings.TrimSpace(left) == strings.TrimSpace(right)
+	}
+	return leftNormalized == rightNormalized
+}
+
 // clearAcmeRuntimeAccountEmail removes the cached CA contact from a temporary
 // runtime before acme.sh --update-account is invoked with an empty email.
 // Runtime snapshots contain only the ca/ tree, so touching it never mutates
 // the installed acme.sh directory or any user-owned account configuration.
-func clearAcmeRuntimeAccountEmail(configHome string) error {
-	caRoot := filepath.Join(strings.TrimSpace(configHome), "ca")
+func clearAcmeRuntimeAccountEmail(configHome string, server string) error {
+	caRoot, err := acmeRuntimeCADir(configHome, server)
+	if err != nil {
+		return err
+	}
 	if _, err := os.Stat(caRoot); err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -409,7 +532,7 @@ func clearAcmeRuntimeAccountEmail(configHome string) error {
 		return common.NewError("inspect temporary acme account config failed: ", err)
 	}
 
-	err := filepath.WalkDir(caRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(caRoot, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}

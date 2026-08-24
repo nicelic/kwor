@@ -70,19 +70,19 @@ const (
 	acmeLogMaxLines                                = 400
 	acmeLogMaxBytes                                = 256 * 1024
 	acmeLogMaxLineBytes                            = 4 * 1024
-	acmeLogTTL                                     = 30 * time.Minute
-	acmeTaskTTL                                    = 30 * time.Minute
-	acmeTerminalTaskCleanupDelay                   = 5 * time.Second
+	acmeLogTTL                                     = 24 * time.Hour
+	acmeTaskTTL                                    = 24 * time.Hour
+	acmeTerminalTaskCleanupDelay                   = acmeTaskTTL
 	acmeTaskQueueCapacity                          = 4096
 	acmeTaskResultOutputMaxRunes                   = 4096
 	acmeTaskDeadline                               = 30 * time.Minute
-	acmeDomainCertificateMaxNames                  = 2048
+	acmeDomainCertificateMaxNames                  = 100
 	acmeCertificateTypeDomain                      = "domain"
 	acmeCertificateTypeIP                          = "ip"
 	acmeLEProductionDirectory                      = "https://acme-v02.api.letsencrypt.org/directory"
 	acmeLEStagingDirectory                         = "https://acme-staging-v02.api.letsencrypt.org/directory"
 	acmeZeroSSLDirectory                           = "https://acme.zerossl.com/v2/DV90"
-	acmeIPCertificateMaxIPs                        = 2048
+	acmeIPCertificateMaxIPs                        = 25
 	acmeIPCertificatePortHTTP                      = 80
 	acmeIPCertificatePortALPN                      = 443
 	acmeMaskedEnvValue                             = "********"
@@ -1795,6 +1795,7 @@ func (s *AcmeService) Issue(payload AcmeIssuePayload) (*AcmeActionResult, error)
 			output = strings.TrimSpace(err.Error())
 			logSession.append("检测到域名未变化，复用已有证书并同步到托管目录")
 		} else {
+			err = annotateAcmeOrderCommandError(err)
 			logSession.fail(err.Error())
 			return nil, common.NewError("issue certificate failed: ", err)
 		}
@@ -2117,6 +2118,7 @@ func (s *AcmeService) Renew(payload AcmeRenewPayload) (*AcmeActionResult, error)
 			output = strings.TrimSpace(err.Error())
 			logSession.append("域名未变化，继续同步已有证书文件")
 		} else {
+			err = annotateAcmeOrderCommandError(err)
 			logSession.fail(err.Error())
 			_ = s.markCertificateError(row.Id, err.Error())
 			return nil, common.NewError("renew certificate failed: ", err)
@@ -8188,6 +8190,31 @@ func isAcmeRenewSkippedError(err error) bool {
 	return isAcmeDomainsNotChangedError(err)
 }
 
+// annotateAcmeOrderCommandError makes the ACME failure shown to the operator
+// describe the response actually captured by acme.sh. It intentionally does
+// not guess at a CA-side root cause beyond the observed response.
+func annotateAcmeOrderCommandError(err error) error {
+	if err == nil {
+		return nil
+	}
+	text := normalizeAcmeOutputForMatch(err.Error())
+	hint := ""
+	switch {
+	case (strings.Contains(text, "curl error: 6") || strings.Contains(text, "could not resolve host")):
+		hint = "ACME 远端主机名解析失败；请检查部署服务器的 DNS 解析、出站网络和 CA 域名可达性"
+	case strings.Contains(text, "502 bad gateway") && strings.Contains(text, "le_orderfinalize not found"):
+		hint = "CA ACME 接口返回 502 网关错误，响应不是有效 ACME JSON；Le_OrderFinalize 缺失是该非 JSON 响应导致的后续解析现象"
+	case strings.Contains(text, "502 bad gateway"):
+		hint = "CA ACME 接口返回 502 网关错误，响应不是有效 ACME JSON"
+	case strings.Contains(text, "let's finalize the order") && strings.Contains(text, "command timed out"):
+		hint = "DNS 授权已进入完成后的订单 finalize 或轮询阶段，但 ACME 命令超时"
+	}
+	if hint == "" {
+		return err
+	}
+	return fmt.Errorf("%s: %w", hint, err)
+}
+
 func normalizeAcmeOutputForMatch(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -8289,25 +8316,39 @@ func runCommandOutputWithTimeoutEnvContextLogInDir(parent context.Context, timeo
 
 	err = cmd.Wait()
 	wg.Wait()
-	if ctx.Err() == context.DeadlineExceeded {
-		return "", fmt.Errorf("command timed out (%s)", command)
-	}
-	if errors.Is(ctx.Err(), context.Canceled) {
-		return "", fmt.Errorf("command canceled (%s): %w", command, ctx.Err())
-	}
-	if err != nil {
-		outputMu.Lock()
-		text := strings.TrimSpace(output.String())
-		outputMu.Unlock()
-		if text == "" {
-			return "", err
-		}
-		return "", fmt.Errorf("%w: %s", err, truncateAcmeTextByBytes(text, acmeCommandErrorMaxBytes))
-	}
 	outputMu.Lock()
 	text := output.String()
 	outputMu.Unlock()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", acmeCommandContextError("timed out", command, text, ctx.Err())
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return "", acmeCommandContextError("canceled", command, text, ctx.Err())
+	}
+	if err != nil {
+		errorText := strings.TrimSpace(text)
+		if errorText == "" {
+			return "", err
+		}
+		return "", fmt.Errorf("%w: %s", err, truncateAcmeTextByBytes(errorText, acmeCommandErrorMaxBytes))
+	}
 	return text, nil
+}
+
+func acmeCommandContextError(kind string, command string, output string, cause error) error {
+	message := fmt.Sprintf("command %s (%s)", strings.TrimSpace(kind), command)
+	output = strings.TrimSpace(output)
+	if output == "" {
+		if cause == nil {
+			return errors.New(message)
+		}
+		return fmt.Errorf("%s: %w", message, cause)
+	}
+	output = truncateAcmeTextByBytes(output, acmeCommandErrorMaxBytes)
+	if cause == nil {
+		return fmt.Errorf("%s: %s", message, output)
+	}
+	return fmt.Errorf("%s: %w: %s", message, cause, output)
 }
 
 type boundedAcmeOutput struct {
@@ -8455,6 +8496,24 @@ func (s *acmeLogStore) queue(id string, title string, taskID string, ctx context
 	session.appendLocked("后台任务已进入队列")
 	s.sessions[id] = session
 	return session
+}
+
+func (s *acmeLogStore) setExecutionContext(id string, ctx context.Context) {
+	if s == nil || ctx == nil {
+		return
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session := s.sessions[id]
+	if session == nil || session.status != acmeTaskStatusQueued && session.status != acmeTaskStatusRunning {
+		return
+	}
+	session.ctx = ctx
+	session.updatedAt = time.Now().Unix()
 }
 
 func (s *acmeLogSession) operationContext() context.Context {

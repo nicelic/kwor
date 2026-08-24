@@ -98,14 +98,17 @@ func TestAcmeOperationRuntimeSnapshotsCAStateAndCleansUp(t *testing.T) {
 	}
 	t.Cleanup(runtime.cleanup)
 
-	caDir := filepath.Join(runtime.configHome, "ca", "letsencrypt")
+	caDir, err := acmeRuntimeCADir(runtime.configHome, account.Server)
+	if err != nil {
+		t.Fatalf("resolve temporary CA directory failed: %v", err)
+	}
 	if err := os.MkdirAll(caDir, 0o700); err != nil {
 		t.Fatalf("create temporary CA directory failed: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(caDir, "account.key"), []byte("account-private-key"), 0o600); err != nil {
 		t.Fatalf("write account key failed: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(caDir, "account.conf"), []byte("ACCOUNT_EMAIL='ops@example.com'\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(caDir, "ca.conf"), []byte("ACCOUNT_URL='https://acme-v02.api.letsencrypt.org/acme/acct/1'\nCA_KEY_HASH='fixture-account-key-hash'\nCA_EMAIL='ops@example.com'\n"), 0o600); err != nil {
 		t.Fatalf("write account config failed: %v", err)
 	}
 	// A root account.conf is intentionally outside the saved ca/ tree because
@@ -154,7 +157,11 @@ func TestAcmeOperationRuntimeSnapshotsCAStateAndCleansUp(t *testing.T) {
 		t.Fatalf("restore operation runtime failed: %v", err)
 	}
 	defer restored.cleanup()
-	key, err := os.ReadFile(filepath.Join(restored.configHome, "ca", "letsencrypt", "account.key"))
+	restoredCADir, err := acmeRuntimeCADir(restored.configHome, account.Server)
+	if err != nil {
+		t.Fatalf("resolve restored CA directory failed: %v", err)
+	}
+	key, err := os.ReadFile(filepath.Join(restoredCADir, "account.key"))
 	if err != nil {
 		t.Fatalf("read restored account key failed: %v", err)
 	}
@@ -163,6 +170,97 @@ func TestAcmeOperationRuntimeSnapshotsCAStateAndCleansUp(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(restored.configHome, "account.conf")); !os.IsNotExist(statErr) {
 		t.Fatalf("root account.conf must not be restored, stat err=%v", statErr)
+	}
+}
+
+func TestCaptureAcmeRuntimeStateRejectsPartialAndOtherCAState(t *testing.T) {
+	configHome := t.TempDir()
+	letDir, err := acmeRuntimeCADir(configHome, "letsencrypt")
+	if err != nil {
+		t.Fatalf("resolve Let's Encrypt runtime directory failed: %v", err)
+	}
+	if err := os.MkdirAll(letDir, 0o700); err != nil {
+		t.Fatalf("create Let's Encrypt runtime directory failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(letDir, "account.key"), []byte("partial-account-key"), 0o600); err != nil {
+		t.Fatalf("write partial account key failed: %v", err)
+	}
+
+	if state, registered, err := captureAcmeRuntimeState(configHome, "letsencrypt"); err != nil || registered || len(state) != 0 {
+		t.Fatalf("partial Let's Encrypt state must not be persisted: registered=%v bytes=%d err=%v", registered, len(state), err)
+	}
+
+	letConfig := "ACCOUNT_URL='https://acme-v02.api.letsencrypt.org/acme/acct/1'\nCA_KEY_HASH='fixture-account-key-hash'\nCA_EMAIL='ops@example.com'\n"
+	if err := os.WriteFile(filepath.Join(letDir, "ca.conf"), []byte(letConfig), 0o600); err != nil {
+		t.Fatalf("write complete Let's Encrypt config failed: %v", err)
+	}
+	if state, registered, err := captureAcmeRuntimeState(configHome, "letsencrypt"); err != nil || !registered || len(state) == 0 {
+		t.Fatalf("complete Let's Encrypt state must be persisted: registered=%v bytes=%d err=%v", registered, len(state), err)
+	}
+	if state, registered, err := captureAcmeRuntimeState(configHome, "zerossl"); err != nil || registered || len(state) != 0 {
+		t.Fatalf("Let's Encrypt state must not be used as ZeroSSL state: registered=%v bytes=%d err=%v", registered, len(state), err)
+	}
+
+	zeroDir, err := acmeRuntimeCADir(configHome, "zerossl")
+	if err != nil {
+		t.Fatalf("resolve ZeroSSL runtime directory failed: %v", err)
+	}
+	if err := os.MkdirAll(zeroDir, 0o700); err != nil {
+		t.Fatalf("create ZeroSSL runtime directory failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(zeroDir, "account.key"), []byte("zerossl-account-key"), 0o600); err != nil {
+		t.Fatalf("write ZeroSSL account key failed: %v", err)
+	}
+	zeroConfig := "ACCOUNT_URL='https://acme.zerossl.com/v2/DV90/acct/1'\nCA_KEY_HASH='fixture-account-key-hash'\nCA_EMAIL='ops@example.com'\n"
+	if err := os.WriteFile(filepath.Join(zeroDir, "ca.conf"), []byte(zeroConfig), 0o600); err != nil {
+		t.Fatalf("write partial ZeroSSL config failed: %v", err)
+	}
+	if state, registered, err := captureAcmeRuntimeState(configHome, "zerossl"); err != nil || registered || len(state) != 0 {
+		t.Fatalf("ZeroSSL state without EAB must not be persisted: registered=%v bytes=%d err=%v", registered, len(state), err)
+	}
+	zeroConfig += "CA_EAB_KEY_ID='fixture-kid'\nCA_EAB_HMAC_KEY='fixture-hmac'\n"
+	if err := os.WriteFile(filepath.Join(zeroDir, "ca.conf"), []byte(zeroConfig), 0o600); err != nil {
+		t.Fatalf("write complete ZeroSSL config failed: %v", err)
+	}
+	if state, registered, err := captureAcmeRuntimeState(configHome, "zerossl"); err != nil || !registered || len(state) == 0 {
+		t.Fatalf("complete ZeroSSL state must be persisted: registered=%v bytes=%d err=%v", registered, len(state), err)
+	}
+}
+
+func TestAcmeOperationRuntimeSnapshotClearsIncompleteRegistration(t *testing.T) {
+	db := setupAcmeDNSTestDB(t, "acme-runtime-incomplete-registration.db")
+	state := acmeRuntimeState{Files: map[string]string{
+		acmeRuntimeFixturePath(t, "letsencrypt", "account.key"): base64.StdEncoding.EncodeToString([]byte("partial-account-key")),
+	}}
+	raw, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal partial runtime state failed: %v", err)
+	}
+	account := &model.AcmeAccount{
+		Name:             "incomplete-registration",
+		Server:           "letsencrypt",
+		AccountKeyLength: "ec-256",
+		Registered:       true,
+		RuntimeState:     raw,
+	}
+	if err := db.Create(account).Error; err != nil {
+		t.Fatalf("create account failed: %v", err)
+	}
+	runtime, err := newAcmeOperationRuntime(account)
+	if err != nil {
+		t.Fatalf("restore partial runtime failed: %v", err)
+	}
+	defer runtime.cleanup()
+
+	if err := runtime.snapshot(); err != nil {
+		t.Fatalf("snapshot incomplete runtime failed: %v", err)
+	}
+	reloaded := &model.AcmeAccount{}
+	if err := db.Where("id = ?", account.Id).First(reloaded).Error; err != nil {
+		t.Fatalf("reload account failed: %v", err)
+	}
+	if reloaded.Registered || len(reloaded.RuntimeState) != 0 {
+		t.Fatalf("incomplete registration must be cleared: registered=%v bytes=%d", reloaded.Registered, len(reloaded.RuntimeState))
 	}
 }
 
@@ -218,10 +316,9 @@ func TestRestoreAcmeRuntimeStateRejectsOversizedAggregate(t *testing.T) {
 }
 
 func TestEnsureOperationRuntimeAccountClearsEmptyLEContact(t *testing.T) {
-	state := acmeRuntimeState{Files: map[string]string{
-		"ca/letsencrypt/account.key": base64.StdEncoding.EncodeToString([]byte("private-account-key")),
-		"ca/letsencrypt/ca.conf":     base64.StdEncoding.EncodeToString([]byte("CA_EMAIL='old@example.com'\nSAVED_CA_EMAIL='old@example.com'\nCA_SERVER='https://acme-v02.api.letsencrypt.org/directory'\n")),
-	}}
+	state := completeAcmeRuntimeStateFixture(t, "letsencrypt", "old@example.com")
+	caConfPath := acmeRuntimeFixturePath(t, "letsencrypt", "ca.conf")
+	state.Files[caConfPath] = base64.StdEncoding.EncodeToString([]byte("ACCOUNT_URL='https://acme-v02.api.letsencrypt.org/acme/acct/1'\nCA_KEY_HASH='fixture-account-key-hash'\nCA_EMAIL='old@example.com'\nSAVED_CA_EMAIL='old@example.com'\n"))
 	raw, err := json.Marshal(state)
 	if err != nil {
 		t.Fatalf("marshal runtime state failed: %v", err)
@@ -260,13 +357,124 @@ func TestEnsureOperationRuntimeAccountClearsEmptyLEContact(t *testing.T) {
 	if !emptyEmailArgument {
 		t.Fatalf("expected an explicit empty -m argument, got %#v", calls[0])
 	}
-	caConf, err := os.ReadFile(filepath.Join(runtime.configHome, "ca", "letsencrypt", "ca.conf"))
+	caDir, err := acmeRuntimeCADir(runtime.configHome, "letsencrypt")
+	if err != nil {
+		t.Fatalf("resolve temporary CA directory failed: %v", err)
+	}
+	caConf, err := os.ReadFile(filepath.Join(caDir, "ca.conf"))
 	if err != nil {
 		t.Fatalf("read temporary ca.conf failed: %v", err)
 	}
 	if strings.Contains(string(caConf), "CA_EMAIL") {
 		t.Fatalf("temporary CA contact must be removed before empty update: %s", caConf)
 	}
+}
+
+func TestEnsureOperationRuntimeAccountSkipsUpdateWhenContactUnchanged(t *testing.T) {
+	state := completeAcmeRuntimeStateFixture(t, "letsencrypt", "ops@example.com")
+	raw, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal runtime state failed: %v", err)
+	}
+	account := &model.AcmeAccount{
+		Name:         "unchanged-contact",
+		Email:        "ops@example.com",
+		Server:       "letsencrypt",
+		Registered:   true,
+		RuntimeState: raw,
+	}
+	runtime, err := newAcmeOperationRuntime(account)
+	if err != nil {
+		t.Fatalf("create runtime failed: %v", err)
+	}
+	defer runtime.cleanup()
+
+	calls := 0
+	runner := func(timeout time.Duration, command string, args []string, envPairs []string, logSession *acmeLogSession) (string, error) {
+		calls++
+		return "", nil
+	}
+	if err := (&AcmeService{}).ensureOperationRuntimeAccountWithRunner("/tmp/acme.sh", "/tmp/acme-home", runtime, account, "letsencrypt", nil, runner); err != nil {
+		t.Fatalf("ensure operation runtime account failed: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("unchanged account contact must not trigger --update-account, calls=%d", calls)
+	}
+}
+
+func TestEnsureOperationRuntimeAccountReregistersIncompleteState(t *testing.T) {
+	incompletePath := acmeRuntimeFixturePath(t, "letsencrypt", "account.key")
+	stalePath := acmeRuntimeFixturePath(t, "letsencrypt", "stale-file")
+	state := acmeRuntimeState{Files: map[string]string{
+		incompletePath: base64.StdEncoding.EncodeToString([]byte("partial-account-key")),
+		stalePath:      base64.StdEncoding.EncodeToString([]byte("must-be-cleared-before-registration")),
+	}}
+	raw, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal runtime state failed: %v", err)
+	}
+	account := &model.AcmeAccount{
+		Name:             "repair-incomplete-state",
+		Email:            "ops@example.com",
+		Server:           "letsencrypt",
+		AccountKeyLength: "ec-256",
+		Registered:       true,
+		RuntimeState:     raw,
+	}
+	runtime, err := newAcmeOperationRuntime(account)
+	if err != nil {
+		t.Fatalf("create runtime failed: %v", err)
+	}
+	defer runtime.cleanup()
+
+	calls := make([][]string, 0, 1)
+	runner := func(timeout time.Duration, command string, args []string, envPairs []string, logSession *acmeLogSession) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		caDir, dirErr := acmeRuntimeCADir(runtime.configHome, "letsencrypt")
+		if dirErr != nil {
+			t.Fatalf("resolve temporary CA directory failed: %v", dirErr)
+		}
+		if _, statErr := os.Stat(filepath.Join(caDir, "stale-file")); !os.IsNotExist(statErr) {
+			t.Fatalf("incomplete CA state must be cleared before registration, stat err=%v", statErr)
+		}
+		return "", nil
+	}
+	if err := (&AcmeService{}).ensureOperationRuntimeAccountWithRunner("/tmp/acme.sh", "/tmp/acme-home", runtime, account, "letsencrypt", nil, runner); err != nil {
+		t.Fatalf("ensure operation runtime account failed: %v", err)
+	}
+	if len(calls) != 1 || !containsToken(calls[0], "--register-account") || containsToken(calls[0], "--update-account") {
+		t.Fatalf("incomplete state must trigger fresh registration, got %#v", calls)
+	}
+}
+
+func completeAcmeRuntimeStateFixture(t *testing.T, server string, email string) acmeRuntimeState {
+	t.Helper()
+	return acmeRuntimeState{Files: map[string]string{
+		acmeRuntimeFixturePath(t, server, "account.key"): base64.StdEncoding.EncodeToString([]byte("fixture-account-key")),
+		acmeRuntimeFixturePath(t, server, "ca.conf"):     base64.StdEncoding.EncodeToString([]byte(acmeRuntimeFixtureCAConfig(server, email))),
+	}}
+}
+
+func acmeRuntimeFixtureCAConfig(server string, email string) string {
+	config := "ACCOUNT_URL='https://acme-v02.api.letsencrypt.org/acme/acct/1'\nCA_KEY_HASH='fixture-account-key-hash'\nCA_EMAIL='" + email + "'\n"
+	if normalizeSupportedAcmeDomainServer(server) == "zerossl" {
+		config = "ACCOUNT_URL='https://acme.zerossl.com/v2/DV90/acct/1'\nCA_KEY_HASH='fixture-account-key-hash'\nCA_EMAIL='" + email + "'\nCA_EAB_KEY_ID='fixture-kid'\nCA_EAB_HMAC_KEY='fixture-hmac'\n"
+	}
+	return config
+}
+
+func acmeRuntimeFixturePath(t *testing.T, server string, filename string) string {
+	t.Helper()
+	configHome := filepath.Join(t.TempDir(), "config")
+	caDir, err := acmeRuntimeCADir(configHome, server)
+	if err != nil {
+		t.Fatalf("resolve fixture CA directory failed: %v", err)
+	}
+	relative, err := filepath.Rel(configHome, filepath.Join(caDir, filename))
+	if err != nil {
+		t.Fatalf("resolve fixture runtime path failed: %v", err)
+	}
+	return filepath.ToSlash(relative)
 }
 
 func TestEnsureOverviewScrubsLegacyAcmeCertificateRuntimeFields(t *testing.T) {

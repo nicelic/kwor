@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -47,6 +48,136 @@ func TestAcmeTaskStoreQueuesCompletesAndFails(t *testing.T) {
 	secondDone := waitForAcmeTask(t, store, second.ID, acmeTaskStatusError)
 	if secondDone.Error != "expected task failure" {
 		t.Fatalf("unexpected failed task: %#v", secondDone)
+	}
+}
+
+func TestAcmeTaskExecutionDeadlineStartsOnlyWhenWorkerBegins(t *testing.T) {
+	previousLogStore := acmeLogSessionStore
+	acmeLogSessionStore = newAcmeLogStore()
+	t.Cleanup(func() { acmeLogSessionStore = previousLogStore })
+
+	store := newAcmeTaskStore()
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	first, err := store.enqueue("issue", "blocking task", func(string) (*AcmeActionResult, error) {
+		close(firstStarted)
+		<-releaseFirst
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("enqueue first task: %v", err)
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("blocking task did not start")
+	}
+
+	secondStarted := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	second, err := store.enqueue("renew", "queued task", func(string) (*AcmeActionResult, error) {
+		close(secondStarted)
+		<-releaseSecond
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("enqueue second task: %v", err)
+	}
+
+	store.mu.Lock()
+	queued := store.tasks[second.ID]
+	if queued == nil || queued.ctx == nil {
+		store.mu.Unlock()
+		t.Fatalf("queued task runtime is missing: %#v", queued)
+	}
+	if _, hasDeadline := queued.ctx.Deadline(); hasDeadline {
+		store.mu.Unlock()
+		t.Fatal("queued ACME task must not start its execution deadline")
+	}
+	if queued.cancel != nil {
+		store.mu.Unlock()
+		t.Fatal("queued ACME task must not have an execution cancel function")
+	}
+	store.mu.Unlock()
+
+	close(releaseFirst)
+	_ = waitForAcmeTask(t, store, first.ID, acmeTaskStatusSuccess)
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("queued task did not begin after first task completed")
+	}
+
+	executionCtx, _, _ := store.getOperation(second.ID)
+	if executionCtx == nil {
+		t.Fatal("running task execution context is missing")
+	}
+	deadline, hasDeadline := executionCtx.Deadline()
+	if !hasDeadline {
+		t.Fatal("running ACME task must have an execution deadline")
+	}
+	if remaining := time.Until(deadline); remaining <= 0 || remaining > acmeTaskDeadline {
+		t.Fatalf("unexpected execution deadline remaining=%s", remaining)
+	}
+
+	acmeLogSessionStore.mu.Lock()
+	logSession := acmeLogSessionStore.sessions[second.LogSessionID]
+	logCtx := context.Background()
+	if logSession != nil {
+		logCtx = logSession.operationContext()
+	}
+	acmeLogSessionStore.mu.Unlock()
+	if logSession == nil || logCtx != executionCtx {
+		t.Fatalf("task and log session must share the execution context: task=%p log=%p", executionCtx, logCtx)
+	}
+
+	close(releaseSecond)
+	_ = waitForAcmeTask(t, store, second.ID, acmeTaskStatusSuccess)
+}
+
+func TestAcmeTaskManagedExecutionKeepsManagedDeadline(t *testing.T) {
+	previousLogStore := acmeLogSessionStore
+	acmeLogSessionStore = newAcmeLogStore()
+	t.Cleanup(func() { acmeLogSessionStore = previousLogStore })
+
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &acmeTaskStore{tasks: map[string]*acmeTask{
+		"managed-install": {
+			ctx:     parent,
+			managed: &ManagedDownloadTaskHandle{},
+			view: AcmeTaskView{
+				ID:           "managed-install",
+				Status:       acmeTaskStatusRunning,
+				LogSessionID: "log-managed-install",
+			},
+		},
+	}}
+	acmeLogSessionStore.queue("log-managed-install", "下载 / 重装", "managed-install", parent, nil)
+
+	executionCtx, cancelExecution, started := store.beginExecution("managed-install", "log-managed-install")
+	if !started || executionCtx != parent {
+		t.Fatalf("managed task must keep its existing context: started=%v task=%p parent=%p", started, executionCtx, parent)
+	}
+	if _, hasDeadline := executionCtx.Deadline(); hasDeadline {
+		t.Fatal("managed install task must not receive the certificate issuance deadline")
+	}
+	cancelExecution()
+	select {
+	case <-parent.Done():
+		t.Fatal("managed task no-op execution cancellation must not cancel its own context")
+	default:
+	}
+
+	acmeLogSessionStore.mu.Lock()
+	logSession := acmeLogSessionStore.sessions["log-managed-install"]
+	logCtx := context.Background()
+	if logSession != nil {
+		logCtx = logSession.operationContext()
+	}
+	acmeLogSessionStore.mu.Unlock()
+	if logSession == nil || logCtx != parent {
+		t.Fatalf("managed task log must retain the managed context: log=%p parent=%p", logCtx, parent)
 	}
 }
 

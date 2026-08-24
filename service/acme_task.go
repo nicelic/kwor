@@ -65,12 +65,11 @@ func (s *acmeTaskStore) enqueue(operation string, title string, run func(logSess
 	if err != nil {
 		return nil, err
 	}
-	operationContext, cancel := context.WithTimeout(operationContext, acmeTaskDeadline)
 
 	now := time.Now().Unix()
 	taskID := newAcmeTaskID()
 	logSessionID := "log-" + taskID
-	entry := &acmeTask{ctx: operationContext, cancel: cancel, operation: operationHandle, view: AcmeTaskView{
+	entry := &acmeTask{ctx: operationContext, operation: operationHandle, view: AcmeTaskView{
 		ID:           taskID,
 		Operation:    operation,
 		Status:       acmeTaskStatusQueued,
@@ -90,7 +89,6 @@ func (s *acmeTaskStore) enqueue(operation string, title string, run func(logSess
 		return cloneAcmeTaskView(&entry.view), nil
 	}
 	s.finish(taskID, nil, fmt.Errorf("ACME 后台任务队列已满，请稍后重试"))
-	cancel()
 	operationHandle.Done()
 	return nil, fmt.Errorf("ACME 后台任务队列已满，请稍后重试")
 }
@@ -251,7 +249,26 @@ func (s *acmeTaskStore) run() {
 			}
 			continue
 		}
+		executionCtx, cancelExecution, started := s.beginExecution(job.id, logSessionID)
+		if !started {
+			continue
+		}
+		if executionCtx.Err() != nil {
+			cancelExecution()
+			cancelErr := fmt.Errorf("ACME 后台任务已取消: %w", executionCtx.Err())
+			if managed != nil {
+				managed.FinishCancelled("cancelled")
+				s.finishManaged(job.id, nil, cancelErr, managed.Snapshot())
+			} else {
+				s.finish(job.id, nil, cancelErr)
+			}
+			if managed == nil && operation != nil {
+				operation.Done()
+			}
+			continue
+		}
 		result, err := runAcmeTaskJob(job.run, logSessionID)
+		cancelExecution()
 		if managed != nil {
 			managedStatus := managed.Snapshot()
 			if err != nil && !isManagedDownloadTaskTerminal(managedStatus.State) {
@@ -273,6 +290,35 @@ func (s *acmeTaskStore) run() {
 			s.cancelTask(job.id)
 		}
 	}
+}
+
+// beginExecution starts the ACME deadline only after a serial-queue worker has
+// received the task. Queueing behind another long issuance must not consume the
+// task's execution budget.
+func (s *acmeTaskStore) beginExecution(id string, logSessionID string) (context.Context, context.CancelFunc, bool) {
+	if s == nil {
+		return nil, func() {}, false
+	}
+	s.mu.Lock()
+	entry := s.tasks[id]
+	if entry == nil || entry.ctx == nil || entry.ctx.Err() != nil {
+		s.mu.Unlock()
+		return nil, func() {}, false
+	}
+	if entry.managed != nil {
+		// Managed install/reinstall tasks already own their configured deadline.
+		// Do not replace it with the issuance deadline used by certificate tasks.
+		executionCtx := entry.ctx
+		s.mu.Unlock()
+		acmeLogSessionStore.setExecutionContext(logSessionID, executionCtx)
+		return executionCtx, func() {}, true
+	}
+	executionCtx, cancel := context.WithTimeout(entry.ctx, acmeTaskDeadline)
+	entry.ctx = executionCtx
+	entry.cancel = cancel
+	s.mu.Unlock()
+	acmeLogSessionStore.setExecutionContext(logSessionID, executionCtx)
+	return executionCtx, cancel, true
 }
 
 func (s *acmeTaskStore) cancelTask(id string) {

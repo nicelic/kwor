@@ -30,7 +30,7 @@ func TestValidateAcmeIssueIdentifiersRejectsInvalidPublicNames(t *testing.T) {
 	}
 }
 
-func TestValidateAcmeIssueIdentifiersEnforces2048DomainLimit(t *testing.T) {
+func TestValidateAcmeIssueIdentifiersEnforces100DomainLimit(t *testing.T) {
 	identifiers := make([]string, 0, acmeDomainCertificateMaxNames+1)
 	for index := 0; index < acmeDomainCertificateMaxNames+1; index++ {
 		identifiers = append(identifiers, fmt.Sprintf("host-%04d.example.com", index))
@@ -38,19 +38,19 @@ func TestValidateAcmeIssueIdentifiersEnforces2048DomainLimit(t *testing.T) {
 
 	accepted, err := validateAcmeIssueIdentifiers(strings.Join(identifiers[:acmeDomainCertificateMaxNames], " "), acmeCertificateTypeDomain)
 	if err != nil {
-		t.Fatalf("expected 2048 domains to be accepted: %v", err)
+		t.Fatalf("expected %d domains to be accepted: %v", acmeDomainCertificateMaxNames, err)
 	}
 	if len(accepted) != acmeDomainCertificateMaxNames {
 		t.Fatalf("accepted domain count = %d, want %d", len(accepted), acmeDomainCertificateMaxNames)
 	}
 
 	_, err = validateAcmeIssueIdentifiers(strings.Join(identifiers, " "), acmeCertificateTypeDomain)
-	if err == nil || !strings.Contains(err.Error(), "2048") {
-		t.Fatalf("expected 2049 domains to be rejected with the 2048 limit, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "100") {
+		t.Fatalf("expected %d domains to be rejected with the %d limit, got %v", acmeDomainCertificateMaxNames+1, acmeDomainCertificateMaxNames, err)
 	}
 }
 
-func TestValidateAcmeIssueIdentifiersEnforces2048IPLimit(t *testing.T) {
+func TestValidateAcmeIssueIdentifiersEnforces25IPLimit(t *testing.T) {
 	identifiers := make([]string, 0, acmeIPCertificateMaxIPs+1)
 	for index := 0; index < acmeIPCertificateMaxIPs+1; index++ {
 		identifiers = append(identifiers, fmt.Sprintf("2001:db8::%x", index+1))
@@ -58,15 +58,15 @@ func TestValidateAcmeIssueIdentifiersEnforces2048IPLimit(t *testing.T) {
 
 	accepted, err := validateAcmeIssueIdentifiers(strings.Join(identifiers[:acmeIPCertificateMaxIPs], " "), acmeCertificateTypeIP)
 	if err != nil {
-		t.Fatalf("expected 2048 IP identifiers to be accepted: %v", err)
+		t.Fatalf("expected %d IP identifiers to be accepted: %v", acmeIPCertificateMaxIPs, err)
 	}
 	if len(accepted) != acmeIPCertificateMaxIPs {
 		t.Fatalf("accepted IP count = %d, want %d", len(accepted), acmeIPCertificateMaxIPs)
 	}
 
 	_, err = validateAcmeIssueIdentifiers(strings.Join(identifiers, " "), acmeCertificateTypeIP)
-	if err == nil || !strings.Contains(err.Error(), "2048") {
-		t.Fatalf("expected 2049 IP identifiers to be rejected with the 2048 limit, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "25") {
+		t.Fatalf("expected %d IP identifiers to be rejected with the %d limit, got %v", acmeIPCertificateMaxIPs+1, acmeIPCertificateMaxIPs, err)
 	}
 }
 

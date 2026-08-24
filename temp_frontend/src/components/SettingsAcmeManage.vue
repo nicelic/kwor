@@ -1639,8 +1639,8 @@ import { push } from 'notivue'
 const acmeInstallRequestTimeout = 35 * 1000
 const acmeRemoveRequestTimeout = 90 * 1000
 const acmeAccountOperationRequestTimeout = 3 * 60 * 1000 + 30 * 1000
-const acmeDomainCertificateMaxNames = 2048
-const acmeIPCertificateMaxIPs = 2048
+const acmeDomainCertificateMaxNames = 100
+const acmeIPCertificateMaxIPs = 25
 const confirmAction = (action: string) => i18n.global.t(`confirmDialog.actions.${action}`)
 
 type AcmeCertificate = {
@@ -3132,9 +3132,18 @@ const caServerItems = computed(() => {
   ]
 })
 
+const issueDomainCAServer = computed(() => {
+  return normalizeDomainCAValue(issueForm.value.server, 'letsencrypt')
+})
+
 const availableAcmeAccountsByCA = computed(() => {
   if (isIPCertificateMode.value) return [] as AcmeAccount[]
-  return overview.value.acmeAccounts
+  const currentCA = issueDomainCAServer.value
+  // The CA selector is the account-list scope. A different CA account must
+  // become selectable only after the user changes the CA explicitly.
+  return overview.value.acmeAccounts.filter((item) => {
+    return normalizeDomainCAValue(item.server, '') === currentCA
+  })
 })
 
 const selectedAcmeAccountForIssue = computed(() => {
@@ -3148,12 +3157,6 @@ const selectedDNSAccountForIssue = computed(() => {
   return overview.value.dnsAccounts.find(item => item.id === issueForm.value.dnsAccountId) ?? null
 })
 
-const issueDomainCAServer = computed(() => {
-  const selected = selectedAcmeAccountForIssue.value
-  if (selected != null) return normalizeDomainCAValue(selected.server, 'letsencrypt')
-  return normalizeDomainCAValue(issueForm.value.server, 'letsencrypt')
-})
-
 const acmeAccountItems = computed(() => {
   return availableAcmeAccountsByCA.value.map(item => ({
     nameText: item.name.trim() === '' ? item.resourceId || `acme_${item.displayId || item.id}` : item.name.trim(),
@@ -3163,7 +3166,7 @@ const acmeAccountItems = computed(() => {
 })
 
 const acmeAccountNoDataText = computed(() => {
-  return '暂无 ACME 账号，请先在 ACME 账号管理中创建'
+  return `当前 ${caLabel(issueDomainCAServer.value)} 没有可用 ACME 账号，请先创建对应平台的账号`
 })
 
 const acmeAccountSelectMessages = computed(() => {
