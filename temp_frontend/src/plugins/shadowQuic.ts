@@ -28,10 +28,10 @@ export function createShadowQuicInboundDefaultOptions(): ShadowQuicInboundDefaul
     congestion_controller: 'bbr',
     up: '500',
     down: '500',
-    cwnd: 32,
-    max_idle_time: 120000,
+    cwnd: 720,
+    max_idle_time: 600000,
     max_datagram_frame_size: 1400,
-    recv_window_conn: 37000000,
+    recv_window_conn: 33000000,
     recv_window: 160000000,
     jls_upstream: {
       rate_limit: 204800,
