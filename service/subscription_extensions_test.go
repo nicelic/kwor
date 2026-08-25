@@ -5,6 +5,57 @@ import (
 	"testing"
 )
 
+func TestClashSubscriptionDefaultsAndExplicitValues(t *testing.T) {
+	defaults, err := ParseSubClashExtension("")
+	if err != nil {
+		t.Fatalf("parse canonical Clash subscription extension: %v", err)
+	}
+	if mode, _ := defaults["find-process-mode"].(string); mode != "always" {
+		t.Fatalf("canonical find-process-mode = %q, want %q", mode, "always")
+	}
+	profile, ok := defaults["profile"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("canonical profile has unexpected type: %T", defaults["profile"])
+	}
+	if storeFakeIP, _ := profile["store-fake-ip"].(bool); storeFakeIP {
+		t.Fatal("canonical store-fake-ip = true, want false")
+	}
+	dns, ok := defaults["dns"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("canonical dns has unexpected type: %T", defaults["dns"])
+	}
+	if useHosts, exists := dns["use-hosts"]; !exists || useHosts != false {
+		t.Fatalf("canonical use-hosts = %#v, want false", useHosts)
+	}
+
+	explicit, err := ParseSubClashExtension(`find-process-mode: strict
+profile:
+  store-fake-ip: true
+dns:
+  use-hosts: true
+`)
+	if err != nil {
+		t.Fatalf("parse explicit Clash subscription values: %v", err)
+	}
+	if mode, _ := explicit["find-process-mode"].(string); mode != "strict" {
+		t.Fatalf("explicit find-process-mode = %q, want %q", mode, "strict")
+	}
+	explicitProfile, ok := explicit["profile"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("explicit profile has unexpected type: %T", explicit["profile"])
+	}
+	if storeFakeIP, _ := explicitProfile["store-fake-ip"].(bool); !storeFakeIP {
+		t.Fatal("explicit store-fake-ip = false, want true")
+	}
+	explicitDNS, ok := explicit["dns"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("explicit dns has unexpected type: %T", explicit["dns"])
+	}
+	if useHosts, ok := explicitDNS["use-hosts"].(bool); !ok || !useHosts {
+		t.Fatalf("explicit use-hosts = %#v, want true", explicitDNS["use-hosts"])
+	}
+}
+
 func TestNormalizeSubJSONExtensionCanonicalizesDNSHTTPPaths(t *testing.T) {
 	normalized, err := NormalizeSubscriptionExtension("subJsonExt", `{
   "dns": {

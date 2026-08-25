@@ -226,28 +226,28 @@
       </v-row>
       <v-row>
         <v-col cols="12" sm="6" md="4">
-          <v-combobox v-model="dnsDirectNameserver" :items="clashDirectNameserverOptions" label="(direct-nameserver)" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>
+          <v-combobox v-model="dnsDirectNameserver" :items="clashDirectNameserverOptions" label="(direct-nameserver)（direct 出口域名解析的 DNS 服务器）" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>
         </v-col>
         <v-col cols="12" sm="6" md="4" v-if="dnsDirectNameserver.length > 0">
-          <v-switch v-model="dnsDirectNameserverFollowPolicy" color="primary" label="direct-nameserver-follow-policy" hide-details  @update:model-value="onFormValueChange"/>
+          <v-switch v-model="dnsDirectNameserverFollowPolicy" color="primary" label="direct-nameserver-follow-policy（流量是否遵守 DNS 解析路由规则）" hide-details  @update:model-value="onFormValueChange"/>
         </v-col>
       </v-row>
       <v-row>
         <v-col cols="12" sm="6" md="4">
-          <v-combobox v-model="dnsProxyServerNameserver" :items="clashProxyServerNameserverOptions" label="(proxy-server-nameserver)" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>
+          <v-combobox v-model="dnsProxyServerNameserver" :items="clashProxyServerNameserverOptions" label="(proxy-server-nameserver)（代理节点域名解析服务器）" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>
         </v-col>
       </v-row>
       <v-row>
         <v-col cols="12" sm="6" md="4">
-          <v-combobox v-model="dnsNameserver" :items="clashNameserverOptions" label="(nameserver)" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>
+          <v-combobox v-model="dnsNameserver" :items="clashNameserverOptions" label="(nameserver)（默认的域名解析服务器）" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>
         </v-col>
         <v-col cols="12" sm="6" md="4">
-          <v-combobox v-model="dnsFallback" :items="clashFallbackOptions" label="(fallback)" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>
+          <v-combobox v-model="dnsFallback" :items="clashFallbackOptions" label="(fallback)（后备域名解析服务器）" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>
         </v-col>
       </v-row>
       <v-row>
         <v-col cols="12" sm="6" md="4">
-          <v-combobox v-model="dnsDefaultNameserver" :items="clashDefaultNameserverOptions" label="(default-nameserver)" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>
+          <v-combobox v-model="dnsDefaultNameserver" :items="clashDefaultNameserverOptions" label="(default-nameserver)（解析 DNS 服务器的域名，必须为 IP，可为加密 DNS）" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>
         </v-col>
         <v-col cols="12" sm="6" md="4" v-if="dnsEnhancedMode === 'fake-ip'">
 		  <v-combobox v-model="dnsFakeIpFilter" :items="clashFakeIpFilterDefaults" :label="$t('subscriptionEditor.fakeIpFilter')" multiple chips closable-chips hide-details @update:model-value="onFormValueChange"></v-combobox>

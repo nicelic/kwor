@@ -652,7 +652,7 @@ export default {
       latencyTolerance: "50" as string,
       enableSniff: true,
       enableHijackDns: true,
-      enableRejectQuic: false,
+      enableRejectQuic: true,
       enableReject443Udp: false,
       _uiConfigLoaded: false,
       _suspendRuleRegeneration: false,

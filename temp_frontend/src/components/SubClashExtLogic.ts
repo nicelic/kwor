@@ -6,6 +6,8 @@ import yaml from 'yaml'
 import { probeSubscriptionRuleSets } from './subscriptionRuleSetProbe'
 import {
   defaultClashConfig,
+  defaultFindProcessMode,
+  defaultStoreFakeIp,
   defaultFakeIpRange,
   clashDomainIpTypes,
   CLASH_RULE_SET_NAME_OPTIONS_BY_SOURCE,
@@ -4460,7 +4462,7 @@ export const SubClashExtMixin = {
       set(this: any, v: boolean) { this.updateMetaJson(v, 'tcp-concurrent') },
     },
     findProcessMode: {
-      get(this: any) { return this.metaJson['find-process-mode'] ?? 'off' },
+      get(this: any) { return this.metaJson['find-process-mode'] ?? defaultFindProcessMode },
       set(this: any, v: string) { this.updateMetaJson(v, 'find-process-mode') },
     },
     storeSelected: {
@@ -4471,7 +4473,7 @@ export const SubClashExtMixin = {
       },
     },
     storeFakeIp: {
-      get(this: any) { return this.metaJson['profile']?.['store-fake-ip'] ?? true },
+      get(this: any) { return this.metaJson['profile']?.['store-fake-ip'] ?? defaultStoreFakeIp },
       set(this: any, v: boolean) {
         const profile = this.metaJson['profile'] ?? {}
         this.updateMetaJson({ ...profile, 'store-fake-ip': v }, 'profile')

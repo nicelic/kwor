@@ -25,7 +25,7 @@ func TestCanonicalSubscriptionExtensionDefaults(t *testing.T) {
 		t.Fatalf("canonical JSON inbound types = %#v", inbounds)
 	}
 	jsonUI := jsonExtension["_uiConfig"].(map[string]interface{})
-	if jsonExtension["route_final"] != "节点选择" || jsonUI["updateMethod"] != "节点选择" || jsonUI["routeFinal"] != "节点选择" || jsonUI["enableSniff"] != false || jsonUI["enableHijackDns"] != false || jsonUI["latencyTestInterval"] != "10m" {
+	if jsonExtension["route_final"] != "节点选择" || jsonUI["updateMethod"] != "节点选择" || jsonUI["routeFinal"] != "节点选择" || jsonUI["enableSniff"] != false || jsonUI["enableHijackDns"] != false || jsonUI["enableRejectQuic"] != true || jsonUI["latencyTestInterval"] != "10m" {
 		t.Fatalf("canonical JSON UI defaults = %#v", jsonUI)
 	}
 	if value, ok := toInt(json.Number("73")); !ok || value != 73 {
@@ -79,6 +79,30 @@ func TestCanonicalSubscriptionExtensionDefaults(t *testing.T) {
 	}
 	if len(expectedRejectQuicRules) != 0 {
 		t.Fatalf("canonical Clash missing QUIC UDP reject rules: %#v", expectedRejectQuicRules)
+	}
+}
+
+func TestJSONSubscriptionExplicitRejectQuicSettingOverridesDefault(t *testing.T) {
+	defaultExtension, err := service.ParseSubJSONExtension("")
+	if err != nil {
+		t.Fatalf("parse canonical JSON extension: %v", err)
+	}
+	defaultUI, ok := defaultExtension["_uiConfig"].(map[string]interface{})
+	if !ok || defaultUI["enableRejectQuic"] != true {
+		t.Fatalf("canonical JSON reject QUIC default = %#v", defaultUI)
+	}
+
+	normalized, err := service.NormalizeSubscriptionExtension("subJsonExt", `{"_uiConfig":{"enableRejectQuic":false}}`)
+	if err != nil {
+		t.Fatalf("normalize explicit JSON reject QUIC setting: %v", err)
+	}
+	explicitExtension, err := service.ParseSubJSONExtension(normalized)
+	if err != nil {
+		t.Fatalf("parse explicit JSON reject QUIC setting: %v", err)
+	}
+	explicitUI, ok := explicitExtension["_uiConfig"].(map[string]interface{})
+	if !ok || explicitUI["enableRejectQuic"] != false {
+		t.Fatalf("explicit JSON reject QUIC setting was forced on: %#v", explicitUI)
 	}
 }
 

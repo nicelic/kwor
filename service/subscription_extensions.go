@@ -65,9 +65,10 @@ ipv6: true
 log-level: silent
 external-controller: 127.0.0.1:9090
 unified-delay: true
+find-process-mode: always
 profile:
   store-selected: true
-  store-fake-ip: true
+  store-fake-ip: false
 tun:
   enable: true
   stack: mixed
@@ -75,9 +76,6 @@ tun:
   strict-route: true
   auto-detect-interface: true
   recvmsgx: true
-  sendmsgx: true
-  inet4-address:
-    - 198.18.0.1/30
   inet6-address:
     - fdfe:dcba:9876::1/126
   mtu: 1500
@@ -88,6 +86,7 @@ dns:
   ipv6: false
   prefer-h3: true
   use-system-hosts: false
+  use-hosts: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/15
   fake-ip-range6: fc00::/18
@@ -174,7 +173,7 @@ const canonicalSubJSONExtension = `{
     "latencyTolerance": "50",
     "enableSniff": false,
     "enableHijackDns": false,
-    "enableRejectQuic": false,
+    "enableRejectQuic": true,
     "enableReject443Udp": false
   }
 }`
