@@ -278,8 +278,8 @@ func TestShadowQUICInboundSaveRoundTripPreservesAllServerControls(t *testing.T) 
 		"quic_versions":           []string{"v2", "v1"},
 		"zero_rtt":                false,
 		"congestion_controller":   "new_reno",
-		"up":                      "100 Mbps",
-		"down":                    "200 Mbps",
+		"up":                      100,
+		"down":                    200,
 		"ignore_client_bandwidth": false,
 		"cwnd":                    0,
 		"bbr_profile":             "conservative",
@@ -313,8 +313,8 @@ func TestShadowQUICInboundSaveRoundTripPreservesAllServerControls(t *testing.T) 
 	for key, want := range map[string]interface{}{
 		"zero_rtt":                false,
 		"congestion_controller":   "new_reno",
-		"up":                      "100 Mbps",
-		"down":                    "200 Mbps",
+		"up":                      float64(100),
+		"down":                    float64(200),
 		"ignore_client_bandwidth": false,
 		"cwnd":                    float64(0),
 		"bbr_profile":             "conservative",
@@ -375,8 +375,8 @@ func TestShadowQUICInboundSaveRoundTripPreservesAllServerControls(t *testing.T) 
 	for key, want := range map[string]interface{}{
 		"zero-rtt":                false,
 		"congestion-controller":   "new_reno",
-		"up":                      "100 Mbps",
-		"down":                    "200 Mbps",
+		"up":                      100,
+		"down":                    200,
 		"ignore-client-bandwidth": false,
 		"cwnd":                    0,
 		"bbr-profile":             "conservative",
@@ -450,7 +450,7 @@ func TestShadowQUICJLSDirectNormalizesForStorageAndListener(t *testing.T) {
 func TestShadowQUICInboundSanitizerRejectsMissingJLSAddress(t *testing.T) {
 	inbound := model.MihomoInbound{
 		Type:    "shadowquic",
-		Options: json.RawMessage(`{"listen_port":10443,"jls_upstream":{"addr":"bad-address"}}`),
+		Options: json.RawMessage(`{"listen_port":10443,"jls_upstream":{"addr":"2001:db8::1:443"}}`),
 	}
 	if err := sanitizeMihomoShadowQUICInboundOptions(&inbound); err == nil {
 		t.Fatal("expected invalid JLS upstream address to be rejected")
@@ -531,6 +531,12 @@ func TestShadowQUICSyncClashOptionsStripTLS(t *testing.T) {
 		"disable_mtu_discovery": false,
 		"tls":                   map[string]interface{}{"enabled": true},
 		"detour":                "unexpected",
+		"routing_mark":          101,
+		"mihomo_common": map[string]interface{}{
+			"udp":          true,
+			"ip_version":   "ipv6",
+			"routing_mark": 100,
+		},
 	}, "m_sq-in_alice")
 	if err != nil {
 		t.Fatalf("buildMihomoClashOptions failed: %v", err)
@@ -543,10 +549,13 @@ func TestShadowQUICSyncClashOptionsStripTLS(t *testing.T) {
 	if proxy["name"] != "m_sq-in_alice" || proxy["type"] != "shadowquic" {
 		t.Fatalf("unexpected synced proxy: %#v", proxy)
 	}
-	for _, key := range []string{"tls", "detour", "routing-mark", "rule", "proxy"} {
+	for _, key := range []string{"tls", "detour", "routing_mark", "rule", "proxy"} {
 		if _, exists := proxy[key]; exists {
 			t.Fatalf("unexpected field %s in synced ClashOptions: %#v", key, proxy)
 		}
+	}
+	if proxy["udp"] != true || proxy["ip-version"] != "ipv6" || proxy["routing-mark"] != float64(100) {
+		t.Fatalf("expected supported common fields in synced ClashOptions: %#v", proxy)
 	}
 	for _, key := range []string{"zero-rtt", "disable-mtu-discovery"} {
 		if _, exists := proxy[key]; !exists {
@@ -564,6 +573,7 @@ func TestShadowQUICSyncClientToSubManagerPersistsRawAndClashOptions(t *testing.T
 		OutJson: json.RawMessage(`{
           "sni":"cdn.example.com",
           "zero_rtt":false,
+		  "mihomo_common":{"udp":true,"ip_version":"ipv6","routing_mark":100,"tcp_fast_open":true},
 		  "username":"inbound-template-user",
 		  "password":"inbound-template-password",
           "tls":{"enabled":true}
@@ -618,6 +628,9 @@ func TestShadowQUICSyncClientToSubManagerPersistsRawAndClashOptions(t *testing.T
 	if _, exists := raw["tls"]; exists {
 		t.Fatalf("synced RawOutbound must not carry TLS: %#v", raw)
 	}
+	if _, exists := raw["mihomo_common"]; exists {
+		t.Fatalf("synced sing-box RawOutbound must not carry Mihomo common fields: %#v", raw)
+	}
 
 	var clash map[string]interface{}
 	if err := json.Unmarshal(synced.ClashOptions, &clash); err != nil {
@@ -629,6 +642,9 @@ func TestShadowQUICSyncClientToSubManagerPersistsRawAndClashOptions(t *testing.T
 	if _, exists := clash["tls"]; exists {
 		t.Fatalf("synced ClashOptions must not carry TLS: %#v", clash)
 	}
+	if clash["udp"] != true || clash["ip-version"] != "ipv6" || clash["routing-mark"] != float64(100) {
+		t.Fatalf("synced ClashOptions must retain ShadowQUIC Mihomo common fields: %#v", clash)
+	}
 }
 
 func TestShadowQUICOutSyncsServerFieldsAndKeepsClientOwnedFields(t *testing.T) {
@@ -639,8 +655,8 @@ func TestShadowQUICOutSyncsServerFieldsAndKeepsClientOwnedFields(t *testing.T) {
           "udp_over_stream": true,
           "keep_alive_interval": 25000,
           "max_open_streams": 2048,
-          "up": "20 Mbps",
-          "down": "30 Mbps",
+          "up": "20",
+          "down": "30",
           "mihomo_common": {
             "udp": true,
             "ip_version": "ipv6",
@@ -660,8 +676,8 @@ func TestShadowQUICOutSyncsServerFieldsAndKeepsClientOwnedFields(t *testing.T) {
           "quic_versions":["v2","v1"],
           "zero_rtt":true,
           "congestion_controller":"bbr",
-          "up":"100 Mbps",
-          "down":"100 Mbps",
+          "up":"100",
+          "down":"100",
           "cwnd":32,
           "bbr_profile":"standard",
           "max_datagram_frame_size":1400,
@@ -699,8 +715,8 @@ func TestShadowQUICOutSyncsServerFieldsAndKeepsClientOwnedFields(t *testing.T) {
 	if template["udp_over_stream"] != true {
 		t.Fatalf("client-only udp-over-stream must be preserved: %#v", template)
 	}
-	if template["up"] != "20 Mbps" || template["down"] != "30 Mbps" {
-		t.Fatalf("client bandwidth must not be overwritten by listener bandwidth: %#v", template)
+	if template["up"] != float64(20) || template["down"] != float64(30) {
+		t.Fatalf("client bandwidth must remain numeric and must not be overwritten by listener bandwidth: %#v", template)
 	}
 	common, ok := template["mihomo_common"].(map[string]interface{})
 	if !ok || common["udp"] != true || common["ip_version"] != "ipv6" || common["routing_mark"] != float64(88) {
@@ -734,8 +750,8 @@ func TestShadowQUICOutSyncsServerFieldsAndKeepsClientOwnedFields(t *testing.T) {
 	if cleared["udp_over_stream"] != true || cleared["keep_alive_interval"] != float64(25000) || cleared["max_open_streams"] != float64(2048) {
 		t.Fatalf("client-only fields must survive server sync: %#v", cleared)
 	}
-	if cleared["up"] != "20 Mbps" || cleared["down"] != "30 Mbps" {
-		t.Fatalf("client bandwidth must survive server option changes: %#v", cleared)
+	if cleared["up"] != float64(20) || cleared["down"] != float64(30) {
+		t.Fatalf("client bandwidth must remain numeric after server option changes: %#v", cleared)
 	}
 }
 
@@ -776,8 +792,8 @@ func TestShadowQUICClientSyncRefreshesServerOwnedFields(t *testing.T) {
           "udp_over_stream":true,
           "keep_alive_interval":25000,
           "max_open_streams":2048,
-          "up":"20 Mbps",
-          "down":"30 Mbps",
+          "up":"20",
+          "down":"30",
           "mihomo_common":{
             "udp":true,
             "ip_version":"ipv6",
@@ -797,8 +813,8 @@ func TestShadowQUICClientSyncRefreshesServerOwnedFields(t *testing.T) {
           "quic_versions":["v2","v1"],
           "zero_rtt":true,
           "congestion_controller":"bbr",
-          "up":"100 Mbps",
-          "down":"100 Mbps",
+          "up":"100",
+          "down":"100",
           "max_datagram_frame_size":1400
         }`),
 	}
@@ -826,8 +842,8 @@ func TestShadowQUICClientSyncRefreshesServerOwnedFields(t *testing.T) {
 	if outbound["udp_over_stream"] != true || outbound["keep_alive_interval"] != 25000 || outbound["max_open_streams"] != 2048 {
 		t.Fatalf("client-only fields must survive subscription sync: %#v", outbound)
 	}
-	if outbound["up"] != "20 Mbps" || outbound["down"] != "30 Mbps" {
-		t.Fatalf("client bandwidth must survive subscription sync: %#v", outbound)
+	if outbound["up"] != 20 || outbound["down"] != 30 {
+		t.Fatalf("client bandwidth must remain numeric during subscription sync: %#v", outbound)
 	}
 	clashData, err := buildMihomoClashOptions(clashSource, inbound.Tag)
 	if err != nil {
@@ -843,8 +859,8 @@ func TestShadowQUICClientSyncRefreshesServerOwnedFields(t *testing.T) {
 	if got := clash["quic-versions"]; fmt.Sprint(got) != "[v2 v1]" {
 		t.Fatalf("expected Clash proxy quic versions to remain ordered, got %#v", got)
 	}
-	if clash["up"] != "20 Mbps" || clash["down"] != "30 Mbps" {
-		t.Fatalf("expected client bandwidth in Clash proxy, got %#v", clash)
+	if clash["up"] != float64(20) || clash["down"] != float64(30) {
+		t.Fatalf("expected numeric client bandwidth in Clash proxy, got %#v", clash)
 	}
 	for _, key := range []string{"tls", "proxy", "quic-version-probe"} {
 		if _, exists := clash[key]; exists {
@@ -871,8 +887,8 @@ func TestShadowQUICClientSyncRefreshesServerOwnedFields(t *testing.T) {
 	if outbound["udp_over_stream"] != true || outbound["keep_alive_interval"] != 25000 || outbound["max_open_streams"] != 2048 {
 		t.Fatalf("client-only fields must remain after clearing server options: %#v", outbound)
 	}
-	if outbound["up"] != "20 Mbps" || outbound["down"] != "30 Mbps" {
-		t.Fatalf("client bandwidth must remain after clearing server options: %#v", outbound)
+	if outbound["up"] != 20 || outbound["down"] != 30 {
+		t.Fatalf("client bandwidth must remain numeric after clearing server options: %#v", outbound)
 	}
 	clashData, err = buildMihomoClashOptions(clashSource, inbound.Tag)
 	if err != nil {
@@ -1102,8 +1118,8 @@ func TestShadowQUICClashImportMapsOfficialFields(t *testing.T) {
 		"zero-rtt":                false,
 		"keep-alive-interval":     0,
 		"congestion-controller":   "cubic",
-		"up":                      "100 Mbps",
-		"down":                    "200 Mbps",
+		"up":                      "100",
+		"down":                    200,
 		"cwnd":                    0,
 		"bbr-profile":             "standard",
 		"max-datagram-frame-size": 1400,
@@ -1125,6 +1141,11 @@ func TestShadowQUICClashImportMapsOfficialFields(t *testing.T) {
 	} {
 		if _, exists := outbound[key]; !exists {
 			t.Fatalf("expected explicit imported option %s, got %#v", key, outbound)
+		}
+	}
+	for key, want := range map[string]int{"up": 100, "down": 200} {
+		if got, ok := outbound[key].(int); !ok || got != want {
+			t.Fatalf("expected numeric imported %s=%d, got %#v", key, want, outbound[key])
 		}
 	}
 	if _, exists := outbound["tls"]; exists {

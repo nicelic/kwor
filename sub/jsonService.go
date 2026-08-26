@@ -1011,7 +1011,7 @@ func stripMihomoFields(outbounds *[]map[string]interface{}) {
 		// Keep a defensive sanitize step here so callers that only invoke
 		// stripMihomoFields still produce sing-box-safe transport blocks.
 		util.SanitizeSingboxSubscriptionOutbound((*outbounds)[i])
-		util.PromoteHysteria2ReceiveWindowsToSingbox((*outbounds)[i])
+		util.StripMihomoHysteria2ReceiveWindowsForSingbox((*outbounds)[i])
 		delete((*outbounds)[i], "mihomo_common")
 		delete((*outbounds)[i], "mihomo_hy2")
 		delete((*outbounds)[i], "mihomo_fast_open")

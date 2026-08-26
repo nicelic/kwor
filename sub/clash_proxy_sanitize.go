@@ -35,9 +35,10 @@ func sanitizeMihomoClashProxy(proxy map[string]interface{}) (map[string]interfac
 	case "shadowquic":
 		// ShadowQUIC only supports its official native fields. Rebuild every
 		// stored/imported Clash proxy so TLS and generic dial fields cannot be
-		// replayed from a raw YAML snippet.
+		// replayed from a raw YAML snippet. This is already a final Clash proxy,
+		// so use the Clash-specific sanitizer instead of the raw-outbound one.
 		name := strings.TrimSpace(firstString(sanitized["name"]))
-		normalized, ok := util.BuildMihomoShadowQUICClashProxy(sanitized, name)
+		normalized, ok := util.SanitizeMihomoShadowQUICClashProxy(sanitized, name)
 		if !ok {
 			return nil, true
 		}

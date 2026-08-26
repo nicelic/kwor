@@ -1417,6 +1417,8 @@ func TestMihomoShadowQUICSubscriptions(t *testing.T) {
 			"alpn":                  []interface{}{"h3"},
 			"quic_versions":         []interface{}{"v2", "v1"},
 			"zero_rtt":              false,
+			"up":                    500,
+			"down":                  600,
 			"disable_mtu_discovery": false,
 			"tls":                   map[string]interface{}{"enabled": true},
 		}),
@@ -1498,6 +1500,14 @@ func TestMihomoShadowQUICSubscriptions(t *testing.T) {
 	}
 	if proxy["sni"] != "cdn.example.com" {
 		t.Fatalf("expected native ShadowQUIC sni, got %#v", proxy["sni"])
+	}
+	for key, want := range map[string]int{"up": 500, "down": 600} {
+		if got, ok := proxy[key].(int); !ok || got != want {
+			t.Fatalf("expected numeric ShadowQUIC %s=%d in Clash subscription, got %#v", key, want, proxy[key])
+		}
+	}
+	if !strings.Contains(*clashSub, "up: 500") || !strings.Contains(*clashSub, "down: 600") || strings.Contains(*clashSub, `up: "500"`) || strings.Contains(*clashSub, `down: "600"`) {
+		t.Fatalf("ShadowQUIC bandwidth must be emitted as unquoted YAML numbers, got %s", *clashSub)
 	}
 	versions, ok := proxy["quic-versions"].([]interface{})
 	if !ok || len(versions) != 2 || versions[0] != "v2" || versions[1] != "v1" {

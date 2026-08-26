@@ -28,27 +28,16 @@ func NormalizeHysteriaOutboundOptionsMap(outbound map[string]interface{}) {
 	NormalizeHysteriaSubscriptionOutbound(outbound)
 }
 
-// PromoteHysteria2ReceiveWindowsToSingbox copies the shared Hysteria2
-// receive-window values out of the Mihomo storage wrapper. The wrapper is
-// panel storage only; sing-box accepts the four fields at the outbound root.
-// Existing root values win so an already-canonical payload is not overwritten.
-func PromoteHysteria2ReceiveWindowsToSingbox(outbound map[string]interface{}) {
+// StripMihomoHysteria2ReceiveWindowsForSingbox removes the four quic-go
+// receive-window fields reserved for Mihomo/Clash Hysteria2 client proxies.
+// The fields may appear in legacy root form or under mihomo_hy2. The wrapper
+// itself is removed by the surrounding sing-box sanitizers.
+func StripMihomoHysteria2ReceiveWindowsForSingbox(outbound map[string]interface{}) {
 	if outbound == nil || !strings.EqualFold(strings.TrimSpace(firstStringValue(outbound["type"])), "hysteria2") {
 		return
 	}
-	nested, ok := outbound["mihomo_hy2"].(map[string]interface{})
-	if !ok || nested == nil {
-		return
-	}
 	for _, key := range hysteria2ReceiveWindowKeys {
-		if _, exists := outbound[key]; exists {
-			if _, valid := positiveIntFromAny(outbound[key]); valid {
-				continue
-			}
-		}
-		if value, ok := positiveIntFromAny(nested[key]); ok {
-			outbound[key] = value
-		}
+		delete(outbound, key)
 	}
 }
 

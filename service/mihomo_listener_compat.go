@@ -345,7 +345,7 @@ func normalizeMihomoShadowQUICListener(listener map[string]interface{}) {
 		clean["bbr-profile"] = profile
 	}
 	for _, field := range []string{"up", "down"} {
-		if value := normalizeMihomoShadowQUICListenerBandwidth(source[field]); value != "" {
+		if value, ok := toInt(source[field]); ok && value >= 0 {
 			clean[field] = value
 		}
 	}
@@ -373,17 +373,6 @@ func normalizeMihomoShadowQUICListener(listener map[string]interface{}) {
 	}
 	for key, value := range clean {
 		listener[key] = value
-	}
-}
-
-func normalizeMihomoShadowQUICListenerBandwidth(raw interface{}) string {
-	switch value := raw.(type) {
-	case string:
-		return strings.TrimSpace(value)
-	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
-		return strings.TrimSpace(fmt.Sprint(value))
-	default:
-		return ""
 	}
 }
 

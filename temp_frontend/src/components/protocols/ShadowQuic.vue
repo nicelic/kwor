@@ -112,19 +112,23 @@
       <v-col cols="12" sm="6" md="4">
         <v-text-field
           hide-details
+          min="0"
+          type="number"
           label="up"
           placeholder="Mbps"
-          :model-value="readStringField('root', 'up')"
-          @update:model-value="setField('root', 'up', $event, 'string')"
+          :model-value="readField('root', 'up')"
+          @update:model-value="setField('root', 'up', $event, 'number')"
         />
       </v-col>
       <v-col cols="12" sm="6" md="4">
         <v-text-field
           hide-details
+          min="0"
+          type="number"
           label="down"
           placeholder="Mbps"
-          :model-value="readStringField('root', 'down')"
-          @update:model-value="setField('root', 'down', $event, 'string')"
+          :model-value="readField('root', 'down')"
+          @update:model-value="setField('root', 'down', $event, 'number')"
         />
       </v-col>
     </v-row>
@@ -295,8 +299,8 @@ const inboundRootOptionDefinitions: ShadowQuicOption[] = [
   { key: 'quic_versions', label: 'quic-versions', kind: 'list', items: ['v1', 'v2'], defaultValue: [...shadowQuicInboundDefaults.quic_versions], defaultEnabled: true },
   { key: 'zero_rtt', label: 'zero-rtt', kind: 'boolean', defaultValue: shadowQuicInboundDefaults.zero_rtt, defaultEnabled: true },
   { key: 'congestion_controller', label: 'congestion-controller', kind: 'select', items: shadowQuicCongestionControllerItems, defaultValue: shadowQuicInboundDefaults.congestion_controller, defaultEnabled: true },
-  { key: 'up', label: 'up', kind: 'string', defaultValue: shadowQuicInboundDefaults.up, defaultEnabled: true, placeholder: 'Mbps' },
-  { key: 'down', label: 'down', kind: 'string', defaultValue: shadowQuicInboundDefaults.down, defaultEnabled: true, placeholder: 'Mbps' },
+  { key: 'up', label: 'up', kind: 'number', defaultValue: shadowQuicInboundDefaults.up, defaultEnabled: true, placeholder: 'Mbps' },
+  { key: 'down', label: 'down', kind: 'number', defaultValue: shadowQuicInboundDefaults.down, defaultEnabled: true, placeholder: 'Mbps' },
   { key: 'ignore_client_bandwidth', label: 'ignore-client-bandwidth', kind: 'boolean', defaultValue: false },
   { key: 'cwnd', label: 'cwnd', kind: 'number', defaultValue: shadowQuicInboundDefaults.cwnd, defaultEnabled: true },
   { key: 'bbr_profile', label: 'bbr-profile', kind: 'select', items: ['standard', 'conservative', 'aggressive'], defaultValue: 'standard' },
@@ -325,8 +329,8 @@ const clientTemplateOptionDefinitions: ShadowQuicOption[] = [
   { key: 'udp_over_stream', label: 'udp-over-stream', kind: 'boolean', defaultValue: false },
   { key: 'keep_alive_interval', label: 'keep-alive-interval', kind: 'number', defaultValue: 10000, unit: 'ms' },
   { key: 'max_open_streams', label: 'max-open-streams', kind: 'number', defaultValue: 1024 },
-  { key: 'up', label: 'up', kind: 'string', defaultValue: shadowQuicInboundDefaults.up, placeholder: 'Mbps' },
-  { key: 'down', label: 'down', kind: 'string', defaultValue: shadowQuicInboundDefaults.down, placeholder: 'Mbps' },
+  { key: 'up', label: 'up', kind: 'number', defaultValue: shadowQuicInboundDefaults.up, placeholder: 'Mbps' },
+  { key: 'down', label: 'down', kind: 'number', defaultValue: shadowQuicInboundDefaults.down, placeholder: 'Mbps' },
 ]
 
 const outboundRootOptionDefinitions: ShadowQuicOption[] = [
@@ -337,8 +341,8 @@ const outboundRootOptionDefinitions: ShadowQuicOption[] = [
   { key: 'zero_rtt', label: 'zero-rtt', kind: 'boolean', defaultValue: false },
   { key: 'keep_alive_interval', label: 'keep-alive-interval（毫秒）', kind: 'number', defaultValue: 0 },
   { key: 'congestion_controller', label: 'congestion-controller', kind: 'select', items: shadowQuicCongestionControllerItems },
-  { key: 'up', label: '上行带宽', kind: 'string' },
-  { key: 'down', label: '下行带宽', kind: 'string' },
+  { key: 'up', label: '上行带宽', kind: 'number', placeholder: 'Mbps' },
+  { key: 'down', label: '下行带宽', kind: 'number', placeholder: 'Mbps' },
   { key: 'cwnd', label: 'cwnd', kind: 'number', defaultValue: 0 },
   { key: 'bbr_profile', label: 'bbr-profile', kind: 'select', items: [...shadowQuicBBRProfileItems], defaultValue: 'aggressive' },
   { key: 'max_datagram_frame_size', label: 'max-datagram-frame-size', kind: 'number', defaultValue: 0 },

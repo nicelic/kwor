@@ -106,6 +106,62 @@ func TestRenderManagedSingboxSubscriptionJSON_StripsMihomoFieldsAndNormalizesLat
 	}
 }
 
+func TestRenderManagedSingboxSubscriptionJSONRemovesMihomoHysteria2ReceiveWindows(t *testing.T) {
+	result, err := renderManagedSingboxSubscriptionJSON(
+		[]map[string]interface{}{
+			{
+				"type":                              "hysteria2",
+				"tag":                               "hy2-managed-node",
+				"server":                            "edge.example.com",
+				"server_port":                       443,
+				"password":                          "secret",
+				"initial_stream_receive_window":     1,
+				"max_stream_receive_window":         2,
+				"initial_connection_receive_window": 3,
+				"max_connection_receive_window":     4,
+				"mihomo_hy2": map[string]interface{}{
+					"initial_stream_receive_window":     38000000,
+					"max_stream_receive_window":         70000000,
+					"initial_connection_receive_window": 120000000,
+					"max_connection_receive_window":     150000000,
+				},
+			},
+		},
+		"{}",
+		func(store string) string { return store },
+	)
+	if err != nil {
+		t.Fatalf("renderManagedSingboxSubscriptionJSON returned error: %v", err)
+	}
+
+	var doc map[string]interface{}
+	if err := json.Unmarshal(result, &doc); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	var node map[string]interface{}
+	for _, raw := range doc["outbounds"].([]interface{}) {
+		outbound, _ := raw.(map[string]interface{})
+		if outbound["tag"] == "hy2-managed-node" {
+			node = outbound
+			break
+		}
+	}
+	if node == nil {
+		t.Fatalf("expected rendered Hysteria2 node, got %#v", doc["outbounds"])
+	}
+	for _, key := range []string{
+		"mihomo_hy2",
+		"initial_stream_receive_window",
+		"max_stream_receive_window",
+		"initial_connection_receive_window",
+		"max_connection_receive_window",
+	} {
+		if _, exists := node[key]; exists {
+			t.Fatalf("managed sing-box subscription retained Mihomo-only field %q: %#v", key, node)
+		}
+	}
+}
+
 func TestRefreshManagedSubscriptionOutboundTLS_DisabledServerCertificate_RemovesCertificateAndSHA256(t *testing.T) {
 	outbound := map[string]interface{}{
 		"type": "trojan",

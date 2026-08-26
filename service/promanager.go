@@ -858,7 +858,7 @@ func stripClashOnlyTLSFields(outbound map[string]interface{}) {
 	if outbound == nil {
 		return
 	}
-	util.PromoteHysteria2ReceiveWindowsToSingbox(outbound)
+	util.StripMihomoHysteria2ReceiveWindowsForSingbox(outbound)
 	delete(outbound, "mihomo_common")
 	delete(outbound, "mihomo_hy2")
 	delete(outbound, "mihomo_fast_open")

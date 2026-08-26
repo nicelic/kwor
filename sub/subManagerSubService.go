@@ -92,9 +92,10 @@ func (s *SubManagerSubService) GetSubManagerClash(tag string) (*string, error) {
 		if proxy, ok := parseSubOutboundClashProxy(subOutbound); ok {
 			if strings.EqualFold(strings.TrimSpace(subOutbound.Type), "shadowquic") {
 				// Keep ClashOptions as the preferred source, but normalize it through
-				// the strict ShadowQUIC schema so old TLS/generic fields cannot leak.
+				// the strict final ShadowQUIC proxy schema so old TLS/generic fields
+				// cannot leak and valid final Mihomo fields are retained.
 				name := strings.TrimSpace(firstString(proxy["name"]))
-				if normalized, valid := util.BuildMihomoShadowQUICClashProxy(proxy, name); valid {
+				if normalized, valid := util.SanitizeMihomoShadowQUICClashProxy(proxy, name); valid {
 					proxy = normalized
 				} else {
 					proxy = nil

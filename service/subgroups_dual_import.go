@@ -559,12 +559,28 @@ func convertClashProxyToSubOutbound(proxy map[string]interface{}) (map[string]in
 		for proxyKey, outboundKey := range map[string]string{
 			"congestion-controller": "congestion_controller",
 			"bbr-profile":           "bbr_profile",
-			"up":                    "up",
-			"down":                  "down",
 		} {
 			if value := strings.TrimSpace(firstStringValue(proxy[proxyKey])); value != "" {
 				outbound[outboundKey] = value
 			}
+		}
+		for _, key := range []string{"up", "down"} {
+			if value, ok := toIntValue(proxy[key]); ok && value >= 0 {
+				outbound[key] = value
+			}
+		}
+		mihomoCommon := map[string]interface{}{}
+		if udp, ok := proxy["udp"].(bool); ok {
+			mihomoCommon["udp"] = udp
+		}
+		if ipVersion, ok := util.NormalizeMihomoClientIPVersion(proxy["ip-version"]); ok {
+			mihomoCommon["ip_version"] = ipVersion
+		}
+		if routingMark, ok := toIntValue(proxy["routing-mark"]); ok && routingMark >= 0 {
+			mihomoCommon["routing_mark"] = routingMark
+		}
+		if len(mihomoCommon) > 0 {
+			outbound["mihomo_common"] = mihomoCommon
 		}
 		util.SanitizeMihomoShadowQUICOutbound(outbound)
 		return outbound, true

@@ -89,8 +89,8 @@ func SanitizeMihomoShadowQUICOutbound(outbound map[string]interface{}) {
 	if controller, ok := NormalizeMihomoShadowQUICCongestionController(firstShadowQUICValue(outbound, "congestion_controller", "congestion-controller")); ok {
 		clean["congestion_controller"] = controller
 	}
-	copyShadowQUICBandwidth(outbound, clean, "up", "up")
-	copyShadowQUICBandwidth(outbound, clean, "down", "down")
+	copyShadowQUICNonNegativeInt(outbound, clean, "up", "up")
+	copyShadowQUICNonNegativeInt(outbound, clean, "down", "down")
 	copyShadowQUICNonNegativeInt(outbound, clean, "cwnd", "cwnd")
 
 	if bbrProfile, hasBBRProfile := NormalizeMihomoBBRProfile(firstShadowQUICValue(outbound, "bbr_profile", "bbr-profile")); hasBBRProfile {
@@ -178,8 +178,8 @@ func BuildMihomoShadowQUICClashProxy(source map[string]interface{}, tag string) 
 	copyShadowQUICProxyBool(normalized, proxy, "zero-rtt", "zero_rtt")
 	copyShadowQUICProxyNonNegativeInt(normalized, proxy, "keep-alive-interval", "keep_alive_interval")
 	copyShadowQUICProxyString(normalized, proxy, "congestion-controller", "congestion_controller")
-	copyShadowQUICProxyString(normalized, proxy, "up", "up")
-	copyShadowQUICProxyString(normalized, proxy, "down", "down")
+	copyShadowQUICProxyNonNegativeInt(normalized, proxy, "up", "up")
+	copyShadowQUICProxyNonNegativeInt(normalized, proxy, "down", "down")
 	copyShadowQUICProxyNonNegativeInt(normalized, proxy, "cwnd", "cwnd")
 	copyShadowQUICProxyString(normalized, proxy, "bbr-profile", "bbr_profile")
 	copyShadowQUICProxyNonNegativeInt(normalized, proxy, "max-datagram-frame-size", "max_datagram_frame_size")
@@ -188,6 +188,75 @@ func BuildMihomoShadowQUICClashProxy(source map[string]interface{}, tag string) 
 	copyShadowQUICProxyNonNegativeInt(normalized, proxy, "recv-window", "recv_window")
 	copyShadowQUICProxyBool(normalized, proxy, "disable-mtu-discovery", "disable_mtu_discovery")
 	applyMihomoShadowQUICCommonFields(proxy, normalized["mihomo_common"])
+
+	return proxy, true
+}
+
+// SanitizeMihomoShadowQUICClashProxy keeps an already-rendered ShadowQUIC
+// Clash proxy within the official Mihomo proxy schema. It is deliberately
+// separate from SanitizeMihomoShadowQUICOutbound: this function reads the
+// final Clash field names and must not reinterpret the proxy as a raw
+// sing-box-style outbound.
+func SanitizeMihomoShadowQUICClashProxy(source map[string]interface{}, fallbackName string) (map[string]interface{}, bool) {
+	if source == nil {
+		return nil, false
+	}
+
+	name := strings.TrimSpace(shadowQUICString(source["name"]))
+	if name == "" {
+		name = strings.TrimSpace(fallbackName)
+	}
+	server := strings.TrimSpace(shadowQUICString(source["server"]))
+	port, portOK := shadowQUICNonNegativeInt(source["port"])
+	username := strings.TrimSpace(shadowQUICString(source["username"]))
+	password := strings.TrimSpace(shadowQUICString(source["password"]))
+	if name == "" || server == "" || !portOK || port < 1 || port > 65535 || username == "" || password == "" {
+		return nil, false
+	}
+
+	proxy := map[string]interface{}{
+		"name":     name,
+		"type":     "shadowquic",
+		"server":   server,
+		"port":     port,
+		"username": username,
+		"password": password,
+	}
+
+	copyShadowQUICProxyString(source, proxy, "sni", "sni")
+	copyShadowQUICProxyStringSlice(source, proxy, "alpn", "alpn")
+	if versions := NormalizeMihomoShadowQUICVersions(source["quic-versions"]); len(versions) > 0 {
+		proxy["quic-versions"] = versions
+	}
+	copyShadowQUICProxyBool(source, proxy, "udp-over-stream", "udp-over-stream")
+	copyShadowQUICProxyBool(source, proxy, "zero-rtt", "zero-rtt")
+	copyShadowQUICProxyNonNegativeInt(source, proxy, "keep-alive-interval", "keep-alive-interval")
+	if controller, ok := NormalizeMihomoShadowQUICCongestionController(source["congestion-controller"]); ok {
+		proxy["congestion-controller"] = controller
+	}
+	copyShadowQUICProxyNonNegativeInt(source, proxy, "up", "up")
+	copyShadowQUICProxyNonNegativeInt(source, proxy, "down", "down")
+	copyShadowQUICProxyNonNegativeInt(source, proxy, "cwnd", "cwnd")
+	if bbrProfile, ok := NormalizeMihomoBBRProfile(source["bbr-profile"]); ok {
+		proxy["bbr-profile"] = bbrProfile
+	}
+	copyShadowQUICProxyNonNegativeInt(source, proxy, "max-datagram-frame-size", "max-datagram-frame-size")
+	copyShadowQUICProxyNonNegativeInt(source, proxy, "max-open-streams", "max-open-streams")
+	copyShadowQUICProxyNonNegativeInt(source, proxy, "recv-window-conn", "recv-window-conn")
+	copyShadowQUICProxyNonNegativeInt(source, proxy, "recv-window", "recv-window")
+	copyShadowQUICProxyBool(source, proxy, "disable-mtu-discovery", "disable-mtu-discovery")
+
+	// These are valid final Mihomo proxy fields. Their raw-outbound forms live
+	// under mihomo_common, so they need their own final-proxy handling here.
+	if udp, ok := source["udp"].(bool); ok {
+		proxy["udp"] = udp
+	}
+	if ipVersion, ok := NormalizeMihomoClientIPVersion(source["ip-version"]); ok {
+		proxy["ip-version"] = ipVersion
+	}
+	if routingMark, ok := shadowQUICNonNegativeInt(source["routing-mark"]); ok {
+		proxy["routing-mark"] = routingMark
+	}
 
 	return proxy, true
 }
@@ -403,20 +472,6 @@ func copyShadowQUICBool(source, target map[string]interface{}, targetKey string,
 
 func copyShadowQUICNonNegativeInt(source, target map[string]interface{}, targetKey string, sourceKeys ...string) {
 	if value, ok := shadowQUICNonNegativeInt(firstShadowQUICValue(source, sourceKeys...)); ok {
-		target[targetKey] = value
-	}
-}
-
-func copyShadowQUICBandwidth(source, target map[string]interface{}, targetKey string, sourceKeys ...string) {
-	raw := firstShadowQUICValue(source, sourceKeys...)
-	var value string
-	switch typed := raw.(type) {
-	case string:
-		value = strings.TrimSpace(typed)
-	case int, int8, int16, int32, int64, uint, uint32, uint64, float32, float64:
-		value = strings.TrimSpace(fmt.Sprint(typed))
-	}
-	if value != "" {
 		target[targetKey] = value
 	}
 }

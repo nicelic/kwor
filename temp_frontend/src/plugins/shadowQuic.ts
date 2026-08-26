@@ -7,8 +7,8 @@ export type ShadowQuicInboundDefaultOptions = {
   quic_versions: string[]
   zero_rtt: boolean
   congestion_controller: string
-  up: string
-  down: string
+  up: number
+  down: number
   cwnd: number
   max_idle_time: number
   max_datagram_frame_size: number
@@ -26,8 +26,8 @@ export function createShadowQuicInboundDefaultOptions(): ShadowQuicInboundDefaul
     quic_versions: ['v2'],
     zero_rtt: true,
     congestion_controller: 'bbr',
-    up: '500',
-    down: '500',
+    up: 500,
+    down: 500,
     cwnd: 720,
     max_idle_time: 600000,
     max_datagram_frame_size: 1400,

@@ -86,9 +86,13 @@ func TestSanitizeSingboxSubscriptionOutboundRemovesPanelFields(t *testing.T) {
 	}
 }
 
-func TestSanitizeSingboxSubscriptionOutboundPromotesHysteria2ReceiveWindows(t *testing.T) {
+func TestSanitizeSingboxSubscriptionOutboundRemovesMihomoHysteria2ReceiveWindows(t *testing.T) {
 	outbound := map[string]interface{}{
-		"type": "hysteria2",
+		"type":                              "hysteria2",
+		"initial_stream_receive_window":     1,
+		"max_stream_receive_window":         2,
+		"initial_connection_receive_window": 3,
+		"max_connection_receive_window":     4,
 		"mihomo_hy2": map[string]interface{}{
 			"initial_stream_receive_window":     38000000,
 			"max_stream_receive_window":         70000000,
@@ -100,14 +104,14 @@ func TestSanitizeSingboxSubscriptionOutboundPromotesHysteria2ReceiveWindows(t *t
 
 	SanitizeSingboxSubscriptionOutbound(outbound)
 
-	for key, want := range map[string]interface{}{
-		"initial_stream_receive_window":     38000000,
-		"max_stream_receive_window":         70000000,
-		"initial_connection_receive_window": 120000000,
-		"max_connection_receive_window":     150000000,
+	for _, key := range []string{
+		"initial_stream_receive_window",
+		"max_stream_receive_window",
+		"initial_connection_receive_window",
+		"max_connection_receive_window",
 	} {
-		if got := outbound[key]; got != want {
-			t.Fatalf("%s = %#v, want %#v", key, got, want)
+		if _, exists := outbound[key]; exists {
+			t.Fatalf("Mihomo-only receive window %s survived sing-box sanitization: %#v", key, outbound)
 		}
 	}
 	if _, exists := outbound["mihomo_hy2"]; exists {

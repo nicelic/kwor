@@ -159,6 +159,82 @@ func TestMihomoBuildSyncedOutboundStripsPanelFieldsBeforeCaching(t *testing.T) {
 	}
 }
 
+func TestMihomoBuildSyncedOutboundKeepsHysteria2ReceiveWindowsOnlyInClashProjection(t *testing.T) {
+	svc := &MihomoSyncService{}
+	inbound := &model.MihomoInbound{
+		Type: "hysteria2",
+		Tag:  "hy2-mihomo-sync",
+		OutJson: json.RawMessage(`{
+			"type":"hysteria2",
+			"tag":"hy2-mihomo-sync",
+			"server":"edge.example.com",
+			"server_port":443,
+			"mihomo_hy2":{
+				"initial_stream_receive_window":38000000,
+				"max_stream_receive_window":70000000,
+				"initial_connection_receive_window":120000000,
+				"max_connection_receive_window":150000000
+			}
+		}`),
+		Options: json.RawMessage(`{}`),
+	}
+	clientConfig := map[string]interface{}{
+		"hysteria2": map[string]interface{}{
+			"password": "secret",
+		},
+	}
+
+	jsonOutbound, clashSource, err := svc.buildSyncedOutbound(nil, inbound, clientConfig, "alice", "", true)
+	if err != nil {
+		t.Fatalf("buildSyncedOutbound returned error: %v", err)
+	}
+	for _, key := range []string{
+		"mihomo_hy2",
+		"initial_stream_receive_window",
+		"max_stream_receive_window",
+		"initial_connection_receive_window",
+		"max_connection_receive_window",
+	} {
+		if _, exists := jsonOutbound[key]; exists {
+			t.Fatalf("sing-box projection retained Mihomo-only field %q: %#v", key, jsonOutbound)
+		}
+	}
+
+	windows, ok := clashSource["mihomo_hy2"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Clash projection lost mihomo_hy2 receive windows: %#v", clashSource)
+	}
+	for key, want := range map[string]float64{
+		"initial_stream_receive_window":     38000000,
+		"max_stream_receive_window":         70000000,
+		"initial_connection_receive_window": 120000000,
+		"max_connection_receive_window":     150000000,
+	} {
+		if got, _ := windows[key].(float64); got != want {
+			t.Fatalf("Clash source %s = %#v, want %v", key, windows[key], want)
+		}
+	}
+
+	raw, err := buildMihomoClashOptions(clashSource, "m_hy2-mihomo-sync_alice")
+	if err != nil {
+		t.Fatalf("buildMihomoClashOptions returned error: %v", err)
+	}
+	proxy := map[string]interface{}{}
+	if err := json.Unmarshal(raw, &proxy); err != nil {
+		t.Fatalf("decode ClashOptions failed: %v", err)
+	}
+	for key, want := range map[string]float64{
+		"initial-stream-receive-window":     38000000,
+		"max-stream-receive-window":         70000000,
+		"initial-connection-receive-window": 120000000,
+		"max-connection-receive-window":     150000000,
+	} {
+		if got, _ := proxy[key].(float64); got != want {
+			t.Fatalf("Clash proxy %s = %#v, want %v", key, proxy[key], want)
+		}
+	}
+}
+
 func TestDefaultAndMihomoSyncExcludeMixedListeners(t *testing.T) {
 	db := setupMihomoSyncTestDB(t, "mixed-sync-exclusion.db")
 

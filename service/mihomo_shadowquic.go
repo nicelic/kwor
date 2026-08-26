@@ -68,8 +68,8 @@ func sanitizeMihomoShadowQUICInboundOptions(inbound *model.MihomoInbound) error 
 	if controller, ok := util.NormalizeMihomoShadowQUICCongestionController(shadowQUICInboundFirst(options, "congestion_controller", "congestion-controller")); ok {
 		clean["congestion_controller"] = controller
 	}
-	shadowQUICInboundCopyBandwidth(options, clean, "up", "up")
-	shadowQUICInboundCopyBandwidth(options, clean, "down", "down")
+	shadowQUICInboundCopyNonNegativeInt(options, clean, "up", "up")
+	shadowQUICInboundCopyNonNegativeInt(options, clean, "down", "down")
 	shadowQUICInboundCopyBool(options, clean, "ignore_client_bandwidth", "ignore_client_bandwidth", "ignore-client-bandwidth")
 	shadowQUICInboundCopyNonNegativeInt(options, clean, "cwnd", "cwnd")
 	if profile, ok := util.NormalizeMihomoBBRProfile(shadowQUICInboundFirst(options, "bbr_profile", "bbr-profile")); ok {
@@ -464,20 +464,6 @@ func shadowQUICInboundCopyBool(source, target map[string]interface{}, targetKey 
 
 func shadowQUICInboundCopyNonNegativeInt(source, target map[string]interface{}, targetKey string, sourceKeys ...string) {
 	if value, ok := toInt(shadowQUICInboundFirst(source, sourceKeys...)); ok && value >= 0 {
-		target[targetKey] = value
-	}
-}
-
-func shadowQUICInboundCopyBandwidth(source, target map[string]interface{}, targetKey string, sourceKeys ...string) {
-	raw := shadowQUICInboundFirst(source, sourceKeys...)
-	value := ""
-	switch typed := raw.(type) {
-	case string:
-		value = strings.TrimSpace(typed)
-	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
-		value = strings.TrimSpace(fmt.Sprint(typed))
-	}
-	if value != "" {
 		target[targetKey] = value
 	}
 }

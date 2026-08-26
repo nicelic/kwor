@@ -276,7 +276,10 @@
 <script lang="ts">
 import { InTypes, createInbound, Addr, ShadowTLS } from '@/types/inbounds'
 import RandomUtil from '@/plugins/randomUtil'
-import { normalizeShadowQuicJlsUpstreamAddr, shadowQuicJlsSniFromAddr } from '@/plugins/shadowQuic'
+import {
+  normalizeShadowQuicJlsUpstreamAddr,
+  shadowQuicJlsSniFromAddr,
+} from '@/plugins/shadowQuic'
 
 import Listen from '@/components/Listen.vue'
 import Direct from '@/components/protocols/Direct.vue'
@@ -1036,6 +1039,7 @@ export default {
       this.initMihomoFastOpenDefaults(forceHyBandwidthDefaults)
       this.initShadowTlsClientDefaults(forceHyBandwidthDefaults)
       this.sanitizeMihomoShadowTLSUnsupportedFields()
+      this.initShadowQuicClientBandwidthDefaults(forceHyBandwidthDefaults)
       this.sanitizeMihomoShadowQUICUnsupportedFields()
       this.initAnyTlsClientDefaults(forceHyBandwidthDefaults)
       this.initTrustTunnelClientDefaults(forceHyBandwidthDefaults)
@@ -1044,6 +1048,16 @@ export default {
       this.initHysteriaClientBandwidthDefaults(forceHyBandwidthDefaults)
       this.initVLESSMihomoEncryptionDefaults()
       this.migrateMihomoClientCommonFields(forceHyBandwidthDefaults)
+    },
+    initShadowQuicClientBandwidthDefaults(forceDefaults: boolean = false) {
+      if (this.namespace !== 'mihomo' || this.inbound.type !== this.inTypes.ShadowQUIC) return
+      if (!this.inbound.out_json) this.inbound.out_json = {}
+      if (forceDefaults && this.inbound.out_json.up === undefined) {
+        this.inbound.out_json.up = 500
+      }
+      if (forceDefaults && this.inbound.out_json.down === undefined) {
+        this.inbound.out_json.down = 500
+      }
     },
     parseValidPort(value: unknown): number | undefined {
       if (value === '' || value === null || value === undefined) return undefined

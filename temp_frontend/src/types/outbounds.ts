@@ -182,8 +182,8 @@ export interface ShadowQUIC extends OutboundBasics {
   zero_rtt?: boolean
   keep_alive_interval?: number
   congestion_controller?: string
-  up?: string
-  down?: string
+  up?: number
+  down?: number
   cwnd?: number
   bbr_profile?: string
   max_datagram_frame_size?: number

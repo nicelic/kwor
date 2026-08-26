@@ -331,3 +331,29 @@ func TestShadowQUICListenerNormalizesBBRProfile(t *testing.T) {
 		t.Fatalf("invalid BBR profile must not reach listener output: %#v", listener)
 	}
 }
+
+func TestShadowQUICListenerNormalizesNumericBandwidth(t *testing.T) {
+	listener := map[string]interface{}{
+		"type": "shadowquic",
+		"up":   "500",
+		"down": float64(600),
+	}
+	normalizeMihomoShadowQUICListener(listener)
+	for key, want := range map[string]int{"up": 500, "down": 600} {
+		if got, ok := listener[key].(int); !ok || got != want {
+			t.Fatalf("listener %s = %#v, want numeric %d; listener=%#v", key, listener[key], want, listener)
+		}
+	}
+
+	listener = map[string]interface{}{
+		"type": "shadowquic",
+		"up":   "500 Mbps",
+		"down": -1,
+	}
+	normalizeMihomoShadowQUICListener(listener)
+	for _, key := range []string{"up", "down"} {
+		if _, exists := listener[key]; exists {
+			t.Fatalf("invalid listener bandwidth %s must be removed: %#v", key, listener)
+		}
+	}
+}

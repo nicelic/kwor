@@ -141,3 +141,69 @@ func TestGetJson_HysteriaOmitsZeroBandwidthFields(t *testing.T) {
 		t.Fatalf("expected down_mbps to be omitted when zero, got %#v", jsonOutbound["down_mbps"])
 	}
 }
+
+func TestGetJson_Hysteria2OmitsMihomoReceiveWindows(t *testing.T) {
+	setupSubscriptionTestDB(t, "json-hysteria2-mihomo-receive-windows.db")
+
+	db := database.GetDB()
+	inbound := model.Inbound{
+		Type:  "hysteria2",
+		Tag:   "hy2-mihomo-window-node",
+		Addrs: mustRawJSON(t, []interface{}{}),
+		OutJson: mustRawJSON(t, map[string]interface{}{
+			"type":                              "hysteria2",
+			"tag":                               "hy2-mihomo-window-node",
+			"server":                            "example.com",
+			"server_port":                       443,
+			"initial_stream_receive_window":     1,
+			"max_stream_receive_window":         2,
+			"initial_connection_receive_window": 3,
+			"max_connection_receive_window":     4,
+			"mihomo_hy2": map[string]interface{}{
+				"initial_stream_receive_window":     38000000,
+				"max_stream_receive_window":         70000000,
+				"initial_connection_receive_window": 120000000,
+				"max_connection_receive_window":     150000000,
+			},
+		}),
+	}
+	if err := db.Create(&inbound).Error; err != nil {
+		t.Fatalf("create inbound failed: %v", err)
+	}
+
+	client := model.Client{
+		Enable: true,
+		Name:   "hy2-mihomo-window-client",
+		Config: mustRawJSON(t, map[string]interface{}{
+			"hysteria2": map[string]interface{}{
+				"password": "secret",
+			},
+		}),
+		Inbounds: mustRawJSON(t, []uint{inbound.Id}),
+		Links:    mustRawJSON(t, []map[string]string{}),
+	}
+	if err := db.Create(&client).Error; err != nil {
+		t.Fatalf("create client failed: %v", err)
+	}
+
+	jsonSub, _, err := (&JsonService{}).GetJson(client.Name, "json")
+	if err != nil {
+		t.Fatalf("GetJson failed: %v", err)
+	}
+	var jsonDoc map[string]interface{}
+	if err := json.Unmarshal([]byte(*jsonSub), &jsonDoc); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	jsonOutbound := findTaggedOutbound(t, jsonDoc["outbounds"], inbound.Tag)
+	for _, key := range []string{
+		"mihomo_hy2",
+		"initial_stream_receive_window",
+		"max_stream_receive_window",
+		"initial_connection_receive_window",
+		"max_connection_receive_window",
+	} {
+		if _, exists := jsonOutbound[key]; exists {
+			t.Fatalf("sing-box Hysteria2 subscription retained Mihomo-only field %q: %#v", key, jsonOutbound)
+		}
+	}
+}

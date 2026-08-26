@@ -79,6 +79,35 @@ func TestConvertClashProxyToSubOutboundPreservesMihomoHiddenFields(t *testing.T)
 	if got, _ := hy2["mihomo_fast_open"].(bool); !got {
 		t.Fatalf("expected Hysteria2 mihomo_fast_open=true, got %#v", hy2["mihomo_fast_open"])
 	}
+
+	shadowQUIC, ok := convertClashProxyToSubOutbound(map[string]interface{}{
+		"name":         "shadowquic-hidden",
+		"type":         "shadowquic",
+		"server":       "example.com",
+		"port":         443,
+		"username":     "alice",
+		"password":     "secret",
+		"udp":          true,
+		"ip-version":   "ipv6",
+		"routing-mark": 100,
+		"tls":          true,
+		"dialer-proxy": "must-not-survive",
+	})
+	if !ok || shadowQUIC == nil {
+		t.Fatalf("expected ShadowQUIC proxy conversion")
+	}
+	common, ok := shadowQUIC["mihomo_common"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected ShadowQUIC mihomo_common map, got %#v", shadowQUIC["mihomo_common"])
+	}
+	if common["udp"] != true || common["ip_version"] != "ipv6" || common["routing_mark"] != 100 {
+		t.Fatalf("unexpected imported ShadowQUIC Mihomo common fields: %#v", common)
+	}
+	for _, key := range []string{"udp", "ip-version", "routing-mark", "tls", "dialer-proxy"} {
+		if _, exists := shadowQUIC[key]; exists {
+			t.Fatalf("final Clash field %q must not leak into ShadowQUIC raw outbound: %#v", key, shadowQUIC)
+		}
+	}
 }
 
 func TestExtractProxyOutboundsInjectsCertificateStoreToTLS(t *testing.T) {

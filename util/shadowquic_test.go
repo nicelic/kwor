@@ -2,6 +2,7 @@ package util
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 )
 
@@ -55,7 +56,8 @@ func TestShadowQUICOutboundSanitizeAndClashBuild(t *testing.T) {
 		"zero_rtt":              false,
 		"keep_alive_interval":   float64(0),
 		"congestion-controller": "bbr",
-		"up":                    "100 Mbps",
+		"up":                    "100",
+		"down":                  float64(200),
 		"cwnd":                  float64(0),
 		"disable-mtu-discovery": false,
 		"mihomo_common": map[string]interface{}{
@@ -113,6 +115,14 @@ func TestShadowQUICOutboundSanitizeAndClashBuild(t *testing.T) {
 	if got := proxy["quic-versions"]; len(got.([]string)) != 1 || got.([]string)[0] != "v1" {
 		t.Fatalf("unexpected quic-versions: %#v", got)
 	}
+	for key, want := range map[string]int{"up": 100, "down": 200} {
+		if got, ok := outbound[key].(int); !ok || got != want {
+			t.Fatalf("sanitized %s = %#v, want numeric %d; outbound=%#v", key, outbound[key], want, outbound)
+		}
+		if got, ok := proxy[key].(int); !ok || got != want {
+			t.Fatalf("Clash proxy %s = %#v, want numeric %d; proxy=%#v", key, proxy[key], want, proxy)
+		}
+	}
 	for _, key := range []string{"udp-over-stream", "zero-rtt", "keep-alive-interval", "cwnd", "disable-mtu-discovery"} {
 		if _, exists := proxy[key]; !exists {
 			t.Fatalf("expected explicit Clash key %s, got %#v", key, proxy)
@@ -125,6 +135,35 @@ func TestShadowQUICOutboundSanitizeAndClashBuild(t *testing.T) {
 	}
 	if proxy["udp"] != true || proxy["ip-version"] != "ipv6" || proxy["routing-mark"] != 100 {
 		t.Fatalf("expected supported common fields in Clash proxy, got %#v", proxy)
+	}
+}
+
+func TestShadowQUICBandwidthRequiresNonNegativeIntegers(t *testing.T) {
+	outbound := map[string]interface{}{
+		"type":        "shadowquic",
+		"tag":         "sq-bandwidth",
+		"server":      "edge.example.com",
+		"server_port": 10443,
+		"username":    "alice",
+		"password":    "secret",
+		"up":          "500",
+		"down":        600,
+	}
+
+	SanitizeMihomoShadowQUICOutbound(outbound)
+	for key, want := range map[string]int{"up": 500, "down": 600} {
+		if got, ok := outbound[key].(int); !ok || got != want {
+			t.Fatalf("sanitized %s = %#v, want numeric %d; outbound=%#v", key, outbound[key], want, outbound)
+		}
+	}
+
+	outbound["up"] = "500 Mbps"
+	outbound["down"] = -1
+	SanitizeMihomoShadowQUICOutbound(outbound)
+	for _, key := range []string{"up", "down"} {
+		if _, exists := outbound[key]; exists {
+			t.Fatalf("invalid ShadowQUIC bandwidth %s must be removed: %#v", key, outbound)
+		}
 	}
 }
 
@@ -292,6 +331,56 @@ func TestShadowQUICClashProxyCanNormalizeStoredClashShape(t *testing.T) {
 	}
 	if _, exists := proxy["tls"]; exists {
 		t.Fatalf("stored tls must not survive normalization: %#v", proxy)
+	}
+}
+
+func TestShadowQUICClashProxySanitizerPreservesFinalMihomoCommonFields(t *testing.T) {
+	stored := map[string]interface{}{
+		"name":                     "stored-sq",
+		"type":                     "shadowquic",
+		"server":                   "edge.example.com",
+		"port":                     float64(443),
+		"username":                 "alice",
+		"password":                 "secret",
+		"sni":                      "edge.example.com",
+		"quic-versions":            []interface{}{"v2", "invalid", "v1"},
+		"udp-over-stream":          false,
+		"zero-rtt":                 false,
+		"keep-alive-interval":      "10000",
+		"congestion-controller":    "BBR",
+		"max-open-streams":         float64(1024),
+		"disable-mtu-discovery":    false,
+		"udp":                      true,
+		"ip-version":               " IPv6-Prefer ",
+		"routing-mark":             float64(100),
+		"routing_mark":             101,
+		"tls":                      true,
+		"detour":                   "must-not-survive",
+		"dialer-proxy":             "must-not-survive",
+		"rule":                     "must-not-survive",
+		"proxy":                    "must-not-survive",
+		"unknown_shadowquic_field": "must-not-survive",
+	}
+
+	proxy, ok := SanitizeMihomoShadowQUICClashProxy(stored, "")
+	if !ok {
+		t.Fatalf("expected stored Clash proxy to sanitize, got %#v", stored)
+	}
+	if proxy["udp"] != true || proxy["ip-version"] != "ipv6-prefer" || proxy["routing-mark"] != 100 {
+		t.Fatalf("expected final Mihomo common fields to remain, got %#v", proxy)
+	}
+	if got := fmt.Sprint(proxy["quic-versions"]); got != "[v2 v1]" {
+		t.Fatalf("unexpected normalized quic versions: %#v", proxy["quic-versions"])
+	}
+	for _, key := range []string{"tls", "detour", "dialer-proxy", "rule", "proxy", "routing_mark", "unknown_shadowquic_field"} {
+		if _, exists := proxy[key]; exists {
+			t.Fatalf("unexpected stored field %s in sanitized proxy: %#v", key, proxy)
+		}
+	}
+
+	again, ok := SanitizeMihomoShadowQUICClashProxy(proxy, "")
+	if !ok || !reflect.DeepEqual(again, proxy) {
+		t.Fatalf("ShadowQUIC Clash sanitizer must be idempotent: first=%#v second=%#v", proxy, again)
 	}
 }
 

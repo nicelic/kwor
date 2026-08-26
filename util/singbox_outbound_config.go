@@ -129,7 +129,7 @@ func SanitizeSingboxSubscriptionOutbound(outbound map[string]interface{}) {
 
 	StripSubscriptionOutboundPanelFields(outbound)
 	protocol, _ := outbound["type"].(string)
-	PromoteHysteria2ReceiveWindowsToSingbox(outbound)
+	StripMihomoHysteria2ReceiveWindowsForSingbox(outbound)
 	if normalizeSubscriptionType(protocol) == "hysteria" {
 		NormalizeHysteriaSubscriptionOutbound(outbound)
 	}
