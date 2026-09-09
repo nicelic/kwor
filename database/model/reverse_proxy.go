@@ -41,8 +41,14 @@ type ReverseProxyRule struct {
 	DNSCacheMinTTL              int    `json:"dnsCacheMinTtl" gorm:"column:dns_cache_min_ttl;not null;default:0"`
 	DNSCacheMaxTTL              int    `json:"dnsCacheMaxTtl" gorm:"column:dns_cache_max_ttl;not null;default:0"`
 	DNSAllowedCIDRs             string `json:"dnsAllowedCidrs" gorm:"column:dns_allowed_cidrs;type:text;not null;default:''"`
-	DNSRateLimitQPS             int    `json:"dnsRateLimitQps" gorm:"column:dns_rate_limit_qps;not null;default:50"`
-	DNSMaxConcurrentQueries     int    `json:"dnsMaxConcurrentQueries" gorm:"column:dns_max_concurrent_queries;not null;default:128"`
+	// DNSPublicExposure records the operator's explicit acknowledgement that
+	// this rule accepts all sources on at least one address family.
+	DNSPublicExposure bool `json:"dnsPublicExposure" gorm:"column:dns_public_exposure;not null;default:false"`
+	// DNSTrustedProxyCIDRs is only used by DoH/DoH3.  X-Forwarded-For is read
+	// only when the direct peer belongs to one of these CIDRs.
+	DNSTrustedProxyCIDRs    string `json:"dnsTrustedProxyCidrs" gorm:"column:dns_trusted_proxy_cidrs;type:text;not null;default:''"`
+	DNSRateLimitQPS         int    `json:"dnsRateLimitQps" gorm:"column:dns_rate_limit_qps;not null;default:50"`
+	DNSMaxConcurrentQueries int    `json:"dnsMaxConcurrentQueries" gorm:"column:dns_max_concurrent_queries;not null;default:128"`
 
 	EDNSEnabled            bool   `json:"ednsEnabled" gorm:"column:edns_enabled;not null;default:false"`
 	EDNSMode               string `json:"ednsMode" gorm:"column:edns_mode;size:32;not null;default:'auto'"`

@@ -485,12 +485,190 @@ func TestReverseProxyResponseRewriteRejectsTruncatedDeclaredBody(t *testing.T) {
 	}
 }
 
-func TestNormalizeReverseProxyTokens_RejectInlinePorts(t *testing.T) {
-	if _, err := normalizeReverseProxyTokens("example.com:8443", reverseProxyTokenModeHost); err == nil {
-		t.Fatal("expected host token with inline port to fail")
+func TestNormalizeReverseProxyAddressTokens(t *testing.T) {
+	tests := []struct {
+		name     string
+		raw      string
+		want     []string
+		wantPort int
+		hasPort  bool
+	}{
+		{
+			name: "strip https prefix and path",
+			raw:  "https://Example.com/path",
+			want: []string{"example.com"},
+		},
+		{
+			name:     "extract host port",
+			raw:      "example.com:8080",
+			want:     []string{"example.com"},
+			wantPort: 8080,
+			hasPort:  true,
+		},
+		{
+			name:     "extract bracketed ipv6 port and path",
+			raw:      "[2001:db8::1]:8443/path",
+			want:     []string{"2001:db8::1"},
+			wantPort: 8443,
+			hasPort:  true,
+		},
+		{
+			name: "keep unbracketed ipv6 intact",
+			raw:  "2001:db8::1",
+			want: []string{"2001:db8::1"},
+		},
+		{
+			name:     "same port across addresses",
+			raw:      "example.com:8080, 192.0.2.1:8080",
+			want:     []string{"example.com", "192.0.2.1"},
+			wantPort: 8080,
+			hasPort:  true,
+		},
 	}
-	if _, err := normalizeReverseProxyTokens("api.example.com:8443", reverseProxyTokenModeTarget); err == nil {
-		t.Fatal("expected target token with inline port to fail")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeReverseProxyTokensWithPort(tt.raw, reverseProxyTokenModeTarget)
+			if err != nil {
+				t.Fatalf("normalize address tokens failed: %v", err)
+			}
+			if !reflect.DeepEqual(got.tokens, tt.want) {
+				t.Fatalf("normalized tokens = %#v, want %#v", got.tokens, tt.want)
+			}
+			if got.hasPort != tt.hasPort || got.port != tt.wantPort {
+				t.Fatalf("normalized port = (%t, %d), want (%t, %d)", got.hasPort, got.port, tt.hasPort, tt.wantPort)
+			}
+		})
+	}
+
+	for _, raw := range []string{
+		"example.com:0",
+		"example.com:65536",
+		"example.com:not-a-port",
+		"[2001:db8::1]:0",
+		"[2001:db8::1]:65536",
+		"[2001:db8::1]:not-a-port",
+	} {
+		t.Run("reject "+raw, func(t *testing.T) {
+			if _, err := normalizeReverseProxyTokensWithPort(raw, reverseProxyTokenModeTarget); err == nil {
+				t.Fatal("expected invalid inline port to fail")
+			}
+		})
+	}
+
+	if _, err := normalizeReverseProxyTokensWithPort("example.com:8080, api.example.com:8443", reverseProxyTokenModeTarget); err == nil {
+		t.Fatal("expected different inline ports to fail")
+	}
+}
+
+func TestNormalizeReverseProxyPayloadAddressAndPort(t *testing.T) {
+	normalized, err := (&ReverseProxyService{}).normalizeRulePayload(ReverseProxyRulePayload{
+		Name:            "address-normalization",
+		Enabled:         false,
+		ListenProtocol:  reverseProxyProtocolHTTP,
+		ListenPort:      18080,
+		Hosts:           "https://Example.com/admin",
+		TargetProtocol:  reverseProxyProtocolHTTP,
+		TargetAddresses: "[2001:db8::1]:8443/path",
+		TargetPort:      18081,
+		IPStrategy:      reverseProxyIPStrategyPreferIPv6,
+	})
+	if err != nil {
+		t.Fatalf("normalize reverse proxy payload failed: %v", err)
+	}
+	if !reflect.DeepEqual(normalized.hosts, []string{"example.com"}) {
+		t.Fatalf("normalized listen hosts = %#v, want %#v", normalized.hosts, []string{"example.com"})
+	}
+	if normalized.listenPort != 18080 {
+		t.Fatalf("listen port without inline port = %d, want 18080", normalized.listenPort)
+	}
+	if !reflect.DeepEqual(normalized.targetAddresses, []string{"2001:db8::1"}) {
+		t.Fatalf("normalized target addresses = %#v, want %#v", normalized.targetAddresses, []string{"2001:db8::1"})
+	}
+	if normalized.targetPort != 8443 {
+		t.Fatalf("target port from inline port = %d, want 8443", normalized.targetPort)
+	}
+
+	withoutPort, err := (&ReverseProxyService{}).normalizeRulePayload(ReverseProxyRulePayload{
+		ListenProtocol:  reverseProxyProtocolHTTP,
+		ListenPort:      18082,
+		Hosts:           "example.com",
+		TargetProtocol:  reverseProxyProtocolHTTPS,
+		TargetAddresses: "https://upstream.example/path",
+		TargetPort:      18083,
+	})
+	if err != nil {
+		t.Fatalf("normalize protocol-only address failed: %v", err)
+	}
+	if withoutPort.targetPort != 18083 {
+		t.Fatalf("https without inline port changed target port to %d, want 18083", withoutPort.targetPort)
+	}
+}
+
+func TestNormalizeReverseProxyPayloadInlinePortsPersistAndConflictBeforeTransaction(t *testing.T) {
+	openReverseProxyTestDB(t)
+	svc := &ReverseProxyService{}
+	settings, err := svc.loadReverseProxySettings()
+	if err != nil {
+		t.Fatalf("load reverse proxy settings failed: %v", err)
+	}
+	expectedRevision := settings.Revision
+	if err := svc.UpsertRule(ReverseProxyRulePayload{
+		ExpectedRevision: &expectedRevision,
+		Name:             "same-inline-ports",
+		Enabled:          false,
+		ListenProtocol:   reverseProxyProtocolHTTP,
+		ListenPort:       18082,
+		Hosts:            "example.com:18080, api.example.com:18080",
+		TargetProtocol:   reverseProxyProtocolHTTP,
+		TargetAddresses:  "192.0.2.1:8080, [2001:db8::1]:8080",
+		TargetPort:       18081,
+	}); err != nil {
+		t.Fatalf("save same-port reverse proxy rule failed: %v", err)
+	}
+
+	var row model.ReverseProxyRule
+	if err := database.GetDB().Where("name = ?", "same-inline-ports").First(&row).Error; err != nil {
+		t.Fatalf("load saved same-port reverse proxy rule failed: %v", err)
+	}
+	if row.ListenPort != 18080 || row.TargetPort != 8080 {
+		t.Fatalf("saved inline ports = listen %d target %d, want listen 18080 target 8080", row.ListenPort, row.TargetPort)
+	}
+	if got := decodeReverseProxyList(row.HostList); !reflect.DeepEqual(got, []string{"example.com", "api.example.com"}) {
+		t.Fatalf("saved listen names = %#v, want %#v", got, []string{"example.com", "api.example.com"})
+	}
+	if got := decodeReverseProxyList(row.TargetAddresses); !reflect.DeepEqual(got, []string{"192.0.2.1", "2001:db8::1"}) {
+		t.Fatalf("saved target addresses = %#v, want %#v", got, []string{"192.0.2.1", "2001:db8::1"})
+	}
+
+	countBeforeConflict := int64(0)
+	if err := database.GetDB().Model(&model.ReverseProxyRule{}).Count(&countBeforeConflict).Error; err != nil {
+		t.Fatalf("count reverse proxy rules before conflict failed: %v", err)
+	}
+	settings, err = svc.loadReverseProxySettings()
+	if err != nil {
+		t.Fatalf("reload reverse proxy settings failed: %v", err)
+	}
+	expectedRevision = settings.Revision
+	if err := svc.UpsertRule(ReverseProxyRulePayload{
+		ExpectedRevision: &expectedRevision,
+		Name:             "different-inline-ports",
+		Enabled:          false,
+		ListenProtocol:   reverseProxyProtocolHTTP,
+		ListenPort:       18082,
+		Hosts:            "conflict.example.com:18080, other.example.com:18081",
+		TargetProtocol:   reverseProxyProtocolHTTP,
+		TargetAddresses:  "192.0.2.2",
+		TargetPort:       8080,
+	}); err == nil || !strings.Contains(err.Error(), "same port") {
+		t.Fatalf("different inline ports error = %v, want same-port conflict", err)
+	}
+	countAfterConflict := int64(0)
+	if err := database.GetDB().Model(&model.ReverseProxyRule{}).Count(&countAfterConflict).Error; err != nil {
+		t.Fatalf("count reverse proxy rules after conflict failed: %v", err)
+	}
+	if countAfterConflict != countBeforeConflict {
+		t.Fatalf("different inline ports changed rule count from %d to %d", countBeforeConflict, countAfterConflict)
 	}
 }
 
@@ -821,8 +999,8 @@ func TestNormalizeReverseProxyPayloadClearsHTTPOnlyFieldsForDNSRules(t *testing.
 	svc := &ReverseProxyService{}
 	normalized, err := svc.normalizeRulePayload(ReverseProxyRulePayload{
 		Enabled:                true,
-		ListenProtocol:         reverseProxyDNSProtocolDoH,
-		ListenPort:             443,
+		ListenProtocol:         reverseProxyDNSProtocolUDP,
+		ListenPort:             53,
 		Hosts:                  "stale.example.com",
 		PathPrefix:             "/stale-http-prefix",
 		ListenDNSPath:          "/dns-query",
@@ -834,7 +1012,6 @@ func TestNormalizeReverseProxyPayloadClearsHTTPOnlyFieldsForDNSRules(t *testing.
 		EDNSMode:               reverseProxyEDNSModeAuto,
 		EDNSClientSubnetPolicy: reverseProxyEDNSClientSubnetPolicyClientIP,
 		IPStrategy:             reverseProxyIPStrategyPreferIPv4,
-		CertificateRecordIDs:   []uint{3},
 	})
 	if err != nil {
 		t.Fatalf("normalize dns payload failed: %v", err)
@@ -1252,27 +1429,129 @@ func TestNormalizeReverseProxyPayloadRejectsDNSTLSWithoutCertificate(t *testing.
 	}
 }
 
-func TestReverseProxyDNSWildcardListenerRequiresRestrictedCIDR(t *testing.T) {
+func TestReverseProxyDNSWildcardListenerRequiresExplicitPublicConfirmation(t *testing.T) {
 	svc := &ReverseProxyService{}
 	base := ReverseProxyRulePayload{
 		Enabled: true, ListenProtocol: reverseProxyDNSProtocolUDP, ListenPort: 53,
 		TargetProtocol: reverseProxyDNSProtocolUDP, TargetAddresses: "1.1.1.1", TargetPort: 53,
 		IPStrategy: reverseProxyIPStrategyPreferIPv4,
 	}
-	if _, err := svc.normalizeRulePayload(base); err == nil || !strings.Contains(strings.ToLower(err.Error()), "allowed cidr") {
-		t.Fatalf("DNS wildcard listener without CIDR must be rejected: %v", err)
+	if _, err := svc.normalizeRulePayload(base); err == nil || !strings.Contains(err.Error(), "explicit confirmation") {
+		t.Fatalf("DNS wildcard listener without confirmation must be rejected: %v", err)
 	}
-	base.DNSAllowedCIDRs = "0.0.0.0/0"
-	if _, err := svc.normalizeRulePayload(base); err == nil || !strings.Contains(strings.ToLower(err.Error()), "entire internet") {
-		t.Fatalf("global CIDR must be rejected: %v", err)
+	zero := 0
+	base.DNSPublicExposure = true
+	base.DNSMaxConcurrentQueries = &zero
+	normalized, err := svc.normalizeRulePayload(base)
+	if err != nil {
+		t.Fatalf("explicitly confirmed DNS wildcard listener must be accepted: %v", err)
 	}
+	if len(normalized.dnsAllowedCIDRs) != 0 {
+		t.Fatalf("empty CIDR must remain open to all sources: %#v", normalized.dnsAllowedCIDRs)
+	}
+	if !normalized.dnsPublicExposure || normalized.dnsMaxConcurrentQueries != reverseProxyDNSPublicMaxConcurrentQueries {
+		t.Fatalf("public DNS safeguards were not applied: public=%t concurrent=%d", normalized.dnsPublicExposure, normalized.dnsMaxConcurrentQueries)
+	}
+	base.DNSAllowedCIDRs = "0.0.0.0/0, ::/0"
+	normalized, err = svc.normalizeRulePayload(base)
+	if err != nil {
+		t.Fatalf("global CIDRs must be accepted: %v", err)
+	}
+	if !reflect.DeepEqual(normalized.dnsAllowedCIDRs, []string{"0.0.0.0/0", "::/0"}) {
+		t.Fatalf("global CIDRs were not normalized as expected: %#v", normalized.dnsAllowedCIDRs)
+	}
+
 	legacy := model.ReverseProxyRule{
 		Id: 1, ListenProtocol: reverseProxyProtocolDNS, ListenProtocolAlias: reverseProxyDNSProtocolUDP,
 		ListenPort: 53, TargetProtocol: reverseProxyProtocolDNS, TargetProtocolAlias: reverseProxyDNSProtocolUDP,
 		TargetAddresses: `["1.1.1.1"]`, TargetPort: 53,
 	}
-	if _, err := buildReverseProxyDNSRuleHandler([]model.ReverseProxyRule{legacy}); err == nil || !strings.Contains(strings.ToLower(err.Error()), "allowed cidr") {
-		t.Fatalf("legacy DNS rule without CIDR must remain configured but fail safe at runtime: %v", err)
+	handler, err := buildReverseProxyDNSRuleHandler([]model.ReverseProxyRule{legacy})
+	if err != nil {
+		t.Fatalf("legacy DNS rule without CIDR must remain runnable as an open listener: %v", err)
+	}
+	defer func() { _ = closeReverseProxyDNSHandler(handler) }()
+}
+
+func TestNormalizeReverseProxyDNSAdmissionSettings(t *testing.T) {
+	svc := &ReverseProxyService{}
+	base := ReverseProxyRulePayload{
+		Enabled: true, ListenProtocol: reverseProxyDNSProtocolUDP, ListenPort: 53,
+		TargetProtocol: reverseProxyDNSProtocolUDP, TargetAddresses: "1.1.1.1", TargetPort: 53,
+		DNSAllowedCIDRs:      "127.0.0.1/32, ::1/128",
+		DNSTrustedProxyCIDRs: "10.0.0.0/8, 2001:db8::/32",
+		IPStrategy:           reverseProxyIPStrategyPreferIPv4,
+	}
+	normalized, err := svc.normalizeRulePayload(base)
+	if err != nil {
+		t.Fatalf("normalize restricted DNS admission settings failed: %v", err)
+	}
+	if normalized.dnsPublicExposure {
+		t.Fatal("restricted DNS CIDRs must not be marked as public")
+	}
+	if !reflect.DeepEqual(normalized.dnsTrustedProxyCIDRs, []string{"10.0.0.0/8", "2001:db8::/32"}) {
+		t.Fatalf("trusted proxy CIDRs were not normalized: %#v", normalized.dnsTrustedProxyCIDRs)
+	}
+	base.DNSTrustedProxyCIDRs = "invalid-cidr"
+	if _, err := svc.normalizeRulePayload(base); err == nil || !strings.Contains(strings.ToLower(err.Error()), "trusted proxy") {
+		t.Fatalf("invalid trusted proxy CIDR must be rejected: %v", err)
+	}
+}
+
+func TestReverseProxyDNSAdmissionPublicPrefixRateLimit(t *testing.T) {
+	public, err := buildReverseProxyDNSAdmission(&model.ReverseProxyRule{
+		DNSAllowedCIDRs: `["0.0.0.0/0","::/0"]`,
+		DNSRateLimitQPS: 1,
+	})
+	if err != nil {
+		t.Fatalf("build public DNS admission failed: %v", err)
+	}
+	firstIPv4 := netip.MustParseAddr("198.51.100.1")
+	secondIPv4 := netip.MustParseAddr("198.51.100.99")
+	if !public.takeRateToken(firstIPv4) || public.takeRateToken(secondIPv4) {
+		t.Fatal("public IPv4 clients in the same /24 must share a rate limit bucket")
+	}
+	firstIPv6 := netip.MustParseAddr("2001:db8:1:00aa::1")
+	secondIPv6 := netip.MustParseAddr("2001:db8:1:00bb::2")
+	if !public.takeRateToken(firstIPv6) || public.takeRateToken(secondIPv6) {
+		t.Fatal("public IPv6 clients in the same /56 must share a rate limit bucket")
+	}
+
+	restricted, err := buildReverseProxyDNSAdmission(&model.ReverseProxyRule{
+		DNSAllowedCIDRs: `["198.51.100.0/24"]`,
+		DNSRateLimitQPS: 1,
+	})
+	if err != nil {
+		t.Fatalf("build restricted DNS admission failed: %v", err)
+	}
+	if !restricted.takeRateToken(firstIPv4) || !restricted.takeRateToken(secondIPv4) {
+		t.Fatal("restricted DNS clients must retain individual-address rate limit buckets")
+	}
+}
+
+func TestReverseProxyDNSAdmissionTrustedProxyBoundary(t *testing.T) {
+	admission, err := buildReverseProxyDNSAdmission(&model.ReverseProxyRule{
+		DNSAllowedCIDRs:      `["198.51.100.0/24"]`,
+		DNSTrustedProxyCIDRs: `["127.0.0.0/8"]`,
+		DNSRateLimitQPS:      1,
+	})
+	if err != nil {
+		t.Fatalf("build DNS admission failed: %v", err)
+	}
+	trustedRequest := httptest.NewRequest(http.MethodPost, "https://dns.example/dns-query", nil)
+	trustedRequest.RemoteAddr = "127.0.0.2:443"
+	trustedRequest.Header.Set("X-Forwarded-For", "198.51.100.9, 127.0.0.1")
+	trustedClient := admission.clientAddress(&dnsproxy.DNSContext{HTTPRequest: trustedRequest})
+	if got, want := trustedClient.String(), "198.51.100.9"; got != want || !admission.allowsClient(trustedClient) {
+		t.Fatalf("trusted proxy forwarded client was not selected: got=%q", got)
+	}
+
+	untrustedRequest := httptest.NewRequest(http.MethodPost, "https://dns.example/dns-query", nil)
+	untrustedRequest.RemoteAddr = "192.0.2.9:443"
+	untrustedRequest.Header.Set("X-Forwarded-For", "198.51.100.9")
+	untrustedClient := admission.clientAddress(&dnsproxy.DNSContext{HTTPRequest: untrustedRequest})
+	if got, want := untrustedClient.String(), "192.0.2.9"; got != want || admission.allowsClient(untrustedClient) {
+		t.Fatalf("untrusted direct peer must not control forwarded client address: got=%q", got)
 	}
 }
 
@@ -2612,15 +2891,24 @@ func TestReverseProxyWebSocketAliasRejectsOrdinaryHTTP(t *testing.T) {
 			TargetProtocolAlias: "ws",
 		}},
 	}
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "http://example.com/socket", nil)
-	request.Host = "example.com"
-	group.newHandler().ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusUpgradeRequired {
-		t.Fatalf("ordinary HTTP request to WS alias returned %d", recorder.Code)
+	server := httptest.NewServer(group.newHandler())
+	defer server.Close()
+
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/socket", nil)
+	if err != nil {
+		t.Fatalf("build ordinary HTTP request failed: %v", err)
 	}
-	if got := recorder.Header().Get("Upgrade"); !strings.EqualFold(got, "websocket") {
-		t.Fatalf("missing websocket upgrade response header: %q", got)
+	request.Host = "example.com"
+	response, err := server.Client().Do(request)
+	if err == nil {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		t.Fatal("ordinary HTTP request to WS alias must be dropped without an HTTP response")
+	}
+	if response != nil {
+		_ = response.Body.Close()
+		t.Fatalf("ordinary HTTP request to WS alias unexpectedly returned a response: %v", err)
 	}
 }
 
@@ -6812,13 +7100,14 @@ func TestReverseProxyRoutesByConfiguredPathPrefixes(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		path       string
-		wantBody   string
-		wantStatus int
+		path        string
+		wantBody    string
+		wantStatus  int
+		wantDropped bool
 	}{
 		{path: "/88999/tag/mysql/", wantBody: "apad:/tag/mysql/", wantStatus: http.StatusOK},
 		{path: "/aaa", wantBody: "google:/", wantStatus: http.StatusOK},
-		{path: "/bbb", wantBody: "", wantStatus: http.StatusNotFound},
+		{path: "/bbb", wantDropped: true},
 	} {
 		req, err := http.NewRequest(http.MethodGet, "https://127.0.0.1:"+strconv.Itoa(listenPort)+tc.path, nil)
 		if err != nil {
@@ -6827,6 +7116,19 @@ func TestReverseProxyRoutesByConfiguredPathPrefixes(t *testing.T) {
 		req.Host = "example.com"
 
 		resp, err := client.Do(req)
+		if tc.wantDropped {
+			if err == nil {
+				if resp != nil && resp.Body != nil {
+					_ = resp.Body.Close()
+				}
+				t.Fatalf("unmatched path %s must be dropped without an HTTP response", tc.path)
+			}
+			if resp != nil {
+				_ = resp.Body.Close()
+				t.Fatalf("unmatched path %s unexpectedly returned an HTTP response: %v", tc.path, err)
+			}
+			continue
+		}
 		if err != nil {
 			t.Fatalf("routed request failed for %s: %v", tc.path, err)
 		}
@@ -6909,18 +7211,26 @@ func TestReverseProxyHTTPSRuleRejectsMismatchedSNIOrHost(t *testing.T) {
 		resp, err := client.Do(req)
 		if tc.handshakeReject {
 			if err == nil {
-				_ = resp.Body.Close()
+				if resp != nil && resp.Body != nil {
+					_ = resp.Body.Close()
+				}
 				t.Fatalf("strict tls listener must reject %s during handshake", tc.name)
+			}
+			if resp != nil {
+				_ = resp.Body.Close()
+				t.Fatalf("strict tls listener unexpectedly returned a response for %s: %v", tc.name, err)
 			}
 			continue
 		}
-		if err != nil {
-			t.Fatalf("mismatched request failed for %s: %v", tc.name, err)
+		if err == nil {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			t.Fatalf("mismatched request %s must be dropped without an HTTP response", tc.name)
 		}
-		_, _ = io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusMisdirectedRequest {
-			t.Fatalf("expected 421 for %s, got %d", tc.name, resp.StatusCode)
+		if resp != nil {
+			_ = resp.Body.Close()
+			t.Fatalf("mismatched request %s unexpectedly returned an HTTP response: %v", tc.name, err)
 		}
 	}
 
@@ -7458,7 +7768,7 @@ func TestReverseProxyHTTP3AdvertisementClearsWhenUDPListenerIsUnavailable(t *tes
 	}
 }
 
-func TestReverseProxyHTTPHandlerReturnsExact404ForUnknownHost(t *testing.T) {
+func TestReverseProxyHTTPHandlerDropsUnknownHost(t *testing.T) {
 	group := &reverseProxyListenerGroup{
 		protocol: reverseProxyProtocolHTTP,
 		rules: []*model.ReverseProxyRule{{
@@ -7466,12 +7776,24 @@ func TestReverseProxyHTTPHandlerReturnsExact404ForUnknownHost(t *testing.T) {
 			HostList:       encodeReverseProxyList([]string{"example.com"}),
 		}},
 	}
-	req := httptest.NewRequest(http.MethodGet, "http://wrong.example/", nil)
+	server := httptest.NewServer(group.newHandler())
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/", nil)
+	if err != nil {
+		t.Fatalf("build unknown-host request failed: %v", err)
+	}
 	req.Host = "wrong.example"
-	recorder := httptest.NewRecorder()
-	group.newHandler().ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("unknown plain-http host must return 404, got %d", recorder.Code)
+	resp, err := server.Client().Do(req)
+	if err == nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		t.Fatal("unknown plain-HTTP host must be dropped without an HTTP response")
+	}
+	if resp != nil {
+		_ = resp.Body.Close()
+		t.Fatalf("unknown plain-HTTP host unexpectedly returned an HTTP response: %v", err)
 	}
 }
 
@@ -7543,6 +7865,36 @@ func TestReverseProxyHTTP3AdvertisementCoversOriginResponsesOnce(t *testing.T) {
 		}
 		return resp
 	}
+	requestDropped := func(serverName string, host string, path string) {
+		t.Helper()
+		client := &http.Client{
+			Transport: &http.Transport{
+				Proxy:             nil,
+				ForceAttemptHTTP2: true,
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+					ServerName:         serverName,
+				},
+			},
+			Timeout: 15 * time.Second,
+		}
+		req, err := http.NewRequest(http.MethodGet, "https://127.0.0.1:"+strconv.Itoa(listenPort)+path, nil)
+		if err != nil {
+			t.Fatalf("build dropped Alt-Svc request failed: %v", err)
+		}
+		req.Host = host
+		resp, err := client.Do(req)
+		if err == nil {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			t.Fatalf("dropped Alt-Svc request for %s%s returned an HTTP response", host, path)
+		}
+		if resp != nil {
+			_ = resp.Body.Close()
+			t.Fatalf("dropped Alt-Svc request for %s%s unexpectedly returned an HTTP response: %v", host, path, err)
+		}
+	}
 	assertResponse := func(resp *http.Response, wantStatus int, wantAltSvc string) {
 		t.Helper()
 		defer resp.Body.Close()
@@ -7564,10 +7916,10 @@ func TestReverseProxyHTTP3AdvertisementCoversOriginResponsesOnce(t *testing.T) {
 
 	advertisement := reverseProxyAltSvcValue(443)
 	assertResponse(request("example.com", "example.com", "/off"), http.StatusNoContent, advertisement)
-	assertResponse(request("example.com", "example.com", "/missing"), http.StatusNotFound, advertisement)
+	requestDropped("example.com", "example.com", "/missing")
 	assertResponse(request("example.com", "example.com", "/error"), http.StatusBadGateway, advertisement)
 	assertResponse(request("isolated.example", "isolated.example", "/"), http.StatusNoContent, "clear")
-	assertResponse(request("example.com", "unknown.example", "/off"), http.StatusMisdirectedRequest, "")
+	requestDropped("example.com", "unknown.example", "/off")
 }
 
 func TestReverseProxyForwardsStandardXForwardedHeadersOnce(t *testing.T) {

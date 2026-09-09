@@ -370,6 +370,7 @@
 <script setup lang="ts">
 import HttpUtils from '@/plugins/httputil'
 import { confirm } from '@/plugins/confirm'
+import { reloadToLogin } from '@/plugins/sessionNavigation'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { Ref } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -515,6 +516,7 @@ const cleanupTaskTimerId = ref<number | null>(null)
 let cleanupTaskRequest: Promise<void> | null = null
 const rebootOverlay = ref(false)
 const reconnectTimerId = ref<number | null>(null)
+let reconnectPollingGeneration = 0
 const downloadProgressSessionId = ref('')
 const downloadProgressTimerId = ref<number | null>(null)
 let downloadProgressRequest: Promise<void> | null = null
@@ -2015,6 +2017,7 @@ const installPackages = async () => {
 }
 
 const clearReconnectTimer = () => {
+  reconnectPollingGeneration += 1
   if (reconnectTimerId.value !== null) {
     window.clearTimeout(reconnectTimerId.value)
     reconnectTimerId.value = null
@@ -2022,26 +2025,46 @@ const clearReconnectTimer = () => {
 }
 
 const startReconnectPolling = () => {
+  clearReconnectTimer()
+  const pollingGeneration = reconnectPollingGeneration
+  let disconnectObserved = false
   rebootOverlay.value = true
+
+  const isCurrentPollingRun = () => pollingGeneration === reconnectPollingGeneration
+  const redirectToLogin = () => {
+    if (!isCurrentPollingRun()) return
+    clearReconnectTimer()
+    reloadToLogin()
+  }
+
   const poll = async () => {
+    if (!isCurrentPollingRun()) return
     try {
       const body = await HttpUtils.get('api/session', {}, {
         timeout: 5000,
         silentAuthCheck: true,
         silentErrorToast: true,
       })
-      if (body.success) {
-        window.location.reload()
+      if (!isCurrentPollingRun()) return
+
+      if (!body.success && body.failureKind === 'transport') {
+        // 连接失败说明系统重启已进入断开阶段；此前成功的探测仍属于旧面板。
+        disconnectObserved = true
+      }
+      if (!body.success && body.failureKind === 'api') {
+        redirectToLogin()
         return
       }
-      if (body.failureKind === 'api') {
-        window.location.reload()
+      if (body.success && disconnectObserved) {
+        redirectToLogin()
         return
       }
     } catch {
-      // wait for service to come back
+      // 等待面板恢复连接。
     }
-    reconnectTimerId.value = window.setTimeout(poll, 4000)
+    if (isCurrentPollingRun()) {
+      reconnectTimerId.value = window.setTimeout(poll, 4000)
+    }
   }
   reconnectTimerId.value = window.setTimeout(poll, 6000)
 }

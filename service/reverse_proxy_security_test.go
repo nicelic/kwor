@@ -88,6 +88,86 @@ func TestReverseProxyJSONPayloadDefaultsTLSVerificationWhenOmitted(t *testing.T)
 	}
 }
 
+func TestReverseProxyRuleTLSVerificationPersistsPerRule(t *testing.T) {
+	openReverseProxyTestDB(t)
+	svc := &ReverseProxyService{}
+
+	saveRule := func(name string, listenPort int, verify bool) model.ReverseProxyRule {
+		t.Helper()
+		settings, err := svc.loadReverseProxySettings()
+		if err != nil {
+			t.Fatalf("load reverse proxy settings failed: %v", err)
+		}
+		expectedRevision := settings.Revision
+		encoded, err := json.Marshal(map[string]interface{}{
+			"name":                name,
+			"enabled":             false,
+			"listenProtocol":      reverseProxyProtocolHTTP,
+			"listenPort":          listenPort,
+			"targetProtocol":      reverseProxyProtocolHTTPS,
+			"targetAddresses":     "127.0.0.1",
+			"targetPort":          443,
+			"ipStrategy":          reverseProxyIPStrategyPreferIPv4,
+			"httpVersionStrategy": reverseProxyHTTPVersionPreferH2,
+			"upstreamTlsVerify":   verify,
+		})
+		if err != nil {
+			t.Fatalf("encode reverse proxy rule %q failed: %v", name, err)
+		}
+		var payload ReverseProxyRulePayload
+		if err := json.Unmarshal(encoded, &payload); err != nil {
+			t.Fatalf("decode reverse proxy rule %q failed: %v", name, err)
+		}
+		payload.ExpectedRevision = &expectedRevision
+		if err := svc.UpsertRule(payload); err != nil {
+			t.Fatalf("save reverse proxy rule %q failed: %v", name, err)
+		}
+
+		var row model.ReverseProxyRule
+		if err := database.GetDB().Where("name = ?", name).First(&row).Error; err != nil {
+			t.Fatalf("load saved reverse proxy rule %q failed: %v", name, err)
+		}
+		if row.UpstreamTLSVerify != verify {
+			t.Fatalf("rule %q stored upstream TLS verification=%t, want %t", name, row.UpstreamTLSVerify, verify)
+		}
+		return row
+	}
+
+	first := saveRule("tls-verify-off", 18080, false)
+	second := saveRule("tls-verify-on", 18081, true)
+
+	var firstReloaded model.ReverseProxyRule
+	if err := database.GetDB().Where("id = ?", first.Id).First(&firstReloaded).Error; err != nil {
+		t.Fatalf("reload first reverse proxy rule failed: %v", err)
+	}
+	if firstReloaded.UpstreamTLSVerify {
+		t.Fatal("saving a second rule must not turn the first rule's TLS verification back on")
+	}
+
+	var secondReloaded model.ReverseProxyRule
+	if err := database.GetDB().Where("id = ?", second.Id).First(&secondReloaded).Error; err != nil {
+		t.Fatalf("reload second reverse proxy rule failed: %v", err)
+	}
+	if !secondReloaded.UpstreamTLSVerify {
+		t.Fatal("second rule's TLS verification state was not preserved")
+	}
+
+	overview, err := svc.GetOverview()
+	if err != nil {
+		t.Fatalf("load reverse proxy overview failed: %v", err)
+	}
+	views := make(map[uint]ReverseProxyRuleView, len(overview.Rules))
+	for _, view := range overview.Rules {
+		views[view.ID] = view
+	}
+	if views[first.Id].UpstreamTLSVerify {
+		t.Fatal("overview must keep the first rule's explicit upstreamTlsVerify=false")
+	}
+	if !views[second.Id].UpstreamTLSVerify {
+		t.Fatal("overview must keep the second rule's upstreamTlsVerify=true")
+	}
+}
+
 func TestReverseProxyNormalizePayloadStripsHTTPPrefixFromHostAndTargetInputs(t *testing.T) {
 	normalized, err := (&ReverseProxyService{}).normalizeRulePayload(ReverseProxyRulePayload{
 		Name:            "strip-http-prefix",
@@ -169,6 +249,37 @@ func TestReverseProxyDNSAdmissionEnforcesACLRateAndConcurrency(t *testing.T) {
 		t.Fatalf("unexpected dns concurrency result: release=%v rejected=%q", nextRelease != nil, nextRejected)
 	}
 	release()
+}
+
+func TestReverseProxyDNSAdmissionAllowsOpenSources(t *testing.T) {
+	makeContext := func(value string) *dnsproxy.DNSContext {
+		message := new(dns.Msg)
+		message.SetQuestion("example.com.", dns.TypeA)
+		return &dnsproxy.DNSContext{Req: message, Addr: netip.MustParseAddrPort(value)}
+	}
+
+	for name, cidrs := range map[string]string{
+		"empty":  "",
+		"global": `["0.0.0.0/0", "::/0"]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			admission, err := buildReverseProxyDNSAdmission(&model.ReverseProxyRule{
+				DNSAllowedCIDRs:         cidrs,
+				DNSRateLimitQPS:         100,
+				DNSMaxConcurrentQueries: 2,
+			})
+			if err != nil {
+				t.Fatalf("build open dns admission failed: %v", err)
+			}
+			for _, address := range []string{"198.51.100.8:53000", "[2001:db8::8]:53000"} {
+				release, rejected := admission.acquire(makeContext(address))
+				if rejected != "" || release == nil {
+					t.Fatalf("open DNS source was rejected for %s: %q", address, rejected)
+				}
+				release()
+			}
+		})
+	}
 }
 
 func TestReverseProxyDNSBootstrapRejectsResolvedListenerLoop(t *testing.T) {

@@ -275,6 +275,7 @@
 
 <script lang="ts">
 import { InTypes, createInbound, Addr, ShadowTLS } from '@/types/inbounds'
+import type { ShadowQUIC } from '@/types/inbounds'
 import RandomUtil from '@/plugins/randomUtil'
 import {
   normalizeShadowQuicJlsUpstreamAddr,
@@ -500,10 +501,10 @@ export default {
       if (this.inbound.type != this.inTypes.Hysteria && this.inbound.type != this.inTypes.Hysteria2) return
       if (!this.inbound.out_json) this.inbound.out_json = {}
       if (forceDefaults && this.inbound.out_json.up_mbps === undefined) {
-        this.inbound.out_json.up_mbps = 500
+        this.inbound.out_json.up_mbps = 350
       }
       if (forceDefaults && this.inbound.out_json.down_mbps === undefined) {
-        this.inbound.out_json.down_mbps = 500
+        this.inbound.out_json.down_mbps = 350
       }
     },
     normalizeVLESSMihomoEncryptionMode(raw: string): string {
@@ -1039,6 +1040,7 @@ export default {
       this.initMihomoFastOpenDefaults(forceHyBandwidthDefaults)
       this.initShadowTlsClientDefaults(forceHyBandwidthDefaults)
       this.sanitizeMihomoShadowTLSUnsupportedFields()
+      this.initMihomoShadowQuicBandwidthDefaults(forceHyBandwidthDefaults)
       this.initShadowQuicClientBandwidthDefaults(forceHyBandwidthDefaults)
       this.sanitizeMihomoShadowQUICUnsupportedFields()
       this.initAnyTlsClientDefaults(forceHyBandwidthDefaults)
@@ -1049,14 +1051,20 @@ export default {
       this.initVLESSMihomoEncryptionDefaults()
       this.migrateMihomoClientCommonFields(forceHyBandwidthDefaults)
     },
+    initMihomoShadowQuicBandwidthDefaults(forceDefaults: boolean = false) {
+      if (!forceDefaults || this.namespace !== 'mihomo' || this.inbound.type !== this.inTypes.ShadowQUIC) return
+      const inbound = this.inbound as ShadowQUIC
+      inbound.up = 350
+      inbound.down = 350
+    },
     initShadowQuicClientBandwidthDefaults(forceDefaults: boolean = false) {
       if (this.namespace !== 'mihomo' || this.inbound.type !== this.inTypes.ShadowQUIC) return
       if (!this.inbound.out_json) this.inbound.out_json = {}
       if (forceDefaults && this.inbound.out_json.up === undefined) {
-        this.inbound.out_json.up = 500
+        this.inbound.out_json.up = 350
       }
       if (forceDefaults && this.inbound.out_json.down === undefined) {
-        this.inbound.out_json.down = 500
+        this.inbound.out_json.down = 350
       }
     },
     parseValidPort(value: unknown): number | undefined {

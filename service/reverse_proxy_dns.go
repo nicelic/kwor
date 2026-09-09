@@ -89,10 +89,12 @@ type reverseProxyDNSRouteLease struct {
 }
 
 type reverseProxyDNSAdmission struct {
-	allowedCIDRs []netip.Prefix
-	qps          int
-	slots        *reverseProxyAdjustableLimiter
-	shards       [reverseProxyDNSAdmissionShardCount]reverseProxyDNSAdmissionClientShard
+	allowedCIDRs      []netip.Prefix
+	trustedProxyCIDRs []netip.Prefix
+	publicExposure    bool
+	qps               int
+	slots             *reverseProxyAdjustableLimiter
+	shards            [reverseProxyDNSAdmissionShardCount]reverseProxyDNSAdmissionClientShard
 }
 
 type reverseProxyDNSAdmissionClient struct {
@@ -127,13 +129,19 @@ func buildReverseProxyDNSAdmission(row *model.ReverseProxyRule) (*reverseProxyDN
 	allowed := make([]netip.Prefix, 0, len(allowedRaw))
 	for _, item := range allowedRaw {
 		prefix, err := netip.ParsePrefix(strings.TrimSpace(item))
-		if err != nil || prefix.Bits() == 0 {
+		if err != nil {
 			return nil, common.NewError("invalid dns allowed cidr")
 		}
 		allowed = append(allowed, prefix.Masked())
 	}
-	if len(allowed) == 0 {
-		return nil, common.NewError("dns wildcard listeners require at least one non-global allowed cidr")
+	trustedRaw := decodeReverseProxyList(row.DNSTrustedProxyCIDRs)
+	trusted := make([]netip.Prefix, 0, len(trustedRaw))
+	for _, item := range trustedRaw {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(item))
+		if err != nil {
+			return nil, common.NewError("invalid dns trusted proxy cidr")
+		}
+		trusted = append(trusted, prefix.Masked())
 	}
 	qps := reverseProxyDNSRateLimitQPS(row.DNSRateLimitQPS)
 	if qps < 1 || qps > reverseProxyDNSMaxRateLimitQPS {
@@ -145,9 +153,11 @@ func buildReverseProxyDNSAdmission(row *model.ReverseProxyRule) (*reverseProxyDN
 	}
 	limiter := newReverseProxyAdjustableLimiter(maxConcurrent)
 	admission := &reverseProxyDNSAdmission{
-		allowedCIDRs: allowed,
-		qps:          qps,
-		slots:        limiter,
+		allowedCIDRs:      allowed,
+		trustedProxyCIDRs: trusted,
+		publicExposure:    reverseProxyDNSCIDRsAllowPublicSources(allowedRaw),
+		qps:               qps,
+		slots:             limiter,
 	}
 	for index := range admission.shards {
 		admission.shards[index].clients = make(map[string]*reverseProxyDNSAdmissionClient)
@@ -160,23 +170,14 @@ func (a *reverseProxyDNSAdmission) acquire(dctx *dnsproxy.DNSContext) (func(), s
 	if a == nil {
 		return func() {}, ""
 	}
-	client := reverseProxyDNSClientAddress(dctx)
+	client := a.clientAddress(dctx)
 	if !client.IsValid() {
 		return nil, "dns_client_address_unavailable"
 	}
-	if len(a.allowedCIDRs) > 0 {
-		allowed := false
-		for _, prefix := range a.allowedCIDRs {
-			if prefix.Contains(client) {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return nil, "dns_acl_denied"
-		}
+	if !a.allowsClient(client) {
+		return nil, "dns_acl_denied"
 	}
-	if !a.takeRateToken(client.String()) {
+	if !a.takeRateToken(client) {
 		return nil, "dns_rate_limited"
 	}
 	if !reverseProxyResources.tryAcquireDNS() {
@@ -194,12 +195,43 @@ func (a *reverseProxyDNSAdmission) acquire(dctx *dnsproxy.DNSContext) (func(), s
 	}, ""
 }
 
-func (a *reverseProxyDNSAdmission) takeRateToken(client string) bool {
+func (a *reverseProxyDNSAdmission) allowsClient(client netip.Addr) bool {
+	if a == nil || !client.IsValid() {
+		return false
+	}
+	if len(a.allowedCIDRs) == 0 {
+		return true
+	}
+	for _, prefix := range a.allowedCIDRs {
+		if prefix.Contains(client) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *reverseProxyDNSAdmission) allowsRemoteAddr(remote net.Addr) bool {
+	return a.allowsClient(reverseProxyDNSAddressFromNetAddr(remote))
+}
+
+func (a *reverseProxyDNSAdmission) clientAddress(dctx *dnsproxy.DNSContext) netip.Addr {
+	direct := reverseProxyDNSClientAddress(dctx)
+	if a == nil || dctx == nil || dctx.HTTPRequest == nil || !direct.IsValid() || !reverseProxyDNSAddressMatchesPrefixes(direct, a.trustedProxyCIDRs) {
+		return direct
+	}
+	return reverseProxyDNSForwardedClientAddress(dctx.HTTPRequest, direct, a.trustedProxyCIDRs)
+}
+
+func (a *reverseProxyDNSAdmission) takeRateToken(client netip.Addr) bool {
 	if a == nil {
 		return true
 	}
+	clientKey := reverseProxyDNSAdmissionClientKey(client, a.publicExposure)
+	if clientKey == "" {
+		return false
+	}
 	now := time.Now()
-	shard := &a.shards[int(crc32.ChecksumIEEE([]byte(client))%reverseProxyDNSAdmissionShardCount)]
+	shard := &a.shards[int(crc32.ChecksumIEEE([]byte(clientKey))%reverseProxyDNSAdmissionShardCount)]
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 	if shard.clients == nil {
@@ -219,7 +251,7 @@ func (a *reverseProxyDNSAdmission) takeRateToken(client string) bool {
 		}
 		delete(shard.clients, oldest)
 	}
-	state := shard.clients[client]
+	state := shard.clients[clientKey]
 	if state == nil {
 		perShardLimit := reverseProxyDNSAdmissionMaxClients / reverseProxyDNSAdmissionShardCount
 		if len(shard.clients) >= perShardLimit && shard.lru.Len() > 0 {
@@ -230,8 +262,8 @@ func (a *reverseProxyDNSAdmission) takeRateToken(client string) bool {
 			delete(shard.clients, oldest)
 		}
 		state = &reverseProxyDNSAdmissionClient{tokens: float64(a.qps), updatedAt: now}
-		state.element = shard.lru.PushFront(client)
-		shard.clients[client] = state
+		state.element = shard.lru.PushFront(clientKey)
+		shard.clients[clientKey] = state
 	} else if state.element != nil {
 		shard.lru.MoveToFront(state.element)
 	}
@@ -248,6 +280,25 @@ func (a *reverseProxyDNSAdmission) takeRateToken(client string) bool {
 	}
 	state.tokens--
 	return true
+}
+
+func reverseProxyDNSAdmissionClientKey(client netip.Addr, publicExposure bool) string {
+	if !client.IsValid() {
+		return ""
+	}
+	client = client.Unmap()
+	if !publicExposure {
+		return client.String()
+	}
+	bits := 56
+	if client.Is4() {
+		bits = 24
+	}
+	prefix, err := client.Prefix(bits)
+	if err != nil {
+		return client.String()
+	}
+	return prefix.Masked().String()
 }
 
 func (a *reverseProxyDNSAdmission) pruneExpiredClients(now time.Time) {
@@ -283,12 +334,53 @@ func reverseProxyDNSClientAddress(dctx *dnsproxy.DNSContext) netip.Addr {
 	if remoteAddr == "" && dctx.Addr.IsValid() {
 		remoteAddr = dctx.Addr.String()
 	}
+	return reverseProxyDNSAddressFromText(remoteAddr)
+}
+
+func reverseProxyDNSAddressFromNetAddr(remote net.Addr) netip.Addr {
+	if remote == nil {
+		return netip.Addr{}
+	}
+	return reverseProxyDNSAddressFromText(remote.String())
+}
+
+func reverseProxyDNSAddressFromText(remoteAddr string) netip.Addr {
 	value := strings.Trim(strings.TrimSpace(extractRemoteIP(remoteAddr)), "[]")
 	addr, err := netip.ParseAddr(value)
 	if err != nil {
 		return netip.Addr{}
 	}
 	return addr.Unmap()
+}
+
+func reverseProxyDNSAddressMatchesPrefixes(address netip.Addr, prefixes []netip.Prefix) bool {
+	if !address.IsValid() {
+		return false
+	}
+	for _, prefix := range prefixes {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
+}
+
+func reverseProxyDNSForwardedClientAddress(request *http.Request, direct netip.Addr, trusted []netip.Prefix) netip.Addr {
+	if request == nil || !direct.IsValid() || !reverseProxyDNSAddressMatchesPrefixes(direct, trusted) {
+		return direct
+	}
+	values := request.Header.Values("X-Forwarded-For")
+	for index := len(values) - 1; index >= 0; index-- {
+		parts := strings.Split(values[index], ",")
+		for itemIndex := len(parts) - 1; itemIndex >= 0; itemIndex-- {
+			candidate := reverseProxyDNSAddressFromText(parts[itemIndex])
+			if !candidate.IsValid() || reverseProxyDNSAddressMatchesPrefixes(candidate, trusted) {
+				continue
+			}
+			return candidate
+		}
+	}
+	return direct
 }
 
 func reverseProxyDNSRefusedResponse(dctx *dnsproxy.DNSContext) {
@@ -905,6 +997,8 @@ func reverseProxyDNSRuntimeStateKey(rows []model.ReverseProxyRule, certificateSt
 			fmt.Sprintf("%d", row.DNSCacheMinTTL),
 			fmt.Sprintf("%d", row.DNSCacheMaxTTL),
 			row.DNSAllowedCIDRs,
+			fmt.Sprintf("%t", row.DNSPublicExposure),
+			row.DNSTrustedProxyCIDRs,
 			fmt.Sprintf("%d", reverseProxyDNSRateLimitQPS(row.DNSRateLimitQPS)),
 			fmt.Sprintf("%d", reverseProxyDNSMaxConcurrentQueries(row.DNSMaxConcurrentQueries)),
 			fmt.Sprintf("%t", row.EDNSEnabled),
@@ -1017,6 +1111,8 @@ func reverseProxyDNSRouteRuntimeStateKey(row *model.ReverseProxyRule) string {
 		fmt.Sprintf("%d", row.DNSCacheMinTTL),
 		fmt.Sprintf("%d", row.DNSCacheMaxTTL),
 		row.DNSAllowedCIDRs,
+		fmt.Sprintf("%t", row.DNSPublicExposure),
+		row.DNSTrustedProxyCIDRs,
 		fmt.Sprintf("%d", reverseProxyDNSRateLimitQPS(row.DNSRateLimitQPS)),
 		fmt.Sprintf("%d", reverseProxyDNSMaxConcurrentQueries(row.DNSMaxConcurrentQueries)),
 		fmt.Sprintf("%t", row.EDNSEnabled),
@@ -1464,6 +1560,33 @@ func (h *reverseProxyDNSRuleHandler) serveDNSRule(ctx context.Context, dctx *dns
 		return errors.New("dns reverse proxy rule route is unavailable")
 	}
 	return h.serveDNSRoute(ctx, dctx, route)
+}
+
+func (h *reverseProxyDNSRuleHandler) allowsRemoteAddrForRule(ruleID uint, remote net.Addr) bool {
+	if h == nil || ruleID == 0 {
+		return false
+	}
+	h.mu.RLock()
+	route := h.routesByRule[ruleID]
+	h.mu.RUnlock()
+	if route == nil || route.admission == nil {
+		return false
+	}
+	return route.admission.allowsRemoteAddr(remote)
+}
+
+func (h *reverseProxyDNSRuleHandler) allowsHTTPRequestForRule(ruleID uint, request *http.Request) bool {
+	if h == nil || ruleID == 0 || request == nil {
+		return false
+	}
+	h.mu.RLock()
+	route := h.routesByRule[ruleID]
+	h.mu.RUnlock()
+	if route == nil || route.admission == nil {
+		return false
+	}
+	client := route.admission.clientAddress(&dnsproxy.DNSContext{HTTPRequest: request})
+	return route.admission.allowsClient(client)
 }
 
 func (h *reverseProxyDNSRuleHandler) serveDNSRoute(ctx context.Context, dctx *dnsproxy.DNSContext, route *reverseProxyDNSRoute) error {

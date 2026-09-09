@@ -168,3 +168,29 @@ func TestReverseProxyDNSListenerResourceKeyTracksOnlyStaticProtocolLimits(t *tes
 		t.Fatalf("dynamic DNS listener limit was not applied: got=%d want=%d", maximum, quicChanged.ListenerConnectionLimit)
 	}
 }
+
+func TestReverseProxyDNSUDPResponseLimit(t *testing.T) {
+	plain := new(dns.Msg)
+	plain.SetQuestion("udp-limit.example.", dns.TypeA)
+	if got := reverseProxyDNSUDPResponseLimit(plain); got != 512 {
+		t.Fatalf("plain DNS UDP response limit = %d, want 512", got)
+	}
+
+	large := plain.Copy()
+	large.SetEdns0(4096, false)
+	if got := reverseProxyDNSUDPResponseLimit(large); got != reverseProxyDNSMaximumPublicUDPPayload {
+		t.Fatalf("large EDNS UDP response limit = %d, want %d", got, reverseProxyDNSMaximumPublicUDPPayload)
+	}
+
+	small := plain.Copy()
+	small.SetEdns0(600, false)
+	if got := reverseProxyDNSUDPResponseLimit(small); got != 600 {
+		t.Fatalf("small EDNS UDP response limit = %d, want 600", got)
+	}
+
+	tooSmall := plain.Copy()
+	tooSmall.SetEdns0(128, false)
+	if got := reverseProxyDNSUDPResponseLimit(tooSmall); got != 512 {
+		t.Fatalf("too-small EDNS UDP response limit = %d, want 512", got)
+	}
+}

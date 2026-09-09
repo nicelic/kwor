@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -215,6 +216,46 @@ func TestNormalizeMihomoSnifferPreservesExplicitBooleanEnableAndFullPortRange(t 
 
 	if legacy := normalizeMihomoSniffer(map[string]interface{}{"sniff": map[string]interface{}{}}); legacy != nil {
 		t.Fatalf("sniffer object without explicit enable must remain disabled, got %#v", legacy)
+	}
+}
+
+func TestDefaultMihomoConfigEnablesSnifferWithFullParameters(t *testing.T) {
+	var config map[string]interface{}
+	if err := json.Unmarshal([]byte(defaultMihomoConfig), &config); err != nil {
+		t.Fatalf("default Mihomo config is invalid JSON: %v", err)
+	}
+
+	rawSniffer, ok := config["sniffer"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("default Mihomo config sniffer = %#v, want an object", config["sniffer"])
+	}
+	for _, key := range []string{"enable", "force-dns-mapping", "override-destination", "parse-pure-ip", "sniff"} {
+		if _, exists := rawSniffer[key]; !exists {
+			t.Fatalf("default Mihomo sniffer is missing %q", key)
+		}
+	}
+
+	sniffer := normalizeMihomoSniffer(rawSniffer)
+	if sniffer == nil || sniffer["enable"] != true {
+		t.Fatalf("default Mihomo sniffer = %#v, want enabled", sniffer)
+	}
+	if sniffer["force-dns-mapping"] != true || sniffer["override-destination"] != false || sniffer["parse-pure-ip"] != true {
+		t.Fatalf("default Mihomo sniffer parameters = %#v, want force-dns-mapping=true, override-destination=false, parse-pure-ip=true", sniffer)
+	}
+
+	sniff, ok := sniffer["sniff"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("default Mihomo sniff protocols = %#v, want a map", sniffer["sniff"])
+	}
+	for _, protocol := range []string{"HTTP", "TLS", "QUIC"} {
+		entry, ok := sniff[protocol].(map[string]interface{})
+		if !ok {
+			t.Fatalf("default Mihomo %s entry = %#v, want a map", protocol, sniff[protocol])
+		}
+		ports := toStringSlice(entry["ports"])
+		if len(ports) != 1 || ports[0] != "1-65535" {
+			t.Fatalf("default Mihomo %s ports = %#v, want [1-65535]", protocol, ports)
+		}
 	}
 }
 

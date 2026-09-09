@@ -67,6 +67,29 @@ var defaultMihomoConfig = `{
     "no_resolve": true,
     "rules": [],
     "rule_set": []
+  },
+  "sniffer": {
+    "enable": true,
+    "force-dns-mapping": true,
+    "override-destination": false,
+    "parse-pure-ip": true,
+    "sniff": {
+      "HTTP": {
+        "ports": [
+          "1-65535"
+        ]
+      },
+      "TLS": {
+        "ports": [
+          "1-65535"
+        ]
+      },
+      "QUIC": {
+        "ports": [
+          "1-65535"
+        ]
+      }
+    }
   }
 }`
 

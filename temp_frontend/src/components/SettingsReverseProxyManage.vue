@@ -531,7 +531,8 @@
                       :label="reverseProxyCopy.hosts"
                       :placeholder="reverseProxyCopy.hostsPlaceholder"
                       @blur="normalizeRuleTextInputs"
-                      hide-details />
+                      :error-messages="listenAddressError ? [listenAddressError] : []"
+                      :hide-details="!listenAddressError" />
                     <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.listenIpLocalHint }}</div>
                   </v-col>
                   <v-col cols="12" md="6" lg="12">
@@ -598,6 +599,17 @@
                   <template v-if="listenIsDNS">
                     <v-col cols="12" lg="12">
                       <div class="rp-panel__section-title">{{ reverseProxyCopy.dnsAccessTitle }}</div>
+                      <v-switch
+                        :model-value="editingRule.dnsPublicExposure"
+                        color="warning"
+                        :label="reverseProxyCopy.dnsPublicExposure"
+                        hide-details
+                        @update:modelValue="(value) => setDNSPublicExposure(Boolean(value))" />
+                      <div class="text-caption text-medium-emphasis mt-2">
+                        {{ editingRule.dnsPublicExposure ? reverseProxyCopy.dnsPublicExposureHint : reverseProxyCopy.dnsPrivateDefaultHint }}
+                      </div>
+                    </v-col>
+                    <v-col cols="12" lg="12">
                       <v-text-field
                         v-model="editingRule.dnsAllowedCidrsText"
                         :label="reverseProxyCopy.dnsAllowedCidrs"
@@ -605,6 +617,15 @@
                         @blur="normalizeRuleTextInputs"
                         hide-details />
                       <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.dnsAllowedCidrsHint }}</div>
+                    </v-col>
+                    <v-col v-if="editingRule.listenProtocol === 'dns_doh' || editingRule.listenProtocol === 'dns_doh3'" cols="12" lg="12">
+                      <v-text-field
+                        v-model="editingRule.dnsTrustedProxyCidrsText"
+                        :label="reverseProxyCopy.dnsTrustedProxyCidrs"
+                        placeholder="203.0.113.0/24, 2001:db8::/32"
+                        @blur="normalizeRuleTextInputs"
+                        hide-details />
+                      <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.dnsTrustedProxyCidrsHint }}</div>
                     </v-col>
                     <v-col cols="12" md="6" lg="12">
                       <v-text-field
@@ -720,7 +741,8 @@
                       :label="reverseProxyCopy.targetAddresses"
                       :placeholder="reverseProxyCopy.targetAddressesPlaceholder"
                       @blur="normalizeRuleTextInputs"
-                      hide-details />
+                      :error-messages="targetAddressError ? [targetAddressError] : []"
+                      :hide-details="!targetAddressError" />
                   </v-col>
                   <v-col cols="12" md="6" lg="12">
                     <v-text-field
@@ -1179,12 +1201,15 @@ const {
   hasPreviewProtocol,
   listenProtocolBehavior,
   targetProtocolBehavior,
+  listenAddressError,
+  targetAddressError,
   refreshOverview,
   openResourceDialog,
   saveResources,
   openRuleDialog,
   changeListenProtocol,
   changeTargetProtocol,
+  setDNSPublicExposure,
   normalizeRuleTextInputs,
   saveRule,
   removeRule,

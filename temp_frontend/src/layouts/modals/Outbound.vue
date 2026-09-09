@@ -220,8 +220,17 @@ export default {
     }
   },
   methods: {
-    initMihomoProtocolDefaults() {
+    initMihomoProtocolDefaults(forceBandwidthDefaults: boolean = false) {
       if (this.namespace !== 'mihomo') return
+      if (forceBandwidthDefaults) {
+        if ([this.outTypes.Hysteria, this.outTypes.Hysteria2].includes(this.outbound.type)) {
+          this.outbound.up_mbps = 350
+          this.outbound.down_mbps = 350
+        } else if (this.outbound.type === this.outTypes.ShadowQUIC) {
+          this.outbound.up = 350
+          this.outbound.down = 350
+        }
+      }
       if ([this.outTypes.Hysteria2, this.outTypes.TUIC].includes(this.outbound.type)) {
         delete this.outbound.mihomo_fast_open
         delete this.outbound.fast_open
@@ -268,7 +277,7 @@ export default {
       // Use previous data
       const prevConfig = { id: this.outbound.id, tag: tag, listen: this.outbound.listen, listen_port: this.outbound.listen_port }
       this.outbound = createOutbound(this.outbound.type, prevConfig)
-      this.initMihomoProtocolDefaults()
+      this.initMihomoProtocolDefaults(currentId === 0)
       this.syncHy2HopIntervalInput()
     },
     closeModal() {

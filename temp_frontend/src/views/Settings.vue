@@ -1,4 +1,4 @@
-﻿<template>
+<template>
   <v-card :loading="loading">
     <v-tabs
       v-if="hasVerifiedSettings"
@@ -616,7 +616,7 @@
       </v-dialog>
 
       <v-overlay :model-value="panelRestartOverlay" class="align-center justify-center" persistent>
-        <v-card width="400" rounded="lg">
+        <v-card class="panel-restart-overlay-card" rounded="lg">
           <v-card-text class="text-center py-8">
             <v-progress-circular indeterminate size="52" width="5" color="primary" class="mb-4" />
             <div class="text-subtitle-1 font-weight-medium">{{ $t('setting.panelRestartingTitle') }}</div>
@@ -664,6 +664,7 @@ import { useLocale } from 'vuetify'
 import { i18n, languages } from '@/locales'
 import { Ref, computed, defineAsyncComponent, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import HttpUtils, { type Msg } from '@/plugins/httputil'
+import { panelBaseURL } from '@/plugins/api'
 import { reloadToLogin, requestLoginNavigation } from '@/plugins/sessionNavigation'
 import { FindDiff } from '@/plugins/utils'
 import { formatPanelDateTime, refreshPanelTimeContext } from '@/plugins/panelTime'
@@ -808,6 +809,12 @@ type PanelUpdateStatus = {
   updateTask?: PanelManagedUpdateTask
 }
 
+type PanelReconnectState = {
+  targetLoginURL: string
+  trackUpdateStatus: boolean
+  disconnectObserved: boolean
+}
+
 type PanelUpdateLogView = {
   path?: string
   exists?: boolean
@@ -856,6 +863,8 @@ const panelUpdateFeedbackType = ref<'success' | 'error' | 'info' | 'warning'>('i
 let panelVersionsRequest: Promise<void> | null = null
 let panelUpdateStatusRequestSequence = 0
 let panelUpdatePollingGeneration = 0
+let panelReconnectGeneration = 0
+let panelReconnectState: PanelReconnectState | null = null
 const panelReconnectTimerId = ref<number | null>(null)
 const panelUninstallPollTimerId = ref<number | null>(null)
 const panelUpdateTaskPollTimerId = ref<number | null>(null)
@@ -1636,7 +1645,7 @@ const handlePanelUpdateTaskTerminal = () => {
   // resume reconnect polling; a new panel process has no such in-memory task.
   const shouldReconnect = task.state === 'success' && task.phase === 'handoff'
   if (shouldReconnect) {
-    startPanelReconnectPolling()
+    startPanelReconnectPolling({ trackUpdateStatus: true })
   }
 }
 
@@ -1893,6 +1902,7 @@ const copyDockerUninstallCommand = async (command?: string) => {
 }
 
 const clearPanelReconnectTimer = () => {
+  panelReconnectGeneration += 1
   if (panelReconnectTimerId.value !== null) {
     window.clearTimeout(panelReconnectTimerId.value)
     panelReconnectTimerId.value = null
@@ -2023,52 +2033,179 @@ const startPanelUninstallStatusPolling = () => {
   panelUninstallPollTimerId.value = window.setTimeout(poll, 1200)
 }
 
-const startPanelReconnectPolling = () => {
+const currentPanelLoginURL = () => {
+  if (typeof window === 'undefined') return ''
+  return new URL(`${panelBaseURL}login`, window.location.origin).href
+}
+
+const toPanelLoginURL = (value: string) => {
+  const target = new URL(value, window.location.origin)
+  target.search = ''
+  target.hash = ''
+  let path = target.pathname.replace(/\/+$/, '')
+  if (path.endsWith('/settings')) {
+    path = path.slice(0, -'/settings'.length)
+  }
+  target.pathname = `${path || ''}/login`
+  return target.href
+}
+
+const configuredPanelLoginURL = () => {
+  let panelURL = String(settings.value.webURI ?? '').trim()
+  if (panelURL === '') {
+    panelURL = buildURL(
+      settings.value.webDomain,
+      settings.value.webPort.toString(),
+      isWebTLSEnabled(settings.value),
+      settings.value.webPath,
+    )
+  }
+  try {
+    return toPanelLoginURL(panelURL)
+  } catch {
+    return ''
+  }
+}
+
+const probePanelLoginURL = async (loginURL: string) => {
+  if (typeof window === 'undefined' || typeof fetch !== 'function') return true
+
+  try {
+    const target = new URL(loginURL)
+    // HTTPS 页面不能探测新的 HTTP 面板地址；确认旧入口断开后，
+    // 顶层跳转仍然可以完成该协议切换。
+    if (window.location.protocol === 'https:' && target.protocol === 'http:') return true
+  } catch {
+    return false
+  }
+
+  const controller = new AbortController()
+  const timeoutId = window.setTimeout(() => controller.abort(), 5000)
+  try {
+    await fetch(loginURL, {
+      method: 'GET',
+      mode: 'no-cors',
+      cache: 'no-store',
+      credentials: 'omit',
+      signal: controller.signal,
+    })
+    return true
+  } catch {
+    return false
+  } finally {
+    window.clearTimeout(timeoutId)
+  }
+}
+
+const redirectToRestartedPanelLogin = async (
+  reconnectState: PanelReconnectState,
+  pollingGeneration: number,
+  reconnectGeneration: number,
+) => {
+  const isCurrentRun = () => (
+    pollingGeneration === panelUpdatePollingGeneration
+    && reconnectGeneration === panelReconnectGeneration
+    && panelReconnectState === reconnectState
+    && isPanelUpdatePollingAllowed()
+  )
+  if (!isCurrentRun()) return true
+
+  const targetLoginURL = reconnectState.targetLoginURL
+  if (targetLoginURL === '' || targetLoginURL === currentPanelLoginURL()) {
+    panelReconnectState = null
+    clearPanelReconnectTimer()
+    reloadToLogin()
+    return true
+  }
+
+  const targetReady = await probePanelLoginURL(targetLoginURL)
+  if (!isCurrentRun()) return true
+  if (!targetReady) return false
+
+  panelReconnectState = null
   clearPanelReconnectTimer()
-  if (!isPanelUpdatePollingAllowed()) return
+  window.location.replace(targetLoginURL)
+  return true
+}
+
+const startPanelReconnectPolling = (options?: {
+  targetLoginURL?: string
+  trackUpdateStatus?: boolean
+}) => {
+  clearPanelReconnectTimer()
+  if (options != null) {
+    panelReconnectState = {
+      targetLoginURL: String(options.targetLoginURL ?? '').trim(),
+      trackUpdateStatus: options.trackUpdateStatus === true,
+      disconnectObserved: false,
+    }
+  }
+  const reconnectState = panelReconnectState
+  if (reconnectState == null || !isPanelUpdatePollingAllowed()) return
+
   const pollingGeneration = panelUpdatePollingGeneration
+  const reconnectGeneration = panelReconnectGeneration
   panelRestartOverlay.value = true
+  const isCurrentPollingRun = () => (
+    pollingGeneration === panelUpdatePollingGeneration
+    && reconnectGeneration === panelReconnectGeneration
+    && panelReconnectState === reconnectState
+    && isPanelUpdatePollingAllowed()
+  )
 
   const poll = async () => {
-    if (pollingGeneration !== panelUpdatePollingGeneration || !isPanelUpdatePollingAllowed()) return
+    if (!isCurrentPollingRun()) return
     try {
-      const [sessionMsg, statusMsg] = await Promise.all([
-        HttpUtils.get('api/session', {}, { silentAuthCheck: true }),
-        HttpUtils.get('api/panel-update-status', {}, { silentAuthCheck: true }),
-      ])
-      if (pollingGeneration !== panelUpdatePollingGeneration || !isPanelUpdatePollingAllowed()) return
+      const sessionMsg = await HttpUtils.get('api/session', {}, {
+        timeout: 5000,
+        silentAuthCheck: true,
+        silentErrorToast: true,
+      })
+      if (!isCurrentPollingRun()) return
 
-      if (!sessionMsg.success && sessionMsg.failureKind === 'api') {
-        clearPanelReconnectTimer()
-        panelRestartOverlay.value = false
-        reloadToLogin()
-        return
+      if (!sessionMsg.success && sessionMsg.failureKind === 'transport') {
+        // 显式重启流程必须先确认旧面板入口已断开，不能把重启前仍
+        // 成功的会话探测误判为新面板已经恢复。
+        reconnectState.disconnectObserved = true
+        if (reconnectState.targetLoginURL !== '' && reconnectState.targetLoginURL !== currentPanelLoginURL()) {
+          if (await redirectToRestartedPanelLogin(reconnectState, pollingGeneration, reconnectGeneration)) return
+        }
       }
 
-      if (sessionMsg.success && statusMsg.success) {
-        const nextStatus = statusMsg.obj ?? null
-        const nextVersion = String(nextStatus?.localVersion ?? '').trim().replace(/^v/i, '')
-        const targetVersion = String(panelSelectedVersion.value ?? '').trim().replace(/^v/i, '')
+      if (!sessionMsg.success && sessionMsg.failureKind === 'api') {
+        if (await redirectToRestartedPanelLogin(reconnectState, pollingGeneration, reconnectGeneration)) return
+      }
 
-        if (nextVersion && targetVersion && nextVersion === targetVersion) {
-          window.location.reload()
-          return
-        }
+      if (sessionMsg.success && reconnectState.disconnectObserved) {
+        if (await redirectToRestartedPanelLogin(reconnectState, pollingGeneration, reconnectGeneration)) return
+      }
 
-        if (String(nextStatus?.lastUpdateError ?? '').trim()) {
-          panelRestartOverlay.value = false
-          panelUpdateStatus.value = nextStatus
-          panelUpdateFeedback.value = `${i18n.global.t('setting.panelUpdateFailed')}：${String(nextStatus.lastUpdateError).trim()}`
-          panelUpdateFeedbackType.value = 'error'
-          clearPanelReconnectTimer()
-          return
+      if (sessionMsg.success && reconnectState.trackUpdateStatus && !reconnectState.disconnectObserved) {
+        const statusMsg = await HttpUtils.get('api/panel-update-status', {}, {
+          timeout: 5000,
+          silentAuthCheck: true,
+          silentErrorToast: true,
+        })
+        if (!isCurrentPollingRun()) return
+        if (statusMsg.success) {
+          const nextStatus = normalizePanelUpdateStatus(statusMsg.obj)
+          const updateError = String(nextStatus?.lastUpdateError ?? '').trim()
+          if (updateError !== '') {
+            panelReconnectState = null
+            clearPanelReconnectTimer()
+            panelRestartOverlay.value = false
+            panelUpdateStatus.value = nextStatus
+            panelUpdateFeedback.value = `${i18n.global.t('setting.panelUpdateFailed')}：${updateError}`
+            panelUpdateFeedbackType.value = 'error'
+            return
+          }
         }
       }
     } catch {
       // 等待面板恢复连接
     }
 
-    if (pollingGeneration === panelUpdatePollingGeneration && isPanelUpdatePollingAllowed()) {
+    if (isCurrentPollingRun()) {
       panelReconnectTimerId.value = window.setTimeout(poll, 4000)
     }
   }
@@ -2229,6 +2366,7 @@ onBeforeUnmount(() => {
 	if (tab.value === 't3') persistSubscriptionDraft('json')
 	if (tab.value === 't4') persistSubscriptionDraft('clash')
   clearPanelReconnectTimer()
+  panelReconnectState = null
   clearPanelUninstallStatusTimer()
   clearPanelUpdateTaskPolling()
   panelRestartOverlay.value = false
@@ -2465,17 +2603,13 @@ const restartApp = async () => {
 	}
 	return
   }
+  const targetLoginURL = configuredPanelLoginURL()
   loading.value = true
   try {
     const msg = await HttpUtils.post('api/restartApp', {})
     if (msg.success) {
-      let url = settings.value.webURI
-      if (!url || url === '') {
-        const isTLS = isWebTLSEnabled(settings.value)
-        url = buildURL(settings.value.webDomain, settings.value.webPort.toString(), isTLS, settings.value.webPath)
-      }
-      await sleep(3000)
-      window.location.replace(url)
+      startPanelReconnectPolling({ targetLoginURL })
+      return
     }
   } finally {
     loading.value = false
@@ -2629,6 +2763,11 @@ const showTopActionBar = computed(() => tab.value !== 't6' && tab.value !== 't7'
 .panel-uninstall-overlay-card {
   width: calc(100vw - 32px);
   max-width: 420px;
+}
+
+.panel-restart-overlay-card {
+  width: calc(100vw - 32px);
+  max-width: 400px;
 }
 
 .panel-uninstall-failure {

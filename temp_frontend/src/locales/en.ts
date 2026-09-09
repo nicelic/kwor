@@ -1,4 +1,4 @@
-﻿export default {
+export default {
   message: "Welcome",
   success: "success",
   failed: "failed",
@@ -301,7 +301,7 @@
     rebootNotice: "After installation, reboot is required before the new kernel takes effect.",
     rebootConfirm: "Reboot system now? This will interrupt the current panel session.",
     rebootingTitle: "System is rebooting",
-    rebootingDesc: "Waiting for panel reconnect. This page will refresh automatically.",
+    rebootingDesc: "Waiting for the panel to reconnect. You will be redirected to the login page when it returns.",
     downloadDone: "Downloaded {count} package(s).",
     downloadFailed: "Download failed.",
     downloadConfirm: "Download kernel packages for the current selection?",
@@ -416,7 +416,7 @@
     update: "Subscription Update Interval",
     subUri: "Subscription URI",
     panelRestartingTitle: "Panel is restarting",
-    panelRestartingDesc: "Waiting for the panel to reconnect. This page will refresh automatically.",
+    panelRestartingDesc: "Waiting for the panel to reconnect. You will be redirected to the login page when it returns.",
     uninstallPanel: "Uninstall Panel",
     uninstallPanelConfirmTitle: "Confirm Panel Uninstall",
     uninstallPanelConfirm: "This stops kwor and deletes every file it created. This cannot be undone.",

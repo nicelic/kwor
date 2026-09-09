@@ -179,6 +179,8 @@ import { push } from 'notivue'
 
 const mihomoDnsOptions = [
   'udp://127.0.0.1',
+  'udp://127.0.0.1#disable-ipv6=true',
+  'udp://127.0.0.1#disable-ipv4=true',
   'udp://8.8.8.8',
   'udp://8.8.4.4',
   'udp://[2001:4860:4860::8888]',

@@ -115,6 +115,7 @@ const (
 	reverseProxyDNSMaxCacheTTLSeconds            = 4294967295
 	reverseProxyDNSDefaultRateLimitQPS           = 50
 	reverseProxyDNSDefaultMaxConcurrentQueries   = 128
+	reverseProxyDNSPublicMaxConcurrentQueries    = 256
 	reverseProxyDNSMaxRateLimitQPS               = 10000
 	reverseProxyDNSMaxConcurrentQueryLimit       = 4096
 	reverseProxyDefaultMaxConcurrentRequests     = 128
@@ -167,6 +168,8 @@ type ReverseProxyRulePayload struct {
 	HTTPVersionStrategy         string   `json:"httpVersionStrategy"`
 	UpstreamTLSVerify           bool     `json:"upstreamTlsVerify"`
 	DNSAllowedCIDRs             string   `json:"dnsAllowedCidrs"`
+	DNSPublicExposure           bool     `json:"dnsPublicExposure"`
+	DNSTrustedProxyCIDRs        string   `json:"dnsTrustedProxyCidrs"`
 	DNSRateLimitQPS             *int     `json:"dnsRateLimitQps"`
 	DNSMaxConcurrentQueries     *int     `json:"dnsMaxConcurrentQueries"`
 	MaxConcurrentConnections    *int     `json:"maxConcurrentConnections"`
@@ -282,6 +285,8 @@ type ReverseProxyRuleView struct {
 	DNSCacheMinTTL              int                                        `json:"dnsCacheMinTtl"`
 	DNSCacheMaxTTL              int                                        `json:"dnsCacheMaxTtl"`
 	DNSAllowedCIDRs             []string                                   `json:"dnsAllowedCidrs"`
+	DNSPublicExposure           bool                                       `json:"dnsPublicExposure"`
+	DNSTrustedProxyCIDRs        []string                                   `json:"dnsTrustedProxyCidrs"`
 	DNSRateLimitQPS             int                                        `json:"dnsRateLimitQps"`
 	DNSMaxConcurrentQueries     int                                        `json:"dnsMaxConcurrentQueries"`
 	EDNSEnabled                 bool                                       `json:"ednsEnabled"`
@@ -364,6 +369,8 @@ type reverseProxyNormalizedRule struct {
 	dnsCacheMinTTL              int
 	dnsCacheMaxTTL              int
 	dnsAllowedCIDRs             []string
+	dnsPublicExposure           bool
+	dnsTrustedProxyCIDRs        []string
 	dnsRateLimitQPS             int
 	dnsMaxConcurrentQueries     int
 	ednsEnabled                 bool
@@ -1268,6 +1275,8 @@ func reverseProxyRulePayloadFromModel(row *model.ReverseProxyRule, enabled bool)
 		HTTPVersionStrategy:         row.HTTPVersionStrategy,
 		UpstreamTLSVerify:           row.UpstreamTLSVerify,
 		DNSAllowedCIDRs:             strings.Join(decodeReverseProxyList(row.DNSAllowedCIDRs), ", "),
+		DNSPublicExposure:           row.DNSPublicExposure,
+		DNSTrustedProxyCIDRs:        strings.Join(decodeReverseProxyList(row.DNSTrustedProxyCIDRs), ", "),
 		DNSRateLimitQPS:             &dnsRateLimit,
 		DNSMaxConcurrentQueries:     &dnsConcurrent,
 		MaxConcurrentConnections:    &maxConnections,
@@ -1545,6 +1554,8 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 		row.DNSCacheMinTTL = normalized.dnsCacheMinTTL
 		row.DNSCacheMaxTTL = normalized.dnsCacheMaxTTL
 		row.DNSAllowedCIDRs = encodeReverseProxyList(normalized.dnsAllowedCIDRs)
+		row.DNSPublicExposure = normalized.dnsPublicExposure
+		row.DNSTrustedProxyCIDRs = encodeReverseProxyList(normalized.dnsTrustedProxyCIDRs)
 		row.DNSRateLimitQPS = normalized.dnsRateLimitQPS
 		row.DNSMaxConcurrentQueries = normalized.dnsMaxConcurrentQueries
 		row.EDNSEnabled = normalized.ednsEnabled
@@ -2169,6 +2180,8 @@ func buildReverseProxyRuleView(row *model.ReverseProxyRule, certMap map[uint]Rev
 		DNSCacheMinTTL:             row.DNSCacheMinTTL,
 		DNSCacheMaxTTL:             row.DNSCacheMaxTTL,
 		DNSAllowedCIDRs:            decodeReverseProxyList(row.DNSAllowedCIDRs),
+		DNSPublicExposure:          row.DNSPublicExposure,
+		DNSTrustedProxyCIDRs:       decodeReverseProxyList(row.DNSTrustedProxyCIDRs),
 		DNSRateLimitQPS:            reverseProxyDNSRateLimitQPS(row.DNSRateLimitQPS),
 		DNSMaxConcurrentQueries:    reverseProxyDNSMaxConcurrentQueries(row.DNSMaxConcurrentQueries),
 		EDNSEnabled:                row.EDNSEnabled,
@@ -2263,6 +2276,8 @@ func reverseProxyRulePersistenceMap(row *model.ReverseProxyRule) map[string]inte
 		"dns_cache_min_ttl":             row.DNSCacheMinTTL,
 		"dns_cache_max_ttl":             row.DNSCacheMaxTTL,
 		"dns_allowed_cidrs":             row.DNSAllowedCIDRs,
+		"dns_public_exposure":           row.DNSPublicExposure,
+		"dns_trusted_proxy_cidrs":       row.DNSTrustedProxyCIDRs,
 		"dns_rate_limit_qps":            row.DNSRateLimitQPS,
 		"dns_max_concurrent_queries":    row.DNSMaxConcurrentQueries,
 		"edns_enabled":                  row.EDNSEnabled,
@@ -2338,9 +2353,6 @@ func normalizeReverseProxyCIDRs(raw string) ([]string, error) {
 			return nil, common.NewError("invalid dns allowed cidr: ", strings.TrimSpace(item))
 		}
 		prefix = prefix.Masked()
-		if prefix.Bits() == 0 {
-			return nil, common.NewError("dns allowed cidr must not allow the entire internet")
-		}
 		value := prefix.String()
 		if _, exists := seen[value]; exists {
 			continue
@@ -2352,6 +2364,30 @@ func normalizeReverseProxyCIDRs(raw string) ([]string, error) {
 	return result, nil
 }
 
+func normalizeReverseProxyTrustedProxyCIDRs(raw string) ([]string, error) {
+	values, err := normalizeReverseProxyCIDRs(raw)
+	if err != nil {
+		return nil, common.NewError("invalid dns trusted proxy cidr")
+	}
+	return values, nil
+}
+
+func reverseProxyDNSCIDRsAllowPublicSources(cidrs []string) bool {
+	if len(cidrs) == 0 {
+		return true
+	}
+	for _, raw := range cidrs {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
+		if err != nil {
+			continue
+		}
+		if prefix.Bits() == 0 && prefix.Addr().IsUnspecified() {
+			return true
+		}
+	}
+	return false
+}
+
 func validateReverseProxyDNSAdmissionSettings(row reverseProxyNormalizedRule) error {
 	if row.dnsRateLimitQPS < 1 || row.dnsRateLimitQPS > reverseProxyDNSMaxRateLimitQPS {
 		return common.NewError("dns rate limit qps must be between 1 and ", reverseProxyDNSMaxRateLimitQPS)
@@ -2361,9 +2397,6 @@ func validateReverseProxyDNSAdmissionSettings(row reverseProxyNormalizedRule) er
 	}
 	if row.maxConcurrentRequests < 0 || row.maxConcurrentRequests > reverseProxyMaxConcurrentRequestLimit {
 		return common.NewError("max concurrent requests must be between 0 and ", reverseProxyMaxConcurrentRequestLimit)
-	}
-	if len(row.dnsAllowedCIDRs) == 0 {
-		return common.NewError("dns wildcard listeners require at least one non-global allowed cidr")
 	}
 	return nil
 }
@@ -2416,6 +2449,23 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		memoryLimitBytes = *payload.MemoryLimitBytes
 	}
 	listenNameInput := strings.TrimSpace(payload.Hosts)
+	normalizedListenTokens, err := normalizeReverseProxyTokensWithPort(listenNameInput, reverseProxyTokenModeListenName)
+	if err != nil {
+		return reverseProxyNormalizedRule{}, err
+	}
+	targetAddressInput := strings.TrimSpace(payload.TargetAddresses)
+	normalizedTargetTokens, err := normalizeReverseProxyTokensWithPort(targetAddressInput, reverseProxyTokenModeTarget)
+	if err != nil {
+		return reverseProxyNormalizedRule{}, err
+	}
+	listenPort := payload.ListenPort
+	if normalizedListenTokens.hasPort {
+		listenPort = normalizedListenTokens.port
+	}
+	targetPort := payload.TargetPort
+	if normalizedTargetTokens.hasPort {
+		targetPort = normalizedTargetTokens.port
+	}
 	listenProtocolAliasInput := strings.ToLower(strings.TrimSpace(payload.ListenProtocolAlias))
 	targetProtocolAliasInput := strings.ToLower(strings.TrimSpace(payload.TargetProtocolAlias))
 	listenCompressionEnabled := reverseProxyPayloadCompressionEnabled(payload.ListenCompressionEnabled)
@@ -2438,10 +2488,10 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		id:                          payload.ID,
 		name:                        strings.TrimSpace(payload.Name),
 		enabled:                     payload.Enabled,
-		listenPort:                  payload.ListenPort,
+		listenPort:                  listenPort,
 		listenCompressionEnabled:    listenCompressionEnabled,
 		listenCompressionAlgorithms: listenCompressionAlgorithms,
-		targetPort:                  payload.TargetPort,
+		targetPort:                  targetPort,
 		targetCompressionEnabled:    targetCompressionEnabled,
 		targetCompressionAlgorithms: targetCompressionAlgorithms,
 		maxConcurrentConnections:    maxConcurrentConnections,
@@ -2464,10 +2514,6 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		disableIPv4Answer:           payload.DisableIPv4Answer,
 		disableIPv6Answer:           payload.DisableIPv6Answer,
 	}
-	if normalized.name == "" {
-		normalized.name = buildReverseProxyDefaultName(payload.ListenProtocol, listenNameInput, payload.ListenPort, payload.PathPrefix)
-	}
-
 	listenProtocolInput := strings.TrimSpace(payload.ListenProtocol)
 	targetProtocolInput := strings.TrimSpace(payload.TargetProtocol)
 
@@ -2507,17 +2553,17 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		return reverseProxyNormalizedRule{}, common.NewError("target port must be between 1 and 65535")
 	}
 
-	hosts, err := normalizeReverseProxyTokens(listenNameInput, reverseProxyTokenModeListenName)
-	if err != nil {
-		return reverseProxyNormalizedRule{}, err
+	normalized.hosts = normalizedListenTokens.tokens
+	if normalized.name == "" {
+		listenName := ""
+		if len(normalized.hosts) > 0 {
+			listenName = normalized.hosts[0]
+		}
+		normalized.name = buildReverseProxyDefaultName(payload.ListenProtocol, listenName, normalized.listenPort, payload.PathPrefix)
 	}
-	normalized.hosts = hosts
 	normalized.pathPrefix = normalizeReverseProxyPath(payload.PathPrefix, false)
 
-	targetAddresses, err := normalizeReverseProxyTokens(payload.TargetAddresses, reverseProxyTokenModeTarget)
-	if err != nil {
-		return reverseProxyNormalizedRule{}, err
-	}
+	targetAddresses := normalizedTargetTokens.tokens
 	if len(targetAddresses) == 0 {
 		return reverseProxyNormalizedRule{}, common.NewError("target addresses are required")
 	}
@@ -2558,6 +2604,18 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 			return reverseProxyNormalizedRule{}, cidrErr
 		}
 		normalized.dnsAllowedCIDRs = allowedCIDRs
+		trustedProxyCIDRs, trustedProxyErr := normalizeReverseProxyTrustedProxyCIDRs(payload.DNSTrustedProxyCIDRs)
+		if trustedProxyErr != nil {
+			return reverseProxyNormalizedRule{}, trustedProxyErr
+		}
+		normalized.dnsTrustedProxyCIDRs = trustedProxyCIDRs
+		normalized.dnsPublicExposure = reverseProxyDNSCIDRsAllowPublicSources(allowedCIDRs)
+		if normalized.dnsPublicExposure && !payload.DNSPublicExposure {
+			return reverseProxyNormalizedRule{}, common.NewError("public dns access requires explicit confirmation")
+		}
+		if normalized.dnsPublicExposure && normalized.dnsMaxConcurrentQueries == 0 {
+			normalized.dnsMaxConcurrentQueries = reverseProxyDNSPublicMaxConcurrentQueries
+		}
 		if err := validateReverseProxyDNSAdmissionSettings(normalized); err != nil {
 			return reverseProxyNormalizedRule{}, err
 		}
@@ -2626,6 +2684,8 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 	normalized.dnsCacheMinTTL = 0
 	normalized.dnsCacheMaxTTL = 0
 	normalized.dnsAllowedCIDRs = []string{}
+	normalized.dnsPublicExposure = false
+	normalized.dnsTrustedProxyCIDRs = []string{}
 	normalized.dnsRateLimitQPS = reverseProxyDNSDefaultRateLimitQPS
 	normalized.dnsMaxConcurrentQueries = 0
 
@@ -3579,23 +3639,101 @@ func normalizeReverseProxyTokenInput(token string, mode int) string {
 		case strings.HasPrefix(lower, "https://"):
 			token = token[len("https://"):]
 		}
+		if pathIndex := strings.IndexByte(token, '/'); pathIndex >= 0 {
+			token = token[:pathIndex]
+		}
 	}
 	return strings.TrimSpace(token)
 }
 
-func normalizeReverseProxyTokens(raw string, mode int) ([]string, error) {
+type reverseProxyTokenNormalization struct {
+	tokens  []string
+	port    int
+	hasPort bool
+}
+
+func reverseProxyTokenPortLabel(mode int) string {
+	switch mode {
+	case reverseProxyTokenModeServerName:
+		return "sni names"
+	case reverseProxyTokenModeHost:
+		return "hosts"
+	case reverseProxyTokenModeTarget:
+		return "target addresses"
+	default:
+		return "listen names"
+	}
+}
+
+func normalizeReverseProxyExplicitPort(portText string, mode int) (int, error) {
+	portText = strings.TrimSpace(portText)
+	if portText == "" {
+		return 0, common.NewError(reverseProxyTokenPortLabel(mode), " port must be a decimal integer between 1 and 65535")
+	}
+	for _, char := range portText {
+		if char < '0' || char > '9' {
+			return 0, common.NewError(reverseProxyTokenPortLabel(mode), " port must be a decimal integer between 1 and 65535")
+		}
+	}
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, common.NewError(reverseProxyTokenPortLabel(mode), " port must be a decimal integer between 1 and 65535")
+	}
+	return int(port), nil
+}
+
+func normalizeReverseProxyAddressToken(token string, mode int) (string, int, bool, error) {
+	token = normalizeReverseProxyTokenInput(token, mode)
+	if token == "" {
+		return "", 0, false, nil
+	}
+
+	host := token
+	portText := ""
+	hasPort := false
+	if strings.HasPrefix(token, "[") {
+		closingBracket := strings.IndexByte(token, ']')
+		if closingBracket <= 1 {
+			return "", 0, false, common.NewError(reverseProxyTokenPortLabel(mode), " contains an invalid bracketed address")
+		}
+		host = strings.TrimSpace(token[1:closingBracket])
+		suffix := strings.TrimSpace(token[closingBracket+1:])
+		if suffix != "" {
+			if !strings.HasPrefix(suffix, ":") {
+				return "", 0, false, common.NewError(reverseProxyTokenPortLabel(mode), " port must be a decimal integer between 1 and 65535")
+			}
+			hasPort = true
+			portText = strings.TrimSpace(suffix[1:])
+		}
+	} else if net.ParseIP(token) == nil && strings.Count(token, ":") == 1 {
+		colonIndex := strings.LastIndexByte(token, ':')
+		host = strings.TrimSpace(token[:colonIndex])
+		hasPort = true
+		portText = strings.TrimSpace(token[colonIndex+1:])
+	}
+
+	if hasPort {
+		port, err := normalizeReverseProxyExplicitPort(portText, mode)
+		if err != nil {
+			return "", 0, false, err
+		}
+		if host == "" {
+			return "", 0, false, common.NewError(reverseProxyTokenPortLabel(mode), " must include a host before the port")
+		}
+		return host, port, true, nil
+	}
+	return host, 0, false, nil
+}
+
+func normalizeReverseProxyTokensWithPort(raw string, mode int) (reverseProxyTokenNormalization, error) {
 	fields := splitReverseProxyTokenFields(raw)
 	seen := make(map[string]struct{}, len(fields))
 	result := make([]string, 0, len(fields))
+	normalized := reverseProxyTokenNormalization{tokens: result}
 	for _, field := range fields {
-		token := normalizeReverseProxyTokenInput(field, mode)
-		if reverseProxyTokenHasExplicitPort(token) {
-			switch mode {
-			case reverseProxyTokenModeTarget:
-				return nil, common.NewError("target addresses must not include port; use the target port field")
-			default:
-				return nil, common.NewError("listen names must not include port; use the listen port field")
-			}
+		token, port, hasPort, err := normalizeReverseProxyAddressToken(field, mode)
+		if err != nil {
+			return reverseProxyTokenNormalization{}, err
 		}
 		token = strings.Trim(token, "[]")
 		if token == "" {
@@ -3606,40 +3744,52 @@ func normalizeReverseProxyTokens(raw string, mode int) ([]string, error) {
 		case reverseProxyTokenModeServerName:
 			if strings.Contains(lower, "*") {
 				if !reverseProxyIsStandardWildcardHost(lower) {
-					return nil, common.NewError("sni wildcard must follow *.example.com format")
+					return reverseProxyTokenNormalization{}, common.NewError("sni wildcard must follow *.example.com format")
 				}
 			} else if reverseProxyParseIPLiteral(lower) == nil && (!reverseProxyHostTokenRe.MatchString(lower) || !reverseProxyLooksLikeHost(lower)) {
-				return nil, common.NewError("sni names must be domain or ip")
+				return reverseProxyTokenNormalization{}, common.NewError("sni names must be domain or ip")
 			}
 		case reverseProxyTokenModeListenName:
 			if strings.Contains(lower, "*") {
 				if !reverseProxyIsStandardWildcardHost(lower) {
-					return nil, common.NewError("listen wildcard must follow *.example.com format")
+					return reverseProxyTokenNormalization{}, common.NewError("listen wildcard must follow *.example.com format")
 				}
 			} else if reverseProxyParseIPLiteral(lower) != nil {
-				return nil, common.NewError("listen names must be domain")
+				return reverseProxyTokenNormalization{}, common.NewError("listen names must be domain")
 			} else if !reverseProxyHostTokenRe.MatchString(lower) || !reverseProxyLooksLikeHost(lower) {
-				return nil, common.NewError("listen names must be domain")
+				return reverseProxyTokenNormalization{}, common.NewError("listen names must be domain")
 			}
 		case reverseProxyTokenModeHost:
 			if strings.Contains(lower, "*") {
 				if !reverseProxyIsStandardWildcardHost(lower) {
-					return nil, common.NewError("hosts wildcard must follow *.example.com format")
+					return reverseProxyTokenNormalization{}, common.NewError("hosts wildcard must follow *.example.com format")
 				}
 			} else if reverseProxyParseIPLiteral(lower) != nil {
-				return nil, common.NewError("hosts must be domain")
+				return reverseProxyTokenNormalization{}, common.NewError("hosts must be domain")
 			} else if !reverseProxyHostTokenRe.MatchString(lower) || !reverseProxyLooksLikeHost(lower) {
-				return nil, common.NewError("hosts must be domain")
+				return reverseProxyTokenNormalization{}, common.NewError("hosts must be domain")
 			}
 		case reverseProxyTokenModeTarget:
 			if strings.Contains(lower, "*") {
-				return nil, common.NewError("target addresses do not support wildcards")
+				return reverseProxyTokenNormalization{}, common.NewError("target addresses do not support wildcards")
 			}
 			if !reverseProxyHostTokenRe.MatchString(lower) || !reverseProxyLooksLikeHost(lower) {
-				return nil, common.NewError("target addresses must be domain or ip")
+				return reverseProxyTokenNormalization{}, common.NewError("target addresses must be domain or ip")
 			}
 		default:
-			return nil, common.NewError("invalid token mode")
+			return reverseProxyTokenNormalization{}, common.NewError("invalid token mode")
+		}
+		if hasPort {
+			if normalized.hasPort && normalized.port != port {
+				return reverseProxyTokenNormalization{}, common.NewErrorf(
+					"%s must use the same port; found %d and %d",
+					reverseProxyTokenPortLabel(mode), normalized.port, port,
+				)
+			}
+			if !normalized.hasPort {
+				normalized.port = port
+				normalized.hasPort = true
+			}
 		}
 		if _, exists := seen[lower]; exists {
 			continue
@@ -3647,7 +3797,16 @@ func normalizeReverseProxyTokens(raw string, mode int) ([]string, error) {
 		seen[lower] = struct{}{}
 		result = append(result, lower)
 	}
-	return result, nil
+	normalized.tokens = result
+	return normalized, nil
+}
+
+func normalizeReverseProxyTokens(raw string, mode int) ([]string, error) {
+	normalized, err := normalizeReverseProxyTokensWithPort(raw, mode)
+	if err != nil {
+		return nil, err
+	}
+	return normalized.tokens, nil
 }
 
 func splitReverseProxyTokenFields(raw string) []string {
@@ -6478,8 +6637,7 @@ func (g *reverseProxyListenerGroup) certificateSelectionFromContext(ctx context.
 func (g *reverseProxyListenerGroup) newHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r == nil {
-			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-			return
+			panic(http.ErrAbortHandler)
 		}
 		host := reverseProxyNormalizeRequestHost(r.Host)
 		externalPort := reverseProxyHTTP3ExternalPort(r.Host)
@@ -6491,21 +6649,12 @@ func (g *reverseProxyListenerGroup) newHandler() http.Handler {
 		selection, hasSelection := g.certificateSelectionFromContext(r.Context())
 		rule, nameMatched := g.findRuleWithSelection(host, sni, path, selection, hasSelection)
 		if rule == nil {
-			status := http.StatusNotFound
 			if r.TLS != nil && !nameMatched {
-				if delay := reverseProxyRuntime.registerMismatch(extractRemoteIP(r.RemoteAddr), "host_sni_mismatch"); delay > 0 {
-					w.Header().Set("Retry-After", strconv.Itoa(int(delay.Seconds())))
-					http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
-					return
-				}
-				status = http.StatusMisdirectedRequest
-			} else if nameMatched {
-				if altSvc := g.http3AdvertisementHeader(host, sni, r.ProtoMajor, externalPort); altSvc != "" {
-					w.Header().Set("Alt-Svc", altSvc)
-				}
+				reverseProxyRuntime.registerMismatch(extractRemoteIP(r.RemoteAddr), "host_sni_mismatch")
 			}
-			http.Error(w, http.StatusText(status), status)
-			return
+			// Abort before net/http can synthesize an HTTP response. HTTP/1.1
+			// closes the connection; HTTP/2 and HTTP/3 reset the current stream.
+			panic(http.ErrAbortHandler)
 		}
 		listenAlias := normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
 		targetAlias := normalizeReverseProxyProtocolAlias(rule.TargetProtocolAlias, rule.TargetProtocol)
@@ -6518,12 +6667,7 @@ func (g *reverseProxyListenerGroup) newHandler() http.Handler {
 		websocketRequest := reverseProxyIsWebSocketUpgradeRequest(r) || reverseProxyIsExtendedWebSocketConnectRequest(r)
 		if (reverseProxyIsWebSocketAlias(listenAlias) || reverseProxyIsWebSocketAlias(targetAlias)) &&
 			!websocketRequest && !reverseProxyIsCONNECTRequest(r) {
-			if altSvc != "" {
-				w.Header().Set("Alt-Svc", altSvc)
-			}
-			w.Header().Set("Upgrade", "websocket")
-			http.Error(w, http.StatusText(http.StatusUpgradeRequired), http.StatusUpgradeRequired)
-			return
+			panic(http.ErrAbortHandler)
 		}
 		if connID := g.connectionIDFromContext(r.Context()); connID != "" {
 			if !g.registerLocalConnectionRule(rule.Id, connID) {

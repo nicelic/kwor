@@ -237,16 +237,16 @@ export default {
       set(v:boolean) { this.$props.data.max_concurrent_streams = v ? 1024 : undefined }
     },
     down_mbps: {
-      get() { return parseSingboxInteger(this.$props.data[this.bandwidthKey('down')], { min: 0 }) ?? 500 },
+      get() { return parseSingboxInteger(this.$props.data[this.bandwidthKey('down')], { min: 0 }) ?? 350 },
       set(newValue:unknown) {
-        this.$props.data[this.bandwidthKey('down')] = parseSingboxInteger(newValue, { min: 0 }) ?? 500
+        this.$props.data[this.bandwidthKey('down')] = parseSingboxInteger(newValue, { min: 0 }) ?? 350
         delete this.$props.data.down
       }
     },
     up_mbps: {
-      get() { return parseSingboxInteger(this.$props.data[this.bandwidthKey('up')], { min: 0 }) ?? 500 },
+      get() { return parseSingboxInteger(this.$props.data[this.bandwidthKey('up')], { min: 0 }) ?? 350 },
       set(newValue:unknown) {
-        this.$props.data[this.bandwidthKey('up')] = parseSingboxInteger(newValue, { min: 0 }) ?? 500
+        this.$props.data[this.bandwidthKey('up')] = parseSingboxInteger(newValue, { min: 0 }) ?? 350
       }
     },
     streamReceiveWindow: {

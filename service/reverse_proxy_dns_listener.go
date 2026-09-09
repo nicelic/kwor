@@ -22,7 +22,10 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-const reverseProxyDNSMaximumWireBytes = 65535
+const (
+	reverseProxyDNSMaximumWireBytes        = 65535
+	reverseProxyDNSMaximumPublicUDPPayload = 1232
+)
 
 // reverseProxyDNSLimitedListener applies the saved listener-group connection
 // safety valve before a TCP or DoT connection reaches its protocol
@@ -30,7 +33,27 @@ const reverseProxyDNSMaximumWireBytes = 65535
 // shutdown path.
 type reverseProxyDNSLimitedListener struct {
 	net.Listener
-	limiter *reverseProxyAdjustableLimiter
+	limiter     *reverseProxyAdjustableLimiter
+	allowRemote func(net.Addr) bool
+}
+
+// reverseProxyDNSFilteredPacketConn drops denied UDP datagrams before the DNS
+// library parses their wire message or allocates a request context.
+type reverseProxyDNSFilteredPacketConn struct {
+	net.PacketConn
+	allowRemote func(net.Addr) bool
+}
+
+func (c *reverseProxyDNSFilteredPacketConn) ReadFrom(data []byte) (int, net.Addr, error) {
+	if c == nil || c.PacketConn == nil {
+		return 0, nil, net.ErrClosed
+	}
+	for {
+		size, remote, err := c.PacketConn.ReadFrom(data)
+		if err != nil || c.allowRemote == nil || c.allowRemote(remote) {
+			return size, remote, err
+		}
+	}
 }
 
 type reverseProxyDNSLimitedConn struct {
@@ -57,6 +80,10 @@ func (l *reverseProxyDNSLimitedListener) Accept() (net.Conn, error) {
 		conn, err := l.Listener.Accept()
 		if err != nil || conn == nil {
 			return conn, err
+		}
+		if l.allowRemote != nil && !l.allowRemote(conn.RemoteAddr()) {
+			_ = conn.Close()
+			continue
 		}
 		if l.limiter == nil || l.limiter.TryAcquire() {
 			return &reverseProxyDNSLimitedConn{
@@ -137,6 +164,9 @@ func (i *reverseProxyDNSInstance) startPlainDNS(ctx context.Context, row *model.
 		if response == nil {
 			response = reverseProxyDNSServfailResponse(request)
 		}
+		if proto == dnsproxy.ProtoUDP {
+			response.Truncate(reverseProxyDNSUDPResponseLimit(request))
+		}
 		if err != nil {
 			reverseProxyRuntime.reportRuleState(row.Id, "upstream_error", err.Error())
 		}
@@ -152,11 +182,17 @@ func (i *reverseProxyDNSInstance) startPlainDNS(ctx context.Context, row *model.
 				}
 				return err
 			}
+			filtered := &reverseProxyDNSFilteredPacketConn{
+				PacketConn: packetConn,
+				allowRemote: func(remote net.Addr) bool {
+					return i.handler.allowsRemoteAddrForRule(row.Id, remote)
+				},
+			}
 			server := &dns.Server{
-				PacketConn:    packetConn,
+				PacketConn:    filtered,
 				Net:           "udp",
 				Handler:       handler,
-				UDPSize:       reverseProxyDNSMaximumWireBytes,
+				UDPSize:       reverseProxyDNSMaximumPublicUDPPayload,
 				ReadTimeout:   reverseProxyServerIdleTimeout,
 				WriteTimeout:  reverseProxyServerIdleTimeout,
 				MsgAcceptFunc: dns.DefaultMsgAcceptFunc,
@@ -177,7 +213,13 @@ func (i *reverseProxyDNSInstance) startPlainDNS(ctx context.Context, row *model.
 			if proto == dnsproxy.ProtoTLS {
 				listener = tls.NewListener(listener, tlsConfig.Clone())
 			}
-			limited := &reverseProxyDNSLimitedListener{Listener: listener, limiter: i.connectionLimiter}
+			limited := &reverseProxyDNSLimitedListener{
+				Listener: listener,
+				limiter:  i.connectionLimiter,
+				allowRemote: func(remote net.Addr) bool {
+					return i.handler.allowsRemoteAddrForRule(row.Id, remote)
+				},
+			}
 			server := &dns.Server{
 				Listener:     limited,
 				Net:          "tcp",
@@ -263,6 +305,10 @@ func (i *reverseProxyDNSInstance) serveDoQListener(ctx context.Context, listener
 				reverseProxyRuntime.reportRuleState(ruleID, "listener_error", err.Error())
 			}
 			return
+		}
+		if !i.handler.allowsRemoteAddrForRule(ruleID, connection.RemoteAddr()) {
+			_ = connection.CloseWithError(0, "dns source is not allowed")
+			continue
 		}
 		if i.connectionLimiter != nil && !i.connectionLimiter.TryAcquire() {
 			_ = connection.CloseWithError(0, "reverse proxy dns connection limit reached")
@@ -425,6 +471,10 @@ func (h *reverseProxyDNSRuleHandler) serveDoHRule(writer http.ResponseWriter, re
 		http.Error(writer, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
 	}
+	if !h.allowsHTTPRequestForRule(ruleID, request) {
+		http.Error(writer, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+		return
+	}
 	h.mu.RLock()
 	route := h.routesByRule[ruleID]
 	h.mu.RUnlock()
@@ -475,6 +525,22 @@ func (h *reverseProxyDNSRuleHandler) serveDoHRule(writer http.ResponseWriter, re
 	defer compressedWriter.Close()
 	compressedWriter.WriteHeader(http.StatusOK)
 	_, _ = compressedWriter.Write(encoded)
+}
+
+func reverseProxyDNSUDPResponseLimit(request *dns.Msg) int {
+	limit := 512
+	if request != nil {
+		if opt := request.IsEdns0(); opt != nil && opt.UDPSize() > 0 {
+			limit = int(opt.UDPSize())
+		}
+	}
+	if limit < 512 {
+		return 512
+	}
+	if limit > reverseProxyDNSMaximumPublicUDPPayload {
+		return reverseProxyDNSMaximumPublicUDPPayload
+	}
+	return limit
 }
 
 func reverseProxyDNSReadDoHMessage(writer http.ResponseWriter, request *http.Request) ([]byte, error) {

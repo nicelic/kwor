@@ -36,6 +36,8 @@ export type ReverseProxyRule = {
   dnsCacheMinTtl: number
   dnsCacheMaxTtl: number
   dnsAllowedCidrs: string[]
+  dnsPublicExposure: boolean
+  dnsTrustedProxyCidrs: string[]
   dnsRateLimitQps: number
   dnsMaxConcurrentQueries: number
   ednsEnabled: boolean
@@ -95,6 +97,8 @@ export type ReverseProxyRuleForm = {
   dnsCacheMinTtl: number
   dnsCacheMaxTtl: number
   dnsAllowedCidrsText: string
+  dnsPublicExposure: boolean
+  dnsTrustedProxyCidrsText: string
   dnsRateLimitQps: number
   dnsMaxConcurrentQueries: number
   ednsEnabled: boolean
