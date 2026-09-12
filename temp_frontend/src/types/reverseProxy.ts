@@ -18,6 +18,7 @@ export type ReverseProxyRule = {
   listenPort: number
   listenCompressionEnabled: boolean
   listenCompressionAlgorithms: string[]
+  listenWebSocketSupport: boolean
   hosts: string[]
   pathPrefix: string
   listenDnsPath?: string
@@ -27,6 +28,7 @@ export type ReverseProxyRule = {
   targetPort: number
   targetCompressionEnabled: boolean
   targetCompressionAlgorithms: string[]
+  targetWebSocketSupport: boolean
   targetPath: string
   targetDnsPath?: string
   fallbackDnsUpstreams: string
@@ -80,6 +82,7 @@ export type ReverseProxyRuleForm = {
   listenPort: number
   listenCompressionEnabled: boolean
   listenCompressionAlgorithms: string[]
+  listenWebSocketSupport: boolean
   hostsText: string
   pathPrefix: string
   listenDnsPath: string
@@ -88,6 +91,7 @@ export type ReverseProxyRuleForm = {
   targetPort: number
   targetCompressionEnabled: boolean
   targetCompressionAlgorithms: string[]
+  targetWebSocketSupport: boolean
   targetPath: string
   targetDnsPath: string
   fallbackDnsUpstreams: string

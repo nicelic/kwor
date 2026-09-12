@@ -138,6 +138,7 @@ type ReverseProxyRulePayload struct {
 	ListenPort                  int      `json:"listenPort"`
 	ListenCompressionEnabled    *bool    `json:"listenCompressionEnabled"`
 	ListenCompressionAlgorithms []string `json:"listenCompressionAlgorithms"`
+	ListenWebSocketSupport      *bool    `json:"listenWebSocketSupport"`
 	Hosts                       string   `json:"hosts"`
 	PathPrefix                  string   `json:"pathPrefix"`
 	ListenDNSPath               string   `json:"listenDnsPath"`
@@ -147,6 +148,7 @@ type ReverseProxyRulePayload struct {
 	TargetPort                  int      `json:"targetPort"`
 	TargetCompressionEnabled    *bool    `json:"targetCompressionEnabled"`
 	TargetCompressionAlgorithms []string `json:"targetCompressionAlgorithms"`
+	TargetWebSocketSupport      *bool    `json:"targetWebSocketSupport"`
 	TargetPath                  string   `json:"targetPath"`
 	TargetDNSPath               string   `json:"targetDnsPath"`
 	FallbackDNSUpstreams        string   `json:"fallbackDnsUpstreams"`
@@ -213,6 +215,12 @@ func reverseProxyPayloadCompressionEnabled(value *bool) bool {
 	return value == nil || *value
 }
 
+func reverseProxyPayloadWebSocketSupport(value *bool) bool {
+	// Omitted fields are legacy payloads and retain default enabled behavior.
+	// An explicit false disables WebSocket support for the protocol leg.
+	return value == nil || *value
+}
+
 type ReverseProxyRuleReorderPayload struct {
 	ExpectedRevision *uint64 `json:"expectedRevision"`
 	IDs              []uint  `json:"ids"`
@@ -267,6 +275,7 @@ type ReverseProxyRuleView struct {
 	ListenPort                  int                                        `json:"listenPort"`
 	ListenCompressionEnabled    bool                                       `json:"listenCompressionEnabled"`
 	ListenCompressionAlgorithms []string                                   `json:"listenCompressionAlgorithms"`
+	ListenWebSocketSupport      bool                                       `json:"listenWebSocketSupport"`
 	Hosts                       []string                                   `json:"hosts"`
 	PathPrefix                  string                                     `json:"pathPrefix"`
 	ListenDNSPath               string                                     `json:"listenDnsPath"`
@@ -276,6 +285,7 @@ type ReverseProxyRuleView struct {
 	TargetPort                  int                                        `json:"targetPort"`
 	TargetCompressionEnabled    bool                                       `json:"targetCompressionEnabled"`
 	TargetCompressionAlgorithms []string                                   `json:"targetCompressionAlgorithms"`
+	TargetWebSocketSupport      bool                                       `json:"targetWebSocketSupport"`
 	TargetPath                  string                                     `json:"targetPath"`
 	TargetDNSPath               string                                     `json:"targetDnsPath"`
 	FallbackDNSUpstreams        string                                     `json:"fallbackDnsUpstreams"`
@@ -351,6 +361,7 @@ type reverseProxyNormalizedRule struct {
 	listenPort                  int
 	listenCompressionEnabled    bool
 	listenCompressionAlgorithms []string
+	listenWebSocketSupport      bool
 	hosts                       []string
 	pathPrefix                  string
 	listenDNSPath               string
@@ -360,6 +371,7 @@ type reverseProxyNormalizedRule struct {
 	targetPort                  int
 	targetCompressionEnabled    bool
 	targetCompressionAlgorithms []string
+	targetWebSocketSupport      bool
 	targetPath                  string
 	targetDNSPath               string
 	fallbackDNSUpstreams        string
@@ -500,11 +512,24 @@ func reverseProxyValidateWebSocketHandshake(response *http.Response, request *ht
 	return nil
 }
 
+// reverseProxyListenSupportsWebSocket reports whether a configured rule allows
+// WebSocket connections on the local listener.
+func reverseProxyListenSupportsWebSocket(rule *model.ReverseProxyRule) bool {
+	if rule == nil {
+		return false
+	}
+	if reverseProxyIsWebSocketAlias(rule.ListenProtocolAlias) {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(rule.ListenProtocol), reverseProxyProtocolDNS) ||
+		reverseProxyProtocolIsDNS(rule.ListenProtocolAlias) {
+		return false
+	}
+	return rule.ListenWebSocketSupport
+}
+
 // reverseProxyTargetSupportsWebSocket reports whether a configured target has
-// an HTTP-shaped connection on which the proxy can perform a WebSocket
-// handshake. Raw DNS wire transports (UDP/TCP/DoT/DoQ) remain CONNECT-only;
-// DoH/DoH3 are HTTP targets and can also carry a WebSocket upgrade when the
-// peer requests it.
+// an upstream connection that explicitly supports WebSocket communication.
 func reverseProxyTargetSupportsWebSocket(rule *model.ReverseProxyRule) bool {
 	if rule == nil {
 		return false
@@ -512,11 +537,11 @@ func reverseProxyTargetSupportsWebSocket(rule *model.ReverseProxyRule) bool {
 	if reverseProxyIsWebSocketAlias(rule.TargetProtocolAlias) {
 		return true
 	}
-	if strings.EqualFold(strings.TrimSpace(rule.TargetProtocol), reverseProxyProtocolHTTP) ||
-		strings.EqualFold(strings.TrimSpace(rule.TargetProtocol), reverseProxyProtocolHTTPS) {
-		return true
+	if strings.EqualFold(strings.TrimSpace(rule.TargetProtocol), reverseProxyProtocolDNS) ||
+		reverseProxyProtocolIsDNS(rule.TargetProtocolAlias) {
+		return false
 	}
-	return reverseProxyIsHTTPDNSAlias(rule.TargetProtocolAlias)
+	return rule.TargetWebSocketSupport
 }
 
 func reverseProxyTargetUsesTLS(rule *model.ReverseProxyRule) bool {
@@ -999,6 +1024,69 @@ func (l *reverseProxyTrackedClientListener) Accept() (net.Conn, error) {
 	}, nil
 }
 
+type reverseProxyStrictTLSListener struct {
+	net.Listener
+}
+
+func newReverseProxyStrictTLSListener(listener net.Listener) net.Listener {
+	return &reverseProxyStrictTLSListener{Listener: listener}
+}
+
+func (l *reverseProxyStrictTLSListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &reverseProxyStrictTLSConn{Conn: conn}, nil
+}
+
+type reverseProxyStrictTLSConn struct {
+	net.Conn
+	leadBuf   []byte
+	leadPos   int
+	checked   bool
+	checkOnce sync.Once
+}
+
+func (c *reverseProxyStrictTLSConn) Unwrap() net.Conn {
+	return c.Conn
+}
+
+func (c *reverseProxyStrictTLSConn) Read(b []byte) (int, error) {
+	c.checkOnce.Do(func() {
+		c.leadBuf = make([]byte, 1024)
+		n, err := c.Conn.Read(c.leadBuf)
+		if err != nil || n == 0 {
+			_ = c.Conn.Close()
+			c.leadBuf = nil
+			return
+		}
+		c.leadBuf = c.leadBuf[:n]
+		// The first byte of a TLS Handshake record must be 0x16 (recordTypeHandshake).
+		// Non-TLS payloads such as SSH banners ("SSH-2.0...") or plain HTTP requests ("GET /...")
+		// are dropped immediately by closing the connection without any reply.
+		if c.leadBuf[0] != 0x16 {
+			_ = c.Conn.Close()
+			c.leadBuf = nil
+			return
+		}
+		c.checked = true
+	})
+
+	if len(c.leadBuf) > 0 {
+		n := copy(b, c.leadBuf[c.leadPos:])
+		c.leadPos += n
+		if c.leadPos >= len(c.leadBuf) {
+			c.leadBuf = nil
+		}
+		return n, nil
+	}
+	if !c.checked {
+		return 0, net.ErrClosed
+	}
+	return c.Conn.Read(b)
+}
+
 func (c *reverseProxyCountedConn) Close() error {
 	err := c.Conn.Close()
 	c.once.Do(func() {
@@ -1236,6 +1324,8 @@ func reverseProxyRulePayloadFromModel(row *model.ReverseProxyRule, enabled bool)
 	memoryLimit := row.MemoryLimitBytes
 	listenCompressionEnabled, listenCompressionAlgorithms := reverseProxyCompressionSettingsFromModel(row.ListenCompressionEnabled, row.ListenCompressionAlgorithms)
 	targetCompressionEnabled, targetCompressionAlgorithms := reverseProxyCompressionSettingsFromModel(row.TargetCompressionEnabled, row.TargetCompressionAlgorithms)
+	listenWebSocketSupport := row.ListenWebSocketSupport
+	targetWebSocketSupport := row.TargetWebSocketSupport
 	payload := ReverseProxyRulePayload{
 		ID:                          row.Id,
 		Name:                        row.Name,
@@ -1245,6 +1335,7 @@ func reverseProxyRulePayloadFromModel(row *model.ReverseProxyRule, enabled bool)
 		ListenPort:                  row.ListenPort,
 		ListenCompressionEnabled:    &listenCompressionEnabled,
 		ListenCompressionAlgorithms: listenCompressionAlgorithms,
+		ListenWebSocketSupport:      &listenWebSocketSupport,
 		Hosts:                       strings.Join(reverseProxyRuleServerNames(row), ", "),
 		PathPrefix:                  row.PathPrefix,
 		ListenDNSPath:               row.ListenDNSPath,
@@ -1254,6 +1345,7 @@ func reverseProxyRulePayloadFromModel(row *model.ReverseProxyRule, enabled bool)
 		TargetPort:                  row.TargetPort,
 		TargetCompressionEnabled:    &targetCompressionEnabled,
 		TargetCompressionAlgorithms: targetCompressionAlgorithms,
+		TargetWebSocketSupport:      &targetWebSocketSupport,
 		TargetPath:                  row.TargetPath,
 		TargetDNSPath:               row.TargetDNSPath,
 		FallbackDNSUpstreams:        row.FallbackDNSUpstreams,
@@ -1536,6 +1628,7 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 		row.ListenPort = normalized.listenPort
 		row.ListenCompressionEnabled = normalized.listenCompressionEnabled
 		row.ListenCompressionAlgorithms = reverseProxyCompressionStorageValue(normalized.listenCompressionEnabled, normalized.listenCompressionAlgorithms)
+		row.ListenWebSocketSupport = normalized.listenWebSocketSupport
 		row.HostList = encodeReverseProxyList(normalized.hosts)
 		row.PathPrefix = normalized.pathPrefix
 		row.ListenDNSPath = normalized.listenDNSPath
@@ -1545,6 +1638,7 @@ func (s *ReverseProxyService) UpsertRule(payload ReverseProxyRulePayload) error 
 		row.TargetPort = normalized.targetPort
 		row.TargetCompressionEnabled = normalized.targetCompressionEnabled
 		row.TargetCompressionAlgorithms = reverseProxyCompressionStorageValue(normalized.targetCompressionEnabled, normalized.targetCompressionAlgorithms)
+		row.TargetWebSocketSupport = normalized.targetWebSocketSupport
 		row.TargetPath = normalized.targetPath
 		row.TargetDNSPath = normalized.targetDNSPath
 		row.FallbackDNSUpstreams = normalized.fallbackDNSUpstreams
@@ -2156,6 +2250,7 @@ func buildReverseProxyRuleView(row *model.ReverseProxyRule, certMap map[uint]Rev
 			_, values := reverseProxyCompressionSettingsFromModel(row.ListenCompressionEnabled, row.ListenCompressionAlgorithms)
 			return values
 		}(),
+		ListenWebSocketSupport: row.ListenWebSocketSupport,
 		Hosts:               hosts,
 		PathPrefix:          strings.TrimSpace(row.PathPrefix),
 		ListenDNSPath:       strings.TrimSpace(row.ListenDNSPath),
@@ -2171,6 +2266,7 @@ func buildReverseProxyRuleView(row *model.ReverseProxyRule, certMap map[uint]Rev
 			_, values := reverseProxyCompressionSettingsFromModel(row.TargetCompressionEnabled, row.TargetCompressionAlgorithms)
 			return values
 		}(),
+		TargetWebSocketSupport: row.TargetWebSocketSupport,
 		TargetPath:                 strings.TrimSpace(row.TargetPath),
 		TargetDNSPath:              strings.TrimSpace(row.TargetDNSPath),
 		FallbackDNSUpstreams:       strings.TrimSpace(row.FallbackDNSUpstreams),
@@ -2484,6 +2580,8 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 	if !targetCompressionEnabled {
 		targetCompressionAlgorithms = []string{}
 	}
+	listenWebSocketSupport := reverseProxyPayloadWebSocketSupport(payload.ListenWebSocketSupport)
+	targetWebSocketSupport := reverseProxyPayloadWebSocketSupport(payload.TargetWebSocketSupport)
 	normalized := reverseProxyNormalizedRule{
 		id:                          payload.ID,
 		name:                        strings.TrimSpace(payload.Name),
@@ -2491,9 +2589,11 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 		listenPort:                  listenPort,
 		listenCompressionEnabled:    listenCompressionEnabled,
 		listenCompressionAlgorithms: listenCompressionAlgorithms,
+		listenWebSocketSupport:      listenWebSocketSupport,
 		targetPort:                  targetPort,
 		targetCompressionEnabled:    targetCompressionEnabled,
 		targetCompressionAlgorithms: targetCompressionAlgorithms,
+		targetWebSocketSupport:      targetWebSocketSupport,
 		maxConcurrentConnections:    maxConcurrentConnections,
 		maxConcurrentRequests:       maxConcurrentRequests,
 		upstreamMaxConnections:      upstreamMaxConnections,
@@ -2536,6 +2636,16 @@ func (s *ReverseProxyService) normalizeRulePayload(payload ReverseProxyRulePaylo
 	if !reverseProxyProtocolSupportsCompression(normalized.targetProtocol, normalized.targetProtocolAlias) {
 		normalized.targetCompressionEnabled = false
 		normalized.targetCompressionAlgorithms = []string{}
+	}
+	if reverseProxyIsWebSocketAlias(normalized.listenProtocolAlias) {
+		normalized.listenWebSocketSupport = true
+	} else if reverseProxyProtocolIsDNS(normalized.listenProtocolAlias) || normalized.listenProtocol == reverseProxyProtocolDNS {
+		normalized.listenWebSocketSupport = false
+	}
+	if reverseProxyIsWebSocketAlias(normalized.targetProtocolAlias) {
+		normalized.targetWebSocketSupport = true
+	} else if reverseProxyProtocolIsDNS(normalized.targetProtocolAlias) || normalized.targetProtocol == reverseProxyProtocolDNS {
+		normalized.targetWebSocketSupport = false
 	}
 	normalized.listenDNSPath = normalizeReverseProxyDNSPath(payload.ListenDNSPath)
 	normalized.targetDNSPath = normalizeReverseProxyDNSPath(payload.TargetDNSPath)
@@ -3575,9 +3685,8 @@ func reverseProxyHTTPListenerUsesSockets(protocol string, listenStrategy string)
 		case reverseProxyListenHTTPVersionH2Only:
 			return true, false
 		case reverseProxyListenHTTPVersionH3Only:
-			// Keep a TCP compatibility endpoint for HTTP/1.1 Upgrade/CONNECT
-			// and HTTP/2 Extended CONNECT while the UDP endpoint serves H3.
-			return true, true
+			// H3 only uses UDP QUIC. Do not keep a TCP compatibility endpoint.
+			return false, true
 		default:
 			return true, true
 		}
@@ -3586,36 +3695,52 @@ func reverseProxyHTTPListenerUsesSockets(protocol string, listenStrategy string)
 }
 
 // reverseProxyHTTPSListenerNextProtos describes the protocols that the TCP
-// side of a TLS listener may negotiate. Every HTTPS-shaped listener exposes
-// both H2 and H1.1: H1.1 is required for classic WebSocket Upgrade/CONNECT,
-// while H2 is required for RFC 8441 Extended CONNECT. The selected strategy
-// remains useful for routing/advertising decisions, but it must not remove
-// either WebSocket-capable wire entry from the shared endpoint.
+// side of a TLS listener may negotiate. For HTTPS (h2+h3) and h2-only rules,
+// it strictly advertises only H2. WSS rules advertise HTTP/1.1.
 func reverseProxyHTTPSListenerNextProtos(rules []*model.ReverseProxyRule) []string {
 	if len(rules) == 0 {
-		return []string{"h2", "http/1.1"}
+		return []string{"h2"}
 	}
+	hasH2 := false
+	hasH1 := false
 	for _, rule := range rules {
 		if rule == nil {
 			continue
 		}
-		// Touch normalization here so malformed legacy rows do not affect
-		// the advertised result, while still keeping both protocols enabled.
-		_, _ = normalizeReverseProxyListenHTTPVersionStrategy(rule.ListenHTTPVersionStrategy, rule.ListenProtocol)
-		_ = normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
+		alias := normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
+		if alias == "wss" {
+			hasH1 = true
+			continue
+		}
+		strategy, _ := normalizeReverseProxyListenHTTPVersionStrategy(rule.ListenHTTPVersionStrategy, rule.ListenProtocol)
+		if strategy == reverseProxyListenHTTPVersionH2H3 || strategy == reverseProxyListenHTTPVersionH2Only || strategy == reverseProxyListenHTTPVersionH3Only || strategy == "" {
+			hasH2 = true
+		}
 	}
-	return []string{"h2", "http/1.1"}
+	if hasH2 && !hasH1 {
+		return []string{"h2"}
+	}
+	if hasH1 && !hasH2 {
+		return []string{"http/1.1"}
+	}
+	if hasH2 && hasH1 {
+		return []string{"h2", "http/1.1"}
+	}
+	return []string{"h2"}
 }
 
-// reverseProxyRequireHTTP2ALPN rejects TLS clients that do not offer H2.  A
-// TLS client without ALPN can otherwise be accepted by net/http and handled
-// as HTTP/1.1 even when NextProtos contains only "h2".
+// reverseProxyRequireHTTP2ALPN rejects TLS clients that do not offer H2. A
+// TLS client without ALPN or offering only HTTP/1.1 is dropped silently by
+// closing the underlying connection.
 func reverseProxyRequireHTTP2ALPN(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 	if hello != nil {
 		for _, protocol := range hello.SupportedProtos {
 			if protocol == "h2" {
 				return nil, nil
 			}
+		}
+		if hello.Conn != nil {
+			_ = hello.Conn.Close()
 		}
 	}
 	return nil, errors.New("reverse proxy HTTPS listener requires ALPN h2")
@@ -5660,7 +5785,7 @@ func (s *ReverseProxyService) newListenerGroup(key string, rules []*model.Revers
 					_ = group.shutdown()
 					return nil, err
 				}
-				listener = network.NewAutoHttpsListener(listener)
+				listener = newReverseProxyStrictTLSListener(listener)
 				listener = tls.NewListener(listener, tlsConfig)
 			} else {
 				listener = network.NewAutoHttpListener(listener)
@@ -6658,11 +6783,20 @@ func (g *reverseProxyListenerGroup) newHandler() http.Handler {
 		}
 		listenAlias := normalizeReverseProxyProtocolAlias(rule.ListenProtocolAlias, rule.ListenProtocol)
 		targetAlias := normalizeReverseProxyProtocolAlias(rule.TargetProtocolAlias, rule.TargetProtocol)
-		// H1 Upgrade and H2/H3 Extended CONNECT are both accepted on the
-		// same logical HTTPS rule. ALPN/QUIC selects the wire protocol.
-		// A single HTTPS endpoint may expose H1 Upgrade and H2/H3 Extended
-		// CONNECT simultaneously.  ALPN chooses the wire protocol; do not
-		// reject H1 here merely because the rule's preferred strategy is H2.
+
+		// HTTPS (h2+h3, h2-only, h3-only) strictly only accepts HTTP/2 and HTTP/3.
+		// Any HTTP/1.x requests, classic HTTP/1.1 WebSocket Upgrade, or non-H2/H3 CONNECT are dropped silently.
+		isHTTPSRule := strings.EqualFold(strings.TrimSpace(rule.ListenProtocol), reverseProxyProtocolHTTPS) && listenAlias != "wss"
+		if isHTTPSRule {
+			if r.ProtoMajor < 2 || reverseProxyIsWebSocketUpgradeRequest(r) {
+				panic(http.ErrAbortHandler)
+			}
+			if r.Method == http.MethodConnect &&
+				(!reverseProxyIsExtendedWebSocketConnectRequest(r) || !reverseProxyListenSupportsWebSocket(rule)) {
+				panic(http.ErrAbortHandler)
+			}
+		}
+
 		altSvc := g.http3AdvertisementHeader(host, sni, r.ProtoMajor, externalPort)
 		websocketRequest := reverseProxyIsWebSocketUpgradeRequest(r) || reverseProxyIsExtendedWebSocketConnectRequest(r)
 		if (reverseProxyIsWebSocketAlias(listenAlias) || reverseProxyIsWebSocketAlias(targetAlias)) &&
@@ -6692,6 +6826,10 @@ func (g *reverseProxyListenerGroup) newHandler() http.Handler {
 			return
 		}
 		if reverseProxyIsWebSocketUpgradeRequest(r) {
+			if !reverseProxyListenSupportsWebSocket(rule) {
+				http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+				return
+			}
 			if !reverseProxyResources.tryAcquireHTTP() {
 				w.Header().Set("Retry-After", "1")
 				http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
@@ -8173,7 +8311,15 @@ func (g *reverseProxyListenerGroup) forwardCONNECT(w http.ResponseWriter, r *htt
 		reverseProxyWriteGatewayError(w, err)
 		return
 	}
-	if reverseProxyIsExtendedWebSocketConnectRequest(r) && reverseProxyTargetSupportsWebSocket(rule) {
+	if reverseProxyIsExtendedWebSocketConnectRequest(r) {
+		if !reverseProxyListenSupportsWebSocket(rule) || !reverseProxyTargetSupportsWebSocket(rule) {
+			_ = dialResult.conn.Close()
+			if altSvc != "" {
+				w.Header().Set("Alt-Svc", altSvc)
+			}
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
 		g.forwardExtendedWebSocketCONNECT(w, r, rule, altSvc, dialResult)
 		return
 	}
@@ -8245,6 +8391,10 @@ func (g *reverseProxyListenerGroup) forwardCONNECT(w http.ResponseWriter, r *htt
 // compression writer: once the upstream returns 101, both legs carry opaque
 // WebSocket frames and must remain byte-for-byte unchanged.
 func (g *reverseProxyListenerGroup) forwardWebSocketUpgrade(w http.ResponseWriter, r *http.Request, rule *model.ReverseProxyRule, altSvc string) {
+	if !reverseProxyListenSupportsWebSocket(rule) {
+		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+		return
+	}
 	if !reverseProxyTargetSupportsWebSocket(rule) {
 		http.Error(w, http.StatusText(http.StatusUpgradeRequired), http.StatusUpgradeRequired)
 		return

@@ -525,6 +525,14 @@
                       hide-details />
                     <div class="text-caption text-medium-emphasis mt-2">{{ listenProtocolBehavior }}</div>
                   </v-col>
+                  <v-col v-if="listenWebSocketVisible" cols="12" lg="12">
+                    <v-switch
+                      v-model="editingRule.listenWebSocketSupport"
+                      color="primary"
+                      :label="reverseProxyCopy.listenWebSocketSupport"
+                      hide-details />
+                    <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.listenWebSocketSupportHint }}</div>
+                  </v-col>
                   <v-col v-if="!listenIsPlainDNS" cols="12" md="6" lg="12">
                     <v-text-field
                       v-model="editingRule.hostsText"
@@ -734,6 +742,14 @@
                       @update:modelValue="changeTargetProtocol"
                       hide-details />
                     <div class="text-caption text-medium-emphasis mt-2">{{ targetProtocolBehavior }}</div>
+                  </v-col>
+                  <v-col v-if="targetWebSocketVisible" cols="12" lg="12">
+                    <v-switch
+                      v-model="editingRule.targetWebSocketSupport"
+                      color="primary"
+                      :label="reverseProxyCopy.targetWebSocketSupport"
+                      hide-details />
+                    <div class="text-caption text-medium-emphasis mt-2">{{ reverseProxyCopy.targetWebSocketSupportHint }}</div>
                   </v-col>
                   <v-col cols="12" lg="12">
                     <v-text-field
@@ -1196,6 +1212,8 @@ const {
   targetIsDNS,
   listenCompressionVisible,
   targetCompressionVisible,
+  listenWebSocketVisible,
+  targetWebSocketVisible,
   targetVersionConfigurable,
   listenCanAdvertiseHTTP3,
   hasPreviewProtocol,

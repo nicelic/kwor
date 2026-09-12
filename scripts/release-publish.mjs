@@ -25,6 +25,7 @@ const allowOtherBranch = argv.includes('--allow-other-branch')
 const remote = readOptionValue('--remote') || 'origin'
 const branch = readOptionValue('--branch') || 'main'
 const assetsDirOption = readOptionValue('--assets-dir') || 'releases'
+const notesOption = readOptionValue('--notes') || ''
 
 const releaseRelevantRoots = [
   '.github',
@@ -170,6 +171,7 @@ await createAndUploadRelease({
   tagName,
   branch,
   releaseAssets,
+  notes: notesOption,
 })
 
 const dockerRun = await runDockerStep('Docker workflow did not start', () => waitForDockerWorkflowStart({
@@ -200,6 +202,7 @@ Options:
   --verify-docker           verify the current version/HEAD Docker workflow and GHCR image without publishing
   --remote <name>           git remote to push to (default: origin)
   --branch <name>           branch to push HEAD to (default: main)
+  --notes <text>            release description / body text
   --allow-other-branch      skip the current-branch check
 `)
 }
@@ -426,7 +429,7 @@ function printDockerVerification(run, release) {
   console.log(`Verified Docker platforms: ${release.platforms.join(', ')}`)
 }
 
-async function createAndUploadRelease({ repository, token, tagName, branch, releaseAssets }) {
+async function createAndUploadRelease({ repository, token, tagName, branch, releaseAssets, notes = '' }) {
   const releasePath = `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/releases/tags/${encodeURIComponent(tagName)}`
   const existing = await githubRequest({
     method: 'GET',
@@ -450,7 +453,7 @@ async function createAndUploadRelease({ repository, token, tagName, branch, rele
       tag_name: tagName,
       target_commitish: branch,
       name: `kwor ${tagName}`,
-      body: '',
+      body: notes,
       draft: true,
       prerelease: false,
       generate_release_notes: false,

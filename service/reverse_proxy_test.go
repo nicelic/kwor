@@ -154,7 +154,7 @@ func TestReverseProxyHTTPSListenerNextProtosStrictModes(t *testing.T) {
 				ListenProtocol:            reverseProxyProtocolHTTPS,
 				ListenHTTPVersionStrategy: reverseProxyListenHTTPVersionH2Only,
 			}},
-			want: []string{"h2", "http/1.1"},
+			want: []string{"h2"},
 		},
 		{
 			name: "h2+h3",
@@ -162,7 +162,7 @@ func TestReverseProxyHTTPSListenerNextProtosStrictModes(t *testing.T) {
 				ListenProtocol:            reverseProxyProtocolHTTPS,
 				ListenHTTPVersionStrategy: reverseProxyListenHTTPVersionH2H3,
 			}},
-			want: []string{"h2", "http/1.1"},
+			want: []string{"h2"},
 		},
 		{
 			name: "wss-only",
@@ -170,7 +170,7 @@ func TestReverseProxyHTTPSListenerNextProtosStrictModes(t *testing.T) {
 				ListenProtocol:      reverseProxyProtocolHTTPS,
 				ListenProtocolAlias: "wss",
 			}},
-			want: []string{"h2", "http/1.1"},
+			want: []string{"http/1.1"},
 		},
 		{
 			name: "wss-and-h2-routes",
@@ -186,7 +186,7 @@ func TestReverseProxyHTTPSListenerNextProtosStrictModes(t *testing.T) {
 				ListenProtocol:      reverseProxyProtocolDNS,
 				ListenProtocolAlias: reverseProxyDNSProtocolDoH,
 			}},
-			want: []string{"h2", "http/1.1"},
+			want: []string{"h2"},
 		},
 	}
 
@@ -2856,11 +2856,11 @@ func TestReverseProxyDNSAndHTTPListenerSocketConflictMatrix(t *testing.T) {
 		conflicts bool
 	}{
 		{name: "dot_with_h2", dnsAlias: reverseProxyDNSProtocolDoT, httpMode: reverseProxyListenHTTPVersionH2Only, conflicts: true},
-		{name: "dot_with_h3", dnsAlias: reverseProxyDNSProtocolDoT, httpMode: reverseProxyListenHTTPVersionH3Only, conflicts: true},
+		{name: "dot_with_h3", dnsAlias: reverseProxyDNSProtocolDoT, httpMode: reverseProxyListenHTTPVersionH3Only, conflicts: false},
 		{name: "doq_with_h2", dnsAlias: reverseProxyDNSProtocolDoQ, httpMode: reverseProxyListenHTTPVersionH2Only, conflicts: false},
 		{name: "doq_with_h3", dnsAlias: reverseProxyDNSProtocolDoQ, httpMode: reverseProxyListenHTTPVersionH3Only, conflicts: true},
 		{name: "doh_with_h2", dnsAlias: reverseProxyDNSProtocolDoH, httpMode: reverseProxyListenHTTPVersionH2Only, conflicts: true},
-		{name: "doh_with_h3", dnsAlias: reverseProxyDNSProtocolDoH, httpMode: reverseProxyListenHTTPVersionH3Only, conflicts: true},
+		{name: "doh_with_h3", dnsAlias: reverseProxyDNSProtocolDoH, httpMode: reverseProxyListenHTTPVersionH3Only, conflicts: false},
 		{name: "doh3_with_h2", dnsAlias: reverseProxyDNSProtocolDoHH3, httpMode: reverseProxyListenHTTPVersionH2Only, conflicts: false},
 		{name: "doh3_with_h3", dnsAlias: reverseProxyDNSProtocolDoHH3, httpMode: reverseProxyListenHTTPVersionH3Only, conflicts: true},
 	}
@@ -5244,10 +5244,10 @@ func TestReverseProxyHTTPSListenerH2AndH3AcceptsHTTP11(t *testing.T) {
 		},
 	}
 	h1Conn, err := h1Dialer.DialContext(context.Background(), "tcp", "127.0.0.1:"+strconv.Itoa(listenPort))
-	if err != nil {
-		t.Fatalf("default h2+h3 listener must accept HTTP/1.1 ALPN: %v", err)
+	if err == nil {
+		_ = h1Conn.Close()
+		t.Fatalf("default h2+h3 listener must reject HTTP/1.1-only ALPN")
 	}
-	_ = h1Conn.Close()
 }
 
 func TestReverseProxyHTTPSListenerSupportsHTTP3WebSocketCONNECT(t *testing.T) {
@@ -5427,10 +5427,10 @@ func TestReverseProxyHTTPSListenerMovesBetweenTCPAndUDPGroups(t *testing.T) {
 	if err := database.GetDB().Where("id = ?", saved.Id).First(&saved).Error; err != nil {
 		t.Fatalf("reload h3-only listener rule failed: %v", err)
 	}
-	h3TCP, _, h3TCPListeners, h3TCPPackets := groupFor(reverseProxySocketKindTCP)
+	h3TCP, _, _, _ := groupFor(reverseProxySocketKindTCP)
 	h3Only, strategy, tcpListeners, udpListeners := groupFor(reverseProxySocketKindUDP)
-	if h3TCP == nil || h3TCPListeners == 0 || h3TCPPackets != 0 || h3Only == nil || h3Only != h2h3UDP || strategy != reverseProxyListenHTTPVersionH3Only || tcpListeners != 0 || udpListeners == 0 {
-		t.Fatalf("h3-only strategy must retain tcp compatibility plus udp H3: tcp=%p/%d/%d udp=%p/%q/%d/%d", h3TCP, h3TCPListeners, h3TCPPackets, h3Only, strategy, tcpListeners, udpListeners)
+	if h3TCP != nil || h3Only == nil || h3Only != h2h3UDP || strategy != reverseProxyListenHTTPVersionH3Only || tcpListeners != 0 || udpListeners == 0 {
+		t.Fatalf("h3-only strategy must have only udp H3 and no tcp listener: tcp=%p udp=%p/%q/%d/%d", h3TCP, h3Only, strategy, tcpListeners, udpListeners)
 	}
 }
 
@@ -5648,10 +5648,10 @@ func TestReverseProxyHTTPSListenerH2OnlyRejectsHTTP3Client(t *testing.T) {
 		},
 	}
 	h1Conn, err := h1Dialer.DialContext(context.Background(), "tcp", "127.0.0.1:"+strconv.Itoa(listenPort))
-	if err != nil {
-		t.Fatalf("h2-only compatibility listener should accept H1 ALPN for classic WebSocket Upgrade/CONNECT: %v", err)
+	if err == nil {
+		_ = h1Conn.Close()
+		t.Fatalf("h2-only listener must reject H1-only ALPN")
 	}
-	_ = h1Conn.Close()
 
 	transport := &http3.Transport{
 		TLSClientConfig: &tls.Config{
@@ -5750,7 +5750,7 @@ func TestReverseProxyHTTPSListenerH3OnlyRejectsTCPHTTPSClient(t *testing.T) {
 				ServerName:         "example.com",
 			},
 		},
-		Timeout: 8 * time.Second,
+		Timeout: 2 * time.Second,
 	}
 	tcpReq, err := http.NewRequest(http.MethodGet, "https://127.0.0.1:"+strconv.Itoa(listenPort)+"/h2/ping", nil)
 	if err != nil {
@@ -5758,11 +5758,10 @@ func TestReverseProxyHTTPSListenerH3OnlyRejectsTCPHTTPSClient(t *testing.T) {
 	}
 	tcpReq.Host = "example.com"
 	tcpResp, err := tcpClient.Do(tcpReq)
-	if err != nil {
-		t.Fatalf("h3-only compatibility listener should accept TCP/H1 HTTP for WebSocket Upgrade/CONNECT: %v", err)
+	if err == nil {
+		_ = tcpResp.Body.Close()
+		t.Fatalf("h3-only listener must reject TCP requests because no TCP listener should be started")
 	}
-	_, _ = io.ReadAll(tcpResp.Body)
-	_ = tcpResp.Body.Close()
 }
 
 func TestReverseProxyVirtualH2ListenerProxiesToVirtualH3Upstream(t *testing.T) {
@@ -8609,5 +8608,155 @@ func openReverseProxyTestDB(t *testing.T) {
 		t.Cleanup(func() {
 			_ = sqlDB.Close()
 		})
+	}
+}
+
+func TestReverseProxyWebSocketSupportFlag(t *testing.T) {
+	// 1. Listen side
+	if reverseProxyListenSupportsWebSocket(nil) {
+		t.Fatal("expected nil rule to not support websocket on listen side")
+	}
+
+	wsRule := &model.ReverseProxyRule{
+		ListenProtocol:         reverseProxyProtocolHTTP,
+		ListenProtocolAlias:    "ws",
+		ListenWebSocketSupport: false,
+	}
+	if !reverseProxyListenSupportsWebSocket(wsRule) {
+		t.Fatal("expected ws alias rule to always support websocket on listen side")
+	}
+
+	dnsRule := &model.ReverseProxyRule{
+		ListenProtocol:         reverseProxyProtocolDNS,
+		ListenProtocolAlias:    "dns_doh",
+		ListenWebSocketSupport: true,
+	}
+	if reverseProxyListenSupportsWebSocket(dnsRule) {
+		t.Fatal("expected dns rule to never support websocket on listen side")
+	}
+
+	h2RuleEnabled := &model.ReverseProxyRule{
+		ListenProtocol:         reverseProxyProtocolHTTPS,
+		ListenWebSocketSupport: true,
+	}
+	if !reverseProxyListenSupportsWebSocket(h2RuleEnabled) {
+		t.Fatal("expected https/h2 rule with websocket enabled to support websocket on listen side")
+	}
+
+	h2RuleDisabled := &model.ReverseProxyRule{
+		ListenProtocol:         reverseProxyProtocolHTTPS,
+		ListenWebSocketSupport: false,
+	}
+	if reverseProxyListenSupportsWebSocket(h2RuleDisabled) {
+		t.Fatal("expected https/h2 rule with websocket disabled to not support websocket on listen side")
+	}
+
+	// 2. Target side
+	if reverseProxyTargetSupportsWebSocket(nil) {
+		t.Fatal("expected nil rule to not support websocket on target side")
+	}
+
+	wsTargetRule := &model.ReverseProxyRule{
+		TargetProtocol:         reverseProxyProtocolHTTP,
+		TargetProtocolAlias:    "wss",
+		TargetWebSocketSupport: false,
+	}
+	if !reverseProxyTargetSupportsWebSocket(wsTargetRule) {
+		t.Fatal("expected wss target alias rule to always support websocket on target side")
+	}
+
+	dnsTargetRule := &model.ReverseProxyRule{
+		TargetProtocol:         reverseProxyProtocolDNS,
+		TargetProtocolAlias:    "dns_doh3",
+		TargetWebSocketSupport: true,
+	}
+	if reverseProxyTargetSupportsWebSocket(dnsTargetRule) {
+		t.Fatal("expected dns target rule to never support websocket on target side")
+	}
+
+	httpTargetEnabled := &model.ReverseProxyRule{
+		TargetProtocol:         reverseProxyProtocolHTTP,
+		TargetWebSocketSupport: true,
+	}
+	if !reverseProxyTargetSupportsWebSocket(httpTargetEnabled) {
+		t.Fatal("expected http target rule with websocket enabled to support websocket on target side")
+	}
+
+	httpTargetDisabled := &model.ReverseProxyRule{
+		TargetProtocol:         reverseProxyProtocolHTTP,
+		TargetWebSocketSupport: false,
+	}
+	if reverseProxyTargetSupportsWebSocket(httpTargetDisabled) {
+		t.Fatal("expected http target rule with websocket disabled to not support websocket on target side")
+	}
+}
+
+func TestReverseProxyWebSocketSupportNormalization(t *testing.T) {
+	svc := &ReverseProxyService{}
+	boolFalse := false
+	boolTrue := true
+
+	basePayload := func() ReverseProxyRulePayload {
+		return ReverseProxyRulePayload{
+			Name:            "test-rule",
+			ListenPort:      8443,
+			TargetPort:      8080,
+			TargetAddresses: "127.0.0.1",
+		}
+	}
+
+	// Test default when nil (backward compatibility)
+	payloadNil := basePayload()
+	payloadNil.ListenProtocol = "http"
+	payloadNil.TargetProtocol = "http"
+	normalizedNil, err := svc.normalizeRulePayload(payloadNil)
+	if err != nil {
+		t.Fatalf("normalize failed: %v", err)
+	}
+	if !normalizedNil.listenWebSocketSupport || !normalizedNil.targetWebSocketSupport {
+		t.Fatal("expected default to true when payload websocket support is nil")
+	}
+
+	// Test explicit false
+	payloadFalse := basePayload()
+	payloadFalse.ListenProtocol = "http"
+	payloadFalse.TargetProtocol = "http"
+	payloadFalse.ListenWebSocketSupport = &boolFalse
+	payloadFalse.TargetWebSocketSupport = &boolFalse
+	normalizedFalse, err := svc.normalizeRulePayload(payloadFalse)
+	if err != nil {
+		t.Fatalf("normalize failed: %v", err)
+	}
+	if normalizedFalse.listenWebSocketSupport || normalizedFalse.targetWebSocketSupport {
+		t.Fatal("expected explicit false to be preserved")
+	}
+
+	// Test ws alias overrides false to true
+	payloadWSAlias := basePayload()
+	payloadWSAlias.ListenProtocol = "ws"
+	payloadWSAlias.TargetProtocol = "ws"
+	payloadWSAlias.ListenWebSocketSupport = &boolFalse
+	payloadWSAlias.TargetWebSocketSupport = &boolFalse
+	normalizedWSAlias, err := svc.normalizeRulePayload(payloadWSAlias)
+	if err != nil {
+		t.Fatalf("normalize failed: %v", err)
+	}
+	if !normalizedWSAlias.listenWebSocketSupport || !normalizedWSAlias.targetWebSocketSupport {
+		t.Fatal("expected ws/wss alias to force websocket support to true")
+	}
+
+	// Test DNS overrides true to false
+	payloadDNS := basePayload()
+	payloadDNS.ListenProtocol = "dns_udp"
+	payloadDNS.TargetProtocol = "dns_udp"
+	payloadDNS.DNSAllowedCIDRs = "127.0.0.1/32"
+	payloadDNS.ListenWebSocketSupport = &boolTrue
+	payloadDNS.TargetWebSocketSupport = &boolTrue
+	normalizedDNS, err := svc.normalizeRulePayload(payloadDNS)
+	if err != nil {
+		t.Fatalf("normalize failed: %v", err)
+	}
+	if normalizedDNS.listenWebSocketSupport || normalizedDNS.targetWebSocketSupport {
+		t.Fatal("expected dns protocol to force websocket support to false")
 	}
 }

@@ -21,6 +21,7 @@ type ReverseProxyRule struct {
 	// arrays stored as text so old SQLite rows can be upgraded in place.
 	ListenCompressionEnabled    bool   `json:"listenCompressionEnabled" gorm:"column:listen_compression_enabled;not null;default:true"`
 	ListenCompressionAlgorithms string `json:"listenCompressionAlgorithms" gorm:"column:listen_compression_algorithms;type:text;not null;default:''"`
+	ListenWebSocketSupport      bool   `json:"listenWebSocketSupport" gorm:"column:listen_websocket_support;not null;default:true"`
 
 	HostList      string `json:"hostList" gorm:"type:text;not null;default:''"`
 	PathPrefix    string `json:"pathPrefix" gorm:"size:1024;not null;default:'/'"`
@@ -32,6 +33,7 @@ type ReverseProxyRule struct {
 	TargetPort                  int    `json:"targetPort" gorm:"not null;default:0"`
 	TargetCompressionEnabled    bool   `json:"targetCompressionEnabled" gorm:"column:target_compression_enabled;not null;default:true"`
 	TargetCompressionAlgorithms string `json:"targetCompressionAlgorithms" gorm:"column:target_compression_algorithms;type:text;not null;default:''"`
+	TargetWebSocketSupport      bool   `json:"targetWebSocketSupport" gorm:"column:target_websocket_support;not null;default:true"`
 	TargetPath                  string `json:"targetPath" gorm:"size:1024;not null;default:''"`
 	TargetDNSPath               string `json:"targetDnsPath" gorm:"column:target_dns_path;size:1024;not null;default:''"`
 	FallbackDNSUpstreams        string `json:"fallbackDnsUpstreams" gorm:"column:fallback_dns_upstreams;type:text;not null;default:''"`

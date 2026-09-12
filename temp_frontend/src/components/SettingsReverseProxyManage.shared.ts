@@ -69,6 +69,10 @@ export const reverseProxyCopy = {
   compressionBr: 'br',
   compressionDeflate: 'deflate',
   compressionGzip: 'gzip',
+  listenWebSocketSupport: 'WS 传输支持',
+  listenWebSocketSupportHint: '允许客户端通过当前监听协议建立 WebSocket 连接（HTTP Upgrade 或 H2/H3 Extended CONNECT）。',
+  targetWebSocketSupport: 'WS 传输支持',
+  targetWebSocketSupportHint: '允许向上游发起 WebSocket 传输（HTTP Upgrade 握手或 Extended CONNECT 桥接）。',
   targetPort: '目标端口',
   targetPath: '目标基础路径',
   targetDnsPath: '目标 DNS URL 路径',
@@ -338,6 +342,7 @@ export const createEmptyReverseProxyRuleForm = (): ReverseProxyRuleForm => ({
   listenPort: 80,
   listenCompressionEnabled: true,
   listenCompressionAlgorithms: [...reverseProxyCompressionOrder],
+  listenWebSocketSupport: true,
   hostsText: '',
   pathPrefix: '',
   listenDnsPath: '/dns-query',
@@ -346,6 +351,7 @@ export const createEmptyReverseProxyRuleForm = (): ReverseProxyRuleForm => ({
   targetPort: 80,
   targetCompressionEnabled: true,
   targetCompressionAlgorithms: [...reverseProxyCompressionOrder],
+  targetWebSocketSupport: true,
   targetPath: '',
   targetDnsPath: '/dns-query',
   fallbackDnsUpstreams: '',
@@ -415,6 +421,14 @@ const protocolSupportsCompression = (value: string) => {
     || normalized === 'h3'
     || normalized === 'dns_doh'
     || normalized === 'dns_doh3'
+}
+
+const protocolSupportsWebSocket = (value: string) => {
+  const normalized = value.trim().toLowerCase()
+  return normalized === 'http'
+    || normalized === 'https'
+    || normalized === 'h2'
+    || normalized === 'h3'
 }
 
 const asBoolean = (value: unknown, fallback = false) => {
@@ -572,6 +586,7 @@ const normalizeRule = (value: unknown): ReverseProxyRule => {
     listenPort: asNumber(item.listenPort),
     listenCompressionEnabled: asBoolean(item.listenCompressionEnabled, true),
     listenCompressionAlgorithms: normalizeCompressionAlgorithms(item.listenCompressionAlgorithms),
+    listenWebSocketSupport: asBoolean(item.listenWebSocketSupport, true),
     hosts: normalizeStringList(item.hosts),
     pathPrefix: asString(item.pathPrefix),
     listenDnsPath: asString(item.listenDnsPath),
@@ -580,6 +595,7 @@ const normalizeRule = (value: unknown): ReverseProxyRule => {
     targetPort: asNumber(item.targetPort),
     targetCompressionEnabled: asBoolean(item.targetCompressionEnabled, true),
     targetCompressionAlgorithms: normalizeCompressionAlgorithms(item.targetCompressionAlgorithms),
+    targetWebSocketSupport: asBoolean(item.targetWebSocketSupport, true),
     targetPath: asString(item.targetPath),
     targetDnsPath: asString(item.targetDnsPath),
     fallbackDnsUpstreams: asString(item.fallbackDnsUpstreams),
@@ -1031,7 +1047,7 @@ const deriveTargetProtocolForForm = (
 
 const mapListenProtocolToBackend = (protocol: string): {
   listenProtocol: 'http' | 'https' | 'dns'
-  listenProtocolAlias?: '' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
+  listenProtocolAlias?: '' | 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
   listenHttpVersionStrategy: '' | 'h2_h3' | 'h2_only' | 'h3_only'
 } => {
   const raw = protocol.trim().toLowerCase()
@@ -1043,10 +1059,10 @@ const mapListenProtocolToBackend = (protocol: string): {
     }
   }
   if (raw === 'ws') {
-    return { listenProtocol: 'http', listenHttpVersionStrategy: '' }
+    return { listenProtocol: 'http', listenProtocolAlias: 'ws', listenHttpVersionStrategy: '' }
   }
   if (raw === 'wss') {
-    return { listenProtocol: 'https', listenHttpVersionStrategy: 'h2_only' }
+    return { listenProtocol: 'https', listenProtocolAlias: 'wss', listenHttpVersionStrategy: '' }
   }
   const normalized = normalizeVirtualProtocol(protocol)
   if (normalized === 'http') {
@@ -1066,7 +1082,7 @@ const mapTargetProtocolToBackend = (
   strategy: ReverseProxyRuleForm['httpVersionStrategy'],
 ): {
   targetProtocol: 'http' | 'https' | 'dns'
-  targetProtocolAlias?: '' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
+  targetProtocolAlias?: '' | 'ws' | 'wss' | 'dns_doh' | 'dns_doh3' | 'dns_doq' | 'dns_dot' | 'dns_udp' | 'dns_tcp'
   httpVersionStrategy: ReverseProxyRuleForm['httpVersionStrategy']
 } => {
   const raw = protocol.trim().toLowerCase()
@@ -1078,10 +1094,10 @@ const mapTargetProtocolToBackend = (
     }
   }
   if (raw === 'ws') {
-    return { targetProtocol: 'http', httpVersionStrategy: '' }
+    return { targetProtocol: 'http', targetProtocolAlias: 'ws', httpVersionStrategy: '' }
   }
   if (raw === 'wss') {
-    return { targetProtocol: 'https', httpVersionStrategy: '' }
+    return { targetProtocol: 'https', targetProtocolAlias: 'wss', httpVersionStrategy: '' }
   }
   const normalized = normalizeVirtualProtocol(protocol)
   if (normalized === 'http') {
@@ -1130,6 +1146,7 @@ export const mapRuleToForm = (rule?: ReverseProxyRule): ReverseProxyRuleForm => 
     listenPort: normalizedHosts.port ?? rule?.listenPort ?? 80,
     listenCompressionEnabled: rule?.listenCompressionEnabled ?? true,
     listenCompressionAlgorithms: normalizeCompressionAlgorithms(rule?.listenCompressionAlgorithms),
+    listenWebSocketSupport: rule?.listenWebSocketSupport ?? true,
     hostsText: normalizedHosts.text,
     pathPrefix: rule?.pathPrefix ?? '',
     listenDnsPath: rule?.listenDnsPath ?? (dnsProtocolUsesPath(listenProtocol) ? '/dns-query' : ''),
@@ -1138,6 +1155,7 @@ export const mapRuleToForm = (rule?: ReverseProxyRule): ReverseProxyRuleForm => 
     targetPort: normalizedTargetAddresses.port ?? rule?.targetPort ?? 80,
     targetCompressionEnabled: rule?.targetCompressionEnabled ?? true,
     targetCompressionAlgorithms: normalizeCompressionAlgorithms(rule?.targetCompressionAlgorithms),
+    targetWebSocketSupport: rule?.targetWebSocketSupport ?? true,
     targetPath: rule?.targetPath ?? '',
     targetDnsPath: rule?.targetDnsPath ?? (dnsProtocolUsesPath(targetProtocol) ? '/dns-query' : ''),
     fallbackDnsUpstreams: rule?.fallbackDnsUpstreams ?? '',
@@ -1228,6 +1246,14 @@ export const buildReverseProxyPayload = (
   const targetCompressionSupported = protocolSupportsCompression(form.targetProtocol)
   const listenCompressionEnabled = listenCompressionSupported && form.listenCompressionEnabled !== false
   const targetCompressionEnabled = targetCompressionSupported && form.targetCompressionEnabled !== false
+  const listenWebSocketSupported = protocolSupportsWebSocket(form.listenProtocol)
+  const targetWebSocketSupported = protocolSupportsWebSocket(form.targetProtocol)
+  const listenWebSocketSupport = listenWebSocketSupported
+    ? form.listenWebSocketSupport !== false
+    : (form.listenProtocol === 'ws' || form.listenProtocol === 'wss')
+  const targetWebSocketSupport = targetWebSocketSupported
+    ? form.targetWebSocketSupport !== false
+    : (form.targetProtocol === 'ws' || form.targetProtocol === 'wss')
   return {
     id: form.id,
     name,
@@ -1239,6 +1265,7 @@ export const buildReverseProxyPayload = (
     listenCompressionAlgorithms: listenCompressionEnabled
       ? normalizeCompressionAlgorithms(form.listenCompressionAlgorithms)
       : [],
+    listenWebSocketSupport,
     hosts: (!protocolIsDNS(form.listenProtocol) || protocolNeedsCertificates(form.listenProtocol)) ? listenNames.join(', ') : '',
     pathPrefix: normalizePathInput(pathPrefix, true),
     listenDnsPath: dnsProtocolUsesPath(form.listenProtocol) ? normalizePathInput(listenDnsPath, true) : '',
@@ -1250,6 +1277,7 @@ export const buildReverseProxyPayload = (
     targetCompressionAlgorithms: targetCompressionEnabled
       ? normalizeCompressionAlgorithms(form.targetCompressionAlgorithms)
       : [],
+    targetWebSocketSupport,
     targetPath: normalizePathInput(targetPath, true),
     targetDnsPath: dnsProtocolUsesPath(form.targetProtocol) ? normalizePathInput(targetDnsPath, true) : '',
     fallbackDnsUpstreams: protocolIsDNS(form.listenProtocol) && protocolIsDNS(form.targetProtocol) ? fallbackDnsUpstreams : '',
@@ -1917,6 +1945,8 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   const targetIsDNS = computed(() => protocolIsDNS(editingRule.value.targetProtocol))
   const listenCompressionVisible = computed(() => protocolSupportsCompression(editingRule.value.listenProtocol))
   const targetCompressionVisible = computed(() => protocolSupportsCompression(editingRule.value.targetProtocol))
+  const listenWebSocketVisible = computed(() => protocolSupportsWebSocket(editingRule.value.listenProtocol))
+  const targetWebSocketVisible = computed(() => protocolSupportsWebSocket(editingRule.value.targetProtocol))
   const hasPreviewProtocol = computed(() => {
     return false
   })
@@ -2182,6 +2212,8 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     targetIsDNS,
     listenCompressionVisible,
     targetCompressionVisible,
+    listenWebSocketVisible,
+    targetWebSocketVisible,
     targetVersionConfigurable,
     listenCanAdvertiseHTTP3,
     hasPreviewProtocol,
