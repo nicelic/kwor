@@ -207,29 +207,41 @@
             </td>
             <!-- 当前探测 / 同步 IP -->
             <td>
-              <div v-if="rule.lastIpv4" class="text-caption d-flex align-center ga-1 mb-0-5">
-                <v-chip size="x-small" color="blue" variant="outlined" density="compact">v4</v-chip>
-                <span class="font-weight-medium text-body-2">{{ rule.lastIpv4 }}</span>
-                <v-btn
-                  size="x-small"
-                  variant="text"
-                  icon="mdi-content-copy"
-                  density="compact"
-                  title="复制 IPv4"
-                  @click="copyToClipboard(rule.lastIpv4, 'IPv4')"
-                />
+              <div v-if="rule.lastIpv4" class="mb-1">
+                <div
+                  v-for="ip in getIpList(rule.lastIpv4)"
+                  :key="'pc-v4-' + ip"
+                  class="text-caption d-flex align-center ga-1 mb-0-5"
+                >
+                  <v-chip size="x-small" color="blue" variant="outlined" density="compact">v4</v-chip>
+                  <span class="font-weight-medium text-body-2">{{ ip }}</span>
+                  <v-btn
+                    size="x-small"
+                    variant="text"
+                    icon="mdi-content-copy"
+                    density="compact"
+                    title="复制 IPv4"
+                    @click="copyToClipboard(ip, 'IPv4')"
+                  />
+                </div>
               </div>
-              <div v-if="rule.lastIpv6" class="text-caption d-flex align-center ga-1">
-                <v-chip size="x-small" color="teal" variant="outlined" density="compact">v6</v-chip>
-                <span class="font-weight-medium text-body-2 text-truncate" style="max-width: 160px;" :title="rule.lastIpv6">{{ rule.lastIpv6 }}</span>
-                <v-btn
-                  size="x-small"
-                  variant="text"
-                  icon="mdi-content-copy"
-                  density="compact"
-                  title="复制 IPv6"
-                  @click="copyToClipboard(rule.lastIpv6, 'IPv6')"
-                />
+              <div v-if="rule.lastIpv6">
+                <div
+                  v-for="ip in getIpList(rule.lastIpv6)"
+                  :key="'pc-v6-' + ip"
+                  class="text-caption d-flex align-center ga-1 mb-0-5"
+                >
+                  <v-chip size="x-small" color="teal" variant="outlined" density="compact">v6</v-chip>
+                  <span class="font-weight-medium text-body-2 text-truncate" style="max-width: 160px;" :title="ip">{{ ip }}</span>
+                  <v-btn
+                    size="x-small"
+                    variant="text"
+                    icon="mdi-content-copy"
+                    density="compact"
+                    title="复制 IPv6"
+                    @click="copyToClipboard(ip, 'IPv6')"
+                  />
+                </div>
               </div>
               <div v-if="!rule.lastIpv4 && !rule.lastIpv6" class="text-caption text-medium-emphasis font-italic d-flex align-center ga-1">
                 <v-icon size="14">mdi-clock-outline</v-icon>
@@ -356,15 +368,27 @@
             </v-chip>
           </div>
 
-          <div v-if="rule.lastIpv4" class="text-caption my-1 d-flex align-center ga-1">
-            <v-chip size="x-small" color="blue" variant="outlined">IPv4</v-chip>
-            <span>{{ rule.lastIpv4 }}</span>
-            <v-btn size="x-small" variant="text" icon="mdi-content-copy" density="compact" @click="copyToClipboard(rule.lastIpv4, 'IPv4')" />
+          <div v-if="rule.lastIpv4" class="my-1">
+            <div
+              v-for="ip in getIpList(rule.lastIpv4)"
+              :key="'mob-v4-' + ip"
+              class="text-caption my-0-5 d-flex align-center ga-1"
+            >
+              <v-chip size="x-small" color="blue" variant="outlined">IPv4</v-chip>
+              <span>{{ ip }}</span>
+              <v-btn size="x-small" variant="text" icon="mdi-content-copy" density="compact" @click="copyToClipboard(ip, 'IPv4')" />
+            </div>
           </div>
-          <div v-if="rule.lastIpv6" class="text-caption my-1 d-flex align-center ga-1">
-            <v-chip size="x-small" color="teal" variant="outlined">IPv6</v-chip>
-            <span class="text-truncate" style="max-width: 200px;">{{ rule.lastIpv6 }}</span>
-            <v-btn size="x-small" variant="text" icon="mdi-content-copy" density="compact" @click="copyToClipboard(rule.lastIpv6, 'IPv6')" />
+          <div v-if="rule.lastIpv6" class="my-1">
+            <div
+              v-for="ip in getIpList(rule.lastIpv6)"
+              :key="'mob-v6-' + ip"
+              class="text-caption my-0-5 d-flex align-center ga-1"
+            >
+              <v-chip size="x-small" color="teal" variant="outlined">IPv6</v-chip>
+              <span class="text-truncate" style="max-width: 200px;" :title="ip">{{ ip }}</span>
+              <v-btn size="x-small" variant="text" icon="mdi-content-copy" density="compact" @click="copyToClipboard(ip, 'IPv6')" />
+            </div>
           </div>
           <div v-if="!rule.lastIpv4 && !rule.lastIpv6" class="text-caption text-medium-emphasis font-italic my-1">
             等待首次同步探测
@@ -813,6 +837,7 @@ const {
   searchText,
   statusFilter,
   filteredRules,
+  getIpList,
   copyToClipboard,
   overview,
   ruleDialogVisible,

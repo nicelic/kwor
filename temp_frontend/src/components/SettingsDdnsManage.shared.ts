@@ -320,6 +320,14 @@ export function useDdnsManage(active: Ref<boolean>) {
     return list
   })
 
+  function getIpList(ipStr?: string): string[] {
+    if (!ipStr) return []
+    return ipStr
+      .split(/[,;\s\n\r]+/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+  }
+
   async function copyToClipboard(text: string, label = '内容') {
     if (!text) return
     try {
@@ -495,6 +503,7 @@ export function useDdnsManage(active: Ref<boolean>) {
     searchText,
     statusFilter,
     filteredRules,
+    getIpList,
     copyToClipboard,
     overview,
     ruleDialogVisible,

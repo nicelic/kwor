@@ -20,6 +20,8 @@ func TestClashHysteria2RealmOpts_GenerationAndSanitize(t *testing.T) {
 				"token":        "public",
 				"realm_id":     "my-room",
 				"stun_servers": []string{"stun.hy2.io:3478"},
+				"proxy":        "http://127.0.0.1:7890",
+				"alpn":         []string{"h3", "h2"},
 			},
 		},
 	}
@@ -51,6 +53,13 @@ func TestClashHysteria2RealmOpts_GenerationAndSanitize(t *testing.T) {
 	}
 	if realmOpts["realm-id"] != "my-room" {
 		t.Errorf("expected realm-id=my-room, got %v", realmOpts["realm-id"])
+	}
+	if _, exists := realmOpts["proxy"]; exists {
+		t.Errorf("expected proxy to be stripped from clash proxy realm-opts")
+	}
+	alpn, ok := realmOpts["alpn"].([]string)
+	if !ok || len(alpn) != 2 || alpn[0] != "h3" || alpn[1] != "h2" {
+		t.Errorf("expected alpn to be preserved in clash proxy realm-opts, got %v", realmOpts["alpn"])
 	}
 
 	// stripSubscriptionClashProxyPanelFields should remove internal realm_opts but keep realm-opts

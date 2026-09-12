@@ -190,11 +190,9 @@ func (t *TencentProvider) SyncRecord(ctx context.Context, env map[string]string,
 	}
 
 	var matchedRecordId uint64
-	var matchedValue string
 	for _, r := range queryResult.Response.RecordList {
-		if r.Name == subDomain && r.Type == param.Type {
+		if r.Name == subDomain && r.Type == param.Type && r.Value == param.IP {
 			matchedRecordId = r.RecordId
-			matchedValue = r.Value
 			break
 		}
 	}
@@ -205,28 +203,7 @@ func (t *TencentProvider) SyncRecord(ctx context.Context, env map[string]string,
 	}
 
 	if matchedRecordId > 0 {
-		if matchedValue == param.IP {
-			return strconv.FormatUint(matchedRecordId, 10), nil
-		}
-		// 修改已有记录
-		modifyPayload := map[string]any{
-			"Domain":     rootDomain,
-			"SubDomain":  subDomain,
-			"RecordType": param.Type,
-			"RecordLine": "默认",
-			"Value":      param.IP,
-			"RecordId":   matchedRecordId,
-			"TTL":        ttl,
-		}
-		var modifyResult struct {
-			Response struct {
-				RecordId uint64 `json:"RecordId"`
-			} `json:"Response"`
-		}
-		if err := t.doRequest(ctx, secretId, secretKey, "ModifyRecord", modifyPayload, &modifyResult); err != nil {
-			return "", err
-		}
-		return strconv.FormatUint(modifyResult.Response.RecordId, 10), nil
+		return strconv.FormatUint(matchedRecordId, 10), nil
 	}
 
 	// 新建记录
@@ -288,6 +265,9 @@ func (t *TencentProvider) DeleteRecord(ctx context.Context, env map[string]strin
 
 	for _, r := range queryResult.Response.RecordList {
 		if r.Name == subDomain && r.Type == param.Type {
+			if param.IP != "" && r.Value != param.IP {
+				continue
+			}
 			delPayload := map[string]any{
 				"Domain":   rootDomain,
 				"RecordId": r.RecordId,

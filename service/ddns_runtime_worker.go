@@ -30,12 +30,9 @@ type ddnsDetectTask struct {
 }
 
 type ddnsSyncTask struct {
-	rule      *model.DDNSRule
-	v4        string
-	v6        string
-	v4Changed bool
-	v6Changed bool
-	force     bool
+	rule  *model.DDNSRule
+	plan  DDNSSyncPlan
+	force bool
 }
 
 type ddnsRuntimeWorker struct {
@@ -356,36 +353,30 @@ func (w *ddnsRuntimeWorker) processDetectTask(task *ddnsDetectTask) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	currentV4, currentV6, detectErrors := w.service.detectRuleIPs(ctx, rule)
+	currentV4s, currentV6s, detectErrors := w.service.detectRuleIPs(ctx, rule)
 
-	if len(detectErrors) > 0 && currentV4 == "" && currentV6 == "" {
+	if len(detectErrors) > 0 && len(currentV4s) == 0 && len(currentV6s) == 0 {
 		errMsg := strings.Join(detectErrors, "; ")
-		w.service.updateRuleStatus(rule.Id, "error", errMsg, currentV4, currentV6)
+		w.service.updateRuleStatus(rule.Id, "error", errMsg, rule.LastIPV4, rule.LastIPV6)
 		w.releaseRuleGuard(rule.Id)
 		return
 	}
 
-	needV4 := rule.IPType == "ipv4" || rule.IPType == "dual"
-	needV6 := rule.IPType == "ipv6" || rule.IPType == "dual"
+	plan := w.service.CalculateSyncPlan(rule, currentV4s, currentV6s, detectErrors)
 
-	v4Changed := needV4 && currentV4 != "" && currentV4 != rule.LastIPV4
-	v6Changed := needV6 && currentV6 != "" && currentV6 != rule.LastIPV6
-
-	// 【快慢分离关键短路】：IP 未发生变化且非强制同步，微秒级短路返回！
-	if !task.force && !v4Changed && !v6Changed {
+	// 【快慢分离关键短路】：IP 未发生变化且非首次同步，即便用户设置高频检测也微秒级短路返回！
+	isFirstSync := rule.LastSyncTime == nil
+	if !task.force && !plan.HasChanges && !isFirstSync {
 		w.service.touchRuleSyncTime(rule.Id)
 		w.releaseRuleGuard(rule.Id)
 		return
 	}
 
-	// IP 发生变动或强制同步，投递到慢路径云商同步队列
+	// IP 发生变动或首次同步，投递到慢路径云商同步队列
 	syncTask := &ddnsSyncTask{
-		rule:      rule,
-		v4:        currentV4,
-		v6:        currentV6,
-		v4Changed: v4Changed,
-		v6Changed: v6Changed,
-		force:     task.force,
+		rule:  rule,
+		plan:  plan,
+		force: task.force,
 	}
 
 	select {
@@ -430,7 +421,7 @@ func (w *ddnsRuntimeWorker) processSyncTask(task *ddnsSyncTask) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	if err := w.service.syncRuleDNS(ctx, task.rule, task.v4, task.v6, task.v4Changed, task.v6Changed, task.force); err != nil {
+	if err := w.service.syncRuleDNS(ctx, task.rule, task.plan); err != nil {
 		logger.Warningf("[DDNS] Sync failed for rule %s: %v", task.rule.Name, err)
 	}
 }

@@ -207,24 +207,24 @@ func (c *CloudflareProvider) SyncRecord(ctx context.Context, env map[string]stri
 		"proxied": param.Proxy,
 	}
 
-	if len(records) > 0 {
-		// 已有记录：若内容一致且 proxied 状态一致，则无需重复更新
-		existing := records[0]
-		if existing.Content == param.IP && existing.Proxied == param.Proxy {
-			return existing.ID, nil
+	for _, existing := range records {
+		if existing.Content == param.IP {
+			if existing.Proxied == param.Proxy {
+				return existing.ID, nil
+			}
+			// 更新记录
+			updateURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", zoneID, existing.ID)
+			putResp, err := c.doRequest(ctx, env, "PUT", updateURL, payload)
+			if err != nil {
+				return "", err
+			}
+			var updated cfDNSRecord
+			_ = json.Unmarshal(putResp.Result, &updated)
+			return updated.ID, nil
 		}
-		// 更新记录
-		updateURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", zoneID, existing.ID)
-		putResp, err := c.doRequest(ctx, env, "PUT", updateURL, payload)
-		if err != nil {
-			return "", err
-		}
-		var updated cfDNSRecord
-		_ = json.Unmarshal(putResp.Result, &updated)
-		return updated.ID, nil
 	}
 
-	// 不存在记录：新增记录
+	// 不存在该 IP 的记录：新增记录（支持多 IP）
 	createURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records", zoneID)
 	postResp, err := c.doRequest(ctx, env, "POST", createURL, payload)
 	if err != nil {
@@ -262,6 +262,9 @@ func (c *CloudflareProvider) DeleteRecord(ctx context.Context, env map[string]st
 	}
 
 	for _, r := range records {
+		if param.IP != "" && r.Content != param.IP {
+			continue
+		}
 		delURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", zoneID, r.ID)
 		if _, delErr := c.doRequest(ctx, env, "DELETE", delURL, nil); delErr != nil {
 			return fmt.Errorf("Cloudflare delete record %s failed: %w", r.ID, delErr)

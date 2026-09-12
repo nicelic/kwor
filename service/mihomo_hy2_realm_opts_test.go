@@ -52,6 +52,22 @@ func TestMihomoHysteria2RealmOpts_Normalize(t *testing.T) {
 	if norm["proxy"] != "DIRECT" {
 		t.Errorf("expected proxy=DIRECT, got %v", norm["proxy"])
 	}
+	if _, exists := norm["alpn"]; exists {
+		t.Errorf("expected alpn to be excluded from server listener realm-opts")
+	}
+
+	// Test NormalizeMihomoHysteria2RealmOptsSnake (client out_json storage)
+	snake, ok := util.NormalizeMihomoHysteria2RealmOptsSnake(input)
+	if !ok {
+		t.Fatalf("expected NormalizeMihomoHysteria2RealmOptsSnake to succeed")
+	}
+	if snake["proxy"] != nil {
+		t.Errorf("expected proxy to be excluded from client snake realm_opts")
+	}
+	alpnsSnake, ok := snake["alpn"].([]string)
+	if !ok || len(alpnsSnake) != 2 {
+		t.Errorf("expected 2 alpn entries in snake, got %v", snake["alpn"])
+	}
 
 	// Test BuildMihomoRealmOptsForClash
 	obMap := map[string]interface{}{
@@ -63,6 +79,13 @@ func TestMihomoHysteria2RealmOpts_Normalize(t *testing.T) {
 	}
 	if clashOpts["server-url"] != "https://realm.hy2.io" {
 		t.Errorf("expected clashOpts server-url=https://realm.hy2.io, got %v", clashOpts["server-url"])
+	}
+	if clashOpts["proxy"] != nil {
+		t.Errorf("expected proxy to be excluded from clash client realm-opts")
+	}
+	alpnsClash, ok := clashOpts["alpn"].([]string)
+	if !ok || len(alpnsClash) != 2 {
+		t.Errorf("expected 2 alpn entries in clashOpts, got %v", clashOpts["alpn"])
 	}
 
 	// Disabled case should return nil
@@ -235,5 +258,91 @@ func TestOutboundEditMergeSchema_Hysteria2RealmOptsAccepted(t *testing.T) {
 	}
 	if _, ok := realmKebabNode.Children["server-url"]; !ok {
 		t.Errorf("expected server-url in realm-opts schema children")
+	}
+}
+
+func TestMihomoHysteria2OutJson_SyncFromInboundRealmOpts(t *testing.T) {
+	// Case 1: Inbound has realm_opts enabled with proxy & alpn
+	inboundData := map[string]interface{}{
+		"type":        "hysteria2",
+		"tag":         "hy2-in",
+		"listen_port": 443,
+		"realm_opts": map[string]interface{}{
+			"enable":       true,
+			"server_url":   "https://realm.hy2.io",
+			"token":        "tok123",
+			"realm_id":     "id456",
+			"stun_servers": []string{"stun.hy2.io:3478"},
+			"proxy":        "http://127.0.0.1:7890",
+			"alpn":         []string{"h3", "h2"},
+		},
+		"out_json": map[string]interface{}{
+			"type": "hysteria2",
+		},
+	}
+	rawInbound, _ := json.Marshal(inboundData)
+	var in model.Inbound
+	if err := json.Unmarshal(rawInbound, &in); err != nil {
+		t.Fatalf("unmarshal inbound failed: %v", err)
+	}
+
+	if err := util.FillOutJson(&in, "example.com"); err != nil {
+		t.Fatalf("FillOutJson failed: %v", err)
+	}
+
+	var out map[string]interface{}
+	if err := json.Unmarshal(in.OutJson, &out); err != nil {
+		t.Fatalf("unmarshal out_json failed: %v", err)
+	}
+
+	realmOpts, ok := out["realm_opts"].(map[string]interface{})
+	if !ok || realmOpts == nil {
+		t.Fatalf("expected realm_opts to be synced to client out_json")
+	}
+	if realmOpts["enable"] != true {
+		t.Errorf("expected enable=true, got %v", realmOpts["enable"])
+	}
+	if realmOpts["server_url"] != "https://realm.hy2.io" {
+		t.Errorf("expected server_url=https://realm.hy2.io, got %v", realmOpts["server_url"])
+	}
+	// proxy must be stripped from client out_json
+	if _, exists := realmOpts["proxy"]; exists {
+		t.Errorf("expected proxy to be stripped from client out_json")
+	}
+	// alpn must be preserved in client out_json
+	alpn, ok := realmOpts["alpn"].([]interface{})
+	if !ok || len(alpn) != 2 {
+		t.Errorf("expected 2 alpn items in client out_json, got %v", realmOpts["alpn"])
+	}
+
+	// Case 2: Inbound has NO realm_opts, but old out_json had stale realm_opts
+	inboundNoRealm := map[string]interface{}{
+		"type":        "hysteria2",
+		"tag":         "hy2-no-realm",
+		"listen_port": 443,
+		"out_json": map[string]interface{}{
+			"type": "hysteria2",
+			"realm_opts": map[string]interface{}{
+				"enable":     true,
+				"server_url": "https://stale.realm.org",
+			},
+		},
+	}
+	rawNoRealm, _ := json.Marshal(inboundNoRealm)
+	var inNoRealm model.Inbound
+	if err := json.Unmarshal(rawNoRealm, &inNoRealm); err != nil {
+		t.Fatalf("unmarshal inbound failed: %v", err)
+	}
+
+	if err := util.FillOutJson(&inNoRealm, "example.com"); err != nil {
+		t.Fatalf("FillOutJson failed: %v", err)
+	}
+
+	var outNoRealm map[string]interface{}
+	if err := json.Unmarshal(inNoRealm.OutJson, &outNoRealm); err != nil {
+		t.Fatalf("unmarshal out_json failed: %v", err)
+	}
+	if _, exists := outNoRealm["realm_opts"]; exists {
+		t.Errorf("expected stale realm_opts in client out_json to be removed when server inbound has no realm_opts")
 	}
 }

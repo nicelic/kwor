@@ -21,6 +21,9 @@
         v-model.number="down_mbps">
         </v-text-field>
       </v-col>
+      <v-col cols="12" sm="6" md="4" v-if="!isSingboxNamespace">
+        <v-switch v-model="optionRealm" color="primary" label="realm-opts" hide-details></v-switch>
+      </v-col>
     </v-row>
     <v-row>
       <v-col cols="12" sm="6" md="4" v-if="data.obfs != undefined">
@@ -189,6 +192,9 @@
         <v-col cols="12" sm="6" md="4" v-if="!hideNetworkSelectorForOut">
           <Network :data="data" />
         </v-col>
+        <v-col cols="12" sm="6" md="4" v-if="!isSingboxNamespace">
+          <v-switch v-model="optionRealm" color="primary" label="realm-opts" hide-details></v-switch>
+        </v-col>
         <v-col cols="12" sm="8" v-if="optionMPort && !hidePortHopEditorsForOut">
           <v-text-field
             :label="$t('rule.portRange') + ' ' + $t('commaSeparated')"
@@ -294,15 +300,20 @@
             </v-text-field>
           </v-col>
           <v-col cols="12" sm="12" md="8">
-            <v-text-field
-              label="stun-servers (comma separated)"
-              placeholder="stun.nextcloud.com:3478, stun.sip.us:3478"
+            <v-combobox
+              label="stun-servers"
+              placeholder="选择或输入 STUN 服务器 (可多选/回车添加)"
+              :items="presetStunServers"
+              v-model="realmStunServersValue"
+              multiple
+              chips
+              closable-chips
+              clearable
               hide-details
-              density="compact"
-              v-model="realmStunServersInput">
-            </v-text-field>
+              density="compact">
+            </v-combobox>
           </v-col>
-          <v-col cols="12" sm="6" md="4" v-if="direction == 'in'">
+          <v-col cols="12" sm="6" md="4">
             <v-text-field
               label="proxy (for server-url, optional)"
               placeholder="DIRECT"
@@ -329,7 +340,18 @@
                   <v-text-field label="fingerprint" hide-details density="compact" v-model="realmOpts.fingerprint"></v-text-field>
                 </v-col>
                 <v-col cols="12" sm="6" md="4">
-                  <v-text-field label="alpn (comma separated)" placeholder="h2, http/1.1" hide-details density="compact" v-model="realmAlpnInput"></v-text-field>
+                  <v-combobox
+                    label="alpn"
+                    placeholder="选择或输入 ALPN (如 h3, h2, http/1.1)"
+                    :items="presetAlpnList"
+                    v-model="realmAlpnValue"
+                    multiple
+                    chips
+                    closable-chips
+                    clearable
+                    hide-details
+                    density="compact">
+                  </v-combobox>
                 </v-col>
                 <v-col cols="12" sm="6" md="4">
                   <v-text-field label="certificate (path or content)" hide-details density="compact" v-model="realmOpts.certificate"></v-text-field>
@@ -408,6 +430,28 @@ function formatBytePlaceholder(value: number): string {
   return `${value}_${value / 1000000}MB`
 }
 
+const PRESET_STUN_SERVERS = [
+  'stun.cloudflare.com:3478',
+  'stun.l.google.com:19302',
+  'stun1.l.google.com:19302',
+  'stun2.l.google.com:19302',
+  'stun3.l.google.com:19302',
+  'stun4.l.google.com:19302',
+  'stun.nextcloud.com:3478',
+  'stun.sip.us:3478',
+  'global.stun.twilio.com:3478',
+  'stun.syncthing.net:3478',
+  'turn.matrix.org:3478',
+  'stun.freeswitch.org:3478',
+  'stun.ekiga.net:3478',
+  'stun.qq.com:3478',
+  'stun.chat.bilibili.com:3478',
+  'stun.baidu.com:3478',
+  'stun.miwifi.com:3478',
+]
+
+const PRESET_ALPN_LIST = ['h3', 'h2', 'http/1.1']
+
 export default {
   props: ['direction', 'data', 'hidePortHopEditors', 'namespace'],
   data() {
@@ -420,6 +464,8 @@ export default {
         initialConnection: formatBytePlaceholder(mihomoReceiveWindowDefaults.initialConnection),
         maxConnection: formatBytePlaceholder(mihomoReceiveWindowDefaults.maxConnection),
       },
+      presetStunServers: PRESET_STUN_SERVERS,
+      presetAlpnList: PRESET_ALPN_LIST,
     }
   },
   methods: {
@@ -896,33 +942,76 @@ export default {
       }
       return this.$props.data.realm_opts
     },
-    realmStunServersInput: {
-      get(): string {
+    realmStunServersValue: {
+      get(): string[] {
         const servers = this.realmOpts.stun_servers || this.realmOpts['stun-servers']
         if (Array.isArray(servers)) {
-          return servers.join(', ')
+          return servers.map((s: unknown) => String(s).trim()).filter(Boolean)
         }
-        if (typeof servers === 'string') return servers
-        return ''
+        if (typeof servers === 'string' && servers.trim() !== '') {
+          return servers.split(',').map((s: string) => s.trim()).filter(Boolean)
+        }
+        return []
+      },
+      set(val: unknown) {
+        let list: string[] = []
+        if (Array.isArray(val)) {
+          list = val.flatMap((s: unknown) => {
+            if (typeof s === 'string') {
+              return s.includes(',') ? s.split(',').map((x) => x.trim()) : [s.trim()]
+            }
+            return [String(s).trim()]
+          }).filter(Boolean)
+        } else if (typeof val === 'string' && val.trim() !== '') {
+          list = val.split(',').map((s: string) => s.trim()).filter(Boolean)
+        }
+        this.realmOpts.stun_servers = Array.from(new Set(list))
+        delete this.realmOpts['stun-servers']
+      }
+    },
+    realmStunServersInput: {
+      get(): string {
+        return this.realmStunServersValue.join(', ')
       },
       set(val: string) {
-        const list = val.split(',').map(s => s.trim()).filter(Boolean)
-        this.realmOpts.stun_servers = list
+        const list = val.split(',').map((s: string) => s.trim()).filter(Boolean)
+        this.realmOpts.stun_servers = Array.from(new Set(list))
         delete this.realmOpts['stun-servers']
+      }
+    },
+    realmAlpnValue: {
+      get(): string[] {
+        const alpn = this.realmOpts.alpn
+        if (Array.isArray(alpn)) {
+          return alpn.map((s: unknown) => String(s).trim()).filter(Boolean)
+        }
+        if (typeof alpn === 'string' && alpn.trim() !== '') {
+          return alpn.split(',').map((s: string) => s.trim()).filter(Boolean)
+        }
+        return []
+      },
+      set(val: unknown) {
+        let list: string[] = []
+        if (Array.isArray(val)) {
+          list = val.flatMap((s: unknown) => {
+            if (typeof s === 'string') {
+              return s.includes(',') ? s.split(',').map((x) => x.trim()) : [s.trim()]
+            }
+            return [String(s).trim()]
+          }).filter(Boolean)
+        } else if (typeof val === 'string' && val.trim() !== '') {
+          list = val.split(',').map((s: string) => s.trim()).filter(Boolean)
+        }
+        this.realmOpts.alpn = Array.from(new Set(list))
       }
     },
     realmAlpnInput: {
       get(): string {
-        const alpn = this.realmOpts.alpn
-        if (Array.isArray(alpn)) {
-          return alpn.join(', ')
-        }
-        if (typeof alpn === 'string') return alpn
-        return ''
+        return this.realmAlpnValue.join(', ')
       },
       set(val: string) {
-        const list = val.split(',').map(s => s.trim()).filter(Boolean)
-        this.realmOpts.alpn = list
+        const list = val.split(',').map((s: string) => s.trim()).filter(Boolean)
+        this.realmOpts.alpn = Array.from(new Set(list))
       }
     },
     optionObfs: {

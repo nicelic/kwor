@@ -134,7 +134,8 @@ func parseRawRealmOpts(raw interface{}) (*RealmOptsParsed, bool) {
 	}, true
 }
 
-// NormalizeMihomoHysteria2RealmOpts produces official Mihomo kebab-case map.
+// NormalizeMihomoHysteria2RealmOpts produces official Mihomo kebab-case map for server listeners.
+// Note: includes server-side proxy; excludes client-only alpn.
 func NormalizeMihomoHysteria2RealmOpts(raw interface{}) (map[string]interface{}, bool) {
 	parsed, ok := parseRawRealmOpts(raw)
 	if !ok {
@@ -173,9 +174,6 @@ func NormalizeMihomoHysteria2RealmOpts(raw interface{}) (map[string]interface{},
 	if parsed.PrivateKey != "" {
 		out["private-key"] = parsed.PrivateKey
 	}
-	if len(parsed.ALPN) > 0 {
-		out["alpn"] = parsed.ALPN
-	}
 	if parsed.Proxy != "" {
 		out["proxy"] = parsed.Proxy
 	}
@@ -184,6 +182,7 @@ func NormalizeMihomoHysteria2RealmOpts(raw interface{}) (map[string]interface{},
 }
 
 // NormalizeMihomoHysteria2RealmOptsSnake produces internal snake_case map (for out_json / UI storage).
+// Note: includes client-side alpn; excludes server-only proxy.
 func NormalizeMihomoHysteria2RealmOptsSnake(raw interface{}) (map[string]interface{}, bool) {
 	parsed, ok := parseRawRealmOpts(raw)
 	if !ok {
@@ -225,15 +224,13 @@ func NormalizeMihomoHysteria2RealmOptsSnake(raw interface{}) (map[string]interfa
 	if len(parsed.ALPN) > 0 {
 		out["alpn"] = parsed.ALPN
 	}
-	if parsed.Proxy != "" {
-		out["proxy"] = parsed.Proxy
-	}
 
 	return out, true
 }
 
 // BuildMihomoRealmOptsForClash extracts and formats realm-opts for Clash/Mihomo proxies.
 // Returns non-nil only when realm-opts is enabled and has valid configuration.
+// Note: includes client-side alpn; excludes server-only proxy.
 func BuildMihomoRealmOptsForClash(outbound map[string]interface{}) map[string]interface{} {
 	if outbound == nil {
 		return nil
@@ -250,19 +247,43 @@ func BuildMihomoRealmOptsForClash(outbound map[string]interface{}) map[string]in
 		return nil
 	}
 
-	norm, ok := NormalizeMihomoHysteria2RealmOpts(rawOpts)
-	if !ok {
+	parsed, ok := parseRawRealmOpts(rawOpts)
+	if !ok || !parsed.Enable || strings.TrimSpace(parsed.ServerURL) == "" {
 		return nil
 	}
 
-	enable, _ := norm["enable"].(bool)
-	if !enable {
-		return nil
+	norm := make(map[string]interface{})
+	norm["enable"] = true
+	norm["server-url"] = parsed.ServerURL
+	if parsed.Token != "" {
+		norm["token"] = parsed.Token
 	}
-
-	serverURL, _ := norm["server-url"].(string)
-	if strings.TrimSpace(serverURL) == "" {
-		return nil
+	if parsed.RealmID != "" {
+		norm["realm-id"] = parsed.RealmID
+	}
+	if len(parsed.STUNServers) > 0 {
+		norm["stun-servers"] = parsed.STUNServers
+	}
+	if parsed.SNI != "" {
+		norm["sni"] = parsed.SNI
+	}
+	if parsed.SkipCertVerify {
+		norm["skip-cert-verify"] = true
+	}
+	if parsed.NameCertVerify != "" {
+		norm["name-cert-verify"] = parsed.NameCertVerify
+	}
+	if parsed.Fingerprint != "" {
+		norm["fingerprint"] = parsed.Fingerprint
+	}
+	if parsed.Certificate != "" {
+		norm["certificate"] = parsed.Certificate
+	}
+	if parsed.PrivateKey != "" {
+		norm["private-key"] = parsed.PrivateKey
+	}
+	if len(parsed.ALPN) > 0 {
+		norm["alpn"] = parsed.ALPN
 	}
 
 	return norm

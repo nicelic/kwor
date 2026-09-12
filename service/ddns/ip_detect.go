@@ -7,7 +7,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,6 +23,7 @@ var defaultIPv4URLs = []string{
 	"https://api-ipv4.ip.sb/ip",
 	"https://api4.ipify.org",
 	"https://v4.ident.me",
+	"https://ipv4.icanhazip.com",
 }
 
 var defaultIPv6URLs = []string{
@@ -28,9 +31,10 @@ var defaultIPv6URLs = []string{
 	"https://api64.ipify.org",
 	"https://v6.ident.me",
 	"https://speed.neu6.edu.cn/getIP.php",
+	"https://ipv6.icanhazip.com",
 }
 
-func DetectPublicIP(ctx context.Context, ipType string, customURL string) (string, error) {
+func DetectPublicIPs(ctx context.Context, ipType string, customURL string) ([]string, error) {
 	urls := make([]string, 0, 8)
 	seen := make(map[string]bool)
 
@@ -44,72 +48,121 @@ func DetectPublicIP(ctx context.Context, ipType string, customURL string) (strin
 
 	if strings.TrimSpace(customURL) != "" {
 		rawUrls := strings.FieldsFunc(customURL, func(r rune) bool {
-			return r == ',' || r == ';' || r == '\n' || r == '\r'
+			return r == ',' || r == ';' || r == '\n' || r == '\r' || r == ' '
 		})
 		for _, u := range rawUrls {
 			addURL(u)
 		}
 	}
 
-	if ipType == "ipv4" {
-		for _, u := range defaultIPv4URLs {
-			addURL(u)
+	if len(urls) == 0 {
+		if ipType == "ipv4" {
+			for _, u := range defaultIPv4URLs {
+				addURL(u)
+			}
+		} else if ipType == "ipv6" {
+			for _, u := range defaultIPv6URLs {
+				addURL(u)
+			}
+		} else {
+			return nil, errors.New("unsupported ipType: " + ipType)
 		}
-	} else if ipType == "ipv6" {
-		for _, u := range defaultIPv6URLs {
-			addURL(u)
-		}
-	} else {
-		return "", errors.New("unsupported ipType: " + ipType)
 	}
 
 	client := &http.Client{Timeout: 8 * time.Second}
-	var lastErr error
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	ipMap := make(map[string]struct{})
+	var errList []string
 
 	for _, u := range urls {
-		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Set("User-Agent", "curl/7.88.1")
-
-		resp, err := client.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		ipStr := strings.TrimSpace(string(body))
-		parsedIP := net.ParseIP(ipStr)
-		if parsedIP == nil {
-			lastErr = fmt.Errorf("invalid IP returned from %s: %s", u, ipStr)
-			continue
-		}
-
-		if ipType == "ipv4" && parsedIP.To4() != nil {
-			return parsedIP.String(), nil
-		}
-		if ipType == "ipv6" && parsedIP.To4() == nil && parsedIP.To16() != nil {
-			// Ensure it's a global unicast address
-			if parsedIP.IsGlobalUnicast() && !parsedIP.IsPrivate() {
-				return parsedIP.String(), nil
+		targetURL := u
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
+			if err != nil {
+				mu.Lock()
+				errList = append(errList, fmt.Sprintf("%s: %v", targetURL, err))
+				mu.Unlock()
+				return
 			}
-			return parsedIP.String(), nil
-		}
+			req.Header.Set("User-Agent", "curl/7.88.1")
+
+			resp, err := client.Do(req)
+			if err != nil {
+				mu.Lock()
+				errList = append(errList, fmt.Sprintf("%s: %v", targetURL, err))
+				mu.Unlock()
+				return
+			}
+			body, err := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if err != nil {
+				mu.Lock()
+				errList = append(errList, fmt.Sprintf("%s: %v", targetURL, err))
+				mu.Unlock()
+				return
+			}
+
+			rawStr := strings.TrimSpace(string(body))
+			cleaned := strings.Trim(rawStr, "\"' \r\n\t")
+			parsedIP := net.ParseIP(cleaned)
+			if parsedIP == nil {
+				tokens := strings.Fields(cleaned)
+				if len(tokens) > 0 {
+					parsedIP = net.ParseIP(tokens[0])
+				}
+			}
+			if parsedIP == nil {
+				mu.Lock()
+				errList = append(errList, fmt.Sprintf("%s: invalid IP '%s'", targetURL, cleaned))
+				mu.Unlock()
+				return
+			}
+
+			if ipType == "ipv4" && parsedIP.To4() != nil {
+				if IsPublicIPv4(parsedIP) {
+					mu.Lock()
+					ipMap[parsedIP.String()] = struct{}{}
+					mu.Unlock()
+				}
+			} else if ipType == "ipv6" && parsedIP.To4() == nil && parsedIP.To16() != nil {
+				if IsPublicIPv6(parsedIP) {
+					mu.Lock()
+					ipMap[parsedIP.String()] = struct{}{}
+					mu.Unlock()
+				}
+			}
+		}()
 	}
 
-	if lastErr != nil {
-		return "", fmt.Errorf("failed to detect %s: %w", ipType, lastErr)
+	wg.Wait()
+
+	result := make([]string, 0, len(ipMap))
+	for ip := range ipMap {
+		result = append(result, ip)
 	}
-	return "", fmt.Errorf("failed to detect %s from all sources", ipType)
+	sort.Strings(result)
+
+	if len(result) == 0 {
+		if len(errList) > 0 {
+			return nil, fmt.Errorf("failed to detect %s: %s", ipType, strings.Join(errList, "; "))
+		}
+		return nil, fmt.Errorf("no public %s found from urls", ipType)
+	}
+	return result, nil
+}
+
+func DetectPublicIP(ctx context.Context, ipType string, customURL string) (string, error) {
+	ips, err := DetectPublicIPs(ctx, ipType, customURL)
+	if err != nil {
+		return "", err
+	}
+	if len(ips) > 0 {
+		return ips[0], nil
+	}
+	return "", fmt.Errorf("failed to detect %s", ipType)
 }
 
 // IsPublicIPv4 判断是否为公网 IPv4 地址（排除私网 10/172.16/192.168、回环 127、链路本地 169.254、未指定 0.0.0.0 等）
@@ -138,17 +191,18 @@ func IsPublicIPv6(ip net.IP) bool {
 	return ip.IsGlobalUnicast()
 }
 
-func DetectInterfaceIP(ifaceName string, ipType string, publicOnly bool) (string, error) {
+func DetectInterfaceIPs(ifaceName string, ipType string, publicOnly bool) ([]string, error) {
 	iface, err := net.InterfaceByName(strings.TrimSpace(ifaceName))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	addrs, err := iface.Addrs()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
+	ipMap := make(map[string]struct{})
 	for _, addr := range addrs {
 		var ip net.IP
 		switch v := addr.(type) {
@@ -166,31 +220,51 @@ func DetectInterfaceIP(ifaceName string, ipType string, publicOnly bool) (string
 			if ipv4 != nil {
 				if publicOnly {
 					if IsPublicIPv4(ipv4) {
-						return ipv4.String(), nil
+						ipMap[ipv4.String()] = struct{}{}
 					}
 				} else {
-					return ipv4.String(), nil
+					ipMap[ipv4.String()] = struct{}{}
 				}
 			}
 		} else if ipType == "ipv6" {
 			if ip.To4() == nil && ip.To16() != nil {
 				if publicOnly {
 					if IsPublicIPv6(ip) {
-						return ip.String(), nil
+						ipMap[ip.String()] = struct{}{}
 					}
 				} else {
 					if ip.IsGlobalUnicast() {
-						return ip.String(), nil
+						ipMap[ip.String()] = struct{}{}
 					}
 				}
 			}
 		}
 	}
 
-	if publicOnly {
-		return "", fmt.Errorf("no public %s found on interface %s", ipType, ifaceName)
+	result := make([]string, 0, len(ipMap))
+	for ip := range ipMap {
+		result = append(result, ip)
 	}
-	return "", fmt.Errorf("no valid %s found on interface %s", ipType, ifaceName)
+	sort.Strings(result)
+
+	if len(result) == 0 {
+		if publicOnly {
+			return nil, fmt.Errorf("no public %s found on interface %s", ipType, ifaceName)
+		}
+		return nil, fmt.Errorf("no valid %s found on interface %s", ipType, ifaceName)
+	}
+	return result, nil
+}
+
+func DetectInterfaceIP(ifaceName string, ipType string, publicOnly bool) (string, error) {
+	ips, err := DetectInterfaceIPs(ifaceName, ipType, publicOnly)
+	if err != nil {
+		return "", err
+	}
+	if len(ips) > 0 {
+		return ips[0], nil
+	}
+	return "", fmt.Errorf("no %s found on interface %s", ipType, ifaceName)
 }
 
 func GetSystemInterfaces() ([]InterfaceInfo, error) {

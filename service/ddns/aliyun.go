@@ -165,11 +165,9 @@ func (a *AliyunProvider) SyncRecord(ctx context.Context, env map[string]string, 
 
 	records := queryResult.DomainRecords.Record
 	var matchedRecordId string
-	var matchedValue string
 	for _, r := range records {
-		if r.RR == subDomain && r.Type == param.Type {
+		if r.RR == subDomain && r.Type == param.Type && r.Value == param.IP {
 			matchedRecordId = r.RecordId
-			matchedValue = r.Value
 			break
 		}
 	}
@@ -180,26 +178,7 @@ func (a *AliyunProvider) SyncRecord(ctx context.Context, env map[string]string, 
 	}
 
 	if matchedRecordId != "" {
-		// 已存在
-		if matchedValue == param.IP {
-			return matchedRecordId, nil
-		}
-		// 更新记录
-		updateParams := url.Values{}
-		updateParams.Set("Action", "UpdateDomainRecord")
-		updateParams.Set("RecordId", matchedRecordId)
-		updateParams.Set("RR", subDomain)
-		updateParams.Set("Type", param.Type)
-		updateParams.Set("Value", param.IP)
-		updateParams.Set("TTL", fmt.Sprintf("%d", ttl))
-
-		var updateResult struct {
-			RecordId string `json:"RecordId"`
-		}
-		if err := a.doRequest(ctx, ak, sk, updateParams, &updateResult); err != nil {
-			return "", err
-		}
-		return updateResult.RecordId, nil
+		return matchedRecordId, nil
 	}
 
 	// 新增记录
@@ -255,6 +234,9 @@ func (a *AliyunProvider) DeleteRecord(ctx context.Context, env map[string]string
 
 	for _, r := range queryResult.DomainRecords.Record {
 		if r.RR == subDomain && r.Type == param.Type {
+			if param.IP != "" && r.Value != param.IP {
+				continue
+			}
 			delParams := url.Values{}
 			delParams.Set("Action", "DeleteDomainRecord")
 			delParams.Set("RecordId", r.RecordId)

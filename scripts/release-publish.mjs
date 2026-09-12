@@ -487,7 +487,7 @@ async function createAndUploadRelease({ repository, token, tagName, branch, rele
   if (draftRelease.statusCode !== 200) {
     fail([`GitHub Release draft ${tagName} verification failed: ${formatGitHubError(draftRelease)}`])
   }
-  verifyReleaseAssets({ release: draftRelease.data, tagName, releaseAssets, expectDraft: true })
+  verifyReleaseAssets({ release: draftRelease.data, tagName, releaseAssets, expectDraft: true, notes })
 
   const published = await githubRequest({
     method: 'PATCH',
@@ -509,11 +509,11 @@ async function createAndUploadRelease({ repository, token, tagName, branch, rele
   if (finalRelease.statusCode !== 200) {
     fail([`Published GitHub Release ${tagName} verification failed: ${formatGitHubError(finalRelease)}`])
   }
-  verifyReleaseAssets({ release: finalRelease.data, tagName, releaseAssets, expectDraft: false })
+  verifyReleaseAssets({ release: finalRelease.data, tagName, releaseAssets, expectDraft: false, notes })
   console.log(`Published GitHub Release ${tagName}`)
 }
 
-function verifyReleaseAssets({ release, tagName, releaseAssets, expectDraft }) {
+function verifyReleaseAssets({ release, tagName, releaseAssets, expectDraft, notes = '' }) {
   const uploadedNames = new Set((release?.assets || []).map(asset => asset.name))
   const missing = releaseAssets.map(asset => asset.name).filter(name => !uploadedNames.has(name))
   const unexpected = [...uploadedNames].filter(name => !releaseAssets.some(asset => asset.name === name))
@@ -523,7 +523,7 @@ function verifyReleaseAssets({ release, tagName, releaseAssets, expectDraft }) {
     release?.prerelease === true ? 'Release is marked as prerelease.' : '',
     missing.length > 0 ? `Missing assets: ${missing.join(', ')}` : '',
     unexpected.length > 0 ? `Unexpected assets: ${unexpected.join(', ')}` : '',
-    String(release?.body ?? '') !== '' ? 'Release body is not empty.' : '',
+    String(release?.body ?? '') !== notes ? (notes ? 'Release body does not match specified notes.' : 'Release body is not empty.') : '',
   ].filter(Boolean)
   if (errors.length > 0) {
     fail([`GitHub Release ${tagName} verification failed.`, ...errors])

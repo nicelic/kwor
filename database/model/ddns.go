@@ -41,8 +41,8 @@ type DDNSRule struct {
 	CloudflareProxy  bool       `json:"cloudflareProxy" gorm:"column:cloudflare_proxy;not null;default:false"`
 
 	// Runtime status fields
-	LastIPV4         string     `json:"lastIpv4" gorm:"column:last_ip_v4;size:64;not null;default:''"`
-	LastIPV6         string     `json:"lastIpv6" gorm:"column:last_ip_v6;size:128;not null;default:''"`
+	LastIPV4         string     `json:"lastIpv4" gorm:"column:last_ip_v4;type:text;not null;default:''"`
+	LastIPV6         string     `json:"lastIpv6" gorm:"column:last_ip_v6;type:text;not null;default:''"`
 	LastSyncTime     *time.Time `json:"lastSyncTime" gorm:"column:last_sync_time"`
 	LastStatus       string     `json:"lastStatus" gorm:"column:last_status;size:32;not null;default:'pending'"` // success, error, pending, syncing
 	LastError        string     `json:"lastError" gorm:"column:last_error;type:text;not null;default:''"`

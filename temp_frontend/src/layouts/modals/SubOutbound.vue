@@ -99,7 +99,7 @@
               <ShadowQuic v-if="outbound.type == outTypes.ShadowQUIC" direction="out" :data="outbound" :namespace="protocolNamespace" />
               <Vless v-if="outbound.type == outTypes.VLESS" :data="outbound" :namespace="protocolNamespace" />
               <Tuic v-if="outbound.type == outTypes.TUIC" direction="out" :data="outbound" :namespace="protocolNamespace" />
-              <Hysteria2 v-if="outbound.type == outTypes.Hysteria2" direction="out" :data="outbound" :namespace="protocolNamespace" :hide-port-hop-editors="true" />
+              <Hysteria2 v-if="outbound.type == outTypes.Hysteria2" direction="out" :data="outbound" :namespace="'mihomo'" :hide-port-hop-editors="true" />
               <AnyTls v-if="outbound.type == outTypes.AnyTls" :data="outbound" direction="out" />
               <Mieru v-if="outbound.type == outTypes.Mieru" :data="outbound" direction="out" :namespace="protocolNamespace" />
               <Sudoku v-if="outbound.type == outTypes.Sudoku" :data="outbound" direction="out" />
@@ -216,6 +216,8 @@ export default {
         'cwnd',
         'ip',
         'disable_mtu_discovery',
+        'realm_opts',
+        'realm-opts',
       ],
     }
   },

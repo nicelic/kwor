@@ -803,18 +803,12 @@ func hysteria2Out(out *map[string]interface{}, inbound map[string]interface{}) {
 	} else {
 		delete(*out, "hop_interval_max")
 	}
-	rawRealm, hasRealm := (*out)["realm_opts"]
-	if !hasRealm {
-		rawRealm, hasRealm = (*out)["realm-opts"]
-	}
-	if !hasRealm {
-		rawRealm, hasRealm = inbound["realm_opts"]
-		if !hasRealm {
-			rawRealm, hasRealm = inbound["realm-opts"]
-		}
-	}
 	delete(*out, "realm_opts")
 	delete(*out, "realm-opts")
+	rawRealm, hasRealm := inbound["realm_opts"]
+	if !hasRealm {
+		rawRealm, hasRealm = inbound["realm-opts"]
+	}
 	if hasRealm && rawRealm != nil {
 		if norm, ok := NormalizeMihomoHysteria2RealmOptsSnake(rawRealm); ok {
 			(*out)["realm_opts"] = norm

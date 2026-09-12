@@ -276,6 +276,9 @@ func (s *SpaceshipProvider) DeleteRecord(ctx context.Context, env map[string]str
 			if val == "" {
 				val = item.Text
 			}
+			if param.IP != "" && val != param.IP && item.Address != param.IP {
+				continue
+			}
 			delName := item.Name
 			if delName == "@" {
 				delName = ""
