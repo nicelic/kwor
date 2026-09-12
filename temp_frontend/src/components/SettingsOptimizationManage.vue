@@ -291,38 +291,38 @@
       </v-col>
 
       <v-col cols="12" md="8">
-        <v-card rounded="xl" variant="outlined" class="opt-card h-100 dns-quick-card opt-group-blue">
+        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-blue">
           <v-card-title class="text-subtitle-1 font-weight-medium">MTU 快速设置</v-card-title>
           <v-divider />
           <v-card-text>
             <div class="text-body-2 text-medium-emphasis mb-3">
-              输入新 MTU 后点击保存：会删除旧脚本、按新值重建脚本、赋权、立即执行并自动校验 systemd 自启动状态。
+              开启左侧开关后可修改 MTU（范围 1280-1600），离开输入框自动应用；关闭开关自动恢复系统 MTU 为 1470。
             </div>
-            <div class="dns-quick-layout">
-              <v-text-field
-                v-model="mtuInput"
-                label="MTU 值（576-9500）"
-                type="number"
-                min="576"
-                max="9500"
-                variant="outlined"
-                hide-details
-                :disabled="overviewInteractionDisabled || !mtuLoaded || loadingMtu || switchingMtu || (!mtuOverview.supported && !mtuOverview.enabled)"
-                class="dns-quick-input" />
-              <div class="dns-quick-action">
-                <v-btn
-                  color="primary"
-                  block
-                  :loading="savingMtu"
-                  :disabled="overviewInteractionDisabled || !canSaveMtu"
-                  @click="saveMtu">
-                  保存
-                </v-btn>
-              </div>
+            <div>
+              <v-tooltip
+                :model-value="isMtuOutOfRange"
+                location="top"
+                text="可填写数值1280-1600">
+                <template #activator="{ props: tooltipProps }">
+                  <v-text-field
+                    v-bind="tooltipProps"
+                    v-model="mtuInput"
+                    label="MTU 值（1280-1600）"
+                    type="number"
+                    min="1280"
+                    max="1600"
+                    variant="outlined"
+                    hide-details
+                    :loading="savingMtu"
+                    :disabled="overviewInteractionDisabled || !mtuLoaded || loadingMtu || switchingMtu || !mtuOverview.enabled || (!mtuOverview.supported && !mtuOverview.enabled)"
+                    class="w-100"
+                    @blur="onMtuInputBlur"
+                    @keydown.enter="($event.target as HTMLInputElement)?.blur()" />
+                </template>
+              </v-tooltip>
             </div>
             <div class="text-caption text-medium-emphasis mt-2">
               默认网卡：{{ mtuOverview.interface || '-' }} · 当前 MTU：{{ formatMtuValue(mtuOverview.currentMtu) }} ·
-              原始 MTU：{{ formatMtuValue(mtuOverview.originalMtu) }} ·
               systemd：{{ mtuOverview.serviceEnabled ? '已注册' : '未注册' }} · 状态：{{ mtuOverview.serviceActive || '-' }}
             </div>
           </v-card-text>
@@ -766,7 +766,7 @@ const applyDnsOverview = (raw: unknown) => {
 const applyMtuOverview = (raw: unknown) => {
   const next = normalizeMtuOverview(raw)
   mtuOverview.value = next
-  const nextInputValue = next.currentMtu > 0 ? next.currentMtu : (next.mtu > 0 ? next.mtu : 1500)
+  const nextInputValue = next.currentMtu > 0 ? next.currentMtu : (next.mtu > 0 ? next.mtu : 1470)
   mtuInput.value = String(nextInputValue)
 }
 
@@ -894,8 +894,17 @@ const refreshMtuOverview = async (): Promise<boolean> => {
   return mtuRefreshFlight.value
 }
 
-const MTU_MIN = 576
-const MTU_MAX = 9500
+const MTU_MIN = 1280
+const MTU_MAX = 1600
+
+const isMtuOutOfRange = computed(() => {
+  if (!mtuOverview.value.enabled) return false
+  const raw = mtuInput.value.trim()
+  if (!raw) return false
+  if (!/^\d+$/.test(raw)) return true
+  const parsed = Number(raw)
+  return !Number.isSafeInteger(parsed) || parsed < MTU_MIN || parsed > MTU_MAX
+})
 const OPTIMIZATION_CONTENT_MAX_LENGTH = 256 * 1024
 const DNS_INPUT_MAX_LENGTH = 16 * 1024
 const textEncoder = new TextEncoder()
@@ -980,17 +989,6 @@ const formatMtuValue = (value: number): string => {
   return String(value)
 }
 
-const canSaveMtu = computed(() => {
-  return (
-    mtuLoaded.value &&
-    mtuOverview.value.supported &&
-    mtuOverview.value.enabled &&
-    !loadingMtu.value &&
-    !savingMtu.value &&
-    parseMtuInputValue() !== null
-  )
-})
-
 const onToggleLogSwitch = async (value: unknown) => {
   const enabled = Boolean(value)
   switchingLog.value = true
@@ -1020,15 +1018,6 @@ const onToggleSysctlSwitch = async (value: unknown) => {
 const onToggleMtuSwitch = async (value: unknown) => {
   const enabled = Boolean(value)
   const payload: Record<string, unknown> = { enabled }
-  if (enabled) {
-    const parsed = parseMtuInputValue()
-    if (parsed === null) {
-      notifyQuickSaveResult('MTU', false, `MTU 必须是 ${MTU_MIN}-${MTU_MAX} 的整数`)
-      return
-    }
-    payload.mtu = parsed
-  }
-
   switchingMtu.value = true
   try {
     const msg = await HttpUtils.post('api/system-mtu-optimization-switch', payload)
@@ -1038,6 +1027,23 @@ const onToggleMtuSwitch = async (value: unknown) => {
   } finally {
     switchingMtu.value = false
   }
+}
+
+const onMtuInputBlur = async () => {
+  if (!mtuOverview.value.enabled || switchingMtu.value || savingMtu.value) {
+    return
+  }
+  const parsed = parseMtuInputValue()
+  if (parsed === null) {
+    const fallbackMtu = mtuOverview.value.currentMtu > 0 ? mtuOverview.value.currentMtu : (mtuOverview.value.mtu > 0 ? mtuOverview.value.mtu : 1470)
+    mtuInput.value = String(fallbackMtu)
+    return
+  }
+  const currentSystemMtu = mtuOverview.value.currentMtu > 0 ? mtuOverview.value.currentMtu : mtuOverview.value.mtu
+  if (parsed === currentSystemMtu) {
+    return
+  }
+  await saveMtu(parsed)
 }
 
 const openLogEditor = async () => {
@@ -1183,8 +1189,8 @@ const saveDnsNameServers = async () => {
   }
 }
 
-const saveMtu = async () => {
-  const parsed = parseMtuInputValue()
+const saveMtu = async (targetMtu?: number) => {
+  const parsed = typeof targetMtu === 'number' ? targetMtu : parseMtuInputValue()
   if (parsed === null) {
     return
   }

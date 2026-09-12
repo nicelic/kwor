@@ -2,6 +2,7 @@ import { oTls } from "./tls"
 import { oMultiplex } from "./multiplex"
 import { Transport } from "./transport"
 import { Dial } from "./dial"
+import { Hysteria2RealmOpts } from "./inbounds"
 
 export const OutTypes = {
   Direct: 'direct',
@@ -250,6 +251,7 @@ export interface Hysteria2 extends OutboundBasics, Dial {
     initial_connection_receive_window?: number
     max_connection_receive_window?: number
   }
+  realm_opts?: Hysteria2RealmOpts
   network?: "udp" | "tcp"
   tls: oTls
   brutal_debug?: boolean

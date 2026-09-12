@@ -610,6 +610,7 @@ func stripSyncedSubscriptionJSONFields(outbound map[string]interface{}) {
 	delete(outbound, "mihomo_fast_open")
 	delete(outbound, "fast_open")
 	delete(outbound, "fast-open")
+	util.StripMihomoRealmOpts(outbound)
 	tlsMap, ok := outbound["tls"].(map[string]interface{})
 	if !ok || tlsMap == nil {
 		return

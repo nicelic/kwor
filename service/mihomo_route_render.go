@@ -7,6 +7,7 @@ import (
 
 	"github.com/alireza0/s-ui/database/model"
 	"github.com/alireza0/s-ui/logger"
+	"github.com/alireza0/s-ui/util"
 )
 
 type mihomoRouteRenderResult struct {
@@ -855,7 +856,7 @@ func buildMihomoListener(inbound model.MihomoInbound, payload map[string]interfa
 		listener["name"] = name
 	}
 	listenerType := strings.ToLower(strings.TrimSpace(inbound.Type))
-	if listenerType == "shadowquic" {
+	if listenerType == "shadowquic" || listenerType == "hysteria2-realm" {
 		// These are listener-level routing fields, not jls-upstream.proxy.
 		// Keep the nested JLS proxy untouched while refusing the unsupported
 		// top-level routing-mark/rule/proxy values.
@@ -867,7 +868,7 @@ func buildMihomoListener(inbound model.MihomoInbound, payload map[string]interfa
 	} else if ref.ProxyTarget != "" {
 		listener["proxy"] = ref.ProxyTarget
 	}
-	if listenerType != "shadowquic" && ref.RuleName != "" {
+	if listenerType != "shadowquic" && listenerType != "hysteria2-realm" && ref.RuleName != "" {
 		// Listener rule names select a same-named entry in top-level sub-rules.
 		listener["rule"] = ref.RuleName
 	}
@@ -890,21 +891,31 @@ func mergeMihomoHysteria2OutJSONListenerCompat(payload map[string]interface{}, r
 	if payload == nil || len(raw) == 0 {
 		return
 	}
-	if _, exists := payload["mihomo_hy2"]; exists {
-		return
-	}
 
 	var outbound map[string]interface{}
 	if err := json.Unmarshal(raw, &outbound); err != nil || outbound == nil {
 		return
 	}
 
-	mihomoHY2, ok := outbound["mihomo_hy2"].(map[string]interface{})
-	if !ok || len(mihomoHY2) == 0 {
-		return
+	if _, exists := payload["mihomo_hy2"]; !exists {
+		if mihomoHY2, ok := outbound["mihomo_hy2"].(map[string]interface{}); ok && len(mihomoHY2) > 0 {
+			payload["mihomo_hy2"] = cloneMihomoListenerCompatMap(mihomoHY2)
+		}
 	}
 
-	payload["mihomo_hy2"] = cloneMihomoListenerCompatMap(mihomoHY2)
+	if _, hasRealm := payload["realm-opts"]; !hasRealm {
+		if _, hasRealm2 := payload["realm_opts"]; !hasRealm2 {
+			if realmRaw, exists := outbound["realm_opts"]; exists && realmRaw != nil {
+				if norm, ok := util.NormalizeMihomoHysteria2RealmOpts(realmRaw); ok {
+					payload["realm-opts"] = norm
+				}
+			} else if realmRaw, exists := outbound["realm-opts"]; exists && realmRaw != nil {
+				if norm, ok := util.NormalizeMihomoHysteria2RealmOpts(realmRaw); ok {
+					payload["realm-opts"] = norm
+				}
+			}
+		}
+	}
 }
 
 func cloneMihomoListenerCompatMap(src map[string]interface{}) map[string]interface{} {
@@ -1211,9 +1222,6 @@ func applyMihomoRouteGeneralConfig(document map[string]interface{}, route map[st
 	}
 	if value, ok := toInt(route["default_mark"]); ok && value > 0 {
 		document["routing-mark"] = value
-	}
-	if value, ok := toBool(route["auto_detect_interface"]); ok {
-		document["auto-detect-interface"] = value
 	}
 }
 

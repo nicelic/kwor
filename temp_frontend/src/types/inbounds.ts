@@ -18,6 +18,7 @@ export const InTypes = {
   ShadowQUIC: 'shadowquic',
   TUIC: 'tuic',
   Hysteria2: 'hysteria2',
+  Hysteria2Realm: 'hysteria2-realm',
   TrustTunnel: 'trusttunnel',
   VLESS: 'vless',
   AnyTls: 'anytls',
@@ -240,6 +241,22 @@ export interface TUIC extends InboundBasics {
   zero_rtt_handshake?: boolean
   heartbeat?: string
 }
+export interface Hysteria2RealmOpts {
+  enable?: boolean
+  server_url?: string
+  token?: string
+  realm_id?: string
+  stun_servers?: string[]
+  sni?: string
+  skip_cert_verify?: boolean
+  name_cert_verify?: string
+  fingerprint?: string
+  certificate?: string
+  private_key?: string
+  alpn?: string[]
+  proxy?: string
+}
+
 export interface Hysteria2 extends InboundBasics {
   server_up_mbps?: number
   server_down_mbps?: number
@@ -263,6 +280,14 @@ export interface Hysteria2 extends InboundBasics {
   port_hop_range?: string
   port_hop_interval?: string
   port_hop_interval_max?: string
+  realm_opts?: Hysteria2RealmOpts
+}
+export interface Hysteria2Realm extends InboundBasics {
+  token?: string
+  max_realms?: number
+  max_realms_per_ip?: number
+  trusted_proxy_header?: string
+  realm_name_pattern?: string
 }
 export interface TrustTunnel extends InboundBasics {
   proxy?: string
@@ -322,6 +347,7 @@ type InterfaceMap = {
   shadowquic: ShadowQUIC
   tuic: TUIC
   hysteria2: Hysteria2
+  'hysteria2-realm': Hysteria2Realm
   trusttunnel: TrustTunnel
   vless: VLESS
   anytls: AnyTls
@@ -401,6 +427,15 @@ const defaultValues: Record<InType, Inbound> = {
   },
   tuic: <TUIC>{ type: InTypes.TUIC, congestion_control: "cubic", tls_id: 0 },
   hysteria2: <Hysteria2>{ type: InTypes.Hysteria2, tls_id: 0, server_up_mbps: 350, server_down_mbps: 350 },
+  'hysteria2-realm': <Hysteria2Realm>{
+    type: InTypes.Hysteria2Realm,
+    tls_id: 0,
+    token: 'public',
+    max_realms: 65536,
+    max_realms_per_ip: 4,
+    realm_name_pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$',
+    trusted_proxy_header: '',
+  },
   trusttunnel: <TrustTunnel>{ type: InTypes.TrustTunnel, tls_id: 0, network: ['tcp'], congestion_controller: "bbr" },
   vless: <VLESS>{ type: InTypes.VLESS, tls_id: 0, multiplex: {}, transport: {} },
   anytls: <AnyTls>{ type: InTypes.AnyTls, tls_id: 0, padding_scheme: "stop=8\n0=30-30\n1=100-400\n2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\n3=9-9,500-1000\n4=500-1000\n5=500-1000\n6=500-1000\n7=500-1000" },

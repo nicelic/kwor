@@ -45,6 +45,7 @@ func sanitizeSingboxRuntimeOutbound(outbound map[string]interface{}) string {
 	delete(outbound, "mihomo_fast_open")
 	delete(outbound, "fast_open")
 	delete(outbound, "fast-open")
+	util.StripMihomoRealmOpts(outbound)
 
 	util.SanitizeSingboxSubscriptionOutbound(outbound)
 

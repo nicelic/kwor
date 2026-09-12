@@ -967,6 +967,9 @@ func (s *ClashService) convertToClashMetaMap(outbounds *[]map[string]interface{}
 					proxy[clashKey] = v
 				}
 			}
+			if realmOpts := util.BuildMihomoRealmOptsForClash(obMap); realmOpts != nil {
+				proxy["realm-opts"] = realmOpts
+			}
 			if clashMihomoFastOpenEnabled(obMap, outType) {
 				proxy["fast-open"] = true
 			}

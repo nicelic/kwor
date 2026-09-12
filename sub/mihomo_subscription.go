@@ -122,6 +122,7 @@ func normalizeMihomoSubscriptionOutJSON(inbound *model.Inbound) error {
 	sanitizeMihomoSubscriptionTLSFields(outbound)
 	sanitizeMihomoSubscriptionGRPCFields(outbound)
 	sanitizeMihomoSubscriptionReceiveWindows(outbound, inbound.Type)
+	sanitizeMihomoSubscriptionRealmOpts(outbound, inbound.Type)
 	if strings.EqualFold(strings.TrimSpace(inbound.Type), "hysteria2") {
 		util.EnsureHysteria2MihomoReceiveWindows(outbound)
 	}
@@ -280,6 +281,31 @@ func sanitizeMihomoSubscriptionReceiveWindows(outbound map[string]interface{}, i
 		return
 	}
 	outbound["mihomo_hy2"] = clean
+}
+
+func sanitizeMihomoSubscriptionRealmOpts(outbound map[string]interface{}, inboundType string) {
+	if outbound == nil {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(inboundType), "hysteria2") {
+		delete(outbound, "realm_opts")
+		delete(outbound, "realm-opts")
+		return
+	}
+	raw, exists := outbound["realm_opts"]
+	if !exists {
+		raw, exists = outbound["realm-opts"]
+	}
+	delete(outbound, "realm-opts")
+	if !exists || raw == nil {
+		delete(outbound, "realm_opts")
+		return
+	}
+	if normalized, ok := util.NormalizeMihomoHysteria2RealmOptsSnake(raw); ok {
+		outbound["realm_opts"] = normalized
+	} else {
+		delete(outbound, "realm_opts")
+	}
 }
 
 func sanitizeMihomoSubscriptionCommonFields(root map[string]interface{}) {

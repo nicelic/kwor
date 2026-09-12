@@ -37,6 +37,8 @@ func normalizeMihomoListenerCompatFields(listener map[string]interface{}, listen
 		normalizeMihomoSudokuListener(listener)
 	case "trusttunnel":
 		normalizeMihomoTrustTunnelListener(listener)
+	case "hysteria2-realm":
+		normalizeMihomoHysteria2RealmListener(listener)
 	case "tun":
 		normalizeMihomoTunListener(listener)
 	case "tproxy":
@@ -158,6 +160,18 @@ func normalizeMihomoHysteria2Listener(listener map[string]interface{}) {
 	normalizeMihomoHysteria2ReceiveWindows(listener, listener)
 	if legacy, ok := listener["mihomo_hy2"].(map[string]interface{}); ok && legacy != nil {
 		normalizeMihomoHysteria2ReceiveWindows(listener, legacy)
+	}
+
+	rawRealm, hasRealm := listener["realm-opts"]
+	if !hasRealm {
+		rawRealm, hasRealm = listener["realm_opts"]
+	}
+	delete(listener, "realm_opts")
+	delete(listener, "realm-opts")
+	if hasRealm && rawRealm != nil {
+		if norm, ok := util.NormalizeMihomoHysteria2RealmOpts(rawRealm); ok {
+			listener["realm-opts"] = norm
+		}
 	}
 
 	delete(listener, "up_mbps")
@@ -962,5 +976,57 @@ func mihomoUsersEmpty(raw interface{}) bool {
 		return len(value) == 0
 	default:
 		return false
+	}
+}
+
+func normalizeMihomoHysteria2RealmListener(listener map[string]interface{}) {
+	if listener == nil {
+		return
+	}
+
+	token := strings.TrimSpace(firstString(listener["token"]))
+	if token == "" {
+		token = "public"
+	}
+	listener["token"] = token
+
+	if val, ok := toInt(firstNonNil(listener["max-realms"], listener["max_realms"])); ok && val >= 0 {
+		listener["max-realms"] = val
+	} else if _, exists := listener["max-realms"]; !exists && listener["max_realms"] == nil {
+		listener["max-realms"] = 65536
+	}
+	delete(listener, "max_realms")
+
+	if val, ok := toInt(firstNonNil(listener["max-realms-per-ip"], listener["max_realms_per_ip"])); ok && val >= 0 {
+		listener["max-realms-per-ip"] = val
+	} else if _, exists := listener["max-realms-per-ip"]; !exists && listener["max_realms_per_ip"] == nil {
+		listener["max-realms-per-ip"] = 4
+	}
+	delete(listener, "max_realms_per_ip")
+
+	trustedHeader := strings.TrimSpace(firstString(firstNonNil(listener["trusted-proxy-header"], listener["trusted_proxy_header"])))
+	if trustedHeader != "" {
+		listener["trusted-proxy-header"] = trustedHeader
+	} else {
+		delete(listener, "trusted-proxy-header")
+	}
+	delete(listener, "trusted_proxy_header")
+
+	pattern := strings.TrimSpace(firstString(firstNonNil(listener["realm-name-pattern"], listener["realm_name_pattern"])))
+	if pattern != "" {
+		listener["realm-name-pattern"] = pattern
+	} else {
+		listener["realm-name-pattern"] = `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`
+	}
+	delete(listener, "realm_name_pattern")
+
+	for _, blocked := range []string{
+		"users", "up_mbps", "down_mbps", "server_up_mbps", "server_down_mbps",
+		"obfs", "obfs-password", "obfs_password", "masquerade",
+		"bbr_profile", "bbr-profile", "routing_mark", "routing-mark",
+		"detour", "proxy", "rule", "ignore_client_bandwidth", "ignore-client-bandwidth",
+		"port_hop_range", "port_hop_interval", "port_hop_interval_max",
+	} {
+		delete(listener, blocked)
 	}
 }

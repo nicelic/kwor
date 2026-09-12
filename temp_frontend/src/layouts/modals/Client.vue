@@ -307,6 +307,7 @@ import { HumanReadable } from '@/plugins/utils'
 import HttpUtils from '@/plugins/httputil'
 import { getNamespaceApi, getNamespaceStore } from '@/store/uiNamespace'
 import { push } from 'notivue'
+import { i18n } from '@/locales'
 
 export default {
   props: {
@@ -552,7 +553,7 @@ export default {
       const clientId = this.$props.id ?? 0
       this.client.name = String(this.client.name ?? '').trim()
       if (this.client.name === '') {
-        push.error({ message: '用户名称不能为空' })
+        push.error({ message: i18n.global.t('notifications.clientNameRequired') })
         return
       }
       const isDuplicateName = store.checkClientName(clientId, this.client.name)
@@ -564,7 +565,7 @@ export default {
       try {
         const normalizedVolume = clientVolumeGiBToBytes(this.volumeInput)
         if (normalizedVolume === null) {
-          push.error({ message: '流量上限必须是大于等于 0 的数字' })
+          push.error({ message: i18n.global.t('notifications.trafficLimitInvalid') })
           return
         }
         this.client.volume = normalizedVolume

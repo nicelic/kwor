@@ -152,6 +152,8 @@ func (a *APP) Start() error {
 
 	service.SyncPortForwardNftablesAfterListenersOnStartup()
 
+	service.StartDDNSRuntimeWorker()
+
 	a.startTrafficOverviewRuntimeProbe()
 	a.startManagedCoreOnLinuxStartup()
 	if database.HasPendingDBRestoreToFinalize() {
@@ -292,6 +294,7 @@ func (a *APP) Stop() {
 			logger.Warning("stop reverse proxy runtime err:", rpErr)
 		}
 	}
+	service.StopDDNSRuntimeWorker()
 	service.StopKworLifecycleControlServer()
 }
 

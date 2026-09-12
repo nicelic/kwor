@@ -96,7 +96,92 @@
           v-model.number="client_down_mbps">
         </v-text-field>
       </v-col>
+      <v-col cols="12" sm="6" md="4" v-if="type == inTypes.Hysteria2 && isMihomoNamespace">
+        <v-switch
+          v-model="optionRealm"
+          color="primary"
+          label="realm-opts"
+          hide-details>
+        </v-switch>
+      </v-col>
     </v-row>
+    <v-card v-if="type == inTypes.Hysteria2 && isMihomoNamespace && optionRealm" class="mt-2 mb-2 pa-3" variant="outlined">
+      <div class="text-subtitle-2 mb-2 font-weight-bold">Hysteria2 Realm Options (Mihomo)</div>
+      <v-row dense>
+        <v-col cols="12" sm="6" md="3">
+          <v-switch v-model="realmOpts.enable" color="primary" label="enable" hide-details></v-switch>
+        </v-col>
+        <v-col cols="12" sm="6" md="5">
+          <v-text-field
+            placeholder="https://realm.hy2.io"
+            hide-details
+            density="compact"
+            v-model="realmOpts.server_url">
+            <template #label>
+              <span class="text-error font-weight-bold mr-1" style="color: red;">*</span>server-url
+            </template>
+          </v-text-field>
+        </v-col>
+        <v-col cols="12" sm="6" md="4">
+          <v-text-field
+            label="token"
+            placeholder="public"
+            hide-details
+            density="compact"
+            v-model="realmOpts.token">
+          </v-text-field>
+        </v-col>
+        <v-col cols="12" sm="6" md="4">
+          <v-text-field
+            placeholder="my-cabin-1f3a8c2e9b"
+            hide-details
+            density="compact"
+            v-model="realmOpts.realm_id">
+            <template #label>
+              <span class="text-error font-weight-bold mr-1" style="color: red;">*</span>realm-id
+            </template>
+          </v-text-field>
+        </v-col>
+        <v-col cols="12" sm="12" md="8">
+          <v-text-field
+            label="stun-servers (comma separated)"
+            placeholder="stun.nextcloud.com:3478, stun.sip.us:3478"
+            hide-details
+            density="compact"
+            v-model="realmStunServersInput">
+          </v-text-field>
+        </v-col>
+      </v-row>
+      <v-expansion-panels class="mt-2" variant="accordion">
+        <v-expansion-panel title="Server URL TLS Settings (Optional)">
+          <v-expansion-panel-text>
+            <v-row dense>
+              <v-col cols="12" sm="6" md="4">
+                <v-text-field label="sni" hide-details density="compact" v-model="realmOpts.sni"></v-text-field>
+              </v-col>
+              <v-col cols="12" sm="6" md="4">
+                <v-switch v-model="realmOpts.skip_cert_verify" color="primary" label="skip-cert-verify" hide-details></v-switch>
+              </v-col>
+              <v-col cols="12" sm="6" md="4">
+                <v-text-field label="name-cert-verify" hide-details density="compact" v-model="realmOpts.name_cert_verify"></v-text-field>
+              </v-col>
+              <v-col cols="12" sm="6" md="4">
+                <v-text-field label="fingerprint" hide-details density="compact" v-model="realmOpts.fingerprint"></v-text-field>
+              </v-col>
+              <v-col cols="12" sm="6" md="4">
+                <v-text-field label="alpn (comma separated)" placeholder="h2, http/1.1" hide-details density="compact" v-model="realmAlpnInput"></v-text-field>
+              </v-col>
+              <v-col cols="12" sm="6" md="4">
+                <v-text-field label="certificate (path or content)" hide-details density="compact" v-model="realmOpts.certificate"></v-text-field>
+              </v-col>
+              <v-col cols="12" sm="6" md="4">
+                <v-text-field label="private-key (path or content)" hide-details density="compact" v-model="realmOpts.private_key"></v-text-field>
+              </v-col>
+            </v-row>
+          </v-expansion-panel-text>
+        </v-expansion-panel>
+      </v-expansion-panels>
+    </v-card>
     <v-row v-if="[inTypes.Hysteria, inTypes.Hysteria2].includes(type)">
       <v-col cols="12" sm="6" md="4">
         <v-text-field
@@ -202,6 +287,12 @@ export default {
       this.$emit('port-hop-range-blur', this.server_ports)
     },
     removeUnsupportedMihomoClientNetwork() {
+      if (this.$props.namespace !== 'mihomo') {
+        if (this.$props.inData.out_json) {
+          delete this.$props.inData.out_json.realm_opts
+          delete this.$props.inData.out_json['realm-opts']
+        }
+      }
       if (!this.isMihomoUnsupportedClientNetworkType) return
       if (!this.$props.inData.out_json) this.$props.inData.out_json = {}
       if (this.$props.type === this.inTypes.ShadowTLS) {
@@ -257,6 +348,75 @@ export default {
     },
   },
   computed: {
+    isMihomoNamespace(): boolean {
+      return this.$props.namespace === 'mihomo'
+    },
+    optionRealm: {
+      get(): boolean {
+        return !!(this.$props.inData.out_json?.realm_opts || this.$props.inData.out_json?.['realm-opts'])
+      },
+      set(v: boolean) {
+        if (!this.$props.inData.out_json) this.$props.inData.out_json = {}
+        if (v) {
+          if (!this.$props.inData.out_json.realm_opts && !this.$props.inData.out_json['realm-opts']) {
+            this.$props.inData.out_json.realm_opts = {
+              enable: true,
+              server_url: '',
+              token: '',
+              realm_id: '',
+              stun_servers: [],
+            }
+          } else if (this.$props.inData.out_json['realm-opts'] && !this.$props.inData.out_json.realm_opts) {
+            this.$props.inData.out_json.realm_opts = this.$props.inData.out_json['realm-opts']
+          }
+        } else {
+          delete this.$props.inData.out_json.realm_opts
+          delete this.$props.inData.out_json['realm-opts']
+        }
+      }
+    },
+    realmOpts(): Record<string, any> {
+      if (!this.$props.inData.out_json) {
+        this.$props.inData.out_json = {}
+      }
+      if (!this.$props.inData.out_json.realm_opts) {
+        if (this.$props.inData.out_json['realm-opts']) {
+          this.$props.inData.out_json.realm_opts = this.$props.inData.out_json['realm-opts']
+        } else {
+          this.$props.inData.out_json.realm_opts = { enable: true }
+        }
+      }
+      return this.$props.inData.out_json.realm_opts
+    },
+    realmStunServersInput: {
+      get(): string {
+        const servers = this.realmOpts.stun_servers || this.realmOpts['stun-servers']
+        if (Array.isArray(servers)) {
+          return servers.join(', ')
+        }
+        if (typeof servers === 'string') return servers
+        return ''
+      },
+      set(val: string) {
+        const list = val.split(',').map(s => s.trim()).filter(Boolean)
+        this.realmOpts.stun_servers = list
+        delete this.realmOpts['stun-servers']
+      }
+    },
+    realmAlpnInput: {
+      get(): string {
+        const alpn = this.realmOpts.alpn
+        if (Array.isArray(alpn)) {
+          return alpn.join(', ')
+        }
+        if (typeof alpn === 'string') return alpn
+        return ''
+      },
+      set(val: string) {
+        const list = val.split(',').map(s => s.trim()).filter(Boolean)
+        this.realmOpts.alpn = list
+      }
+    },
     vmessSecurities(): string[] {
       const securities = [
         "auto",

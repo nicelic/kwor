@@ -19,6 +19,8 @@
       <v-tab value="t10">证书管理</v-tab>
       <v-tab value="t11">反向代理</v-tab>
       <v-tab value="t12">{{ $t('setting.kernelManage') }}</v-tab>
+      <v-tab value="t13">DDNS</v-tab>
+      <v-tab value="t14">{{ $t('setting.dnsManage') }}</v-tab>
     </v-tabs>
 
     <v-card-text>
@@ -563,6 +565,14 @@
         <v-window-item value="t12">
           <SettingsKernelManageVue :active="tab === 't12'" />
         </v-window-item>
+
+        <v-window-item value="t13">
+          <SettingsDdnsManageVue :active="tab === 't13'" />
+        </v-window-item>
+
+        <v-window-item value="t14">
+          <SettingsDnsManageVue :active="tab === 't14'" />
+        </v-window-item>
       </v-window>
 
       <v-dialog v-model="panelInstallDialogVisible" max-width="480">
@@ -678,6 +688,8 @@ const SettingsOptimizationManageVue = defineAsyncComponent(() => import('@/compo
 const SettingsAcmeManageVue = defineAsyncComponent(() => import('@/components/SettingsAcmeManage.vue'))
 const SettingsReverseProxyManageVue = defineAsyncComponent(() => import('@/components/SettingsReverseProxyManage.vue'))
 const SettingsKernelManageVue = defineAsyncComponent(() => import('@/components/SettingsKernelManage.vue'))
+const SettingsDdnsManageVue = defineAsyncComponent(() => import('@/components/SettingsDdnsManage.vue'))
+const SettingsDnsManageVue = defineAsyncComponent(() => import('@/components/SettingsDnsManage.vue'))
 const SubJsonExtVue = defineAsyncComponent(() => import('@/components/SubJsonExt.vue'))
 const SubClashExtVue = defineAsyncComponent(() => import('@/components/SubClashExt.vue'))
 
@@ -2732,7 +2744,7 @@ const stateChange = computed(() => {
     || systemTimeLocation.value !== oldSystemTimeLocation.value
 })
 
-const showTopActionBar = computed(() => tab.value !== 't6' && tab.value !== 't7' && tab.value !== 't8' && tab.value !== 't9' && tab.value !== 't10' && tab.value !== 't11' && tab.value !== 't12')
+const showTopActionBar = computed(() => tab.value !== 't6' && tab.value !== 't7' && tab.value !== 't8' && tab.value !== 't9' && tab.value !== 't10' && tab.value !== 't11' && tab.value !== 't12' && tab.value !== 't13' && tab.value !== 't14')
 </script>
 
 <style scoped>

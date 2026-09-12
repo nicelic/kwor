@@ -87,14 +87,16 @@ var mihomoRuntimeListenerTypes = map[string]struct{}{
 	"hysteria2":   {},
 	"mieru":       {},
 	"sudoku":      {},
-	"trusttunnel": {},
+	"trusttunnel":     {},
+	"hysteria2-realm": {},
 }
 
 // IsSubscriptionServerOnlyInboundType identifies listener-only protocols while
 // processing an inbound. It must not be used to reject a manually configured
 // subscription outbound with the same type.
 func IsSubscriptionServerOnlyInboundType(inboundType string) bool {
-	return normalizeSubscriptionType(inboundType) == "mixed"
+	normalized := normalizeSubscriptionType(inboundType)
+	return normalized == "mixed" || normalized == "hysteria2-realm"
 }
 
 // SupportsMihomoRuntimeListenerType reports whether a persisted Mihomo inbound

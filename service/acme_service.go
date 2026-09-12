@@ -206,6 +206,16 @@ var defaultAcmeDNSProviderCatalog = []AcmeDNSProviderMeta{
 		},
 	},
 	{
+		Name:         "Spaceship",
+		ProviderCode: "dns_spaceship",
+		Helper:       "acme.sh 官方: dns_spaceship；API Key 需要 dnsrecords:read 和 dnsrecords:write 权限；根域名自动识别失败时可填写 SPACESHIP_ROOT_DOMAIN",
+		Fields: []AcmeDNSFieldDef{
+			{Key: "SPACESHIP_API_KEY", Label: "API Key", Required: true},
+			{Key: "SPACESHIP_API_SECRET", Label: "API Secret", Required: true},
+			{Key: "SPACESHIP_ROOT_DOMAIN", Label: "根域名（可选）", Required: false, Placeholder: "example.com"},
+		},
+	},
+	{
 		Name:         "Cloudflare",
 		ProviderCode: "dns_cf",
 		Helper:       "acme.sh 官方: dns_cf；支持 Token 模式（CF_Token 可单独使用，CF_Account_ID/CF_Zone_ID 可选）或 Global Key 模式（CF_Email + CF_Key）",
@@ -253,16 +263,6 @@ var defaultAcmeDNSProviderCatalog = []AcmeDNSProviderMeta{
 		Helper:       "acme.sh 官方: dns_vercel",
 		Fields: []AcmeDNSFieldDef{
 			{Key: "VERCEL_TOKEN", Label: "API Token", Required: true},
-		},
-	},
-	{
-		Name:         "Spaceship",
-		ProviderCode: "dns_spaceship",
-		Helper:       "acme.sh 官方: dns_spaceship；API Key 需要 dnsrecords:read 和 dnsrecords:write 权限；根域名自动识别失败时可填写 SPACESHIP_ROOT_DOMAIN",
-		Fields: []AcmeDNSFieldDef{
-			{Key: "SPACESHIP_API_KEY", Label: "API Key", Required: true},
-			{Key: "SPACESHIP_API_SECRET", Label: "API Secret", Required: true},
-			{Key: "SPACESHIP_ROOT_DOMAIN", Label: "根域名（可选）", Required: false, Placeholder: "example.com"},
 		},
 	},
 	{

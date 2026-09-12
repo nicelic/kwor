@@ -75,6 +75,7 @@ func stripSubscriptionClashProxyPanelFields(proxy map[string]interface{}) bool {
 		"mihomo_hy2",
 		"mihomo_fast_open",
 		"fast_open",
+		"realm_opts",
 	} {
 		if _, exists := proxy[key]; exists {
 			delete(proxy, key)

@@ -62,7 +62,7 @@
               <Listen
                 :data="inbound"
                 :inTags="inTags"
-                :disable-detour-option="isMihomoShadowProtocol"
+                :disable-detour-option="isMihomoShadowProtocol || inbound.type === inTypes.Hysteria2Realm"
                 :disable-tcp-options="disableMihomoListenTcpOptions"
                 :disable-udp-options="disableMihomoListenUdpOptions"
                 v-if="inbound.type != inTypes.Tun && inbound.type != inTypes.Mieru && inbound.type != inTypes.TrustTunnel"
@@ -83,6 +83,12 @@
               />
               <Hysteria2
                 v-if="inbound.type == inTypes.Hysteria2"
+                direction="in"
+                :data="inbound"
+                :namespace="namespace"
+              />
+              <Hysteria2Realm
+                v-if="inbound.type == inTypes.Hysteria2Realm"
                 direction="in"
                 :data="inbound"
                 :namespace="namespace"
@@ -289,6 +295,7 @@ import Users from '@/components/Users.vue'
 import Shadowsocks from '@/components/protocols/Shadowsocks.vue'
 import Hysteria from '@/components/protocols/Hysteria.vue'
 import Hysteria2 from '@/components/protocols/Hysteria2.vue'
+import Hysteria2Realm from '@/components/protocols/Hysteria2Realm.vue'
 import TrustTunnel from '@/components/protocols/TrustTunnel.vue'
 import Naive from '@/components/protocols/Naive.vue'
 import ShadowTls from '@/components/protocols/ShadowTls.vue'
@@ -339,7 +346,7 @@ export default {
       side: "s",
       inTypes: InTypes,
 		mihomoUnsupportedTypes: ['direct', 'naive', 'hysteria', InTypes.ShadowTLS, InTypes.SSH],
-      defaultUnsupportedTypes: [InTypes.Snell, InTypes.Mieru, InTypes.Sudoku, InTypes.TrustTunnel, InTypes.ShadowQUIC, InTypes.SSH],
+      defaultUnsupportedTypes: [InTypes.Snell, InTypes.Mieru, InTypes.Sudoku, InTypes.TrustTunnel, InTypes.ShadowQUIC, InTypes.SSH, InTypes.Hysteria2Realm],
       stlsFingerprints: [
         { title: "Chrome", value: "chrome" },
         { title: "Firefox", value: "firefox" },
@@ -385,6 +392,7 @@ export default {
         InTypes.Hysteria,
         InTypes.TUIC,
         InTypes.Hysteria2,
+        InTypes.Hysteria2Realm,
         InTypes.TrustTunnel,
         InTypes.VLESS,
         InTypes.AnyTls,
@@ -1872,7 +1880,8 @@ export default {
       }
 
       moveEntry(this.inTypes.Hysteria2, this.inTypes.Hysteria, 'before')
-      moveEntry(this.inTypes.TrustTunnel, this.inTypes.Hysteria2, 'after')
+      moveEntry(this.inTypes.Hysteria2Realm, this.inTypes.Hysteria2, 'after')
+      moveEntry(this.inTypes.TrustTunnel, this.inTypes.Hysteria2Realm, 'after')
       moveEntry(this.inTypes.Snell, this.inTypes.Shadowsocks, 'before')
       moveEntry(this.inTypes.ShadowTLS, this.inTypes.Shadowsocks, 'after')
       moveEntry(this.inTypes.Sudoku, this.inTypes.Mieru, 'after')
@@ -1884,7 +1893,7 @@ export default {
         // protocol must remain unavailable for newly created inbounds.
         .filter(([, value]) => !unsupportedTypes.has(value) || (editingExistingInbound && value === currentInboundType))
         .map(([key, value]) => ({
-          title: value === this.inTypes.SSH ? 'SSH(\u4ec5\u8ba2\u9605\u3001\u51fa\u7ad9)' : key,
+          title: value === this.inTypes.SSH ? 'SSH(\u4ec5\u8ba2\u9605\u3001\u51fa\u7ad9)' : (value === this.inTypes.Hysteria2Realm ? 'Hysteria2 Realm' : key),
           value,
         }))
     },
@@ -2011,7 +2020,7 @@ export default {
     this.cancelInboundLoad()
   },
   components: {
-    Listen, InTls, Hysteria2, TrustTunnel, Naive, Direct, Shadowsocks,
+    Listen, InTls, Hysteria2, Hysteria2Realm, TrustTunnel, Naive, Direct, Shadowsocks,
     Users, Hysteria, ShadowTls, ShadowQuic, Snell, TProxy, Multiplex, Tuic, Tun,
     AnyTls, SshInbound, Mieru, Sudoku, Transport, AddrVue, OutJsonVue, MihomoClientCommonFields
   }

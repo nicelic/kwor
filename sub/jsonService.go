@@ -1017,6 +1017,7 @@ func stripMihomoFields(outbounds *[]map[string]interface{}) {
 		delete((*outbounds)[i], "mihomo_fast_open")
 		delete((*outbounds)[i], "fast_open")
 		delete((*outbounds)[i], "fast-open")
+		util.StripMihomoRealmOpts((*outbounds)[i])
 		if tlsMap, ok := (*outbounds)[i]["tls"].(map[string]interface{}); ok {
 			delete(tlsMap, "mihomo_use_fingerprint")
 			delete(tlsMap, "fingerprint")

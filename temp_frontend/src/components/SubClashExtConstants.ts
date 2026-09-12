@@ -230,12 +230,11 @@ export const defaultFakeIpRange6 = "fc00::/18"
 export const defaultFakeIpTtlSeconds = 60
 
 export const defaultClashConfig: Record<string, any> = {
-  "mixed-port": 7890,
+  "mixed-port": 7787,
   "allow-lan": false,
   "mode": "rule",
   "ipv6": true,
   "log-level": "silent",
-  "external-controller": "127.0.0.1:9090",
   "unified-delay": true,
   "tcp-concurrent": true,
   "find-process-mode": defaultFindProcessMode,

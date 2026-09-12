@@ -3932,7 +3932,7 @@ export const SubClashExtMixin = {
 
     // ===== Basic Settings =====
     mixedPort: {
-      get(this: any) { return this.metaJson['mixed-port'] ?? 7890 },
+      get(this: any) { return this.metaJson['mixed-port'] ?? 7787 },
       set(this: any, v: number) { this.updateMetaJson(v, 'mixed-port') },
     },
     globalIpv6: {

@@ -2030,15 +2030,15 @@ const applyNftablesInstallTask = async (raw: any, allowTerminal = true) => {
   try {
     await fetchOverview(true)
     if (task.state === 'success') {
-      push.success({ duration: 4000, message: 'nftables 已安装并完成应用' })
+      push.success({ duration: 4000, message: i18n.global.t('notifications.nftablesInstalled') })
       return
     }
     if (task.state === 'cancelled' || task.state === 'timed_out') {
-      push.info({ duration: 5000, message: task.state === 'timed_out' ? 'nftables 下载超时，任务已停止' : 'nftables 下载已停止' })
+      push.info({ duration: 5000, message: task.state === 'timed_out' ? i18n.global.t('notifications.nftablesInstallTimeout') : i18n.global.t('notifications.nftablesInstallStopped') })
       return
     }
     if (task.state === 'error') {
-      push.warning({ duration: 6000, message: task.error || task.phase || 'nftables 安装失败' })
+      push.warning({ duration: 6000, message: task.error || task.phase || i18n.global.t('notifications.nftablesInstallFailed') })
     }
   } finally {
     resetNftablesInstallTask()

@@ -92,7 +92,7 @@ const login = async () => {
       const warning = response.obj?.warning
       if (typeof warning === 'string' && warning.trim().length > 0) {
         push.warning({
-          title: 'Warning',
+          title: i18n.global.t('warning'),
           message: warning,
           duration: 7000,
         })

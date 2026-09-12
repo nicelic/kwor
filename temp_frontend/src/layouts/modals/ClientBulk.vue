@@ -149,7 +149,7 @@ export default {
       if (!this.dialogVisible || this.loading) return
       const count = Math.floor(Number(this.count))
       if (!Number.isFinite(count) || count < 1 || count > 100) {
-        push.error('批量数量必须在 1 到 100 之间')
+        push.error(i18n.global.t('notifications.bulkCountInvalid'))
         return
       }
       this.count = count
@@ -159,7 +159,7 @@ export default {
       }
       const volumeBytes = clientVolumeGiBToBytes(this.bulkData.Volume)
       if (volumeBytes === null) {
-        push.error('流量上限必须是大于等于 0 的数字')
+        push.error(i18n.global.t('notifications.trafficLimitInvalid'))
         return
       }
       const inboundIds = this.normalizeInboundIds(this.bulkData.clientInbounds)
@@ -171,7 +171,7 @@ export default {
         for(let i=0;i<count;i++){
           const name = this.genByPattern(this.bulkData.name, i).trim()
           if (name === '') {
-            push.error('批量生成的用户名称不能为空')
+            push.error(i18n.global.t('notifications.bulkClientNameRequired'))
             return
           }
           this.clients.push(createClient({

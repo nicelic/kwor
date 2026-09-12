@@ -192,6 +192,28 @@ var mihomoHY2MergeSchema = mergeSchemaLeaves(
 	"max_connection_receive_window",
 )
 
+var hysteria2RealmMergeSchema = mergeSchemaLeaves(
+	"enable",
+	"server_url",
+	"server-url",
+	"token",
+	"realm_id",
+	"realm-id",
+	"stun_servers",
+	"stun-servers",
+	"sni",
+	"skip_cert_verify",
+	"skip-cert-verify",
+	"name_cert_verify",
+	"name-cert-verify",
+	"fingerprint",
+	"certificate",
+	"private_key",
+	"private-key",
+	"alpn",
+	"proxy",
+)
+
 var defaultDialMergeSchema = mergeSchemaLeaves(
 	"detour",
 	"bind_interface",
@@ -401,6 +423,8 @@ func protocolEditableMergeSchema(outType string) map[string]*outboundMergeSchema
 			map[string]*outboundMergeSchemaNode{
 				"obfs":       mergeBranch(hysteria2ObfsMergeSchema),
 				"mihomo_hy2": mergeBranch(mihomoHY2MergeSchema),
+				"realm_opts": mergeBranch(hysteria2RealmMergeSchema),
+				"realm-opts": mergeBranch(hysteria2RealmMergeSchema),
 			},
 		)
 	case "anytls":

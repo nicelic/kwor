@@ -349,7 +349,7 @@ const Data = defineStore('Data', {
           push.warning({
             title: i18n.global.t('warning'),
             duration: 7000,
-            message: reloaded ? '数据已保存，列表已重新加载。' : '数据已保存，但列表刷新失败，请稍后刷新页面。',
+            message: reloaded ? i18n.global.t('notifications.dataSavedReloaded') : i18n.global.t('notifications.dataSavedRefreshFailed'),
           })
           return true
         }

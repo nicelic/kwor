@@ -4140,18 +4140,18 @@ const completeAcmeInstallTask = async (task: AcmeInstallTaskStatus) => {
   try {
     if (task.state === 'success') {
       await refreshOverview(true)
-      push.success({ duration: 3600, message: 'acme.sh 下载 / 重装完成' })
+      push.success({ duration: 3600, message: i18n.global.t('notifications.acmeInstalled') })
       return
     }
     if (task.state === 'cancelled') {
-      push.info({ duration: 3600, message: 'acme.sh 下载任务已停止，临时文件已清理' })
+      push.info({ duration: 3600, message: i18n.global.t('notifications.acmeInstallStopped') })
       return
     }
     if (task.state === 'timed_out') {
-      push.warning({ duration: 4600, message: 'acme.sh 下载任务超过 20 分钟，已停止并清理临时文件' })
+      push.warning({ duration: 4600, message: i18n.global.t('notifications.acmeInstallTimeout') })
       return
     }
-    push.error({ duration: 5000, message: task.error || 'acme.sh 下载 / 重装失败' })
+    push.error({ duration: 5000, message: task.error || i18n.global.t('notifications.acmeInstallFailed') })
   } finally {
     clearCompletedAcmeInstallTask(task.id)
   }
@@ -4284,13 +4284,13 @@ const installAcme = async () => {
         duration: 5000,
         message: String(msg.msg || (targetVersion !== ''
           ? `版本 ${targetVersion} 无法下载或安装`
-          : beforeVersion === '' ? 'acme.sh 下载任务未能受理' : 'acme.sh 重装任务未能受理')),
+          : beforeVersion === '' ? i18n.global.t('notifications.acmeTaskNotAccepted') : i18n.global.t('notifications.acmeReinstallNotAccepted'))),
       })
     }
   } catch {
     const recovered = await recoverAcmeInstallTask()
     if (!recovered) {
-      push.error({ duration: 5000, message: beforeVersion === '' ? 'acme.sh 下载任务未能受理' : 'acme.sh 重装任务未能受理' })
+      push.error({ duration: 5000, message: beforeVersion === '' ? i18n.global.t('notifications.acmeTaskNotAccepted') : i18n.global.t('notifications.acmeReinstallNotAccepted') })
     }
   } finally {
     installStartPending.value = false
@@ -4663,7 +4663,7 @@ const issueCertificate = async () => {
     if (msg.success) {
       const task = normalizeAcmeTask(msg.obj)
       if (task == null) {
-        push.error({ duration: 4200, message: '后台签发任务返回无效，请刷新页面后查看证书库存。' })
+        push.error({ duration: 4200, message: i18n.global.t('notifications.certIssueInvalid') })
         return
       }
       openIssueTaskLog(task)
@@ -4737,7 +4737,7 @@ const renewCertificate = async (cert: AcmeCertificate, force: boolean) => {
     if (msg.success) {
       const task = normalizeAcmeTask(msg.obj)
       if (task == null) {
-        push.error({ duration: 4200, message: '后台续签任务返回无效，请刷新页面后查看证书库存。' })
+        push.error({ duration: 4200, message: i18n.global.t('notifications.certRenewInvalid') })
         return
       }
       openIssueTaskLog(task)
@@ -5094,7 +5094,7 @@ const rotateAcmeAccountKey = async () => {
     if (msg.success) {
       applyActionResult(msg.obj)
       acmeAccountRotateVisible.value = false
-      push.success({ duration: 3600, message: 'ACME 账号密钥已轮换' })
+      push.success({ duration: 3600, message: i18n.global.t('notifications.acmeKeyRotated') })
     }
   } finally {
     savingAcmeAccount.value = false

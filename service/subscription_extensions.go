@@ -58,12 +58,11 @@ const SubscriptionJSONBaseConfig = `{
   ]
 }`
 
-const SubscriptionClashBaseConfig = `mixed-port: 7890
+const SubscriptionClashBaseConfig = `mixed-port: 7787
 allow-lan: false
 mode: rule
 ipv6: true
 log-level: silent
-external-controller: 127.0.0.1:9090
 unified-delay: true
 find-process-mode: always
 profile:

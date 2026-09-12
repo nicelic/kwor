@@ -33,7 +33,7 @@
     </v-row>
     <v-row>
       <v-col cols="12" sm="6" md="3" lg="2">
-        <v-text-field v-model="externalController" :label="$t('basic.exp.extController')" hide-details @update:model-value="onFormValueChange"></v-text-field>
+        <v-text-field v-model="externalController" :label="$t('basic.exp.extController')" placeholder="127.0.0.1:9090" hide-details @update:model-value="onFormValueChange"></v-text-field>
       </v-col>
       <v-col cols="12" sm="6" md="3" lg="2">
         <v-select v-model="logLevel" :items="clashLogLevels" :label="$t('basic.log.title') + ' - ' + $t('basic.log.level')" hide-details @update:model-value="onFormValueChange"></v-select>
@@ -674,8 +674,15 @@
       <v-col cols="12" sm="6" md="3" lg="2">
 		<v-switch v-model="enableSniff" color="primary" :label="$t('subscriptionEditor.sniffer')" hide-details  @update:model-value="onFormValueChange"/>
       </v-col>
-      <v-col cols="12" sm="6" md="3" lg="2">
-		<v-switch v-model="enableRejectQuic" color="primary" :label="$t('subscriptionEditor.rejectQuicPorts')" hide-details  @update:model-value="onFormValueChange"/>
+      <v-col cols="12" sm="6" md="5" lg="4">
+		<v-switch v-model="enableRejectQuic" color="primary" hide-details @update:model-value="onFormValueChange">
+          <template #label>
+            <div>
+              <div>{{ $t('subscriptionEditor.rejectQuicPorts') }}</div>
+              <div class="text-caption text-medium-emphasis">(80, 443, 2443, 4443, 6443, 8080, 8081, 8443)</div>
+            </div>
+          </template>
+        </v-switch>
       </v-col>
     </v-row>
     <v-row>

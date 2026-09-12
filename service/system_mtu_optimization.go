@@ -26,9 +26,9 @@ const (
 	systemMTUInterfaceKey  = "systemMTUInterface"
 	systemMTUOriginalKey   = "systemMTUOriginalValue"
 
-	defaultSystemMTUValue = 1500
-	minAllowedMTUValue    = 576
-	maxAllowedMTUValue    = 9500
+	defaultSystemMTUValue = 1470
+	minAllowedMTUValue    = 1280
+	maxAllowedMTUValue    = 1600
 
 	managedMTUScriptFileName = "_set_mtu_.sh"
 	managedMTUServiceUnit    = "kwor-mtu-opt.service"
@@ -177,9 +177,6 @@ func (s *SystemMTUOptimizationService) GetOverviewContext(ctx context.Context) (
 	}
 
 	if enabled {
-		if overview.OriginalMTU <= 0 {
-			issues = append(issues, "旧版本未记录原始 MTU，关闭时将回退到 1500")
-		}
 		if !overview.ScriptExists {
 			issues = append(issues, "MTU 脚本不存在，请重新保存 MTU 或重新开启开关")
 		}
@@ -205,19 +202,13 @@ func (s *SystemMTUOptimizationService) SetEnabled(enabled bool, requestedMTU *in
 	}
 
 	if enabled {
-		targetMTU := defaultSystemMTUValue
-		if requestedMTU != nil {
-			targetMTU = *requestedMTU
-		} else if iface, detectErr := detectDefaultInterfaceName(); detectErr == nil {
-			if currentMTU, currentErr := detectInterfaceMTUValue(iface); currentErr == nil {
-				targetMTU = currentMTU
-			} else if storedMTU, storedErr := s.getStoredMTU(); storedErr == nil {
-				targetMTU = storedMTU
-			}
-		} else if storedMTU, storedErr := s.getStoredMTU(); storedErr == nil {
-			targetMTU = storedMTU
+		if err := s.setString(systemMTUEnabledKey, "true"); err != nil {
+			return err
 		}
-		return s.enableMTULocked(targetMTU)
+		if requestedMTU != nil {
+			return s.enableMTULocked(*requestedMTU)
+		}
+		return nil
 	}
 
 	return s.disableMTULocked()
@@ -232,14 +223,6 @@ func (s *SystemMTUOptimizationService) SaveMTU(mtu int) error {
 	}
 	if err := validateMTUValue(mtu); err != nil {
 		return err
-	}
-
-	enabled, err := s.getBool(systemMTUEnabledKey)
-	if err != nil {
-		return err
-	}
-	if !enabled {
-		return s.setString(systemMTUValueKey, strconv.Itoa(mtu))
 	}
 
 	return s.enableMTULocked(mtu)
@@ -328,22 +311,7 @@ func (s *SystemMTUOptimizationService) disableMTULocked() error {
 	if previous.ScriptPath == "" {
 		previous.ScriptPath = s.resolveMTUScriptPath()
 	}
-	if !previous.Enabled {
-		errs := make([]error, 0, 2)
-		if err := removeSystemdMTUService(); err != nil {
-			errs = append(errs, err)
-		}
-		if err := removeManagedMTUScript(previous.ScriptPath); err != nil {
-			errs = append(errs, err)
-		}
-		if err := joinMTUErrors(errs); err != nil {
-			return err
-		}
 
-		previous.Interface = ""
-		previous.OriginalMTU = 0
-		return s.saveMTUPersistedState(previous)
-	}
 	previousInterface := sanitizeInterfaceName(previous.Interface)
 	iface := previousInterface
 	if iface != "" {
@@ -357,10 +325,7 @@ func (s *SystemMTUOptimizationService) disableMTULocked() error {
 			return common.NewError("默认网卡检测失败: ", err)
 		}
 	}
-	restoreMTU := previous.OriginalMTU
-	if restoreMTU <= 0 || iface != previousInterface {
-		restoreMTU = defaultSystemMTUValue
-	}
+	restoreMTU := defaultSystemMTUValue
 	if _, err := resolveInterfaceMTUMutator(iface); err != nil {
 		return err
 	}
@@ -368,7 +333,7 @@ func (s *SystemMTUOptimizationService) disableMTULocked() error {
 		return s.rollbackMTUDisable(previous, iface, cause)
 	}
 	if err := setInterfaceMTUValue(iface, restoreMTU); err != nil {
-		return rollback(common.NewError("恢复原始 MTU=", restoreMTU, " 失败: ", err))
+		return rollback(common.NewError("恢复 MTU=", restoreMTU, " 失败: ", err))
 	}
 	if err := removeSystemdMTUService(); err != nil {
 		return rollback(err)

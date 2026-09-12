@@ -115,6 +115,14 @@ func buildMihomoInboundUserManagement(inboundType string, shadowTLSVersion int) 
 			IdentityType:   "username",
 			Reason:         "trusttunnel_username_password_users",
 		}
+	case "hysteria2-realm":
+		return MihomoInboundUserManagement{
+			Selectable:     false,
+			UsesUsersField: false,
+			Mode:           "not_applicable",
+			IdentityType:   "none",
+			Reason:         "rendezvous_server",
+		}
 	case "shadowquic":
 		return MihomoInboundUserManagement{
 			Selectable:     true,

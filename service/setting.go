@@ -292,7 +292,7 @@ var defaultValueMap = map[string]string{
 	"systemLinuxDnsPath":                "",
 	"systemLinuxDnsNameServersInput":    "",
 	"systemMTUEnabled":                  "false",
-	"systemMTUValue":                    "1500",
+	"systemMTUValue":                    "1470",
 	"systemMTUScriptPath":               "",
 	"systemMTUInterface":                "",
 	"systemMTUOriginalValue":            "0",

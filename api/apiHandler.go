@@ -339,6 +339,38 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.SaveSelfSignedAuthority(c)
 	case "self-signed-authority-delete":
 		a.ApiService.DeleteSelfSignedAuthority(c)
+	case "ddns-rule-save":
+		a.ApiService.SaveDDNSRule(c)
+	case "ddns-rule-status":
+		a.ApiService.ToggleDDNSRule(c)
+	case "ddns-rule-delete":
+		a.ApiService.DeleteDDNSRule(c)
+	case "ddns-rule-sync":
+		a.ApiService.SyncDDNSRule(c)
+	case "ddns-rule-sync-all":
+		a.ApiService.SyncAllDDNSRules(c)
+	case "ddns-account-save":
+		a.ApiService.SaveDDNSAccount(c)
+	case "ddns-account-delete":
+		a.ApiService.DeleteDDNSAccount(c)
+	case "ddns-account-test":
+		a.ApiService.TestDDNSAccountAuth(c)
+	case "dns-record-create":
+		a.ApiService.CreateDNSRecord(c)
+	case "dns-record-update":
+		a.ApiService.UpdateDNSRecord(c)
+	case "dns-record-delete":
+		a.ApiService.DeleteDNSRecord(c)
+	case "dns-domain-save":
+		a.ApiService.SaveDNSFavoriteDomain(c)
+	case "dns-domain-delete":
+		a.ApiService.DeleteDNSFavoriteDomain(c)
+	case "dns-account-save":
+		a.ApiService.SaveDNSAccount(c)
+	case "dns-account-delete":
+		a.ApiService.DeleteDNSAccount(c)
+	case "dns-account-test":
+		a.ApiService.TestDNSAccountAuth(c)
 	default:
 		jsonMsg(c, "failed", common.NewError("unknown action: ", action))
 	}
@@ -555,6 +587,16 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetPanelUpdateVersions(c)
 	case "panel-update-log":
 		a.ApiService.GetPanelUpdateLog(c)
+	case "ddns-overview":
+		a.ApiService.GetDDNSOverview(c)
+	case "ddns-interfaces":
+		a.ApiService.GetDDNSInterfaces(c)
+	case "dns-overview":
+		a.ApiService.GetDNSOverview(c)
+	case "dns-records":
+		a.ApiService.ListDNSRecords(c)
+	case "dns-domains":
+		a.ApiService.ListDNSDomains(c)
 	default:
 		jsonMsg(c, "failed", common.NewError("unknown action: ", action))
 	}

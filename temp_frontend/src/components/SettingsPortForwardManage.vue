@@ -1,7 +1,7 @@
 <template>
   <section class="pf-page">
     <v-row class="mt-1">
-      <v-col cols="12" xl="8">
+      <v-col cols="12">
         <v-card class="pf-hero" rounded="xl" :loading="loading && !hasLoaded">
           <div class="pf-hero__bg"></div>
           <v-card-text class="pf-hero__content">
@@ -59,7 +59,7 @@
         </v-card>
       </v-col>
 
-      <v-col cols="12" xl="4">
+      <v-col cols="12">
         <v-card rounded="xl" variant="outlined" class="pf-side">
           <v-card-title class="text-subtitle-1 font-weight-medium">{{ t('runtimeTitle') }}</v-card-title>
           <v-divider />

@@ -153,6 +153,8 @@ func stripMihomoOnlySubscriptionFields(outbound map[string]interface{}) {
 		"mihomo_fast_open",
 		"fast_open",
 		"fast-open",
+		"realm_opts",
+		"realm-opts",
 	} {
 		delete(outbound, key)
 	}

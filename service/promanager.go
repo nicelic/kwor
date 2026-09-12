@@ -863,6 +863,7 @@ func stripClashOnlyTLSFields(outbound map[string]interface{}) {
 	delete(outbound, "mihomo_hy2")
 	delete(outbound, "mihomo_fast_open")
 	delete(outbound, "fast_open")
+	util.StripMihomoRealmOpts(outbound)
 	tlsRaw, ok := outbound["tls"]
 	if !ok {
 		return

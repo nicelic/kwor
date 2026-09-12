@@ -39,8 +39,10 @@ func sanitizeMihomoClientCommonFields(inbound *model.MihomoInbound) error {
 	if strings.EqualFold(strings.TrimSpace(inbound.Type), "hysteria2") {
 		util.EnsureHysteria2MihomoReceiveWindows(outbound)
 		sanitizeMihomoHysteria2ClientReceiveWindows(outbound)
+		sanitizeMihomoHysteria2ClientRealmOpts(outbound)
 	} else {
 		delete(outbound, "mihomo_hy2")
+		util.StripMihomoRealmOpts(outbound)
 	}
 	stripUnsupportedMihomoTLSFields(outbound)
 	sanitizeMihomoGRPCNumericFields(outbound)
@@ -281,6 +283,26 @@ func sanitizeMihomoHysteria2ClientReceiveWindows(outbound map[string]interface{}
 		return
 	}
 	outbound["mihomo_hy2"] = clean
+}
+
+func sanitizeMihomoHysteria2ClientRealmOpts(outbound map[string]interface{}) {
+	if outbound == nil {
+		return
+	}
+	raw, exists := outbound["realm_opts"]
+	if !exists {
+		raw, exists = outbound["realm-opts"]
+	}
+	delete(outbound, "realm-opts")
+	if !exists || raw == nil {
+		delete(outbound, "realm_opts")
+		return
+	}
+	if normalized, ok := util.NormalizeMihomoHysteria2RealmOptsSnake(raw); ok {
+		outbound["realm_opts"] = normalized
+	} else {
+		delete(outbound, "realm_opts")
+	}
 }
 
 func sanitizeMihomoOutboundRoutingMark(outbound map[string]interface{}) {

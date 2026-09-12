@@ -88,7 +88,7 @@
             :label="$t('basic.routing.defaultRm')">
           </v-text-field>
         </v-col>
-        <v-col cols="12" sm="6" md="3" lg="2">
+        <v-col cols="12" sm="6" md="3" lg="2" v-if="props.namespace !== 'mihomo'">
           <v-switch
             v-model="route.auto_detect_interface"
             color="primary"
@@ -695,9 +695,11 @@ const saveConfig = async () => {
       }
     }
     if (props.namespace === 'mihomo') {
+      const mihomoRoute = cloneConfig(appConfig.value.route ?? {}) as unknown as Record<string, unknown>
+      delete mihomoRoute.auto_detect_interface
       const routeRequest: { expectedRevision: number, route: Record<string, unknown>, sniffer?: unknown } = {
         expectedRevision: mihomoRouteRevision.value,
-        route: cloneConfig(appConfig.value.route ?? {}) as unknown as Record<string, unknown>,
+        route: mihomoRoute,
       }
       if (mihomoSniffUiTouched.value) {
         routeRequest.sniffer = Object.hasOwn(appConfig.value as object, 'sniffer')

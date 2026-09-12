@@ -58,6 +58,8 @@ type ApiService struct {
 	service.AcmeService
 	service.CertificateInventoryService
 	service.SelfSignedService
+	service.DDNSService
+	service.DNSService
 	service.PanelUpdateService
 	service.PanelUninstallService
 
