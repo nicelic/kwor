@@ -396,6 +396,21 @@ const applySingboxRouteContext = async (context: any, preserveDraft = false): Pr
   singboxRouteInboundTags.value = Array.isArray(context.inboundTags) ? context.inboundTags : []
   singboxRouteOutboundTags.value = Array.isArray(context.outboundTags) ? context.outboundTags : []
   singboxRouteClientNames.value = Array.isArray(context.clientNames) ? context.clientNames : []
+  if (singboxRouteInboundTags.value.length === 0 && Array.isArray(store.inbounds)) {
+    singboxRouteInboundTags.value = store.inbounds
+      .map((i: any) => String(i?.tag ?? '').trim())
+      .filter((tag: string) => tag.length > 0)
+  }
+  if (singboxRouteOutboundTags.value.length === 0 && Array.isArray(store.outbounds)) {
+    singboxRouteOutboundTags.value = store.outbounds
+      .map((o: any) => String(o?.tag ?? '').trim())
+      .filter((tag: string) => tag.length > 0)
+  }
+  if (singboxRouteClientNames.value.length === 0 && Array.isArray(store.clients)) {
+    singboxRouteClientNames.value = store.clients
+      .map((c: any) => String(c?.name ?? '').trim())
+      .filter((name: string) => name.length > 0)
+  }
   if (!preserveDraft) {
     await replaceDraft({ route: context.route ?? {} } as Config)
   }
@@ -522,11 +537,44 @@ const initialize = async () => {
         const storeLoaded = await store.loadData()
         if (storeLoaded || store.hasFullData) {
           await replaceDraft(store.config)
+          if (mihomoRouteInboundTags.value.length === 0 && Array.isArray(store.inbounds)) {
+            mihomoRouteInboundTags.value = store.inbounds
+              .map((i: any) => String(i?.tag ?? '').trim())
+              .filter((tag: string) => tag.length > 0)
+          }
+          if (mihomoRouteTargets.value.length === 0) {
+            const availableOuts = Array.isArray(store.outbounds)
+              ? store.outbounds.map((o: any) => String(o?.tag ?? '').trim()).filter(Boolean)
+              : []
+            mihomoRouteTargets.value = ['DIRECT', 'REJECT', 'REJECT-DROP', ...availableOuts]
+          }
           success = true
         }
       }
     } else {
       success = await loadSingboxRouteEditorContext()
+      if (!success) {
+        const storeLoaded = await store.loadData()
+        if (storeLoaded || store.hasFullData) {
+          await replaceDraft(store.config)
+          if (singboxRouteInboundTags.value.length === 0 && Array.isArray(store.inbounds)) {
+            singboxRouteInboundTags.value = store.inbounds
+              .map((i: any) => String(i?.tag ?? '').trim())
+              .filter((tag: string) => tag.length > 0)
+          }
+          if (singboxRouteOutboundTags.value.length === 0 && Array.isArray(store.outbounds)) {
+            singboxRouteOutboundTags.value = store.outbounds
+              .map((o: any) => String(o?.tag ?? '').trim())
+              .filter((tag: string) => tag.length > 0)
+          }
+          if (singboxRouteClientNames.value.length === 0 && Array.isArray(store.clients)) {
+            singboxRouteClientNames.value = store.clients
+              .map((c: any) => String(c?.name ?? '').trim())
+              .filter((name: string) => name.length > 0)
+          }
+          success = true
+        }
+      }
     }
     if (!componentActive) return
     if (!success) {

@@ -75,7 +75,7 @@ func TestMihomoConfigSaveRejectsMalformedInboundReference(t *testing.T) {
 	}
 }
 
-func TestMihomoRouteEditorContextExcludesNativeDetourListeners(t *testing.T) {
+func TestMihomoRouteEditorContextIncludesSupportedListeners(t *testing.T) {
 	initMihomoManagerFinalFallbackTestDB(t, "mihomo-route-detour-context.db")
 	createMihomoRouteReferenceInbound(t, "rule-listener", `{"listen":"::","listen_port":18080}`)
 	createMihomoRouteReferenceInbound(t, "detoured-listener", `{"listen":"::","listen_port":18081,"detour":"DIRECT"}`)
@@ -92,8 +92,8 @@ func TestMihomoRouteEditorContextExcludesNativeDetourListeners(t *testing.T) {
 	if _, ok := seen["rule-listener"]; !ok {
 		t.Fatalf("expected ordinary listener in route context: %#v", context.InboundTags)
 	}
-	if _, ok := seen["detoured-listener"]; ok {
-		t.Fatalf("native detour listener must not be selectable for route rules: %#v", context.InboundTags)
+	if _, ok := seen["detoured-listener"]; !ok {
+		t.Fatalf("supported listener must be selectable in route context: %#v", context.InboundTags)
 	}
 
 	tx := database.GetDB().Begin()
@@ -102,8 +102,8 @@ func TestMihomoRouteEditorContextExcludesNativeDetourListeners(t *testing.T) {
 	}
 	defer tx.Rollback()
 	err = (&MihomoConfigService{}).SaveConfig(tx, mihomoRouteConfigForInboundReference("detoured-listener"))
-	if err == nil || !strings.Contains(err.Error(), "references unavailable inbound tag(s): detoured-listener") {
-		t.Fatalf("expected detoured listener rejection, got %v", err)
+	if err != nil {
+		t.Fatalf("expected detoured listener save to succeed, got %v", err)
 	}
 }
 
@@ -160,8 +160,8 @@ func TestMihomoInboundSaveRejectsRouteReferenceAfterDeleteOrDetour(t *testing.T)
 		defer tx.Rollback()
 
 		_, err = (&MihomoInboundService{}).Save(tx, "edit", raw, "", "panel.example.com")
-		if err == nil || !strings.Contains(err.Error(), "references unavailable inbound tag(s): detour-listener") {
-			t.Fatalf("expected detour edit to reject route reference, got %v", err)
+		if err != nil {
+			t.Fatalf("expected detour edit to succeed, got %v", err)
 		}
 	})
 }

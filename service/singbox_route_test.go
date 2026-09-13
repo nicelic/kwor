@@ -422,3 +422,59 @@ func TestSaveSingboxRouteRetryIgnoresStaleRevision(t *testing.T) {
 		t.Fatalf("runtime regeneration calls=%d, want 2", calls)
 	}
 }
+
+func TestSingboxRouteEditorContextIncludesDetourAndShadowTLSTags(t *testing.T) {
+	stubSingboxRouteRuntimeRegeneration(t)
+	settingService := initPanelSQLiteSettingTestDB(t)
+	if err := settingService.SaveSetting("config", `{"route":{"rules":[],"rule_set":[]}}`); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	db := database.GetDB()
+	if err := db.Create(&model.Inbound{
+		Type:    "mixed",
+		Tag:     "mixed-detoured",
+		Options: json.RawMessage(`{"listen":"::","listen_port":1080,"detour":"DIRECT"}`),
+	}).Error; err != nil {
+		t.Fatalf("create mixed inbound: %v", err)
+	}
+	if err := db.Create(&model.Inbound{
+		Type:    "shadowtls",
+		Tag:     "stls-listener",
+		Options: json.RawMessage(`{"listen":"::","listen_port":443,"version":3,"ss_config":{"method":"2022-blake3-aes-128-gcm","password":"pwd"}}`),
+	}).Error; err != nil {
+		t.Fatalf("create shadowtls inbound: %v", err)
+	}
+
+	configService := &ConfigService{}
+	context, err := configService.GetSingboxRouteEditorContext()
+	if err != nil {
+		t.Fatalf("load route context: %v", err)
+	}
+
+	tagMap := make(map[string]bool)
+	for _, tag := range context.InboundTags {
+		tagMap[tag] = true
+	}
+
+	if !tagMap["mixed-detoured"] {
+		t.Fatalf("expected mixed-detoured in InboundTags, got: %v", context.InboundTags)
+	}
+	if !tagMap["stls-listener"] {
+		t.Fatalf("expected stls-listener in InboundTags, got: %v", context.InboundTags)
+	}
+	if !tagMap["stls-listener-in"] {
+		t.Fatalf("expected stls-listener-in in InboundTags, got: %v", context.InboundTags)
+	}
+
+	// 验证使用带 detour 的入站保存路由规则不会报 unknown inbound
+	result, err := configService.SaveSingboxRoute(SingboxRouteSaveRequest{
+		ExpectedRevision: context.Revision,
+		Route: json.RawMessage(`{
+			"rules":[{"inbound":["mixed-detoured"],"action":"sniff"}],
+			"rule_set":[]
+		}`),
+	}, "test")
+	if err != nil || result == nil {
+		t.Fatalf("expected save route with detoured inbound to succeed, got %v", err)
+	}
+}

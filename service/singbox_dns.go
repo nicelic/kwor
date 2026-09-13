@@ -395,30 +395,7 @@ func loadSingboxDNSEndpointTags(tx *gorm.DB, endpointType string, onlyListening 
 }
 
 func loadSingboxDNSInboundTags(tx *gorm.DB) ([]string, error) {
-	inbounds := make([]model.Inbound, 0)
-	if err := tx.Select("type", "tag", "options").Order("id ASC").Find(&inbounds).Error; err != nil {
-		return nil, err
-	}
-	values := make([]string, 0, len(inbounds))
-	for _, inbound := range inbounds {
-		values = append(values, deriveEffectiveInboundRouteTagFromRaw(inbound.Tag, inbound.Type, inbound.Options))
-	}
-	endpoints := make([]model.Endpoint, 0)
-	if err := tx.Select("tag", "options").Order("id ASC").Find(&endpoints).Error; err != nil {
-		return nil, err
-	}
-	for _, endpoint := range endpoints {
-		options := map[string]any{}
-		if len(endpoint.Options) == 0 || json.Unmarshal(endpoint.Options, &options) != nil {
-			continue
-		}
-		port, ok := asPositiveInteger(options["listen_port"])
-		if !ok || port == 0 {
-			continue
-		}
-		values = append(values, deriveEffectiveEndpointRouteTagFromRaw(endpoint.Tag, endpoint.Options))
-	}
-	return compactUniqueStrings(values), nil
+	return loadSingboxRuntimeInboundReferenceTags(tx)
 }
 
 func compactUniqueStrings(values []string) []string {

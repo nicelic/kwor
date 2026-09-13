@@ -32,12 +32,16 @@ func loadMihomoRouteInboundRuleTags(db *gorm.DB, targets *mihomoProxyConversionR
 			continue
 		}
 
-		ref, err := buildMihomoInboundRouteRef(inbound, targets, "DIRECT")
-		if err != nil {
-			return nil, err
-		}
-		if tag := strings.TrimSpace(ref.RuleName); tag != "" {
+		tag := strings.TrimSpace(inbound.Tag)
+		if tag != "" {
 			tags[tag] = struct{}{}
+		}
+
+		ref, err := buildMihomoInboundRouteRef(inbound, targets, "DIRECT")
+		if err == nil {
+			if ruleName := strings.TrimSpace(ref.RuleName); ruleName != "" {
+				tags[ruleName] = struct{}{}
+			}
 		}
 	}
 

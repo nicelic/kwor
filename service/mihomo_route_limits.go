@@ -52,7 +52,13 @@ type MihomoRouteEditorContext struct {
 func GetMihomoRouteEditorContext(db *gorm.DB) (*MihomoRouteEditorContext, error) {
 	targets, err := loadMihomoRouteTargets(db)
 	if err != nil {
-		return nil, err
+		targets = &mihomoProxyConversionResult{
+			SupportedTags: map[string]struct{}{
+				"DIRECT":      {},
+				"REJECT":      {},
+				"REJECT-DROP": {},
+			},
+		}
 	}
 
 	inboundTags, err := loadMihomoRouteInboundRuleTags(db, targets)

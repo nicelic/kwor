@@ -88,7 +88,7 @@ func (s *ConfigService) GetSingboxRouteEditorContext() (*SingboxRouteEditorConte
 		}
 		outboundTags, err := loadSingboxRouteOutboundTags(tx)
 		if err != nil {
-			return err
+			outboundTags = []string{}
 		}
 		clientNames := []string{}
 		if err := tx.Model(&model.Client{}).Order("id ASC").Pluck("name", &clientNames).Error; err != nil {
@@ -262,7 +262,8 @@ func loadSingboxRouteOutboundTags(tx *gorm.DB) ([]string, error) {
 	for index := range outbounds {
 		runtimeTags, err := singboxRuntimeOutboundTags(&outbounds[index])
 		if err != nil {
-			return nil, fmt.Errorf("decode sing-box outbound %q runtime tags: %w", outbounds[index].Tag, err)
+			add(outbounds[index].Tag)
+			continue
 		}
 		for _, tag := range runtimeTags {
 			add(tag)

@@ -85,21 +85,38 @@ func buildInboundTagAliasMap(db *gorm.DB) (map[string]string, error) {
 	if err := db.Model(model.Inbound{}).Find(&inbounds).Error; err != nil {
 		return nil, err
 	}
-	for _, inbound := range inbounds {
-		effectiveTag := deriveEffectiveInboundRouteTagFromRaw(inbound.Tag, inbound.Type, inbound.Options)
-		if effectiveTag != "" && effectiveTag != inbound.Tag {
-			aliasMap[inbound.Tag] = effectiveTag
-		}
-	}
-
 	var endpoints []model.Endpoint
 	if err := db.Model(model.Endpoint{}).Find(&endpoints).Error; err != nil {
 		return nil, err
 	}
+
+	validInboundTags := make(map[string]struct{})
+	for index := range inbounds {
+		for _, tag := range singboxRuntimeInboundTags(&inbounds[index]) {
+			validInboundTags[tag] = struct{}{}
+		}
+	}
+	for index := range endpoints {
+		for _, tag := range singboxRouteEndpointReferenceTags(&endpoints[index]) {
+			validInboundTags[tag] = struct{}{}
+		}
+	}
+
+	for _, inbound := range inbounds {
+		effectiveTag := deriveEffectiveInboundRouteTagFromRaw(inbound.Tag, inbound.Type, inbound.Options)
+		if effectiveTag != "" && effectiveTag != inbound.Tag {
+			if _, isValid := validInboundTags[effectiveTag]; isValid {
+				aliasMap[inbound.Tag] = effectiveTag
+			}
+		}
+	}
+
 	for _, endpoint := range endpoints {
 		effectiveTag := deriveEffectiveEndpointRouteTagFromRaw(endpoint.Tag, endpoint.Options)
 		if effectiveTag != "" && effectiveTag != endpoint.Tag {
-			aliasMap[endpoint.Tag] = effectiveTag
+			if _, isValid := validInboundTags[effectiveTag]; isValid {
+				aliasMap[endpoint.Tag] = effectiveTag
+			}
 		}
 	}
 

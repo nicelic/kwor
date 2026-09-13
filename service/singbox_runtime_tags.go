@@ -112,8 +112,12 @@ func singboxRouteEndpointReferenceTags(endpoint *model.Endpoint) []string {
 		return nil
 	}
 
-	tag := deriveEffectiveEndpointRouteTagFromRaw(endpoint.Tag, endpoint.Options)
-	return compactUniqueStrings([]string{tag})
+	effectiveTag := deriveEffectiveEndpointRouteTagFromRaw(endpoint.Tag, endpoint.Options)
+	rawTag := strings.TrimSpace(endpoint.Tag)
+	if rawTag != "" && rawTag != effectiveTag {
+		return compactUniqueStrings([]string{rawTag, effectiveTag})
+	}
+	return compactUniqueStrings([]string{effectiveTag})
 }
 
 func removedSingboxRuntimeTags(previous []string, current []string) []string {
