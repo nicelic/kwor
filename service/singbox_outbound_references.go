@@ -182,6 +182,9 @@ func validateSingboxDNSServerRemovalReferences(tx *gorm.DB, tag string) error {
 				if key == "domain_resolver" || key == "default_domain_resolver" {
 					add(childPath, child)
 				}
+				if key == "server" && strings.HasPrefix(childPath, "config.dns.rules") {
+					add(childPath, child)
+				}
 				collect(child, childPath)
 			}
 		case []interface{}:

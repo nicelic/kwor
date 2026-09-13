@@ -153,6 +153,7 @@ func (a *APP) Start() error {
 	service.SyncPortForwardNftablesAfterListenersOnStartup()
 
 	service.StartDDNSRuntimeWorker()
+	service.StartSystemOptimizationWatcher()
 
 	a.startTrafficOverviewRuntimeProbe()
 	a.startManagedCoreOnLinuxStartup()

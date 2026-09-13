@@ -152,3 +152,22 @@ func TestCertificateDeleteAllowedAfterReverseProxyBindingCleared(t *testing.T) {
 		t.Fatalf("delete after reverse proxy binding cleared failed: %v", err)
 	}
 }
+
+func TestCertificateDeleteBlockedByMinimumAssignment(t *testing.T) {
+	reasonPanel := certificateMinimumAssignmentBlockReason(true, false, 1, 0)
+	if !strings.Contains(reasonPanel, "界面") || !strings.Contains(reasonPanel, "至少需要保留一张") {
+		t.Fatalf("unexpected panel block reason: %q", reasonPanel)
+	}
+	reasonSub := certificateMinimumAssignmentBlockReason(false, true, 0, 1)
+	if !strings.Contains(reasonSub, "订阅") || !strings.Contains(reasonSub, "至少需要保留一张") {
+		t.Fatalf("unexpected sub block reason: %q", reasonSub)
+	}
+	reasonBoth := certificateMinimumAssignmentBlockReason(true, true, 1, 1)
+	if !strings.Contains(reasonBoth, "界面、订阅") || !strings.Contains(reasonBoth, "至少需要保留一张") {
+		t.Fatalf("unexpected both block reason: %q", reasonBoth)
+	}
+	reasonMultiple := certificateMinimumAssignmentBlockReason(true, false, 2, 0)
+	if reasonMultiple != "" {
+		t.Fatalf("expected empty reason when multiple certificates exist, got %q", reasonMultiple)
+	}
+}

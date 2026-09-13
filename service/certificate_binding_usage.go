@@ -153,6 +153,20 @@ func certificateDeleteBlocked(row *model.CertificateRecord) bool {
 	return strings.TrimSpace(certificateDeleteBlockReason(row)) != ""
 }
 
+func certificateMinimumAssignmentBlockReason(inUseByPanel, inUseBySub bool, panelAssignedCount, subAssignedCount int) string {
+	labels := make([]string, 0, 2)
+	if inUseByPanel && panelAssignedCount <= 1 {
+		labels = append(labels, "界面")
+	}
+	if inUseBySub && subAssignedCount <= 1 {
+		labels = append(labels, "订阅")
+	}
+	if len(labels) == 0 {
+		return ""
+	}
+	return strings.Join(labels, "、") + " 至少需要保留一张已应用证书，无法删除。如需更换，请先应用新证书后再删除"
+}
+
 func certificateMinimumAssignmentDeleteError(targets []PanelSelfSignedTarget) error {
 	if len(targets) == 0 {
 		return nil
@@ -169,5 +183,5 @@ func certificateMinimumAssignmentDeleteError(targets []PanelSelfSignedTarget) er
 	if len(labels) == 0 {
 		return nil
 	}
-	return common.NewErrorf("%s 至少需要保留一张已应用证书，无法删除", strings.Join(labels, "、"))
+	return common.NewErrorf("%s 至少需要保留一张已应用证书，无法删除。如需更换，请先应用新证书后再删除", strings.Join(labels, "、"))
 }

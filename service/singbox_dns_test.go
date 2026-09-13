@@ -171,12 +171,18 @@ func TestSaveSingboxDNSCanonicalizesDoHPaths(t *testing.T) {
 		t.Fatalf("decode generated DNS config: %v", err)
 	}
 	servers, _ := generatedDNS["servers"].([]interface{})
-	if len(servers) != 1 {
-		t.Fatalf("generated DNS server count = %d, want 1", len(servers))
+	if len(servers) != 3 {
+		t.Fatalf("generated DNS server count = %d, want 3 (bootstrap, google-doh, google-doh3)", len(servers))
 	}
-	server, _ := servers[0].(map[string]interface{})
-	if path, _ := server["path"].(string); path != "/dns-query" {
-		t.Fatalf("generated DoH path = %q, want /dns-query", path)
+	var googleDohPath string
+	for _, item := range servers {
+		s, _ := item.(map[string]interface{})
+		if s["tag"] == "google-doh" {
+			googleDohPath, _ = s["path"].(string)
+		}
+	}
+	if googleDohPath != "/dns-query" {
+		t.Fatalf("generated DoH path = %q, want /dns-query", googleDohPath)
 	}
 }
 
@@ -398,23 +404,30 @@ func TestSaveSingboxDNSRuntimeRetryDoesNotMutateDatabase(t *testing.T) {
 	}
 }
 
-func TestNormalizeDNSRuleServerRecursesIntoLogicalChildren(t *testing.T) {
+func TestValidateAndNormalizeDNSRuleServerRecursesIntoLogicalChildren(t *testing.T) {
+	known := map[string]struct{}{
+		"dns-final":    {},
+		"valid-server": {},
+	}
+	// Test 1: Empty server gets defaulted to dns-final, while valid server is preserved
 	rules := []interface{}{map[string]interface{}{
 		"type": "logical",
 		"mode": "and",
 		"rules": []interface{}{
-			map[string]interface{}{"action": "route", "server": "stale"},
+			map[string]interface{}{"action": "route", "server": ""},
 			map[string]interface{}{
 				"type": "logical",
 				"mode": "or",
 				"rules": []interface{}{
-					map[string]interface{}{"action": "route", "server": "another-stale"},
+					map[string]interface{}{"action": "route", "server": "valid-server"},
 				},
 			},
 		},
 	}}
 	for _, rule := range rules {
-		normalizeDNSRuleServer(rule, "dns-final")
+		if err := validateAndNormalizeDNSRuleServer(rule, known, "dns-final"); err != nil {
+			t.Fatalf("validateAndNormalizeDNSRuleServer failed: %v", err)
+		}
 	}
 	outer := rules[0].(map[string]interface{})
 	children := outer["rules"].([]interface{})
@@ -422,8 +435,14 @@ func TestNormalizeDNSRuleServerRecursesIntoLogicalChildren(t *testing.T) {
 		t.Fatalf("top-level logical child server = %#v, want dns-final", got)
 	}
 	nested := children[1].(map[string]interface{})["rules"].([]interface{})
-	if got := nested[0].(map[string]interface{})["server"]; got != "dns-final" {
-		t.Fatalf("nested logical child server = %#v, want dns-final", got)
+	if got := nested[0].(map[string]interface{})["server"]; got != "valid-server" {
+		t.Fatalf("nested logical child server = %#v, want preserved valid-server", got)
+	}
+
+	// Test 2: Unknown server returns error
+	invalidRule := map[string]interface{}{"action": "route", "server": "unknown-server"}
+	if err := validateAndNormalizeDNSRuleServer(invalidRule, known, "dns-final"); err == nil {
+		t.Fatal("expected unknown DNS server in rule to be rejected")
 	}
 }
 

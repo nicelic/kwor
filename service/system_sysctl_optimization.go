@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/util/common"
 )
 
@@ -156,8 +157,15 @@ func (s *SystemSysctlOptimizationService) SetEnabledContext(ctx context.Context,
 		return s.setString(systemSysctlPathKey, formatManagedSysctlPathList(paths))
 	}
 
+	// 开关关闭：第一时间注销轮询监视并彻底删除落盘母本，不留痕迹
+	watcher := GetSystemOptimizationWatcher()
+	watcher.Unregister("sysctl-main")
+	watcher.Unregister("sysctl-dropin")
+	_ = RemoveOptimizationGoldenFile(GoldenSysctlMain)
+	_ = RemoveOptimizationGoldenFile(GoldenSysctlDropIn)
+
 	if err := unlockManagedSysctlFiles(resolveSysctlManagedPaths()); err != nil {
-		return err
+		logger.Warningf("[SystemOptimize] 关闭 sysctl 优化时解除文件锁定警告: %v", err)
 	}
 
 	if err := s.setString(systemSysctlPathKey, formatManagedSysctlPathList(resolveSysctlManagedPaths())); err != nil {
@@ -228,6 +236,11 @@ func (s *SystemSysctlOptimizationService) ReconcileOnStartup() error {
 		if err := unlockManagedSysctlFiles(paths); err != nil {
 			return err
 		}
+		watcher := GetSystemOptimizationWatcher()
+		watcher.Unregister("sysctl-main")
+		watcher.Unregister("sysctl-dropin")
+		_ = RemoveOptimizationGoldenFile(GoldenSysctlMain)
+		_ = RemoveOptimizationGoldenFile(GoldenSysctlDropIn)
 		return s.setString(systemSysctlEnabledKey, "false")
 	}
 
@@ -310,6 +323,37 @@ func (s *SystemSysctlOptimizationService) applyManagedSysctlContentLocked(ctx co
 		}); err != nil {
 			return nil, err
 		}
+
+		// 检查加锁状态，执行分叉：第一功能 vs 第二功能
+		locked, lockErr := detectFileImmutable(path)
+		goldenName := GoldenSysctlDropIn
+		watchKey := "sysctl-dropin"
+		if path == sysctlManagedMainPath {
+			goldenName = GoldenSysctlMain
+			watchKey = "sysctl-main"
+		}
+
+		watcher := GetSystemOptimizationWatcher()
+		if lockErr == nil && locked {
+			// 第一功能：已成功加锁，注销监视并清理母本
+			watcher.Unregister(watchKey)
+			_ = RemoveOptimizationGoldenFile(goldenName)
+		} else {
+			// 第二功能：未加锁，直接将生效内容落盘作为母本并注册 10s 轮询监控
+			if saveErr := SaveOptimizationGoldenFile(goldenName, pathContent); saveErr != nil {
+				logger.Warningf("[SystemOptimize] 保存 sysctl 母本文件失败 (%s): %v", goldenName, saveErr)
+			}
+			targetPathCopy := path
+			watcher.Register(OptimizationWatchItem{
+				Key:            watchKey,
+				DisplayName:    "sysctl 配置 " + filepath.Base(path),
+				TargetPath:     targetPathCopy,
+				GoldenFileName: goldenName,
+				OnCorrected: func(correctCtx context.Context, correctedPath string) error {
+					return applySysctlFromManagedFilesContext(correctCtx, []string{correctedPath})
+				},
+			})
+		}
 	}
 
 	pathValue := formatManagedSysctlPathList(paths)
@@ -382,18 +426,6 @@ func allManagedSysctlPathsLocked(paths []string) bool {
 	return true
 }
 
-func normalizeManagedSysctlContent(content string) string {
-	content = strings.ReplaceAll(content, "\r\n", "\n")
-	content = strings.ReplaceAll(content, "\r", "\n")
-	if strings.TrimSpace(content) == "" {
-		content = defaultSystemSysctlContent
-	}
-	if !strings.HasSuffix(content, "\n") {
-		content += "\n"
-	}
-	return content
-}
-
 func applySysctlFromManagedFiles(paths []string) error {
 	return applySysctlFromManagedFilesContext(context.Background(), paths)
 }
@@ -459,6 +491,14 @@ func applySysctlFromManagedFilesContext(ctx context.Context, paths []string) err
 		return nil
 	} else {
 		appendAttempt("restart sysctl service", attemptErr)
+	}
+
+	// 容器环境宽容：若错误信息中包含 read-only 或 permission denied 或 operation not permitted，
+	// 说明部分全局参数受容器内核隔离限制无法修改，但文件已写入且受支持的参数已载入
+	allText := strings.ToLower(strings.Join(attempts, " "))
+	if strings.Contains(allText, "read-only") || strings.Contains(allText, "permission denied") || strings.Contains(allText, "operation not permitted") {
+		logger.Warningf("[SystemOptimize] sysctl 命令执行中部分参数受容器/环境限制无法修改（%s），已记录并继续生效可用参数", strings.Join(attempts, " | "))
+		return nil
 	}
 
 	if len(attempts) == 0 {
@@ -555,4 +595,16 @@ func restartSysctlServiceContext(ctx context.Context) error {
 		return common.NewError("未找到可用的 sysctl 服务管理命令（systemctl/service/rc-service/sv）")
 	}
 	return common.NewError("重启 sysctl 服务失败: ", strings.Join(attempts, " | "))
+}
+
+func normalizeManagedSysctlContent(content string) string {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\r", "\n")
+	if strings.TrimSpace(content) == "" {
+		return ""
+	}
+	if !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	return content
 }

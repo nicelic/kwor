@@ -251,6 +251,7 @@
 
         <v-data-table
           v-if="!smAndDown"
+          :key="`rp-table-${overview.revision}`"
           :headers="reverseProxyHeaders"
           :items="filteredRules"
           item-value="id"
@@ -1524,24 +1525,30 @@ const {
 
 .rp-table :deep(.v-table__wrapper) {
   overflow-x: auto;
+  overscroll-behavior-x: contain;
 }
 
 .rp-table :deep(table) {
   min-width: 1680px;
 }
 
+.rp-table :deep(.rp-table__col-actions),
 .rp-table :deep(th:last-child),
 .rp-table :deep(td:last-child) {
-  position: sticky;
-  right: 0;
-  min-width: 250px;
-  background: rgb(var(--v-theme-surface));
-  box-shadow: -10px 0 14px rgba(15, 23, 42, 0.08);
-  z-index: 2;
+  position: sticky !important;
+  right: 0 !important;
+  min-width: 260px !important;
+  max-width: 260px !important;
+  background: rgb(var(--v-theme-surface)) !important;
+  box-shadow: -10px 0 14px rgba(15, 23, 42, 0.12) !important;
+  z-index: 2 !important;
+  will-change: transform;
+  transform: translateZ(0);
 }
 
+.rp-table :deep(thead .rp-table__col-actions),
 .rp-table :deep(th:last-child) {
-  z-index: 3;
+  z-index: 4 !important;
 }
 
 .rp-panel {

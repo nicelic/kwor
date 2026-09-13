@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/util/common"
 )
 
@@ -187,6 +188,28 @@ func (s *SystemLinuxDNSOptimizationService) applyManagedLinuxDNSContentLocked(ct
 		Context:                          ctx,
 	}); err != nil {
 		return "", err
+	}
+
+	// 检查加锁状态：第一功能 vs 第二功能
+	locked, lockErr := detectFileImmutable(path)
+	watcher := GetSystemOptimizationWatcher()
+	if lockErr == nil && locked {
+		// 第一功能：已成功加锁
+		watcher.Unregister("dns")
+		_ = RemoveOptimizationGoldenFile(GoldenDNS)
+	} else {
+		// 第二功能：未加锁，保存生效内容到母本并注册 10s 轮询监控
+		if saveErr := SaveOptimizationGoldenFile(GoldenDNS, content); saveErr != nil {
+			logger.Warningf("[SystemOptimize] 保存 DNS 母本文件失败: %v", saveErr)
+		}
+		targetPathCopy := path
+		watcher.Register(OptimizationWatchItem{
+			Key:            "dns",
+			DisplayName:    "resolv.conf 配置",
+			TargetPath:     targetPathCopy,
+			GoldenFileName: GoldenDNS,
+			OnCorrected:    nil,
+		})
 	}
 
 	if err := s.setString(systemLinuxDNSPathKey, path); err != nil {

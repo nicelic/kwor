@@ -115,9 +115,6 @@ func (s *NftTrafficService) ApplyInboundNftAction(db *gorm.DB, action *InboundNf
 		if err != nil {
 			return err
 		}
-		if !coreRunning {
-			s.cleanupOnShutdown()
-		}
 		return nil
 	})
 }

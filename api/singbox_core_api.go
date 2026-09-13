@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/alireza0/s-ui/service"
@@ -39,8 +40,89 @@ type singboxCoreUpdateSettingsRequest struct {
 	HasAutoUpdate bool
 }
 
+func parseSingboxCoreVersionWindowPagination(c *gin.Context) (string, int, int) {
+	channel := strings.TrimSpace(c.Query("channel"))
+	if channel == "" {
+		channel = "stable"
+	}
+
+	offset := 0
+	limit := 5
+	if offsetRaw := strings.TrimSpace(c.Query("offset")); offsetRaw != "" {
+		if parsed, err := strconv.Atoi(offsetRaw); err == nil && parsed >= 0 {
+			offset = parsed
+		}
+		if limitRaw := strings.TrimSpace(c.Query("limit")); limitRaw != "" {
+			if parsed, err := strconv.Atoi(limitRaw); err == nil && parsed > 0 {
+				limit = parsed
+			}
+		} else if perPageRaw := strings.TrimSpace(c.Query("per_page")); perPageRaw != "" {
+			if parsed, err := strconv.Atoi(perPageRaw); err == nil && parsed > 0 {
+				limit = parsed
+			}
+		}
+	} else {
+		page := 1
+		if pageRaw := strings.TrimSpace(c.Query("page")); pageRaw != "" {
+			if parsed, err := strconv.Atoi(pageRaw); err == nil && parsed > 0 {
+				page = parsed
+			}
+		}
+		if perPageRaw := strings.TrimSpace(c.Query("per_page")); perPageRaw != "" {
+			if parsed, err := strconv.Atoi(perPageRaw); err == nil && parsed > 0 {
+				limit = parsed
+			}
+		}
+		offset = (page - 1) * limit
+	}
+
+	return channel, offset, limit
+}
+
+func parseSingboxCoreIntervalHours(raw string) (int, error) {
+	trimmed := strings.TrimSpace(strings.ToLower(raw))
+	trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, "h"))
+	if trimmed == "" {
+		return 0, fmt.Errorf("interval is required")
+	}
+	intervalHours, err := strconv.Atoi(trimmed)
+	if err != nil || intervalHours <= 0 {
+		return 0, fmt.Errorf("interval must be a positive hour value, e.g. 12 or 12h")
+	}
+	return intervalHours, nil
+}
+
+type singboxCoreDownloadStopRequest struct {
+	ID *string `json:"id" form:"id"`
+}
+
+func parseSingboxCoreDownloadStopRequest(c *gin.Context) (string, error) {
+	req := singboxCoreDownloadStopRequest{}
+	if err := c.ShouldBind(&req); err != nil {
+		return "", fmt.Errorf("invalid request body: %w", err)
+	}
+	if req.ID == nil || strings.TrimSpace(*req.ID) == "" {
+		return "", fmt.Errorf("id is required")
+	}
+	return strings.TrimSpace(*req.ID), nil
+}
+
+func (a *ApiService) GetCoreDownloadProgress(c *gin.Context) {
+	jsonObj(c, service.GetSingboxManagedCoreDownloadProgress(c.Query("id")), nil)
+}
+
+func (a *ApiService) StopCoreDownload(c *gin.Context) {
+	id, err := parseSingboxCoreDownloadStopRequest(c)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	progress, err := service.StopSingboxManagedCoreDownload(id)
+	jsonObj(c, progress, err)
+}
+
 func parseSingboxCoreVersionWindowQuery(c *gin.Context) singboxCoreVersionRequest {
-	channel, offset, limit := parseCoreVersionWindowPagination(c)
+	channel, offset, limit := parseSingboxCoreVersionWindowPagination(c)
 	return singboxCoreVersionRequest{
 		Channel: channel,
 		Offset:  offset,
@@ -110,7 +192,7 @@ func parseSingboxCoreUpdateSettingsRequest(c *gin.Context) (singboxCoreUpdateSet
 		}
 		return request, nil
 	case "interval", "":
-		intervalHours, err := parseCoreIntervalHours(c.Request.FormValue("interval"))
+		intervalHours, err := parseSingboxCoreIntervalHours(c.Request.FormValue("interval"))
 		if err != nil {
 			return singboxCoreUpdateSettingsRequest{}, err
 		}

@@ -11,7 +11,7 @@ import type {
 } from '@/types/reverseProxy'
 import { push } from 'notivue'
 import { formatPanelDateTime } from '@/plugins/panelTime'
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 export const reverseProxyCopy = {
   heroEyebrow: 'GO REVERSE PROXY',
@@ -248,7 +248,14 @@ export const reverseProxyHeaders = [
   { title: reverseProxyCopy.strategyLabel, key: 'strategy', sortable: false, width: 180 },
   { title: reverseProxyCopy.certificateLabel, key: 'certificate', sortable: false, width: 180 },
   { title: reverseProxyCopy.remarkLabel, key: 'remark', sortable: false, width: 200 },
-  { title: reverseProxyCopy.actionLabel, key: 'actions', sortable: false, width: 260 },
+  {
+    title: reverseProxyCopy.actionLabel,
+    key: 'actions',
+    sortable: false,
+    width: 260,
+    cellProps: { class: 'rp-table__col-actions' },
+    headerProps: { class: 'rp-table__col-actions' },
+  },
 ]
 
 const reverseProxyDNSMaxTTL = 4294967295
@@ -1349,6 +1356,16 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   let latestOverviewRequestId = 0
   const isRecord = (value: unknown): value is Record<string, unknown> => value != null && typeof value === 'object' && !Array.isArray(value)
 
+  const stabilizeTableLayout = () => {
+    if (typeof window === 'undefined') return
+    void nextTick(() => {
+      window.dispatchEvent(new Event('resize'))
+      setTimeout(() => {
+        window.dispatchEvent(new Event('resize'))
+      }, 60)
+    })
+  }
+
   const applyOverview = (raw: unknown, clearConflict = true) => {
     if (!isRecord(raw) || !Array.isArray(raw.rules) || !isRecord(raw.resourceSettings)) return false
     const nextOverview = normalizeOverview(raw)
@@ -1363,6 +1380,7 @@ export function useReverseProxyManage(props: { active?: boolean }) {
       editingResources.value = { ...overview.value.resourceSettings }
     }
     if (clearConflict) configurationConflict.value = false
+    stabilizeTableLayout()
     return true
   }
 
@@ -1533,9 +1551,15 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     }
     savingResources.value = true
     try {
-      const msg = await runMutation(() => HttpUtils.post('api/reverse-proxy-settings', payload, { headers: { 'Content-Type': 'application/json' } }))
+      const msg = await runMutation(
+        () => HttpUtils.post('api/reverse-proxy-settings', payload, { headers: { 'Content-Type': 'application/json' } }),
+        false,
+      )
       if (msg?.success) {
         resourceDialogVisible.value = false
+        await nextTick()
+        applyOverview(msg.obj)
+        stabilizeTableLayout()
         push.success({ duration: 3500, message: reverseProxyCopy.resourceSaved })
       } else {
         await handleRevisionConflict(msg)
@@ -1742,17 +1766,23 @@ export function useReverseProxyManage(props: { active?: boolean }) {
     }
     saving.value = true
     try {
-      const msg = await runMutation(() => HttpUtils.post(
-        'api/reverse-proxy-rule',
-        payload,
-        {
-          headers: {
-            'Content-Type': 'application/json',
+      const msg = await runMutation(
+        () => HttpUtils.post(
+          'api/reverse-proxy-rule',
+          payload,
+          {
+            headers: {
+              'Content-Type': 'application/json',
+            },
           },
-        },
-      ))
+        ),
+        false,
+      )
       if (msg?.success) {
         dialogVisible.value = false
+        await nextTick()
+        applyOverview(msg.obj)
+        stabilizeTableLayout()
         push.success({
           duration: 4000,
           message: editingID > 0 ? reverseProxyCopy.saveUpdated : reverseProxyCopy.saveCreated,

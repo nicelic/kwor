@@ -20,8 +20,10 @@ const (
 	ddnsSyncerWorkerCount = 2
 	// ddnsQueueCapacity 队列缓冲容量
 	ddnsQueueCapacity = 64
-	// ddnsSchedulerInterval 调度器心跳周期（1秒周期检查是否有规则到期）
-	ddnsSchedulerInterval = 1 * time.Second
+	// ddnsSchedulerInterval 调度器心跳周期
+	ddnsSchedulerInterval = 30 * time.Second
+	// ddnsDefaultIdleInterval 无启用规则时的休眠周期
+	ddnsDefaultIdleInterval = 30 * time.Second
 )
 
 type ddnsDetectTask struct {
@@ -35,14 +37,25 @@ type ddnsSyncTask struct {
 	force bool
 }
 
+// ============================================================================
+// 架构隔离规范（严禁合并进主调度中枢 cronjob.RuntimeSampler）：
+// 1. 独立运行架构：本调度器运行在专属锁定 OS 物理线程 (runtime.LockOSThread)，并维护快慢分离并发 Worker 池
+//    （4 探测 Worker + 2 云商同步 Worker），与主协程调度池物理隔离。
+// 2. 独立数据库保护：独享完全独立的物理 SQLite 数据库 Promanager_data/db/ddns.db (database.GetDDNSDB())，
+//    绝不与主库 s-ui.db 争抢连接与锁。
+// 3. 外部网络 I/O 隔离：DDNS 涉及公网多源 IP HTTP 探测与 34 家第三方云厂商 OpenAPI 交互，具备不可控的外部网络延迟（最高 45s 超时）。
+// 4. 隔离依据：主调度中枢 cronjob.RuntimeSampler 采用严格的相锁强串行化机制保障面板毫秒级流量记账与 nftables 完整性。
+//    严禁将 DDNS 任务合并入 RuntimeSampler，以防任何外部网络抖动或超时直接拖死面板核心网络中枢！
+// ============================================================================
 type ddnsRuntimeWorker struct {
-	mu         sync.Mutex
-	running    bool
-	stopping   bool
-	stopCh     chan struct{}
-	doneCh     chan struct{}
-	completeCh chan struct{}
-	wakeCh     chan struct{}
+	mu            sync.Mutex
+	running       bool
+	stopping      bool
+	isInitialPass bool // 标记开机启动后首轮扫描，确保重启后第一时间对齐探测
+	stopCh        chan struct{}
+	doneCh        chan struct{}
+	completeCh    chan struct{}
+	wakeCh        chan struct{}
 
 	service    *DDNSService
 	ruleGuards sync.Map // key: uint (rule.Id), value: *atomic.Bool
@@ -89,6 +102,7 @@ func (w *ddnsRuntimeWorker) Start() {
 		}
 
 		w.running = true
+		w.isInitialPass = true
 		w.stopCh = make(chan struct{})
 		w.doneCh = make(chan struct{})
 		w.completeCh = make(chan struct{})
@@ -202,74 +216,108 @@ func (w *ddnsRuntimeWorker) runScheduler(stopCh <-chan struct{}, wakeCh <-chan s
 	// 启动后延迟 1 秒进行首次扫描，保证主程序其他系统资源准备就绪
 	select {
 	case <-time.After(1 * time.Second):
-		w.schedulePass()
 	case <-stopCh:
 		return
 	}
 
-	ticker := time.NewTicker(ddnsSchedulerInterval)
-	defer ticker.Stop()
+	delay := w.schedulePass()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-stopCh:
 			return
 		case <-wakeCh:
-			w.schedulePass()
-		case <-ticker.C:
-			w.schedulePass()
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			delay = w.schedulePass()
+			timer.Reset(delay)
+		case <-timer.C:
+			delay = w.schedulePass()
+			timer.Reset(delay)
 		}
 	}
 }
 
-func (w *ddnsRuntimeWorker) schedulePass() {
+func (w *ddnsRuntimeWorker) schedulePass() time.Duration {
 	operation, err := BeginKworInProcessOperation("ddns-runtime-scheduler")
 	if err != nil {
-		return
+		return ddnsDefaultIdleInterval
 	}
 	defer operation.Done()
 
 	db := database.GetDDNSDB()
 	if db == nil {
-		return
+		return ddnsDefaultIdleInterval
 	}
 
 	var rules []model.DDNSRule
 	if err := db.Where("enabled = ?", true).Find(&rules).Error; err != nil {
-		return
+		return ddnsDefaultIdleInterval
 	}
+
+	if len(rules) == 0 {
+		return ddnsDefaultIdleInterval
+	}
+
+	w.mu.Lock()
+	initialPass := w.isInitialPass
+	w.isInitialPass = false
+	w.mu.Unlock()
 
 	now := time.Now()
+	nextDelay := ddnsDefaultIdleInterval
 	for i := range rules {
 		rule := &rules[i]
-		if !w.shouldDetectRule(rule, now) {
-			continue
-		}
+		ruleInterval := w.getRuleInterval(rule)
+		if initialPass || w.shouldDetectRuleWithInterval(rule, now, ruleInterval) {
+			// 防重叠守卫：检查该规则是否已有探测或同步正在运行
+			guardVal, _ := w.ruleGuards.LoadOrStore(rule.Id, &atomic.Bool{})
+			guard := guardVal.(*atomic.Bool)
+			if !guard.CompareAndSwap(false, true) {
+				// 上一轮任务尚未结束，跳过本次调度，避免因网络抖动堆叠
+				continue
+			}
 
-		// 防重叠守卫：检查该规则是否已有探测或同步正在运行
-		guardVal, _ := w.ruleGuards.LoadOrStore(rule.Id, &atomic.Bool{})
-		guard := guardVal.(*atomic.Bool)
-		if !guard.CompareAndSwap(false, true) {
-			// 上一轮任务尚未结束，跳过本次调度，避免因网络抖动堆叠
-			continue
-		}
+			task := &ddnsDetectTask{
+				rule:  rule,
+				force: false,
+			}
 
-		task := &ddnsDetectTask{
-			rule:  rule,
-			force: false,
-		}
-
-		select {
-		case w.detectQueue <- task:
-		default:
-			// 探测队列满保护：释放守卫并告警
-			guard.Store(false)
-			logger.Warningf("[DDNS] Detect queue full, skipping rule %s", rule.Name)
+			select {
+			case w.detectQueue <- task:
+			default:
+				// 探测队列满保护：释放守卫并告警
+				guard.Store(false)
+				logger.Warningf("[DDNS] Detect queue full, skipping rule %s", rule.Name)
+			}
+			if ruleInterval < nextDelay {
+				nextDelay = ruleInterval
+			}
+		} else {
+			if rule.LastSyncTime != nil {
+				rem := ruleInterval - now.Sub(*rule.LastSyncTime)
+				if rem > 0 && rem < nextDelay {
+					nextDelay = rem
+				}
+			}
 		}
 	}
+
+	if nextDelay < 2*time.Second {
+		nextDelay = 2 * time.Second
+	} else if nextDelay > ddnsDefaultIdleInterval {
+		nextDelay = ddnsDefaultIdleInterval
+	}
+	return nextDelay
 }
 
-func (w *ddnsRuntimeWorker) shouldDetectRule(rule *model.DDNSRule, now time.Time) bool {
+func (w *ddnsRuntimeWorker) getRuleInterval(rule *model.DDNSRule) time.Duration {
 	needV4 := rule.IPType == "ipv4" || rule.IPType == "dual"
 	needV6 := rule.IPType == "ipv6" || rule.IPType == "dual"
 	hasInterface := (needV4 && strings.Contains(rule.IPV4Source, "interface")) || (needV6 && strings.Contains(rule.IPV6Source, "interface"))
@@ -289,10 +337,25 @@ func (w *ddnsRuntimeWorker) shouldDetectRule(rule *model.DDNSRule, now time.Time
 		interval = time.Duration(min) * time.Minute
 	}
 
+	// 故障快速自愈机制：若规则处于异常状态（如开机网络未就绪或API推送失败），启用10秒快速重试周期加速收敛
+	if rule.LastStatus == "error" {
+		errorRetryInterval := 10 * time.Second
+		if errorRetryInterval < interval {
+			interval = errorRetryInterval
+		}
+	}
+	return interval
+}
+
+func (w *ddnsRuntimeWorker) shouldDetectRuleWithInterval(rule *model.DDNSRule, now time.Time, interval time.Duration) bool {
 	if rule.LastSyncTime == nil {
 		return true
 	}
 	return now.Sub(*rule.LastSyncTime) >= interval
+}
+
+func (w *ddnsRuntimeWorker) shouldDetectRule(rule *model.DDNSRule, now time.Time) bool {
+	return w.shouldDetectRuleWithInterval(rule, now, w.getRuleInterval(rule))
 }
 
 func (w *ddnsRuntimeWorker) releaseRuleGuard(ruleID uint) {
@@ -364,9 +427,10 @@ func (w *ddnsRuntimeWorker) processDetectTask(task *ddnsDetectTask) {
 
 	plan := w.service.CalculateSyncPlan(rule, currentV4s, currentV6s, detectErrors)
 
-	// 【快慢分离关键短路】：IP 未发生变化且非首次同步，即便用户设置高频检测也微秒级短路返回！
+	// 【快慢分离关键短路】：IP 未发生变化且非首次同步且上次非错误状态，微秒级短路返回！
 	isFirstSync := rule.LastSyncTime == nil
-	if !task.force && !plan.HasChanges && !isFirstSync {
+	hasPreviousError := rule.LastStatus == "error"
+	if !task.force && !plan.HasChanges && !isFirstSync && !hasPreviousError {
 		w.service.touchRuleSyncTime(rule.Id)
 		w.releaseRuleGuard(rule.Id)
 		return

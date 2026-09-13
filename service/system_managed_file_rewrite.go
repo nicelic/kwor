@@ -45,12 +45,16 @@ func rewriteManagedFileWithImmutable(path string, content string, opts managedFi
 		return common.NewError("校验", displayName, "失败: 写入内容与文件内容不一致")
 	}
 
+	// 尝试加锁 (chattr +i)。若在容器（如 LXC）或不支持的文件系统上失败，
+	// 执行平滑降级（回退第二功能），不中断配置生效流程。
 	if err := setManagedFileImmutableFlag(path, displayName, opts.Context); err != nil {
-		return err
+		logger.Warningf("[SystemOptimize] %s 无法设置 immutable 属性锁 (%v)，平滑降级为未加锁模式，将由母本和 10s 轮询监控负责自动纠正: %s", displayName, err, path)
+		return nil
 	}
 	immutable, immutableErr := detectFileImmutableContext(opts.Context, path)
 	if immutableErr == nil && !immutable {
-		return common.NewError("校验", displayName, "失败: immutable 标记未生效")
+		logger.Warningf("[SystemOptimize] %s immutable 标记未生效，平滑降级为未加锁模式: %s", displayName, path)
+		return nil
 	}
 
 	logger.Infof("[SystemOptimize] rebuilt and locked %s: %s", displayName, path)
@@ -81,7 +85,7 @@ func removeManagedFile(path string, opts managedFileRewriteOptions) error {
 	}
 
 	if err := clearManagedFileImmutableFlag(path, displayName, opts); err != nil {
-		return err
+		logger.Warningf("[SystemOptimize] 解锁 %s 出现警告: %v，尝试直接删除", displayName, err)
 	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return buildManagedFileDeleteError(displayName, err)
@@ -100,6 +104,12 @@ func clearManagedFileImmutableFlag(path string, displayName string, opts managed
 		return nil
 	}
 
+	// 若未检测到锁定，直接跳过 chattr -i
+	locked, checkErr := detectFileImmutableContext(opts.Context, path)
+	if checkErr == nil && !locked {
+		return nil
+	}
+
 	chattrPath, err := exec.LookPath("chattr")
 	if err != nil {
 		logger.Warningf("[SystemOptimize] chattr not found while unlocking %s: %s", displayName, path)
@@ -109,8 +119,8 @@ func clearManagedFileImmutableFlag(path string, displayName string, opts managed
 		if opts.IgnoreUnsupportedUnlockOnSymlink && isPathSymlink(path) && isImmutableUnsupportedError(err) {
 			return nil
 		}
-		if isImmutableUnsupportedError(err) {
-			logger.Warningf("[SystemOptimize] immutable unlock unsupported for %s: %s", displayName, path)
+		if isImmutableUnsupportedError(err) || isOperationNotPermittedError(err) {
+			logger.Warningf("[SystemOptimize] immutable unlock unsupported or not permitted for %s: %s", displayName, path)
 			return nil
 		}
 		return common.NewError("解除", displayName, " immutable 失败: ", err)
@@ -154,4 +164,12 @@ func normalizeManagedFileDisplayName(displayName string) string {
 		return "配置文件"
 	}
 	return displayName
+}
+
+func isOperationNotPermittedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "operation not permitted") || strings.Contains(text, "permission denied")
 }

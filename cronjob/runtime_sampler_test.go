@@ -254,3 +254,25 @@ func waitForRuntimeSamplerCalls(t *testing.T, calls *atomic.Int32, want int32) {
 		}
 	}
 }
+
+func TestRuntimeSamplerPhaseSlotsNeverCollide(t *testing.T) {
+	// Verify that across a full hour (3600 seconds), no two tasks ever share the exact same second slot.
+	for sec := int64(0); sec < 3600; sec++ {
+		now := time.Unix(sec, 0)
+		tTraffic := nextPhaseSlot(now, runtimeSamplerTrafficInterval, runtimeSamplerTrafficPhase)
+		tIntegrity := nextPhaseSlot(now, runtimeSamplerIntegrityInterval, runtimeSamplerIntegrityPhase)
+		tPortForward := nextPhaseSlot(now, runtimeSamplerPortForwardInterval, runtimeSamplerPortForwardPhase)
+		tDeplete := nextPhaseSlot(now, runtimeSamplerDepleteInterval, runtimeSamplerDepletePhase)
+		tFlush := nextPhaseSlot(now, runtimeSamplerFlushInterval, runtimeSamplerFlushPhase)
+
+		times := []time.Time{tTraffic, tIntegrity, tPortForward, tDeplete, tFlush}
+		for i := 0; i < len(times); i++ {
+			for j := i + 1; j < len(times); j++ {
+				if times[i].Equal(times[j]) {
+					t.Fatalf("phase collision at second %d: task %d and %d both scheduled at %v", sec, i, j, times[i])
+				}
+			}
+		}
+	}
+}
+

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -659,5 +660,73 @@ func TestMihomoSnellClientBindingsRejectSecondUser(t *testing.T) {
 	expected := "snell inbound snell-occupied can bind only one user"
 	if err == nil || err.Error() != expected {
 		t.Fatalf("expected %q, got %v", expected, err)
+	}
+}
+
+func TestMihomoAddUsersWithPreloadedClients(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "mihomo-add-users-preloaded.db")
+	if err := database.InitDB(dbPath); err != nil {
+		t.Fatalf("InitDB failed: %v", err)
+	}
+
+	db := database.GetDB()
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("db.DB failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
+
+	inbound := model.MihomoInbound{
+		Type: "socks",
+		Tag:  "socks-in",
+		Options: json.RawMessage(`{
+			"listen": "::",
+			"listen_port": 1080
+		}`),
+	}
+	if err := db.Create(&inbound).Error; err != nil {
+		t.Fatalf("create inbound failed: %v", err)
+	}
+
+	client := model.MihomoClient{
+		Enable:   true,
+		Name:     "user-1",
+		Config:   json.RawMessage(`{"socks":{"username":"u1","password":"p1"}}`),
+		Inbounds: json.RawMessage(fmt.Sprintf("[%d]", inbound.Id)),
+		Links:    json.RawMessage(`[]`),
+	}
+	if err := db.Create(&client).Error; err != nil {
+		t.Fatalf("create client failed: %v", err)
+	}
+
+	svc := &MihomoInboundService{}
+	rawInbound := json.RawMessage(`{"type":"socks","tag":"socks-in"}`)
+
+	// Test with nil preloaded clients (fallback path)
+	fromDB, err := svc.addUsers(db, rawInbound, inbound.Id, inbound.Type)
+	if err != nil {
+		t.Fatalf("addUsers fallback failed: %v", err)
+	}
+
+	// Test with preloaded clients (optimized batch path)
+	preloadedClients := []model.MihomoClient{client}
+	fromPreloaded, err := svc.addUsersWithPreloadedClients(db, rawInbound, inbound.Id, inbound.Type, preloadedClients)
+	if err != nil {
+		t.Fatalf("addUsersWithPreloadedClients failed: %v", err)
+	}
+
+	if !bytes.Equal(fromDB, fromPreloaded) {
+		t.Fatalf("expected identical output, got %s vs %s", string(fromDB), string(fromPreloaded))
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(fromPreloaded, &parsed); err != nil {
+		t.Fatalf("parse rendered json failed: %v", err)
+	}
+	users, ok := parsed["users"].([]interface{})
+	if !ok || len(users) != 1 {
+		t.Fatalf("expected 1 user in rendered inbound, got %v", parsed["users"])
 	}
 }

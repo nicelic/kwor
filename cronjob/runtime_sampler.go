@@ -14,12 +14,42 @@ const (
 	runtimeSamplerPortForwardInterval = 15 * time.Second
 	runtimeSamplerDepleteInterval     = time.Minute
 	runtimeSamplerFlushInterval       = time.Minute
+
+	runtimeSamplerTrafficPhase     = 0 * time.Second
+	runtimeSamplerIntegrityPhase   = 3 * time.Second
+	runtimeSamplerPortForwardPhase = 7 * time.Second
+	runtimeSamplerDepletePhase     = 12 * time.Second
+	runtimeSamplerFlushPhase       = 26 * time.Second
 )
 
 // RuntimeSampler owns the panel's frequent runtime work.  It deliberately
 // serializes the jobs because they all inspect the same host and share one
 // SQLite connection.  sing-box and Mihomo keep separate job instances and
 // runtime state; only their scheduling is centralized.
+//
+// ============================================================================
+// 架构隔离铁律与职责边界（严禁擅自合并）：
+// 1. 本调度中枢专职负责“微秒/毫秒级本地宿主机状态同步与单主库 (s-ui.db) 保护”任务：
+//    - 10s 流量记账 (traffic)
+//    - 15s sing-box/Mihomo 与 nftables 核心同步 (integrity)
+//    - 15s 端口转发探测与同步 (port-forward)
+//    - 1m 额度耗尽封禁检查 (deplete)
+//    - 1m 流量账本安全落库 (flush)
+//    通过“相锁错峰 (Phase-locked staggering)”与“单连接强串行化”彻底杜绝 CPU 突发共振与 SQLite 死锁。
+//
+// 2. 严禁合并 DDNS 任务 (service.StartDDNSRuntimeWorker)：
+//    - DDNS 涉及外网 HTTP IP 探测与 34 家云商 OpenAPI 交互（含不可预测的网络延迟与最高 45s 超时）；
+//    - DDNS 独享完全隔离的物理数据库 Promanager_data/db/ddns.db (database.GetDDNSDB())；
+//    - DDNS 运行于专属内核物理线程 (runtime.LockOSThread) 并维护快慢分离并发 Worker 池。
+//    若合并入本调度器，外部网络抖动将直接阻塞串行循环，导致面板流量记账掉帧与 nftables 同步瘫痪！
+//
+// 3. 严禁合并系统优化监视器 (service.StartSystemOptimizationWatcher)：
+//    - 系统优化负责 10s 轮询监控 sysctl、journald、resolv.conf 等受管配置文件；
+//    - 当配置被外部篡改时，需执行 sysctl -p 或 systemctl restart systemd-journald 等外部重型系统命令；
+//    若合并入本调度器，外部系统命令调用的停顿将直接阻断核心网络层的精准错峰采样。
+//
+// 4. 反向代理监视器 (service.StartReverseProxyRuntimeWorker) 亦由独立 30s 协程托管，不在此处混用。
+// ============================================================================
 type RuntimeSampler struct {
 	mu sync.Mutex
 
@@ -200,15 +230,23 @@ func (s *RuntimeSampler) run(stopCh <-chan struct{}, wakeCh <-chan struct{}, don
 	}()
 
 	now := time.Now()
-	// Spread the first pass over several seconds.  The prior cron setup started
-	// every high-frequency task together, which created avoidable CPU spikes.
-	// Configuration and Core lifecycle changes still call Wake explicitly; a
-	// clean scheduler start does not turn that staggered pass into a burst.
-	nextTraffic := now.Add(time.Second)
-	nextIntegrity := now.Add(2 * time.Second)
-	nextPortForward := now.Add(4 * time.Second)
-	nextDeplete := now.Add(8 * time.Second)
-	nextFlush := now.Add(runtimeSamplerFlushInterval)
+	// Phase-locked staggering: anchor each task to dedicated non-overlapping
+	// second slots across the minute. This completely avoids the periodic
+	// resonance (30s and 60s CPU bursts) caused by simple interval addition.
+	nextTraffic := nextPhaseSlot(now, runtimeSamplerTrafficInterval, runtimeSamplerTrafficPhase)
+	nextIntegrity := nextPhaseSlot(now, runtimeSamplerIntegrityInterval, runtimeSamplerIntegrityPhase)
+	nextPortForward := nextPhaseSlot(now, runtimeSamplerPortForwardInterval, runtimeSamplerPortForwardPhase)
+	nextDeplete := nextPhaseSlot(now, runtimeSamplerDepleteInterval, runtimeSamplerDepletePhase)
+	nextFlush := nextPhaseSlot(now, runtimeSamplerFlushInterval, runtimeSamplerFlushPhase)
+
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	defer timer.Stop()
 
 	for {
 		now = time.Now()
@@ -217,7 +255,7 @@ func (s *RuntimeSampler) run(stopCh <-chan struct{}, wakeCh <-chan struct{}, don
 		if delay < 0 {
 			delay = 0
 		}
-		timer := time.NewTimer(delay)
+		timer.Reset(delay)
 
 		select {
 		case <-stopCh:
@@ -237,11 +275,11 @@ func (s *RuntimeSampler) run(stopCh <-chan struct{}, wakeCh <-chan struct{}, don
 			}
 			s.runWakePass()
 			now = time.Now()
-			nextTraffic = now.Add(runtimeSamplerTrafficInterval)
-			nextIntegrity = now.Add(runtimeSamplerIntegrityInterval)
-			nextPortForward = now.Add(runtimeSamplerPortForwardInterval)
-			nextDeplete = now.Add(runtimeSamplerDepleteInterval)
-			nextFlush = now.Add(runtimeSamplerFlushInterval)
+			nextTraffic = nextPhaseSlot(now, runtimeSamplerTrafficInterval, runtimeSamplerTrafficPhase)
+			nextIntegrity = nextPhaseSlot(now, runtimeSamplerIntegrityInterval, runtimeSamplerIntegrityPhase)
+			nextPortForward = nextPhaseSlot(now, runtimeSamplerPortForwardInterval, runtimeSamplerPortForwardPhase)
+			nextDeplete = nextPhaseSlot(now, runtimeSamplerDepleteInterval, runtimeSamplerDepletePhase)
+			nextFlush = nextPhaseSlot(now, runtimeSamplerFlushInterval, runtimeSamplerFlushPhase)
 			continue
 		case <-timer.C:
 		}
@@ -252,19 +290,19 @@ func (s *RuntimeSampler) run(stopCh <-chan struct{}, wakeCh <-chan struct{}, don
 			now = time.Now()
 			if !now.Before(nextIntegrity) {
 				s.runTask("integrity", func() { s.runIntegrity(false) })
-				nextIntegrity = time.Now().Add(runtimeSamplerIntegrityInterval)
+				nextIntegrity = nextPhaseSlot(time.Now(), runtimeSamplerIntegrityInterval, runtimeSamplerIntegrityPhase)
 			}
 			if !now.Before(nextTraffic) {
 				s.runTask("traffic", s.runTraffic)
-				nextTraffic = time.Now().Add(runtimeSamplerTrafficInterval)
+				nextTraffic = nextPhaseSlot(time.Now(), runtimeSamplerTrafficInterval, runtimeSamplerTrafficPhase)
 			}
 			if !now.Before(nextPortForward) {
 				s.runTask("port-forward", s.runPortForward)
-				nextPortForward = time.Now().Add(runtimeSamplerPortForwardInterval)
+				nextPortForward = nextPhaseSlot(time.Now(), runtimeSamplerPortForwardInterval, runtimeSamplerPortForwardPhase)
 			}
 			if !now.Before(nextDeplete) {
 				s.runTask("deplete", s.runDeplete)
-				nextDeplete = time.Now().Add(runtimeSamplerDepleteInterval)
+				nextDeplete = nextPhaseSlot(time.Now(), runtimeSamplerDepleteInterval, runtimeSamplerDepletePhase)
 			}
 			if !now.Before(nextFlush) {
 				s.runTask("flush", func() {
@@ -272,7 +310,7 @@ func (s *RuntimeSampler) run(stopCh <-chan struct{}, wakeCh <-chan struct{}, don
 						logger.Warning("flush traffic runtime journal failed: ", err)
 					}
 				})
-				nextFlush = time.Now().Add(runtimeSamplerFlushInterval)
+				nextFlush = nextPhaseSlot(time.Now(), runtimeSamplerFlushInterval, runtimeSamplerFlushPhase)
 			}
 		})
 	}
@@ -374,3 +412,24 @@ func earliestRuntimeSamplerDeadline(values ...time.Time) time.Time {
 	}
 	return next
 }
+
+// nextPhaseSlot calculates the next occurrence after now matching the given
+// period and phase offset. It guarantees that tasks with different phase offsets
+// never fire at the same second, completely preventing cyclical resonance.
+func nextPhaseSlot(now time.Time, interval, phase time.Duration) time.Time {
+	unixSec := now.Unix()
+	periodSec := int64(interval / time.Second)
+	phaseSec := int64(phase / time.Second)
+
+	rem := (unixSec - phaseSec) % periodSec
+	if rem < 0 {
+		rem += periodSec
+	}
+	deltaSec := periodSec - rem
+	next := time.Unix(unixSec+deltaSec, 0)
+	if next.Sub(now) < 800*time.Millisecond {
+		next = next.Add(interval)
+	}
+	return next
+}
+

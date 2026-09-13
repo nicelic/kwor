@@ -4,6 +4,7 @@
     transition="dialog-bottom-transition"
     width="760"
     max-width="95vw"
+    max-height="90vh"
   >
     <v-card class="rounded-lg core-modal-card">
       <v-card-title>
@@ -2033,9 +2034,17 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+.core-modal-card {
+  display: flex;
+  flex-direction: column;
+  max-height: 90vh;
+}
+
 .core-modal-body {
-  min-height: 450px;
+  flex: 1 1 auto;
+  min-height: 0;
   padding: 20px;
+  overflow-y: auto;
 }
 
 .core-path-chip {
@@ -2057,6 +2066,14 @@ onBeforeUnmount(() => {
 .core-status-chip :deep(.v-chip__content) {
   padding-block: 6px;
   white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.core-auto-update-meta {
+  overflow-wrap: anywhere;
+}
+
+.core-auto-update-reason {
   overflow-wrap: anywhere;
 }
 

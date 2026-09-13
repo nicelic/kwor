@@ -603,13 +603,6 @@ func (s *MihomoInboundService) fetchUsersForInbound(db *gorm.DB, inboundType str
 	if inboundID == 0 {
 		return nil, nil
 	}
-	if inboundType == "shadowsocks" {
-		method, _ := inbound["method"].(string)
-		if method == "2022-blake3-aes-128-gcm" {
-			inboundType = "shadowsocks16"
-		}
-	}
-
 	var clients []model.MihomoClient
 	if err := db.Model(model.MihomoClient{}).
 		Select("config", "inbounds").
@@ -617,10 +610,24 @@ func (s *MihomoInboundService) fetchUsersForInbound(db *gorm.DB, inboundType str
 		Find(&clients).Error; err != nil {
 		return nil, err
 	}
-	clients = filterMihomoClientsBoundToInboundIDs(clients, []uint{inboundID})
+	return s.fetchUsersFromLoadedClients(clients, inboundType, inboundID, inbound)
+}
 
-	users := make([]string, 0, len(clients))
-	for _, client := range clients {
+func (s *MihomoInboundService) fetchUsersFromLoadedClients(clients []model.MihomoClient, inboundType string, inboundID uint, inbound map[string]interface{}) (interface{}, error) {
+	if inboundID == 0 {
+		return nil, nil
+	}
+	if inboundType == "shadowsocks" {
+		method, _ := inbound["method"].(string)
+		if method == "2022-blake3-aes-128-gcm" {
+			inboundType = "shadowsocks16"
+		}
+	}
+
+	boundClients := filterMihomoClientsBoundToInboundIDs(clients, []uint{inboundID})
+
+	users := make([]string, 0, len(boundClients))
+	for _, client := range boundClients {
 		rawConfig := strings.TrimSpace(string(client.Config))
 		if rawConfig == "" || strings.EqualFold(rawConfig, "null") {
 			continue
@@ -654,6 +661,10 @@ func normalizeMihomoFetchedUsers(inboundType string, users []string, inbound map
 }
 
 func (s *MihomoInboundService) addUsers(db *gorm.DB, inboundJSON []byte, inboundID uint, inboundType string) ([]byte, error) {
+	return s.addUsersWithPreloadedClients(db, inboundJSON, inboundID, inboundType, nil)
+}
+
+func (s *MihomoInboundService) addUsersWithPreloadedClients(db *gorm.DB, inboundJSON []byte, inboundID uint, inboundType string, preloadedClients []model.MihomoClient) ([]byte, error) {
 	if !s.hasUser(inboundType) || inboundType == "shadowsocks" || inboundType == "sudoku" || inboundType == "snell" {
 		return inboundJSON, nil
 	}
@@ -666,7 +677,15 @@ func (s *MihomoInboundService) addUsers(db *gorm.DB, inboundJSON []byte, inbound
 	// also prevents legacy Options or view metadata from reaching server.yaml.
 	delete(inbound, "users")
 
-	users, err := s.fetchUsersForInbound(db, inboundType, inboundID, inbound)
+	var (
+		users interface{}
+		err   error
+	)
+	if preloadedClients != nil {
+		users, err = s.fetchUsersFromLoadedClients(preloadedClients, inboundType, inboundID, inbound)
+	} else {
+		users, err = s.fetchUsersForInbound(db, inboundType, inboundID, inbound)
+	}
 	if err != nil {
 		return nil, err
 	}

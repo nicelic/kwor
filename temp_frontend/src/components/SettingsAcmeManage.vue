@@ -404,6 +404,7 @@
                     <v-list-item
                       prepend-icon="mdi-delete-outline"
                       title="删除证书"
+                      :subtitle="certDeleteBlockedReason(cert) || undefined"
                       @click="deleteCertificate(cert)" />
                   </v-list>
                 </v-menu>
@@ -442,10 +443,26 @@
                     <v-list-item prepend-icon="mdi-alert" title="强制续签" :disabled="!isAcmeCertificate(cert)" @click="renewCertificate(cert, true)" />
                     <v-list-item :prepend-icon="cert.autoRenew ? 'mdi-toggle-switch' : 'mdi-toggle-switch-off-outline'" :title="cert.autoRenew ? '关闭自动续签' : '开启自动续签'" :disabled="!supportsAutoRenew(cert)" @click="toggleCertificateAutoRenew(cert)" />
                     <v-list-item prepend-icon="mdi-folder-arrow-up-outline" title="推送到目录" @click="openPushDialog(cert)" />
-                    <v-list-item :prepend-icon="cert.inUseByPanel ? 'mdi-monitor-off' : 'mdi-monitor-lock'" :title="cert.inUseByPanel ? '取消应用到面板' : '应用到面板'" :disabled="cert.inUseByPanel && isUnapplyDisabled(cert, 'panel')" @click="toggleCertificateApply(cert, 'panel')" />
-                    <v-list-item :prepend-icon="cert.inUseBySub ? 'mdi-link-variant-off' : 'mdi-link-variant'" :title="cert.inUseBySub ? '取消应用到订阅' : '应用到订阅'" :disabled="cert.inUseBySub && isUnapplyDisabled(cert, 'sub')" @click="toggleCertificateApply(cert, 'sub')" />
+                    <v-list-item
+                      :prepend-icon="cert.inUseByPanel ? 'mdi-monitor-off' : 'mdi-monitor-lock'"
+                      :title="cert.inUseByPanel ? '取消应用到面板' : '应用到面板'"
+                      :subtitle="cert.inUseByPanel && isUnapplyDisabled(cert, 'panel') ? unapplyDisabledMessage('panel') : undefined"
+                      :disabled="cert.inUseByPanel && isUnapplyDisabled(cert, 'panel')"
+                      :class="{ 'acme-menu-item--disabled': cert.inUseByPanel && isUnapplyDisabled(cert, 'panel') }"
+                      @click="toggleCertificateApply(cert, 'panel')" />
+                    <v-list-item
+                      :prepend-icon="cert.inUseBySub ? 'mdi-link-variant-off' : 'mdi-link-variant'"
+                      :title="cert.inUseBySub ? '取消应用到订阅' : '应用到订阅'"
+                      :subtitle="cert.inUseBySub && isUnapplyDisabled(cert, 'sub') ? unapplyDisabledMessage('sub') : undefined"
+                      :disabled="cert.inUseBySub && isUnapplyDisabled(cert, 'sub')"
+                      :class="{ 'acme-menu-item--disabled': cert.inUseBySub && isUnapplyDisabled(cert, 'sub') }"
+                      @click="toggleCertificateApply(cert, 'sub')" />
                     <v-list-item prepend-icon="mdi-text-box-search-outline" title="查看日志" @click="openLogDialog(cert)" />
-                    <v-list-item prepend-icon="mdi-delete-outline" title="删除证书" @click="deleteCertificate(cert)" />
+                    <v-list-item
+                      prepend-icon="mdi-delete-outline"
+                      title="删除证书"
+                      :subtitle="certDeleteBlockedReason(cert) || undefined"
+                      @click="deleteCertificate(cert)" />
                   </v-list>
                 </v-menu>
               </div>
@@ -3255,6 +3272,24 @@ const isUnapplyDisabled = (cert: AcmeCertificate, target: 'panel' | 'sub'): bool
   return subAssignedCertificateCount.value <= 1
 }
 
+const certDeleteBlockedReason = (cert: AcmeCertificate): string => {
+  const backendReason = cert.deleteBlockedReason.trim()
+  if (backendReason !== '') {
+    return backendReason
+  }
+  const targets: string[] = []
+  if (cert.inUseByPanel && panelAssignedCertificateCount.value <= 1) {
+    targets.push('界面')
+  }
+  if (cert.inUseBySub && subAssignedCertificateCount.value <= 1) {
+    targets.push('订阅')
+  }
+  if (targets.length > 0) {
+    return `${targets.join('、')} 至少需要保留一张已应用证书，无法删除。如需更换，请先应用新证书后再删除`
+  }
+  return ''
+}
+
 const selectedLogCertificate = computed(() => {
   return certificateItems.value.find(item => item.id === logCertId.value) ?? null
 })
@@ -4812,7 +4847,7 @@ const toggleCertificateApply = async (cert: AcmeCertificate, target: 'panel' | '
 }
 
 const deleteCertificate = async (cert: AcmeCertificate) => {
-  const deleteBlockedReason = cert.deleteBlockedReason.trim()
+  const deleteBlockedReason = certDeleteBlockedReason(cert).trim()
   if (cert.deleteBlocked || deleteBlockedReason !== '') {
     push.warning({
       duration: 4800,

@@ -100,12 +100,18 @@ func (s *DnsServerService) NormalizeConfigForStorage(tx *gorm.DB, config json.Ra
 	delete(dnsMap, "servers")
 
 	finalTag, _ := dnsMap["final"].(string)
+	finalTag = strings.TrimSpace(finalTag)
 	server, found, err := s.getSelectedServer(tx, finalTag)
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(finalTag) != "" && !found {
+	if finalTag != "" && !found {
 		return nil, common.NewErrorf("final DNS server %q does not exist", finalTag)
+	}
+
+	knownServers, err := s.loadServerTagSet(tx)
+	if err != nil {
+		return nil, err
 	}
 
 	rules, hasRules := dnsMap["rules"].([]interface{})
@@ -114,7 +120,9 @@ func (s *DnsServerService) NormalizeConfigForStorage(tx *gorm.DB, config json.Ra
 			return nil, common.NewError("DNS rules require a saved DNS server selected as final")
 		}
 		for _, rawRule := range rules {
-			normalizeDNSRuleServer(rawRule, server.Tag)
+			if err := validateAndNormalizeDNSRuleServer(rawRule, knownServers, server.Tag); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -122,24 +130,57 @@ func (s *DnsServerService) NormalizeConfigForStorage(tx *gorm.DB, config json.Ra
 	return json.Marshal(root)
 }
 
-func normalizeDNSRuleServer(rawRule interface{}, selectedTag string) {
+func (s *DnsServerService) loadServerTagSet(db *gorm.DB) (map[string]struct{}, error) {
+	if db == nil {
+		return nil, common.NewError("database is not initialized")
+	}
+	var servers []model.DnsServer
+	if err := db.Model(&model.DnsServer{}).Select("tag").Find(&servers).Error; err != nil {
+		return nil, err
+	}
+	known := make(map[string]struct{}, len(servers))
+	for _, server := range servers {
+		tag := strings.TrimSpace(server.Tag)
+		if tag != "" {
+			known[tag] = struct{}{}
+		}
+	}
+	return known, nil
+}
+
+func validateAndNormalizeDNSRuleServer(rawRule interface{}, knownServers map[string]struct{}, defaultTag string) error {
 	rule, ok := rawRule.(map[string]interface{})
 	if !ok || rule == nil {
-		return
+		return nil
 	}
 	action, _ := rule["action"].(string)
 	if action == "route" {
-		rule["server"] = selectedTag
+		targetServer, _ := rule["server"].(string)
+		targetServer = strings.TrimSpace(targetServer)
+		if targetServer == "" {
+			if defaultTag == "" {
+				return common.NewError("DNS rules require a default or final DNS server")
+			}
+			rule["server"] = defaultTag
+		} else {
+			if _, exists := knownServers[targetServer]; !exists {
+				return common.NewErrorf("DNS rule references unknown DNS server %q", targetServer)
+			}
+			rule["server"] = targetServer
+		}
 	}
 	if children, ok := rule["rules"].([]interface{}); ok {
 		for _, child := range children {
-			normalizeDNSRuleServer(child, selectedTag)
+			if err := validateAndNormalizeDNSRuleServer(child, knownServers, defaultTag); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 // ApplySelectedServerToCoreConfig injects the fixed runtime bootstrap DNS and
-// the selected database record into the generated sing-box config. The
+// all configured database records into the generated sing-box config. The
 // bootstrap server is runtime-only and is never stored as a DNS card.
 func (s *DnsServerService) ApplySelectedServerToDNSConfig(db *gorm.DB, dnsConfig *json.RawMessage) error {
 	if dnsConfig == nil {
@@ -154,45 +195,78 @@ func (s *DnsServerService) ApplySelectedServerToDNSConfig(db *gorm.DB, dnsConfig
 	}
 
 	finalTag, _ := dnsMap["final"].(string)
-	rawServer, found, err := s.GetSelectedConfig(db, finalTag)
-	if err != nil {
+	finalTag = strings.TrimSpace(finalTag)
+
+	var dbServers []model.DnsServer
+	if err := db.Model(&model.DnsServer{}).Order("id ASC").Find(&dbServers).Error; err != nil {
 		return err
 	}
-	if !found {
-		legacyServer, legacyFound := legacySelectedDNSConfig(dnsMap, finalTag)
-		if legacyFound {
-			rawServer, err = json.Marshal(legacyServer)
-			if err != nil {
-				return err
-			}
-			found = true
-		} else if strings.TrimSpace(finalTag) != "" {
-			return fmt.Errorf("final DNS server %q does not exist", finalTag)
-		} else {
-			delete(dnsMap, "servers")
-		}
-	}
-	runtimeServers := []interface{}{singboxRuntimeBootstrapDNSServer()}
-	if found {
-		server := map[string]interface{}{}
-		if err := json.Unmarshal(rawServer, &server); err != nil {
+
+	allServers := make([]map[string]interface{}, 0, len(dbServers))
+	knownServers := make(map[string]struct{}, len(dbServers))
+	for _, rawDns := range dbServers {
+		full, err := rawDns.MarshalFull()
+		if err != nil {
 			return err
 		}
-		if tag, _ := server["tag"].(string); strings.TrimSpace(tag) == singboxRuntimeBootstrapDNSTag {
+		delete(full, "id")
+		tag, _ := full["tag"].(string)
+		tag = strings.TrimSpace(tag)
+		if tag == singboxRuntimeBootstrapDNSTag {
 			return fmt.Errorf("DNS server tag %q is reserved for the runtime bootstrap DNS", singboxRuntimeBootstrapDNSTag)
 		}
-		// Resolve every user DNS through the fixed bootstrap DNS, even when
-		// the configured DNS address is already an IP literal.
-		server["domain_resolver"] = singboxRuntimeBootstrapDNSTag
-		dnsMap["servers"] = []interface{}{server}
-		selectedTag, _ := server["tag"].(string)
-		runtimeServers = append(runtimeServers, server)
-		if rules, ok := dnsMap["rules"].([]interface{}); ok {
-			for _, rawRule := range rules {
-				normalizeDNSRuleServer(rawRule, selectedTag)
+		if tag != "" {
+			knownServers[tag] = struct{}{}
+		}
+		allServers = append(allServers, full)
+	}
+
+	if len(allServers) == 0 {
+		if legacyServers, ok := dnsMap["servers"].([]interface{}); ok && len(legacyServers) > 0 {
+			for _, item := range legacyServers {
+				if m, ok := item.(map[string]interface{}); ok && m != nil {
+					tag, _ := m["tag"].(string)
+					tag = strings.TrimSpace(tag)
+					if tag != "" {
+						knownServers[tag] = struct{}{}
+					}
+					allServers = append(allServers, m)
+				}
 			}
 		}
 	}
+
+	var effectiveFinalTag string
+	if len(allServers) > 0 {
+		if finalTag != "" {
+			if _, ok := knownServers[finalTag]; !ok {
+				return fmt.Errorf("final DNS server %q does not exist", finalTag)
+			}
+			effectiveFinalTag = finalTag
+		} else {
+			firstTag, _ := allServers[0]["tag"].(string)
+			effectiveFinalTag = strings.TrimSpace(firstTag)
+		}
+	} else if finalTag != "" {
+		return fmt.Errorf("final DNS server %q does not exist", finalTag)
+	}
+
+	runtimeServers := []interface{}{singboxRuntimeBootstrapDNSServer()}
+	for _, server := range allServers {
+		if resolver, _ := server["domain_resolver"].(string); strings.TrimSpace(resolver) == "" {
+			server["domain_resolver"] = singboxRuntimeBootstrapDNSTag
+		}
+		runtimeServers = append(runtimeServers, server)
+	}
+
+	if rules, ok := dnsMap["rules"].([]interface{}); ok && len(rules) > 0 {
+		for _, rawRule := range rules {
+			if err := validateAndNormalizeDNSRuleServer(rawRule, knownServers, effectiveFinalTag); err != nil {
+				return err
+			}
+		}
+	}
+
 	dnsMap["servers"] = runtimeServers
 
 	rendered, err := json.Marshal(dnsMap)

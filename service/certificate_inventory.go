@@ -868,6 +868,13 @@ func convertCertificateRecordWithUsage(entry *model.CertificateRecord, snapshot 
 	inUseByMihomo := len(tlsUsage.MihomoTLSNames) > 0
 	usageLabel := buildCertificateUsageLabel(inUseByPanel, inUseBySub, tlsUsage, reverseProxyUsage)
 	deleteBlockedReason := certificateDeleteBlockReason(entry)
+	if minAssignReason := certificateMinimumAssignmentBlockReason(inUseByPanel, inUseBySub, len(snapshot.panelAssignedIDs), len(snapshot.subAssignedIDs)); minAssignReason != "" {
+		if strings.TrimSpace(deleteBlockedReason) != "" {
+			deleteBlockedReason += "；" + minAssignReason
+		} else {
+			deleteBlockedReason = minAssignReason
+		}
+	}
 	applyTarget := strings.TrimSpace(entry.ApplyTarget)
 	switch {
 	case inUseByPanel && inUseBySub:

@@ -307,6 +307,7 @@ var defaultValueMap = map[string]string{
 	"panelAssignedCertificateRecordID":  "0",
 	"panelAssignedCertificateRecordIDs": "[]",
 	"timeLocation":                      "UTC",
+	"defaultLanguage":                  "zhHans",
 	"subListen":                         "",
 	"subPort":                           "22780",
 	"subDomain":                         "",
@@ -394,6 +395,7 @@ var genericSettingsSaveKeys = map[string]struct{}{
 	"serverTlsStore":        {},
 	"clientTlsStoreEnabled": {},
 	"clientTlsStore":        {},
+	"defaultLanguage":       {},
 	"subJsonExt":            {},
 	"subClashExt":           {},
 }
@@ -577,7 +579,7 @@ func EffectiveSessionMaxAgeMinutes(value int) int {
 	return value
 }
 
-func generateRandomSubPath() string {
+func GenerateRandomSubPath() string {
 	const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 	var builder strings.Builder
@@ -596,6 +598,10 @@ func generateRandomSubPath() string {
 	}
 	builder.WriteByte('/')
 	return builder.String()
+}
+
+func generateRandomSubPath() string {
+	return GenerateRandomSubPath()
 }
 
 func normalizeInitialRandomSubPortStart(port int) int {
@@ -1109,6 +1115,25 @@ func (s *SettingService) getInt(key string) (int, error) {
 
 func (s *SettingService) setInt(key string, value int) error {
 	return s.setString(key, strconv.Itoa(value))
+}
+
+func (s *SettingService) GetDefaultLanguage() (string, error) {
+	val, err := s.getString("defaultLanguage")
+	if err != nil || val == "" {
+		return "zhHans", nil
+	}
+	return val, nil
+}
+
+func (s *SettingService) SaveDefaultLanguage(lang string) (string, error) {
+	normalized, err := normalizeSupportedLanguage(lang)
+	if err != nil {
+		return "", err
+	}
+	if err := s.saveEditableSettingDirect("defaultLanguage", normalized); err != nil {
+		return "", err
+	}
+	return normalized, nil
 }
 func (s *SettingService) GetListen() (string, error) {
 	return s.getString("webListen")

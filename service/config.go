@@ -873,14 +873,20 @@ func (s *ConfigService) applyInboundNftAction(action *InboundNftAction) error {
 }
 
 func (s *ConfigService) applyClientRateLimitNft() error {
-	nftSvc := &ClientRateLimitService{}
 	coreRunning := (&CoreManagerService{}).IsRunning()
+	if !coreRunning {
+		return nil
+	}
+	nftSvc := &ClientRateLimitService{}
 	return nftSvc.Reconcile(coreRunning)
 }
 
 func (s *ConfigService) applyClientPortBlockNft() error {
-	nftSvc := &ClientPortBlockService{}
 	coreRunning := (&CoreManagerService{}).IsRunning()
+	if !coreRunning {
+		return nil
+	}
+	nftSvc := &ClientPortBlockService{}
 	return nftSvc.Reconcile(coreRunning)
 }
 
@@ -892,14 +898,20 @@ func (s *ConfigService) applyDefaultClientNftPolicies() error {
 }
 
 func (s *ConfigService) applyMihomoClientRateLimitNft() error {
-	nftSvc := &MihomoClientRateLimitService{}
 	coreRunning := (&MihomoCoreManagerService{}).IsRunning()
+	if !coreRunning {
+		return nil
+	}
+	nftSvc := &MihomoClientRateLimitService{}
 	return nftSvc.Reconcile(coreRunning)
 }
 
 func (s *ConfigService) applyMihomoClientPortBlockNft() error {
-	nftSvc := &MihomoClientPortBlockService{}
 	coreRunning := (&MihomoCoreManagerService{}).IsRunning()
+	if !coreRunning {
+		return nil
+	}
+	nftSvc := &MihomoClientPortBlockService{}
 	return nftSvc.Reconcile(coreRunning)
 }
 
@@ -945,10 +957,6 @@ func (s *ConfigService) applyMihomoInboundNftActionLocked(action *InboundNftActi
 	}
 	if err != nil {
 		return err
-	}
-
-	if !coreRunning {
-		nftSvc.cleanupOnShutdown()
 	}
 
 	return nil

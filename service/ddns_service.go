@@ -671,7 +671,8 @@ func (s *DDNSService) syncRuleDNS(ctx context.Context, rule *model.DDNSRule, pla
 
 	if len(syncErrors) > 0 {
 		errMsg := strings.Join(syncErrors, "; ")
-		s.updateRuleStatus(rule.Id, "error", errMsg, targetV4Str, targetV6Str)
+		// 严禁脏写未生效 IP：推送失败时必须保留远端确认生效的旧 IP，防止被误判为“已生效”而在下个周期短路跳过重试
+		s.updateRuleStatus(rule.Id, "error", errMsg, rule.LastIPV4, rule.LastIPV6)
 		return errors.New(errMsg)
 	}
 
@@ -694,9 +695,10 @@ func (s *DDNSService) executeSyncRule(rule *model.DDNSRule, force bool) error {
 
 	plan := s.CalculateSyncPlan(rule, currentV4s, currentV6s, detectErrors)
 
-	// 2. 快慢分离短路校验：如果未变动且非首次同步，即便用户点击同步也跳过外部云商推送（用户特别指示：ip不变不会进行dns服务商的api推送）
+	// 2. 快慢分离短路校验：仅在非强制同步、IP未变动、非首次同步且上次同步状态非错误时才短路跳过外部云商推送
 	isFirstSync := rule.LastSyncTime == nil
-	if !plan.HasChanges && !isFirstSync {
+	hasPreviousError := rule.LastStatus == "error"
+	if !force && !plan.HasChanges && !isFirstSync && !hasPreviousError {
 		s.touchRuleSyncTime(rule.Id)
 		logger.Infof("[DDNS] Rule %s: probed IPs unchanged (v4: %s, v6: %s), skipping DNS API push", rule.Name, rule.LastIPV4, rule.LastIPV6)
 		return nil

@@ -187,6 +187,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.DetectTLSSelfSignedTemplate(c)
 	case "portOccupancy":
 		a.ApiService.CheckPortOccupancy(c)
+	case "settings-language":
+		a.ApiService.SaveSettingsLanguage(c)
 	case "traffic-overview-settings":
 		a.ApiService.SaveTrafficOverviewSettings(c)
 	case "traffic-overview-switch":
@@ -451,6 +453,8 @@ func (a *APIHandler) getHandler(c *gin.Context) {
 		a.ApiService.GetSettings(c)
 	case "settings-snapshot":
 		a.ApiService.GetSettingsSnapshot(c)
+	case "settings-language":
+		a.ApiService.GetSettingsLanguage(c)
 	case "subscription-settings-snapshot":
 		a.ApiService.GetSubscriptionSettingsSnapshot(c)
 	case "subscription-uri":

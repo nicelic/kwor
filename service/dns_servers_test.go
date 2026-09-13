@@ -77,7 +77,7 @@ func TestMigrateLegacySingboxDNSServersImportsMultipleCardsBeforeValidation(t *t
 	}
 }
 
-func TestGenerateFullConfigIncludesBootstrapAndFinalDNSServer(t *testing.T) {
+func TestGenerateFullConfigIncludesBootstrapAndAllDNSServers(t *testing.T) {
 	settingService := initPanelSQLiteSettingTestDB(t)
 	raw := "{\"dns\":{\"final\":\"dns-selected\",\"rules\":[{\"action\":\"route\",\"server\":\"dns-idle\",\"domain_suffix\":[\"example.com\"]}]}}"
 	if err := settingService.saveSetting("config", raw); err != nil {
@@ -102,8 +102,8 @@ func TestGenerateFullConfigIncludesBootstrapAndFinalDNSServer(t *testing.T) {
 		t.Fatalf("decode generated dns config: %v", err)
 	}
 	runtimeServers, ok := dns["servers"].([]interface{})
-	if !ok || len(runtimeServers) != 2 {
-		t.Fatalf("expected bootstrap and final runtime DNS servers, got %#v", dns["servers"])
+	if !ok || len(runtimeServers) != 3 {
+		t.Fatalf("expected bootstrap and all configured runtime DNS servers, got %#v", dns["servers"])
 	}
 	bootstrap, _ := runtimeServers[0].(map[string]interface{})
 	if tag, _ := bootstrap["tag"].(string); tag != singboxRuntimeBootstrapDNSTag {
@@ -115,17 +115,27 @@ func TestGenerateFullConfigIncludesBootstrapAndFinalDNSServer(t *testing.T) {
 	if port, _ := bootstrap["server_port"].(float64); port != 53 {
 		t.Fatalf("runtime bootstrap DNS port = %v, want 53", port)
 	}
-	server, _ := runtimeServers[1].(map[string]interface{})
-	if tag, _ := server["tag"].(string); tag != "dns-selected" {
-		t.Fatalf("runtime DNS tag = %q, want dns-selected", tag)
+
+	idleServer, _ := runtimeServers[1].(map[string]interface{})
+	if tag, _ := idleServer["tag"].(string); tag != "dns-idle" {
+		t.Fatalf("runtime DNS tag = %q, want dns-idle", tag)
 	}
-	if resolver, _ := server["domain_resolver"].(string); resolver != singboxRuntimeBootstrapDNSTag {
+	if resolver, _ := idleServer["domain_resolver"].(string); resolver != singboxRuntimeBootstrapDNSTag {
 		t.Fatalf("runtime DNS domain_resolver = %q, want %q", resolver, singboxRuntimeBootstrapDNSTag)
 	}
+
+	selectedServer, _ := runtimeServers[2].(map[string]interface{})
+	if tag, _ := selectedServer["tag"].(string); tag != "dns-selected" {
+		t.Fatalf("runtime DNS tag = %q, want dns-selected", tag)
+	}
+	if resolver, _ := selectedServer["domain_resolver"].(string); resolver != singboxRuntimeBootstrapDNSTag {
+		t.Fatalf("runtime DNS domain_resolver = %q, want %q", resolver, singboxRuntimeBootstrapDNSTag)
+	}
+
 	rules, _ := dns["rules"].([]interface{})
 	rule, _ := rules[0].(map[string]interface{})
-	if target, _ := rule["server"].(string); target != "dns-selected" {
-		t.Fatalf("runtime DNS rule target = %q, want dns-selected", target)
+	if target, _ := rule["server"].(string); target != "dns-idle" {
+		t.Fatalf("runtime DNS rule target = %q, want preserved dns-idle", target)
 	}
 }
 
@@ -167,5 +177,41 @@ func TestDnsServerServiceRejectsDeletingSelectedServer(t *testing.T) {
 	}
 	if err := (&DnsServerService{}).Save(tx, "del", payload); err == nil {
 		t.Fatal("expected selected DNS server deletion to be rejected")
+	}
+}
+
+func TestDnsServerServiceRejectsDeletingServerReferencedByRule(t *testing.T) {
+	settingService := initPanelSQLiteSettingTestDB(t)
+	raw := "{\"dns\":{\"final\":\"dns-final\",\"rules\":[{\"action\":\"route\",\"server\":\"dns-routed\",\"domain\":[\"test.com\"]}]}}"
+	if err := settingService.saveSetting("config", raw); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	finalServer := model.DnsServer{
+		Type:    "udp",
+		Tag:     "dns-final",
+		Options: json.RawMessage("{\"server\":\"8.8.8.8\",\"server_port\":53}"),
+	}
+	routedServer := model.DnsServer{
+		Type:    "tls",
+		Tag:     "dns-routed",
+		Options: json.RawMessage("{\"server\":\"1.1.1.1\",\"server_port\":853}"),
+	}
+	if err := database.GetDB().Create(&[]model.DnsServer{finalServer, routedServer}).Error; err != nil {
+		t.Fatalf("create DNS servers: %v", err)
+	}
+
+	tx := database.GetDB().Begin()
+	if tx.Error != nil {
+		t.Fatalf("begin transaction: %v", tx.Error)
+	}
+	defer tx.Rollback()
+
+	payload, err := json.Marshal(routedServer.Id)
+	if err != nil {
+		t.Fatalf("marshal delete payload: %v", err)
+	}
+	if err := (&DnsServerService{}).Save(tx, "del", payload); err == nil {
+		t.Fatal("expected DNS server deletion referenced by rule to be rejected")
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/util/common"
 )
 
@@ -138,10 +139,15 @@ func (s *SystemLogOptimizationService) SetDisabledContext(ctx context.Context, e
 		return s.setString(systemLogJournaldPathKey, path)
 	}
 
+	// 开关关闭：第一时间注销轮询监视并彻底删除落盘母本，不留痕迹
+	watcher := GetSystemOptimizationWatcher()
+	watcher.Unregister("journald")
+	_ = RemoveOptimizationGoldenFile(GoldenJournald)
+
 	path, pathErr := s.resolveJournaldConfigPath(false)
 	if pathErr == nil && pathEntryExists(path) {
 		if err := clearManagedFileImmutableFlag(path, "journald 配置", managedFileRewriteOptions{}); err != nil {
-			return err
+			logger.Warningf("[SystemOptimize] 关闭日志优化时解除文件锁定警告: %v", err)
 		}
 	}
 
@@ -195,7 +201,6 @@ func (s *SystemLogOptimizationService) ReconcileOnStartup() error {
 	if !IsSystemPlatformLinux() {
 		return nil
 	}
-
 	enabled, err := s.getBool(systemLogDisableEnabledKey)
 	if err != nil {
 		return err
@@ -215,6 +220,9 @@ func (s *SystemLogOptimizationService) ReconcileOnStartup() error {
 				return err
 			}
 		}
+		watcher := GetSystemOptimizationWatcher()
+		watcher.Unregister("journald")
+		_ = RemoveOptimizationGoldenFile(GoldenJournald)
 		return s.setString(systemLogDisableEnabledKey, "false")
 	}
 
@@ -271,6 +279,30 @@ func (s *SystemLogOptimizationService) applyManagedJournaldContentLocked(ctx con
 		return "", err
 	}
 
+	// 检查加锁状态：第一功能 vs 第二功能
+	locked, lockErr := detectFileImmutable(path)
+	watcher := GetSystemOptimizationWatcher()
+	if lockErr == nil && locked {
+		// 第一功能：已成功加锁
+		watcher.Unregister("journald")
+		_ = RemoveOptimizationGoldenFile(GoldenJournald)
+	} else {
+		// 第二功能：未加锁，保存生效内容到母本并注册 10s 轮询监控
+		if saveErr := SaveOptimizationGoldenFile(GoldenJournald, content); saveErr != nil {
+			logger.Warningf("[SystemOptimize] 保存 journald 母本文件失败: %v", saveErr)
+		}
+		targetPathCopy := path
+		watcher.Register(OptimizationWatchItem{
+			Key:            "journald",
+			DisplayName:    "journald 配置",
+			TargetPath:     targetPathCopy,
+			GoldenFileName: GoldenJournald,
+			OnCorrected: func(correctCtx context.Context, correctedPath string) error {
+				return restartJournaldServiceContext(correctCtx)
+			},
+		})
+	}
+
 	if err := s.setString(systemLogJournaldPathKey, path); err != nil {
 		return "", err
 	}
@@ -304,25 +336,17 @@ func (s *SystemLogOptimizationService) resolveJournaldConfigPath(writeIntent boo
 			return candidate, nil
 		}
 	}
-
 	if writeIntent {
-		for _, candidate := range journaldConfigCandidates {
-			dir := filepath.Dir(candidate)
-			if pathExists(dir) {
-				return candidate, nil
-			}
-		}
 		return journaldConfigCandidates[0], nil
 	}
-
-	return "", common.NewError("未找到 journald 配置文件路径")
+	return "", common.NewError("未找到 journald.conf 配置文件")
 }
 
 func normalizeManagedJournaldContent(content string) string {
 	content = strings.ReplaceAll(content, "\r\n", "\n")
 	content = strings.ReplaceAll(content, "\r", "\n")
 	if strings.TrimSpace(content) == "" {
-		content = defaultSystemLogJournaldContent
+		return ""
 	}
 	if !strings.HasSuffix(content, "\n") {
 		content += "\n"
@@ -335,17 +359,21 @@ func detectFileImmutable(path string) (bool, error) {
 }
 
 func detectFileImmutableContext(ctx context.Context, path string) (bool, error) {
-	if !pathExists(path) {
+	path = strings.TrimSpace(path)
+	if path == "" || !pathEntryExists(path) {
 		return false, nil
 	}
+
 	lsattrPath, err := exec.LookPath("lsattr")
 	if err != nil {
-		return false, fmt.Errorf("lsattr is unavailable: %w", err)
+		return false, common.NewError("未找到 lsattr 命令，无法检测 immutable 状态")
 	}
-	output, err := runOptimizationCommandOutputWithTimeout(ctx, 8*time.Second, lsattrPath, path)
-	if err != nil {
-		return false, err
+
+	output, cmdErr := runOptimizationCommandOutputWithTimeout(ctx, 8*time.Second, lsattrPath, "-d", path)
+	if cmdErr != nil {
+		return false, cmdErr
 	}
+
 	fields := strings.Fields(output)
 	if len(fields) == 0 {
 		return false, errors.New("lsattr returned no file attributes")
@@ -408,26 +436,6 @@ func restartJournaldServiceContext(ctx context.Context) error {
 		}
 	}
 
-	if openrcPath, err := exec.LookPath("rc-service"); err == nil {
-		for _, serviceName := range serviceNames {
-			commandErr := runOptimizationCommandWithTimeout(ctx, 12*time.Second, openrcPath, serviceName, "restart")
-			if commandErr == nil {
-				return nil
-			}
-			appendAttempt("rc-service "+serviceName+" restart", commandErr)
-		}
-	}
-
-	if runitPath, err := exec.LookPath("sv"); err == nil {
-		for _, serviceName := range serviceNames {
-			commandErr := runOptimizationCommandWithTimeout(ctx, 12*time.Second, runitPath, "restart", serviceName)
-			if commandErr == nil {
-				return nil
-			}
-			appendAttempt("sv restart "+serviceName, commandErr)
-		}
-	}
-
 	for _, serviceName := range serviceNames {
 		initScript := filepath.Join("/etc/init.d", serviceName)
 		if !pathExists(initScript) {
@@ -441,19 +449,17 @@ func restartJournaldServiceContext(ctx context.Context) error {
 	}
 
 	if len(attempts) == 0 {
-		return common.NewError("未找到可用的 journald 服务管理命令（systemctl/service/rc-service/sv）")
+		return common.NewError("未找到可用的 journald 服务管理命令（systemctl/service）")
 	}
-	return common.NewError("重启 journald 失败: ", strings.Join(attempts, " | "))
+	return common.NewError("重启 journald 服务失败: ", strings.Join(attempts, " | "))
 }
 
 func resolveJournaldServiceCandidates() []string {
 	family := strings.TrimSpace(detectLinuxSystemFamily())
 	switch family {
-	case "debian", "rhel", "suse", "arch":
+	case "debian", "ubuntu":
 		return []string{"systemd-journald", "journald"}
-	case "alpine":
-		return []string{"journald", "systemd-journald"}
 	default:
-		return []string{"systemd-journald", "journald"}
+		return journaldServiceCandidates
 	}
 }

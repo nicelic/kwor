@@ -121,6 +121,14 @@ func (s *MihomoManagerService) generateServerDocument(db *gorm.DB) (map[string]i
 	}
 	inbounds = filterSupportedMihomoListeners(inbounds)
 
+	var enabledClients []model.MihomoClient
+	if err := db.Model(model.MihomoClient{}).
+		Select("config", "inbounds").
+		Where("enable = ?", true).
+		Find(&enabledClients).Error; err != nil {
+		return nil, fmt.Errorf("load mihomo clients for listeners failed: %w", err)
+	}
+
 	inboundAlias := buildMihomoInboundAliasMap(inbounds)
 	inboundRefs := make(map[string]mihomoInboundRouteRef, len(inbounds))
 	listeners := make([]interface{}, 0, len(inbounds))
@@ -149,7 +157,7 @@ func (s *MihomoManagerService) generateServerDocument(db *gorm.DB) (map[string]i
 		if err != nil {
 			return nil, fmt.Errorf("marshal mihomo inbound %s failed: %w", inbound.Tag, err)
 		}
-		rawJSON, err = s.MihomoInboundService.addUsers(db, rawJSON, inbound.Id, inbound.Type)
+		rawJSON, err = s.MihomoInboundService.addUsersWithPreloadedClients(db, rawJSON, inbound.Id, inbound.Type, enabledClients)
 		if err != nil {
 			return nil, fmt.Errorf("append mihomo inbound users for %s failed: %w", inbound.Tag, err)
 		}

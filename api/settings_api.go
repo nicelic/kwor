@@ -39,6 +39,41 @@ func (a *ApiService) GetSubscriptionSettingsSnapshot(c *gin.Context) {
 	jsonObj(c, snapshot, err)
 }
 
+func (a *ApiService) GetSettingsLanguage(c *gin.Context) {
+	lang, err := a.SettingService.GetDefaultLanguage()
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, gin.H{
+		"defaultLanguage": lang,
+	}, nil)
+}
+
+type settingsLanguageSaveRequest struct {
+	Language string `json:"language" form:"language"`
+}
+
+func (a *ApiService) SaveSettingsLanguage(c *gin.Context) {
+	req := settingsLanguageSaveRequest{}
+	if err := c.ShouldBind(&req); err != nil {
+		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+	if strings.TrimSpace(req.Language) == "" {
+		jsonMsg(c, "", fmt.Errorf("language is required"))
+		return
+	}
+	normalized, err := a.SettingService.SaveDefaultLanguage(req.Language)
+	if err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	jsonObj(c, gin.H{
+		"defaultLanguage": normalized,
+	}, nil)
+}
+
 func (a *ApiService) SaveSettingsPatch(c *gin.Context, actor string) {
 	request := settingsPatchAPIRequest{}
 	if err := c.ShouldBindJSON(&request); err != nil {

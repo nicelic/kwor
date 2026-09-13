@@ -535,6 +535,8 @@ func normalizeGenericSettingValue(key string, value string) (string, error) {
 			return "", err
 		}
 		return normalized, nil
+	case "defaultLanguage":
+		return normalizeSupportedLanguage(value)
 	case "serverTlsStoreEnabled", "clientTlsStoreEnabled", "subEncode", "subShowInfo":
 		parsed, err := strconv.ParseBool(value)
 		if err != nil {
@@ -724,4 +726,24 @@ func hasAnySettingsKey(keys []string, expected ...string) bool {
 		}
 	}
 	return false
+}
+
+func normalizeSupportedLanguage(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	switch trimmed {
+	case "zhHans", "zh-CN", "zh_CN", "zh":
+		return "zhHans", nil
+	case "zhHant", "zh-TW", "zh_TW", "zh-HK":
+		return "zhHant", nil
+	case "en", "en-US", "en_US":
+		return "en", nil
+	case "fa", "fa-IR", "fa_IR":
+		return "fa", nil
+	case "vi", "vi-VN", "vi_VN":
+		return "vi", nil
+	case "ru", "ru-RU", "ru_RU":
+		return "ru", nil
+	default:
+		return "", common.NewErrorf("不受支持的语言代码: %s", value)
+	}
 }

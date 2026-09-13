@@ -254,5 +254,6 @@ func (c *CronJob) ResumeRuntimeSamplerAfterDatabaseRestoreFailure() {
 	c.mu.Unlock()
 	if shouldResume {
 		runtimeSampler.Start()
+		runtimeSampler.Wake()
 	}
 }
