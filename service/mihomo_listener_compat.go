@@ -290,6 +290,15 @@ func normalizeMihomoShadowQUICListener(listener map[string]interface{}) {
 	if users, ok := source["users"].([]interface{}); ok && len(users) > 0 {
 		clean["users"] = users
 	}
+	if rule := strings.TrimSpace(firstString(source["rule"])); rule != "" {
+		clean["rule"] = rule
+	}
+	if proxy := strings.TrimSpace(firstString(source["proxy"])); proxy != "" {
+		clean["proxy"] = proxy
+	}
+	if routingMark, ok := toInt(firstNonNil(source["routing-mark"], source["routing_mark"])); ok && routingMark >= 0 {
+		clean["routing-mark"] = routingMark
+	}
 
 	upstreamSource, _ := source["jls-upstream"].(map[string]interface{})
 	if canonical, ok := source["jls_upstream"].(map[string]interface{}); ok && canonical != nil {

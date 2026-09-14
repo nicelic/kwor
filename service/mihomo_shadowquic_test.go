@@ -479,16 +479,22 @@ func TestShadowQUICListenerDoesNotInjectTopLevelRouteFields(t *testing.T) {
 	listener := buildMihomoListener(
 		model.MihomoInbound{Type: "shadowquic", Tag: "sq-in"},
 		payload,
-		mihomoInboundRouteRef{RuleName: "should-not-apply", ProxyTarget: "should-not-apply"},
+		mihomoInboundRouteRef{RuleName: "sq-subrule", ProxyTarget: "sq-proxy"},
 	)
 
 	for _, key := range []string{
-		"routing_mark", "routing-mark", "rule", "proxy", "detour", "tls",
+		"detour", "tls",
 		"keep_alive_interval", "max_open_streams", "sni", "quic_version_probe", "quic-version-probe", "unknown",
 	} {
 		if _, exists := listener[key]; exists {
 			t.Fatalf("unexpected top-level %s in listener: %#v", key, listener)
 		}
+	}
+	if listener["rule"] != "sq-subrule" {
+		t.Fatalf("expected rule sq-subrule, got %#v", listener["rule"])
+	}
+	if listener["proxy"] != "sq-proxy" {
+		t.Fatalf("expected proxy sq-proxy, got %#v", listener["proxy"])
 	}
 	upstream, ok := listener["jls-upstream"].(map[string]interface{})
 	if !ok || upstream["proxy"] != "upstream-group" {
@@ -496,6 +502,81 @@ func TestShadowQUICListenerDoesNotInjectTopLevelRouteFields(t *testing.T) {
 	}
 	if _, exists := upstream["quic-version-probe"]; exists {
 		t.Fatalf("quic-version-probe must not reach listener yaml: %#v", upstream)
+	}
+}
+
+func TestShadowQUICRouteAndSubRulesGeneration(t *testing.T) {
+	db := setupMihomoSyncTestDB(t, "shadowquic-route-subrules.db")
+	inboundHY2 := &model.MihomoInbound{
+		Type:    "hysteria2",
+		Tag:     "hy2",
+		Addrs:   json.RawMessage(`[]`),
+		OutJson: json.RawMessage(`{}`),
+		Options: json.RawMessage(`{"listen":"::","listen_port":48280}`),
+	}
+	inboundSQ := &model.MihomoInbound{
+		Type:    "shadowquic",
+		Tag:     "shadowquic-26823",
+		Addrs:   json.RawMessage(`[]`),
+		OutJson: json.RawMessage(`{}`),
+		Options: json.RawMessage(`{"listen":"::","listen_port":26823,"jls_upstream":{"addr":"www.example.com:443"}}`),
+	}
+	if err := db.Create(inboundHY2).Error; err != nil {
+		t.Fatalf("create hy2 inbound failed: %v", err)
+	}
+	if err := db.Create(inboundSQ).Error; err != nil {
+		t.Fatalf("create shadowquic inbound failed: %v", err)
+	}
+
+	outbound := &model.MihomoOutbound{
+		Type:        "selector",
+		Tag:         "m_sq_wap-hinet-v6",
+		RawOutbound: json.RawMessage(`{"type":"selector","tag":"m_sq_wap-hinet-v6","outbounds":["DIRECT"]}`),
+	}
+	if err := db.Create(outbound).Error; err != nil {
+		t.Fatalf("create outbound failed: %v", err)
+	}
+
+	routeJSON := `{
+		"route": {
+			"final": "DIRECT",
+			"rules": [
+				{
+					"action": "route",
+					"inbound": ["hy2", "shadowquic-26823"],
+					"outbound": "m_sq_wap-hinet-v6"
+				}
+			]
+		}
+	}`
+	setMihomoConfigForFallbackTest(t, db, routeJSON)
+
+	doc, err := NewMihomoManagerService().GenerateServerDocument()
+	if err != nil {
+		t.Fatalf("GenerateServerDocument failed: %v", err)
+	}
+
+	subRules, ok := doc["sub-rules"].(map[string][]string)
+	if !ok {
+		t.Fatalf("expected sub-rules map in document, got %#v", doc["sub-rules"])
+	}
+
+	hy2Rules, ok := subRules["hy2"]
+	if !ok || len(hy2Rules) == 0 || hy2Rules[0] != "MATCH,m_sq_wap-hinet-v6" {
+		t.Fatalf("expected hy2 sub-rules to contain MATCH,m_sq_wap-hinet-v6, got %#v", hy2Rules)
+	}
+
+	sqRules, ok := subRules["shadowquic-26823"]
+	if !ok || len(sqRules) == 0 || sqRules[0] != "MATCH,m_sq_wap-hinet-v6" {
+		t.Fatalf("expected shadowquic-26823 sub-rules to contain MATCH,m_sq_wap-hinet-v6, got %#v", sqRules)
+	}
+
+	sqListener := findMihomoListenerByTag(doc, "shadowquic-26823")
+	if sqListener == nil {
+		t.Fatalf("expected shadowquic-26823 listener in doc")
+	}
+	if sqListener["rule"] != "shadowquic-26823" {
+		t.Fatalf("expected listener rule shadowquic-26823, got %#v", sqListener["rule"])
 	}
 }
 

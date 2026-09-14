@@ -809,9 +809,6 @@ func normalizeMihomoInlineRuleProviderPayload(raw interface{}) []string {
 func buildMihomoInboundAliasMap(inbounds []model.MihomoInbound) map[string]string {
 	aliasMap := make(map[string]string)
 	for _, inbound := range inbounds {
-		if strings.EqualFold(strings.TrimSpace(inbound.Type), "shadowquic") {
-			continue
-		}
 		effectiveTag := deriveEffectiveMihomoInboundRouteTagFromRaw(inbound.Tag, inbound.Type, inbound.Options)
 		if effectiveTag != "" && effectiveTag != inbound.Tag {
 			aliasMap[inbound.Tag] = effectiveTag
@@ -856,10 +853,8 @@ func buildMihomoListener(inbound model.MihomoInbound, payload map[string]interfa
 		listener["name"] = name
 	}
 	listenerType := strings.ToLower(strings.TrimSpace(inbound.Type))
-	if listenerType == "shadowquic" || listenerType == "hysteria2-realm" {
-		// These are listener-level routing fields, not jls-upstream.proxy.
-		// Keep the nested JLS proxy untouched while refusing the unsupported
-		// top-level routing-mark/rule/proxy values.
+	if listenerType == "hysteria2-realm" {
+		// Hysteria2-realm is a control-plane API listener, not a proxy listener.
 		delete(listener, "routing_mark")
 		delete(listener, "routing-mark")
 		delete(listener, "rule")
@@ -868,7 +863,7 @@ func buildMihomoListener(inbound model.MihomoInbound, payload map[string]interfa
 	} else if ref.ProxyTarget != "" {
 		listener["proxy"] = ref.ProxyTarget
 	}
-	if listenerType != "shadowquic" && listenerType != "hysteria2-realm" && ref.RuleName != "" {
+	if listenerType != "hysteria2-realm" && ref.RuleName != "" {
 		// Listener rule names select a same-named entry in top-level sub-rules.
 		listener["rule"] = ref.RuleName
 	}
@@ -1111,7 +1106,7 @@ func buildMihomoListenerRealityConfig(tlsMap map[string]interface{}) map[string]
 }
 
 func buildMihomoInboundRouteRef(inbound model.MihomoInbound, targets *mihomoProxyConversionResult, globalFinal string) (mihomoInboundRouteRef, error) {
-	if strings.EqualFold(strings.TrimSpace(inbound.Type), "shadowquic") {
+	if strings.EqualFold(strings.TrimSpace(inbound.Type), "hysteria2-realm") {
 		return mihomoInboundRouteRef{}, nil
 	}
 	ref := mihomoInboundRouteRef{

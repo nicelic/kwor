@@ -1,26 +1,28 @@
 ﻿<template>
   <v-card subtitle="Hysteria2">
-    <v-row v-if="direction == 'in' && !data.ignore_client_bandwidth">
-      <v-col cols="12" sm="6" md="4">
-        <v-text-field
-        :label="$t('stats.upload')"
-        hide-details
-        type="number"
-        :suffix="$t('stats.Mbps')"
-        min="0"
-        v-model.number="up_mbps">
-        </v-text-field>
-      </v-col>
-      <v-col cols="12" sm="6" md="4">
-        <v-text-field
-        :label="$t('stats.download')"
-        hide-details
-        type="number"
-        :suffix="$t('stats.Mbps')"
-        min="0"
-        v-model.number="down_mbps">
-        </v-text-field>
-      </v-col>
+    <v-row v-if="direction == 'in'">
+      <template v-if="!data.ignore_client_bandwidth">
+        <v-col cols="12" sm="6" md="4">
+          <v-text-field
+          :label="$t('stats.upload')"
+          hide-details
+          type="number"
+          :suffix="$t('stats.Mbps')"
+          min="0"
+          v-model.number="up_mbps">
+          </v-text-field>
+        </v-col>
+        <v-col cols="12" sm="6" md="4">
+          <v-text-field
+          :label="$t('stats.download')"
+          hide-details
+          type="number"
+          :suffix="$t('stats.Mbps')"
+          min="0"
+          v-model.number="down_mbps">
+          </v-text-field>
+        </v-col>
+      </template>
       <v-col cols="12" sm="6" md="4" v-if="!isSingboxNamespace">
         <v-switch v-model="optionRealm" color="primary" label="realm-opts" hide-details></v-switch>
       </v-col>
@@ -374,9 +376,6 @@
         </template>
         <v-card>
           <v-list>
-            <v-list-item v-if="!isSingboxNamespace">
-              <v-switch v-model="optionRealm" color="primary" label="realm-opts" hide-details></v-switch>
-            </v-list-item>
             <v-list-item v-if="showMihomoFastOpenOption">
               <v-switch v-model="optionMihomoFastOpen" color="primary" label="fast-open(mihomo)" hide-details></v-switch>
             </v-list-item>

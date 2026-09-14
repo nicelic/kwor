@@ -153,6 +153,20 @@ func normalizeConfigInboundRuleTags(configRaw json.RawMessage, aliasMap map[stri
 		}
 	}
 
+	if exp, ok := config["experimental"].(map[string]interface{}); ok {
+		if v2rayAPI, ok := exp["v2ray_api"].(map[string]interface{}); ok {
+			if stats, ok := v2rayAPI["stats"].(map[string]interface{}); ok {
+				if inbounds, ok := stats["inbounds"]; ok {
+					normalized, fieldChanged := normalizeInboundField(inbounds, aliasMap)
+					if fieldChanged {
+						stats["inbounds"] = normalized
+						changed = true
+					}
+				}
+			}
+		}
+	}
+
 	if !changed {
 		return configRaw, false, nil
 	}

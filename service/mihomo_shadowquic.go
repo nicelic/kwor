@@ -42,6 +42,9 @@ func sanitizeMihomoShadowQUICInboundOptions(inbound *model.MihomoInbound) error 
 	} else if listenPort, ok := toInt(options["port"]); ok && listenPort > 0 && listenPort <= 65535 {
 		clean["listen_port"] = listenPort
 	}
+	if detour := strings.TrimSpace(firstString(options["detour"])); detour != "" {
+		clean["detour"] = detour
+	}
 
 	upstreamSource := shadowQUICInboundMap(options["jls-upstream"])
 	if canonical := shadowQUICInboundMap(options["jls_upstream"]); canonical != nil {

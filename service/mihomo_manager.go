@@ -121,6 +121,14 @@ func (s *MihomoManagerService) generateServerDocument(db *gorm.DB) (map[string]i
 	}
 	inbounds = filterSupportedMihomoListeners(inbounds)
 
+	for _, inbound := range inbounds {
+		if strings.EqualFold(strings.TrimSpace(inbound.Type), "shadowquic") {
+			if err := repairMihomoShadowQUICInboundClientCredentials(db, inbound.Id); err != nil {
+				return nil, fmt.Errorf("repair mihomo shadowquic client credentials for %s failed: %w", inbound.Tag, err)
+			}
+		}
+	}
+
 	var enabledClients []model.MihomoClient
 	if err := db.Model(model.MihomoClient{}).
 		Select("config", "inbounds").
@@ -146,11 +154,6 @@ func (s *MihomoManagerService) generateServerDocument(db *gorm.DB) (map[string]i
 			}
 			if err := normalizeMihomoTLSOutboundReferences(inbound.Tls, proxyResult); err != nil {
 				return nil, fmt.Errorf("mihomo inbound %s has invalid TLS outbound reference: %w", inbound.Tag, err)
-			}
-		}
-		if strings.EqualFold(strings.TrimSpace(inbound.Type), "shadowquic") {
-			if err := repairMihomoShadowQUICInboundClientCredentials(db, inbound.Id); err != nil {
-				return nil, fmt.Errorf("repair mihomo shadowquic client credentials for %s failed: %w", inbound.Tag, err)
 			}
 		}
 		rawJSON, err := inbound.MarshalJSON()

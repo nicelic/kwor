@@ -28,7 +28,7 @@ func loadMihomoRouteInboundRuleTags(db *gorm.DB, targets *mihomoProxyConversionR
 
 	tags := make(map[string]struct{}, len(inbounds))
 	for _, inbound := range inbounds {
-		if !isSupportedMihomoInboundType(inbound.Type) {
+		if !isSupportedMihomoInboundType(inbound.Type) || strings.EqualFold(strings.TrimSpace(inbound.Type), "hysteria2-realm") {
 			continue
 		}
 

@@ -132,6 +132,13 @@ func TestNormalizeConfigInboundRuleTags(t *testing.T) {
 				},
 			},
 		},
+		"experimental": map[string]interface{}{
+			"v2ray_api": map[string]interface{}{
+				"stats": map[string]interface{}{
+					"inbounds": []interface{}{"stls_hk1", "other_in"},
+				},
+			},
+		},
 	}
 
 	rawConfig, err := json.Marshal(rawConfigMap)
@@ -174,6 +181,14 @@ func TestNormalizeConfigInboundRuleTags(t *testing.T) {
 	dnsInbound := inboundFieldToStringSlice(t, dnsRules[0].(map[string]interface{})["inbound"])
 	if !reflect.DeepEqual(dnsInbound, []string{"stls_hk1-in"}) {
 		t.Fatalf("dns inbound = %#v, want %#v", dnsInbound, []string{"stls_hk1-in"})
+	}
+
+	exp := normalizedConfig["experimental"].(map[string]interface{})
+	v2rayAPI := exp["v2ray_api"].(map[string]interface{})
+	stats := v2rayAPI["stats"].(map[string]interface{})
+	statsInbounds := inboundFieldToStringSlice(t, stats["inbounds"])
+	if !reflect.DeepEqual(statsInbounds, []string{"stls_hk1-in", "other_in"}) {
+		t.Fatalf("stats inbounds = %#v, want %#v", statsInbounds, []string{"stls_hk1-in", "other_in"})
 	}
 }
 
