@@ -660,14 +660,16 @@ func (s *ClientService) DepleteClients() ([]uint, error) {
 	now := time.Now().Unix()
 	db := database.GetDB()
 
+	if err := db.Model(model.Client{}).Where("enable = true AND ((volume > 0 AND up + down >= volume) OR (expiry > 0 AND expiry <= ?))", now).Find(&clients).Error; err != nil {
+		return nil, err
+	}
+	if len(clients) == 0 {
+		return nil, nil
+	}
+
 	tx := db.Begin()
 	if tx.Error != nil {
 		return nil, tx.Error
-	}
-
-	if err := tx.Model(model.Client{}).Where("enable = true AND ((volume > 0 AND up + down >= volume) OR (expiry > 0 AND expiry <= ?))", now).Scan(&clients).Error; err != nil {
-		tx.Rollback()
-		return nil, err
 	}
 
 	dt := time.Now().Unix()

@@ -9,14 +9,16 @@ import (
 
 type StatsJob struct {
 	service.StatsService
-	enableTraffic bool
-	mu            sync.Mutex
-	running       bool
+	enableTraffic    bool
+	mu               sync.Mutex
+	running          bool
+	lastCoresRunning bool
 }
 
 func NewStatsJob(saveTraffic bool) *StatsJob {
 	return &StatsJob{
-		enableTraffic: saveTraffic,
+		enableTraffic:    saveTraffic,
+		lastCoresRunning: true,
 	}
 }
 
@@ -26,6 +28,20 @@ func (s *StatsJob) Run() {
 		return
 	}
 	defer s.finishRun()
+
+	coreRunning := (&service.CoreManagerService{}).IsRunning()
+	mihomoRunning := (&service.MihomoCoreManagerService{}).IsRunning()
+	anyRunning := coreRunning || mihomoRunning
+
+	if !anyRunning {
+		if s.lastCoresRunning {
+			_ = s.StatsService.SaveStats(false)
+			_ = (&service.TrafficOverviewService{}).ReconcileTrafficCap()
+			s.lastCoresRunning = false
+		}
+		return
+	}
+	s.lastCoresRunning = true
 
 	// Keep port-hop refresh alive even when traffic accounting is disabled.
 	if refreshErr := s.StatsService.NftTrafficService.RefreshPortHopRedirects(); refreshErr != nil {

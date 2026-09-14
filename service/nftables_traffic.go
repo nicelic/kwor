@@ -38,11 +38,18 @@ type NftTrafficService struct{}
 // failed targeted sync. Normal client/inbound saves already queue an exact
 // post-commit binding update, so repeating a full client JSON scan on every
 // traffic delta only burns CPU and SQLite time.
-var defaultClientBindingRepairNeeded atomic.Bool
+var (
+	defaultClientBindingRepairNeeded atomic.Bool
+	defaultInboundEmptySelfHealed    atomic.Bool
+)
 
 func init() {
 	defaultClientBindingRepairNeeded.Store(true)
-	database.RegisterDBResetHook(func() { defaultClientBindingRepairNeeded.Store(true) })
+	database.RegisterDBResetHook(func() {
+		defaultClientBindingRepairNeeded.Store(true)
+		defaultInboundEmptySelfHealed.Store(false)
+		invalidateDefaultPortHopCache()
+	})
 }
 
 type inboundCounterSnapshot struct {
@@ -61,11 +68,22 @@ type inboundTrafficSample struct {
 	delta                  inboundDelta
 }
 
+const defaultPortHopIdleVerifyInterval = 1 * time.Minute
+
 var portHopRefreshState = struct {
-	mu   sync.Mutex
-	last map[uint]time.Time
+	mu             sync.Mutex
+	last           map[uint]time.Time
+	lastEmptyCheck time.Time
+	hasActiveHops  bool
 }{
 	last: map[uint]time.Time{},
+}
+
+func invalidateDefaultPortHopCache() {
+	portHopRefreshState.mu.Lock()
+	portHopRefreshState.lastEmptyCheck = time.Time{}
+	portHopRefreshState.hasActiveHops = true
+	portHopRefreshState.mu.Unlock()
 }
 
 // defaultInboundNftMutationMu serializes default-chain inbound rule changes.
@@ -332,6 +350,8 @@ func (s *NftTrafficService) ensureInboundRuleIntegrity(tx *gorm.DB, inbound *mod
 // If portHopRange is non-empty, also creates a REDIRECT rule for port hopping.
 // Call after the inbound is saved to the DB (so we have its ID).
 func (s *NftTrafficService) SetupInboundRules(tx *gorm.DB, inboundId uint, tag string, port int, portHopRange string) error {
+	invalidateDefaultPortHopCache()
+	defaultInboundEmptySelfHealed.Store(false)
 	if port <= 0 {
 		return s.removeInboundRules(tx, inboundId)
 	}
@@ -412,6 +432,7 @@ func (s *NftTrafficService) RemoveInboundRules(tx *gorm.DB, inboundId uint) erro
 }
 
 func (s *NftTrafficService) removeInboundRules(tx *gorm.DB, inboundId uint) error {
+	invalidateDefaultPortHopCache()
 	var state model.InboundTrafficState
 	result := tx.Where("inbound_id = ?", inboundId).First(&state)
 	if result.Error != nil {
@@ -437,6 +458,8 @@ func (s *NftTrafficService) removeInboundRules(tx *gorm.DB, inboundId uint) erro
 // UpsertInboundStateOnly updates/creates InboundTrafficState without touching nftables rules.
 // Use this while core is stopped to keep DB state in sync with inbound changes.
 func (s *NftTrafficService) UpsertInboundStateOnly(tx *gorm.DB, inboundId uint, tag string, port int, portHopRange string) error {
+	invalidateDefaultPortHopCache()
+	defaultInboundEmptySelfHealed.Store(false)
 	if inboundId == 0 {
 		return nil
 	}
@@ -486,6 +509,7 @@ func (s *NftTrafficService) UpsertInboundStateOnly(tx *gorm.DB, inboundId uint, 
 // RemoveInboundStateOnly deletes traffic state rows without touching nftables rules.
 // Use this while core is stopped to avoid noisy nft command errors.
 func (s *NftTrafficService) RemoveInboundStateOnly(tx *gorm.DB, inboundId uint) error {
+	invalidateDefaultPortHopCache()
 	if inboundId == 0 {
 		return nil
 	}
@@ -508,6 +532,7 @@ func (s *NftTrafficService) UpdateInboundRules(tx *gorm.DB, inboundId uint, tag 
 }
 
 func (s *NftTrafficService) updateInboundRules(tx *gorm.DB, inboundId uint, tag string, newPort int, portHopRange string) error {
+	invalidateDefaultPortHopCache()
 	if newPort <= 0 {
 		return s.removeInboundRules(tx, inboundId)
 	}
@@ -869,11 +894,25 @@ func (s *NftTrafficService) refreshPortHopRedirects() error {
 		return nil
 	}
 
+	now := time.Now()
+	portHopRefreshState.mu.Lock()
+	skipEmpty := !portHopRefreshState.hasActiveHops && !portHopRefreshState.lastEmptyCheck.IsZero() && now.Sub(portHopRefreshState.lastEmptyCheck) < defaultPortHopIdleVerifyInterval
+	portHopRefreshState.mu.Unlock()
+	if skipEmpty {
+		return nil
+	}
+
 	db := database.GetDB()
 	var states []model.InboundTrafficState
 	if err := db.Where("port_hop_range <> ''").Find(&states).Error; err != nil {
 		return err
 	}
+
+	portHopRefreshState.mu.Lock()
+	portHopRefreshState.lastEmptyCheck = now
+	portHopRefreshState.hasActiveHops = len(states) > 0
+	portHopRefreshState.mu.Unlock()
+
 	if len(states) == 0 {
 		return nil
 	}
@@ -1016,9 +1055,12 @@ func (s *NftTrafficService) collectAndSaveTraffic(saveTrafficOverride *bool) (bo
 
 	if len(states) == 0 {
 		// Legacy self-heal: old deployments may have inbounds but no nft state rows yet.
-		s.InitOnStartup()
-		if err := db.Find(&states).Error; err != nil {
-			return false, err
+		if !defaultInboundEmptySelfHealed.Load() {
+			s.InitOnStartup()
+			defaultInboundEmptySelfHealed.Store(true)
+			if err := db.Find(&states).Error; err != nil {
+				return false, err
+			}
 		}
 		if len(states) == 0 {
 			setOnlines(nil, nil, nil)
@@ -1643,6 +1685,7 @@ func (s *NftTrafficService) InitOnStartup() {
 }
 
 func (s *NftTrafficService) initOnStartup() {
+	invalidateDefaultPortHopCache()
 	if !nftSupported() {
 		logger.Info("nftables not supported on this platform, skipping traffic rule initialization")
 		return

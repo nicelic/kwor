@@ -43,7 +43,8 @@ func InitDDNSDB() error {
 	}
 
 	c := &gorm.Config{
-		Logger: gormLogger,
+		Logger:                 gormLogger,
+		SkipDefaultTransaction: true,
 	}
 
 	openedDB, err := gorm.Open(sqlite.Open(sqliteDSNWithPragmas(dbPath)), c)
@@ -93,6 +94,8 @@ func InitDDNSDB() error {
 			}
 		}
 	}
+
+	_ = openedDB.Exec("PRAGMA shrink_memory").Error
 
 	ddnsDB = openedDB
 	return nil

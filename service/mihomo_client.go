@@ -894,26 +894,21 @@ func (s *MihomoClientService) DepleteClients() ([]uint, error) {
 	now := time.Now().Unix()
 	db := database.GetDB()
 
-	tx := db.Begin()
-	if tx.Error != nil {
-		return nil, tx.Error
-	}
-
 	var clients []model.MihomoClient
-	err := tx.Model(model.MihomoClient{}).
+	err := db.Model(model.MihomoClient{}).
 		Where("enable = true AND ((volume > 0 AND up + down >= volume) OR (expiry > 0 AND expiry <= ?))", now).
 		Find(&clients).Error
 	if err != nil {
-		tx.Rollback()
 		return nil, err
 	}
 
 	if len(clients) == 0 {
-		if err = tx.Commit().Error; err != nil {
-			tx.Rollback()
-			return nil, err
-		}
 		return nil, nil
+	}
+
+	tx := db.Begin()
+	if tx.Error != nil {
+		return nil, tx.Error
 	}
 
 	inboundIDs := make([]uint, 0)

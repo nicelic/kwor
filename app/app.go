@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"time"
 
 	"github.com/alireza0/s-ui/api"
@@ -73,6 +75,9 @@ func (a *APP) Init() error {
 	if err := refreshPanelRuntimeOwnershipOnStartup(); err != nil {
 		return err
 	}
+
+	runtime.GC()
+	debug.FreeOSMemory()
 
 	a.cronJob = cronjob.NewCronJob()
 	a.coreManager = &service.CoreManagerService{}
@@ -162,6 +167,9 @@ func (a *APP) Start() error {
 			logger.Warning("finalize pending db restore failed:", err)
 		}
 	}
+
+	runtime.GC()
+	debug.FreeOSMemory()
 
 	return nil
 }

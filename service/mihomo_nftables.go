@@ -20,11 +20,18 @@ import (
 
 type MihomoNftTrafficService struct{}
 
-var mihomoClientBindingRepairNeeded atomic.Bool
+var (
+	mihomoClientBindingRepairNeeded atomic.Bool
+	mihomoInboundEmptySelfHealed    atomic.Bool
+)
 
 func init() {
 	mihomoClientBindingRepairNeeded.Store(true)
-	database.RegisterDBResetHook(func() { mihomoClientBindingRepairNeeded.Store(true) })
+	database.RegisterDBResetHook(func() {
+		mihomoClientBindingRepairNeeded.Store(true)
+		mihomoInboundEmptySelfHealed.Store(false)
+		invalidateMihomoPortHopCache()
+	})
 }
 
 type mihomoInboundTrafficSample struct {
@@ -38,11 +45,22 @@ type mihomoInboundTrafficSample struct {
 	delta                  inboundDelta
 }
 
+const mihomoPortHopIdleVerifyInterval = 1 * time.Minute
+
 var mihomoPortHopRefreshState = struct {
-	mu   sync.Mutex
-	last map[uint]time.Time
+	mu             sync.Mutex
+	last           map[uint]time.Time
+	lastEmptyCheck time.Time
+	hasActiveHops  bool
 }{
 	last: map[uint]time.Time{},
+}
+
+func invalidateMihomoPortHopCache() {
+	mihomoPortHopRefreshState.mu.Lock()
+	mihomoPortHopRefreshState.lastEmptyCheck = time.Time{}
+	mihomoPortHopRefreshState.hasActiveHops = true
+	mihomoPortHopRefreshState.mu.Unlock()
 }
 
 // Mihomo has an independent rule/state model, but its nft commands still need
@@ -268,6 +286,8 @@ func (s *MihomoNftTrafficService) ensureInboundRuleIntegrity(tx *gorm.DB, inboun
 }
 
 func (s *MihomoNftTrafficService) SetupInboundRules(tx *gorm.DB, inboundID uint, tag string, port int, portHopRange string, redirectTCP bool) error {
+	invalidateMihomoPortHopCache()
+	mihomoInboundEmptySelfHealed.Store(false)
 	if inboundID == 0 {
 		return nil
 	}
@@ -488,6 +508,8 @@ func (s *MihomoNftTrafficService) updateInboundTag(tx *gorm.DB, state *model.Mih
 }
 
 func (s *MihomoNftTrafficService) UpsertInboundStateOnly(tx *gorm.DB, inboundID uint, tag string, port int, portHopRange string) error {
+	invalidateMihomoPortHopCache()
+	mihomoInboundEmptySelfHealed.Store(false)
 	if inboundID == 0 {
 		return nil
 	}
@@ -533,6 +555,7 @@ func (s *MihomoNftTrafficService) UpsertInboundStateOnly(tx *gorm.DB, inboundID 
 }
 
 func (s *MihomoNftTrafficService) RemoveInboundStateOnly(tx *gorm.DB, inboundID uint) error {
+	invalidateMihomoPortHopCache()
 	if inboundID == 0 {
 		return nil
 	}
@@ -547,6 +570,7 @@ func (s *MihomoNftTrafficService) RemoveInboundStateOnly(tx *gorm.DB, inboundID 
 }
 
 func (s *MihomoNftTrafficService) RemoveInboundRules(tx *gorm.DB, inboundID uint) error {
+	invalidateMihomoPortHopCache()
 	var state model.MihomoInboundRedirectState
 	if err := tx.Where("inbound_id = ?", inboundID).First(&state).Error; err != nil {
 		return nil
@@ -831,11 +855,25 @@ func (s *MihomoNftTrafficService) refreshPortHopRedirects() error {
 		return nil
 	}
 
+	now := time.Now()
+	mihomoPortHopRefreshState.mu.Lock()
+	skipEmpty := !mihomoPortHopRefreshState.hasActiveHops && !mihomoPortHopRefreshState.lastEmptyCheck.IsZero() && now.Sub(mihomoPortHopRefreshState.lastEmptyCheck) < mihomoPortHopIdleVerifyInterval
+	mihomoPortHopRefreshState.mu.Unlock()
+	if skipEmpty {
+		return nil
+	}
+
 	db := database.GetDB()
 	var states []model.MihomoInboundRedirectState
 	if err := db.Where("port_hop_range <> ''").Find(&states).Error; err != nil {
 		return err
 	}
+
+	mihomoPortHopRefreshState.mu.Lock()
+	mihomoPortHopRefreshState.lastEmptyCheck = now
+	mihomoPortHopRefreshState.hasActiveHops = len(states) > 0
+	mihomoPortHopRefreshState.mu.Unlock()
+
 	if len(states) == 0 {
 		return nil
 	}
@@ -1011,9 +1049,12 @@ func (s *MihomoNftTrafficService) collectAndSaveTrafficLocked(saveTrafficOverrid
 
 	if len(states) == 0 {
 		// Legacy self-heal: old deployments may have mihomo inbounds but no nft state rows yet.
-		s.initOnStartup()
-		if err := db.Find(&states).Error; err != nil {
-			return false, err
+		if !mihomoInboundEmptySelfHealed.Load() {
+			s.initOnStartup()
+			mihomoInboundEmptySelfHealed.Store(true)
+			if err := db.Find(&states).Error; err != nil {
+				return false, err
+			}
 		}
 		if len(states) == 0 {
 			setMihomoOnlines(nil, nil)
@@ -1555,6 +1596,7 @@ func (s *MihomoNftTrafficService) InitOnStartup() {
 }
 
 func (s *MihomoNftTrafficService) initOnStartup() {
+	invalidateMihomoPortHopCache()
 	if !IsSystemPlatformLinux() || !nftSupported() {
 		return
 	}

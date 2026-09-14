@@ -263,6 +263,18 @@ func FlushTrafficRuntimeJournal() error {
 	return runtimeTrafficStats.flush()
 }
 
+// HasPendingTrafficRuntimeJournal reports whether the in-memory journal has
+// uncommitted samples waiting for the next flush pass.
+func HasPendingTrafficRuntimeJournal() bool {
+	return runtimeTrafficStats.hasPending()
+}
+
+func (s *trafficRuntimeStatsJournal) hasPending() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.pending) > 0
+}
+
 // QuarantineTrafficRuntimeJournalBeforeDatabaseRestore separates the old
 // database's filesystem mirror before SQLite is replaced. The normal restore
 // hook rotates the database generation afterward as a second protection.

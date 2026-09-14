@@ -18,6 +18,24 @@ if (!fs.existsSync(path.join(distDir, 'index.html'))) {
 fs.rmSync(embeddedDir, { recursive: true, force: true })
 fs.cpSync(distDir, embeddedDir, { recursive: true })
 
+// Prune legacy redundant font files (.ttf, .eot, .woff) to save Go binary .rodata RAM
+function pruneLegacyFonts(dir) {
+  if (!fs.existsSync(dir)) return
+  const files = fs.readdirSync(dir, { withFileTypes: true })
+  for (const file of files) {
+    const fullPath = path.join(dir, file.name)
+    if (file.isDirectory()) {
+      pruneLegacyFonts(fullPath)
+    } else if (file.isFile()) {
+      const ext = path.extname(file.name).toLowerCase()
+      if (ext === '.ttf' || ext === '.eot' || ext === '.woff') {
+        fs.unlinkSync(fullPath)
+      }
+    }
+  }
+}
+pruneLegacyFonts(path.join(embeddedDir, 'assets'))
+
 if (!fs.existsSync(path.join(embeddedDir, 'index.html'))) {
   throw new Error(`Embedded frontend sync failed: ${embeddedDir}`)
 }

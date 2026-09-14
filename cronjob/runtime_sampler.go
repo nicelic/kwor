@@ -1,6 +1,7 @@
 package cronjob
 
 import (
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -400,7 +401,12 @@ func (s *RuntimeSampler) flushJournal() error {
 	if s.taskOverrides != nil && s.taskOverrides.flush != nil {
 		return s.taskOverrides.flush()
 	}
-	return service.FlushTrafficRuntimeJournal()
+	hadPending := service.HasPendingTrafficRuntimeJournal()
+	err := service.FlushTrafficRuntimeJournal()
+	if hadPending {
+		debug.FreeOSMemory()
+	}
+	return err
 }
 
 func earliestRuntimeSamplerDeadline(values ...time.Time) time.Time {

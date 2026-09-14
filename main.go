@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	_ "time/tzdata"
 
@@ -12,6 +13,9 @@ import (
 )
 
 func runApp() {
+	debug.SetMemoryLimit(24 * 1024 * 1024)
+	debug.SetGCPercent(40)
+
 	app := app.NewApp()
 
 	err := app.Init()

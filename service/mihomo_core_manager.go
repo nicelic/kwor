@@ -1874,8 +1874,18 @@ func (s *MihomoCoreManagerService) isRunning() bool {
 	return false
 }
 
+// isMihomoSystemdActive 检查 mihomo systemd 服务是否 active
 func (s *MihomoCoreManagerService) isMihomoSystemdActive() bool {
+	if !s.isMihomoSystemdExists() {
+		return false
+	}
 	return systemctlUnitIsActive(mihomoSystemdName)
+}
+
+// isMihomoSystemdExists 检查 mihomo systemd 服务文件是否存在
+func (s *MihomoCoreManagerService) isMihomoSystemdExists() bool {
+	_, err := os.Stat(getMihomoServiceFilePath())
+	return err == nil
 }
 
 func (s *MihomoCoreManagerService) startCoreWindows(coreDir string) error {

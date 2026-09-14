@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 
@@ -68,6 +70,10 @@ func sqliteDSNWithPragmas(dbPath string) string {
 		values = url.Values{}
 	}
 	values.Add("_pragma", "secure_delete(1)")
+	values.Add("_pragma", "cache_size(-64)")
+	values.Add("_pragma", "mmap_size(0)")
+	values.Add("_pragma", "temp_store(1)")
+	values.Add("_pragma", "auto_vacuum(2)")
 
 	encoded := values.Encode()
 	if encoded == "" {
@@ -92,7 +98,8 @@ func OpenDB(dbPath string) error {
 	}
 
 	c := &gorm.Config{
-		Logger: gormLogger,
+		Logger:                 gormLogger,
+		SkipDefaultTransaction: true,
 	}
 	openedDB, err := gorm.Open(sqlite.Open(sqliteDSNWithPragmas(dbPath)), c)
 	if err != nil {
@@ -239,6 +246,10 @@ func InitDB(dbPath string) error {
 	if err != nil {
 		return err
 	}
+
+	_ = target.Exec("PRAGMA shrink_memory").Error
+	runtime.GC()
+	debug.FreeOSMemory()
 
 	return nil
 }

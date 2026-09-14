@@ -117,15 +117,13 @@ func (c *CronJob) Start(loc *time.Location, trafficAge int) error {
 	register("@every 5m", firewallSync, "firewall sync")
 	register("@every 5m", panelCertificateBalanceSync, "panel certificate-balance sync")
 	register("@daily", delStatsJob, "delete old stats")
-	// Auto-check core updates based on the configured interval.
-	// Keep the one-minute cadence while spreading remote checks and filesystem
-	// work across the minute. This avoids colliding with the sampler's journal
-	// flush and with each other on small hosts.
-	register("7 * * * * *", checkCoreJob, "sing-box core update check")
+	// Auto-check core updates and subscription groups based on configured intervals.
+	// Check every 30 minutes instead of every minute to eliminate idle database polling.
+	register("7 */30 * * * *", checkCoreJob, "sing-box core update check")
 	register("0 0 4 * * *", autoUpdateCoreJob, "sing-box core auto update")
-	register("17 * * * * *", checkMihomoCoreJob, "mihomo core update check")
+	register("17 */30 * * * *", checkMihomoCoreJob, "mihomo core update check")
 	register("0 0 4 * * *", autoUpdateMihomoCoreJob, "mihomo core auto update")
-	register("53 * * * * *", subGroupAutoUpdateJob, "subscription group auto-update")
+	register("53 */30 * * * *", subGroupAutoUpdateJob, "subscription group auto-update")
 	register("@every 10m", acmeAutoRenew, "ACME auto-renew")
 	register("41 * * * * *", certificateCoreRestart, "certificate Core restart")
 	register("29 * * * * *", tlsPathSync, "TLS path sync")
@@ -148,10 +146,11 @@ func (c *CronJob) Start(loc *time.Location, trafficAge int) error {
 	service.RegisterRuntimeSamplerDatabaseBarrier(c.PauseRuntimeSamplerForDatabaseRestore, c.ResumeRuntimeSamplerAfterDatabaseRestoreFailure)
 	runtimeSampler.Start()
 
-	c.runImmediateJob(firewallSync)
-	c.runImmediateJob(panelCertificateBalanceSync)
-	c.runImmediateJob(tlsPathSync)
-	c.runImmediateJob(acmeAutoRenew)
+	// Stagger initial warmups to eliminate startup memory and CPU concurrency spike.
+	c.runDelayedJob(firewallSync, 2*time.Second)
+	c.runDelayedJob(panelCertificateBalanceSync, 6*time.Second)
+	c.runDelayedJob(tlsPathSync, 12*time.Second)
+	c.runDelayedJob(acmeAutoRenew, 20*time.Second)
 
 	return nil
 }
@@ -183,12 +182,19 @@ func (c *CronJob) Stop() {
 }
 
 func (c *CronJob) runImmediateJob(job cron.Job) {
+	c.runDelayedJob(job, 0)
+}
+
+func (c *CronJob) runDelayedJob(job cron.Job, delay time.Duration) {
 	if c == nil || job == nil {
 		return
 	}
 	c.manualRuns.Add(1)
 	go func() {
 		defer c.manualRuns.Done()
+		if delay > 0 {
+			time.Sleep(delay)
+		}
 		job.Run()
 	}()
 }

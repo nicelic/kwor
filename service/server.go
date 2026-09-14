@@ -66,6 +66,7 @@ type systemdUnitStats struct {
 const (
 	systemdStatusCommandTimeout = 2 * time.Second
 	systemdUnitActiveCacheTTL   = 3 * time.Second
+	systemdUnitInactiveCacheTTL = time.Minute
 )
 
 type systemdUnitActiveCacheEntry struct {
@@ -357,6 +358,10 @@ func (s *ServerService) getManagedCoreRuntimeStats(unit string, binaryPath strin
 	}
 
 	running := inspector != nil && inspector.IsRunning()
+	if !running {
+		stats.Active = false
+		return stats
+	}
 
 	unitStats, err := s.getSystemdUnitStats(unit)
 	if err != nil {
@@ -681,10 +686,16 @@ func systemctlUnitIsActive(unit string) bool {
 	for {
 		now := time.Now()
 		systemdUnitActiveCache.Lock()
-		if cached, ok := systemdUnitActiveCache.entries[unit]; ok && now.Sub(cached.checkedAt) < systemdUnitActiveCacheTTL {
-			active := cached.active
-			systemdUnitActiveCache.Unlock()
-			return active
+		if cached, ok := systemdUnitActiveCache.entries[unit]; ok {
+			ttl := systemdUnitActiveCacheTTL
+			if !cached.active {
+				ttl = systemdUnitInactiveCacheTTL
+			}
+			if now.Sub(cached.checkedAt) < ttl {
+				active := cached.active
+				systemdUnitActiveCache.Unlock()
+				return active
+			}
 		}
 		if done := systemdUnitActiveCache.inflight[unit]; done != nil {
 			systemdUnitActiveCache.Unlock()
@@ -718,6 +729,13 @@ func systemctlUnitIsActive(unit string) bool {
 		systemdUnitActiveCache.Unlock()
 		return active
 	}
+}
+
+// InvalidateSystemdUnitActiveCache is called after systemctl mutations and
+// runtime lifecycle changes. The cache avoids duplicate probes within a
+// sampler pass; it must never mask a just-started or just-stopped core.
+func InvalidateSystemdUnitActiveCache() {
+	invalidateSystemdUnitActiveCache()
 }
 
 // invalidateSystemdUnitActiveCache is called after systemctl mutations and

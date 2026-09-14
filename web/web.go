@@ -196,7 +196,7 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 		return nil, err
 	}
 
-	engine.Use(gzip.Gzip(gzip.DefaultCompression))
+	engine.Use(gzip.Gzip(gzip.BestSpeed, gzip.WithExcludedExtensions([]string{".woff2", ".woff", ".ttf", ".png", ".jpg", ".jpeg", ".ico", ".svg", ".gz"})))
 	assetsBasePath := base_url + "assets/"
 
 	store := newSessionCookieStore(secret)

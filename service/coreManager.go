@@ -1740,6 +1740,9 @@ func (s *CoreManagerService) isRunning() bool {
 
 // isSingboxSystemdActive 检查 sing-box systemd 服务是否 active
 func (s *CoreManagerService) isSingboxSystemdActive() bool {
+	if !s.isSingboxSystemdExists() {
+		return false
+	}
 	return systemctlUnitIsActive(singboxSystemdName)
 }
 

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -48,14 +49,15 @@ type ddnsSyncTask struct {
 //    严禁将 DDNS 任务合并入 RuntimeSampler，以防任何外部网络抖动或超时直接拖死面板核心网络中枢！
 // ============================================================================
 type ddnsRuntimeWorker struct {
-	mu            sync.Mutex
-	running       bool
-	stopping      bool
-	isInitialPass bool // 标记开机启动后首轮扫描，确保重启后第一时间对齐探测
-	stopCh        chan struct{}
-	doneCh        chan struct{}
-	completeCh    chan struct{}
-	wakeCh        chan struct{}
+	mu             sync.Mutex
+	running        bool
+	stopping       bool
+	isInitialPass  bool // 标记开机启动后首轮扫描，确保重启后第一时间对齐探测
+	workersRunning bool
+	stopCh         chan struct{}
+	doneCh         chan struct{}
+	completeCh     chan struct{}
+	wakeCh         chan struct{}
 
 	service    *DDNSService
 	ruleGuards sync.Map // key: uint (rule.Id), value: *atomic.Bool
@@ -118,10 +120,7 @@ func (w *ddnsRuntimeWorker) Start() {
 		// 启动专属 OS 物理线程绑定的核心调度器
 		go w.runScheduler(stopCh, wakeCh, doneCh)
 
-		// 启动快慢分离工作池（并发探测池与并发同步池）
-		w.startWorkerPool(stopCh)
-
-		logger.Info("[DDNS] Runtime worker started on dedicated OS thread with fast/slow worker pool")
+		logger.Info("[DDNS] Runtime worker started on dedicated OS thread (worker pool will initialize on demand)")
 		return
 	}
 }
@@ -170,6 +169,7 @@ func (w *ddnsRuntimeWorker) StopAndWait() {
 		w.wakeCh = nil
 		w.detectQueue = nil
 		w.syncQueue = nil
+		w.workersRunning = false
 		w.stopping = false
 		if completeCh != nil {
 			close(completeCh)
@@ -251,6 +251,10 @@ func (w *ddnsRuntimeWorker) schedulePass() time.Duration {
 	}
 	defer operation.Done()
 
+	if _, err := os.Stat(database.GetDDNSDBPath()); os.IsNotExist(err) {
+		return ddnsDefaultIdleInterval
+	}
+
 	db := database.GetDDNSDB()
 	if db == nil {
 		return ddnsDefaultIdleInterval
@@ -268,6 +272,7 @@ func (w *ddnsRuntimeWorker) schedulePass() time.Duration {
 	w.mu.Lock()
 	initialPass := w.isInitialPass
 	w.isInitialPass = false
+	w.ensureWorkerPoolLocked(w.stopCh)
 	w.mu.Unlock()
 
 	now := time.Now()
@@ -364,7 +369,11 @@ func (w *ddnsRuntimeWorker) releaseRuleGuard(ruleID uint) {
 	}
 }
 
-func (w *ddnsRuntimeWorker) startWorkerPool(stopCh <-chan struct{}) {
+func (w *ddnsRuntimeWorker) ensureWorkerPoolLocked(stopCh <-chan struct{}) {
+	if w.workersRunning || stopCh == nil {
+		return
+	}
+	w.workersRunning = true
 	// 启动快路径并发探测 Worker 池
 	for i := 0; i < ddnsDetectorWorkerCount; i++ {
 		w.workerWg.Add(1)
@@ -376,6 +385,7 @@ func (w *ddnsRuntimeWorker) startWorkerPool(stopCh <-chan struct{}) {
 		w.workerWg.Add(1)
 		go w.runSyncerWorker(stopCh)
 	}
+	logger.Info("[DDNS] Worker pool initialized on demand")
 }
 
 func (w *ddnsRuntimeWorker) runDetectorWorker(stopCh <-chan struct{}) {
