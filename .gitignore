@@ -61,3 +61,6 @@ build-final.log
 .vscode
 .claude/
 .codex/
+.agents/
+.gortex.yaml
+

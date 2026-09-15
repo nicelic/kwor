@@ -100,12 +100,21 @@ type tlsSha256Request struct {
 }
 
 type trafficOverviewSettingsRequest struct {
-	LimitGiB         *float64 `json:"limit_gib" form:"limit_gib"`
-	ResetDay         *int     `json:"reset_day" form:"reset_day"`
-	ExpiryDate       *string  `json:"expiry_date" form:"expiry_date"`
-	LimitGiBCompat   *float64 `json:"limitGiB" form:"limitGiB"`
-	ResetDayCompat   *int     `json:"resetDay" form:"resetDay"`
-	ExpiryDateCompat *string  `json:"expiryDate" form:"expiryDate"`
+	LimitGiB            *float64 `json:"limit_gib" form:"limit_gib"`
+	ResetDay            *int     `json:"reset_day" form:"reset_day"`
+	ExpiryDate          *string  `json:"expiry_date" form:"expiry_date"`
+	LimitGiBCompat      *float64 `json:"limitGiB" form:"limitGiB"`
+	ResetDayCompat      *int     `json:"resetDay" form:"resetDay"`
+	ExpiryDateCompat    *string  `json:"expiryDate" form:"expiryDate"`
+	Interfaces          []string `json:"interfaces" form:"interfaces"`
+	InterfaceMode       *string  `json:"interface_mode" form:"interface_mode"`
+	InterfaceModeCompat *string  `json:"interfaceMode" form:"interfaceMode"`
+}
+
+type trafficOverviewInterfacesRequest struct {
+	Interfaces          []string `json:"interfaces" form:"interfaces"`
+	InterfaceMode       string   `json:"interface_mode" form:"interface_mode"`
+	InterfaceModeCompat string   `json:"interfaceMode" form:"interfaceMode"`
 }
 
 type trafficOverviewSwitchRequest struct {
@@ -812,8 +821,12 @@ func (a *ApiService) GetStatus(c *gin.Context) {
 
 func (a *ApiService) GetDashboardRuntime(c *gin.Context) {
 	request := c.Query("r")
-	result := a.ServerService.GetDashboardRuntime(request)
-	jsonObj(c, result, nil)
+	rawJSON, mapVal := a.ServerService.GetDashboardRuntimeRaw(request)
+	if len(rawJSON) > 0 {
+		c.Data(200, "application/json; charset=utf-8", rawJSON)
+		return
+	}
+	jsonObj(c, mapVal, nil)
 }
 
 func (a *ApiService) GetRuntimePerformance(c *gin.Context) {
@@ -855,6 +868,32 @@ func (a *ApiService) SaveTrafficOverviewSettings(c *gin.Context) {
 	}
 
 	if err := a.TrafficOverviewService.UpdateTrafficOverviewSettings(limitGiB, resetDay, expiryDate, expiryDateProvided); err != nil {
+		jsonMsg(c, "", err)
+		return
+	}
+	if req.InterfaceMode != nil || req.InterfaceModeCompat != nil || len(req.Interfaces) > 0 {
+		mode := ""
+		if req.InterfaceMode != nil {
+			mode = *req.InterfaceMode
+		} else if req.InterfaceModeCompat != nil {
+			mode = *req.InterfaceModeCompat
+		}
+		_ = a.TrafficOverviewService.SetTrafficOverviewInterfaces(req.Interfaces, mode)
+	}
+	a.GetTrafficOverview(c)
+}
+
+func (a *ApiService) SaveTrafficOverviewInterfaces(c *gin.Context) {
+	req := trafficOverviewInterfacesRequest{}
+	if err := c.ShouldBind(&req); err != nil {
+		jsonMsg(c, "", fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+	mode := req.InterfaceMode
+	if mode == "" {
+		mode = req.InterfaceModeCompat
+	}
+	if err := a.TrafficOverviewService.SetTrafficOverviewInterfaces(req.Interfaces, mode); err != nil {
 		jsonMsg(c, "", err)
 		return
 	}

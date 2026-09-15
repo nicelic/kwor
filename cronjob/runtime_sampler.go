@@ -1,6 +1,7 @@
 package cronjob
 
 import (
+	"runtime"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -15,12 +16,14 @@ const (
 	runtimeSamplerPortForwardInterval = 15 * time.Second
 	runtimeSamplerDepleteInterval     = time.Minute
 	runtimeSamplerFlushInterval       = time.Minute
+	runtimeSamplerScavengeInterval    = 15 * time.Minute
 
 	runtimeSamplerTrafficPhase     = 0 * time.Second
 	runtimeSamplerIntegrityPhase   = 3 * time.Second
 	runtimeSamplerPortForwardPhase = 7 * time.Second
 	runtimeSamplerDepletePhase     = 12 * time.Second
 	runtimeSamplerFlushPhase       = 26 * time.Second
+	runtimeSamplerScavengePhase    = 45 * time.Second
 )
 
 // RuntimeSampler owns the panel's frequent runtime work.  It deliberately
@@ -239,6 +242,7 @@ func (s *RuntimeSampler) run(stopCh <-chan struct{}, wakeCh <-chan struct{}, don
 	nextPortForward := nextPhaseSlot(now, runtimeSamplerPortForwardInterval, runtimeSamplerPortForwardPhase)
 	nextDeplete := nextPhaseSlot(now, runtimeSamplerDepleteInterval, runtimeSamplerDepletePhase)
 	nextFlush := nextPhaseSlot(now, runtimeSamplerFlushInterval, runtimeSamplerFlushPhase)
+	nextScavenge := nextPhaseSlot(now, runtimeSamplerScavengeInterval, runtimeSamplerScavengePhase)
 
 	timer := time.NewTimer(time.Hour)
 	if !timer.Stop() {
@@ -251,7 +255,7 @@ func (s *RuntimeSampler) run(stopCh <-chan struct{}, wakeCh <-chan struct{}, don
 
 	for {
 		now = time.Now()
-		next := earliestRuntimeSamplerDeadline(nextTraffic, nextIntegrity, nextPortForward, nextDeplete, nextFlush)
+		next := earliestRuntimeSamplerDeadline(nextTraffic, nextIntegrity, nextPortForward, nextDeplete, nextFlush, nextScavenge)
 		delay := time.Until(next)
 		if delay < 0 {
 			delay = 0
@@ -281,6 +285,7 @@ func (s *RuntimeSampler) run(stopCh <-chan struct{}, wakeCh <-chan struct{}, don
 			nextPortForward = nextPhaseSlot(now, runtimeSamplerPortForwardInterval, runtimeSamplerPortForwardPhase)
 			nextDeplete = nextPhaseSlot(now, runtimeSamplerDepleteInterval, runtimeSamplerDepletePhase)
 			nextFlush = nextPhaseSlot(now, runtimeSamplerFlushInterval, runtimeSamplerFlushPhase)
+			nextScavenge = nextPhaseSlot(now, runtimeSamplerScavengeInterval, runtimeSamplerScavengePhase)
 			continue
 		case <-timer.C:
 		}
@@ -313,8 +318,17 @@ func (s *RuntimeSampler) run(stopCh <-chan struct{}, wakeCh <-chan struct{}, don
 				})
 				nextFlush = nextPhaseSlot(time.Now(), runtimeSamplerFlushInterval, runtimeSamplerFlushPhase)
 			}
+			if !now.Before(nextScavenge) {
+				s.runTask("scavenge", s.runScavenge)
+				nextScavenge = nextPhaseSlot(time.Now(), runtimeSamplerScavengeInterval, runtimeSamplerScavengePhase)
+			}
 		})
 	}
+}
+
+func (s *RuntimeSampler) runScavenge() {
+	runtime.GC()
+	debug.FreeOSMemory()
 }
 
 func (s *RuntimeSampler) runWakePass() {

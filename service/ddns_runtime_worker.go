@@ -23,8 +23,8 @@ const (
 	ddnsQueueCapacity = 64
 	// ddnsSchedulerInterval 调度器心跳周期
 	ddnsSchedulerInterval = 30 * time.Second
-	// ddnsDefaultIdleInterval 无启用规则时的休眠周期
-	ddnsDefaultIdleInterval = 30 * time.Second
+	// ddnsDefaultIdleInterval 无启用规则时的休眠周期（无规则时进入低功耗长休眠，规则变更通过 Wake 触发）
+	ddnsDefaultIdleInterval = 2 * time.Minute
 )
 
 type ddnsDetectTask struct {

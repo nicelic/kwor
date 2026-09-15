@@ -70,7 +70,8 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	engine := gin.Default()
+	engine := gin.New()
+	engine.Use(gin.Recovery())
 
 	subPath, err := s.SettingService.GetSubPath()
 	if err != nil {
@@ -165,6 +166,7 @@ func (s *Server) Start() (err error) {
 		TLSConfig:         serverTLSConfig,
 		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 		WriteTimeout:      20 * time.Second,
 		MaxHeaderBytes:    64 << 10,
 		ConnState:         s.trackTLSConn,

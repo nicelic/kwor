@@ -3,7 +3,10 @@ package ddns
 import (
 	"context"
 	"errors"
+	"net"
+	"net/http"
 	"strings"
+	"time"
 )
 
 type RecordParam struct {
@@ -439,4 +442,34 @@ func SplitDomain(fullDomain string) (subDomain string, rootDomain string, err er
 		subDomain = strings.Join(subParts, ".")
 	}
 	return subDomain, rootDomain, nil
+}
+
+var sharedDDNSTransport = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	DialContext: (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          30,
+	MaxIdleConnsPerHost:   5,
+	IdleConnTimeout:       60 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
+var sharedDDNSHTTPClient = &http.Client{
+	Transport: sharedDDNSTransport,
+	Timeout:   15 * time.Second,
+}
+
+// GetSharedDDNSHTTPClient returns a pooled HTTP client with reusable transport
+func GetSharedDDNSHTTPClient(timeout time.Duration) *http.Client {
+	if timeout <= 0 || timeout == 15*time.Second {
+		return sharedDDNSHTTPClient
+	}
+	return &http.Client{
+		Transport: sharedDDNSTransport,
+		Timeout:   timeout,
+	}
 }

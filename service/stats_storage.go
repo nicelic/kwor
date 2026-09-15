@@ -599,7 +599,9 @@ func compactMainSQLiteDB(db *gorm.DB, force bool) error {
 	if err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)").Error; err != nil {
 		logger.Warning("main sqlite wal checkpoint failed: ", err)
 	}
-	return db.Exec("VACUUM").Error
+	err := db.Exec("VACUUM").Error
+	_ = db.Exec("PRAGMA shrink_memory").Error
+	return err
 }
 
 // requestMainSQLiteCompaction deliberately keeps VACUUM out of API response

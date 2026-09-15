@@ -30,6 +30,9 @@ type OptimizationWatchItem struct {
 	TargetPath     string
 	GoldenFileName string
 	OnCorrected    func(ctx context.Context, targetPath string) error
+	lastVerified   bool
+	lastSize       int64
+	lastModTime    time.Time
 }
 
 // SystemOptimizationWatcher 负责高频（10秒）轮询受管文件与母本的比对与自动纠正。
@@ -303,6 +306,12 @@ func (w *SystemOptimizationWatcher) checkAndCorrectItem(item *OptimizationWatchI
 		return
 	}
 
+	// 1. 轻量化 Stat 检查：若属性未变化且上次核对通过，直接跳过全量磁盘读与字符串比对
+	fi, statErr := os.Stat(item.TargetPath)
+	if statErr == nil && item.lastVerified && fi.Size() == item.lastSize && fi.ModTime().Equal(item.lastModTime) {
+		return
+	}
+
 	goldenContent, err := ReadOptimizationGoldenFile(item.GoldenFileName)
 	if err != nil {
 		// 母本文件若读取不到则无法进行比对，避免盲目重置
@@ -313,19 +322,29 @@ func (w *SystemOptimizationWatcher) checkAndCorrectItem(item *OptimizationWatchI
 	goldenNormalized := strings.ReplaceAll(goldenContent, "\r\n", "\n")
 
 	needCorrection := false
-	currentRaw, err := os.ReadFile(item.TargetPath)
-	if err != nil {
-		logger.Warningf("[SystemOptimizationWatcher] 受管文件 %s 读取失败 (%v)，判定为需要从母本纠正", item.TargetPath, err)
+	if statErr != nil {
+		logger.Warningf("[SystemOptimizationWatcher] 受管文件 %s 读取失败 (%v)，判定为需要从母本纠正", item.TargetPath, statErr)
 		needCorrection = true
 	} else {
-		currentNormalized := strings.ReplaceAll(string(currentRaw), "\r\n", "\n")
-		if currentNormalized != goldenNormalized {
-			logger.Warningf("[SystemOptimizationWatcher] 检测到 %s (%s) 被外部修改，与母本内容不一致，触发自动纠正", item.DisplayName, item.TargetPath)
+		currentRaw, err := os.ReadFile(item.TargetPath)
+		if err != nil {
+			logger.Warningf("[SystemOptimizationWatcher] 受管文件 %s 读取失败 (%v)，判定为需要从母本纠正", item.TargetPath, err)
 			needCorrection = true
+		} else {
+			currentNormalized := strings.ReplaceAll(string(currentRaw), "\r\n", "\n")
+			if currentNormalized != goldenNormalized {
+				logger.Warningf("[SystemOptimizationWatcher] 检测到 %s (%s) 被外部修改，与母本内容不一致，触发自动纠正", item.DisplayName, item.TargetPath)
+				needCorrection = true
+			}
 		}
 	}
 
 	if !needCorrection {
+		if fi, err := os.Stat(item.TargetPath); err == nil {
+			item.lastVerified = true
+			item.lastSize = fi.Size()
+			item.lastModTime = fi.ModTime()
+		}
 		return
 	}
 
@@ -333,14 +352,21 @@ func (w *SystemOptimizationWatcher) checkAndCorrectItem(item *OptimizationWatchI
 	dir := filepath.Dir(item.TargetPath)
 	if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
 		logger.Errorf("[SystemOptimizationWatcher] 纠正 %s 失败：创建目录失败: %v", item.TargetPath, mkErr)
+		item.lastVerified = false
 		return
 	}
 	if writeErr := os.WriteFile(item.TargetPath, []byte(goldenNormalized), 0o644); writeErr != nil {
 		logger.Errorf("[SystemOptimizationWatcher] 纠正 %s 失败：写回文件失败: %v", item.TargetPath, writeErr)
+		item.lastVerified = false
 		return
 	}
 
 	logger.Infof("[SystemOptimizationWatcher] 成功自动纠正受管文件内容: %s", item.TargetPath)
+	if fi, err := os.Stat(item.TargetPath); err == nil {
+		item.lastVerified = true
+		item.lastSize = fi.Size()
+		item.lastModTime = fi.ModTime()
+	}
 
 	// 执行重载生效回调
 	if item.OnCorrected != nil {
@@ -354,8 +380,11 @@ func (w *SystemOptimizationWatcher) checkAndCorrectItem(item *OptimizationWatchI
 	}
 }
 
-// StartSystemOptimizationWatcher 启动全局优化文件监视器
+// StartSystemOptimizationWatcher 启动全局优化文件监视器（非 Linux 平台直接休眠跳过）
 func StartSystemOptimizationWatcher() {
+	if !IsSystemPlatformLinux() {
+		return
+	}
 	GetSystemOptimizationWatcher().Start()
 }
 

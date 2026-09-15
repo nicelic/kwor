@@ -69,7 +69,7 @@ func DetectPublicIPs(ctx context.Context, ipType string, customURL string) ([]st
 		}
 	}
 
-	client := &http.Client{Timeout: 8 * time.Second}
+	client := GetSharedDDNSHTTPClient(8 * time.Second)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	ipMap := make(map[string]struct{})
@@ -96,8 +96,9 @@ func DetectPublicIPs(ctx context.Context, ipType string, customURL string) ([]st
 				mu.Unlock()
 				return
 			}
-			body, err := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
+			defer resp.Body.Close()
+
+			body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 			if err != nil {
 				mu.Lock()
 				errList = append(errList, fmt.Sprintf("%s: %v", targetURL, err))

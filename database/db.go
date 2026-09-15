@@ -10,6 +10,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/alireza0/s-ui/config"
 	"github.com/alireza0/s-ui/database/model"
@@ -115,6 +116,8 @@ func OpenDB(dbPath string) error {
 	// keeps connection-level PRAGMA state uniform.
 	sqlDB.SetMaxOpenConns(1)
 	sqlDB.SetMaxIdleConns(1)
+	sqlDB.SetConnMaxLifetime(10 * time.Minute)
+	sqlDB.SetConnMaxIdleTime(3 * time.Minute)
 
 	if config.IsDebug() {
 		openedDB = openedDB.Debug()
@@ -205,6 +208,7 @@ func InitDB(dbPath string) error {
 		&model.Client{},
 		&model.MihomoClient{},
 		&model.Changes{},
+		&model.NetworkInterfaceInfo{},
 		&managedRuntimeFileBackupEntry{},
 	)
 	if err != nil {

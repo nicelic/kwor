@@ -37,25 +37,28 @@ import (
 )
 
 type TrafficOverview struct {
-	Source      string              `json:"source"`
-	Interface   string              `json:"interface"`
-	Enabled     bool                `json:"enabled"`
-	Status      string              `json:"status"`
-	Available   bool                `json:"available"`
-	Up          int64               `json:"up"`
-	Down        int64               `json:"down"`
-	Total       int64               `json:"total"`
-	AccumUp     int64               `json:"accumUp"`
-	AccumDown   int64               `json:"accumDown"`
-	AccumTotal  int64               `json:"accumTotal"`
-	LimitGiB    float64             `json:"limitGiB"`
-	ResetDay    int                 `json:"resetDay"`
-	ExpiryDate  string              `json:"expiryDate,omitempty"`
-	Expired     bool                `json:"expired"`
-	NextResetAt int64               `json:"nextResetAt"`
-	UpdatedAt   int64               `json:"updatedAt"`
-	Vnstat      VnstatPackageStatus `json:"vnstat"`
-	Error       string              `json:"error,omitempty"`
+	Source              string                       `json:"source"`
+	Interface           string                       `json:"interface"`
+	Interfaces          []string                     `json:"interfaces"`
+	AvailableInterfaces []model.NetworkInterfaceInfo `json:"availableInterfaces"`
+	InterfaceMode       string                       `json:"interfaceMode"`
+	Enabled             bool                         `json:"enabled"`
+	Status              string                       `json:"status"`
+	Available           bool                         `json:"available"`
+	Up                  int64                        `json:"up"`
+	Down                int64                        `json:"down"`
+	Total               int64                        `json:"total"`
+	AccumUp             int64                        `json:"accumUp"`
+	AccumDown           int64                        `json:"accumDown"`
+	AccumTotal          int64                        `json:"accumTotal"`
+	LimitGiB            float64                      `json:"limitGiB"`
+	ResetDay            int                          `json:"resetDay"`
+	ExpiryDate          string                       `json:"expiryDate,omitempty"`
+	Expired             bool                         `json:"expired"`
+	NextResetAt         int64                        `json:"nextResetAt"`
+	UpdatedAt           int64                        `json:"updatedAt"`
+	Vnstat              VnstatPackageStatus          `json:"vnstat"`
+	Error               string                       `json:"error,omitempty"`
 }
 
 type VnstatPackageStatus struct {
@@ -222,6 +225,8 @@ const (
 	trafficOverviewEnabledKey          = "trafficOverviewEnabled"
 	trafficOverviewResetDayKey         = "trafficOverviewResetDay"
 	trafficOverviewExpiryDateKey       = "trafficOverviewExpiryDate"
+	trafficOverviewInterfacesKey       = "trafficOverviewInterfaces"
+	trafficOverviewInterfaceModeKey    = "trafficOverviewInterfaceMode"
 	trafficOverviewSnapshotKey         = "trafficOverviewSnapshot"
 	trafficOverviewCapStateKey         = "trafficOverviewCapState"
 	trafficOverviewPauseStateKey       = "trafficOverviewPauseState"
@@ -518,16 +523,19 @@ func (s *TrafficOverviewService) getTrafficOverviewUncached() (*TrafficOverview,
 		return overview, nil
 	}
 
-	iface, err := detectDefaultTrafficInterface()
-	if err != nil {
-		overview.Error = err.Error()
+	ifaces, mode := s.GetSelectedTrafficInterfaces()
+	if len(ifaces) == 0 {
+		overview.Error = "no network interface selected or found"
 		overview.Available = false
 		overview.Status = "error"
 		return overview, nil
 	}
-	overview.Interface = iface
+	overview.Interfaces = ifaces
+	overview.Interface = strings.Join(ifaces, ", ")
+	overview.InterfaceMode = mode
+	overview.AvailableInterfaces = (&NetworkInterfaceService{}).GetSystemInterfaces(false)
 
-	vnstatUp, vnstatDown, err := loadVnstatTrafficTotals(iface)
+	vnstatUp, vnstatDown, err := loadVnstatTrafficTotals(ifaces)
 	if err != nil {
 		overview.Error = err.Error()
 		overview.Available = false
@@ -546,7 +554,7 @@ func (s *TrafficOverviewService) getTrafficOverviewUncached() (*TrafficOverview,
 	}
 
 	stateChanged := false
-	currentUp, currentDown, source, derivedChanged, deriveErr := deriveCurrentAlltimeTotals(&state, iface, vnstatUp, vnstatDown)
+	currentUp, currentDown, source, derivedChanged, deriveErr := deriveCurrentAlltimeTotals(&state, ifaces, vnstatUp, vnstatDown)
 	if deriveErr != nil {
 		overview.Error = deriveErr.Error()
 		overview.Available = false
@@ -556,7 +564,8 @@ func (s *TrafficOverviewService) getTrafficOverviewUncached() (*TrafficOverview,
 	overview.Source = source
 	stateChanged = stateChanged || derivedChanged
 
-	normalizedChanged, normalizeErr := normalizeStateForTotals(&state, iface, currentUp, currentDown)
+	joinedIfaces := joinSortedInterfaces(ifaces)
+	normalizedChanged, normalizeErr := normalizeStateForTotals(&state, joinedIfaces, currentUp, currentDown)
 	if normalizeErr != nil {
 		overview.Error = normalizeErr.Error()
 		overview.Available = false
@@ -637,6 +646,83 @@ func (s *TrafficOverviewService) UpdateTrafficOverviewSettings(limitGiB float64,
 	if err := s.ReconcileTrafficCap(); err != nil {
 		logger.Warning("reconcile traffic cap after settings update failed:", err)
 	}
+	return nil
+}
+
+func (s *TrafficOverviewService) GetSelectedTrafficInterfaces() ([]string, string) {
+	var settingService SettingService
+	mode, _ := settingService.getString(trafficOverviewInterfaceModeKey)
+	mode = strings.TrimSpace(mode)
+	if mode != "custom" {
+		mode = "auto"
+	}
+
+	if mode == "auto" {
+		recommended := (&NetworkInterfaceService{}).GetDefaultTrafficInterfaces()
+		if len(recommended) > 0 {
+			return recommended, "auto"
+		}
+		if def, err := detectDefaultTrafficInterface(); err == nil && def != "" {
+			return []string{def}, "auto"
+		}
+		return nil, "auto"
+	}
+
+	rawJson, err := settingService.getString(trafficOverviewInterfacesKey)
+	if err == nil && strings.TrimSpace(rawJson) != "" {
+		var ifaces []string
+		if json.Unmarshal([]byte(rawJson), &ifaces) == nil && len(ifaces) > 0 {
+			var validIfaces []string
+			for _, iface := range ifaces {
+				if trimmed := strings.TrimSpace(iface); trimmed != "" {
+					validIfaces = append(validIfaces, trimmed)
+				}
+			}
+			if len(validIfaces) > 0 {
+				return validIfaces, "custom"
+			}
+		}
+	}
+
+	recommended := (&NetworkInterfaceService{}).GetDefaultTrafficInterfaces()
+	if len(recommended) > 0 {
+		return recommended, "auto"
+	}
+	if def, err := detectDefaultTrafficInterface(); err == nil && def != "" {
+		return []string{def}, "auto"
+	}
+	return nil, "auto"
+}
+
+func (s *TrafficOverviewService) SetTrafficOverviewInterfaces(interfaces []string, mode string) error {
+	trafficOverviewOperationMu.Lock()
+	defer trafficOverviewOperationMu.Unlock()
+
+	mode = strings.TrimSpace(mode)
+	if mode != "custom" {
+		mode = "auto"
+	}
+
+	var valid []string
+	for _, iface := range interfaces {
+		if trimmed := strings.TrimSpace(iface); trimmed != "" {
+			valid = append(valid, trimmed)
+		}
+	}
+
+	trafficOverviewSettingsMu.Lock()
+	defer trafficOverviewSettingsMu.Unlock()
+
+	valBytes, _ := json.Marshal(valid)
+	changes := map[string]string{
+		trafficOverviewInterfaceModeKey: mode,
+		trafficOverviewInterfacesKey:    string(valBytes),
+	}
+
+	if err := saveTrafficOverviewSettingsAtomically(changes); err != nil {
+		return err
+	}
+	invalidateTrafficOverviewConfigCache()
 	return nil
 }
 
@@ -756,15 +842,14 @@ func (s *TrafficOverviewService) pauseTrafficOverviewAccounting() error {
 		return s.pauseTrafficOverviewWithCachedSnapshot()
 	}
 
-	iface, err := detectDefaultTrafficInterface()
-	if err != nil {
-		return err
+	ifaces, _ := s.GetSelectedTrafficInterfaces()
+	if len(ifaces) == 0 {
+		return s.pauseTrafficOverviewWithCachedSnapshot()
 	}
-	if iface == "" {
-		return errors.New("default interface is empty")
-	}
+	ifaceStr := strings.Join(ifaces, ", ")
+	joinedIfaces := joinSortedInterfaces(ifaces)
 
-	vnstatUp, vnstatDown, err := loadVnstatTrafficTotals(iface)
+	vnstatUp, vnstatDown, err := loadVnstatTrafficTotals(ifaces)
 	if err != nil {
 		return err
 	}
@@ -782,13 +867,13 @@ func (s *TrafficOverviewService) pauseTrafficOverviewAccounting() error {
 		return stateErr
 	}
 
-	currentUp, currentDown, source, derivedChanged, deriveErr := deriveCurrentAlltimeTotals(&state, iface, vnstatUp, vnstatDown)
+	currentUp, currentDown, source, derivedChanged, deriveErr := deriveCurrentAlltimeTotals(&state, ifaces, vnstatUp, vnstatDown)
 	if deriveErr != nil {
 		trafficOverviewStateMu.Unlock()
 		return deriveErr
 	}
 
-	normalizedChanged, normalizeErr := normalizeStateForTotals(&state, iface, currentUp, currentDown)
+	normalizedChanged, normalizeErr := normalizeStateForTotals(&state, joinedIfaces, currentUp, currentDown)
 	if normalizeErr != nil {
 		trafficOverviewStateMu.Unlock()
 		return normalizeErr
@@ -810,7 +895,7 @@ func (s *TrafficOverviewService) pauseTrafficOverviewAccounting() error {
 
 	snapshot := trafficOverviewSnapshot{
 		Source:    source,
-		Interface: iface,
+		Interface: ifaceStr,
 		Available: true,
 		Up:        nonNegativeDiff(currentUp, state.PeriodBaseUp),
 		Down:      nonNegativeDiff(currentDown, state.PeriodBaseDown),
@@ -826,7 +911,7 @@ func (s *TrafficOverviewService) pauseTrafficOverviewAccounting() error {
 
 	return s.savePauseState(trafficOverviewPauseState{
 		Paused:         true,
-		Interface:      iface,
+		Interface:      ifaceStr,
 		CurrentUp:      currentUp,
 		CurrentDown:    currentDown,
 		PeriodBaseUp:   state.PeriodBaseUp,
@@ -874,21 +959,21 @@ func (s *TrafficOverviewService) resumeTrafficOverviewAccounting() error {
 		return s.clearPauseState()
 	}
 
-	iface, err := detectDefaultTrafficInterface()
-	if err != nil {
-		return err
+	ifaces, _ := s.GetSelectedTrafficInterfaces()
+	if len(ifaces) == 0 {
+		return s.clearPauseState()
 	}
-	if iface == "" {
-		return errors.New("default interface is empty")
-	}
-	if err := ensureVnstatTracking(iface); err != nil {
-		return err
+	joinedIfaces := joinSortedInterfaces(ifaces)
+	for _, iface := range ifaces {
+		if err := ensureVnstatTracking(iface); err != nil {
+			logger.Warning("ensure vnstat tracking on resume for", iface, "failed:", err)
+		}
 	}
 	if daemonErr := ensureVnstatDaemonRunning(); daemonErr != nil {
 		logger.Warning("ensure vnstat daemon on resume failed:", daemonErr)
 	}
 
-	vnstatUp, vnstatDown, err := loadVnstatTrafficTotals(iface)
+	vnstatUp, vnstatDown, err := loadVnstatTrafficTotals(ifaces)
 	if err != nil {
 		return err
 	}
@@ -905,13 +990,13 @@ func (s *TrafficOverviewService) resumeTrafficOverviewAccounting() error {
 		return stateErr
 	}
 
-	currentUp, currentDown, _, _, deriveErr := deriveCurrentAlltimeTotals(&state, iface, vnstatUp, vnstatDown)
+	currentUp, currentDown, _, _, deriveErr := deriveCurrentAlltimeTotals(&state, ifaces, vnstatUp, vnstatDown)
 	if deriveErr != nil {
 		trafficOverviewStateMu.Unlock()
 		return deriveErr
 	}
 
-	state.Interface = iface
+	state.Interface = joinedIfaces
 	state.ManualBaseUp = nonNegativeDiff(currentUp, pauseState.Snapshot.AccumUp)
 	state.ManualBaseDown = nonNegativeDiff(currentDown, pauseState.Snapshot.AccumDown)
 	state.PeriodBaseUp = nonNegativeDiff(currentUp, pauseState.Snapshot.Up)
@@ -1921,12 +2006,15 @@ func (s *TrafficOverviewService) installManagedVnstatWithContext(ctx context.Con
 		return nil, err
 	}
 
-	if iface, detectErr := detectDefaultTrafficInterface(); detectErr == nil && iface != "" {
+	ifaces, _ := s.GetSelectedTrafficInterfaces()
+	if len(ifaces) > 0 {
 		if err := reportVnstatInstallProgressContext(ctx, report, "正在配置 vnStat 流量网卡"); err != nil {
 			return nil, err
 		}
-		if trackErr := ensureVnstatTracking(iface); trackErr != nil {
-			logger.Warning("ensure vnstat tracking after install failed:", trackErr)
+		for _, iface := range ifaces {
+			if trackErr := ensureVnstatTracking(iface); trackErr != nil {
+				logger.Warning("ensure vnstat tracking after install failed for", iface, ":", trackErr)
+			}
 		}
 	}
 	if err := reportVnstatInstallProgressContext(ctx, report, "正在启动 vnStat 服务"); err != nil {
@@ -2857,15 +2945,14 @@ func (s *TrafficOverviewService) ResetAllTrafficOverviewStats() error {
 		return nil
 	}
 
-	iface, err := detectDefaultTrafficInterface()
-	if err != nil {
-		return err
+	ifaces, _ := s.GetSelectedTrafficInterfaces()
+	if len(ifaces) == 0 {
+		return errors.New("no traffic interface configured or detected")
 	}
-	if iface == "" {
-		return errors.New("default interface is empty")
-	}
+	ifaceStr := strings.Join(ifaces, ", ")
+	joinedIfaces := joinSortedInterfaces(ifaces)
 
-	vnstatUp, vnstatDown, err := loadVnstatTrafficTotals(iface)
+	vnstatUp, vnstatDown, err := loadVnstatTrafficTotals(ifaces)
 	if err != nil {
 		return err
 	}
@@ -2883,16 +2970,16 @@ func (s *TrafficOverviewService) ResetAllTrafficOverviewStats() error {
 		return stateErr
 	}
 
-	currentUp, currentDown, source, _, deriveErr := deriveCurrentAlltimeTotals(&state, iface, vnstatUp, vnstatDown)
+	currentUp, currentDown, source, _, deriveErr := deriveCurrentAlltimeTotals(&state, ifaces, vnstatUp, vnstatDown)
 	if deriveErr != nil {
 		trafficOverviewStateMu.Unlock()
 		return deriveErr
 	}
-	if _, normalizeErr := normalizeStateForTotals(&state, iface, currentUp, currentDown); normalizeErr != nil {
+	if _, normalizeErr := normalizeStateForTotals(&state, joinedIfaces, currentUp, currentDown); normalizeErr != nil {
 		trafficOverviewStateMu.Unlock()
 		return normalizeErr
 	}
-	state.Interface = iface
+	state.Interface = joinedIfaces
 	state.ManualBaseUp = currentUp
 	state.ManualBaseDown = currentDown
 	state.PeriodBaseUp = currentUp
@@ -2910,7 +2997,7 @@ func (s *TrafficOverviewService) ResetAllTrafficOverviewStats() error {
 
 	resetSnapshot := trafficOverviewSnapshot{
 		Source:     source,
-		Interface:  iface,
+		Interface:  ifaceStr,
 		Available:  true,
 		Up:         0,
 		Down:       0,
@@ -2942,15 +3029,14 @@ func (s *TrafficOverviewService) ResetPeriodTrafficOverviewStats() error {
 		return nil
 	}
 
-	iface, err := detectDefaultTrafficInterface()
-	if err != nil {
-		return err
+	ifaces, _ := s.GetSelectedTrafficInterfaces()
+	if len(ifaces) == 0 {
+		return errors.New("no traffic interface configured or detected")
 	}
-	if iface == "" {
-		return errors.New("default interface is empty")
-	}
+	ifaceStr := strings.Join(ifaces, ", ")
+	joinedIfaces := joinSortedInterfaces(ifaces)
 
-	vnstatUp, vnstatDown, err := loadVnstatTrafficTotals(iface)
+	vnstatUp, vnstatDown, err := loadVnstatTrafficTotals(ifaces)
 	if err != nil {
 		return err
 	}
@@ -2968,16 +3054,16 @@ func (s *TrafficOverviewService) ResetPeriodTrafficOverviewStats() error {
 		return stateErr
 	}
 
-	currentUp, currentDown, source, _, deriveErr := deriveCurrentAlltimeTotals(&state, iface, vnstatUp, vnstatDown)
+	currentUp, currentDown, source, _, deriveErr := deriveCurrentAlltimeTotals(&state, ifaces, vnstatUp, vnstatDown)
 	if deriveErr != nil {
 		trafficOverviewStateMu.Unlock()
 		return deriveErr
 	}
-	if _, normalizeErr := normalizeStateForTotals(&state, iface, currentUp, currentDown); normalizeErr != nil {
+	if _, normalizeErr := normalizeStateForTotals(&state, joinedIfaces, currentUp, currentDown); normalizeErr != nil {
 		trafficOverviewStateMu.Unlock()
 		return normalizeErr
 	}
-	state.Interface = iface
+	state.Interface = joinedIfaces
 	state.PeriodBaseUp = currentUp
 	state.PeriodBaseDown = currentDown
 	state.PeriodTag = computePeriodTag(resetDay, now)
@@ -2995,7 +3081,7 @@ func (s *TrafficOverviewService) ResetPeriodTrafficOverviewStats() error {
 
 	resetSnapshot := trafficOverviewSnapshot{
 		Source:     source,
-		Interface:  iface,
+		Interface:  ifaceStr,
 		Available:  true,
 		Up:         0,
 		Down:       0,
@@ -3027,15 +3113,14 @@ func (s *TrafficOverviewService) ResetTotalTrafficOverviewStats() error {
 		return nil
 	}
 
-	iface, err := detectDefaultTrafficInterface()
-	if err != nil {
-		return err
+	ifaces, _ := s.GetSelectedTrafficInterfaces()
+	if len(ifaces) == 0 {
+		return errors.New("no traffic interface configured or detected")
 	}
-	if iface == "" {
-		return errors.New("default interface is empty")
-	}
+	ifaceStr := strings.Join(ifaces, ", ")
+	joinedIfaces := joinSortedInterfaces(ifaces)
 
-	vnstatUp, vnstatDown, err := loadVnstatTrafficTotals(iface)
+	vnstatUp, vnstatDown, err := loadVnstatTrafficTotals(ifaces)
 	if err != nil {
 		return err
 	}
@@ -3048,16 +3133,16 @@ func (s *TrafficOverviewService) ResetTotalTrafficOverviewStats() error {
 		return stateErr
 	}
 
-	currentUp, currentDown, source, _, deriveErr := deriveCurrentAlltimeTotals(&state, iface, vnstatUp, vnstatDown)
+	currentUp, currentDown, source, _, deriveErr := deriveCurrentAlltimeTotals(&state, ifaces, vnstatUp, vnstatDown)
 	if deriveErr != nil {
 		trafficOverviewStateMu.Unlock()
 		return deriveErr
 	}
-	if _, normalizeErr := normalizeStateForTotals(&state, iface, currentUp, currentDown); normalizeErr != nil {
+	if _, normalizeErr := normalizeStateForTotals(&state, joinedIfaces, currentUp, currentDown); normalizeErr != nil {
 		trafficOverviewStateMu.Unlock()
 		return normalizeErr
 	}
-	state.Interface = iface
+	state.Interface = joinedIfaces
 	state.ManualBaseUp = currentUp
 	state.ManualBaseDown = currentDown
 	state.LastFullResetAt = now.Unix()
@@ -3073,7 +3158,7 @@ func (s *TrafficOverviewService) ResetTotalTrafficOverviewStats() error {
 
 	resetSnapshot := trafficOverviewSnapshot{
 		Source:     source,
-		Interface:  iface,
+		Interface:  ifaceStr,
 		Available:  true,
 		Up:         periodUp,
 		Down:       periodDown,
@@ -3097,6 +3182,8 @@ func (s *TrafficOverviewService) EnsureRuntimeReady() error {
 	if !IsSystemPlatformLinux() {
 		return nil
 	}
+	_, _ = (&NetworkInterfaceService{}).SyncSystemInterfaces()
+
 	if enabled, err := s.isOverviewEnabled(); err != nil {
 		return err
 	} else if !enabled {
@@ -3113,16 +3200,11 @@ func (s *TrafficOverviewService) EnsureRuntimeReady() error {
 		return err
 	}
 
-	iface, err := detectDefaultTrafficInterface()
-	if err != nil {
-		return err
-	}
-	if iface == "" {
-		return nil
-	}
-
-	if err := ensureVnstatTracking(iface); err != nil {
-		return err
+	ifaces, _ := s.GetSelectedTrafficInterfaces()
+	for _, iface := range ifaces {
+		if err := ensureVnstatTracking(iface); err != nil {
+			logger.Warning("initial vnstat tracking failed for", iface, ":", err)
+		}
 	}
 	if err := s.ReconcileTrafficCap(); err != nil {
 		logger.Warning("initial traffic cap reconcile failed:", err)
@@ -4213,16 +4295,31 @@ func hasTrafficCapRules() bool {
 	return inHandle > 0 && outHandle > 0 && forwardHandle > 0
 }
 
-func deriveCurrentAlltimeTotals(state *trafficOverviewRuntimeState, iface string, vnstatUp int64, vnstatDown int64) (int64, int64, string, bool, error) {
+func joinSortedInterfaces(ifaces []string) string {
+	if len(ifaces) == 0 {
+		return ""
+	}
+	cloned := make([]string, 0, len(ifaces))
+	for _, iface := range ifaces {
+		if trimmed := strings.TrimSpace(iface); trimmed != "" {
+			cloned = append(cloned, trimmed)
+		}
+	}
+	sort.Strings(cloned)
+	return strings.Join(cloned, ",")
+}
+
+func deriveCurrentAlltimeTotals(state *trafficOverviewRuntimeState, ifaces []string, vnstatUp int64, vnstatDown int64) (int64, int64, string, bool, error) {
 	if state == nil {
 		return 0, 0, "vnstat", false, errors.New("state is nil")
 	}
 
 	vnstatUp = maxInt64(vnstatUp, 0)
 	vnstatDown = maxInt64(vnstatDown, 0)
-	ifaceChanged := strings.TrimSpace(state.Interface) == "" || state.Interface != strings.TrimSpace(iface)
+	joinedIfaces := joinSortedInterfaces(ifaces)
+	ifaceChanged := strings.TrimSpace(state.Interface) == "" || state.Interface != joinedIfaces
 
-	kernelUp, kernelDown, err := loadKernelTrafficTotals(iface)
+	kernelUp, kernelDown, err := loadKernelTrafficTotals(ifaces)
 	if err != nil {
 		return vnstatUp, vnstatDown, "vnstat", false, nil
 	}
@@ -4273,56 +4370,105 @@ func reconcileKernelRealtimeCounter(offset *int64, lastKernel *int64, ifaceChang
 	return changed, current
 }
 
-func loadKernelTrafficTotals(iface string) (int64, int64, error) {
-	if strings.TrimSpace(iface) == "" {
-		return 0, 0, errors.New("default interface is empty")
+func loadKernelTrafficTotals(ifaces []string) (int64, int64, error) {
+	if len(ifaces) == 0 {
+		return 0, 0, errors.New("interfaces list is empty")
 	}
 
 	ioStats, err := psnet.IOCounters(true)
 	if err != nil {
 		return 0, 0, err
 	}
-	for _, stat := range ioStats {
-		if stat.Name != iface {
-			continue
+	targetMap := make(map[string]bool, len(ifaces))
+	for _, iface := range ifaces {
+		if trimmed := strings.TrimSpace(iface); trimmed != "" {
+			targetMap[trimmed] = true
 		}
-		return uint64ToSafeInt64(stat.BytesSent), uint64ToSafeInt64(stat.BytesRecv), nil
 	}
-	return 0, 0, fmt.Errorf("kernel traffic counters not found for interface %s", iface)
+	var totalSent, totalRecv uint64
+	found := false
+	for _, stat := range ioStats {
+		if targetMap[stat.Name] {
+			totalSent += stat.BytesSent
+			totalRecv += stat.BytesRecv
+			found = true
+		}
+	}
+	if !found {
+		return 0, 0, fmt.Errorf("kernel traffic counters not found for interfaces %v", ifaces)
+	}
+	return uint64ToSafeInt64(totalSent), uint64ToSafeInt64(totalRecv), nil
 }
 
-func loadVnstatTrafficTotals(iface string) (int64, int64, error) {
-	up, down, err := queryVnstatTrafficTotals(iface)
+func loadVnstatTrafficTotals(ifaces []string) (int64, int64, error) {
+	if len(ifaces) == 0 {
+		return 0, 0, errors.New("interfaces list is empty")
+	}
+
+	for _, iface := range ifaces {
+		if ensureErr := ensureVnstatTracking(iface); ensureErr != nil {
+			logger.Warning("ensure vnstat tracking failed for", iface, ":", ensureErr)
+		}
+	}
+
+	up, down, err := queryVnstatTrafficTotals(ifaces)
 	if err == nil {
 		return up, down, nil
 	}
 
-	if ensureErr := ensureVnstatTracking(iface); ensureErr != nil {
-		return 0, 0, fmt.Errorf("%w; ensure tracking failed: %v", err, ensureErr)
-	}
-
-	return queryVnstatTrafficTotals(iface)
+	return 0, 0, err
 }
 
-func queryVnstatTrafficTotals(iface string) (int64, int64, error) {
-	output, err := runVnstatCommand("-i", iface, "--json")
-	if err != nil {
-		return 0, 0, err
+func queryVnstatTrafficTotals(ifaces []string) (int64, int64, error) {
+	if len(ifaces) == 0 {
+		return 0, 0, errors.New("interfaces list is empty")
 	}
 
-	return parseVnstatTrafficTotals(output)
+	output, err := runVnstatCommand("--json")
+	if err == nil {
+		up, down, parseErr := parseVnstatMultiInterfaceTrafficTotals(output, ifaces)
+		if parseErr == nil {
+			return up, down, nil
+		}
+	}
+
+	var totalUp, totalDown int64
+	var lastErr error
+	found := false
+	for _, iface := range ifaces {
+		singleOut, singleErr := runVnstatCommand("-i", iface, "--json")
+		if singleErr != nil {
+			lastErr = singleErr
+			continue
+		}
+		up, down, parseErr := parseVnstatTrafficTotals(singleOut)
+		if parseErr == nil {
+			totalUp += up
+			totalDown += down
+			found = true
+		} else {
+			lastErr = parseErr
+		}
+	}
+	if found {
+		return totalUp, totalDown, nil
+	}
+	if lastErr != nil {
+		return 0, 0, lastErr
+	}
+	return 0, 0, errors.New("no vnstat traffic data available for interfaces")
 }
 
 func ensureVnstatTracking(iface string) error {
 	if iface == "" {
-		return errors.New("default interface is empty")
+		return errors.New("interface is empty")
 	}
 
 	if err := ensureVnstatAvailable(); err != nil {
 		return err
 	}
 
-	if _, _, err := queryVnstatTrafficTotals(iface); err == nil {
+	if _, _, err := queryVnstatTrafficTotals([]string{iface}); err == nil {
 		return nil
 	}
 
@@ -4336,7 +4482,7 @@ func ensureVnstatTracking(iface string) error {
 		logger.Warning("vnstat daemon restart after interface update failed:", err)
 	}
 
-	_, _, err := queryVnstatTrafficTotals(iface)
+	_, _, err := queryVnstatTrafficTotals([]string{iface})
 	return err
 }
 
@@ -6126,7 +6272,7 @@ func hasFlag(flags []string, target string) bool {
 	return false
 }
 
-func parseVnstatTrafficTotals(output string) (int64, int64, error) {
+func parseVnstatMultiInterfaceTrafficTotals(output string, ifaces []string) (int64, int64, error) {
 	type vnstatTotals struct {
 		RX json.Number `json:"rx"`
 		TX json.Number `json:"tx"`
@@ -6136,6 +6282,7 @@ func parseVnstatTrafficTotals(output string) (int64, int64, error) {
 		Alltime vnstatTotals `json:"alltime"`
 	}
 	type vnstatInterface struct {
+		Name    string        `json:"name"`
 		Traffic vnstatTraffic `json:"traffic"`
 	}
 	var payload struct {
@@ -6150,15 +6297,51 @@ func parseVnstatTrafficTotals(output string) (int64, int64, error) {
 	if len(payload.Interfaces) == 0 {
 		return 0, 0, errors.New("vnstat json does not contain interfaces")
 	}
-	for _, totals := range []vnstatTotals{payload.Interfaces[0].Traffic.Total, payload.Interfaces[0].Traffic.Alltime} {
-		rx, rxOK := parseVnstatJSONNumber(totals.RX)
-		tx, txOK := parseVnstatJSONNumber(totals.TX)
-		if rxOK && txOK {
-			return tx, rx, nil
+
+	targetMap := make(map[string]bool, len(ifaces))
+	for _, iface := range ifaces {
+		if strings.TrimSpace(iface) != "" {
+			targetMap[strings.TrimSpace(iface)] = true
 		}
 	}
 
-	return 0, 0, errors.New("vnstat json traffic total is missing")
+	var totalTX, totalRX int64
+	matched := 0
+
+	for _, item := range payload.Interfaces {
+		if len(targetMap) > 0 && !targetMap[item.Name] {
+			continue
+		}
+		for _, totals := range []vnstatTotals{item.Traffic.Total, item.Traffic.Alltime} {
+			rx, rxOK := parseVnstatJSONNumber(totals.RX)
+			tx, txOK := parseVnstatJSONNumber(totals.TX)
+			if rxOK && txOK {
+				totalRX += rx
+				totalTX += tx
+				matched++
+				break
+			}
+		}
+	}
+
+	if matched == 0 {
+		if len(ifaces) <= 1 && len(payload.Interfaces) > 0 {
+			for _, totals := range []vnstatTotals{payload.Interfaces[0].Traffic.Total, payload.Interfaces[0].Traffic.Alltime} {
+				rx, rxOK := parseVnstatJSONNumber(totals.RX)
+				tx, txOK := parseVnstatJSONNumber(totals.TX)
+				if rxOK && txOK {
+					return tx, rx, nil
+				}
+			}
+		}
+		return 0, 0, errors.New("no matching interface traffic found in vnstat json")
+	}
+
+	return totalTX, totalRX, nil
+}
+
+func parseVnstatTrafficTotals(output string) (int64, int64, error) {
+	return parseVnstatMultiInterfaceTrafficTotals(output, nil)
 }
 
 func parseVnstatJSONNumber(value json.Number) (int64, bool) {

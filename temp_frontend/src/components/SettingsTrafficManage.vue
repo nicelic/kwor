@@ -76,25 +76,126 @@
       </v-card-title>
       <v-divider />
       <v-card-text class="pt-4">
-        <!-- 运行基础信息条 -->
-        <div class="d-flex align-center justify-space-between flex-wrap ga-2 mb-4 text-caption text-medium-emphasis">
-          <div class="d-flex align-center flex-wrap ga-2">
-            <span>网卡接口: <strong>{{ overview.interface || '-' }}</strong></span>
-            <span class="mx-1">|</span>
-            <span>统计数据源: <strong>{{ overview.source || 'vnstat' }}</strong></span>
-            <span class="mx-1">|</span>
-            <span>更新时间: <strong>{{ updatedAtLabel }}</strong></span>
+        <!-- 网卡接口与运行基础信息控制条 -->
+        <div class="traffic-interface-bar pa-3 mb-4 rounded-lg border">
+          <div class="d-flex align-center justify-space-between flex-wrap ga-2 mb-2">
+            <div class="d-flex align-center flex-wrap ga-2">
+              <v-icon size="small" color="cyan">mdi-ethernet</v-icon>
+              <span class="font-weight-medium text-body-2">统计网卡接口</span>
+              <v-btn-toggle
+                v-model="interfaceModeInput"
+                mandatory
+                density="compact"
+                variant="outlined"
+                color="cyan"
+                class="ml-sm-1"
+                :disabled="trafficOperationBusy || savingInterfaces"
+                @update:model-value="onInterfaceModeChanged"
+              >
+                <v-btn value="auto" size="x-small">
+                  自动推荐
+                </v-btn>
+                <v-btn value="custom" size="x-small">
+                  自定义多选
+                </v-btn>
+              </v-btn-toggle>
+            </div>
+            <div class="d-flex align-center flex-wrap ga-2 text-caption text-medium-emphasis">
+              <span>数据源: <strong>{{ overview.source || 'vnstat' }}</strong></span>
+              <span class="mx-1">|</span>
+              <span>更新时间: <strong>{{ updatedAtLabel }}</strong></span>
+              <v-btn
+                size="small"
+                variant="text"
+                prepend-icon="mdi-refresh"
+                :loading="loading"
+                :disabled="trafficOperationBusy"
+                @click="fetchOverview(false)"
+              >
+                立即刷新
+              </v-btn>
+            </div>
           </div>
-          <v-btn
-            size="small"
-            variant="text"
-            prepend-icon="mdi-refresh"
-            :loading="loading"
-            :disabled="trafficOperationBusy"
-            @click="fetchOverview(false)"
-          >
-            立即刷新
-          </v-btn>
+
+          <!-- 自动推荐模式：展示当前系统已选定的网卡徽章 -->
+          <div v-if="interfaceModeInput === 'auto'" class="d-flex align-center flex-wrap ga-2 pt-1">
+            <template v-if="overview.interfaces && overview.interfaces.length > 0">
+              <v-chip
+                v-for="iface in overview.interfaces"
+                :key="iface"
+                size="small"
+                variant="tonal"
+                color="cyan"
+                class="font-weight-medium"
+              >
+                <v-icon start size="x-small">mdi-check-circle-outline</v-icon>
+                {{ iface }}
+              </v-chip>
+              <span class="text-caption text-medium-emphasis ml-1">
+                (已自动聚合系统所有物理与模拟物理网卡)
+              </span>
+            </template>
+            <span v-else class="text-caption text-medium-emphasis">
+              {{ overview.interface || '正在检测网卡...' }}
+            </span>
+          </div>
+
+          <!-- 自定义模式：多选下拉框 + 保存按钮 -->
+          <div v-else class="pt-2">
+            <div class="d-flex align-center flex-wrap ga-2">
+              <v-select
+                v-model="selectedInterfacesInput"
+                :items="availableInterfaceOptions"
+                item-title="title"
+                item-value="value"
+                multiple
+                chips
+                closable-chips
+                density="compact"
+                variant="outlined"
+                hide-details
+                placeholder="请选择需要统计流量的网卡"
+                class="flex-grow-1"
+                :disabled="trafficOperationBusy || savingInterfaces"
+              >
+                <template #item="{ item, props: itemProps }">
+                  <v-list-item v-bind="itemProps" :subtitle="item.raw.displayName">
+                    <template #append>
+                      <v-chip
+                        size="x-small"
+                        :color="item.raw.categoryColor"
+                        variant="flat"
+                        class="ml-2"
+                      >
+                        {{ item.raw.categoryLabel }}
+                      </v-chip>
+                      <v-chip
+                        v-if="item.raw.isDefaultRoute"
+                        size="x-small"
+                        color="primary"
+                        variant="outlined"
+                        class="ml-1"
+                      >
+                        默认出口
+                      </v-chip>
+                    </template>
+                  </v-list-item>
+                </template>
+              </v-select>
+
+              <v-btn
+                color="cyan"
+                variant="flat"
+                size="small"
+                prepend-icon="mdi-content-save"
+                :loading="savingInterfaces"
+                :disabled="trafficOperationBusy || !hasPendingInterfaceChanges"
+                @click="saveTrafficInterfaces"
+              >
+                保存网卡选择
+              </v-btn>
+            </div>
+          </div>
         </div>
 
         <!-- 3 大核心指标卡 (PC 端 3 列，移动端单列) -->
@@ -489,6 +590,7 @@ import {
   INSTALL_VNSTAT_CONFIRM_TEXT,
   MONTHLY_HINT,
   NEXT_RESET_LABEL,
+  NetworkInterfaceInfo,
   REMOVE_VNSTAT_CONFIRM_TEXT,
   RESET_DAY_LABEL,
   RESET_PERIOD_CONFIRM_TEXT,
@@ -505,6 +607,8 @@ import {
   createDefaultOverview,
   createIdleVnstatUpdateInfo,
   formatGB,
+  getInterfaceCategoryColor,
+  getInterfaceCategoryLabel,
   getNextResetAt,
   normalizeExpiryDateInput,
   normalizeLimitGiB,
@@ -517,6 +621,7 @@ import {
   parseEpochSeconds,
   readBoolField,
   readNumberField,
+  readStringArrayField,
   readStringField,
 } from './SettingsTrafficManage.shared'
 
@@ -588,6 +693,11 @@ const expiryPickerEpoch = ref(0)
 const savedLimitGiB = ref(0)
 const savedResetDay = ref(0)
 const savedExpiryDate = ref('')
+const interfaceModeInput = ref<'auto' | 'custom'>('auto')
+const selectedInterfacesInput = ref<string[]>([])
+const savedInterfaceMode = ref<'auto' | 'custom'>('auto')
+const savedInterfaces = ref<string[]>([])
+const savingInterfaces = ref(false)
 let pollingTimer: number | null = null
 let vnstatInstallPollingTimer: number | null = null
 let vnstatRemovalPollingTimer: number | null = null
@@ -596,6 +706,31 @@ let overviewRequestGeneration = 0
 let vnstatVersionOptionsGeneration = 0
 
 // 计算属性
+const hasPendingInterfaceChanges = computed(() => {
+  if (interfaceModeInput.value !== savedInterfaceMode.value) return true
+  if (interfaceModeInput.value === 'custom') {
+    if (selectedInterfacesInput.value.length !== savedInterfaces.value.length) return true
+    const setA = new Set(selectedInterfacesInput.value)
+    for (const item of savedInterfaces.value) {
+      if (!setA.has(item)) return true
+    }
+  }
+  return false
+})
+
+const availableInterfaceOptions = computed(() => {
+  return (overview.value.availableInterfaces || []).map(item => ({
+    title: item.name,
+    value: item.name,
+    category: item.category,
+    categoryLabel: getInterfaceCategoryLabel(item.category),
+    categoryColor: getInterfaceCategoryColor(item.category),
+    displayName: item.displayName || item.name,
+    isDefaultRoute: item.isDefaultRoute,
+    isUp: item.isUp,
+    driver: item.driver,
+  }))
+})
 const limitBytes = computed(() => (
   limitGiBInput.value > 0 ? limitGiBInput.value * 1024 * 1024 * 1024 : 0
 ))
@@ -844,9 +979,16 @@ const applyOverview = (raw: Partial<TrafficOverview>, options: ApplyOverviewOpti
   const shouldSyncDraft = options.forceSyncDraft || !hasPendingSettingsChanges.value
   const vnstat = normalizeVnstatStatus(input.vnstat)
 
+  const rawInterfaces = readStringArrayField(input, ['interfaces'], [])
+  const rawAvailable = (Array.isArray(input.availableInterfaces) ? input.availableInterfaces : (Array.isArray(input.available_interfaces) ? input.available_interfaces : [])) as NetworkInterfaceInfo[]
+  const rawMode = (readStringField(input, ['interfaceMode', 'interface_mode'], 'auto').trim() || 'auto') as 'auto' | 'custom'
+
   overview.value = {
     source: readStringField(input, ['source'], 'vnstat'),
     interface: readStringField(input, ['interface'], ''),
+    interfaces: rawInterfaces,
+    availableInterfaces: rawAvailable,
+    interfaceMode: rawMode,
     enabled: readBoolField(input, ['enabled'], true),
     status: readStringField(input, ['status'], ''),
     available: readBoolField(input, ['available'], false),
@@ -873,8 +1015,16 @@ const applyOverview = (raw: Partial<TrafficOverview>, options: ApplyOverviewOpti
   savedExpiryDate.value = normalizedExpiryDate
   enabledInput.value = overview.value.enabled
 
+  savedInterfaceMode.value = rawMode
+  savedInterfaces.value = [...rawInterfaces]
+
   if (shouldSyncDraft) {
     syncDraftFromSavedSettings()
+  }
+
+  if (shouldSyncDraft || !hasPendingInterfaceChanges.value) {
+    interfaceModeInput.value = rawMode
+    selectedInterfacesInput.value = [...rawInterfaces]
   }
 
   if (selectedVnstatVersion.value === '') {
@@ -886,6 +1036,35 @@ const applyOverview = (raw: Partial<TrafficOverview>, options: ApplyOverviewOpti
   }
 
   schedulePolling(30000)
+}
+
+const saveTrafficInterfaces = async () => {
+  if (savingInterfaces.value || trafficOperationBusy.value) return
+  savingInterfaces.value = true
+  try {
+    const payload = {
+      interfaces: selectedInterfacesInput.value,
+      interface_mode: interfaceModeInput.value,
+    }
+    const msg = await HttpUtils.post('api/traffic-overview-interfaces', payload, {
+      headers: { 'Content-Type': 'application/json' },
+    })
+    if (msg.success && msg.obj) {
+      applyOverview(msg.obj as Partial<TrafficOverview>, { forceSyncDraft: true })
+      push.success('网卡统计配置已更新')
+    } else {
+      push.error(`保存网卡配置失败：${msg.msg || '未知错误'}`)
+    }
+  } finally {
+    savingInterfaces.value = false
+  }
+}
+
+const onInterfaceModeChanged = async (mode: 'auto' | 'custom') => {
+  interfaceModeInput.value = mode
+  if (mode === 'auto') {
+    await saveTrafficInterfaces()
+  }
 }
 
 const isTrafficPageActiveAndVisible = () => (

@@ -167,7 +167,8 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	engine := gin.Default()
+	engine := gin.New()
+	engine.Use(gin.Recovery())
 
 	// Load the HTML template
 	t := template.New("").Funcs(engine.FuncMap)
@@ -196,7 +197,16 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 		return nil, err
 	}
 
-	engine.Use(gzip.Gzip(gzip.BestSpeed, gzip.WithExcludedExtensions([]string{".woff2", ".woff", ".ttf", ".png", ".jpg", ".jpeg", ".ico", ".svg", ".gz"})))
+	// Gzip 仅对静态前端与页面生效，彻底排除高频小 JSON API，消除多余内存分配与 CPU 消耗
+	gzipHandler := gzip.Gzip(gzip.BestSpeed, gzip.WithExcludedExtensions([]string{".woff2", ".woff", ".ttf", ".png", ".jpg", ".jpeg", ".ico", ".svg", ".gz"}))
+	engine.Use(func(c *gin.Context) {
+		path := c.Request.URL.Path
+		if strings.Contains(path, "/api/") || strings.Contains(path, "/apiv2/") {
+			c.Next()
+			return
+		}
+		gzipHandler(c)
+	})
 	assetsBasePath := base_url + "assets/"
 
 	store := newSessionCookieStore(secret)
@@ -371,6 +381,7 @@ func (s *Server) Start() (err error) {
 		TLSConfig:         serverTLSConfig,
 		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 		// Kernel catalog APIs may wait up to 45 seconds for the bounded
 		// SourceForge request; long mutations use background task status APIs.
 		WriteTimeout:   60 * time.Second,

@@ -191,6 +191,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.SaveSettingsLanguage(c)
 	case "traffic-overview-settings":
 		a.ApiService.SaveTrafficOverviewSettings(c)
+	case "traffic-overview-interfaces":
+		a.ApiService.SaveTrafficOverviewInterfaces(c)
 	case "traffic-overview-switch":
 		a.ApiService.SaveTrafficOverviewSwitch(c)
 	case "traffic-overview-period-reset":

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"sort"
 	"strings"
 	"sync"
@@ -38,6 +39,7 @@ type dashboardRuntimeCacheState struct {
 type dashboardRuntimeCacheEntry struct {
 	expiresAt time.Time
 	value     map[string]interface{}
+	rawJSON   []byte
 }
 
 var dashboardRuntimeCache = dashboardRuntimeCacheState{
@@ -45,11 +47,9 @@ var dashboardRuntimeCache = dashboardRuntimeCacheState{
 	inflight: make(map[string]chan struct{}),
 }
 
-// GetDashboardRuntime returns the compact data used by the home page.  It is
-// intentionally separate from the full core-status endpoints: opening a core
-// dialog may inspect binaries and download preferences, while the dashboard
-// only needs a cached runtime view.
-func (s *ServerService) GetDashboardRuntime(request string) map[string]interface{} {
+// GetDashboardRuntimeRaw returns the pre-encoded raw JSON bytes when available,
+// completely eliminating map cloning and re-serialization allocations on cache hits.
+func (s *ServerService) GetDashboardRuntimeRaw(request string) ([]byte, map[string]interface{}) {
 	started := time.Now()
 	defer func() {
 		RecordRuntimePerformance(RuntimePerformanceSample{
@@ -62,10 +62,10 @@ func (s *ServerService) GetDashboardRuntime(request string) map[string]interface
 	for {
 		now := time.Now()
 		dashboardRuntimeCache.Lock()
-		if cached, ok := dashboardRuntimeCache.entries[request]; ok && now.Before(cached.expiresAt) && cached.value != nil {
-			value := cloneDashboardRuntimeMap(cached.value)
+		if cached, ok := dashboardRuntimeCache.entries[request]; ok && now.Before(cached.expiresAt) && len(cached.rawJSON) > 0 {
+			raw := cached.rawJSON
 			dashboardRuntimeCache.Unlock()
-			return value
+			return raw, nil
 		}
 		if done := dashboardRuntimeCache.inflight[request]; done != nil {
 			dashboardRuntimeCache.Unlock()
@@ -78,19 +78,40 @@ func (s *ServerService) GetDashboardRuntime(request string) map[string]interface
 		dashboardRuntimeCache.Unlock()
 
 		value := s.collectDashboardRuntime(request)
+		raw, _ := json.Marshal(map[string]interface{}{
+			"success": true,
+			"msg":     "",
+			"obj":     value,
+		})
 
 		dashboardRuntimeCache.Lock()
 		delete(dashboardRuntimeCache.inflight, request)
 		if dashboardRuntimeCache.generation == generation {
 			dashboardRuntimeCache.entries[request] = dashboardRuntimeCacheEntry{
 				expiresAt: time.Now().Add(dashboardRuntimeCacheTTL),
-				value:     cloneDashboardRuntimeMap(value),
+				value:     value,
+				rawJSON:   raw,
 			}
 		}
 		close(done)
 		dashboardRuntimeCache.Unlock()
-		return value
+		return raw, value
 	}
+}
+
+// GetDashboardRuntime returns the compact data used by the home page.
+func (s *ServerService) GetDashboardRuntime(request string) map[string]interface{} {
+	_, value := s.GetDashboardRuntimeRaw(request)
+	if value != nil {
+		return cloneDashboardRuntimeMap(value)
+	}
+	request = normalizeDashboardRuntimeRequest(request)
+	dashboardRuntimeCache.Lock()
+	defer dashboardRuntimeCache.Unlock()
+	if cached, ok := dashboardRuntimeCache.entries[request]; ok && cached.value != nil {
+		return cloneDashboardRuntimeMap(cached.value)
+	}
+	return s.collectDashboardRuntime(request)
 }
 
 func InvalidateDashboardRuntimeCache() {

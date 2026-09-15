@@ -10,9 +10,27 @@ import {
   panelNow,
 } from '@/plugins/panelTime'
 
+export type NetworkInterfaceInfo = {
+  id: number
+  name: string
+  displayName: string
+  category: 'physical' | 'simulated' | 'virtual' | 'loopback' | string
+  driver: string
+  macAddress: string
+  ipAddresses: string
+  isUp: boolean
+  isDefaultRoute: boolean
+  speedMbps: number
+  mtu: number
+  virtualization: string
+}
+
 export type TrafficOverview = {
   source: string
   interface: string
+  interfaces: string[]
+  availableInterfaces: NetworkInterfaceInfo[]
+  interfaceMode: 'auto' | 'custom' | string
   enabled: boolean
   status: string
   available: boolean
@@ -446,6 +464,9 @@ export const formatDynamicBytes = (bytes: number): string => {
 export const createDefaultOverview = (): TrafficOverview => ({
   source: 'vnstat',
   interface: '',
+  interfaces: [],
+  availableInterfaces: [],
+  interfaceMode: 'auto',
   enabled: true,
   status: 'stopped',
   available: false,
@@ -483,6 +504,36 @@ export const createDefaultOverview = (): TrafficOverview => ({
     manageHint: '',
   },
 })
+
+export const getInterfaceCategoryLabel = (category: string): string => {
+  switch (category) {
+    case 'physical':
+      return '物理网卡'
+    case 'simulated':
+      return '模拟/主网卡'
+    case 'virtual':
+      return '虚拟/代理'
+    case 'loopback':
+      return '回环设备'
+    default:
+      return '网卡'
+  }
+}
+
+export const getInterfaceCategoryColor = (category: string): string => {
+  switch (category) {
+    case 'physical':
+      return 'success'
+    case 'simulated':
+      return 'cyan'
+    case 'virtual':
+      return 'secondary'
+    case 'loopback':
+      return 'grey'
+    default:
+      return 'info'
+  }
+}
 
 export const createIdleVnstatUpdateInfo = (status?: VnstatStatus): VnstatUpdateInfo => ({
   supported: status?.supported ?? false,
