@@ -8,12 +8,13 @@ import (
 	"github.com/alireza0/s-ui/database"
 )
 
-func TestManagedMTUScriptUsesStoredInterfaceAndSysfsFallback(t *testing.T) {
-	script := buildManagedMTUScriptContent(1420, "eth0")
+func TestManagedMTUScriptUsesStoredInterfacesAndSysfsFallback(t *testing.T) {
+	script := buildManagedMTUScriptContent(1420, []string{"eth0", "eth1"})
 	for _, expected := range []string{
-		`PREFERRED_IFACE="eth0"`,
+		`TARGET_IFACES="eth0 eth1"`,
+		`for iface in $TARGET_IFACES; do`,
 		`/sys/class/net/*`,
-		`[ -w "/sys/class/net/$IFACE/mtu" ]`,
+		`[ -w "/sys/class/net/$target/mtu" ]`,
 		`printf '%s\n' "$MTU_VALUE"`,
 	} {
 		if !strings.Contains(script, expected) {
@@ -59,8 +60,13 @@ func TestSaveAndLoadMTUPersistedState(t *testing.T) {
 		Enabled:     true,
 		MTU:         1420,
 		OriginalMTU: 1500,
-		Interface:   "eth0",
-		ScriptPath:  "/var/lib/kwor/_set_mtu_.sh",
+		OriginalMTUs: map[string]int{
+			"eth0": 1500,
+			"eth1": 1500,
+		},
+		Interface:  "eth0, eth1",
+		Interfaces: []string{"eth0", "eth1"},
+		ScriptPath: "/var/lib/kwor/_set_mtu_.sh",
 	}
 	if err := svc.saveMTUPersistedState(want); err != nil {
 		t.Fatalf("save MTU state failed: %v", err)
@@ -69,7 +75,13 @@ func TestSaveAndLoadMTUPersistedState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load MTU state failed: %v", err)
 	}
-	if got != want {
-		t.Fatalf("MTU state mismatch: got=%#v want=%#v", got, want)
+	if got.Enabled != want.Enabled || got.MTU != want.MTU || got.OriginalMTU != want.OriginalMTU || got.ScriptPath != want.ScriptPath {
+		t.Fatalf("MTU state basic fields mismatch: got=%#v want=%#v", got, want)
+	}
+	if len(got.Interfaces) != len(want.Interfaces) || got.Interfaces[0] != "eth0" || got.Interfaces[1] != "eth1" {
+		t.Fatalf("MTU state interfaces mismatch: got=%#v want=%#v", got.Interfaces, want.Interfaces)
+	}
+	if got.OriginalMTUs["eth0"] != 1500 || got.OriginalMTUs["eth1"] != 1500 {
+		t.Fatalf("MTU state original MTUs mismatch: got=%#v want=%#v", got.OriginalMTUs, want.OriginalMTUs)
 	}
 }

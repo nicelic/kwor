@@ -1062,7 +1062,7 @@ const saveTrafficInterfaces = async () => {
 
 const onInterfaceModeChanged = async (mode: 'auto' | 'custom') => {
   interfaceModeInput.value = mode
-  if (mode === 'auto') {
+  if (mode === 'auto' && savedInterfaceMode.value !== 'auto') {
     await saveTrafficInterfaces()
   }
 }

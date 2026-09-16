@@ -98,8 +98,7 @@ func GetSystemTimeZoneStatus() SystemTimeZoneStatus {
 }
 
 // SetSystemTimeLocation changes only the Linux timezone configuration. It
-// never adjusts the Linux clock. The caller must have completed remote time
-// source validation before invoking this method.
+// never adjusts the Linux clock.
 func SetSystemTimeLocation(value string) error {
 	return setSystemTimeLocation(value, true)
 }
@@ -119,6 +118,9 @@ func setSystemTimeLocation(value string, requireSelectable bool) error {
 
 	name, err := NormalizePanelTimeLocation(value)
 	if err != nil {
+		return err
+	}
+	if err := ValidatePanelTimeZoneLocal(name); err != nil {
 		return err
 	}
 	if requireSelectable && !IsSelectableTimeLocation(name) {

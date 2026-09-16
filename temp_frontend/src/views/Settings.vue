@@ -1310,10 +1310,7 @@ const save = async () => {
 	}
 	if (subJsonDraftDirty.value) changes.subJsonExt = subJsonDraftValue.value
 	if (subClashDraftDirty.value) changes.subClashExt = subClashDraftValue.value
-	const requestedSystemTimeLocation = systemTimeLocation.value !== oldSystemTimeLocation.value
-	  ? systemTimeLocation.value.trim()
-	  : ''
-	if (Object.keys(changes).length === 0 && requestedSystemTimeLocation === '') return
+	if (Object.keys(changes).length === 0) return
 	const clearingTrafficHistory = String(normalizedSettings.trafficAge ?? '').trim() === '0'
 	  && String(previousNormalizedSettings.trafficAge ?? '').trim() !== '0'
 	if (clearingTrafficHistory) {
@@ -1341,7 +1338,6 @@ const save = async () => {
 	const msg = await HttpUtils.post('api/settings-patch', {
 	  expectedRevision: settingsRevision.value,
 	  changes,
-	  systemTimeLocation: requestedSystemTimeLocation || undefined,
 	  confirmTrafficHistoryClear: clearingTrafficHistory || undefined,
 	}, {
 	  headers: { 'Content-Type': 'application/json' },
@@ -1608,7 +1604,6 @@ const stateChange = computed(() => {
   return !FindDiff.deepCompare(settings.value, oldSettings.value)
 	|| subJsonDraftDirty.value
 	|| subClashDraftDirty.value
-    || systemTimeLocation.value !== oldSystemTimeLocation.value
 })
 
 const showTopActionBar = computed(() => ['t1', 't2', 't3', 't4'].includes(tab.value))

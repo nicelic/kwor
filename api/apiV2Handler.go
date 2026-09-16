@@ -63,6 +63,8 @@ func (a *APIv2Handler) postHandler(c *gin.Context) {
 		a.ApiService.RetrySingboxRuntime(c, username)
 	case "settings-patch":
 		a.ApiService.SaveSettingsPatch(c, username)
+	case "system-timezone":
+		a.ApiService.SetSystemTimeZone(c)
 	case "singbox-route-save":
 		a.ApiService.SaveSingboxRoute(c, username)
 	case "singbox-dns-save":

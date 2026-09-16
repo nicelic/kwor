@@ -270,6 +270,53 @@ func TestSaveTrafficOverviewSwitchPersistsEnabled(t *testing.T) {
 	}
 }
 
+func TestSaveTrafficOverviewInterfacesPersistsModeAndList(t *testing.T) {
+	initTrafficOverviewAPITestDB(t)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	body := `{"interfaces":["eth0","eth1"],"interface_mode":"custom"}`
+	req := httptest.NewRequest("POST", "/api/traffic-overview-interfaces", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+
+	apiSvc := &ApiService{}
+	apiSvc.SaveTrafficOverviewInterfaces(ctx)
+
+	msg := decodeAPIMessage(t, rec.Body.String())
+	if !msg.Success {
+		t.Fatalf("expected success response, got error: %s", msg.Msg)
+	}
+
+	selected, mode := apiSvc.TrafficOverviewService.GetSelectedTrafficInterfaces()
+	if mode != "custom" {
+		t.Fatalf("interfaceMode=%q, want custom", mode)
+	}
+	if len(selected) != 2 || selected[0] != "eth0" || selected[1] != "eth1" {
+		t.Fatalf("selected interfaces=%v, want [eth0 eth1]", selected)
+	}
+
+	// Switch back to auto mode
+	recAuto := httptest.NewRecorder()
+	ctxAuto, _ := gin.CreateTestContext(recAuto)
+	bodyAuto := `{"interfaces":["eth0","eth1"],"interface_mode":"auto"}`
+	reqAuto := httptest.NewRequest("POST", "/api/traffic-overview-interfaces", strings.NewReader(bodyAuto))
+	reqAuto.Header.Set("Content-Type", "application/json")
+	ctxAuto.Request = reqAuto
+
+	apiSvc.SaveTrafficOverviewInterfaces(ctxAuto)
+
+	msgAuto := decodeAPIMessage(t, recAuto.Body.String())
+	if !msgAuto.Success {
+		t.Fatalf("expected success response on switching to auto, got error: %s", msgAuto.Msg)
+	}
+
+	_, modeAuto := apiSvc.TrafficOverviewService.GetSelectedTrafficInterfaces()
+	if modeAuto != "auto" {
+		t.Fatalf("interfaceMode=%q, want auto", modeAuto)
+	}
+}
+
 func TestGetTrafficOverviewVnstatVersionsReturnsBothSources(t *testing.T) {
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)

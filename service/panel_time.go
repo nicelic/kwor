@@ -1,23 +1,17 @@
 package service
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/alireza0/s-ui/database"
-	"github.com/alireza0/s-ui/logger"
 )
 
 const (
-	panelTimeLocationCacheTTL        = 30 * time.Second
-	panelTimeRemoteValidationTimeout = 5 * time.Second
+	panelTimeLocationCacheTTL = 30 * time.Second
 )
 
 // PanelTimeContext is the small, explicit contract used by the browser.  Unix
@@ -41,15 +35,12 @@ var cachedPanelTimeLocation panelTimeLocationCache
 // Database recovery can be reached by several requests at the same time after
 // a manual database repair/reset. Settings has no uniqueness constraint on its
 // key column, so serialize this rare initialization path to avoid duplicate
-// timeLocation rows and duplicate remote validation requests.
+// timeLocation rows.
 var panelTimeInitializationMu sync.Mutex
 
 var (
 	panelTimeNow                    = time.Now
-	panelTimeRemoteValidator        = validateTimeZoneWithRemoteSources
 	panelTimeSystemLocationDetector = detectSystemTimeLocationName
-	panelTimeHTTPClient             = http.DefaultClient
-	panelTimeRemoteURLBuilder       = timeZoneRemoteURLs
 )
 
 func init() {
@@ -125,10 +116,8 @@ func (s *SettingService) storedPanelTimeLocation() (string, bool, error) {
 }
 
 // EnsurePanelTimeLocation creates the database value only when it is absent
-// or invalid.  It first validates UTC against international HTTPS sources. If
-// all sources are blocked, the current Linux system zone is retained as the
-// fallback; UTC is the final safe fallback. Existing valid values are never
-// overwritten by a remote validation failure.
+// or invalid. It first checks the detected Linux host timezone. If unavailable,
+// UTC is the safe fallback.
 func (s *SettingService) EnsurePanelTimeLocation() (string, error) {
 	panelTimeInitializationMu.Lock()
 	defer panelTimeInitializationMu.Unlock()
@@ -142,9 +131,8 @@ func (s *SettingService) EnsurePanelTimeLocation() (string, error) {
 	}
 
 	selected := "UTC"
-	if err := ValidatePanelTimeZoneRemote(selected); err != nil {
-		logger.Warning("validate UTC while initializing panel timezone failed, fallback to system timezone: ", err)
-		if detected := normalizeTimeLocationName(panelTimeSystemLocationDetector()); detected != "" {
+	if detected := normalizeTimeLocationName(panelTimeSystemLocationDetector()); detected != "" {
+		if err := ValidatePanelTimeZoneLocal(detected); err == nil {
 			selected = detected
 		}
 	}
@@ -155,9 +143,8 @@ func (s *SettingService) EnsurePanelTimeLocation() (string, error) {
 	return selected, nil
 }
 
-// InitializePanelTimeOnStartup performs the only automatic remote validation.
-// It is called once for every process start. A valid saved setting remains the
-// source of truth even if every remote source is unavailable.
+// InitializePanelTimeOnStartup loads and verifies the saved panel timezone.
+// It is called once for every process start without remote network dependencies.
 func (s *SettingService) InitializePanelTimeOnStartup() error {
 	name, exists, err := s.storedPanelTimeLocation()
 	if err != nil {
@@ -175,10 +162,6 @@ func (s *SettingService) InitializePanelTimeOnStartup() error {
 		return err
 	}
 	cachePanelTimeLocation(name, location)
-
-	if err := ValidatePanelTimeZoneRemote(name); err != nil {
-		logger.Warningf("validate saved panel timezone %q on startup failed; keep database value: %v", name, err)
-	}
 	return nil
 }
 
@@ -259,163 +242,21 @@ func PanelNow() time.Time {
 	return panelTimeNow().In(location)
 }
 
-// ValidatePanelTimeZoneRemote validates a selected IANA zone before any user
-// initiated mutation. It never changes the host clock or produces a virtual
-// database clock.
-func ValidatePanelTimeZoneRemote(value string) error {
+// ValidatePanelTimeZoneLocal validates a selected IANA zone using local Go
+// time databases. It does not perform any remote HTTP requests.
+func ValidatePanelTimeZoneLocal(value string) error {
 	name, err := NormalizePanelTimeLocation(value)
 	if err != nil {
 		return err
 	}
-	return panelTimeRemoteValidator(name)
-}
-
-type remoteTimeValidationError struct {
-	failures []string
-}
-
-func (e *remoteTimeValidationError) Error() string {
-	if e == nil || len(e.failures) == 0 {
-		return "国际时间源校验失败"
-	}
-	return "国际时间源校验失败：" + strings.Join(e.failures, "；")
-}
-
-type remoteTimeSourceResult struct {
-	url string
-	err error
-}
-
-func timeZoneRemoteURLs(name string) []string {
-	queryName := url.QueryEscape(name)
-	// WorldTimeAPI models an IANA name as nested path segments. Preserve its
-	// slash separator while escaping every other path character.
-	pathName := strings.ReplaceAll(url.PathEscape(name), "%2F", "/")
-	return []string{
-		"https://timeapi.io/api/Time/current/zone?timeZone=" + queryName,
-		"https://worldtimeapi.org/api/timezone/" + pathName,
-	}
-}
-
-func validateTimeZoneWithRemoteSources(name string) error {
-	urls := panelTimeRemoteURLBuilder(name)
-	ctx, cancel := context.WithTimeout(context.Background(), panelTimeRemoteValidationTimeout)
-	defer cancel()
-
-	resultCh := make(chan remoteTimeSourceResult, len(urls))
-	for _, sourceURL := range urls {
-		sourceURL := sourceURL
-		go func() {
-			resultCh <- remoteTimeSourceResult{
-				url: sourceURL,
-				err: validateSingleRemoteTimeSource(ctx, sourceURL, name),
-			}
-		}()
-	}
-
-	failures := make([]string, 0, len(urls))
-	for range urls {
-		result := <-resultCh
-		if result.err == nil {
-			return nil
-		}
-		failures = append(failures, result.url+"（"+result.err.Error()+"）")
-	}
-	return &remoteTimeValidationError{failures: failures}
-}
-
-func validateSingleRemoteTimeSource(ctx context.Context, sourceURL string, expectedZone string) error {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Accept", "application/json")
-	// 校验仅发生在启动/用户保存时；关闭本次连接，避免为这类低频请求
-	// 保留空闲 HTTP 连接或后台资源。
-	request.Close = true
-	response, err := panelTimeHTTPClient.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		io.Copy(io.Discard, io.LimitReader(response.Body, 1024))
-		return fmt.Errorf("HTTP %d", response.StatusCode)
-	}
-
-	var payload map[string]json.RawMessage
-	decoder := json.NewDecoder(io.LimitReader(response.Body, 64*1024))
-	if err := decoder.Decode(&payload); err != nil {
-		return fmt.Errorf("响应不是有效 JSON：%w", err)
-	}
-
-	remoteZone := readRemoteString(payload, "timeZone", "timezone")
-	normalizedRemoteZone := normalizeTimeLocationName(remoteZone)
-	if normalizedRemoteZone == "" || normalizedRemoteZone != expectedZone {
-		return fmt.Errorf("返回时区 %q 与请求时区 %q 不一致", remoteZone, expectedZone)
-	}
-	if !remotePayloadContainsUsableTime(payload) {
-		return fmt.Errorf("响应未包含可用时间")
+	if _, err := time.LoadLocation(name); err != nil {
+		return fmt.Errorf("系统无法加载 IANA 时区 %q: %w", name, err)
 	}
 	return nil
 }
 
-func readRemoteString(payload map[string]json.RawMessage, keys ...string) string {
-	for _, key := range keys {
-		raw, ok := payload[key]
-		if !ok {
-			continue
-		}
-		var value string
-		if json.Unmarshal(raw, &value) == nil {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
-}
-
-func remotePayloadContainsUsableTime(payload map[string]json.RawMessage) bool {
-	for _, key := range []string{"unixtime", "unixTime", "currentFileTime"} {
-		if raw, ok := payload[key]; ok {
-			var value float64
-			if json.Unmarshal(raw, &value) == nil && value > 0 {
-				return true
-			}
-		}
-	}
-	for _, key := range []string{"datetime", "dateTime"} {
-		value := readRemoteString(payload, key)
-		if value == "" {
-			continue
-		}
-		if _, err := time.Parse(time.RFC3339Nano, value); err == nil {
-			return true
-		}
-		if _, err := time.Parse("2006-01-02T15:04:05", value); err == nil {
-			return true
-		}
-	}
-
-	var year, month, day int
-	if !readRemoteInt(payload, "year", &year) || !readRemoteInt(payload, "month", &month) || !readRemoteInt(payload, "day", &day) {
-		return false
-	}
-	if year < 1970 || month < 1 || month > 12 || day < 1 || day > 31 {
-		return false
-	}
-	validated := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
-	return validated.Year() == year && int(validated.Month()) == month && validated.Day() == day
-}
-
-func readRemoteInt(payload map[string]json.RawMessage, key string, target *int) bool {
-	raw, ok := payload[key]
-	if !ok {
-		return false
-	}
-	var number float64
-	if err := json.Unmarshal(raw, &number); err != nil {
-		return false
-	}
-	*target = int(number)
-	return true
+// ValidatePanelTimeZoneRemote is preserved for backwards compatibility and
+// directly executes local validation without remote network calls.
+func ValidatePanelTimeZoneRemote(value string) error {
+	return ValidatePanelTimeZoneLocal(value)
 }

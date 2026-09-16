@@ -1,5 +1,6 @@
 <template>
   <section class="opt-page">
+    <!-- 全局加载失败提示 -->
     <v-alert
       v-if="pageLoadError"
       type="error"
@@ -8,236 +9,315 @@
       class="mb-4">
       <div class="d-flex align-center justify-space-between flex-wrap ga-3">
         <span>{{ pageLoadError }}</span>
-        <v-btn variant="text" prepend-icon="mdi-refresh" :loading="pageLoading" @click="refreshAll">
+        <v-btn variant="outlined" prepend-icon="mdi-refresh" :loading="pageLoading" @click="refreshAll">
           重新加载
         </v-btn>
       </div>
     </v-alert>
-    <v-alert
-      v-else-if="!pageReady"
-      type="info"
-      variant="tonal"
-      density="comfortable"
-      class="mb-4">
-      <div class="d-flex align-center ga-2">
-        <v-progress-circular indeterminate size="18" width="2" />
-        <span>正在读取系统优化概览</span>
-      </div>
-    </v-alert>
-    <v-row class="mt-1">
-      <v-col cols="12" md="4">
-        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-cyan">
-          <v-card-title class="text-subtitle-1 font-weight-medium">禁用系统日志</v-card-title>
-          <v-divider />
-          <v-card-text>
-            <div class="text-body-2 text-medium-emphasis mb-3">
-              从关闭切换到开启时会先检查并尝试解除 immutable(+i)，再删除旧文件、重建写入，最后重新加锁并重启 journald；关闭时仅解除锁定，不清空配置内容。
-            </div>
-            <v-switch
-              :model-value="logOverview.enabled"
-              :loading="switchingLog"
-              :disabled="overviewInteractionDisabled || !logLoaded || loadingLog || switchingLog || !logOverview.supported"
-              color="success"
-              inset
-              hide-details
-              label="禁用 systemd journal 持久日志"
-              @update:modelValue="onToggleLogSwitch" />
-            <div class="text-caption text-medium-emphasis mt-2">
-              当前状态：{{ logOverview.enabled ? '已开启' : '已关闭' }}
-            </div>
-          </v-card-text>
-        </v-card>
-      </v-col>
 
-      <v-col cols="12" md="4">
-        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-cyan">
-          <v-card-title class="text-subtitle-1 font-weight-medium">编辑</v-card-title>
-          <v-divider />
-          <v-card-text>
-            <div class="text-body-2 text-medium-emphasis mb-3">
-              可编辑 journald 参数内容。每次点保存都会执行完整重建流程（即使内容未修改）：检查/解除锁定、删旧、重建、写入、加锁并重启 journald。
+    <!-- 顶部状态与概览 Hero 卡片 -->
+    <v-card class="opt-hero mb-4" rounded="xl" :loading="pageLoading && !pageReady">
+      <div class="opt-hero__bg"></div>
+      <v-card-text class="opt-hero__content">
+        <div class="opt-hero__top">
+          <div class="d-flex align-center ga-3">
+            <div class="opt-hero__icon">
+              <v-icon size="30">mdi-tune-vertical</v-icon>
             </div>
+            <div>
+              <div class="text-overline opt-hero__eyebrow">SYSTEM OPTIMIZATION</div>
+              <div class="text-h5 font-weight-bold">系统环境与性能优化</div>
+              <div class="text-body-2 text-medium-emphasis mt-1">
+                接管与调优主机 Linux 持久化日志、内核 TCP 网络参数、系统 DNS 解析及物理网卡 MTU。
+              </div>
+            </div>
+          </div>
+          <div class="opt-hero__toolbar">
             <v-btn
-              color="primary"
-              prepend-icon="mdi-file-document-edit-outline"
-              :disabled="overviewInteractionDisabled || !logLoaded || loadingLog || !logOverview.supported"
-              @click="openLogEditor">
-              编辑
+              class="opt-hero-action"
+              variant="outlined"
+              prepend-icon="mdi-refresh"
+              :loading="pageLoading"
+              :disabled="overviewInteractionDisabled && !pageLoadError"
+              @click="refreshAll">
+              重新加载
             </v-btn>
-          </v-card-text>
-        </v-card>
-      </v-col>
-
-      <v-col cols="12" md="4">
-        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-cyan">
-          <v-card-title class="text-subtitle-1 font-weight-medium">日志运行信息</v-card-title>
-          <v-divider />
-          <v-card-text>
-            <div class="opt-meta__row">
-              <span>生效路径</span>
-              <strong>{{ logOverview.configPath || '-' }}</strong>
-            </div>
-            <div class="opt-meta__row">
-              <span>文件锁定</span>
-              <strong :class="logOverview.immutable ? 'text-success' : 'text-warning'">
-                {{ logOverview.immutable ? '已锁定(+i)' : '未锁定' }}
-              </strong>
-            </div>
-          </v-card-text>
-        </v-card>
-      </v-col>
-    </v-row>
-
-    <v-alert
-      v-if="logOverview.error"
-      type="warning"
-      variant="tonal"
-      density="comfortable"
-      class="mb-4">
-      {{ logOverview.error }}
-    </v-alert>
-
-    <v-row class="mt-4">
-      <v-col cols="12" md="4">
-        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-blue">
-          <v-card-title class="text-subtitle-1 font-weight-medium">sysctl 参数优化</v-card-title>
-          <v-divider />
-          <v-card-text>
-            <div class="text-body-2 text-medium-emphasis mb-3">
-              开启后会同时接管并重建 /etc/sysctl.d/99-s-ui-optimize.conf 与 /etc/sysctl.conf，加锁后按系统可用命令立即生效；关闭时仅解除两处 immutable(+i)，不清空内容。
-            </div>
-            <v-switch
-              :model-value="sysctlOverview.enabled"
-              :loading="switchingSysctl"
-              :disabled="overviewInteractionDisabled || !sysctlLoaded || loadingSysctl || switchingSysctl || !sysctlOverview.supported"
-              color="success"
-              inset
-              hide-details
-              label="启用 sysctl 优化参数"
-              @update:modelValue="onToggleSysctlSwitch" />
-            <div class="text-caption text-medium-emphasis mt-2">
-              当前状态：{{ sysctlOverview.enabled ? '已开启' : '已关闭' }}
-            </div>
-          </v-card-text>
-        </v-card>
-      </v-col>
-
-      <v-col cols="12" md="4">
-        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-blue">
-          <v-card-title class="text-subtitle-1 font-weight-medium">编辑</v-card-title>
-          <v-divider />
-          <v-card-text>
-            <div class="text-body-2 text-medium-emphasis mb-3">
-              可编辑 sysctl 参数内容。每次点保存都会对两处文件执行完整重建流程（即使内容未修改）：检查/解除锁定、删旧、重建、写入、加锁并应用参数。
-            </div>
-            <v-btn
-              color="primary"
-              prepend-icon="mdi-tune-variant"
-              :disabled="overviewInteractionDisabled || !sysctlLoaded || loadingSysctl || !sysctlOverview.supported"
-              @click="openSysctlEditor">
-              编辑
-            </v-btn>
-          </v-card-text>
-        </v-card>
-      </v-col>
-
-      <v-col cols="12" md="4">
-        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-blue">
-          <v-card-title class="text-subtitle-1 font-weight-medium">sysctl 运行信息</v-card-title>
-          <v-divider />
-          <v-card-text>
-            <div class="opt-meta__row">
-              <span>生效路径</span>
-              <strong>{{ sysctlOverview.configPath || '-' }}</strong>
-            </div>
-            <div class="opt-meta__row">
-              <span>文件锁定</span>
-              <strong :class="sysctlOverview.immutable ? 'text-success' : 'text-warning'">
-                {{ sysctlOverview.immutable ? '已锁定(+i)' : '未锁定' }}
-              </strong>
-            </div>
-          </v-card-text>
-        </v-card>
-      </v-col>
-
-    </v-row>
-
-    <v-alert
-      v-if="sysctlOverview.error"
-      type="warning"
-      variant="tonal"
-      density="comfortable"
-      class="mb-4">
-      {{ sysctlOverview.error }}
-    </v-alert>
-
-    <v-alert
-      v-if="dnsOverview.error"
-      type="warning"
-      variant="tonal"
-      density="comfortable"
-      class="mb-4">
-      {{ dnsOverview.error }}
-    </v-alert>
-
-    <v-card rounded="xl" variant="outlined" class="opt-meta opt-group-cyan">
-      <v-card-title class="text-subtitle-1 font-weight-medium">DNS 运行信息</v-card-title>
-      <v-divider />
-      <v-card-text>
-        <div class="opt-meta__row">
-          <span>生效路径</span>
-          <strong>{{ dnsOverview.configPath || '-' }}</strong>
+          </div>
         </div>
-        <div class="opt-meta__row">
-          <span>文件锁定</span>
-          <strong :class="dnsOverview.immutable ? 'text-success' : 'text-warning'">
-            {{ dnsOverview.immutable ? '已锁定(+i)' : '未锁定' }}
-          </strong>
+
+        <div class="opt-hero__chips mt-3 d-flex flex-wrap align-center ga-2">
+          <v-chip
+            size="small"
+            :color="pageReady ? 'success' : pageLoading ? 'info' : 'warning'"
+            variant="flat">
+            {{ pageReady ? '运行状态就绪' : pageLoading ? '正在同步概览...' : '加载异常' }}
+          </v-chip>
+          <v-chip
+            v-if="pageReady"
+            size="small"
+            :color="lockedFilesCount > 0 ? 'success' : 'warning'"
+            variant="flat"
+            class="opt-hero-chip--lock">
+            <v-icon start size="small">mdi-shield-lock-outline</v-icon>
+            受管文件加锁：{{ lockedFilesCount }} / 3
+          </v-chip>
+          <v-chip
+            v-if="pageReady && mtuOverview.enabled"
+            size="small"
+            color="primary"
+            variant="flat">
+            <v-icon start size="small">mdi-ethernet</v-icon>
+            MTU：{{ mtuOverview.currentMtu || 1470 }} (已接管)
+          </v-chip>
         </div>
       </v-card-text>
     </v-card>
 
-    <v-row class="mt-4">
-      <v-col cols="12" md="4">
-        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-cyan">
-          <v-card-title class="text-subtitle-1 font-weight-medium">编辑</v-card-title>
+    <!-- 四大核心功能卡片 2x2 网格 -->
+    <v-row class="opt-grid">
+      <!-- 模块 1：系统日志持久化 -->
+      <v-col cols="12" md="6">
+        <v-card rounded="xl" variant="outlined" class="opt-card card-cyan h-100 d-flex flex-column">
+          <v-card-title class="d-flex align-center justify-space-between flex-wrap ga-2 py-3 px-4">
+            <div class="text-subtitle-1 font-weight-bold d-flex align-center ga-2">
+              <v-icon size="20" color="info">mdi-text-box-remove-outline</v-icon>
+              <span>系统日志持久化</span>
+            </div>
+            <div class="d-flex align-center flex-wrap ga-2">
+              <v-chip
+                size="x-small"
+                :color="logOverview.immutable ? 'success' : 'warning'"
+                variant="tonal">
+                <v-icon start size="x-small">mdi-lock-outline</v-icon>
+                {{ logOverview.immutable ? '已加锁(+i)' : '未锁定' }}
+              </v-chip>
+              <v-switch
+                :model-value="logOverview.enabled"
+                :loading="switchingLog"
+                :disabled="overviewInteractionDisabled || !logLoaded || loadingLog || switchingLog || !logOverview.supported"
+                color="success"
+                density="compact"
+                inset
+                hide-details
+                label="禁用持久日志"
+                @update:modelValue="onToggleLogSwitch" />
+            </div>
+          </v-card-title>
           <v-divider />
-          <v-card-text>
+          <v-card-text class="flex-grow-1 pt-3 pb-3">
             <div class="text-body-2 text-medium-emphasis mb-3">
-              可编辑 Linux DNS（resolv.conf）内容。每次点保存都会执行完整重建流程（即使内容未修改）：检查/解除锁定、删旧、重建、写入、再锁定。
+              关闭 systemd-journald 持久化日志存储，减少固态硬盘（SSD）高频磨损并降低系统开销；关闭时仅解除加锁，保留配置。
             </div>
-            <div class="text-caption text-medium-emphasis mb-3">
-              当前系统 DNS：{{ dnsActiveNameServerText }}
+
+            <v-alert
+              v-if="logOverview.error"
+              type="warning"
+              variant="tonal"
+              density="compact"
+              class="mb-3">
+              {{ logOverview.error }}
+            </v-alert>
+
+            <div class="opt-meta-box">
+              <div class="opt-meta__row">
+                <span class="opt-meta__label">生效配置文件</span>
+                <strong class="opt-meta__value text-mono">{{ logOverview.configPath || '-' }}</strong>
+              </div>
+              <div class="opt-meta__row">
+                <span class="opt-meta__label">当前运行状态</span>
+                <span class="opt-meta__value">
+                  <v-badge
+                    dot
+                    inline
+                    :color="logOverview.enabled ? 'success' : 'grey'"
+                    class="mr-1" />
+                  {{ logOverview.enabled ? '已开启（持久日志已禁用）' : '已关闭（默认持久记录）' }}
+                </span>
+              </div>
             </div>
+          </v-card-text>
+          <v-divider />
+          <v-card-actions class="px-4 py-3 d-flex justify-space-between align-center flex-wrap ga-2">
+            <v-tooltip location="top" text="每次保存执行完整重建流程：解除锁定 -> 删旧重建 -> 写入校验 -> 重新加锁并重启 journald">
+              <template #activator="{ props: tipProps }">
+                <span v-bind="tipProps" class="text-caption text-medium-emphasis d-flex align-center ga-1 cursor-pointer">
+                  <v-icon size="small">mdi-information-outline</v-icon>
+                  支持底层 chattr +i 防篡改
+                </span>
+              </template>
+            </v-tooltip>
             <v-btn
               color="primary"
-              prepend-icon="mdi-dns"
-              :disabled="overviewInteractionDisabled || !dnsLoaded || loadingDns || !dnsOverview.supported"
-              @click="openDnsEditor">
-              编辑
+              variant="tonal"
+              size="small"
+              prepend-icon="mdi-file-document-edit-outline"
+              :disabled="overviewInteractionDisabled || !logLoaded || loadingLog || !logOverview.supported"
+              @click="openLogEditor">
+              编辑完整配置
             </v-btn>
-          </v-card-text>
+          </v-card-actions>
         </v-card>
       </v-col>
 
-      <v-col cols="12" md="8">
-        <v-card rounded="xl" variant="outlined" class="opt-card h-100 dns-quick-card opt-group-cyan">
-          <v-card-title class="text-subtitle-1 font-weight-medium">
-            DNS 快速编辑
+      <!-- 模块 2：Linux 内核参数优化 (sysctl) -->
+      <v-col cols="12" md="6">
+        <v-card rounded="xl" variant="outlined" class="opt-card card-blue h-100 d-flex flex-column">
+          <v-card-title class="d-flex align-center justify-space-between flex-wrap ga-2 py-3 px-4">
+            <div class="text-subtitle-1 font-weight-bold d-flex align-center ga-2">
+              <v-icon size="20" color="primary">mdi-tune-variant</v-icon>
+              <span>内核网络参数 (sysctl)</span>
+            </div>
+            <div class="d-flex align-center flex-wrap ga-2">
+              <v-chip
+                size="x-small"
+                :color="sysctlOverview.immutable ? 'success' : 'warning'"
+                variant="tonal">
+                <v-icon start size="x-small">mdi-lock-outline</v-icon>
+                {{ sysctlOverview.immutable ? '已加锁(+i)' : '未锁定' }}
+              </v-chip>
+              <v-switch
+                :model-value="sysctlOverview.enabled"
+                :loading="switchingSysctl"
+                :disabled="overviewInteractionDisabled || !sysctlLoaded || loadingSysctl || switchingSysctl || !sysctlOverview.supported"
+                color="success"
+                density="compact"
+                inset
+                hide-details
+                label="启用优化参数"
+                @update:modelValue="onToggleSysctlSwitch" />
+            </div>
           </v-card-title>
           <v-divider />
-          <v-card-text>
+          <v-card-text class="flex-grow-1 pt-3 pb-3">
             <div class="text-body-2 text-medium-emphasis mb-3">
-              仅展示非注释的 nameserver，支持空格、换行或混合输入。保存时会自动补全 nameserver，并尽量保留你当前使用的分隔显示方式。
+              优化 Linux 内核 TCP 读写缓冲区、并发连接队列与拥塞控制算法，加锁后立即执行生效，提升网络传输吞吐与稳定性。
             </div>
+
+            <v-alert
+              v-if="sysctlOverview.error"
+              type="warning"
+              variant="tonal"
+              density="compact"
+              class="mb-3">
+              {{ sysctlOverview.error }}
+            </v-alert>
+
+            <div class="opt-meta-box">
+              <div class="opt-meta__row">
+                <span class="opt-meta__label">生效配置文件</span>
+                <strong class="opt-meta__value text-mono">{{ sysctlOverview.configPath || '-' }}</strong>
+              </div>
+              <div class="opt-meta__row">
+                <span class="opt-meta__label">当前运行状态</span>
+                <span class="opt-meta__value">
+                  <v-badge
+                    dot
+                    inline
+                    :color="sysctlOverview.enabled ? 'success' : 'grey'"
+                    class="mr-1" />
+                  {{ sysctlOverview.enabled ? '已启用优化参数' : '已关闭优化参数' }}
+                </span>
+              </div>
+            </div>
+          </v-card-text>
+          <v-divider />
+          <v-card-actions class="px-4 py-3 d-flex justify-space-between align-center flex-wrap ga-2">
+            <v-tooltip location="top" text="接管 /etc/sysctl.d/99-s-ui-optimize.conf 与 /etc/sysctl.conf，保存即加锁并执行 sysctl -p 立即应用">
+              <template #activator="{ props: tipProps }">
+                <span v-bind="tipProps" class="text-caption text-medium-emphasis d-flex align-center ga-1 cursor-pointer">
+                  <v-icon size="small">mdi-information-outline</v-icon>
+                  双配置双锁定并即时生效
+                </span>
+              </template>
+            </v-tooltip>
+            <v-btn
+              color="primary"
+              variant="tonal"
+              size="small"
+              prepend-icon="mdi-file-document-edit-outline"
+              :disabled="overviewInteractionDisabled || !sysctlLoaded || loadingSysctl || !sysctlOverview.supported"
+              @click="openSysctlEditor">
+              编辑完整配置
+            </v-btn>
+          </v-card-actions>
+        </v-card>
+      </v-col>
+
+      <!-- 模块 3：系统 DNS 解析 (resolv.conf) -->
+      <v-col cols="12" md="6">
+        <v-card rounded="xl" variant="outlined" class="opt-card card-cyan h-100 d-flex flex-column">
+          <v-card-title class="d-flex align-center justify-space-between flex-wrap ga-2 py-3 px-4">
+            <div class="text-subtitle-1 font-weight-bold d-flex align-center ga-2">
+              <v-icon size="20" color="info">mdi-dns-outline</v-icon>
+              <span>系统 DNS 解析</span>
+            </div>
+            <div class="d-flex align-center flex-wrap ga-2">
+              <v-chip
+                size="x-small"
+                :color="dnsOverview.immutable ? 'success' : 'warning'"
+                variant="tonal">
+                <v-icon start size="x-small">mdi-lock-outline</v-icon>
+                {{ dnsOverview.immutable ? '已加锁(+i)' : '未锁定' }}
+              </v-chip>
+              <v-btn
+                color="primary"
+                variant="tonal"
+                size="small"
+                prepend-icon="mdi-file-document-edit-outline"
+                :disabled="overviewInteractionDisabled || !dnsLoaded || loadingDns || !dnsOverview.supported"
+                @click="openDnsEditor">
+                完整文件
+              </v-btn>
+            </div>
+          </v-card-title>
+          <v-divider />
+          <v-card-text class="flex-grow-1 pt-3 pb-3">
+            <div class="text-body-2 text-medium-emphasis mb-3">
+              管理主机 /etc/resolv.conf 解析地址。快速编辑支持空格或换行混合输入，保存自动补全 nameserver 语法并加锁保护。
+            </div>
+
+            <v-alert
+              v-if="dnsOverview.error"
+              type="warning"
+              variant="tonal"
+              density="compact"
+              class="mb-3">
+              {{ dnsOverview.error }}
+            </v-alert>
+
+            <div class="opt-meta-box mb-3">
+              <div class="opt-meta__row">
+                <span class="opt-meta__label">生效路径</span>
+                <strong class="opt-meta__value text-mono">{{ dnsOverview.configPath || '-' }}</strong>
+              </div>
+              <div class="opt-meta__row">
+                <span class="opt-meta__label">当前生效 DNS</span>
+                <div class="opt-meta__value d-flex flex-wrap ga-1 justify-end">
+                  <template v-if="dnsOverview.activeNameServers && dnsOverview.activeNameServers.length > 0">
+                    <v-chip
+                      v-for="ns in dnsOverview.activeNameServers"
+                      :key="ns"
+                      size="x-small"
+                      variant="outlined"
+                      color="info">
+                      {{ ns }}
+                    </v-chip>
+                  </template>
+                  <span v-else class="text-medium-emphasis">-</span>
+                </div>
+              </div>
+            </div>
+
             <div class="dns-quick-layout">
               <v-textarea
                 :model-value="dnsNameServerInput"
-                label="DNS 地址（支持空格/换行混合）"
+                label="DNS 地址快速设置（支持空格/换行混合）"
                 variant="outlined"
+                density="comfortable"
                 :rows="getDnsNameServerRows()"
                 :maxlength="DNS_INPUT_MAX_LENGTH"
                 :disabled="overviewInteractionDisabled || !dnsLoaded || loadingDns || savingDnsNameServers || !dnsOverview.supported"
+                hide-details
                 @update:model-value="updateDnsNameServerInput"
                 class="dns-quick-input" />
               <div class="dns-quick-action">
@@ -247,70 +327,78 @@
                   :loading="savingDnsNameServers"
                   :disabled="overviewInteractionDisabled || !dnsLoaded || loadingDns || savingDnsNameServers || !dnsOverview.supported"
                   @click="saveDnsNameServers">
-                  保存
+                  保存 DNS
                 </v-btn>
               </div>
             </div>
           </v-card-text>
-        </v-card>
-      </v-col>
-    </v-row>
-
-    <v-alert
-      v-if="mtuOverview.error"
-      type="warning"
-      variant="tonal"
-      density="comfortable"
-      class="mb-4">
-      {{ mtuOverview.error }}
-    </v-alert>
-
-    <v-row class="mt-4">
-      <v-col cols="12" md="4">
-        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-blue">
-          <v-card-title class="text-subtitle-1 font-weight-medium">默认网卡 MTU 优化</v-card-title>
           <v-divider />
-          <v-card-text>
-            <div class="text-body-2 text-medium-emphasis mb-3">
-              开启后会在 Promanager_data/mtu 生成脚本并赋予执行权限，立即应用 MTU，同时自动注册 systemd（重启后延迟 10 秒执行）。
-            </div>
-            <v-switch
-              :model-value="mtuOverview.enabled"
-              :loading="switchingMtu"
-              :disabled="overviewInteractionDisabled || !mtuLoaded || loadingMtu || switchingMtu || (!mtuOverview.supported && !mtuOverview.enabled)"
-              color="success"
-              inset
-              hide-details
-              label="启用默认网卡 MTU 开关"
-              @update:modelValue="onToggleMtuSwitch" />
-            <div class="text-caption text-medium-emphasis mt-2">
-              当前状态：{{ mtuOverview.enabled ? '已开启' : '已关闭' }}
-            </div>
-          </v-card-text>
+          <v-card-actions class="px-4 py-2">
+            <span class="text-caption text-medium-emphasis d-flex align-center ga-1">
+              <v-icon size="small">mdi-shield-check-outline</v-icon>
+              保存自动写入并加锁，防止外部 DHCP/NetworkManager 覆盖
+            </span>
+          </v-card-actions>
         </v-card>
       </v-col>
 
-      <v-col cols="12" md="8">
-        <v-card rounded="xl" variant="outlined" class="opt-card h-100 opt-group-blue">
-          <v-card-title class="text-subtitle-1 font-weight-medium">MTU 快速设置</v-card-title>
-          <v-divider />
-          <v-card-text>
-            <div class="text-body-2 text-medium-emphasis mb-3">
-              开启左侧开关后可修改 MTU（范围 1280-1600），离开输入框自动应用；关闭开关自动恢复系统 MTU 为 1470。
+      <!-- 模块 4：网卡 MTU 调优 -->
+      <v-col cols="12" md="6">
+        <v-card rounded="xl" variant="outlined" class="opt-card card-blue h-100 d-flex flex-column">
+          <v-card-title class="d-flex align-center justify-space-between flex-wrap ga-2 py-3 px-4">
+            <div class="text-subtitle-1 font-weight-bold d-flex align-center ga-2">
+              <v-icon size="20" color="primary">mdi-ethernet</v-icon>
+              <span>网卡 MTU 优化</span>
             </div>
-            <div>
+            <div class="d-flex align-center flex-wrap ga-2">
+              <v-chip
+                size="x-small"
+                :color="mtuOverview.serviceEnabled ? 'success' : 'default'"
+                variant="tonal">
+                <v-icon start size="x-small">mdi-cog-sync-outline</v-icon>
+                systemd：{{ mtuOverview.serviceEnabled ? '自启已注册' : '未注册' }}
+              </v-chip>
+              <v-switch
+                :model-value="mtuOverview.enabled"
+                :loading="switchingMtu"
+                :disabled="overviewInteractionDisabled || !mtuLoaded || loadingMtu || switchingMtu || (!mtuOverview.supported && !mtuOverview.enabled)"
+                color="success"
+                density="compact"
+                inset
+                hide-details
+                label="启用 MTU 开关"
+                @update:modelValue="onToggleMtuSwitch" />
+            </div>
+          </v-card-title>
+          <v-divider />
+          <v-card-text class="flex-grow-1 pt-3 pb-3">
+            <div class="text-body-2 text-medium-emphasis mb-3">
+              批量调优物理与虚拟网卡 MTU（范围 1280-1600），离开输入框自动生效并注册开机服务；关闭开关自动恢复 1470。
+            </div>
+
+            <v-alert
+              v-if="mtuOverview.error"
+              type="warning"
+              variant="tonal"
+              density="compact"
+              class="mb-3">
+              {{ mtuOverview.error }}
+            </v-alert>
+
+            <div class="mb-3">
               <v-tooltip
                 :model-value="isMtuOutOfRange"
                 location="top"
-                text="可填写数值1280-1600">
+                text="可填写数值 1280 - 1600">
                 <template #activator="{ props: tooltipProps }">
                   <v-text-field
                     v-bind="tooltipProps"
                     v-model="mtuInput"
-                    label="MTU 值（1280-1600）"
+                    label="目标 MTU 数值（1280 - 1600）"
                     type="number"
                     min="1280"
                     max="1600"
+                    density="comfortable"
                     variant="outlined"
                     hide-details
                     :loading="savingMtu"
@@ -321,15 +409,50 @@
                 </template>
               </v-tooltip>
             </div>
-            <div class="text-caption text-medium-emphasis mt-2">
-              默认网卡：{{ mtuOverview.interface || '-' }} · 当前 MTU：{{ formatMtuValue(mtuOverview.currentMtu) }} ·
-              systemd：{{ mtuOverview.serviceEnabled ? '已注册' : '未注册' }} · 状态：{{ mtuOverview.serviceActive || '-' }}
+
+            <div class="opt-meta-box">
+              <div class="opt-meta__row align-start">
+                <span class="opt-meta__label mt-1">生效网卡列表</span>
+                <div class="opt-meta__value d-flex flex-wrap ga-1 justify-end">
+                  <template v-if="mtuOverview.interfaceDetails && mtuOverview.interfaceDetails.length > 0">
+                    <v-chip
+                      v-for="item in mtuOverview.interfaceDetails"
+                      :key="item.name"
+                      size="x-small"
+                      variant="tonal"
+                      color="primary">
+                      {{ item.name }} (MTU: {{ formatMtuValue(item.currentMtu) }})
+                    </v-chip>
+                  </template>
+                  <template v-else-if="mtuOverview.interfaces && mtuOverview.interfaces.length > 0">
+                    <v-chip
+                      v-for="name in mtuOverview.interfaces"
+                      :key="name"
+                      size="x-small"
+                      variant="tonal"
+                      color="primary">
+                      {{ name }} (MTU: {{ formatMtuValue(mtuOverview.currentMtus?.[name] || mtuOverview.currentMtu) }})
+                    </v-chip>
+                  </template>
+                  <span v-else class="text-medium-emphasis">
+                    {{ mtuOverview.interface || '-' }} · MTU: {{ formatMtuValue(mtuOverview.currentMtu) }}
+                  </span>
+                </div>
+              </div>
             </div>
           </v-card-text>
+          <v-divider />
+          <v-card-actions class="px-4 py-2">
+            <span class="text-caption text-medium-emphasis d-flex align-center ga-1">
+              <v-icon size="small">mdi-refresh-auto</v-icon>
+              失焦或回车后自动应用生效 · 运行态服务：{{ mtuOverview.serviceActive || '-' }}
+            </span>
+          </v-card-actions>
         </v-card>
       </v-col>
     </v-row>
 
+    <!-- 日志编辑弹窗 -->
     <v-dialog
       v-model="logDialogVisible"
       max-width="980"
@@ -337,7 +460,7 @@
       scrollable
       :persistent="savingLog || resettingLog">
       <v-card rounded="xl">
-        <v-card-title class="text-subtitle-1 font-weight-medium">编辑 journald 配置</v-card-title>
+        <v-card-title class="text-subtitle-1 font-weight-medium">编辑 systemd journald 配置</v-card-title>
         <v-divider />
         <v-card-text>
           <v-text-field
@@ -359,7 +482,7 @@
             UTF-8 字节：{{ formatUtf8ByteCount(logEditorContent) }}
           </div>
           <div class="text-caption text-medium-emphasis mt-2">
-            保存时会执行：chattr -i -> 删除旧文件并重建 -> 写入并校验 -> chattr +i -> 重启 journald（即使内容未变也会完整执行）。
+            保存时会执行：chattr -i -> 删除旧文件并重建 -> 写入并校验 -> chattr +i 并重启 journald（即使内容未变也会完整执行）。
           </div>
         </v-card-text>
         <v-divider />
@@ -385,6 +508,7 @@
       </v-card>
     </v-dialog>
 
+    <!-- sysctl 编辑弹窗 -->
     <v-dialog
       v-model="sysctlDialogVisible"
       max-width="980"
@@ -392,7 +516,7 @@
       scrollable
       :persistent="savingSysctl || resettingSysctl">
       <v-card rounded="xl">
-        <v-card-title class="text-subtitle-1 font-weight-medium">编辑 sysctl 配置</v-card-title>
+        <v-card-title class="text-subtitle-1 font-weight-medium">编辑 sysctl 参数配置</v-card-title>
         <v-divider />
         <v-card-text>
           <v-text-field
@@ -414,7 +538,7 @@
             UTF-8 字节：{{ formatUtf8ByteCount(sysctlEditorContent) }}
           </div>
           <div class="text-caption text-medium-emphasis mt-2">
-            保存时会执行：两处文件 chattr -i -> 删除旧文件并重建 -> 写入并校验 -> chattr +i -> 按系统可用命令应用 sysctl 参数（即使内容未变也会完整执行）。
+            保存时会执行：两处文件解除锁定 -> 删除旧文件并重建 -> 写入校验 -> 重新加锁并立即应用参数（即使内容未变也会完整执行）。
           </div>
         </v-card-text>
         <v-divider />
@@ -440,6 +564,7 @@
       </v-card>
     </v-dialog>
 
+    <!-- DNS 编辑弹窗 -->
     <v-dialog
       v-model="dnsDialogVisible"
       max-width="980"
@@ -507,13 +632,22 @@ type OptimizationOverview = {
   error?: string
 }
 
+type InterfaceMTUDetail = {
+  name: string
+  currentMtu: number
+}
+
 type MTUOptimizationOverview = {
   supported: boolean
   enabled: boolean
   interface: string
+  interfaces?: string[]
   currentMtu: number
+  currentMtus?: Record<string, number>
+  interfaceDetails?: InterfaceMTUDetail[]
   mtu: number
   originalMtu: number
+  originalMtus?: Record<string, number>
   scriptPath: string
   scriptExists: boolean
   serviceName: string
@@ -572,9 +706,13 @@ const mtuOverview = ref<MTUOptimizationOverview>({
   supported: false,
   enabled: false,
   interface: '',
+  interfaces: [],
   currentMtu: 0,
+  currentMtus: {},
+  interfaceDetails: [],
   mtu: 1500,
   originalMtu: 0,
+  originalMtus: {},
   scriptPath: '',
   scriptExists: false,
   serviceName: '',
@@ -648,6 +786,14 @@ const pageLoadError = computed(() => [
   mtuLoadError.value,
 ].filter((value): value is string => Boolean(value && value.trim())).join('；'))
 
+const lockedFilesCount = computed(() => {
+  let count = 0
+  if (logOverview.value.immutable) count++
+  if (sysctlOverview.value.immutable) count++
+  if (dnsOverview.value.immutable) count++
+  return count
+})
+
 const logRefreshFlight = ref<Promise<boolean> | null>(null)
 const sysctlRefreshFlight = ref<Promise<boolean> | null>(null)
 const dnsRefreshFlight = ref<Promise<boolean> | null>(null)
@@ -710,23 +856,30 @@ const normalizeOverview = (raw: unknown): OptimizationOverview => {
   }
 }
 
-const dnsActiveNameServerText = computed(() => {
-  const list = dnsOverview.value.activeNameServers
-  if (!Array.isArray(list) || list.length === 0) {
-    return '-'
-  }
-  return list.join(' ')
-})
-
 const normalizeMtuOverview = (raw: unknown): MTUOptimizationOverview => {
   const data = (raw ?? {}) as Record<string, unknown>
+  const rawDetails = Array.isArray(data.interfaceDetails) ? data.interfaceDetails : []
+  const interfaceDetails: InterfaceMTUDetail[] = rawDetails
+    .map((item) => {
+      const detail = (item ?? {}) as Record<string, unknown>
+      return {
+        name: readString(detail, 'name', ''),
+        currentMtu: readInt(detail, 'currentMtu', 0),
+      }
+    })
+    .filter((item) => Boolean(item.name))
+
   return {
     supported: readBool(data, 'supported', false),
     enabled: readBool(data, 'enabled', false),
     interface: readString(data, 'interface', ''),
+    interfaces: readStringArray(data, 'interfaces'),
     currentMtu: readInt(data, 'currentMtu', 0),
+    currentMtus: (data.currentMtus ?? {}) as Record<string, number>,
+    interfaceDetails,
     mtu: readInt(data, 'mtu', 1500),
     originalMtu: readInt(data, 'originalMtu', 0),
+    originalMtus: (data.originalMtus ?? {}) as Record<string, number>,
     scriptPath: readString(data, 'scriptPath', ''),
     scriptExists: readBool(data, 'scriptExists', false),
     serviceName: readString(data, 'serviceName', ''),
@@ -1238,51 +1391,82 @@ watch(
   width: 100%;
 }
 
+.opt-hero {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: linear-gradient(135deg, rgba(30, 41, 59, 0.5) 0%, rgba(15, 23, 42, 0.7) 100%);
+}
+
+.opt-hero__content {
+  position: relative;
+  z-index: 1;
+  padding: 20px 24px;
+}
+
+.opt-hero__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.opt-hero__icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 12px;
+  background: rgba(34, 211, 238, 0.12);
+  color: #22d3ee;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(34, 211, 238, 0.24);
+}
+
+.opt-hero__eyebrow {
+  color: #22d3ee;
+  letter-spacing: 0.12em;
+  font-size: 11px;
+}
+
+.opt-hero-chip--lock {
+  background: #0f766e !important;
+  color: #ecfeff !important;
+}
+
+.card-cyan {
+  border-color: rgba(34, 211, 238, 0.45) !important;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.card-cyan:hover {
+  border-color: rgba(34, 211, 238, 0.75) !important;
+}
+
+.card-blue {
+  border-color: rgba(96, 165, 250, 0.45) !important;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.card-blue:hover {
+  border-color: rgba(96, 165, 250, 0.75) !important;
+}
+
 .opt-card {
-  min-height: 220px;
+  min-height: 260px;
 }
 
-.opt-card,
-.opt-meta {
-  border-width: 1px;
-  border-style: solid;
-  transition:
-    background-color 0.2s ease,
-    border-color 0.2s ease,
-    box-shadow 0.2s ease;
-}
-
-.opt-group-cyan {
-  background-color: rgba(35, 191, 190, 0.08);
-  border-color: rgba(35, 191, 190, 0.72);
-  box-shadow: inset 0 0 0 1px rgba(35, 191, 190, 0.06);
-}
-
-.opt-group-cyan :deep(.v-divider) {
-  border-color: rgba(35, 191, 190, 0.34);
-  opacity: 1;
-}
-
-.opt-group-blue {
-  background-color: rgba(84, 156, 255, 0.08);
-  border-color: rgba(84, 156, 255, 0.72);
-  box-shadow: inset 0 0 0 1px rgba(84, 156, 255, 0.06);
-}
-
-.opt-group-blue :deep(.v-divider) {
-  border-color: rgba(84, 156, 255, 0.34);
-  opacity: 1;
-}
-
-.opt-meta {
-  margin-top: 12px;
+.opt-meta-box {
+  background: rgba(15, 23, 42, 0.35);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 12px;
+  padding: 12px 14px;
 }
 
 .opt-meta__row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
   margin-bottom: 8px;
 }
 
@@ -1290,37 +1474,67 @@ watch(
   margin-bottom: 0;
 }
 
+.opt-meta__label {
+  color: rgba(148, 163, 184, 0.9);
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.opt-meta__value {
+  font-size: 13px;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.text-mono {
+  font-family: Consolas, "Courier New", monospace;
+}
+
 .dns-quick-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 140px;
-  gap: 16px;
+  grid-template-columns: minmax(0, 1fr) 110px;
+  gap: 12px;
   align-items: stretch;
 }
 
 .dns-quick-action {
   display: flex;
-  align-items: flex-end;
+  align-items: stretch;
+}
+
+.dns-quick-action .v-btn {
+  height: 100% !important;
+  min-height: 48px;
 }
 
 .dns-quick-input :deep(textarea) {
   white-space: pre-wrap;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 13px;
 }
 
 @media (max-width: 960px) {
   .dns-quick-layout {
     grid-template-columns: 1fr;
   }
+  .dns-quick-action .v-btn {
+    height: 40px !important;
+  }
 }
 
 @media (max-width: 599px) {
-  .opt-meta__row {
-    align-items: flex-start;
+  .opt-hero__content {
+    padding: 16px;
   }
 
-  .opt-meta__row strong {
-    min-width: 0;
-    overflow-wrap: anywhere;
-    text-align: right;
+  .opt-meta__row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+
+  .opt-meta__value {
+    text-align: left;
   }
 
   .opt-editor-actions {

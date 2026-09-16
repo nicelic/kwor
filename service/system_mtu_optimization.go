@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"os"
 	"os/exec"
@@ -24,7 +25,9 @@ const (
 	systemMTUValueKey      = "systemMTUValue"
 	systemMTUScriptPathKey = "systemMTUScriptPath"
 	systemMTUInterfaceKey  = "systemMTUInterface"
+	systemMTUInterfacesKey = "systemMTUInterfaces"
 	systemMTUOriginalKey   = "systemMTUOriginalValue"
+	systemMTUOriginalsKey  = "systemMTUOriginalValues"
 
 	defaultSystemMTUValue = 1470
 	minAllowedMTUValue    = 1280
@@ -48,11 +51,13 @@ type SystemMTUOptimizationService struct {
 }
 
 type systemMTUPersistedState struct {
-	Enabled     bool
-	MTU         int
-	OriginalMTU int
-	Interface   string
-	ScriptPath  string
+	Enabled      bool           `json:"enabled"`
+	MTU          int            `json:"mtu"`
+	OriginalMTU  int            `json:"originalMtu"`
+	OriginalMTUs map[string]int `json:"originalMtus,omitempty"`
+	Interface    string         `json:"interface"`
+	Interfaces   []string       `json:"interfaces,omitempty"`
+	ScriptPath   string         `json:"scriptPath"`
 }
 
 type systemMTUFileSnapshot struct {
@@ -61,30 +66,38 @@ type systemMTUFileSnapshot struct {
 	mode   os.FileMode
 }
 
+type InterfaceMTUDetail struct {
+	Name       string `json:"name"`
+	CurrentMTU int    `json:"currentMtu"`
+}
+
 type SystemMTUOptimizationOverview struct {
-	Supported         bool   `json:"supported"`
-	Enabled           bool   `json:"enabled"`
-	Interface         string `json:"interface"`
-	CurrentMTU        int    `json:"currentMtu"`
-	MTU               int    `json:"mtu"`
-	OriginalMTU       int    `json:"originalMtu"`
-	ScriptPath        string `json:"scriptPath"`
-	ScriptExists      bool   `json:"scriptExists"`
-	ServiceName       string `json:"serviceName"`
-	ServicePath       string `json:"servicePath"`
-	ServiceRegistered bool   `json:"serviceRegistered"`
-	ServiceEnabled    bool   `json:"serviceEnabled"`
-	ServiceActive     string `json:"serviceActive"`
-	Error             string `json:"error,omitempty"`
+	Supported         bool                 `json:"supported"`
+	Enabled           bool                 `json:"enabled"`
+	Interface         string               `json:"interface"`
+	Interfaces        []string             `json:"interfaces"`
+	CurrentMTU        int                  `json:"currentMtu"`
+	CurrentMTUs       map[string]int       `json:"currentMtus,omitempty"`
+	InterfaceDetails  []InterfaceMTUDetail `json:"interfaceDetails,omitempty"`
+	MTU               int                  `json:"mtu"`
+	OriginalMTU       int                  `json:"originalMtu"`
+	OriginalMTUs      map[string]int       `json:"originalMtus,omitempty"`
+	ScriptPath        string               `json:"scriptPath"`
+	ScriptExists      bool                 `json:"scriptExists"`
+	ServiceName       string               `json:"serviceName"`
+	ServicePath       string               `json:"servicePath"`
+	ServiceRegistered bool                 `json:"serviceRegistered"`
+	ServiceEnabled    bool                 `json:"serviceEnabled"`
+	ServiceActive     string               `json:"serviceActive"`
+	Error             string               `json:"error,omitempty"`
 }
 
 func (s *SystemMTUOptimizationService) GetOverview() (*SystemMTUOptimizationOverview, error) {
 	return s.GetOverviewContext(context.Background())
 }
 
-// GetOverviewContext only reads the current host state. It does not acquire the
-// mutation mutex, otherwise a routine page refresh could wait behind an MTU
-// rollback, a systemd reload, or another privileged write operation.
+// GetOverviewContext 每次优先触发网卡同步，获取最新物理与模拟物理网卡信息。
+// 仅读取当前系统状态，不持有变更互斥锁。
 func (s *SystemMTUOptimizationService) GetOverviewContext(ctx context.Context) (*SystemMTUOptimizationOverview, error) {
 	enabled, err := s.getBool(systemMTUEnabledKey)
 	if err != nil {
@@ -96,7 +109,8 @@ func (s *SystemMTUOptimizationService) GetOverviewContext(ctx context.Context) (
 		storedMTU = defaultSystemMTUValue
 	}
 	originalMTU, originalErr := s.getStoredOriginalMTU()
-	storedInterface, interfaceErr := s.getStoredInterface()
+	originalMTUs, originalMapErr := s.getStoredOriginalMTUs()
+	storedInterfaces, interfaceErr := s.getStoredInterfaces()
 
 	scriptPath := s.resolveMTUScriptPath()
 	overview := &SystemMTUOptimizationOverview{
@@ -104,6 +118,7 @@ func (s *SystemMTUOptimizationService) GetOverviewContext(ctx context.Context) (
 		Enabled:           enabled,
 		MTU:               storedMTU,
 		OriginalMTU:       originalMTU,
+		OriginalMTUs:      originalMTUs,
 		ScriptPath:        scriptPath,
 		ScriptExists:      pathEntryExists(scriptPath),
 		ServiceName:       managedMTUServiceUnit,
@@ -120,45 +135,49 @@ func (s *SystemMTUOptimizationService) GetOverviewContext(ctx context.Context) (
 	if mtuErr != nil {
 		issues = append(issues, strings.TrimSpace(mtuErr.Error()))
 	}
-	if originalErr != nil {
+	if originalErr != nil && originalMapErr != nil {
 		issues = append(issues, strings.TrimSpace(originalErr.Error()))
 	}
 	if interfaceErr != nil {
 		issues = append(issues, strings.TrimSpace(interfaceErr.Error()))
 	}
 
-	iface := ""
-	if enabled {
-		iface = sanitizeInterfaceName(storedInterface)
-		if iface != "" {
-			if _, lookupErr := net.InterfaceByName(iface); lookupErr != nil {
-				issues = append(issues, "保存的 MTU 网卡已不可用，将回退到当前默认网卡")
-				iface = ""
-			}
-		}
-	}
-	var detectErr error
-	if iface == "" {
-		iface, detectErr = detectDefaultInterfaceNameContext(ctx)
-	}
+	// 实时探测最新的物理与模拟物理网卡列表
+	targetIfaces, detectErr := detectTargetMTUInterfacesContext(ctx)
 	if detectErr != nil {
-		overview.Supported = false
-		issues = append(issues, "默认网卡检测失败: "+strings.TrimSpace(detectErr.Error()))
-	} else {
-		overview.Interface = iface
-		currentMTU, currentErr := detectInterfaceMTUValueContext(ctx, iface)
-		if currentErr != nil {
-			issues = append(issues, "读取网卡 MTU 失败: "+strings.TrimSpace(currentErr.Error()))
+		if len(storedInterfaces) > 0 {
+			targetIfaces = storedInterfaces
 		} else {
-			overview.CurrentMTU = currentMTU
+			overview.Supported = false
+			issues = append(issues, "网卡检测失败: "+strings.TrimSpace(detectErr.Error()))
 		}
 	}
 
-	if iface != "" {
-		if _, capabilityErr := resolveInterfaceMTUMutator(iface); capabilityErr != nil {
-			overview.Supported = false
-			issues = append(issues, strings.TrimSpace(capabilityErr.Error()))
+	if len(targetIfaces) > 0 {
+		overview.Interfaces = targetIfaces
+		overview.Interface = strings.Join(targetIfaces, ", ")
+		currentMTUs := make(map[string]int, len(targetIfaces))
+		details := make([]InterfaceMTUDetail, 0, len(targetIfaces))
+
+		for idx, iface := range targetIfaces {
+			currentMTU, currentErr := detectInterfaceMTUValueContext(ctx, iface)
+			if currentErr != nil {
+				issues = append(issues, "读取网卡 "+iface+" MTU 失败: "+strings.TrimSpace(currentErr.Error()))
+			} else {
+				currentMTUs[iface] = currentMTU
+				details = append(details, InterfaceMTUDetail{Name: iface, CurrentMTU: currentMTU})
+				if idx == 0 {
+					overview.CurrentMTU = currentMTU
+				}
+			}
+
+			if _, capabilityErr := resolveInterfaceMTUMutator(iface); capabilityErr != nil {
+				overview.Supported = false
+				issues = append(issues, strings.TrimSpace(capabilityErr.Error()))
+			}
 		}
+		overview.CurrentMTUs = currentMTUs
+		overview.InterfaceDetails = details
 	}
 
 	systemctlPath, systemctlErr := resolveOperationalSystemctlContext(ctx)
@@ -228,6 +247,57 @@ func (s *SystemMTUOptimizationService) SaveMTU(mtu int) error {
 	return s.enableMTULocked(mtu)
 }
 
+// OnSystemStartup 在面板启动或系统重启时由启动生命周期协同中枢调用，
+// 核验当前物理与模拟物理网卡的 MTU 配置状态并执行自愈。
+func (s *SystemMTUOptimizationService) OnSystemStartup(isHostReboot bool) error {
+	systemMTUOptimizationMu.Lock()
+	defer systemMTUOptimizationMu.Unlock()
+
+	if !IsSystemPlatformLinux() {
+		return nil
+	}
+
+	state, err := s.loadMTUPersistedState()
+	if err != nil || !state.Enabled {
+		return nil
+	}
+
+	targetMTU := state.MTU
+	if targetMTU == 0 {
+		targetMTU = defaultSystemMTUValue
+	}
+
+	targetIfaces, detectErr := detectTargetMTUInterfacesContext(context.Background())
+	if detectErr != nil {
+		if len(state.Interfaces) > 0 {
+			targetIfaces = state.Interfaces
+		} else {
+			return common.NewError("启动时 MTU 网卡探测失败: ", detectErr)
+		}
+	}
+
+	allMatched := true
+	for _, iface := range targetIfaces {
+		curr, readErr := detectInterfaceMTUValue(iface)
+		if readErr != nil || curr != targetMTU {
+			allMatched = false
+			break
+		}
+	}
+
+	scriptPath := state.ScriptPath
+	if scriptPath == "" {
+		scriptPath = s.resolveMTUScriptPath()
+	}
+	scriptMissing := !pathEntryExists(scriptPath)
+
+	if !allMatched || scriptMissing || isHostReboot {
+		return s.enableMTULocked(targetMTU)
+	}
+
+	return nil
+}
+
 func (s *SystemMTUOptimizationService) enableMTULocked(mtu int) error {
 	if err := validateMTUValue(mtu); err != nil {
 		return err
@@ -237,43 +307,53 @@ func (s *SystemMTUOptimizationService) enableMTULocked(mtu int) error {
 		return err
 	}
 
-	iface := ""
-	previousInterface := sanitizeInterfaceName(previous.Interface)
-	if previous.Enabled {
-		iface = previousInterface
-		if iface != "" {
-			if _, lookupErr := net.InterfaceByName(iface); lookupErr != nil {
-				iface = ""
+	// 1. 触发最新的网卡探测同步，获取所有物理与模拟物理网卡
+	targetIfaces, err := detectTargetMTUInterfacesContext(context.Background())
+	if err != nil {
+		if len(previous.Interfaces) > 0 {
+			targetIfaces = previous.Interfaces
+		} else if previous.Interface != "" {
+			targetIfaces = []string{previous.Interface}
+		} else {
+			return common.NewError("网卡检测失败: ", err)
+		}
+	}
+
+	previousCurrentMTUs := make(map[string]int, len(targetIfaces))
+	originalMTUs := make(map[string]int, len(targetIfaces))
+
+	for _, iface := range targetIfaces {
+		curr, readErr := detectInterfaceMTUValue(iface)
+		if readErr != nil {
+			return common.NewError("读取网卡 ", iface, " MTU 失败: ", readErr)
+		}
+		previousCurrentMTUs[iface] = curr
+
+		orig := curr
+		if previous.Enabled {
+			if previous.OriginalMTUs != nil && previous.OriginalMTUs[iface] > 0 {
+				orig = previous.OriginalMTUs[iface]
+			} else if previous.OriginalMTU > 0 && iface == previous.Interface {
+				orig = previous.OriginalMTU
 			}
 		}
-	}
-	if iface == "" {
-		iface, err = detectDefaultInterfaceName()
-		if err != nil {
-			return common.NewError("默认网卡检测失败: ", err)
+		originalMTUs[iface] = orig
+
+		if _, capErr := resolveInterfaceMTUMutator(iface); capErr != nil {
+			return capErr
 		}
 	}
-	currentMTU, err := detectInterfaceMTUValue(iface)
-	if err != nil {
-		return common.NewError("读取网卡原始 MTU 失败: ", err)
-	}
-	if _, err := resolveInterfaceMTUMutator(iface); err != nil {
-		return err
-	}
+
 	if _, err := resolveOperationalSystemctl(); err != nil {
 		return err
 	}
 
-	originalMTU := currentMTU
-	if previous.Enabled && previous.OriginalMTU > 0 && iface == previousInterface {
-		originalMTU = previous.OriginalMTU
-	}
-	scriptPath, err := s.rebuildManagedMTUScriptLocked(mtu, iface)
+	scriptPath, err := s.rebuildManagedMTUScriptLocked(mtu, targetIfaces)
 	if err != nil {
 		return err
 	}
 	rollback := func(cause error) error {
-		return s.rollbackMTUEnable(previous, iface, currentMTU, scriptPath, cause)
+		return s.rollbackMTUEnable(previous, targetIfaces, previousCurrentMTUs, scriptPath, cause)
 	}
 	if err := ensureSystemdMTUService(scriptPath); err != nil {
 		return rollback(err)
@@ -281,20 +361,31 @@ func (s *SystemMTUOptimizationService) enableMTULocked(mtu int) error {
 	if err := runManagedMTUScript(scriptPath, mtu); err != nil {
 		return rollback(common.NewError("执行 MTU 脚本失败: ", err))
 	}
-	verifiedMTU, err := detectInterfaceMTUValue(iface)
-	if err != nil || verifiedMTU != mtu {
-		if err == nil {
-			err = common.NewError("读取值为 ", verifiedMTU, "，期望值为 ", mtu)
+
+	// 逐个校验目标网卡生效结果
+	for _, iface := range targetIfaces {
+		verifiedMTU, err := detectInterfaceMTUValue(iface)
+		if err != nil || verifiedMTU != mtu {
+			if err == nil {
+				err = common.NewError("网卡 ", iface, " 读取值为 ", verifiedMTU, "，期望值为 ", mtu)
+			}
+			return rollback(common.NewError("校验 MTU 生效结果失败: ", err))
 		}
-		return rollback(common.NewError("校验 MTU 生效结果失败: ", err))
+	}
+
+	primaryOriginal := 0
+	if len(targetIfaces) > 0 {
+		primaryOriginal = originalMTUs[targetIfaces[0]]
 	}
 
 	next := systemMTUPersistedState{
-		Enabled:     true,
-		MTU:         mtu,
-		OriginalMTU: originalMTU,
-		Interface:   iface,
-		ScriptPath:  scriptPath,
+		Enabled:      true,
+		MTU:          mtu,
+		OriginalMTU:  primaryOriginal,
+		OriginalMTUs: originalMTUs,
+		Interface:    strings.Join(targetIfaces, ", "),
+		Interfaces:   targetIfaces,
+		ScriptPath:   scriptPath,
 	}
 	if err := s.saveMTUPersistedState(next); err != nil {
 		return rollback(common.NewError("保存 MTU 状态失败: ", err))
@@ -312,29 +403,58 @@ func (s *SystemMTUOptimizationService) disableMTULocked() error {
 		previous.ScriptPath = s.resolveMTUScriptPath()
 	}
 
-	previousInterface := sanitizeInterfaceName(previous.Interface)
-	iface := previousInterface
-	if iface != "" {
-		if _, lookupErr := net.InterfaceByName(iface); lookupErr != nil {
-			iface = ""
+	// 实时刷新并合并所有历史和当前的目标网卡
+	currentIfaces, _ := detectTargetMTUInterfacesContext(context.Background())
+	combinedSet := make(map[string]struct{})
+	for _, item := range previous.Interfaces {
+		if norm := sanitizeInterfaceName(item); norm != "" {
+			combinedSet[norm] = struct{}{}
 		}
 	}
-	if iface == "" {
-		iface, err = detectDefaultInterfaceName()
-		if err != nil {
-			return common.NewError("默认网卡检测失败: ", err)
+	if norm := sanitizeInterfaceName(previous.Interface); norm != "" {
+		for _, part := range strings.Split(norm, ",") {
+			if p := sanitizeInterfaceName(part); p != "" {
+				combinedSet[p] = struct{}{}
+			}
 		}
 	}
+	for _, item := range currentIfaces {
+		if norm := sanitizeInterfaceName(item); norm != "" {
+			combinedSet[norm] = struct{}{}
+		}
+	}
+
+	targetList := make([]string, 0, len(combinedSet))
+	for iface := range combinedSet {
+		targetList = append(targetList, iface)
+	}
+	if len(targetList) == 0 {
+		if def, defErr := detectDefaultInterfaceName(); defErr == nil && def != "" {
+			targetList = append(targetList, def)
+		}
+	}
+
 	restoreMTU := defaultSystemMTUValue
-	if _, err := resolveInterfaceMTUMutator(iface); err != nil {
-		return err
+	for _, iface := range targetList {
+		if _, err := resolveInterfaceMTUMutator(iface); err != nil {
+			return err
+		}
 	}
+
 	rollback := func(cause error) error {
-		return s.rollbackMTUDisable(previous, iface, cause)
+		return s.rollbackMTUDisable(previous, targetList, cause)
 	}
-	if err := setInterfaceMTUValue(iface, restoreMTU); err != nil {
-		return rollback(common.NewError("恢复 MTU=", restoreMTU, " 失败: ", err))
+
+	for _, iface := range targetList {
+		targetRestore := restoreMTU
+		if previous.OriginalMTUs != nil && previous.OriginalMTUs[iface] > 0 {
+			targetRestore = previous.OriginalMTUs[iface]
+		}
+		if err := setInterfaceMTUValue(iface, targetRestore); err != nil {
+			return rollback(common.NewError("恢复网卡 ", iface, " MTU=", targetRestore, " 失败: ", err))
+		}
 	}
+
 	if err := removeSystemdMTUService(); err != nil {
 		return rollback(err)
 	}
@@ -352,31 +472,47 @@ func (s *SystemMTUOptimizationService) disableMTULocked() error {
 	return nil
 }
 
-func (s *SystemMTUOptimizationService) rollbackMTUDisable(previous systemMTUPersistedState, iface string, cause error) error {
+func (s *SystemMTUOptimizationService) rollbackMTUDisable(previous systemMTUPersistedState, ifaces []string, cause error) error {
 	errs := []error{cause}
-	restoredPath, rebuildErr := s.rebuildManagedMTUScriptLocked(previous.MTU, iface)
+	restoreIfaces := previous.Interfaces
+	if len(restoreIfaces) == 0 && previous.Interface != "" {
+		restoreIfaces = []string{previous.Interface}
+	}
+	if len(restoreIfaces) == 0 {
+		restoreIfaces = ifaces
+	}
+	restoredPath, rebuildErr := s.rebuildManagedMTUScriptLocked(previous.MTU, restoreIfaces)
 	if rebuildErr != nil {
 		errs = append(errs, common.NewError("恢复原 MTU 脚本失败: ", rebuildErr))
 	} else if serviceErr := ensureSystemdMTUService(restoredPath); serviceErr != nil {
 		errs = append(errs, common.NewError("恢复原 MTU systemd 服务失败: ", serviceErr))
 	}
-	if restoreErr := setInterfaceMTUValue(iface, previous.MTU); restoreErr != nil {
-		errs = append(errs, common.NewError("恢复关闭前 MTU 失败: ", restoreErr))
+	for _, iface := range restoreIfaces {
+		if restoreErr := setInterfaceMTUValue(iface, previous.MTU); restoreErr != nil {
+			errs = append(errs, common.NewError("恢复网卡 ", iface, " 关闭前 MTU 失败: ", restoreErr))
+		}
 	}
 	return joinMTUErrors(errs)
 }
 
-func (s *SystemMTUOptimizationService) rollbackMTUEnable(previous systemMTUPersistedState, iface string, previousCurrentMTU int, scriptPath string, cause error) error {
+func (s *SystemMTUOptimizationService) rollbackMTUEnable(previous systemMTUPersistedState, ifaces []string, previousCurrentMTUs map[string]int, scriptPath string, cause error) error {
 	errs := []error{cause}
-	if err := setInterfaceMTUValue(iface, previousCurrentMTU); err != nil {
-		errs = append(errs, common.NewError("恢复变更前 MTU 失败: ", err))
+	for _, iface := range ifaces {
+		if prevMTU, ok := previousCurrentMTUs[iface]; ok && prevMTU > 0 {
+			if err := setInterfaceMTUValue(iface, prevMTU); err != nil {
+				errs = append(errs, common.NewError("恢复网卡 ", iface, " 变更前 MTU 失败: ", err))
+			}
+		}
 	}
 	if previous.Enabled {
-		restoreInterface := sanitizeInterfaceName(previous.Interface)
-		if restoreInterface == "" {
-			restoreInterface = iface
+		restoreIfaces := previous.Interfaces
+		if len(restoreIfaces) == 0 && previous.Interface != "" {
+			restoreIfaces = []string{previous.Interface}
 		}
-		restoredPath, rebuildErr := s.rebuildManagedMTUScriptLocked(previous.MTU, restoreInterface)
+		if len(restoreIfaces) == 0 {
+			restoreIfaces = ifaces
+		}
+		restoredPath, rebuildErr := s.rebuildManagedMTUScriptLocked(previous.MTU, restoreIfaces)
 		if rebuildErr != nil {
 			errs = append(errs, common.NewError("恢复原 MTU 脚本失败: ", rebuildErr))
 		} else if serviceErr := ensureSystemdMTUService(restoredPath); serviceErr != nil {
@@ -423,6 +559,24 @@ func (s *SystemMTUOptimizationService) getStoredOriginalMTU() (int, error) {
 	return value, nil
 }
 
+func (s *SystemMTUOptimizationService) getStoredOriginalMTUs() (map[string]int, error) {
+	res := make(map[string]int)
+	raw, err := s.getString(systemMTUOriginalsKey)
+	if err == nil && strings.TrimSpace(raw) != "" {
+		if jsonErr := json.Unmarshal([]byte(raw), &res); jsonErr == nil && len(res) > 0 {
+			return res, nil
+		}
+	}
+	oldVal, err := s.getStoredOriginalMTU()
+	if err == nil && oldVal > 0 {
+		oldIface, _ := s.getStoredInterface()
+		if oldIface != "" {
+			res[oldIface] = oldVal
+		}
+	}
+	return res, nil
+}
+
 func (s *SystemMTUOptimizationService) getStoredInterface() (string, error) {
 	raw, err := s.getString(systemMTUInterfaceKey)
 	if err != nil {
@@ -432,11 +586,50 @@ func (s *SystemMTUOptimizationService) getStoredInterface() (string, error) {
 	if trimmed == "" {
 		return "", nil
 	}
-	normalized := sanitizeInterfaceName(trimmed)
-	if normalized == "" || normalized != trimmed {
-		return "", common.NewError("保存的 MTU 网卡名称无效")
+	return trimmed, nil
+}
+
+func (s *SystemMTUOptimizationService) getStoredInterfaces() ([]string, error) {
+	raw, err := s.getString(systemMTUInterfacesKey)
+	if err == nil && strings.TrimSpace(raw) != "" {
+		var list []string
+		if jsonErr := json.Unmarshal([]byte(raw), &list); jsonErr == nil && len(list) > 0 {
+			sanitized := make([]string, 0, len(list))
+			for _, item := range list {
+				if norm := sanitizeInterfaceName(item); norm != "" {
+					sanitized = append(sanitized, norm)
+				}
+			}
+			if len(sanitized) > 0 {
+				return sanitized, nil
+			}
+		}
+		parts := strings.Split(raw, ",")
+		sanitized := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if norm := sanitizeInterfaceName(p); norm != "" {
+				sanitized = append(sanitized, norm)
+			}
+		}
+		if len(sanitized) > 0 {
+			return sanitized, nil
+		}
 	}
-	return normalized, nil
+
+	oldIface, err := s.getStoredInterface()
+	if err == nil && oldIface != "" {
+		parts := strings.Split(oldIface, ",")
+		sanitized := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if norm := sanitizeInterfaceName(p); norm != "" {
+				sanitized = append(sanitized, norm)
+			}
+		}
+		if len(sanitized) > 0 {
+			return sanitized, nil
+		}
+	}
+	return nil, nil
 }
 
 func (s *SystemMTUOptimizationService) loadMTUPersistedState() (systemMTUPersistedState, error) {
@@ -452,16 +645,21 @@ func (s *SystemMTUOptimizationService) loadMTUPersistedState() (systemMTUPersist
 	if err != nil {
 		return systemMTUPersistedState{}, err
 	}
+	originalMTUs, _ := s.getStoredOriginalMTUs()
 	iface, err := s.getStoredInterface()
 	if err != nil {
 		return systemMTUPersistedState{}, err
 	}
+	ifaces, _ := s.getStoredInterfaces()
+
 	return systemMTUPersistedState{
-		Enabled:     enabled,
-		MTU:         mtu,
-		OriginalMTU: originalMTU,
-		Interface:   iface,
-		ScriptPath:  s.resolveMTUScriptPath(),
+		Enabled:      enabled,
+		MTU:          mtu,
+		OriginalMTU:  originalMTU,
+		OriginalMTUs: originalMTUs,
+		Interface:    iface,
+		Interfaces:   ifaces,
+		ScriptPath:   s.resolveMTUScriptPath(),
 	}, nil
 }
 
@@ -470,17 +668,48 @@ func (s *SystemMTUOptimizationService) saveMTUPersistedState(state systemMTUPers
 	if db == nil {
 		return common.NewError("database is not ready")
 	}
-	iface := sanitizeInterfaceName(state.Interface)
-	if state.Enabled && iface == "" {
+
+	sanitizedIfaces := make([]string, 0, len(state.Interfaces))
+	for _, iface := range state.Interfaces {
+		if norm := sanitizeInterfaceName(iface); norm != "" {
+			sanitizedIfaces = append(sanitizedIfaces, norm)
+		}
+	}
+	if len(sanitizedIfaces) == 0 && state.Interface != "" {
+		for _, part := range strings.Split(state.Interface, ",") {
+			if norm := sanitizeInterfaceName(part); norm != "" {
+				sanitizedIfaces = append(sanitizedIfaces, norm)
+			}
+		}
+	}
+
+	primaryIface := ""
+	if len(sanitizedIfaces) > 0 {
+		primaryIface = strings.Join(sanitizedIfaces, ", ")
+	}
+
+	if state.Enabled && len(sanitizedIfaces) == 0 {
 		return common.NewError("MTU 网卡名称为空")
 	}
+
+	ifacesJSON, _ := json.Marshal(sanitizedIfaces)
+	originalsJSON, _ := json.Marshal(state.OriginalMTUs)
+
+	primaryOriginal := state.OriginalMTU
+	if primaryOriginal == 0 && len(sanitizedIfaces) > 0 && state.OriginalMTUs != nil {
+		primaryOriginal = state.OriginalMTUs[sanitizedIfaces[0]]
+	}
+
 	values := map[string]string{
 		systemMTUEnabledKey:    strconv.FormatBool(state.Enabled),
 		systemMTUValueKey:      strconv.Itoa(state.MTU),
 		systemMTUScriptPathKey: strings.TrimSpace(state.ScriptPath),
-		systemMTUInterfaceKey:  iface,
-		systemMTUOriginalKey:   strconv.Itoa(state.OriginalMTU),
+		systemMTUInterfaceKey:  primaryIface,
+		systemMTUInterfacesKey: string(ifacesJSON),
+		systemMTUOriginalKey:   strconv.Itoa(primaryOriginal),
+		systemMTUOriginalsKey:  string(originalsJSON),
 	}
+
 	return db.Transaction(func(tx *gorm.DB) error {
 		for key, value := range values {
 			setting := &model.Setting{}
@@ -514,10 +743,9 @@ func (s *SystemMTUOptimizationService) resolveMTUScriptPath() string {
 	return filepath.Join(config.GetDataDir(), "mtu", managedMTUScriptFileName)
 }
 
-func (s *SystemMTUOptimizationService) rebuildManagedMTUScriptLocked(mtu int, iface string) (string, error) {
-	iface = sanitizeInterfaceName(iface)
-	if iface == "" {
-		return "", common.NewError("MTU 网卡名称为空")
+func (s *SystemMTUOptimizationService) rebuildManagedMTUScriptLocked(mtu int, ifaces []string) (string, error) {
+	if len(ifaces) == 0 {
+		return "", common.NewError("MTU 网卡列表为空")
 	}
 	scriptPath := s.resolveMTUScriptPath()
 	scriptPath = strings.TrimSpace(scriptPath)
@@ -536,7 +764,7 @@ func (s *SystemMTUOptimizationService) rebuildManagedMTUScriptLocked(mtu int, if
 		return "", common.NewError("记录待写入 MTU 脚本所有权失败: ", err)
 	}
 
-	content := buildManagedMTUScriptContent(mtu, iface)
+	content := buildManagedMTUScriptContent(mtu, ifaces)
 	if err := writeSystemMTUFileAtomic(scriptPath, []byte(content), 0o755); err != nil {
 		if restoreErr := rollbackSystemMTUFile(ownership.ID, scriptPath, previousFile); restoreErr != nil {
 			return "", common.NewError("原子替换 MTU 脚本失败: ", err, "；恢复旧脚本失败: ", restoreErr)
@@ -575,6 +803,44 @@ func removeManagedMTUScript(scriptPath string) error {
 	return nil
 }
 
+func writeSystemMTUFileAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmpFile, err := os.CreateTemp(dir, ".mtu-atomic-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmpFile.Chmod(mode); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
 func captureSystemMTUFile(path string) (systemMTUFileSnapshot, error) {
 	info, err := os.Stat(path)
 	if os.IsNotExist(err) {
@@ -600,61 +866,39 @@ func restoreSystemMTUFile(path string, snapshot systemMTUFileSnapshot) error {
 	return writeSystemMTUFileAtomic(path, snapshot.data, snapshot.mode)
 }
 
-func restoreMTUFileOwnership(id string, snapshot systemMTUFileSnapshot) error {
+func rollbackSystemMTUFile(resourceID string, path string, snapshot systemMTUFileSnapshot) error {
+	errs := make([]error, 0, 2)
+	if restoreErr := restoreSystemMTUFile(path, snapshot); restoreErr != nil {
+		errs = append(errs, restoreErr)
+	}
 	if snapshot.exists {
-		return VerifyAndActivateHostResource(id)
+		if activateErr := VerifyAndActivateHostResource(resourceID); activateErr != nil {
+			errs = append(errs, activateErr)
+		}
+	} else {
+		if removeErr := RemoveHostResource(resourceID); removeErr != nil {
+			errs = append(errs, removeErr)
+		}
 	}
-	return RemoveHostResource(id)
+	return joinMTUErrors(errs)
 }
 
-func rollbackSystemMTUFile(id string, path string, snapshot systemMTUFileSnapshot) error {
-	if err := restoreSystemMTUFile(path, snapshot); err != nil {
-		return err
+func buildManagedMTUScriptContent(mtu int, ifaces []string) string {
+	sanitizedList := make([]string, 0, len(ifaces))
+	for _, iface := range ifaces {
+		if norm := sanitizeInterfaceName(iface); norm != "" {
+			sanitizedList = append(sanitizedList, norm)
+		}
 	}
-	return restoreMTUFileOwnership(id, snapshot)
-}
+	targetIfacesStr := strings.Join(sanitizedList, " ")
 
-func writeSystemMTUFileAtomic(path string, data []byte, mode os.FileMode) error {
-	directory := filepath.Dir(path)
-	if err := os.MkdirAll(directory, 0o755); err != nil {
-		return err
-	}
-	tempFile, err := os.CreateTemp(directory, ".kwor-mtu-*")
-	if err != nil {
-		return err
-	}
-	tempPath := tempFile.Name()
-	defer os.Remove(tempPath)
-	if _, err := tempFile.Write(data); err != nil {
-		_ = tempFile.Close()
-		return err
-	}
-	if err := tempFile.Sync(); err != nil {
-		_ = tempFile.Close()
-		return err
-	}
-	if err := tempFile.Chmod(mode); err != nil {
-		_ = tempFile.Close()
-		return err
-	}
-	if err := tempFile.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tempPath, path); err != nil {
-		return err
-	}
-	return syncHostOwnershipDirectory(directory)
-}
-
-func buildManagedMTUScriptContent(mtu int, iface string) string {
-	iface = sanitizeInterfaceName(iface)
 	return strings.TrimSpace(
 		`#!/bin/sh
 # kwor-owner:v1 resource=mtu-script
 set -eu
 
 MTU_VALUE="`+strconv.Itoa(mtu)+`"
-PREFERRED_IFACE="`+iface+`"
+TARGET_IFACES="`+targetIfacesStr+`"
 if [ "${1:-}" != "" ]; then
   MTU_VALUE="$1"
 fi
@@ -666,13 +910,23 @@ case "$MTU_VALUE" in
     ;;
 esac
 
+set_iface_mtu() {
+  target="$1"
+  [ -z "$target" ] && return 0
+  if command -v ip >/dev/null 2>&1; then
+    ip link set dev "$target" mtu "$MTU_VALUE"
+  elif command -v ifconfig >/dev/null 2>&1; then
+    ifconfig "$target" mtu "$MTU_VALUE" up
+  elif [ -w "/sys/class/net/$target/mtu" ]; then
+    printf '%s\n' "$MTU_VALUE" > "/sys/class/net/$target/mtu"
+  else
+    echo "missing MTU write capability for $target" >&2
+    return 1
+  fi
+}
+
 detect_default_iface() {
   iface=""
-  if [ -n "${PREFERRED_IFACE:-}" ] && [ "${PREFERRED_IFACE}" != "lo" ] && [ -e "/sys/class/net/${PREFERRED_IFACE}" ]; then
-    echo "${PREFERRED_IFACE}"
-    return 0
-  fi
-
   if command -v ip >/dev/null 2>&1; then
     iface="$(ip -o route show to default 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1); exit}}}')"
     iface="${iface%%@*}"
@@ -719,21 +973,24 @@ detect_default_iface() {
   return 1
 }
 
-IFACE="$(detect_default_iface || true)"
-if [ -z "${IFACE:-}" ]; then
-  echo "failed to detect default network interface" >&2
-  exit 1
-fi
+applied=0
+for iface in $TARGET_IFACES; do
+  [ -n "$iface" ] || continue
+  if [ -e "/sys/class/net/$iface" ]; then
+    if set_iface_mtu "$iface"; then
+      applied=$((applied + 1))
+    fi
+  fi
+done
 
-if command -v ip >/dev/null 2>&1; then
-  ip link set dev "$IFACE" mtu "$MTU_VALUE"
-elif command -v ifconfig >/dev/null 2>&1; then
-  ifconfig "$IFACE" mtu "$MTU_VALUE" up
-elif [ -w "/sys/class/net/$IFACE/mtu" ]; then
-  printf '%s\n' "$MTU_VALUE" > "/sys/class/net/$IFACE/mtu"
-else
-  echo "missing MTU write capability: ip, ifconfig and writable sysfs are unavailable" >&2
-  exit 1
+if [ "$applied" -eq 0 ]; then
+  IFACE="$(detect_default_iface || true)"
+  if [ -n "${IFACE:-}" ]; then
+    set_iface_mtu "$IFACE"
+  else
+    echo "failed to detect any network interface" >&2
+    exit 1
+  fi
 fi
 `,
 	) + "\n"
@@ -883,35 +1140,39 @@ func removeSystemdMTUService() error {
 
 	if pathEntryExists(managedMTUServicePath) {
 		if err := os.Remove(managedMTUServicePath); err != nil && !os.IsNotExist(err) {
-			errs = append(errs, common.NewError("删除 MTU systemd 服务文件失败: ", err))
+			errs = append(errs, common.NewError("删除 MTU systemd 服务失败: ", err))
 		}
 	}
-
+	if err := RemoveHostResource(managedMTUServiceOwnerID); err != nil {
+		errs = append(errs, common.NewError("删除 MTU systemd 服务所有权记录失败: ", err))
+	}
 	if systemctlErr == nil {
 		if err := runCommandWithTimeout(12*time.Second, systemctlPath, "daemon-reload"); err != nil {
-			errs = append(errs, common.NewError("删除 MTU 服务后重新加载 systemd 失败: ", err))
+			errs = append(errs, common.NewError("重新加载 systemd 失败: ", err))
 		}
-		_ = runCommandWithTimeout(8*time.Second, systemctlPath, "reset-failed", managedMTUServiceUnit)
-	}
-	if len(errs) == 0 {
-		if err := RemoveHostResource(managedMTUServiceOwnerID); err != nil {
-			errs = append(errs, common.NewError("删除 MTU systemd 所有权记录失败: ", err))
+		if err := runCommandWithTimeout(12*time.Second, systemctlPath, "reset-failed"); err != nil {
+			errs = append(errs, common.NewError("重置 systemd 失败状态失败: ", err))
 		}
 	}
 	return joinMTUErrors(errs)
+}
+
+func restoreMTUFileOwnership(resourceID string, snapshot systemMTUFileSnapshot) error {
+	if snapshot.exists {
+		return VerifyAndActivateHostResource(resourceID)
+	}
+	return RemoveHostResource(resourceID)
 }
 
 func isMissingSystemdUnitError(err error) bool {
 	if err == nil {
 		return false
 	}
-	lower := strings.ToLower(err.Error())
-	for _, fragment := range []string{"not found", "not loaded", "does not exist", "no such file"} {
-		if strings.Contains(lower, fragment) {
-			return true
-		}
-	}
-	return false
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "does not exist") ||
+		strings.Contains(msg, "not loaded") ||
+		strings.Contains(msg, "no such file") ||
+		strings.Contains(msg, "not-found")
 }
 
 func resolveOperationalSystemctl() (string, error) {
@@ -919,34 +1180,38 @@ func resolveOperationalSystemctl() (string, error) {
 }
 
 func resolveOperationalSystemctlContext(ctx context.Context) (string, error) {
-	if !pathEntryExists("/run/systemd/system") {
-		return "", common.NewError("当前环境没有运行中的 systemd 管理器，MTU 持久化不可用")
+	candidates := []string{"/bin/systemctl", "/usr/bin/systemctl"}
+	for _, candidate := range candidates {
+		if pathExists(candidate) {
+			return candidate, nil
+		}
 	}
-	systemctlPath, err := exec.LookPath("systemctl")
-	if err != nil {
-		return "", common.NewError("未找到 systemctl，MTU 持久化不可用")
+	path, err := exec.LookPath("systemctl")
+	if err == nil {
+		return path, nil
 	}
-	output, err := runOptimizationCommandOutputWithTimeout(ctx, 5*time.Second, systemctlPath, "show", "--property=Version", "--value")
-	if err != nil {
-		return "", common.NewError("无法连接 systemd 管理器: ", err)
-	}
-	if strings.TrimSpace(output) == "" {
-		return "", common.NewError("systemd 管理器未返回版本信息")
-	}
-	return systemctlPath, nil
+	return "", common.NewError("当前系统未找到可用 systemctl，无法注册开机自启")
 }
 
-func readSystemdUnitStatus(systemctlPath string, unit string) (string, string, error) {
-	return readSystemdUnitStatusContext(context.Background(), systemctlPath, unit)
+func readSystemdUnitStatus(systemctlPath string, unitName string) (string, string, error) {
+	return readSystemdUnitStatusContext(context.Background(), systemctlPath, unitName)
 }
 
-func readSystemdUnitStatusContext(ctx context.Context, systemctlPath string, unit string) (string, string, error) {
-	output, err := runOptimizationCommandOutputWithTimeout(ctx, 5*time.Second, systemctlPath, "show", "-p", "LoadState", "-p", "UnitFileState", "-p", "ActiveState", unit)
+func readSystemdUnitStatusContext(ctx context.Context, systemctlPath string, unitName string) (string, string, error) {
+	output, err := runOptimizationCommandOutputWithTimeout(
+		ctx,
+		8*time.Second,
+		systemctlPath,
+		"show",
+		unitName,
+		"--no-pager",
+		"--property=UnitFileState,ActiveState,LoadState",
+	)
 	if err != nil {
 		return "", "", err
 	}
-	unitFileState, activeState := parseSystemdUnitStatus(output)
-	return unitFileState, activeState, nil
+	unitState, activeState := parseSystemdUnitStatus(output)
+	return unitState, activeState, nil
 }
 
 func parseSystemdUnitStatus(output string) (string, string) {
@@ -1030,6 +1295,53 @@ func detectDefaultInterfaceNameContext(ctx context.Context) (string, error) {
 	}
 
 	return "", common.NewError("未检测到可用默认网卡")
+}
+
+// detectTargetMTUInterfacesContext 每次优先触发网卡同步，获取最新的物理与模拟物理网卡列表。
+func detectTargetMTUInterfacesContext(ctx context.Context) ([]string, error) {
+	// 1. 强制同步最新的物理与模拟物理网卡检测状态并落盘
+	_, _ = (&NetworkInterfaceService{}).SyncSystemInterfaces()
+
+	// 2. 从已识别网卡中提取所有处于 UP 状态的物理网卡（physical）与模拟物理网卡（simulated）
+	systemIfaces := (&NetworkInterfaceService{}).GetSystemInterfaces(false)
+	var targets []string
+	seen := make(map[string]struct{})
+
+	for _, item := range systemIfaces {
+		name := sanitizeInterfaceName(item.Name)
+		if name == "" || name == "lo" || item.Category == model.NetworkInterfaceCategoryLoopback {
+			continue
+		}
+		if item.IsUp && (item.Category == model.NetworkInterfaceCategoryPhysical || item.Category == model.NetworkInterfaceCategorySimulated) {
+			if _, exists := seen[name]; !exists {
+				seen[name] = struct{}{}
+				targets = append(targets, name)
+			}
+		}
+	}
+
+	if len(targets) > 0 {
+		return targets, nil
+	}
+
+	// 3. 回退策略：优先默认路由网卡
+	defaultIface, err := detectDefaultInterfaceNameContext(ctx)
+	if err == nil && defaultIface != "" && defaultIface != "lo" {
+		return []string{defaultIface}, nil
+	}
+
+	// 4. 回退策略：首个非 lo 且处于 UP 状态的网卡
+	for _, item := range systemIfaces {
+		name := sanitizeInterfaceName(item.Name)
+		if name == "" || name == "lo" || item.Category == model.NetworkInterfaceCategoryLoopback {
+			continue
+		}
+		if item.IsUp {
+			return []string{name}, nil
+		}
+	}
+
+	return nil, common.NewError("未检测到可用的物理或网络接口")
 }
 
 func parseMTUDefaultInterfaceFromIPRouteOutput(output string) string {

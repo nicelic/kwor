@@ -251,7 +251,6 @@
 
         <v-data-table
           v-if="!smAndDown"
-          :key="`rp-table-${overview.revision}`"
           :headers="reverseProxyHeaders"
           :items="filteredRules"
           item-value="id"
@@ -1542,8 +1541,6 @@ const {
   background: rgb(var(--v-theme-surface)) !important;
   box-shadow: -10px 0 14px rgba(15, 23, 42, 0.12) !important;
   z-index: 2 !important;
-  will-change: transform;
-  transform: translateZ(0);
 }
 
 .rp-table :deep(thead .rp-table__col-actions),

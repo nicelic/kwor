@@ -273,6 +273,8 @@ var defaultValueMap = map[string]string{
 	"trafficOverviewEnabled":            "true",
 	"trafficOverviewResetDay":           "0",
 	"trafficOverviewExpiryDate":         "",
+	"trafficOverviewInterfaces":         "[]",
+	"trafficOverviewInterfaceMode":       "auto",
 	"trafficOverviewState":              "{}",
 	"trafficOverviewSnapshot":           "{}",
 	"trafficOverviewCapState":           "{}",

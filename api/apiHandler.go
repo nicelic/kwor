@@ -73,6 +73,8 @@ func (a *APIHandler) postHandler(c *gin.Context) {
 		a.ApiService.RetrySingboxRuntime(c, loginUser)
 	case "settings-patch":
 		a.ApiService.SaveSettingsPatch(c, loginUser)
+	case "system-timezone":
+		a.ApiService.SetSystemTimeZone(c)
 	case "mihomo-dns-save":
 		a.ApiService.SaveMihomoDNSPatch(c, loginUser)
 	case "mihomo-route-save":

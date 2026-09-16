@@ -3212,6 +3212,52 @@ func (s *TrafficOverviewService) EnsureRuntimeReady() error {
 	return nil
 }
 
+// ReconcileInterfacesOnStartup 在系统或面板启动时，比对物理网卡是否有变化，
+// 若模式为自动推荐且有网卡增减，重新校准选中的网卡，并确保所有目标网卡的 vnstat 守护正常跟踪。
+func (s *TrafficOverviewService) ReconcileInterfacesOnStartup(isHostReboot bool) error {
+	if !IsSystemPlatformLinux() {
+		return nil
+	}
+
+	enabled, err := s.isOverviewEnabled()
+	if err != nil || !enabled {
+		return nil
+	}
+
+	// 此时底层 NetworkInterfaceService.SyncSystemInterfaces() 已在 Step 1 完成全量扫描
+	ifaces, mode := s.GetSelectedTrafficInterfaces()
+	if len(ifaces) == 0 {
+		return nil
+	}
+
+	if mode == "auto" {
+		recommended := (&NetworkInterfaceService{}).GetDefaultTrafficInterfaces()
+		if len(recommended) > 0 {
+			ifaces = recommended
+		}
+	}
+
+	if _, ok := loadTrustedVnstatManifest(); !ok {
+		return nil
+	}
+
+	if err := ensureVnstatDaemonRunning(); err != nil {
+		logger.Warning("startup vnstat daemon ensure failed:", err)
+		return err
+	}
+
+	for _, iface := range ifaces {
+		if err := ensureVnstatTracking(iface); err != nil {
+			logger.Warning("startup vnstat tracking ensure failed for", iface, ":", err)
+		}
+	}
+
+	if err := s.ReconcileTrafficCap(); err != nil {
+		logger.Warning("startup traffic cap reconcile failed:", err)
+	}
+	return nil
+}
+
 func (s *TrafficOverviewService) FlushPendingSnapshot() error {
 	if err := s.flushRuntimeState(); err != nil {
 		return err

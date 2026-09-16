@@ -1359,10 +1359,9 @@ export function useReverseProxyManage(props: { active?: boolean }) {
   const stabilizeTableLayout = () => {
     if (typeof window === 'undefined') return
     void nextTick(() => {
-      window.dispatchEvent(new Event('resize'))
-      setTimeout(() => {
+      window.requestAnimationFrame(() => {
         window.dispatchEvent(new Event('resize'))
-      }, 60)
+      })
     })
   }
 

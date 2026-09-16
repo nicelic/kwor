@@ -49,3 +49,18 @@ func TestGetPanelTimeContextReturnsDatabaseTimeZone(t *testing.T) {
 		t.Fatalf("invalid server unix value: %#v", body["unix"])
 	}
 }
+
+func TestSetSystemTimeZoneValidatesPayload(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest("POST", "/api/system-timezone", nil)
+	(&ApiService{}).SetSystemTimeZone(context)
+
+	var response Msg
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+	if response.Success {
+		t.Fatal("empty payload should not succeed")
+	}
+}

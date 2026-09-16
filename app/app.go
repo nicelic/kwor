@@ -159,6 +159,7 @@ func (a *APP) Start() error {
 
 	service.StartDDNSRuntimeWorker()
 	service.StartSystemOptimizationWatcher()
+	service.StartSystemBootLifecycleInBackground(context.Background())
 
 	a.startTrafficOverviewRuntimeProbe()
 	a.startManagedCoreOnLinuxStartup()

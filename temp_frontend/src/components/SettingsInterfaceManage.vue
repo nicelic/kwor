@@ -72,14 +72,14 @@
       <v-card-title class="py-3 px-4">
         <div class="text-subtitle-1 font-weight-medium d-flex align-center ga-2">
           <v-icon size="small" color="primary">mdi-shield-clock-outline</v-icon>
-          <span>{{ $t('setting.sessionAndEnvironment') || '会话安全与环境时区' }}</span>
+          <span>{{ $t('setting.sessionAndEnvironment') || '会话安全与面板时区' }}</span>
         </div>
       </v-card-title>
       <v-divider />
       <v-card-text class="pt-4">
         <v-row>
           <!-- 会话超时限（移动端弹性适配，单位下拉固定宽度防止截断） -->
-          <v-col cols="12" sm="6" md="4">
+          <v-col cols="12" sm="6" md="6">
             <div class="d-flex ga-2 align-center">
               <v-text-field
                 type="number"
@@ -105,7 +105,7 @@
           </v-col>
 
           <!-- 面板时区 -->
-          <v-col cols="12" sm="6" md="4">
+          <v-col cols="12" sm="6" md="6">
             <v-select
               v-model="settings.timeLocation"
               :items="timeZoneOptions"
@@ -122,34 +122,86 @@
             </div>
             <div class="text-caption text-medium-emphasis mt-1">{{ $t('setting.panelTimeScope') }}</div>
           </v-col>
+        </v-row>
 
-          <!-- 系统时区 -->
-          <v-col cols="12" sm="12" md="4">
-            <v-select
-              :model-value="systemTimeLocation"
-              :items="timeZoneOptions"
-              item-title="title"
-              item-value="value"
-              item-props="props"
-              :label="$t('setting.systemTimeLoc')"
-              hide-details
-              density="comfortable"
-              :menu-props="{ maxHeight: 360 }"
-              :disabled="systemTimeZoneLoadState === 'loading' || systemTimeZoneLoadState === 'error'"
-              @update:model-value="onSystemTimeLocationSelected"
+        <!-- 宿主机系统时区信息与快捷操作栏 -->
+        <v-divider class="my-4" style="opacity: 0.25;" />
+        <div class="d-flex align-center justify-space-between flex-wrap ga-3">
+          <div class="d-flex align-center flex-wrap ga-2">
+            <span class="text-body-2 font-weight-medium d-flex align-center ga-1">
+              <v-icon size="small" color="secondary">mdi-server</v-icon>
+              <span>{{ $t('setting.systemTimeHostTitle') }}：</span>
+            </span>
+
+            <v-progress-circular
+              v-if="systemTimeZoneLoadState === 'loading'"
+              indeterminate
+              size="14"
+              width="2"
+              color="primary"
             />
-            <div v-if="systemTimeZoneLoadState === 'error'" class="text-caption text-error mt-1">
-              <div>{{ $t('setting.systemTimeReadFailed') }}：{{ systemTimeZoneLoadError || $t('setting.requestFailed') }}</div>
-              <v-btn class="mt-1" size="small" variant="text" color="primary" @click="emit('retrySystemTimezone')">
+            <v-chip
+              v-else-if="effectiveSystemTimeLocation"
+              size="small"
+              variant="tonal"
+              color="info"
+              label
+            >
+              {{ effectiveSystemTimeLocation }}
+            </v-chip>
+            <span v-else-if="systemTimeZoneLoadState === 'error'" class="text-caption text-error">
+              {{ systemTimeZoneLoadError || $t('setting.systemTimeReadFailed') }}
+              <v-btn
+                class="ml-1 px-1"
+                size="x-small"
+                variant="text"
+                color="primary"
+                @click="emit('retrySystemTimezone')"
+              >
                 {{ $t('setting.systemTimeReload') }}
               </v-btn>
-            </div>
-            <div v-else-if="systemTimeZoneStatus.reason" class="text-caption text-medium-emphasis mt-1">
-              {{ systemTimeZoneStatus.reason }}
-            </div>
-            <div v-else class="text-caption text-medium-emphasis mt-1">{{ $t('setting.systemTimeScope') }}</div>
-          </v-col>
-        </v-row>
+            </span>
+            <span v-else class="text-caption text-medium-emphasis">
+              {{ systemTimeZoneStatus.reason || $t('setting.panelUnknown') }}
+            </span>
+          </div>
+
+          <div class="d-flex align-center flex-wrap ga-2">
+            <!-- 一键填入面板时区 -->
+            <v-btn
+              size="small"
+              variant="tonal"
+              color="secondary"
+              prepend-icon="mdi-arrow-up-bold-box-outline"
+              :disabled="disabled || !effectiveSystemTimeLocation || isCurrentPanelTimeSameAsSystem"
+              @click="applySystemTimeToPanel"
+            >
+              {{ $t('setting.systemTimeApplyToPanel') }}
+            </v-btn>
+
+            <!-- 独立修改系统时区按钮 -->
+            <v-btn
+              v-if="systemTimeZoneStatus.canModify"
+              size="small"
+              variant="outlined"
+              color="primary"
+              prepend-icon="mdi-pencil-outline"
+              :disabled="disabled || systemTimeZoneLoadState === 'loading' || modifySystemTimeLoading"
+              @click="openModifySystemTimeDialog"
+            >
+              {{ $t('setting.modifySystemTimeBtn') }}
+            </v-btn>
+          </div>
+        </div>
+
+        <div class="text-caption text-medium-emphasis mt-2">
+          <span v-if="systemTimeZoneStatus.reason && !systemTimeZoneStatus.canModify">
+            {{ systemTimeZoneStatus.reason }}。{{ $t('setting.systemTimeUnsupportedNotice') }}
+          </span>
+          <span v-else>
+            {{ $t('setting.systemTimeNotice') }}
+          </span>
+        </div>
       </v-card-text>
     </v-card>
 
@@ -500,6 +552,51 @@
         </v-card-actions>
       </v-card>
     </v-dialog>
+
+    <!-- 修改宿主机系统时区 Dialog -->
+    <v-dialog v-model="modifySystemTimeDialogVisible" max-width="480">
+      <v-card rounded="xl">
+        <v-card-title class="text-subtitle-1 font-weight-medium d-flex align-center ga-2 pt-4 px-4">
+          <v-icon size="small" color="primary">mdi-server-cog</v-icon>
+          <span>{{ $t('setting.modifySystemTimeDialogTitle') }}</span>
+        </v-card-title>
+        <v-divider />
+        <v-card-text class="pt-4">
+          <v-alert type="warning" variant="tonal" density="compact" class="mb-4">
+            {{ $t('setting.modifySystemTimeDialogDesc') }}
+          </v-alert>
+
+          <v-select
+            v-model="modifySystemTimeTarget"
+            :items="timeZoneOptions"
+            item-title="title"
+            item-value="value"
+            item-props="props"
+            :label="$t('setting.systemTimeLoc')"
+            hide-details
+            density="comfortable"
+            :menu-props="{ maxHeight: 320 }"
+            :disabled="modifySystemTimeLoading"
+          />
+        </v-card-text>
+        <v-divider />
+        <v-card-actions class="pa-3">
+          <v-spacer />
+          <v-btn variant="text" :disabled="modifySystemTimeLoading" @click="modifySystemTimeDialogVisible = false">
+            {{ $t('actions.cancel') }}
+          </v-btn>
+          <v-btn
+            color="primary"
+            variant="flat"
+            :loading="modifySystemTimeLoading"
+            :disabled="modifySystemTimeLoading || !modifySystemTimeTarget"
+            @click="submitModifySystemTimeZone"
+          >
+            {{ modifySystemTimeLoading ? $t('setting.modifySystemTimeExecuting') : $t('setting.modifySystemTimeConfirm') }}
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </div>
 </template>
 
@@ -719,6 +816,63 @@ watch(
 const onSystemTimeLocationSelected = (val: string) => {
   emit('update:systemTimeLocation', val)
   emit('systemTimeLocationSelected', val)
+}
+
+// --- 宿主机系统时区独立管理与联动 ---
+const modifySystemTimeDialogVisible = ref(false)
+const modifySystemTimeTarget = ref('')
+const modifySystemTimeLoading = ref(false)
+
+const effectiveSystemTimeLocation = computed(() => {
+  return String(props.systemTimeLocation || props.systemTimeZoneStatus?.timeLocation || '').trim()
+})
+
+const isCurrentPanelTimeSameAsSystem = computed(() => {
+  const currentPanel = String(props.settings.timeLocation ?? '').trim()
+  const sys = effectiveSystemTimeLocation.value
+  return currentPanel !== '' && sys !== '' && currentPanel === sys
+})
+
+const applySystemTimeToPanel = () => {
+  const sys = effectiveSystemTimeLocation.value
+  if (!sys) return
+  props.settings.timeLocation = sys
+  push.success({
+    title: i18n.global.t('success'),
+    duration: 4000,
+    message: i18n.global.t('setting.systemTimeApplySuccess'),
+  })
+}
+
+const openModifySystemTimeDialog = () => {
+  modifySystemTimeTarget.value = effectiveSystemTimeLocation.value || props.settings.timeLocation || 'UTC'
+  modifySystemTimeDialogVisible.value = true
+}
+
+const submitModifySystemTimeZone = async () => {
+  const target = String(modifySystemTimeTarget.value ?? '').trim()
+  if (!target) return
+  modifySystemTimeLoading.value = true
+  try {
+    const msg = await HttpUtils.post('api/system-timezone', { timeLocation: target }, { timeout: 15000 })
+    if (msg.success) {
+      push.success({
+        title: i18n.global.t('success'),
+        duration: 4000,
+        message: i18n.global.t('setting.modifySystemTimeSuccess'),
+      })
+      modifySystemTimeDialogVisible.value = false
+      emit('retrySystemTimezone')
+    } else {
+      push.error({
+        title: i18n.global.t('failed'),
+        duration: 6000,
+        message: msg.msg || i18n.global.t('requestFailed'),
+      })
+    }
+  } finally {
+    modifySystemTimeLoading.value = false
+  }
 }
 
 // --- 面板更新与生命周期状态 ---
