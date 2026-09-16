@@ -931,7 +931,7 @@
                 color="error"
                 variant="tonal"
                 prepend-icon="mdi-delete"
-                :disabled="!hasLoaded || !extRule.canDelete || hasFirewallWriteInProgress"
+                :disabled="!hasLoaded || !overview.enabled || !extRule.canDelete || hasFirewallWriteInProgress"
                 @click="removeRule(extRule)">
                 清理规则
               </v-btn>

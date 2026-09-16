@@ -882,7 +882,7 @@ export function useFirewallManage(props: { active?: boolean }) {
     systemRuleBusyKey.value = systemKey
     beginOverviewMutation()
     try {
-      const msg = await HttpUtils.post('api/firewall-system-rule', { systemKey, reserved }, {
+      const msg = await HttpUtils.post('api/firewall-system-rule', { systemKey, enabled: reserved, reserved }, {
         headers: { 'Content-Type': 'application/json' },
       })
       if (msg.success && msg.obj) {
@@ -1409,6 +1409,14 @@ export function useFirewallManage(props: { active?: boolean }) {
         portSpec: editingRuleNeedsPort.value ? editingRule.value.portSpec.trim() : '',
         sourceSpec: editingRuleNeedsSource.value ? editingRule.value.sourceSpec.trim() : '',
         sourceMode: editingRuleNeedsSource.value ? editingRule.value.sourceMode : '',
+      }
+
+      if (editingRuleNeedsPort.value && !payload.portSpec) {
+        push.warning({
+          duration: 4000,
+          message: '请填写端口或端口范围',
+        })
+        return
       }
 
       if (['block', 'allow'].includes(payload.sourceMode) && !payload.sourceSpec) {
