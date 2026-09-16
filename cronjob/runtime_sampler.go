@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/logger"
 	"github.com/alireza0/s-ui/service"
 )
@@ -70,6 +71,8 @@ type RuntimeSampler struct {
 	stats             *StatsJob
 	portForward       *PortForwardSyncJob
 	deplete           *DepleteJob
+
+	lastOSMemoryRelease time.Time
 
 	// taskOverrides exists for focused scheduler tests. Production instances
 	// leave it nil and always execute the concrete panel services above.
@@ -327,8 +330,10 @@ func (s *RuntimeSampler) run(stopCh <-chan struct{}, wakeCh <-chan struct{}, don
 }
 
 func (s *RuntimeSampler) runScavenge() {
+	database.ShrinkMemory()
 	runtime.GC()
 	debug.FreeOSMemory()
+	s.lastOSMemoryRelease = time.Now()
 }
 
 func (s *RuntimeSampler) runWakePass() {
@@ -417,8 +422,11 @@ func (s *RuntimeSampler) flushJournal() error {
 	}
 	hadPending := service.HasPendingTrafficRuntimeJournal()
 	err := service.FlushTrafficRuntimeJournal()
-	if hadPending {
+	now := time.Now()
+	// 有待刷库数据时立即释放；静默空载期若距离上次归还超过2分钟亦保底释放，确保常驻物理内存不漂移
+	if hadPending || s.lastOSMemoryRelease.IsZero() || now.Sub(s.lastOSMemoryRelease) >= 2*time.Minute {
 		debug.FreeOSMemory()
+		s.lastOSMemoryRelease = now
 	}
 	return err
 }

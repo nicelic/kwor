@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/alireza0/s-ui/config"
 	"github.com/alireza0/s-ui/database/model"
@@ -59,8 +58,8 @@ func InitDDNSDB() error {
 	}
 	sqlDB.SetMaxOpenConns(1)
 	sqlDB.SetMaxIdleConns(1)
-	sqlDB.SetConnMaxLifetime(10 * time.Minute)
-	sqlDB.SetConnMaxIdleTime(3 * time.Minute)
+	sqlDB.SetConnMaxLifetime(0)
+	sqlDB.SetConnMaxIdleTime(0)
 
 	if config.IsDebug() {
 		openedDB = openedDB.Debug()

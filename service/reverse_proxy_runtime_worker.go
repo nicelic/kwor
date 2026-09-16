@@ -8,7 +8,7 @@ import (
 	"github.com/alireza0/s-ui/logger"
 )
 
-const reverseProxyRuntimeMonitorInterval = 30 * time.Second
+const reverseProxyRuntimeMonitorInterval = 2 * time.Minute
 
 // reverseProxyRuntimeWorker keeps reverse-proxy reconciliation independent
 // from the sampler that handles traffic counters and nftables.  Reconcile

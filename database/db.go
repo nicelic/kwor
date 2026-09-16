@@ -10,7 +10,6 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/alireza0/s-ui/config"
 	"github.com/alireza0/s-ui/database/model"
@@ -116,8 +115,8 @@ func OpenDB(dbPath string) error {
 	// keeps connection-level PRAGMA state uniform.
 	sqlDB.SetMaxOpenConns(1)
 	sqlDB.SetMaxIdleConns(1)
-	sqlDB.SetConnMaxLifetime(10 * time.Minute)
-	sqlDB.SetConnMaxIdleTime(3 * time.Minute)
+	sqlDB.SetConnMaxLifetime(0)
+	sqlDB.SetConnMaxIdleTime(0)
 
 	if config.IsDebug() {
 		openedDB = openedDB.Debug()
@@ -583,4 +582,18 @@ func ensurePanelCertificateBalanceIndexes(db *gorm.DB) error {
 	}
 	createSQL := "CREATE UNIQUE INDEX IF NOT EXISTS idx_panel_cert_balance_listener_sni_cert ON panel_certificate_balance_states(listener_key, sni_bucket, certificate_record_id)"
 	return db.Exec(createSQL).Error
+}
+
+// ShrinkMemory 主动收缩已打开数据库的内存占用，触发 SQLite 释放内部 pager 缓存与空闲堆。
+// 注意：严禁在此主动调用 InitDDNSDB()，必须安全检查仅在 DDNS 已初始化时执行收缩，严格维护按需延迟加载边界。
+func ShrinkMemory() {
+	if currentDB := GetDB(); currentDB != nil {
+		_ = currentDB.Exec("PRAGMA shrink_memory").Error
+	}
+	ddnsDBMu.RLock()
+	currentDDNSDB := ddnsDB
+	ddnsDBMu.RUnlock()
+	if currentDDNSDB != nil {
+		_ = currentDDNSDB.Exec("PRAGMA shrink_memory").Error
+	}
 }

@@ -234,7 +234,7 @@ const (
 	trafficOverviewMinDisplayGiB       = 0.01
 	trafficOverviewFlushDelta          = int64(1024 * 1024)
 	trafficOverviewFlushInterval       = 30 * time.Second
-	trafficOverviewConfigCacheTTL      = 30 * time.Second
+	trafficOverviewConfigCacheTTL      = 5 * time.Minute
 	trafficOverviewCapEvaluateInterval = 30 * time.Second
 	vnstatStatusCacheTTL               = 15 * time.Second
 	maxVnstatCommandOutputBytes        = 1024 * 1024
@@ -3325,6 +3325,9 @@ func markTrafficOverviewCapReconcileNeeded() {
 	trafficOverviewCapScheduleMu.Lock()
 	trafficOverviewCapLastEvaluatedAt = time.Time{}
 	trafficOverviewCapScheduleMu.Unlock()
+	trafficOverviewConfigMu.Lock()
+	trafficOverviewConfigCache.loaded = false
+	trafficOverviewConfigMu.Unlock()
 }
 
 func shouldEvaluateTrafficCapNow() bool {

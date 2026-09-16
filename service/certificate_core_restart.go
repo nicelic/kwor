@@ -135,10 +135,21 @@ func queueCertificateCoreRestart(kind string, recordID uint, fingerprint string)
 	return nil
 }
 
+func hasPendingCertificateCoreRestart() bool {
+	coordinator := certificateCoreRestartCoordinator
+	coordinator.mu.Lock()
+	defer coordinator.mu.Unlock()
+	coordinator.loadLocked()
+	return coordinator.persisted.Singbox.Pending || coordinator.persisted.Mihomo.Pending
+}
+
 // ProcessCertificateCoreRestartQueue is intentionally lightweight and may run
 // every minute. It never starts a stopped Core and it defers while an automatic
 // renewal batch is still accepting candidates or resolving rapid retries.
 func ProcessCertificateCoreRestartQueue() error {
+	if !hasPendingCertificateCoreRestart() {
+		return nil
+	}
 	if certificateCoreRestartMustWaitForRenewalBatch() {
 		return nil
 	}

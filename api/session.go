@@ -87,11 +87,13 @@ func loginSessionReasonIsTransient(reason string) bool {
 
 var loginSessionRegistry = struct {
 	sync.Mutex
-	epoch    string
-	sessions map[string]loginSessionRecord
+	epoch        string
+	sessions     map[string]loginSessionRecord
+	hasPersisted bool
 }{
-	epoch:    newLoginSessionEpoch(),
-	sessions: make(map[string]loginSessionRecord),
+	epoch:        newLoginSessionEpoch(),
+	sessions:     make(map[string]loginSessionRecord),
+	hasPersisted: false,
 }
 
 var (
@@ -108,6 +110,7 @@ func InitializeLoginSessionStore() error {
 	memoryCount := len(loginSessionRegistry.sessions)
 	loginSessionRegistry.sessions = make(map[string]loginSessionRecord)
 	loginSessionRegistry.epoch = newLoginSessionEpoch()
+	loginSessionRegistry.hasPersisted = false
 	persistedCount, err := clearPersistedLoginSessionsLocked()
 	loginSessionRegistry.Unlock()
 	if err != nil {
@@ -125,6 +128,10 @@ func startLoginSessionCleanup() {
 		defer ticker.Stop()
 		for now := range ticker.C {
 			loginSessionRegistry.Lock()
+			if len(loginSessionRegistry.sessions) == 0 && !loginSessionRegistry.hasPersisted {
+				loginSessionRegistry.Unlock()
+				continue
+			}
 			pruneExpiredLoginSessionsLocked(now)
 			err := prunePersistedLoginSessionsLocked(now)
 			if err == nil {
@@ -627,7 +634,11 @@ func savePersistedLoginSessionLocked(tokenHash string, record loginSessionRecord
 	if db == nil {
 		return fmt.Errorf("login session database is unavailable")
 	}
-	return db.Create(loginSessionModel(tokenHash, record)).Error
+	err := db.Create(loginSessionModel(tokenHash, record)).Error
+	if err == nil {
+		loginSessionRegistry.hasPersisted = true
+	}
+	return err
 }
 
 func updatePersistedLoginSessionLocked(tokenHash string, record loginSessionRecord) error {
@@ -703,6 +714,7 @@ func refillInMemoryLoginSessionsLocked(now time.Time) error {
 		err := db.Order("updated_at DESC").Take(&candidate).Error
 		if err != nil {
 			if err == gorm.ErrRecordNotFound {
+				loginSessionRegistry.hasPersisted = false
 				return nil
 			}
 			return err

@@ -65,7 +65,7 @@ type systemdUnitStats struct {
 
 const (
 	systemdStatusCommandTimeout = 2 * time.Second
-	systemdUnitActiveCacheTTL   = 3 * time.Second
+	systemdUnitActiveCacheTTL   = 45 * time.Second
 	systemdUnitInactiveCacheTTL = time.Minute
 )
 
