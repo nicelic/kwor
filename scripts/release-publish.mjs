@@ -2,7 +2,9 @@
 
 import { execFileSync, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
+import http from 'node:http'
 import https from 'node:https'
+import tls from 'node:tls'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -429,6 +431,55 @@ function printDockerVerification(run, release) {
   console.log(`Verified Docker platforms: ${release.platforms.join(', ')}`)
 }
 
+let cachedProxyAgent = null
+let proxyAgentResolved = false
+
+function getProxyAgent() {
+  if (proxyAgentResolved) {
+    return cachedProxyAgent
+  }
+  proxyAgentResolved = true
+
+  const rawProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || process.env.ALL_PROXY || process.env.all_proxy || 'http://127.0.0.1:7890'
+  if (!rawProxy) {
+    return null
+  }
+
+  try {
+    const proxyUrl = new URL(rawProxy.startsWith('http') ? rawProxy : `http://${rawProxy}`)
+    cachedProxyAgent = new https.Agent({
+      createConnection(options, callback) {
+        const req = http.request({
+          host: proxyUrl.hostname,
+          port: Number(proxyUrl.port) || 80,
+          method: 'CONNECT',
+          path: `${options.host}:${options.port || 443}`,
+          headers: {
+            Host: `${options.host}:${options.port || 443}`,
+          },
+        })
+        req.on('connect', (res, socket) => {
+          if (res.statusCode !== 200) {
+            socket.destroy()
+            callback(new Error(`Proxy CONNECT failed: HTTP ${res.statusCode}`))
+            return
+          }
+          const tlsSocket = tls.connect({
+            socket,
+            servername: options.servername || options.host,
+          })
+          callback(null, tlsSocket)
+        })
+        req.on('error', err => callback(err))
+        req.end()
+      },
+    })
+    return cachedProxyAgent
+  } catch {
+    return null
+  }
+}
+
 async function createAndUploadRelease({ repository, token, tagName, branch, releaseAssets, notes = '' }) {
   const releasePath = `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/releases/tags/${encodeURIComponent(tagName)}`
   const existing = await githubRequest({
@@ -442,6 +493,26 @@ async function createAndUploadRelease({ repository, token, tagName, branch, rele
   }
   if (existing.statusCode !== 404) {
     fail([`Cannot check GitHub Release ${tagName}: ${formatGitHubError(existing)}`])
+  }
+
+  // 检查是否有中断遗留的同名 draft release，若有则先清理
+  const allReleases = await githubRequest({
+    method: 'GET',
+    hostname: 'api.github.com',
+    requestPath: `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/releases`,
+    token,
+  })
+  if (Array.isArray(allReleases.data)) {
+    const draftRelease = allReleases.data.find(r => r.tag_name === tagName && r.draft === true)
+    if (draftRelease?.id) {
+      console.log(`Cleaning up leftover draft release ${tagName} (${draftRelease.id}) ...`)
+      await githubRequest({
+        method: 'DELETE',
+        hostname: 'api.github.com',
+        requestPath: `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/releases/${draftRelease.id}`,
+        token,
+      })
+    }
   }
 
   const created = await githubRequest({
@@ -532,11 +603,13 @@ function verifyReleaseAssets({ release, tagName, releaseAssets, expectDraft, not
 
 function githubRequest({ method, hostname, requestPath, token, body }) {
   const payload = body === undefined ? null : Buffer.from(JSON.stringify(body))
+  const agent = getProxyAgent()
   return new Promise((resolve, reject) => {
     const request = https.request({
       hostname,
       method,
       path: requestPath,
+      agent: agent || undefined,
       headers: {
         Accept: 'application/vnd.github+json',
         Authorization: `Bearer ${token}`,
@@ -572,10 +645,12 @@ function githubRequest({ method, hostname, requestPath, token, body }) {
 function uploadReleaseAsset({ repository, token, releaseId, asset }) {
   return new Promise((resolve, reject) => {
     const requestPath = `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/releases/${releaseId}/assets?name=${encodeURIComponent(asset.name)}`
+    const agent = getProxyAgent()
     const request = https.request({
       hostname: 'uploads.github.com',
       method: 'POST',
       path: requestPath,
+      agent: agent || undefined,
       headers: {
         Accept: 'application/vnd.github+json',
         Authorization: `Bearer ${token}`,
@@ -600,7 +675,19 @@ function uploadReleaseAsset({ repository, token, releaseId, asset }) {
     })
     request.on('error', reject)
 
+    let uploaded = 0
+    let lastPercent = -1
     const input = fs.createReadStream(asset.filePath)
+    input.on('data', chunk => {
+      uploaded += chunk.length
+      const percent = Math.floor((uploaded / asset.size) * 100)
+      if (percent !== lastPercent && (percent % 25 === 0 || percent === 100)) {
+        lastPercent = percent
+        const mbUploaded = (uploaded / (1024 * 1024)).toFixed(1)
+        const mbTotal = (asset.size / (1024 * 1024)).toFixed(1)
+        console.log(`    [Uploading ${asset.name}] ${mbUploaded} MB / ${mbTotal} MB (${percent}%)`)
+      }
+    })
     input.on('error', reject)
     input.pipe(request)
   })

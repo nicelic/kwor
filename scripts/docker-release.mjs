@@ -1,4 +1,55 @@
+import http from 'node:http'
 import https from 'node:https'
+import tls from 'node:tls'
+
+let cachedProxyAgent = null
+let proxyAgentResolved = false
+
+function getProxyAgent() {
+  if (proxyAgentResolved) {
+    return cachedProxyAgent
+  }
+  proxyAgentResolved = true
+
+  const rawProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || process.env.ALL_PROXY || process.env.all_proxy || 'http://127.0.0.1:7890'
+  if (!rawProxy) {
+    return null
+  }
+
+  try {
+    const proxyUrl = new URL(rawProxy.startsWith('http') ? rawProxy : `http://${rawProxy}`)
+    cachedProxyAgent = new https.Agent({
+      createConnection(options, callback) {
+        const req = http.request({
+          host: proxyUrl.hostname,
+          port: Number(proxyUrl.port) || 80,
+          method: 'CONNECT',
+          path: `${options.host}:${options.port || 443}`,
+          headers: {
+            Host: `${options.host}:${options.port || 443}`,
+          },
+        })
+        req.on('connect', (res, socket) => {
+          if (res.statusCode !== 200) {
+            socket.destroy()
+            callback(new Error(`Proxy CONNECT failed: HTTP ${res.statusCode}`))
+            return
+          }
+          const tlsSocket = tls.connect({
+            socket,
+            servername: options.servername || options.host,
+          })
+          callback(null, tlsSocket)
+        })
+        req.on('error', err => callback(err))
+        req.end()
+      },
+    })
+    return cachedProxyAgent
+  } catch {
+    return null
+  }
+}
 
 export const DOCKER_WORKFLOW_FILE = 'docker.yml'
 export const DOCKER_WORKFLOW_TIMEOUT_MS = 60 * 60 * 1000
@@ -272,11 +323,13 @@ function githubRequest({ token, requestPath }) {
 }
 
 function requestJson({ hostname, requestPath, headers }) {
+  const agent = getProxyAgent()
   return new Promise((resolve, reject) => {
     const request = https.request({
       hostname,
       method: 'GET',
       path: requestPath,
+      agent: agent || undefined,
       headers,
     }, response => {
       const chunks = []
