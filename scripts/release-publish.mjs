@@ -19,6 +19,56 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const rootDir = path.resolve(__dirname, '..')
 
+let cachedProxyAgent = null
+let proxyAgentResolved = false
+
+function getProxyAgent() {
+  if (proxyAgentResolved) {
+    return cachedProxyAgent
+  }
+  proxyAgentResolved = true
+
+  const rawProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || process.env.ALL_PROXY || process.env.all_proxy || 'http://127.0.0.1:7890'
+  if (!rawProxy) {
+    return null
+  }
+
+  try {
+    const proxyUrl = new URL(rawProxy.startsWith('http') ? rawProxy : `http://${rawProxy}`)
+    cachedProxyAgent = new https.Agent({
+      createConnection(options, callback) {
+        const req = http.request({
+          host: proxyUrl.hostname,
+          port: Number(proxyUrl.port) || 80,
+          method: 'CONNECT',
+          path: `${options.host}:${options.port || 443}`,
+          headers: {
+            Host: `${options.host}:${options.port || 443}`,
+          },
+        })
+        req.on('connect', (res, socket) => {
+          if (res.statusCode !== 200) {
+            socket.destroy()
+            callback(new Error(`Proxy CONNECT failed: HTTP ${res.statusCode}`))
+            return
+          }
+          const tlsSocket = tls.connect({
+            socket,
+            servername: options.servername || options.host,
+          })
+          callback(null, tlsSocket)
+        })
+        req.on('error', err => callback(err))
+        req.end()
+      },
+    })
+    return cachedProxyAgent
+  } catch {
+    return null
+  }
+}
+
+
 const argv = process.argv.slice(2)
 const push = argv.includes('--push')
 const retag = argv.includes('--retag')
@@ -431,54 +481,6 @@ function printDockerVerification(run, release) {
   console.log(`Verified Docker platforms: ${release.platforms.join(', ')}`)
 }
 
-let cachedProxyAgent = null
-let proxyAgentResolved = false
-
-function getProxyAgent() {
-  if (proxyAgentResolved) {
-    return cachedProxyAgent
-  }
-  proxyAgentResolved = true
-
-  const rawProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || process.env.ALL_PROXY || process.env.all_proxy || 'http://127.0.0.1:7890'
-  if (!rawProxy) {
-    return null
-  }
-
-  try {
-    const proxyUrl = new URL(rawProxy.startsWith('http') ? rawProxy : `http://${rawProxy}`)
-    cachedProxyAgent = new https.Agent({
-      createConnection(options, callback) {
-        const req = http.request({
-          host: proxyUrl.hostname,
-          port: Number(proxyUrl.port) || 80,
-          method: 'CONNECT',
-          path: `${options.host}:${options.port || 443}`,
-          headers: {
-            Host: `${options.host}:${options.port || 443}`,
-          },
-        })
-        req.on('connect', (res, socket) => {
-          if (res.statusCode !== 200) {
-            socket.destroy()
-            callback(new Error(`Proxy CONNECT failed: HTTP ${res.statusCode}`))
-            return
-          }
-          const tlsSocket = tls.connect({
-            socket,
-            servername: options.servername || options.host,
-          })
-          callback(null, tlsSocket)
-        })
-        req.on('error', err => callback(err))
-        req.end()
-      },
-    })
-    return cachedProxyAgent
-  } catch {
-    return null
-  }
-}
 
 async function createAndUploadRelease({ repository, token, tagName, branch, releaseAssets, notes = '' }) {
   const releasePath = `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/releases/tags/${encodeURIComponent(tagName)}`
