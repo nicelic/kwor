@@ -338,6 +338,9 @@ func (s *ProManagerService) GenerateFullConfigWithDB(db *gorm.DB) (*ProManagerSi
 	if err := (&DnsServerService{}).ApplySelectedServerToCoreConfig(db, config); err != nil {
 		return nil, fmt.Errorf("应用选中的 DNS 服务器失败: %w", err)
 	}
+	if err := normalizeSingboxRouteDefaultDomainResolver(config); err != nil {
+		return nil, fmt.Errorf("同步 DNS 默认域名解析器失败: %w", err)
+	}
 
 	// 聚合所有数据库对象
 	config.Inbounds, err = s.InboundService.GetAllConfig(db)
@@ -516,6 +519,47 @@ func normalizeSingboxDNSConfig(config *ProManagerSingBoxConfig) error {
 		return err
 	}
 	config.Dns = dnsData
+	return nil
+}
+
+// normalizeSingboxRouteDefaultDomainResolver keeps the generated server
+// configuration self-contained: route.default_domain_resolver must reference
+// the same server-side DNS tag as dns.final. Client subscription tags are
+// handled by a separate generation path and never participate here.
+func normalizeSingboxRouteDefaultDomainResolver(config *ProManagerSingBoxConfig) error {
+	if config == nil || len(config.Dns) == 0 {
+		return nil
+	}
+
+	dnsMap := map[string]interface{}{}
+	if err := json.Unmarshal(config.Dns, &dnsMap); err != nil {
+		return err
+	}
+	finalTag, _ := dnsMap["final"].(string)
+	finalTag = strings.TrimSpace(finalTag)
+	if finalTag == "" {
+		return nil
+	}
+
+	routeMap := map[string]interface{}{}
+	if len(config.Route) > 0 && string(config.Route) != "null" {
+		if err := json.Unmarshal(config.Route, &routeMap); err != nil {
+			return err
+		}
+	}
+	if routeMap == nil {
+		routeMap = map[string]interface{}{}
+	}
+	if currentTag, _ := routeMap["default_domain_resolver"].(string); strings.TrimSpace(currentTag) == finalTag {
+		return nil
+	}
+
+	routeMap["default_domain_resolver"] = finalTag
+	routeData, err := json.Marshal(routeMap)
+	if err != nil {
+		return err
+	}
+	config.Route = routeData
 	return nil
 }
 

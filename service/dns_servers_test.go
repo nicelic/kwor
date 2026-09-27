@@ -101,6 +101,13 @@ func TestGenerateFullConfigIncludesBootstrapAndAllDNSServers(t *testing.T) {
 	if err := json.Unmarshal(config.Dns, &dns); err != nil {
 		t.Fatalf("decode generated dns config: %v", err)
 	}
+	route := map[string]interface{}{}
+	if err := json.Unmarshal(config.Route, &route); err != nil {
+		t.Fatalf("decode generated route config: %v", err)
+	}
+	if resolver, _ := route["default_domain_resolver"].(string); resolver != "dns-selected" {
+		t.Fatalf("generated route.default_domain_resolver = %q, want dns-selected", resolver)
+	}
 	runtimeServers, ok := dns["servers"].([]interface{})
 	if !ok || len(runtimeServers) != 3 {
 		t.Fatalf("expected bootstrap and all configured runtime DNS servers, got %#v", dns["servers"])

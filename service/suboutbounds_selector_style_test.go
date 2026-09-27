@@ -103,6 +103,17 @@ func TestBuildSubJsonFullConfig_NormalizesDetourAndRouteFinal(t *testing.T) {
 	}
 }
 
+func TestBuildSubJsonFullConfigKeepsClientDNSResolverTagIndependent(t *testing.T) {
+	cfg := buildSubJsonFullConfig(nil, `{"default_domain_resolver":"direct-dns","dns":{"servers":[{"tag":"direct-dns"}]}}`)
+	route, _ := cfg["route"].(map[string]interface{})
+	if route == nil {
+		t.Fatalf("route should exist")
+	}
+	if got, _ := route["default_domain_resolver"].(string); got != "direct-dns" {
+		t.Fatalf("client subscription resolver = %q, want independent client tag direct-dns", got)
+	}
+}
+
 func TestNormalizeRouteFinalOutbound_UsesSelectorTags(t *testing.T) {
 	if got := normalizeRouteFinalOutbound("proxy"); got != finalSelectorTag {
 		t.Fatalf("expected proxy -> %q, got %q", finalSelectorTag, got)

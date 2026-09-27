@@ -9,6 +9,25 @@ import (
 	"github.com/alireza0/s-ui/database/model"
 )
 
+func TestNormalizeSingboxRouteDefaultDomainResolverUsesServerDNSFinal(t *testing.T) {
+	config := &ProManagerSingBoxConfig{
+		Dns: json.RawMessage(`{"final":"tls_1.1.1.1","servers":[{"tag":"tls_1.1.1.1"}]}`),
+		Route: json.RawMessage(`{"default_domain_resolver":"direct-dns","rules":[]}`),
+	}
+
+	if err := normalizeSingboxRouteDefaultDomainResolver(config); err != nil {
+		t.Fatalf("normalize server route resolver failed: %v", err)
+	}
+
+	var route map[string]interface{}
+	if err := json.Unmarshal(config.Route, &route); err != nil {
+		t.Fatalf("decode normalized route failed: %v", err)
+	}
+	if got, _ := route["default_domain_resolver"].(string); got != "tls_1.1.1.1" {
+		t.Fatalf("server route resolver = %q, want server DNS tag tls_1.1.1.1", got)
+	}
+}
+
 func TestNormalizeSingboxDNSConfig_RemovesLegacyServerStrategy(t *testing.T) {
 	config := &ProManagerSingBoxConfig{
 		Dns: json.RawMessage(`{

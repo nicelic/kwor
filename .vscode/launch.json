@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "kwor: F5 debug",
+      "type": "go",
+      "request": "launch",
+      "mode": "exec",
+      "program": "${workspaceFolder}/.vscode/bin/kwor-dev.exe",
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "kwor: prepare F5 debug",
+      "env": {
+        "KWOR_DEBUG": "true"
+      },
+      "serverReadyAction": {
+        "action": "openExternally",
+        "pattern": "web server run http on .*:(\\d+)",
+        "uriFormat": "http://127.0.0.1:%s/app"
+      },
+      "sourceLanguages": [
+        "go"
+      ]
+    }
+  ]
+}
