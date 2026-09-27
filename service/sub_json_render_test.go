@@ -7,6 +7,30 @@ import (
 	"github.com/alireza0/s-ui/database/model"
 )
 
+func TestRenderManagedSingboxSubscriptionJSONOmitsDefaultTunStack(t *testing.T) {
+	result, err := renderManagedSingboxSubscriptionJSON(nil, "{}", func(store string) string { return store })
+	if err != nil {
+		t.Fatalf("renderManagedSingboxSubscriptionJSON returned error: %v", err)
+	}
+
+	var doc map[string]interface{}
+	if err := json.Unmarshal(result, &doc); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+
+	inbounds, ok := doc["inbounds"].([]interface{})
+	if !ok || len(inbounds) == 0 {
+		t.Fatalf("expected rendered inbounds, got %#v", doc["inbounds"])
+	}
+	tun, ok := inbounds[0].(map[string]interface{})
+	if !ok || tun["type"] != "tun" {
+		t.Fatalf("expected first inbound to be tun, got %#v", inbounds[0])
+	}
+	if _, exists := tun["stack"]; exists {
+		t.Fatalf("default tun inbound must omit stack, got %#v", tun["stack"])
+	}
+}
+
 func TestRenderManagedSingboxSubscriptionJSON_StripsMihomoFieldsAndNormalizesLatency(t *testing.T) {
 	result, err := renderManagedSingboxSubscriptionJSON(
 		[]map[string]interface{}{

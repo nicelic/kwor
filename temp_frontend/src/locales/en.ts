@@ -698,7 +698,7 @@ export default {
 	  strictRoute: "Strict routing",
 	  tcpConcurrent: "Concurrent TCP (tcp-concurrent)",
 	  tunAddress: "TUN interface addresses",
-	  tunMode: "TUN mode",
+	  tunMode: "TUN mode (`stack` deprecated in 1.15.0 and removed in 1.17.0)",
 	  unifiedDelay: "Unified delay",
 	  updateInterval: "Update interval, for example 1m, 1h, or 1d",
 	  updateMethod: "Update route",

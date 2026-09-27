@@ -145,7 +145,6 @@ export const defaultTunInbound = {
   auto_route: true,
   strict_route: true,
   endpoint_independent_nat: false,
-  stack: "mixed",
   exclude_package: [] as string[],
 }
 
@@ -157,7 +156,6 @@ export const defaultInb = [
     auto_route: true,
     strict_route: true,
     endpoint_independent_nat: false,
-    stack: "mixed",
     exclude_package: [] as string[],
   },
   {

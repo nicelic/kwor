@@ -618,7 +618,12 @@
             <v-col cols="12" sm="6" md="3">
               <v-select
                 v-model="tunMode"
-                :items="['system', 'mixed', 'gvisor']"
+                :items="[
+                  { title: '', value: '' },
+                  { title: 'system', value: 'system' },
+                  { title: 'mixed', value: 'mixed' },
+                  { title: 'gvisor', value: 'gvisor' },
+                ]"
                 :label="$t('subscriptionEditor.tunMode')"
                 density="comfortable"
                 hide-details

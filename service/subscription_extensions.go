@@ -46,7 +46,6 @@ const SubscriptionJSONBaseConfig = `{
       "auto_route": true,
       "strict_route": true,
       "endpoint_independent_nat": false,
-      "stack": "mixed",
       "exclude_package": []
     },
     {
@@ -146,7 +145,6 @@ const canonicalSubJSONExtension = `{
       "auto_route": true,
       "strict_route": true,
       "endpoint_independent_nat": false,
-      "stack": "mixed",
       "exclude_package": []
     },
     {

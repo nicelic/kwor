@@ -3053,10 +3053,17 @@ export const SubJsonExtMixin = {
     },
     tunMode: {
       get(this: any): string {
-        return this.tunInbound?.stack ?? 'mixed'
+        return typeof this.tunInbound?.stack === 'string' ? this.tunInbound.stack : ''
       },
       set(this: any, v: string) {
-        if (this.tunInbound && this.tunInbound.type === 'tun') this.tunInbound.stack = v
+        const tun = this.tunInbound
+        if (!tun || tun.type !== 'tun') return
+        const stack = typeof v === 'string' ? v.trim() : ''
+        if (stack) {
+          tun.stack = stack
+        } else {
+          delete tun.stack
+        }
       },
     },
     mixedListen: {

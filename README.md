@@ -165,7 +165,7 @@ docker run -itd \
     --network host \
     -v $PWD/Promanager_data:/app/Promanager_data \
     --name kwor --restart=unless-stopped \
-    ghcr.io/nicelic/kwor:v1.6.31
+    ghcr.io/nicelic/kwor:v1.6.32
 ```
 
 ### Uninstall Docker

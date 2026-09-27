@@ -698,7 +698,7 @@ export default {
 	  strictRoute: "严格路由",
 	  tcpConcurrent: "TCP 并发 (tcp-concurrent)",
 	  tunAddress: "TUN 网卡地址",
-	  tunMode: "TUN 模式",
+	  tunMode: "TUN 模式（`stack` 在 1.15.0 废弃，1.17.0 将移除）",
 	  unifiedDelay: "统一延迟 (unified-delay)",
 	  updateInterval: "更新时间，例如 1m、1h 或 1d",
 	  updateMethod: "更新方式",
