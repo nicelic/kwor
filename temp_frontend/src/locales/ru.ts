@@ -488,6 +488,7 @@ export default {
     disableExpire: "Отключить истечение",
     independentCache: "Независимый кэш",
     reverseMapping: "Обратное отображение",
+    bootstrapDns: "Bootstrap DNS",
     domainStrategy: "Стратегия домена",
     rule: {
       add: "Добавить правило DNS",

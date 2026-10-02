@@ -695,6 +695,7 @@ export default {
     disableExpire: "停用過期",
     independentCache: "獨立快取",
     reverseMapping: "反向映射",
+    bootstrapDns: "Bootstrap DNS",
     domainStrategy: "域名策略",
     rule: {
       add: "添加 DNS 規則",

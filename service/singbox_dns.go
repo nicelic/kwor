@@ -520,6 +520,20 @@ func validateSingboxDNSConfigMap(dns map[string]any) error {
 	if _, exists := dns["servers"]; exists {
 		return common.NewError("DNS servers must be saved through DNS server cards")
 	}
+	if bs, exists := dns["bootstrap_dns"]; exists {
+		if bsStr, ok := bs.(string); ok {
+			bsStr = strings.TrimSpace(bsStr)
+			if bsStr == "" {
+				delete(dns, "bootstrap_dns")
+			} else {
+				dns["bootstrap_dns"] = bsStr
+			}
+		} else if bs == nil {
+			delete(dns, "bootstrap_dns")
+		} else {
+			return common.NewError("bootstrap_dns must be a string")
+		}
+	}
 	if err := validateSingboxDNSValue(dns, 0); err != nil {
 		return err
 	}

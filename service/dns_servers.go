@@ -15,9 +15,13 @@ import (
 
 const singboxRuntimeBootstrapDNSTag = "bootstrap-dns"
 
-func singboxRuntimeBootstrapDNSServer() map[string]interface{} {
+func singboxRuntimeBootstrapDNSServer(serverIP string) map[string]interface{} {
+	ip := strings.TrimSpace(serverIP)
+	if ip == "" {
+		ip = "8.8.8.8"
+	}
 	return map[string]interface{}{
-		"server":      "8.8.8.8",
+		"server":      ip,
 		"server_port": 53,
 		"tag":         singboxRuntimeBootstrapDNSTag,
 		"type":        "udp",
@@ -197,6 +201,10 @@ func (s *DnsServerService) ApplySelectedServerToDNSConfig(db *gorm.DB, dnsConfig
 	finalTag, _ := dnsMap["final"].(string)
 	finalTag = strings.TrimSpace(finalTag)
 
+	bootstrapDNS, _ := dnsMap["bootstrap_dns"].(string)
+	bootstrapDNS = strings.TrimSpace(bootstrapDNS)
+	hasBootstrapDNS := bootstrapDNS != ""
+
 	var dbServers []model.DnsServer
 	if err := db.Model(&model.DnsServer{}).Order("id ASC").Find(&dbServers).Error; err != nil {
 		return err
@@ -212,7 +220,7 @@ func (s *DnsServerService) ApplySelectedServerToDNSConfig(db *gorm.DB, dnsConfig
 		delete(full, "id")
 		tag, _ := full["tag"].(string)
 		tag = strings.TrimSpace(tag)
-		if tag == singboxRuntimeBootstrapDNSTag {
+		if hasBootstrapDNS && tag == singboxRuntimeBootstrapDNSTag {
 			return fmt.Errorf("DNS server tag %q is reserved for the runtime bootstrap DNS", singboxRuntimeBootstrapDNSTag)
 		}
 		if tag != "" {
@@ -251,12 +259,20 @@ func (s *DnsServerService) ApplySelectedServerToDNSConfig(db *gorm.DB, dnsConfig
 		return fmt.Errorf("final DNS server %q does not exist", finalTag)
 	}
 
-	runtimeServers := []interface{}{singboxRuntimeBootstrapDNSServer()}
-	for _, server := range allServers {
-		if resolver, _ := server["domain_resolver"].(string); strings.TrimSpace(resolver) == "" {
-			server["domain_resolver"] = singboxRuntimeBootstrapDNSTag
+	var runtimeServers []interface{}
+	if hasBootstrapDNS {
+		runtimeServers = append(runtimeServers, singboxRuntimeBootstrapDNSServer(bootstrapDNS))
+		for _, server := range allServers {
+			if resolver, _ := server["domain_resolver"].(string); strings.TrimSpace(resolver) == "" {
+				server["domain_resolver"] = singboxRuntimeBootstrapDNSTag
+			}
+			runtimeServers = append(runtimeServers, server)
 		}
-		runtimeServers = append(runtimeServers, server)
+	} else {
+		runtimeServers = make([]interface{}, 0, len(allServers))
+		for _, server := range allServers {
+			runtimeServers = append(runtimeServers, server)
+		}
 	}
 
 	if rules, ok := dnsMap["rules"].([]interface{}); ok && len(rules) > 0 {
@@ -267,6 +283,7 @@ func (s *DnsServerService) ApplySelectedServerToDNSConfig(db *gorm.DB, dnsConfig
 		}
 	}
 
+	delete(dnsMap, "bootstrap_dns")
 	dnsMap["servers"] = runtimeServers
 
 	rendered, err := json.Marshal(dnsMap)

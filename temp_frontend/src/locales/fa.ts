@@ -488,6 +488,7 @@ export default {
     disableExpire: "بدون انقضا",
     independentCache: "استقلال cache",
     reverseMapping: "نگاشت معکوس",
+    bootstrapDns: "Bootstrap DNS",
     domainStrategy: "استراتژی دامنه",
     rule: {
       add: "ایجاد قانون DNS",

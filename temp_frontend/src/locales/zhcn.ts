@@ -979,6 +979,7 @@ export default {
     disableExpire: "禁用过期",
     independentCache: "独立缓存",
     reverseMapping: "反向映射",
+    bootstrapDns: "Bootstrap DNS",
     domainStrategy: "域名解析策略",
     rule: {
       add: "添加 DNS 规则",

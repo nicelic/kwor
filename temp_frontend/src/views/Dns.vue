@@ -56,7 +56,7 @@
     <v-row>
       <v-col class="v-card-subtitle" cols="12">{{ $t('pages.basics') }}</v-col>
       <v-col cols="12">
-        <v-row>
+        <v-row align="center">
           <v-col cols="12" sm="6" md="3" lg="2">
             <v-select hide-details :label="$t('dns.final')" :items="[ {title: $t('dns.firstServer'), value: ''}, ...dnsServerTags]" :disabled="loading" v-model="finalDns" />
           </v-col>
@@ -72,6 +72,26 @@
           <v-col cols="auto"><v-checkbox v-model="dns.disable_cache" :disabled="loading" hide-details :label="$t('dns.disableCache')" /></v-col>
           <v-col cols="auto"><v-checkbox v-model="dns.disable_expire" :disabled="loading" hide-details :label="$t('dns.disableExpire')" /></v-col>
           <v-col cols="auto"><v-checkbox v-model="dns.reverse_mapping" :disabled="loading" hide-details :label="$t('dns.reverseMapping')" /></v-col>
+          <v-col cols="auto" class="d-flex align-center">
+            <v-switch
+              v-model="enableBootstrapDns"
+              color="primary"
+              :disabled="loading"
+              hide-details
+              :label="$t('dns.bootstrapDns')"
+            />
+          </v-col>
+          <v-col cols="12" sm="6" md="3" lg="2" v-if="enableBootstrapDns">
+            <v-select
+              v-model="bootstrapDns"
+              hide-details
+              clearable
+              @click:clear="delete dns.bootstrap_dns"
+              :label="$t('dns.bootstrapDns')"
+              :items="bootstrapDnsOptions"
+              :disabled="loading"
+            />
+          </v-col>
         </v-row>
       </v-col>
     </v-row>
@@ -249,6 +269,30 @@ const ruleSets = computed(() => snapshot.value?.ruleSetTags ?? [])
 const dnsServerTags = computed(() => servers.value.map((s: any) => s.tag).filter((tag: any) => typeof tag === 'string' && tag.trim() !== ''))
 const dialTags = computed(() => snapshot.value?.dialTags ?? [])
 const finalDns = computed({ get: () => dns.value?.final ?? '', set: (value: string) => value ? dns.value.final = value : delete dns.value.final })
+const bootstrapDnsOptions = ['8.8.8.8', '1.1.1.1', '223.5.5.5', '119.29.29.29']
+const enableBootstrapDns = computed({
+  get: () => typeof dns.value?.bootstrap_dns === 'string' && dns.value.bootstrap_dns.trim() !== '',
+  set: (val: boolean) => {
+    if (val) {
+      if (!dns.value?.bootstrap_dns) {
+        dns.value.bootstrap_dns = '8.8.8.8'
+      }
+    } else {
+      delete dns.value?.bootstrap_dns
+    }
+  }
+})
+const bootstrapDns = computed({
+  get: () => dns.value?.bootstrap_dns ?? '',
+  set: (val: string) => {
+    const trimmed = typeof val === 'string' ? val.trim() : ''
+    if (trimmed) {
+      dns.value.bootstrap_dns = trimmed
+    } else {
+      delete dns.value?.bootstrap_dns
+    }
+  }
+})
 const dnsRules = computed((): any[] => Array.isArray(dns.value.rules) ? dns.value.rules : [])
 const effectiveDnsServerTag = computed(() => {
   const requested = typeof dns.value?.final === 'string' ? dns.value.final.trim() : ''

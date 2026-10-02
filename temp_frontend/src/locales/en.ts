@@ -979,6 +979,7 @@ export default {
     disableExpire: "Disable Expire",
     independentCache: "Independent Cache",
     reverseMapping: "Reverse Mapping",
+    bootstrapDns: "Bootstrap DNS",
     domainStrategy: "Domain Strategy",
     rule: {
       add: "Add Dns Rule",

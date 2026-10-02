@@ -488,6 +488,7 @@ export default {
     disableExpire: "Vô hiệu hóa hệ thống",
     independentCache: "Bộ nhớ rẽ",
     reverseMapping: "Màm mạng tên lập",
+    bootstrapDns: "Bootstrap DNS",
     domainStrategy: "Chiến lược Domain",
     rule: {
       add: "Thêm Quy tắc DNS",
